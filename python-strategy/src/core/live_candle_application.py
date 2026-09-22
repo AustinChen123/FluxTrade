@@ -87,12 +87,40 @@ class LiveCandleApplicationService:
             with self._db_session_factory() as owned_db:
                 return self.was_applied(candle, db=owned_db)
 
+        applied, _batch = self._applied_state(candle, db)
+        return applied
+
+    def applied_decision_batch(
+        self,
+        candle: Candlestick,
+        *,
+        db: Session | None = None,
+    ) -> MarketDataDecisionBatch | None:
+        """Read exact terminal evidence for one already-applied live candle."""
+        if db is None:
+            with self._db_session_factory() as owned_db:
+                return self.applied_decision_batch(candle, db=owned_db)
+        applied, batch = self._applied_state(candle, db)
+        if not applied:
+            raise RuntimeError(
+                "cannot read decision evidence for an unapplied candle"
+            )
+        return batch
+
+    def _applied_state(
+        self,
+        candle: Candlestick,
+        db: Session,
+    ) -> tuple[bool, MarketDataDecisionBatch | None]:
+        if self._environment_identity() != "live":
+            return False, None
+
         application = db.get(
             MarketDataApplication,
             self._application_identity(candle),
         )
         if application is None:
-            return False
+            return False, None
         if self._application_values(application) != self._candle_values(candle):
             raise RuntimeError(
                 "live application receipt conflicts with market payload: "
@@ -110,6 +138,7 @@ class LiveCandleApplicationService:
                 f"{candle.product_id}:{candle.timeframe}:{candle.timestamp}"
             )
         marker = application.decision_contract_version
+        batch = None
         if marker is not None:
             if type(marker) is not int or marker != 1:
                 raise DecisionBatchIntegrityError()
@@ -122,7 +151,8 @@ class LiveCandleApplicationService:
             )
             if record is None:
                 raise DecisionBatchIntegrityError()
-        return True
+            batch = record.batch
+        return True, batch
 
     def assert_newer(
         self,

@@ -333,7 +333,9 @@ def test_receipt_marker_requires_complete_evidence(
         environment_identity=lambda: "live",
         db_session_factory=lambda: nullcontext(session),
     )
-    reader = MagicMock(return_value=object() if present else None)
+    reader = MagicMock(
+        return_value=SimpleNamespace(batch=MagicMock()) if present else None
+    )
     monkeypatch.setattr(live_candle_application, "read_decision_batch", reader)
     if marker is None or type(marker) is int and marker == 1 and present:
         assert service.was_applied(candle)
@@ -344,6 +346,53 @@ def test_receipt_marker_requires_complete_evidence(
         assert reader.call_args.args[0] is session
     else:
         reader.assert_not_called()
+
+
+@pytest.mark.parametrize("contract", [False, True])
+def test_applied_decision_batch_returns_exact_durable_evidence(
+    sample_candlestick, monkeypatch, contract
+):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    from test_profile_decision_application import batch
+
+    candle = sample_candlestick
+    values = {
+        name: getattr(candle, name)
+        for name in ("open", "high", "low", "close", "volume")
+    }
+    pending = batch() if contract else None
+    session = MagicMock()
+    session.get.side_effect = [
+        SimpleNamespace(
+            **values,
+            decision_contract_version=1 if contract else None,
+        ),
+        SimpleNamespace(**values),
+    ]
+    service = LiveCandleApplicationService(
+        environment_identity=lambda: "live",
+        db_session_factory=lambda: nullcontext(session),
+    )
+    reader = MagicMock(return_value=SimpleNamespace(batch=pending))
+    monkeypatch.setattr(live_candle_application, "read_decision_batch", reader)
+
+    assert service.applied_decision_batch(candle) is pending
+    if contract:
+        reader.assert_called_once()
+    else:
+        reader.assert_not_called()
+
+
+def test_applied_decision_batch_rejects_unapplied_candle(sample_candlestick):
+    service = LiveCandleApplicationService(
+        environment_identity=lambda: "live",
+        db_session_factory=_session_factory,
+    )
+
+    with pytest.raises(RuntimeError, match="unapplied candle"):
+        service.applied_decision_batch(sample_candlestick)
 
 
 def test_owner_has_no_concrete_venue_dependency() -> None:
