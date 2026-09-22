@@ -15,7 +15,12 @@ MAX_JSON_DEPTH = 16
 MAX_JSON_NODES = 4096
 
 
-def _canonical(value: dict[str, object], *, max_nodes: int = MAX_JSON_NODES) -> str:
+def _canonical(
+    value: dict[str, object],
+    *,
+    max_nodes: int = MAX_JSON_NODES,
+    max_bytes: int = MAX_JSON_BYTES,
+) -> str:
     """Root depth is zero; keys and values count as nodes. UTF-8 bytes include syntax."""
     if type(value) is not dict:
         raise ValueError("expected exact JSON object")
@@ -26,7 +31,7 @@ def _canonical(value: dict[str, object], *, max_nodes: int = MAX_JSON_NODES) -> 
     def emit(text: str) -> None:
         nonlocal size
         size += len(text.encode("utf-8"))
-        if size > MAX_JSON_BYTES:
+        if size > max_bytes:
             raise ValueError("JSON byte limit exceeded")
         pieces.append(text)
 
@@ -45,9 +50,7 @@ def _canonical(value: dict[str, object], *, max_nodes: int = MAX_JSON_NODES) -> 
                 raise ValueError("JSON node limit exceeded")
             if kind is dict:
                 obj = cast(dict[str, object], item)
-                if any(
-                    type(key) is not str or len(key) > MAX_JSON_BYTES for key in obj
-                ):
+                if any(type(key) is not str or len(key) > max_bytes for key in obj):
                     raise ValueError("expected bounded exact string keys")
                 emit("{")
                 for index, key in enumerate(sorted(obj)):
@@ -68,7 +71,7 @@ def _canonical(value: dict[str, object], *, max_nodes: int = MAX_JSON_NODES) -> 
         elif kind is str or kind is int or kind is bool or item is None:
             if kind is str and "\x00" in cast(str, item):
                 raise ValueError("JSON text contains forbidden NUL")
-            if kind is str and len(cast(str, item)) > MAX_JSON_BYTES:
+            if kind is str and len(cast(str, item)) > max_bytes:
                 raise ValueError("JSON string limit exceeded")
             if kind is int and not -(1 << 63) <= cast(int, item) < (1 << 64):
                 raise ValueError("JSON integer outside signed64/unsigned64 domain")
@@ -125,19 +128,28 @@ class VerifiedProfilePublication:
         stamp = self.source_available_at
         if stamp is not None:
             try:
-                valid = type(stamp) is datetime and stamp.tzinfo is not None and stamp.utcoffset() == timedelta(0)
+                valid = (
+                    type(stamp) is datetime
+                    and stamp.tzinfo is not None
+                    and stamp.utcoffset() == timedelta(0)
+                )
             except Exception:
                 raise ValueError("invalid UTC availability timestamp") from None
             if not valid:
                 raise ValueError("invalid UTC availability timestamp")
-            object.__setattr__(self, "source_available_at", stamp.replace(tzinfo=timezone.utc))
+            object.__setattr__(
+                self, "source_available_at", stamp.replace(tzinfo=timezone.utc)
+            )
         if type(self.availability_basis) is not str or self.availability_basis not in (
             "OBSERVED",
             "MODELED",
         ):
             raise ValueError("invalid availability basis")
         retention_states = ("PRESENT", "DELETED", "NOT_STORED")
-        if type(self.raw_retention_state) is not str or self.raw_retention_state not in retention_states:
+        if (
+            type(self.raw_retention_state) is not str
+            or self.raw_retention_state not in retention_states
+        ):
             raise ValueError("invalid raw retention state")
 
     @property

@@ -71,15 +71,18 @@ def test_maximum_typed_json_plus_lf_roundtrips_without_reducing_rust_domain() ->
                           reconciliation=CanonicalJsonObject(recon))
     framed = encode_handoff(spec, publication)
     assert len(framed[:-1]) == MAX_JSON_BYTES == 65536
-    assert len(framed) == MAX_FRAMED_HANDOFF_BYTES == 65537
+    assert len(framed) == 65537 < MAX_FRAMED_HANDOFF_BYTES == 2097153
     parsed = parse_handoff(framed)
     assert parsed.spec == spec and parsed.publication == publication
     assert encode_handoff(parsed.spec, parsed.publication) == framed
     hours[0]["page_count"] = 10  # Exactly one more canonical JSON byte.
+    larger = encode_handoff(spec, replace(publication, source_manifest=CanonicalJsonObject(manifest)))
+    assert len(larger) == len(framed) + 1
+    assert parse_handoff(larger).publication.source_manifest.thaw() == manifest
+    padded = framed + b" " * (MAX_FRAMED_HANDOFF_BYTES - len(framed))
+    assert parse_handoff(padded).publication == publication
     with pytest.raises(ValueError):
-        encode_handoff(spec, replace(publication, source_manifest=CanonicalJsonObject(manifest)))
-    with pytest.raises(ValueError):
-        parse_handoff(framed.replace(b'"page_count":1', b'"page_count":10', 1))
+        parse_handoff(padded + b" ")
 
 
 def test_exact_order_argv_and_only_retention_mutation(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -183,7 +186,7 @@ def test_result_matrix_and_path_validation(monkeypatch: pytest.MonkeyPatch) -> N
     execute.assert_not_called()
 
 
-@pytest.mark.parametrize("code", ["import time;time.sleep(5)", "import sys;sys.stdout.write('x'*65538)",
+@pytest.mark.parametrize("code", ["import time;time.sleep(5)", "import sys;sys.stdout.write('x'*1025)",
                                   "import sys;sys.stderr.write('SECRET'*1000)", "raise SystemExit(7)"])
 def test_real_cleanup_child_is_bounded_devnull_no_shell_and_reaped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
                                                                   code: str) -> None:
@@ -203,7 +206,11 @@ def test_real_cleanup_child_is_bounded_devnull_no_shell_and_reaped(tmp_path: Pat
     store = MagicMock()
     store.recover_completed_snapshot.return_value = RECOVERED
     owner = cleanup.ProfileRawCleanupProcess(store, str(tmp_path / "missing"), str(helper),
-                                             ingest.IngestPolicy(timeout_ms=100))
+                                             ingest.IngestPolicy(timeout_ms=100 if "sleep" in code else 3000, stdout_bytes=1024))
     assert owner.run(PARSED.spec, str(tmp_path)) == cleanup.CleanupResult("RETRYABLE", "LOCAL_PROCESS_FAILURE")
     assert len(children) == 1 and children[0].poll() is not None
     store.mark_raw_deleted.assert_not_called()
+    if "stdout.write" in code:
+        with pytest.raises(ingest.AssemblyFailure, match="^assembler output limit$"):
+            ingest._assemble([str(helper)], ingest.IngestPolicy(timeout_ms=3000, stdout_bytes=1024))
+        assert children[-1].poll() is not None

@@ -118,7 +118,7 @@ def test_input_limits_reject_before_job_or_process(monkeypatch: pytest.MonkeyPat
             owner.run(PARSED.spec, root, "worker")
     store.register.assert_not_called()
     assembler.assert_not_called()
-    for changes in ({"timeout_ms": 0}, {"stdout_bytes": 65538}, {"stderr_bytes": True}):
+    for changes in ({"timeout_ms": 0}, {"stdout_bytes": 2097154}, {"stderr_bytes": True}):
         with pytest.raises(ValueError):
             replace(ingest.IngestPolicy(), **changes)
 
@@ -188,10 +188,10 @@ def test_real_stdout_accepts_full_framed_limit_and_reaps_one_over(monkeypatch: p
 
     monkeypatch.setattr(ingest.subprocess, "Popen", spawn)
     policy = ingest.IngestPolicy()
-    assert policy.stdout_bytes == 65537
+    assert policy.stdout_bytes == 2097153
     command = [sys.executable, "-c", "import sys;sys.stdout.buffer.write(b'x'*int(sys.argv[1]))"]
-    assert ingest._assemble([*command, "65537"], policy) == b"x" * 65537
+    assert ingest._assemble([*command, "2097153"], policy) == b"x" * 2097153
     assert children[-1].poll() is not None
     with pytest.raises(ingest.AssemblyFailure, match="^assembler output limit$"):
-        ingest._assemble([*command, "65538"], policy)
+        ingest._assemble([*command, "2097154"], policy)
     assert children[-1].poll() is not None

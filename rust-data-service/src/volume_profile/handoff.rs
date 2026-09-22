@@ -11,7 +11,7 @@ use super::{binance_spot::PRODUCT_ID, VolumeProfile, ALGORITHM_VERSION};
 const HOUR: i64 = 3_600_000;
 const DAY: i64 = 24 * HOUR;
 const MAX_EPOCH: i64 = 253_402_300_799_999;
-const MAX_BYTES: usize = 65_536;
+const MAX_BYTES: usize = 2 * 1024 * 1024;
 pub(crate) use super::mvp::GRID as GRID_ID;
 
 fn safe(value: &str, limit: usize) -> bool {

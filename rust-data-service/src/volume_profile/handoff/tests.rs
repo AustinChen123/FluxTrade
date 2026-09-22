@@ -16,16 +16,21 @@ fn profile() -> VolumeProfile {
 }
 
 #[test]
-fn legitimate_510_bins_exceed_old_node_envelope_but_not_bytes() {
+fn legitimate_655_bins_exceed_old_byte_envelope() {
     let mut p = VolumeProfile::new(
         PRODUCT_ID,
         Grid::new(Decimal::ZERO, Decimal::TEN, "USDT").unwrap(),
         Window::new(0, DAY).unwrap(),
     )
     .unwrap();
-    for index in 0..510 {
-        p.add(PRODUCT_ID, 0, Decimal::from(index * 10 + 1), Decimal::ONE)
-            .unwrap();
+    for index in 0..655_i64 {
+        p.add(
+            PRODUCT_ID,
+            0,
+            Decimal::from((10_000_000_000 + index) * 10 + 1),
+            Decimal::ONE,
+        )
+        .unwrap();
     }
     let evidence = (0..24)
         .map(|hour| {
@@ -34,16 +39,17 @@ fn legitimate_510_bins_exceed_old_node_envelope_but_not_bytes() {
                 "a".repeat(64),
                 1,
                 if hour == 0 { Some(1) } else { None },
-                if hour == 0 { Some(510) } else { None },
-                if hour == 0 { 510 } else { 0 },
+                if hour == 0 { Some(655) } else { None },
+                if hour == 0 { 655 } else { 0 },
             )
             .unwrap()
         })
         .collect();
     let wire = handoff(&p, evidence).unwrap();
-    assert!(510 * 9 > 4096); // Each bin object has four keys and four scalar values.
+    assert!(655 * 9 > 4096); // Each bin object has four keys and four scalar values.
     let bytes = wire.to_bytes().unwrap();
     assert!(bytes.len() <= MAX_BYTES);
+    assert!(bytes.len() > 65_536);
     assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), wire.wire);
     let oversized = Handoff {
         wire: json!({"padding": "x".repeat(MAX_BYTES)}),
