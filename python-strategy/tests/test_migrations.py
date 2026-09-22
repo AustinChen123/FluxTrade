@@ -1718,10 +1718,183 @@ def _schema_fingerprint(engine: Engine) -> tuple:
 # --------------------------------------------------------------------------- #
 
 
+def test_decision_input_constraints_and_immutable_dml(
+    profile_repository_pg: Engine,
+) -> None:
+    engine = profile_repository_pg
+    table = sa.Table("market_data_decision_input", sa.MetaData(), autoload_with=engine)
+    row = dict(
+        input_id="a" * 64,
+        environment="live",
+        execution_scope_id="deployment",
+        strategy_id="s",
+        strategy_version="v1",
+        config_hash="b" * 64,
+        product_id="BINANCE:BTCUSDT-SPOT",
+        trigger_kind="CANDLE",
+        trigger_id="1m:0",
+        requirements_digest="c" * 64,
+        policy_digest="d" * 64,
+        input_digest="e" * 64,
+        decision_time_ms=0,
+        contract_version=1,
+        canonical_payload=b"{}",
+    )
+    with engine.begin() as conn:
+        first = dict(
+            conn.execute(table.insert().values(**row).returning(table)).mappings().one()
+        )
+    stamp = first["recorded_at"]
+    assert stamp.utcoffset() == timedelta(0) and stamp.microsecond % 1000 == 0
+    with engine.connect() as conn:
+        transaction = conn.begin()
+        try:
+            accepted = conn.execute(
+                table.insert()
+                .values(
+                    **{
+                        **row,
+                        "input_id": "1" * 64,
+                        "strategy_id": "trigger_max",
+                        "trigger_id": "1m:9223372036854775807",
+                    }
+                )
+                .returning(table.c.trigger_id)
+            ).scalar_one()
+            assert accepted == "1m:9223372036854775807"
+        finally:
+            transaction.rollback()
+    with pytest.raises(DBAPIError) as caught, engine.begin() as conn:
+        conn.execute(
+            table.insert().values(
+                **{
+                    **row,
+                    "input_id": "2" * 64,
+                    "strategy_id": "trigger_overflow",
+                    "trigger_id": "1m:9223372036854775808",
+                }
+            )
+        )
+    assert getattr(caught.value.orig, "pgcode", None) == "23514"
+    invalid = [
+        (name, "INVALID!")
+        for name in (
+            "environment",
+            "execution_scope_id",
+            "strategy_id",
+            "strategy_version",
+        )
+    ]
+    invalid += [
+        (name, "A" * 64)
+        for name in (
+            "input_id",
+            "config_hash",
+            "requirements_digest",
+            "policy_digest",
+            "input_digest",
+        )
+    ]
+    invalid += [
+        ("product_id", "BINANCE:ETHUSDT-SPOT"),
+        ("product_id", "bad"),
+        ("trigger_kind", "OTHER"),
+        ("trigger_id", "1m:00"),
+        ("trigger_id", "1m:-1"),
+        ("trigger_id", "1m:12345678901234567890"),
+        ("trigger_id", "bad:tf:0"),
+        ("decision_time_ms", -1),
+        ("decision_time_ms", 2**63),
+        ("contract_version", 2),
+        ("canonical_payload", b""),
+        ("canonical_payload", b"x" * (8388608 + 1)),
+    ]
+    for name, value in invalid:
+        candidate = {**row, "input_id": "f" * 64, "strategy_id": "other", name: value}
+        with pytest.raises(DBAPIError), engine.begin() as conn:
+            conn.execute(table.insert().values(**candidate))
+    for name in row:
+        with pytest.raises(DBAPIError), engine.begin() as conn:
+            conn.execute(
+                table.insert().values(
+                    **{**row, "input_id": "f" * 64, "strategy_id": "other", name: None}
+                )
+            )
+    for timestamp in (
+        "-infinity",
+        "infinity",
+        "10000-01-01 00:00:00+00",
+        "2026-01-01 00:00:00.000001+00",
+    ):
+        with pytest.raises(DBAPIError), engine.begin() as conn:
+            conn.execute(
+                table.insert().values(
+                    **{
+                        **row,
+                        "input_id": "f" * 64,
+                        "strategy_id": "other",
+                        "recorded_at": sa.cast(timestamp, sa.DateTime(timezone=True)),
+                    }
+                )
+            )
+    with pytest.raises(DBAPIError) as caught, engine.begin() as conn:
+        conn.execute(table.insert().values(**{**row, "input_id": "f" * 64}))
+    assert getattr(caught.value.orig, "pgcode", None) == "23505"
+    with pytest.raises(DBAPIError) as caught, engine.begin() as conn:
+        conn.execute(table.insert().values(**{**row, "strategy_id": "different_key"}))
+    assert getattr(caught.value.orig, "pgcode", None) == "23505"
+    for statement in (
+        "UPDATE market_data_decision_input SET strategy_id=strategy_id",
+        "UPDATE market_data_decision_input SET strategy_id='changed' WHERE false",
+        "DELETE FROM market_data_decision_input",
+        "DELETE FROM market_data_decision_input WHERE false",
+        "TRUNCATE market_data_decision_input",
+    ):
+        with pytest.raises(DBAPIError) as caught, engine.begin() as conn:
+            conn.execute(text(statement))
+        assert getattr(caught.value.orig, "pgcode", None) == "55000"
+        with engine.connect() as conn:
+            assert dict(conn.execute(sa.select(table)).mappings().one()) == first
+
+
+def test_decision_input_upgrade_downgrade_artifacts(fresh_pg_db: str) -> None:
+    _upgrade(fresh_pg_db)
+    engine = sa.create_engine(_target_url(fresh_pg_db))
+    try:
+        for index, present in enumerate((True, False, True)):
+            with engine.connect() as conn:
+                assert (
+                    conn.execute(
+                        text("SELECT to_regclass('market_data_decision_input')")
+                    ).scalar_one()
+                    is not None
+                ) is present
+                assert (
+                    conn.execute(
+                        text(
+                            "SELECT to_regprocedure('reject_market_data_decision_input_mutation()')"
+                        )
+                    ).scalar_one()
+                    is not None
+                ) is present
+                assert conn.execute(
+                    text(
+                        "SELECT count(*) FROM pg_trigger WHERE tgname='market_data_decision_input_append_only' AND NOT tgisinternal"
+                    )
+                ).scalar_one() == int(present)
+            if index == 0:
+                _downgrade(fresh_pg_db, "7d3a9c02e5f8")
+            elif index == 1:
+                _upgrade(fresh_pg_db)
+    finally:
+        engine.dispose()
+
+
 # Selected non-legacy tables that must exist at HEAD and be gone
 # after a full downgrade to ``base``.
 HEAD_ONLY_TABLES = {
     "market_data_invalidation",
+    "market_data_decision_input",
     "volume_profile_snapshot",
     "volume_profile_bin",
     "volume_profile_ingest_job",
@@ -2524,7 +2697,7 @@ def test_order_identity_incompatible_downgrade_keeps_scoped_indexes(
                 conn.execute(
                     text("SELECT version_num FROM alembic_version")
                 ).scalar_one()
-                == "7d3a9c02e5f8"
+                == "8e4b2c91a6d0"
             )
     finally:
         engine.dispose()

@@ -8,6 +8,8 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Index,
+    Integer,
+    LargeBinary,
     Numeric,
     String,
     Text,
@@ -28,6 +30,45 @@ def _finite(table: str, *columns: str) -> tuple[CheckConstraint, ...]:
             name=f"ck_{table}_{column}_finite",
         )
         for column in columns
+    )
+
+
+class MarketDataDecisionInput(Base):
+    __tablename__ = "market_data_decision_input"
+    input_id: Mapped[str] = mapped_column(String(64, collation="C"), primary_key=True, nullable=False)
+    environment: Mapped[str] = mapped_column(String(128, collation="C"), nullable=False)
+    execution_scope_id: Mapped[str] = mapped_column(String(128, collation="C"), nullable=False)
+    strategy_id: Mapped[str] = mapped_column(String(128, collation="C"), nullable=False)
+    strategy_version: Mapped[str] = mapped_column(String(128, collation="C"), nullable=False)
+    config_hash: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    trigger_kind: Mapped[str] = mapped_column(String(16, collation="C"), nullable=False)
+    trigger_id: Mapped[str] = mapped_column(String(52, collation="C"), nullable=False)
+    requirements_digest: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    policy_digest: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    input_digest: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    product_id: Mapped[str] = mapped_column(String(64), ForeignKey("product.id"), nullable=False)
+    decision_time_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    contract_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    canonical_payload: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=text("date_trunc('milliseconds', clock_timestamp())"))
+    __table_args__ = (
+        UniqueConstraint("environment", "execution_scope_id", "strategy_id", "strategy_version", "config_hash", "product_id", "trigger_kind", "trigger_id", name="uq_mdd_input_key"),
+        CheckConstraint("input_id COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_mdd_input_id"),
+        CheckConstraint("environment COLLATE \"C\" ~ '^[A-Za-z0-9_-]{1,128}$'", name="ck_mdd_environment"),
+        CheckConstraint("execution_scope_id COLLATE \"C\" ~ '^[A-Za-z0-9_-]{1,128}$'", name="ck_mdd_scope"),
+        CheckConstraint("strategy_id COLLATE \"C\" ~ '^[A-Za-z0-9_-]{1,128}$'", name="ck_mdd_strategy"),
+        CheckConstraint("strategy_version COLLATE \"C\" ~ '^[A-Za-z0-9_-]{1,128}$'", name="ck_mdd_version"),
+        CheckConstraint("config_hash COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_mdd_config"),
+        CheckConstraint("product_id COLLATE \"C\" ~ '^[A-Z0-9_]+:[A-Z0-9_-]+$'", name="ck_mdd_product"),
+        CheckConstraint("trigger_kind = 'CANDLE'", name="ck_mdd_trigger_kind"),
+        CheckConstraint("trigger_id COLLATE \"C\" ~ '^[A-Za-z0-9_-]{1,32}:(0|[1-9][0-9]{0,18})$' AND (length(split_part(trigger_id, ':', 2)) < 19 OR (length(split_part(trigger_id, ':', 2)) = 19 AND split_part(trigger_id, ':', 2) COLLATE \"C\" <= '9223372036854775807'))", name="ck_mdd_trigger"),
+        CheckConstraint("requirements_digest COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_mdd_requirements"),
+        CheckConstraint("policy_digest COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_mdd_policy"),
+        CheckConstraint("input_digest COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_mdd_digest"),
+        CheckConstraint("decision_time_ms >= 0 AND decision_time_ms <= 9223372036854775807", name="ck_mdd_time"),
+        CheckConstraint("contract_version = 1", name="ck_mdd_contract"),
+        CheckConstraint("octet_length(canonical_payload) BETWEEN 1 AND 8388608", name="ck_mdd_payload"),
+        CheckConstraint("recorded_at >= TIMESTAMPTZ '0001-01-01 00:00:00+00' AND recorded_at < TIMESTAMPTZ '10000-01-01 00:00:00+00' AND recorded_at = date_trunc('milliseconds', recorded_at)", name="ck_mdd_recorded"),
     )
 
 
