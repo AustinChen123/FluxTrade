@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from src.core.models import Candlestick
 from src.core.orm_models import Candlestick as ORMCandlestick
 from src.core.risk_manager import AccountService
-from src.core.signal_processor import SignalProcessor
+from src.core.signal_processor import SignalProcessor, StrategyDecisionScopeLoader
 from src.strategies.base import BaseStrategy
 
 
@@ -53,6 +53,7 @@ class StrategyHydrationService:
         instance: BaseStrategy,
         *,
         before_timestamp: int | None = None,
+        decision_scope_loader: StrategyDecisionScopeLoader | None = None,
     ) -> int:
         """Replay recent candles without emitting signals, then sync position."""
         requirements = instance.requirements
@@ -88,7 +89,14 @@ class StrategyHydrationService:
             )
             for row in rows
         ]
-        self._signal_processor.warm_up(instance, candles)
+        if decision_scope_loader is None:
+            self._signal_processor.warm_up(instance, candles)
+        else:
+            self._signal_processor.warm_up(
+                instance,
+                candles,
+                decision_scope_loader=decision_scope_loader,
+            )
         self.sync_position_state(instance)
         return len(candles)
 

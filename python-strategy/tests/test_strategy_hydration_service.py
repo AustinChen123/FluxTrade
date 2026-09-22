@@ -118,6 +118,24 @@ def test_warm_up_orders_rows_and_preserves_exact_values() -> None:
     signal_processor.warm_up.assert_called_once_with(strategy, candles)
 
 
+def test_warm_up_forwards_explicit_recorded_scope_loader() -> None:
+    service, signal_processor, _account_service = _service()
+    db, _query = _db_with_rows([_row(1000), _row(2000)])
+    strategy = _Strategy()
+    scope_loader = MagicMock()
+
+    assert (
+        service.warm_up(db, strategy, decision_scope_loader=scope_loader) == 2
+    )
+
+    candles = signal_processor.warm_up.call_args.args[1]
+    signal_processor.warm_up.assert_called_once_with(
+        strategy,
+        candles,
+        decision_scope_loader=scope_loader,
+    )
+
+
 def test_incomplete_warm_up_fails_before_signal_or_position_sync() -> None:
     service, signal_processor, account_service = _service()
     db, _query = _db_with_rows([_row(1000)])

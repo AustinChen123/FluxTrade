@@ -33,6 +33,7 @@ StrategyDecisionScope = Callable[
     [BaseStrategy, Candlestick, StrategyContext | None],
     AbstractContextManager[StrategyContext | None],
 ]
+StrategyDecisionScopeLoader = Callable[[Candlestick], StrategyDecisionScope | None]
 
 
 class StrategyDecisionSkipped(RuntimeError):
@@ -378,6 +379,7 @@ class SignalProcessor:
         candles: list[Candlestick],
         *,
         require_complete_trade_state: bool = False,
+        decision_scope_loader: StrategyDecisionScopeLoader | None = None,
     ) -> None:
         """Replay candles through one strategy without emitting orders.
 
@@ -397,7 +399,38 @@ class SignalProcessor:
                     continue
                 if strategy.requirements.timeframe != candle.timeframe:
                     continue
-                self._dispatch_to_strategy(strategy, candle)
+                if decision_scope_loader is None:
+                    self._dispatch_to_strategy(strategy, candle)
+                    continue
+                invocation_mode = self._context_invocation_mode(strategy)
+                context = None
+                if (
+                    self.strategy_context_loader is not None
+                    and invocation_mode is not StrategyContextInvocationMode.NONE
+                ):
+                    context = self.strategy_context_loader(strategy, candle, ())
+                scope = decision_scope_loader(candle)
+                manager = (
+                    nullcontext(context)
+                    if scope is None
+                    else scope(strategy, candle, context)
+                )
+                try:
+                    enriched = manager.__enter__()
+                except StrategyDecisionSkipped:
+                    continue
+                try:
+                    self._dispatch_to_strategy(
+                        strategy,
+                        candle,
+                        enriched,
+                        invocation_mode=invocation_mode,
+                    )
+                except BaseException:
+                    manager.__exit__(*sys.exc_info())
+                    raise
+                else:
+                    manager.__exit__(None, None, None)
         finally:
             if require_complete_trade_state:
                 strategy.restore_walk_forward_trade_state(complete_trade_state)
