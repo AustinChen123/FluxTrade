@@ -1,8 +1,22 @@
+from dataclasses import replace
 from unittest.mock import MagicMock, call
 
 import pytest
 
-from test_signal_processor import make_candle
+from src.core.runtime_environment import RuntimeEnvironment
+from test_profile_decision_input import sample
+from test_signal_processor import DummyStrategy, make_candle
+
+
+class _ProfileStrategy(DummyStrategy):
+    __fluxtrade_readiness__ = "LIVE_APPROVED"
+
+    @property
+    def requirements(self):
+        return replace(
+            super().requirements,
+            profile_requirements=sample().requirements,
+        )
 
 
 def test_decision_owner_requires_base_context_loader(engine_factory):
@@ -10,6 +24,35 @@ def test_decision_owner_requires_base_context_loader(engine_factory):
         ValueError, match="^market data decisions require a context loader$"
     ):
         engine_factory(market_data_decision_owner=MagicMock())
+
+
+def test_live_profile_activation_waits_for_modeled_warmup_contract(engine_factory):
+    engine = engine_factory(
+        strategy_context_loader=MagicMock(),
+        market_data_decision_owner=MagicMock(),
+    )
+    engine.runtime_environment = RuntimeEnvironment("live")
+    engine._strategy_hydration.fresh_instance_for_replay = MagicMock()
+    strategy = _ProfileStrategy("profile", "BINANCE:BTCUSDT-PERP")
+
+    with pytest.raises(
+        RuntimeError,
+        match="^strategy_profile_activation_requires_modeled_warmup: profile$",
+    ):
+        engine.add_strategy(strategy)
+
+    engine._strategy_hydration.fresh_instance_for_replay.assert_not_called()
+    assert "profile" not in engine.strategy_instances
+
+
+def test_non_live_profile_registration_is_not_blocked_by_live_gate(engine_factory):
+    engine = engine_factory()
+    engine.runtime_environment = RuntimeEnvironment("test")
+    strategy = _ProfileStrategy("profile", "BINANCE:BTCUSDT-PERP")
+
+    engine.add_strategy(strategy)
+
+    assert engine.strategy_instances["profile"] is strategy
 
 
 def test_unpersisted_candle_passes_scope_and_returns_pending_batch(engine_factory):

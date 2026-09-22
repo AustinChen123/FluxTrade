@@ -1188,6 +1188,16 @@ class StrategyEngine:
     ) -> None:
         if self._is_backtest or self.runtime_environment.identity != "live":
             return
+        profile_strategies = sorted(
+            strategy.strategy_id
+            for strategy in strategies
+            if strategy.requirements.profile_requirements
+        )
+        if profile_strategies:
+            raise RuntimeError(
+                "strategy_profile_activation_requires_modeled_warmup: "
+                + ",".join(profile_strategies)
+            )
         required = frozenset(
             capability
             for strategy in strategies
