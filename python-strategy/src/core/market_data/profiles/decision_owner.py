@@ -62,6 +62,7 @@ class MarketDataDecisionOwner:
             or not callable(monotonic_ms)
             or not callable(getattr(cache, "decision_many", None))
             or not callable(getattr(cache, "live_requests", None))
+            or not callable(getattr(input_store, "get", None))
             or not callable(getattr(input_store, "pin_confirmed", None))
         ):
             raise MarketDataDecisionOwnerError()
@@ -144,6 +145,29 @@ class MarketDataCandleDecision:
             timeframe=candle.timeframe,
             bar_start_ms=candle.timestamp,
         )
+        try:
+            existing = self._owner._input_store.get(key)
+        except Exception:
+            return self._skip(strategy, key, "INPUT_STORE_FAILED")
+        if existing is not None:
+            if (
+                type(existing) is not DecisionInputRecord
+                or existing.value.key != key
+                or existing.value.requirements != requirements
+            ):
+                raise MarketDataDecisionOwnerError()
+            enriched = enrich_profile_context(
+                context,
+                requirements,
+                existing.value.context,
+                decision_time_ms=existing.value.decision_time_ms,
+            )
+            return self._batch.applied_scope(
+                key=key,
+                input_id=existing.value.input_id,
+                input_digest=existing.value.input_digest,
+                context=enriched,
+            )
         requests = self._owner._cache.live_requests(
             requirements, selection_time_ms=self._decision_time_ms
         )
@@ -170,13 +194,7 @@ class MarketDataCandleDecision:
                 if pin.status is DecisionInputPinStatus.FAILED
                 else "INPUT_COMMIT_UNCONFIRMED"
             )
-            self._batch.record_skipped(key=key, reason=reason)
-            logger.warning(
-                "market_data_decision_input_skipped strategy_id=%s reason=%s",
-                strategy.strategy_id,
-                reason,
-            )
-            return _skipped_scope()
+            return self._skip(strategy, key, reason)
         record = pin.record
         if (
             type(record) is not DecisionInputRecord
@@ -189,6 +207,20 @@ class MarketDataCandleDecision:
             input_digest=record.value.input_digest,
             context=enriched,
         )
+
+    def _skip(
+        self,
+        strategy: BaseStrategy,
+        key: MarketDataDecisionKey,
+        reason: str,
+    ) -> AbstractContextManager[StrategyContext | None]:
+        self._batch.record_skipped(key=key, reason=reason)
+        logger.warning(
+            "market_data_decision_input_skipped strategy_id=%s reason=%s",
+            strategy.strategy_id,
+            reason,
+        )
+        return _skipped_scope()
 
     def build(self) -> MarketDataDecisionBatch | None:
         return self._batch.build()

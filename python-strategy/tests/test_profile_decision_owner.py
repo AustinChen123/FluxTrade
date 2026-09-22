@@ -45,8 +45,8 @@ def base_context(strategy):
     )
 
 
-def decision(store):
-    cache = ProfileSnapshotCache(Mock(), utc_ms=lambda: DAY + 3, monotonic_ms=lambda: 10)
+def decision(store, *, clock=DAY + 3):
+    cache = ProfileSnapshotCache(Mock(), utc_ms=lambda: clock, monotonic_ms=lambda: 10)
     owner = MarketDataDecisionOwner(
         environment="live",
         execution_scope_id="live-berlin-1",
@@ -55,7 +55,7 @@ def decision(store):
         ),
         cache=cache,
         input_store=store,
-        utc_ms=lambda: DAY + 3,
+        utc_ms=lambda: clock,
         monotonic_ms=lambda: 10,
     )
     candle = make_candle()
@@ -76,6 +76,7 @@ def decision(store):
 )
 def test_pin_state_maps_to_callback_outcome(status, disposition, reason):
     store = MagicMock()
+    store.get.return_value = None
 
     def result(value):
         record = (

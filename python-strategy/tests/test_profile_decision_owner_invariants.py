@@ -33,6 +33,7 @@ def confirmed(value):
 
 def test_confirmed_wrong_valid_record_is_rejected_before_callback():
     store = MagicMock()
+    store.get.return_value = None
 
     def wrong(value):
         other = replace(
@@ -87,6 +88,7 @@ def test_one_candle_samples_clocks_once_and_rejects_equal_copy():
     utc, mono = Mock(return_value=DAY + 3), Mock(return_value=10)
     cache = ProfileSnapshotCache(Mock(), utc_ms=utc, monotonic_ms=mono)
     store = MagicMock()
+    store.get.return_value = None
     store.pin_confirmed.side_effect = confirmed
     owner = MarketDataDecisionOwner(
         environment="live",
@@ -115,6 +117,7 @@ def test_one_candle_samples_clocks_once_and_rejects_equal_copy():
 @pytest.mark.parametrize("failure", [RuntimeError("callback"), KeyboardInterrupt()])
 def test_callback_failure_propagates_and_keeps_batch_incomplete(failure):
     store = MagicMock()
+    store.get.return_value = None
     store.pin_confirmed.side_effect = confirmed
     strategy, (candle, scope) = Strategy("profile_strategy"), decision(store)
     manager = scope(strategy, candle, base_context(strategy))
@@ -128,6 +131,7 @@ def test_callback_failure_propagates_and_keeps_batch_incomplete(failure):
 
 def test_applied_exists_only_after_normal_scope_exit():
     store = MagicMock()
+    store.get.return_value = None
     store.pin_confirmed.side_effect = confirmed
     strategy, (candle, scope) = Strategy("profile_strategy"), decision(store)
     manager = scope(strategy, candle, base_context(strategy))
