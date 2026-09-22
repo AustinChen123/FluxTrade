@@ -10,11 +10,13 @@ from src.core.market_data.profiles.live_query import (
     LiveProfileQueryUnavailable,
     ProfileQueryError,
 )
+from src.core.market_data.profiles.selection import ProfileSelectionError
 from src.core.market_data.profiles.snapshot_cache import (
     ProfileSnapshotCache,
     ProfileRefreshResult,
 )
 from test_profile_observed_snapshot import observed, DAY
+from test_profile_context_enrichment import requirement
 
 
 def setup():
@@ -30,6 +32,81 @@ def setup():
         mono,
         ProfileSnapshotCache(client, utc_ms=utc, monotonic_ms=mono),
     )
+
+
+def test_live_request_identity_is_retained_per_utc_day():
+    request, _, _, _, _, cache = setup()
+    requirements = (requirement(request),)
+    first = cache.live_requests(requirements, selection_time_ms=DAY + 1)
+    same = cache.live_requests(requirements, selection_time_ms=2 * DAY - 1)
+    next_day = cache.live_requests(requirements, selection_time_ms=2 * DAY)
+    assert first[0] is same[0]
+    assert next_day[0] is not first[0] and next_day[0].end_ms == 2 * DAY
+
+
+def test_live_request_plan_is_the_exact_cache_request_identity():
+    request, _, _, _, _, cache = setup()
+    requirements = (requirement(request),)
+    planned = cache.live_requests(requirements, selection_time_ms=DAY + 1)
+    result = cache.decision_many(
+        planned, decision_time_ms=DAY + 1, current_monotonic_ms=1
+    )
+    assert result.profiles[0].request is planned[0]
+    assert (
+        cache.live_requests(requirements, selection_time_ms=DAY + 2)[0]
+        is planned[0]
+    )
+
+
+def test_live_requests_intern_permutations_subsets_and_existing_entries():
+    request, _, _, _, _, cache = setup()
+    first = requirement(request)
+    second = replace(first, output_grid_id="second")
+    cache.decision(request, decision_time_ms=DAY + 1, current_monotonic_ms=1)
+    one = cache.live_requests((first,), selection_time_ms=DAY + 1)
+    forward = cache.live_requests((first, second), selection_time_ms=DAY + 1)
+    reverse = cache.live_requests((second, first), selection_time_ms=DAY + 1)
+    assert one[0] is request
+    for planned in (forward, reverse):
+        assert next(item for item in planned if item == request) is request
+    assert set(map(id, forward)) == set(map(id, reverse))
+
+
+def test_live_request_identity_is_shared_by_concurrent_planners():
+    request, _, _, _, _, cache = setup()
+    requirements = (requirement(request),)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        planned = tuple(
+            pool.map(
+                lambda _: cache.live_requests(
+                    requirements, selection_time_ms=DAY + 1
+                ),
+                range(16),
+            )
+        )
+    assert len({id(item[0]) for item in planned}) == 1
+
+
+def test_planning_first_owns_identity_against_equal_copy():
+    request, _, _, _, _, cache = setup()
+    requirements = (requirement(request),)
+    planned = cache.live_requests(requirements, selection_time_ms=DAY + 1)[0]
+    with pytest.raises(ProfileQueryError):
+        cache.decision(
+            replace(planned), decision_time_ms=DAY + 1, current_monotonic_ms=1
+        )
+    result = cache.decision(
+        planned, decision_time_ms=DAY + 1, current_monotonic_ms=1
+    )
+    assert result.request is planned
+
+
+def test_invalid_live_plan_creates_no_partial_entries():
+    request, _, _, _, _, cache = setup()
+    item = requirement(request)
+    with pytest.raises(ProfileSelectionError):
+        cache.live_requests((item, item), selection_time_ms=DAY + 1)
+    assert cache._entries == {}
 
 
 def read(cache, request, **changes):

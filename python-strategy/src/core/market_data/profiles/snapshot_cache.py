@@ -5,6 +5,7 @@ from threading import Lock
 from typing import Callable, Protocol
 
 from .decision_context import ProfileDecisionContext, StrategyMarketDataContext
+from .live_selection import plan_live_profile_requests
 from .live_query import LiveProfileQueryUnavailable, ProfileQueryError
 from .live_validation import (
     LiveProfileValidationUnavailable,
@@ -14,6 +15,7 @@ from .live_validation import (
 )
 from .observed_snapshot import ObservedProfileSnapshot
 from .read_types import ProfileQueryRequest
+from .requirements import ProfileRequirement
 from .wire import ProfileWireEvidence
 
 _State = (
@@ -86,6 +88,26 @@ class ProfileSnapshotCache:
         self._client, self._utc, self._mono = client, utc_ms, monotonic_ms
         self._lock = Lock()
         self._entries: dict[ProfileQueryRequest, _Entry] = {}
+
+    def live_requests(
+        self,
+        requirements: tuple[ProfileRequirement, ...],
+        *,
+        selection_time_ms: int,
+    ) -> tuple[ProfileQueryRequest, ...]:
+        """Retain exact request objects shared by refresh and decision paths."""
+        planned = plan_live_profile_requests(
+            requirements, selection_time_ms=selection_time_ms
+        )
+        with self._lock:
+            retained = []
+            for request in planned:
+                entry = self._entries.get(request)
+                if entry is None:
+                    entry = _Entry(request)
+                    self._entries[request] = entry
+                retained.append(entry.request)
+            return tuple(retained)
 
     def _entry(self, request: ProfileQueryRequest) -> _Entry:
         # Only called under the lock. Validation precedes hashing caller input.
