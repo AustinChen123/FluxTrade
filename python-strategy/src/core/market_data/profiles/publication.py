@@ -15,7 +15,7 @@ MAX_JSON_DEPTH = 16
 MAX_JSON_NODES = 4096
 
 
-def _canonical(value: dict[str, object]) -> str:
+def _canonical(value: dict[str, object], *, max_nodes: int = MAX_JSON_NODES) -> str:
     """Root depth is zero; keys and values count as nodes. UTF-8 bytes include syntax."""
     if type(value) is not dict:
         raise ValueError("expected exact JSON object")
@@ -33,7 +33,7 @@ def _canonical(value: dict[str, object]) -> str:
     def walk(item: object, depth: int) -> None:
         nonlocal nodes
         nodes += 1
-        if nodes > MAX_JSON_NODES or depth > MAX_JSON_DEPTH:
+        if nodes > max_nodes or depth > MAX_JSON_DEPTH:
             raise ValueError("JSON node/depth limit exceeded")
         kind = type(item)
         if kind is dict or kind is list:
@@ -41,7 +41,7 @@ def _canonical(value: dict[str, object]) -> str:
                 raise ValueError("cyclic JSON")
             active.add(id(item))
             container = cast(dict[str, object] | list[object], item)
-            if len(container) > MAX_JSON_NODES:
+            if len(container) > max_nodes:
                 raise ValueError("JSON node limit exceeded")
             if kind is dict:
                 obj = cast(dict[str, object], item)

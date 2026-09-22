@@ -14,6 +14,42 @@ fn profile() -> VolumeProfile {
         .unwrap();
     p
 }
+
+#[test]
+fn legitimate_510_bins_exceed_old_node_envelope_but_not_bytes() {
+    let mut p = VolumeProfile::new(
+        PRODUCT_ID,
+        Grid::new(Decimal::ZERO, Decimal::TEN, "USDT").unwrap(),
+        Window::new(0, DAY).unwrap(),
+    )
+    .unwrap();
+    for index in 0..510 {
+        p.add(PRODUCT_ID, 0, Decimal::from(index * 10 + 1), Decimal::ONE)
+            .unwrap();
+    }
+    let evidence = (0..24)
+        .map(|hour| {
+            HourEvidence::new(
+                hour * HOUR,
+                "a".repeat(64),
+                1,
+                if hour == 0 { Some(1) } else { None },
+                if hour == 0 { Some(510) } else { None },
+                if hour == 0 { 510 } else { 0 },
+            )
+            .unwrap()
+        })
+        .collect();
+    let wire = handoff(&p, evidence).unwrap();
+    assert!(510 * 9 > 4096); // Each bin object has four keys and four scalar values.
+    let bytes = wire.to_bytes().unwrap();
+    assert!(bytes.len() <= MAX_BYTES);
+    assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), wire.wire);
+    let oversized = Handoff {
+        wire: json!({"padding": "x".repeat(MAX_BYTES)}),
+    };
+    assert!(oversized.to_bytes().is_err());
+}
 fn hours() -> Vec<HourEvidence> {
     (0..24)
         .map(|i| {

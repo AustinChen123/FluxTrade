@@ -16,9 +16,11 @@ from typing import Any
 from src.core.decimal_math import canonical_decimal_text
 
 from .jobs import JobSpec
-from .publication import MAX_JSON_BYTES, CanonicalJsonObject, VerifiedProfilePublication
+from .publication import MAX_JSON_BYTES, CanonicalJsonObject, VerifiedProfilePublication, _canonical
+
 from .types import BIGINT_MAX, ProfileBin, VolumeProfileContent, _decimal
 
+MAX_HANDOFF_NODES = 65_536  # Full wire only; publication metadata retains 4096 nodes.
 _HOUR = 3_600_000
 _U64_MAX = (1 << 64) - 1
 MAX_FRAMED_HANDOFF_BYTES = MAX_JSON_BYTES + 1  # Canonical JSON plus the CLI's single LF.
@@ -150,7 +152,7 @@ def encode_handoff(spec: JobSpec, publication: VerifiedProfilePublication) -> by
         "availability_basis": publication.availability_basis, "raw_retention_state": publication.raw_retention_state,
     }
     # Same bounded UTF-8/canonical JSON domain as the wire parser.
-    encoded = CanonicalJsonObject(wire).text.encode("utf-8")
+    encoded = _canonical(wire, max_nodes=MAX_HANDOFF_NODES).encode("utf-8")
     return encoded + b"\n"
 
 
@@ -160,11 +162,11 @@ def parse_handoff(raw: bytes) -> ParsedHandoff:
     try:
         wire = _keys(json.loads(raw.decode("utf-8"), object_pairs_hook=_pairs,
                                parse_float=_reject_number, parse_constant=_reject_number), _TOP)
-        CanonicalJsonObject(wire)  # Shared UTF-8/NUL, depth, node and integer bounds.
+        _canonical(wire, max_nodes=MAX_HANDOFF_NODES)
         _require(_int(wire["schema_version"]) == 1)
         payload = _keys(wire["content"], _CONTENT)
         _require(_int(payload["schema_version"]) == 1 and payload["period"] == "1d" and payload["timezone"] == "UTC")
-        _require(type(payload["bins"]) is list)
+        _require(type(payload["bins"]) is list and len(payload["bins"]) <= 4096)
         bins = []
         for item in payload["bins"]:
             item = _keys(item, "bin_index base_volume quote_volume aggregate_count")

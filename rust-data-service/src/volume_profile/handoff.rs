@@ -246,7 +246,7 @@ impl Handoff {
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         let bytes = serde_json::to_vec(&self.wire)?;
         ensure!(bytes.len() <= MAX_BYTES, "handoff byte limit");
-        // Match the existing canonical JSON depth/node envelope, not just bytes.
+        // Full-wire envelope; small publication metadata keeps its separate limit.
         fn nodes(value: &Value) -> usize {
             match value {
                 Value::Object(map) => 1 + map.values().map(|v| 1 + nodes(v)).sum::<usize>(),
@@ -254,7 +254,7 @@ impl Handoff {
                 _ => 1,
             }
         }
-        ensure!(nodes(&self.wire) <= 4096, "handoff node limit");
+        ensure!(nodes(&self.wire) <= 65_536, "handoff node limit");
         Ok(bytes)
     }
 }
