@@ -5,6 +5,8 @@ from itertools import permutations
 from typing import Any, cast
 
 import pytest
+from unittest.mock import Mock
+from src.core.market_data.profiles import decision_application as owner
 
 from src.core.market_data.profiles.decision_application import (
     DecisionApplicationError,
@@ -34,6 +36,178 @@ def applied(value=None):
 
 def batch(keys=(), outcomes=()):
     return Batch("live", "deployment", "BINANCE:BTCUSDT-SPOT", "1m", 0, keys, outcomes)
+
+
+def test_batch_empty_literal_and_full_roundtrip():
+    expected = b'{"bar_start_ms":0,"environment":"live","execution_scope_id":"deployment","outcomes":[],"participants":[],"product_id":"BINANCE:BTCUSDT-SPOT","schema_version":1,"timeframe":"1m"}'
+    assert batch().canonical_bytes == expected
+    assert Batch.from_canonical_bytes(expected) == batch()
+    outcomes = [
+        applied(),
+        replace(
+            applied(), signal_suppressed=True, suppression_reason="SNAPSHOT_REVOKED"
+        ),
+    ]
+    for reason in ("INPUT_COMMIT_UNCONFIRMED", "INPUT_STORE_FAILED"):
+        outcomes.extend(
+            [
+                Outcome(key(), "SKIPPED", None, None, reason),
+                Outcome(key(), "SKIPPED", key().input_id, "b" * 64, reason),
+            ]
+        )
+    for outcome in outcomes:
+        value = batch((key(),), (outcome,))
+        assert Batch.from_canonical_bytes(value.canonical_bytes) == value
+
+
+@pytest.mark.parametrize(
+    "path,value",
+    [
+        (("schema_version",), True),
+        (("schema_version",), 2),
+        (("bar_start_ms",), True),
+        (("environment",), "SECRET!"),
+        (("participants", 0, "strategy_id"), "other"),
+        (("outcomes", 0, "disposition"), "OTHER"),
+        (("outcomes", 0, "input_digest"), "SECRET"),
+        (("outcomes", 0, "signal_suppressed"), 0),
+        (("outcomes", 0, "contract_version"), True),
+        (("outcomes", 0, "key", "execution_scope_id"), "other"),
+    ],
+)
+def test_batch_codec_hostile_fields(path, value):
+    data = json.loads(batch((key(),), (applied(),)).canonical_bytes)
+    target = data
+    for part in path[:-1]:
+        target = target[part]
+    target[path[-1]] = value
+    with pytest.raises(DecisionApplicationError) as caught:
+        Batch.from_canonical_bytes(owner._bytes(data))
+    assert (
+        str(caught.value) == "MARKET_DATA_DECISION_INVALID"
+        and caught.value.__cause__ is None
+    )
+
+
+def test_batch_codec_nested_shapes_and_json_domain():
+    raw = batch((key(),), (applied(),)).canonical_bytes
+    for path in ((), ("participants", 0), ("outcomes", 0), ("outcomes", 0, "key")):
+        for extra in (False, True):
+            data = json.loads(raw)
+            target = data
+            for part in path:
+                target = target[part]
+            if extra:
+                target["SECRET"] = 1
+            else:
+                target.pop(next(iter(target)))
+            with pytest.raises(DecisionApplicationError):
+                Batch.from_canonical_bytes(owner._bytes(data))
+    for invalid in (
+        b"\xff",
+        raw + b" ",
+        raw.replace(b'"strategy_id":"s"', b'"strategy_id":"s","strategy_id":"s"'),
+        raw.replace(b'"bar_start_ms":0', b'"bar_start_ms":0.0'),
+        raw.replace(b'"bar_start_ms":0', b'"bar_start_ms":NaN'),
+        raw.replace(b'"bar_start_ms":0', b'"bar_start_ms":Infinity'),
+    ):
+        with pytest.raises(DecisionApplicationError):
+            Batch.from_canonical_bytes(invalid)
+
+
+def test_batch_count_admission_constructor_and_decoder(monkeypatch):
+    assert owner.MAX_DECISION_BATCH_PARTICIPANTS == 256
+    keys = tuple(replace(key(), strategy_id=f"s{i}") for i in range(3))
+    value = batch(keys, tuple(applied(k) for k in keys))
+    raw = value.canonical_bytes
+    monkeypatch.setattr(owner, "MAX_DECISION_BATCH_PARTICIPANTS", 2)
+    control = batch(keys[:2], tuple(applied(k) for k in keys[:2]))
+    assert Batch.from_canonical_bytes(control.canonical_bytes) == control
+    with pytest.raises(DecisionApplicationError):
+        batch(keys, tuple(applied(k) for k in keys))
+    original_shape = owner._shape
+    spy = Mock(side_effect=AssertionError("typed reconstruction"))
+
+    def shape(value, cls):
+        if cls in (Key, Outcome):
+            spy()
+        return original_shape(value, cls)
+
+    monkeypatch.setattr(owner, "_shape", shape)
+    with pytest.raises(DecisionApplicationError):
+        Batch.from_canonical_bytes(raw)
+    spy.assert_not_called()
+
+
+def test_batch_bytes_depth_nodes_admission(monkeypatch):
+    assert (
+        owner.MAX_DECISION_BATCH_BYTES,
+        owner.MAX_DECISION_BATCH_DEPTH,
+        owner.MAX_DECISION_BATCH_NODES,
+    ) == (1048576, 16, 65536)
+    raw = batch((key(),), (applied(),)).canonical_bytes
+    assert Batch.from_canonical_bytes(raw)
+    with monkeypatch.context() as patch:
+        patch.setattr(owner, "MAX_DECISION_BATCH_BYTES", len(raw))
+        assert Batch.from_canonical_bytes(raw)
+        assert batch((key(),), (applied(),)).canonical_bytes == raw
+        patch.setattr(owner, "MAX_DECISION_BATCH_BYTES", len(raw) - 1)
+        with pytest.raises(DecisionApplicationError):
+            batch((key(),), (applied(),))
+        spy = Mock(side_effect=AssertionError("JSON parser"))
+        patch.setattr(owner.json, "loads", spy)
+        with pytest.raises(DecisionApplicationError):
+            Batch.from_canonical_bytes(raw)
+        spy.assert_not_called()
+    data = json.loads(raw)
+    nested = "SECRET"
+    for _ in range(17):
+        nested = [nested]
+    data["outcomes"][0]["reason"] = nested
+    spy = Mock(side_effect=AssertionError("typed reconstruction"))
+    monkeypatch.setattr(owner, "_shape", spy)
+    with pytest.raises(DecisionApplicationError):
+        Batch.from_canonical_bytes(owner._bytes(data))
+    spy.assert_not_called()
+
+
+def test_batch_actual_byte_boundary_precedes_parser(monkeypatch):
+    spy = Mock(side_effect=ValueError)
+    monkeypatch.setattr(owner.json, "loads", spy)
+    with pytest.raises(DecisionApplicationError):
+        Batch.from_canonical_bytes(b" " * owner.MAX_DECISION_BATCH_BYTES)
+    spy.assert_called_once()
+    spy.reset_mock()
+    with pytest.raises(DecisionApplicationError):
+        Batch.from_canonical_bytes(b" " * (owner.MAX_DECISION_BATCH_BYTES + 1))
+    spy.assert_not_called()
+
+
+def test_batch_exact_node_boundary_is_symmetric(monkeypatch):
+    raw = batch((key(),), (applied(),)).canonical_bytes
+
+    def nodes(value):
+        if type(value) is dict:
+            return 1 + sum(1 + nodes(v) for v in value.values())
+        if type(value) is list:
+            return 1 + sum(nodes(v) for v in value)
+        return 1
+
+    count = nodes(json.loads(raw))
+    monkeypatch.setattr(owner, "MAX_DECISION_BATCH_NODES", count)
+    assert Batch.from_canonical_bytes(raw) == batch((key(),), (applied(),))
+    monkeypatch.setattr(owner, "MAX_DECISION_BATCH_NODES", count - 1)
+    with pytest.raises(DecisionApplicationError):
+        batch((key(),), (applied(),))
+    spy = Mock(side_effect=AssertionError("typed reconstruction"))
+    monkeypatch.setattr(owner, "_shape", spy)
+    with pytest.raises(DecisionApplicationError):
+        Batch.from_canonical_bytes(raw)
+    spy.assert_not_called()
+    monkeypatch.setattr(owner, "MAX_DECISION_BATCH_NODES", 1)
+    with pytest.raises(DecisionApplicationError):
+        Batch.from_canonical_bytes(raw)
+    spy.assert_not_called()
 
 
 def test_key_canonical_identity_and_no_decision_time():

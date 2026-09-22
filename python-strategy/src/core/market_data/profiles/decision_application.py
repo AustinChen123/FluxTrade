@@ -4,12 +4,32 @@ The dispatcher must never label a started/partial callback SKIPPED. These pure
 DTOs cannot observe caller behavior; persistence and receipt atomicity are separate.
 """
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 import hashlib
 import json
+from typing import Any
 
 from src.core.product_registry import validate_product_id
 from .read_types import _hex, _integer, _safe
+from .publication import _canonical
+
+MAX_DECISION_BATCH_PARTICIPANTS = 256
+MAX_DECISION_BATCH_BYTES = 1024 * 1024
+MAX_DECISION_BATCH_NODES = 65536
+MAX_DECISION_BATCH_DEPTH = 16  # Shared detached JSON helper's fixed depth domain.
+
+
+def _batch_bytes(value: dict[str, Any]) -> bytes:
+    # Detached bounded JSON only; this is not the HTTP profile wire decoder.
+    return _canonical(
+        value, max_bytes=MAX_DECISION_BATCH_BYTES, max_nodes=MAX_DECISION_BATCH_NODES
+    ).encode("utf-8")
+
+
+def _shape(value: Any, cls: Any) -> dict[str, Any]:
+    if type(value) is not dict or set(value) != {field.name for field in fields(cls)}:
+        raise ValueError
+    return value.copy()
 
 
 class DecisionApplicationError(ValueError):
@@ -196,6 +216,8 @@ class MarketDataDecisionBatch:
             if (
                 type(self.participants) is not tuple
                 or type(self.outcomes) is not tuple
+                or len(self.participants) > MAX_DECISION_BATCH_PARTICIPANTS
+                or len(self.outcomes) > MAX_DECISION_BATCH_PARTICIPANTS
                 or any(
                     type(key) is not MarketDataDecisionKey for key in self.participants
                 )
@@ -239,13 +261,67 @@ class MarketDataDecisionBatch:
                     )
                 ),
             )
+            self.canonical_bytes
         except ValueError:
             raise DecisionApplicationError() from None
 
     @property
     def canonical_bytes(self) -> bytes:
-        return _bytes({"schema_version": 1, **asdict(self)})
+        data = {"schema_version": 1, **asdict(self)}
+        data["participants"] = list(data["participants"])
+        data["outcomes"] = list(data["outcomes"])
+        return _batch_bytes(data)
 
     @property
     def digest(self) -> str:
         return hashlib.sha256(self.canonical_bytes).hexdigest()
+
+    @classmethod
+    def from_canonical_bytes(cls, raw: bytes) -> "MarketDataDecisionBatch":
+        def pairs(items: list[tuple[str, Any]]) -> dict[str, Any]:
+            if len({key for key, _ in items}) != len(items):
+                raise ValueError
+            return dict(items)
+
+        def reject(value: str) -> Any:
+            raise ValueError
+
+        try:
+            if type(raw) is not bytes or len(raw) > MAX_DECISION_BATCH_BYTES:
+                raise ValueError
+            data = json.loads(
+                raw.decode("utf-8"),
+                object_pairs_hook=pairs,
+                parse_float=reject,
+                parse_constant=reject,
+            )
+            if _batch_bytes(data) != raw or type(data) is not dict:
+                raise ValueError
+            version = data.pop("schema_version")
+            if type(version) is not int or version != 1:
+                raise ValueError
+            data = _shape(data, cls)
+            for name in ("participants", "outcomes"):
+                if (
+                    type(data[name]) is not list
+                    or len(data[name]) > MAX_DECISION_BATCH_PARTICIPANTS
+                ):
+                    raise ValueError
+            data["participants"] = tuple(
+                MarketDataDecisionKey(**_shape(row, MarketDataDecisionKey))
+                for row in data["participants"]
+            )
+            outcomes = []
+            for row in data["outcomes"]:
+                item = _shape(row, MarketDataDecisionOutcome)
+                item["key"] = MarketDataDecisionKey(
+                    **_shape(item["key"], MarketDataDecisionKey)
+                )
+                outcomes.append(MarketDataDecisionOutcome(**item))
+            data["outcomes"] = tuple(outcomes)
+            result = cls(**data)
+            if result.canonical_bytes != raw:
+                raise ValueError
+            return result
+        except (ValueError, TypeError, KeyError, OverflowError, RecursionError):
+            raise DecisionApplicationError() from None
