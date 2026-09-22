@@ -379,12 +379,27 @@ class BacktestRunner:
         self.engine = None
 
     def add_strategy(self, strategy: BaseStrategy):
+        if strategy.requirements.profile_requirements:
+            raise RuntimeError(
+                "profile_market_data_provider_required: "
+                f"runner=full strategy_id={strategy.strategy_id}"
+            )
         if self._primary_runtime_id is None:
             self._primary_runtime_id = strategy.strategy_id
         self._strategies_buffer.append(strategy)
 
     def add_portfolio(self, definition: PortfolioDefinition) -> None:
         """Add a portfolio while retaining strategy-scoped fills and metrics."""
+        profile_ids = sorted(
+            sleeve.strategy.strategy_id
+            for sleeve in definition.sleeves
+            if sleeve.strategy.requirements.profile_requirements
+        )
+        if profile_ids:
+            raise RuntimeError(
+                "profile_market_data_provider_required: runner=full strategy_id="
+                + ",".join(profile_ids)
+            )
         decision_timeframe = definition.sleeves[0].strategy.requirements.timeframe
         if (
             definition.product_id != self.product_id

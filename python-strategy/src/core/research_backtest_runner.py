@@ -169,6 +169,11 @@ class ResearchBacktestRunner:
         self._strategies: list[BaseStrategy] = []
 
     def add_strategy(self, strategy: BaseStrategy) -> None:
+        if strategy.requirements.profile_requirements:
+            raise RuntimeError(
+                "profile_market_data_provider_required: "
+                f"runner=research strategy_id={strategy.strategy_id}"
+            )
         self._strategies.append(strategy)
 
     def run(self) -> dict:
