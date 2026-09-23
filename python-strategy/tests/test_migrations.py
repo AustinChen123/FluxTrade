@@ -3075,7 +3075,7 @@ def test_order_identity_incompatible_downgrade_keeps_scoped_indexes(
                 conn.execute(
                     text("SELECT version_num FROM alembic_version")
                 ).scalar_one()
-                == "b73e9a21c604"
+                == "c84f1a92d607"
             )
     finally:
         engine.dispose()

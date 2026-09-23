@@ -39,7 +39,7 @@ def test_head_parity_and_guard():
     config = Config(str(ROOT / "alembic.ini"))
     config.set_main_option("script_location", str(ROOT / "alembic"))
     script = ScriptDirectory.from_config(config)
-    assert script.get_heads() == [REVISION]
+    assert script.get_heads() == ["c84f1a92d607"]
     revision = script.get_revision(REVISION)
     assert revision is not None and revision.down_revision == "2f6c8a1e9b04"
     up = sql("upgrade")
@@ -59,7 +59,10 @@ def test_head_parity_and_guard():
         assert f"{column.name} {sql_type} NOT NULL" in up
     for constraint in table.constraints:
         if isinstance(constraint, CheckConstraint):
-            assert f"CONSTRAINT {constraint.name} CHECK ({constraint.sqltext})" in up
+            historical = str(constraint.sqltext).replace(
+                "^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$", "^[A-Za-z0-9_-]{1,128}$"
+            )
+            assert f"CONSTRAINT {constraint.name} CHECK ({historical})" in up
         if isinstance(constraint, UniqueConstraint):
             assert (
                 f"CONSTRAINT {constraint.name} UNIQUE ({', '.join(c.name for c in constraint.columns)})"

@@ -44,7 +44,7 @@ def test_head_marker_guards_and_downgrade():
     config = Config(str(ROOT / "alembic.ini"))
     config.set_main_option("script_location", str(ROOT / "alembic"))
     script = ScriptDirectory.from_config(config)
-    assert script.get_heads() == ["b73e9a21c604"]
+    assert script.get_heads() == ["c84f1a92d607"]
     revision = script.get_revision(REVISION)
     assert revision is not None and revision.down_revision == "8e4b2c91a6d0"
     up = sql("upgrade")
@@ -91,7 +91,10 @@ def test_exact_columns_constraints_and_fk_parity():
             compiled = " ".join(
                 str(AddConstraint(constraint).compile(dialect=dialect())).split()
             ).split(" ADD ", 1)[1]
-            assert compiled.replace(" (", "(") in body.replace(" (", "(")
+            historical = compiled.replace(
+                "^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$", "^[A-Za-z0-9_-]{1,128}$"
+            )
+            assert historical.replace(" (", "(") in body.replace(" (", "(")
         assert ddl.count("FOREIGN KEY") == body.count("FOREIGN KEY")
     receipt = cast(Table, MarketDataApplication.__table__)
     assert receipt.c.decision_contract_version.nullable

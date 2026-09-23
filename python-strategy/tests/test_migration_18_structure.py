@@ -40,7 +40,7 @@ def test_head_and_guard_exact_scope():
     config = Config()
     config.set_main_option("script_location", str(ROOT))
     script = ScriptDirectory.from_config(config)
-    assert script.get_heads() == ["b73e9a21c604"]
+    assert script.get_heads() == ["c84f1a92d607"]
     revision = script.get_revision(REVISION)
     assert revision and revision.down_revision == "7d3a9c02e5f8"
     assert re.fullmatch("[0-9a-f]{12}", REVISION)
@@ -96,7 +96,10 @@ def test_exact_orm_migration_parity():
     checks = [c for c in table.constraints if isinstance(c, CheckConstraint)]
     assert len(checks) == body.count(" CHECK (") == 16
     for check in checks:
-        assert f"CONSTRAINT {check.name} CHECK ({check.sqltext})" in body.replace(
+        historical = str(check.sqltext).replace(
+            "^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$", "^[A-Za-z0-9_-]{1,128}$"
+        )
+        assert f"CONSTRAINT {check.name} CHECK ({historical})" in body.replace(
             "( ", "("
         ).replace(" )", ")")
     unique = [c for c in table.constraints if isinstance(c, UniqueConstraint)]
