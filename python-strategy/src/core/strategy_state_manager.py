@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import ContextManager, Callable, Optional
 
 from sqlalchemy.orm import Session
+from sqlalchemy import insert
 
 from src.core.models import StrategyStatus
 from src.core.orm_models import StrategyState, StrategyStateTransition
@@ -48,6 +49,11 @@ class StaleStrategyStateVersion(RuntimeError):
 class StrategyStateEvidenceError(RuntimeError):
     def __init__(self) -> None:
         super().__init__("STRATEGY_STATE_EVIDENCE_INVALID")
+
+
+class StrategyStateTransactionValidationError(ValueError):
+    def __init__(self) -> None:
+        super().__init__("STRATEGY_STATE_TRANSACTION_INVALID")
 
 
 @dataclass(frozen=True, slots=True)
@@ -308,6 +314,48 @@ class StrategyStateManager:
                 raise
         self._after_committed_transition(result)
 
+    def transition_in_transaction(
+        self,
+        session: Session,
+        strategy_id: str,
+        to_status: StrategyStatus,
+        *,
+        actor: str,
+        reason: Optional[str],
+        changed_at: datetime,
+        force: bool = False,
+        expected_version: int | None = None,
+    ) -> StrategyStateTransitionResult:
+        """Write in the caller's active PG transaction, not proof of commit."""
+        if (
+            type(to_status) is not StrategyStatus
+            or type(force) is not bool
+            or type(changed_at) is not datetime
+            or changed_at.tzinfo is not UTC
+            or (
+                expected_version is not None
+                and (
+                    type(expected_version) is not int
+                    or not 0 <= expected_version <= 2**31 - 1
+                )
+            )
+            or not isinstance(session, Session)
+            or not session.is_active
+            or not session.in_transaction()
+            or session.get_bind().dialect.name != "postgresql"
+        ):
+            raise StrategyStateTransactionValidationError()
+        return self._write_transition(
+            session,
+            strategy_id,
+            to_status,
+            actor=actor,
+            reason=reason,
+            changed_at=changed_at,
+            force=force,
+            expected_version=expected_version,
+        )
+
     def _write_transition(
         self,
         db: Session,
@@ -393,8 +441,8 @@ class StrategyStateManager:
                     f"{strategy_id} expected version {current_version}"
                 )
 
-            db.add(
-                StrategyStateTransition(
+            db.execute(
+                insert(StrategyStateTransition).values(
                     strategy_id=strategy_id,
                     from_status=from_status.value,
                     to_status=to_status.value,
@@ -403,7 +451,6 @@ class StrategyStateManager:
                     actor=actor,
                 )
             )
-            db.flush()
         return StrategyStateTransitionResult(
             strategy_id,
             from_status,
