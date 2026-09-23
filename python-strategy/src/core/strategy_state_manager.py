@@ -7,6 +7,7 @@ import logging
 import threading
 import time
 from datetime import UTC, datetime
+from dataclasses import dataclass
 from typing import ContextManager, Callable, Optional
 
 from sqlalchemy.orm import Session
@@ -44,6 +45,20 @@ class StaleStrategyStateVersion(RuntimeError):
     """Raised when optimistic locking detects a concurrent state update."""
 
 
+class StrategyStateEvidenceError(RuntimeError):
+    def __init__(self) -> None:
+        super().__init__("STRATEGY_STATE_EVIDENCE_INVALID")
+
+
+@dataclass(frozen=True, slots=True)
+class StrategyStateTransitionResult:
+    strategy_id: str
+    from_status: StrategyStatus
+    to_status: StrategyStatus
+    version: int
+    changed_at: datetime
+
+
 class StrategyStateManager:
     """Manage strategy lifecycle state with a local O(1) status cache."""
 
@@ -67,12 +82,10 @@ class StrategyStateManager:
 
         with self._lock:
             self._cache = {
-                state.strategy_id: StrategyStatus(state.status)
-                for state in states
+                state.strategy_id: StrategyStatus(state.status) for state in states
             }
             self._cache_versions = {
-                state.strategy_id: int(state.version or 0)
-                for state in states
+                state.strategy_id: int(state.version or 0) for state in states
             }
 
     def get_status(self, strategy_id: str) -> Optional[StrategyStatus]:
@@ -178,11 +191,7 @@ class StrategyStateManager:
 
     def _refresh_cached_state_from_db(self, strategy_id: str) -> None:
         with self._db_session_factory() as db:
-            state = (
-                db.query(StrategyState)
-                .filter_by(strategy_id=strategy_id)
-                .first()
-            )
+            state = db.query(StrategyState).filter_by(strategy_id=strategy_id).first()
         if state is None:
             logger.warning(
                 "Ignoring strategy state message for unknown strategy: %s",
@@ -282,21 +291,68 @@ class StrategyStateManager:
     ) -> None:
         now = datetime.now(UTC)
         with self._db_session_factory() as db:
-            state = db.query(StrategyState).filter_by(strategy_id=strategy_id).first()
+            try:
+                result = self._write_transition(
+                    db,
+                    strategy_id,
+                    to_status,
+                    actor=actor,
+                    reason=reason,
+                    changed_at=now,
+                    force=force,
+                    expected_version=expected_version,
+                )
+                db.commit()
+            except StaleStrategyStateVersion:
+                db.rollback()
+                raise
+        self._after_committed_transition(result)
+
+    def _write_transition(
+        self,
+        db: Session,
+        strategy_id: str,
+        to_status: StrategyStatus,
+        *,
+        actor: str,
+        reason: Optional[str],
+        changed_at: datetime,
+        force: bool = False,
+        expected_version: int | None = None,
+    ) -> StrategyStateTransitionResult:
+        """Write transaction-local evidence; no commit/cache/publication ownership."""
+        now = changed_at
+        with db.no_autoflush:
+            state = (
+                db.query(StrategyState.status, StrategyState.version)
+                .filter(StrategyState.strategy_id == strategy_id)
+                .with_for_update()
+                .first()
+            )
             if state is None:
                 raise KeyError(f"strategy state not found: {strategy_id}")
 
-            from_status = StrategyStatus(state.status)
-            if from_status == StrategyStatus.ERROR and to_status == StrategyStatus.ACTIVE and not force:
+            if (
+                type(state.status) is not str
+                or type(state.version) is not int
+                or not 0 <= state.version < 2**31 - 1
+            ):
+                raise StrategyStateEvidenceError()
+            try:
+                from_status = StrategyStatus(state.status)
+            except ValueError:
+                raise StrategyStateEvidenceError() from None
+            if (
+                from_status == StrategyStatus.ERROR
+                and to_status == StrategyStatus.ACTIVE
+                and not force
+            ):
                 raise InvalidStrategyStateTransition(
                     f"{strategy_id} is in ERROR and requires force=True to resume"
                 )
 
-            current_version = int(state.version or 0)
-            if (
-                expected_version is not None
-                and current_version != expected_version
-            ):
+            current_version = state.version
+            if expected_version is not None and current_version != expected_version:
                 raise StaleStrategyStateVersion(
                     f"{strategy_id} expected version {expected_version}, "
                     f"found {current_version}"
@@ -333,7 +389,6 @@ class StrategyStateManager:
                 )
             )
             if updated != 1:
-                db.rollback()
                 raise StaleStrategyStateVersion(
                     f"{strategy_id} expected version {current_version}"
                 )
@@ -348,12 +403,27 @@ class StrategyStateManager:
                     actor=actor,
                 )
             )
-            db.commit()
+            db.flush()
+        return StrategyStateTransitionResult(
+            strategy_id,
+            from_status,
+            to_status,
+            current_version + 1,
+            now,
+        )
 
+    def _after_committed_transition(
+        self, result: StrategyStateTransitionResult
+    ) -> None:
+        strategy_id, to_status, now = (
+            result.strategy_id,
+            result.to_status,
+            result.changed_at,
+        )
         self._apply_cached_state(
             strategy_id,
             to_status,
-            current_version + 1,
+            result.version,
         )
         try:
             self._publish_state_change(
