@@ -266,8 +266,26 @@ def test_dependency_boundary():
         )
         for name in imports
     )
+    initial = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "prepare_initial_seed"
+    )
+    pins = [
+        node
+        for node in ast.walk(initial)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "pin_confirmed"
+    ]
+    assert (
+        len(pins) == 1
+        and ast.unparse(pins[0]) == "self._seeds.pin_confirmed(candidate)"
+    )
+    allowed_pin = pins[0].func
     assert not any(
         isinstance(node, ast.Attribute)
+        and node is not allowed_pin
         and node.attr
         in ("pin", "pin_confirmed", "hydrate_candles", "warm_up", "publish")
         for node in ast.walk(tree)

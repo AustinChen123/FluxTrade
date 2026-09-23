@@ -1,9 +1,8 @@
 """Read existing bootstrap/terminal evidence into a detached executable binding.
 
-No pin, hydration, publication, provider, clock, retry, or modeled fallback. The
-caller owns authoritative boundary selection and the later exposure lifecycle.
-History evidence is only a trusted-reader contract: future ABSENT-to-pin use
-requires an upper-layer activation/application admission fence, not DTO typing.
+No hydration, publication, clock, retry, or modeled fallback. Initial seed pin
+requires a trusted history reader and an upper-layer admission fence serializing
+ABSENT through pin; DTO typing is not authority. This seam is not activation.
 """
 
 from collections.abc import Callable
@@ -19,10 +18,17 @@ from src.core.market_data.profiles.bootstrap_hydration import (
     BootstrapHydrationPlan,
     BoundBootstrapHydration,
 )
-from src.core.market_data.profiles.bootstrap_seed import BootstrapKey
+from src.core.market_data.profiles.bootstrap_seed import (
+    BootstrapKey,
+    BootstrapSeed,
+    BootstrapDisposition,
+    classify_bootstrap,
+)
 from src.core.market_data.profiles.bootstrap_seed_store import (
     BootstrapSeedStore,
     BootstrapSeedRecord,
+    BootstrapSeedPinResult,
+    BootstrapSeedPinStatus,
 )
 from src.core.market_data.profiles.decision_application_store import DecisionBatchRecord
 from src.core.market_data.profiles.decision_identity import (
@@ -98,6 +104,93 @@ class BootstrapHydrationReader:
             identity_resolver,
         )
         self._max_seed, self._max_recorded = max_seed_candles, max_recorded_candles
+
+    def prepare_initial_seed(
+        self,
+        strategy: BaseStrategy,
+        boundary_bar_start_ms: int,
+        *,
+        history_reader: Callable[[BootstrapKey, int], BootstrapHistoryEvidence],
+        factory: Callable[[BootstrapKey], BootstrapSeed],
+    ) -> BootstrapSeedRecord:
+        """Caller must hold the authority/admission fence across this entire call."""
+        try:
+            _integer(boundary_bar_start_ms)
+            if not isinstance(strategy, BaseStrategy):
+                raise ValueError
+        except ValueError:
+            raise BootstrapHydrationReaderError() from None
+        identity = self._identity(strategy)
+        if type(identity) is not MarketDataDecisionCompositionIdentity:
+            raise BootstrapHydrationReaderError()
+        requirements = strategy.requirements
+        key = BootstrapKey(
+            self._environment,
+            identity.execution_scope_id,
+            strategy.strategy_id,
+            identity.strategy_version,
+            identity.config_hash,
+            strategy.product_id,
+            requirements.timeframe,
+        )
+        if (
+            not requirements.profile_requirements
+            or requirements.lookback_window > self._max_seed
+            or boundary_bar_start_ms % timeframe_to_ms(key.timeframe)
+        ):
+            raise BootstrapHydrationReaderError()
+        record = self._seeds.get(key)
+        if record is not None:
+            if (
+                type(record) is not BootstrapSeedRecord
+                or record.value.key != key
+                or record.value.requirements != requirements.profile_requirements
+                or record.value.lookback != requirements.lookback_window
+            ):
+                raise BootstrapHydrationReaderError()
+            return record
+        if not callable(history_reader) or not callable(factory):
+            raise BootstrapHydrationReaderError()
+        proof = history_reader(key, boundary_bar_start_ms)
+        if (
+            type(proof) is not BootstrapHistoryEvidence
+            or proof.key != key
+            or proof.boundary_bar_start_ms != boundary_bar_start_ms
+            or proof.state != "ABSENT"
+        ):
+            raise BootstrapHydrationReaderError()
+        candidate = factory(key)
+        if (
+            type(candidate) is not BootstrapSeed
+            or candidate.key != key
+            or candidate.cutover_ms != boundary_bar_start_ms
+            or candidate.requirements != requirements.profile_requirements
+            or candidate.lookback != requirements.lookback_window
+        ):
+            raise BootstrapHydrationReaderError()
+        if (
+            classify_bootstrap(
+                requirements.profile_requirements,
+                proposed=candidate,
+                stored=None,
+                history_known_absent=True,
+                completed_recorded_through_ms=None,
+                recorded=(),
+                max_seed_candles=self._max_seed,
+                max_recorded_candles=self._max_recorded,
+            )
+            is not BootstrapDisposition.BOOTSTRAP
+        ):
+            raise BootstrapHydrationReaderError()
+        result = self._seeds.pin_confirmed(candidate)
+        if (
+            type(result) is not BootstrapSeedPinResult
+            or result.status is not BootstrapSeedPinStatus.CONFIRMED
+            or type(result.record) is not BootstrapSeedRecord
+            or result.record.value != candidate
+        ):
+            raise BootstrapHydrationReaderError()
+        return result.record
 
     def prepare(
         self,
