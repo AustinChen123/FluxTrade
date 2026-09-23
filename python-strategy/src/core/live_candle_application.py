@@ -21,6 +21,7 @@ from src.core.product_registry import validate_product_id
 from src.core.market_data.profiles.decision_application import MarketDataDecisionBatch
 from src.core.market_data.profiles.decision_application_store import (
     DecisionBatchIntegrityError,
+    DecisionBatchRecord,
     append_decision_batch,
     read_decision_batch,
 )
@@ -105,7 +106,7 @@ class LiveCandleApplicationService:
         applied, batch = self._applied_state(candle, db)
         if not applied:
             raise RuntimeError("cannot read decision evidence for an unapplied candle")
-        return batch
+        return batch.batch if batch is not None else None
 
     def read_applied_candle(
         self,
@@ -114,7 +115,7 @@ class LiveCandleApplicationService:
         timeframe: str,
         bar_start_ms: int,
         db: Session,
-    ) -> tuple[Candlestick, MarketDataDecisionBatch]:
+    ) -> tuple[Candlestick, DecisionBatchRecord]:
         """Read one canonical candle and complete contract evidence in caller session."""
         if (
             self._environment_identity() != "live"
@@ -158,7 +159,7 @@ class LiveCandleApplicationService:
         self,
         candle: Candlestick,
         db: Session,
-    ) -> tuple[bool, MarketDataDecisionBatch | None]:
+    ) -> tuple[bool, DecisionBatchRecord | None]:
         if self._environment_identity() != "live":
             return False, None
 
@@ -198,7 +199,7 @@ class LiveCandleApplicationService:
             )
             if record is None:
                 raise DecisionBatchIntegrityError()
-            batch = record.batch
+            batch = record
         return True, batch
 
     def assert_newer(

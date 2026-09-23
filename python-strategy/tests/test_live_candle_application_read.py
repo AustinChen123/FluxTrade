@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from datetime import datetime, timezone
 from unittest.mock import MagicMock
 from typing import Any
 from decimal import Decimal
@@ -22,7 +23,11 @@ def setup(monkeypatch):
         else state["receipt"]
     )
     terminal = batch()
-    read = MagicMock(return_value=SimpleNamespace(batch=terminal))
+    read = MagicMock(
+        return_value=owner.DecisionBatchRecord(
+            terminal, datetime(2026, 1, 1, tzinfo=timezone.utc), True, ()
+        )
+    )
     monkeypatch.setattr(owner, "read_decision_batch", read)
     factory = MagicMock(side_effect=AssertionError("no new session"))
     service = owner.LiveCandleApplicationService(
@@ -40,7 +45,9 @@ def setup(monkeypatch):
 def test_reads_exact_canonical_candle_and_reuses_receipt_classifier(monkeypatch):
     service, args, candle, _, read, terminal = setup(monkeypatch)
     result, evidence = service.read_applied_candle(**args)
-    assert result == candle and result is not candle and evidence is terminal
+    assert result == candle and result is not candle
+    assert evidence is read.return_value and evidence.batch is terminal
+    assert evidence.verified_inputs == ()
     db = args["db"]
     assert db.get.call_args_list[0].args == (
         owner.ORMCandlestick,

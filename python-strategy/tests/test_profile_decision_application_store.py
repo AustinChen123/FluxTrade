@@ -64,7 +64,9 @@ def test_append_readback_idempotent_and_lifecycle(empty):
     requested = batch() if empty else value()
     assert read(session) is None
     result = owner.append_decision_batch(session, requested)
-    assert result == owner.DecisionBatchRecord(requested, NOW, False)
+    assert result == owner.DecisionBatchRecord(
+        requested, NOW, False, () if empty else (sample(),)
+    )
     assert read(session) == replace(result, already_present=True)
     before = len(calls)
     assert owner.append_decision_batch(session, requested).already_present
@@ -90,6 +92,61 @@ def test_valid_different_batch_conflict_not_corruption():
     owner.append_decision_batch(session, value())
     with pytest.raises(owner.DecisionBatchConflict, match="^DECISION_BATCH_CONFLICT$"):
         owner.append_decision_batch(session, batch())
+
+
+@pytest.mark.parametrize("referenced", [False, True])
+def test_skipped_verified_input_and_no_orphan_query(referenced):
+    session, _, calls = harness()
+    outcome = replace(
+        value().outcomes[0],
+        disposition="SKIPPED",
+        reason="INPUT_STORE_FAILED",
+        input_id=sample().input_id if referenced else None,
+        input_digest=sample().input_digest if referenced else None,
+    )
+    requested = batch((outcome.key,), (outcome,))
+    result = owner.append_decision_batch(session, requested)
+    assert result.verified_inputs == ((sample(),) if referenced else (None,))
+    assert (
+        any("FROM market_data_decision_input" in sql for sql, _, _ in calls)
+        is referenced
+    )
+    recovered = read(session)
+    assert recovered is not None and recovered.verified_inputs == result.verified_inputs
+
+
+def test_record_exact_order_length_and_reference_binding():
+    first = sample()
+    second_key = replace(first.key, strategy_id="second")
+    second = replace(first, key=second_key)
+    second_outcome = replace(
+        value().outcomes[0],
+        key=second_key,
+        input_id=second.input_id,
+        input_digest=second.input_digest,
+    )
+    requested = batch((first.key, second_key), (value().outcomes[0], second_outcome))
+    by_id = {first.input_id: first, second.input_id: second}
+    ordered = tuple(
+        by_id[cast(str, outcome.input_id)] for outcome in requested.outcomes
+    )
+    result = owner.DecisionBatchRecord(requested, NOW, True, ordered)
+    assert result.verified_inputs == ordered
+    session = MagicMock()
+    responses = []
+    for item in ordered:
+        response = MagicMock()
+        response.mappings.return_value.all.return_value = [input_row(item)]
+        responses.append(response)
+    session.execute.side_effect = responses
+    assert owner._inputs(session, requested) == ordered
+    assert session.execute.call_count == 2
+    for invalid in ((), ordered[:1], ordered[::-1], (None, None), list(ordered)):
+        with pytest.raises(owner.DecisionBatchIntegrityError):
+            owner.DecisionBatchRecord(requested, NOW, True, cast(Any, invalid))
+    wrong = replace(first, requirements=(), context=replace(first.context, profiles=()))
+    with pytest.raises(owner.DecisionBatchIntegrityError):
+        owner.DecisionBatchRecord(value(), NOW, True, (wrong,))
 
 
 def test_conflict_loser_reads_complete_winner_without_outcome_writes():

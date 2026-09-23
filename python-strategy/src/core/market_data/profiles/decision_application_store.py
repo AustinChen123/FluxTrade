@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from .decision_application import MarketDataDecisionBatch, _product
 from .decision_input_store import _hydrate
+from .decision_input import MarketDataDecisionInput
 from .orm import MarketDataDecisionBatch as BatchRow
 from .orm import MarketDataDecisionOutcome as OutcomeRow
 from .orm import MarketDataDecisionInput as InputRow
@@ -40,6 +41,7 @@ class DecisionBatchRecord:
     batch: MarketDataDecisionBatch
     recorded_at: datetime
     already_present: bool
+    verified_inputs: tuple[MarketDataDecisionInput | None, ...]
 
     def __post_init__(self) -> None:
         if (
@@ -48,8 +50,23 @@ class DecisionBatchRecord:
             or type(self.recorded_at) is not datetime
             or self.recorded_at.tzinfo is not timezone.utc
             or self.recorded_at.microsecond % 1000
+            or type(self.verified_inputs) is not tuple
+            or len(self.verified_inputs) != len(self.batch.outcomes)
         ):
             raise DecisionBatchIntegrityError()
+        for outcome, value in zip(
+            self.batch.outcomes, self.verified_inputs, strict=True
+        ):
+            if outcome.input_id is None:
+                if value is not None:
+                    raise DecisionBatchIntegrityError()
+            elif (
+                type(value) is not MarketDataDecisionInput
+                or value.key != outcome.key
+                or value.input_id != outcome.input_id
+                or value.input_digest != outcome.input_digest
+            ):
+                raise DecisionBatchIntegrityError()
 
 
 def _guard(session: Session, identity: dict[str, Any]) -> None:
@@ -92,9 +109,13 @@ def _outcomes(batch: MarketDataDecisionBatch) -> list[dict[str, Any]]:
     return rows
 
 
-def _inputs(session: Session, batch: MarketDataDecisionBatch) -> None:
+def _inputs(
+    session: Session, batch: MarketDataDecisionBatch
+) -> tuple[MarketDataDecisionInput | None, ...]:
+    verified: list[MarketDataDecisionInput | None] = []
     for outcome in batch.outcomes:
         if outcome.input_id is None:
+            verified.append(None)
             continue
         rows = (
             session.execute(
@@ -118,8 +139,14 @@ def _inputs(session: Session, batch: MarketDataDecisionBatch) -> None:
         if len(rows) != 1:
             raise DecisionBatchIntegrityError()
         record = _hydrate(rows[0], outcome.key, True)
-        if record.value.input_digest != outcome.input_digest:
+        if (
+            record.value.key != outcome.key
+            or record.value.input_id != outcome.input_id
+            or record.value.input_digest != outcome.input_digest
+        ):
             raise DecisionBatchIntegrityError()
+        verified.append(record.value)
+    return tuple(verified)
 
 
 def read_decision_batch(
@@ -189,8 +216,8 @@ def read_decision_batch(
                 for name, value in expected_row.items()
             ):
                 raise ValueError
-        _inputs(session, batch)
-        return DecisionBatchRecord(batch, row["recorded_at"], True)
+        verified = _inputs(session, batch)
+        return DecisionBatchRecord(batch, row["recorded_at"], True, verified)
     except (ValueError, TypeError, KeyError, OverflowError):
         raise DecisionBatchIntegrityError() from None
 
@@ -227,4 +254,6 @@ def append_decision_batch(
         raise DecisionBatchIntegrityError()
     if record.batch != batch:
         raise DecisionBatchConflict()
-    return DecisionBatchRecord(record.batch, record.recorded_at, inserted is None)
+    return DecisionBatchRecord(
+        record.batch, record.recorded_at, inserted is None, record.verified_inputs
+    )

@@ -2159,12 +2159,14 @@ def test_decision_batch_transaction_helper_pg(profile_repository_pg: Engine, dam
         assert owner.read_decision_batch(session, **identity) is None
         fresh = owner.append_decision_batch(session, value)
         assert not fresh.already_present and fresh.batch == value
+        assert fresh.verified_inputs == (sample(),)
         assert owner.append_decision_batch(session, value).already_present
         with pytest.raises(owner.DecisionBatchConflict):
             owner.append_decision_batch(session, batch())
     with Session(engine) as session, session.begin():
         restored = owner.read_decision_batch(session, **identity)
         assert restored is not None and restored.batch == value and restored.recorded_at == fresh.recorded_at
+        assert restored.verified_inputs == fresh.verified_inputs
 
 
 def test_decision_batch_empty_and_rollback_pg(profile_repository_pg: Engine) -> None:
