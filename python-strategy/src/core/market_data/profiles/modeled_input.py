@@ -2,13 +2,15 @@
 
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Protocol
 
 from src.core.data_provider import timeframe_to_ms
 from src.core.models import Candlestick
 from src.core.strategy_context import StrategyContext
-from src.strategies.base import BaseStrategy
+from src.strategies.base import BaseStrategy, StrategyRequirements
+
+from .bootstrap_seed import BootstrapKey, BootstrapCandle, BootstrapSeed, _requirements
 
 from .context_enrichment import (
     ProfileContextEnrichmentError,
@@ -160,6 +162,89 @@ class ModeledProfileInput:
         except (ValueError, ProfileContextEnrichmentError):
             raise ModeledProfileInputError() from None
         return result
+
+
+def build_modeled_bootstrap_seed(
+    modeled_input: ModeledProfileInput,
+    key: BootstrapKey,
+    requirements: StrategyRequirements,
+    candles: tuple[Candlestick, ...],
+    *,
+    cutover_ms: int,
+    max_seed_candles: int,
+) -> BootstrapSeed:
+    """Preflight the entire fixed candle batch, then resolve frozen modeled evidence."""
+    try:
+        _integer(cutover_ms)
+        _integer(max_seed_candles, 1)
+        if (
+            type(modeled_input) is not ModeledProfileInput
+            or type(key) is not BootstrapKey
+            or type(requirements) is not StrategyRequirements
+            or type(candles) is not tuple
+        ):
+            raise ValueError
+        _integer(requirements.lookback_window)
+        wanted = _requirements(requirements.profile_requirements)
+        if (
+            not wanted
+            or key.product_id != requirements.product_id
+            or key.timeframe != requirements.timeframe
+            or len(candles) != requirements.lookback_window
+            or len(candles) > max_seed_candles
+        ):
+            raise ValueError
+        duration = timeframe_to_ms(key.timeframe)
+        start = cutover_ms - len(candles) * duration
+        if start < 0 or cutover_ms % duration:
+            raise ValueError
+        prepared = []
+        for index, candle in enumerate(candles):
+            if (
+                type(candle) is not Candlestick
+                or type(candle.product_id) is not str
+                or type(candle.timeframe) is not str
+                or candle.product_id != key.product_id
+                or candle.timeframe != key.timeframe
+            ):
+                raise ValueError
+            _integer(candle.timestamp)
+            if candle.timestamp != start + index * duration:
+                raise ValueError
+            # Empty context is a temporary validation carrier, never returned or pinned.
+            prepared.append(
+                BootstrapCandle(
+                    candle.timestamp,
+                    candle.open,
+                    candle.high,
+                    candle.low,
+                    candle.close,
+                    candle.volume,
+                    StrategyMarketDataContext(candle.timestamp + duration, ()),
+                )
+            )
+    except (ValueError, TypeError, OverflowError):
+        raise ModeledProfileInputError() from None
+    resolved = tuple(
+        replace(
+            candle,
+            context=modeled_input.resolve(
+                wanted, decision_time_ms=candle.context.decision_time_ms
+            ),
+        )
+        for candle in prepared
+    )
+    return BootstrapSeed(
+        key,
+        wanted,
+        cutover_ms,
+        requirements.lookback_window,
+        modeled_input.availability_policy_id,
+        modeled_input.availability_policy_digest,
+        modeled_input.dataset_digest,
+        resolved,
+        max_seed_candles,
+    )
 
 
 def modeled_profile_warmup_scope_loader(
