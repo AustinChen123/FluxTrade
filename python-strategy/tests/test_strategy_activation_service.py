@@ -5,8 +5,21 @@ from collections.abc import Callable
 from contextlib import nullcontext
 from decimal import Decimal
 from unittest.mock import MagicMock
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
+from typing import Any, cast
 
 import pytest
+from sqlalchemy.orm import Session
+from src.core import strategy_activation_service as consumption
+from src.core.strategy_activation_intent import ProfileActivationCommand as Command
+from src.core.strategy_activation_request_store import (
+    ProfileActivationRequestRecord as Record,
+    ProfileActivationRequestStatus as RequestStatus,
+    ProfileActivationRequestConflict as Conflict,
+)
+from src.core.strategy_state_manager import StrategyStateManager, LockedStrategyState
+from test_profile_activation_request import request
 
 from src.core.models import Candlestick, Signal, StrategyStatus
 from src.core.portfolio_runtime import (
@@ -18,6 +31,193 @@ from src.core.strategy_activation_service import StrategyActivationService
 from src.core.strategy_context import StrategyContext
 from src.core.strategy_state_manager import StaleStrategyStateVersion
 from src.strategies.base import BaseStrategy, StrategyRequirements
+
+
+def consume_setup(monkeypatch, status=StrategyStatus.READY, command=Command.START):
+    value = replace(request(), command=command)
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    session = MagicMock(spec=Session)
+    session.is_active = True
+    session.in_transaction.return_value = True
+    session.get_bind.return_value.dialect.name = "postgresql"
+    factory, redis = MagicMock(), MagicMock()
+    manager = StrategyStateManager(factory, redis)
+    calls = MagicMock()
+    calls.state.return_value = LockedStrategyState(
+        value.intent.key.strategy_id, status, 0
+    )
+    calls.request.return_value = Record(value, RequestStatus.PENDING, now)
+    calls.terminal.return_value = Record(
+        value, RequestStatus.CONSUMED, now, now, "ACTIVATION_COMMITTED"
+    )
+    monkeypatch.setattr(manager, "lock_state_in_transaction", calls.state)
+    monkeypatch.setattr(manager, "transition_in_transaction", calls.transition)
+    monkeypatch.setattr(consumption, "lock_profile_activation_request", calls.request)
+    monkeypatch.setattr(
+        consumption, "terminalize_profile_activation_request", calls.terminal
+    )
+    return value, now, session, manager, calls, factory, redis
+
+
+@pytest.mark.parametrize(
+    "status,command",
+    [
+        (StrategyStatus.READY, Command.START),
+        (StrategyStatus.STOPPED, Command.RESUME),
+        (StrategyStatus.ERROR, Command.FORCE_RECOVER),
+    ],
+)
+def test_consume_order_arguments_and_transaction_local_result(
+    monkeypatch, status, command
+):
+    value, now, session, manager, calls, factory, redis = consume_setup(
+        monkeypatch, status, command
+    )
+    result = consumption.consume_profile_activation_request(
+        session, manager, value, terminal_at=now
+    )
+    assert result.disposition is consumption.ProfileActivationConsumption.CONSUMED_NOW
+    assert result.record is calls.terminal.return_value
+    assert [call[0] for call in calls.mock_calls] == [
+        "state",
+        "request",
+        "transition",
+        "terminal",
+    ]
+    calls.state.assert_called_once_with(session, value.intent.key.strategy_id)
+    calls.request.assert_called_once_with(session, value)
+    calls.transition.assert_called_once_with(
+        session,
+        value.intent.key.strategy_id,
+        StrategyStatus.ACTIVE,
+        actor=value.actor,
+        reason="ACTIVATION_COMMITTED",
+        changed_at=now,
+        force=command is Command.FORCE_RECOVER,
+        expected_version=0,
+    )
+    calls.terminal.assert_called_once_with(
+        session,
+        value,
+        status=RequestStatus.CONSUMED,
+        terminal_at=now,
+        terminal_reason="ACTIVATION_COMMITTED",
+    )
+    for name in ("begin", "commit", "rollback", "execute"):
+        getattr(session, name).assert_not_called()
+    assert not factory.mock_calls and not redis.mock_calls
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["stale", "illegal", "cancelled", "stale_terminal", "reason", "time", "early"],
+)
+def test_consume_conflicts_before_mutation(monkeypatch, case):
+    value, now, session, manager, calls, _, _ = consume_setup(monkeypatch)
+    error = Conflict
+    if case == "stale":
+        calls.state.return_value = replace(calls.state.return_value, version=1)
+        error = StaleStrategyStateVersion
+    elif case == "illegal":
+        calls.state.return_value = replace(
+            calls.state.return_value, status=StrategyStatus.ACTIVE
+        )
+    elif case == "early":
+        now -= timedelta(milliseconds=1)
+        error = consumption.ProfileActivationRequestValidationError
+    else:
+        status = {
+            "cancelled": RequestStatus.CANCELLED,
+            "stale_terminal": RequestStatus.STALE,
+        }.get(case, RequestStatus.CONSUMED)
+        calls.request.return_value = Record(
+            value,
+            status,
+            now,
+            now,
+            "OTHER" if case == "reason" else "ACTIVATION_COMMITTED",
+        )
+        if case == "time":
+            now += timedelta(milliseconds=1)
+    with pytest.raises(error):
+        consumption.consume_profile_activation_request(
+            session, cast(Any, manager), cast(Any, value), terminal_at=cast(Any, now)
+        )
+    calls.transition.assert_not_called()
+    calls.terminal.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "status,version",
+    [
+        (StrategyStatus.ACTIVE, 1),
+        (StrategyStatus.STOPPED, 2),
+        (StrategyStatus.ERROR, 3),
+    ],
+)
+def test_consumed_reentry_never_restarts(monkeypatch, status, version):
+    value, now, session, manager, calls, _, _ = consume_setup(monkeypatch, status)
+    calls.request.return_value = calls.terminal.return_value
+    calls.state.return_value = replace(calls.state.return_value, version=version)
+    result = consumption.consume_profile_activation_request(
+        session, manager, value, terminal_at=now
+    )
+    assert (
+        result.disposition is consumption.ProfileActivationConsumption.ALREADY_CONSUMED
+    )
+    calls.transition.assert_not_called()
+    calls.terminal.assert_not_called()
+
+
+@pytest.mark.parametrize("phase", ["state", "request", "transition", "terminal"])
+@pytest.mark.parametrize("error", [RuntimeError("failure"), BaseException("failure")])
+def test_consume_exception_identity(monkeypatch, phase, error):
+    value, now, session, manager, calls, factory, redis = consume_setup(monkeypatch)
+    getattr(calls, phase).side_effect = error
+    with pytest.raises(type(error)) as caught:
+        consumption.consume_profile_activation_request(
+            session, manager, value, terminal_at=now
+        )
+    assert caught.value is error
+    assert not factory.mock_calls and not redis.mock_calls
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "request",
+        "manager",
+        "clock",
+        "naive",
+        "precision",
+        "inactive",
+        "transaction",
+        "dialect",
+    ],
+)
+def test_consume_invalid_arguments_before_locks(monkeypatch, bad):
+    value, now, session, manager, calls, _, _ = consume_setup(monkeypatch)
+    if bad == "request":
+        value = None
+    elif bad == "manager":
+        manager = None
+    elif bad == "clock":
+        now = None
+    elif bad == "naive":
+        now = now.replace(tzinfo=None)
+    elif bad == "precision":
+        now = now.replace(microsecond=1)
+    elif bad == "inactive":
+        session.is_active = False
+    elif bad == "transaction":
+        session.in_transaction.return_value = False
+    else:
+        session.get_bind.return_value.dialect.name = "sqlite"
+    with pytest.raises(consumption.ProfileActivationRequestValidationError):
+        consumption.consume_profile_activation_request(
+            session, cast(Any, manager), cast(Any, value), terminal_at=cast(Any, now)
+        )
+    assert not calls.mock_calls
 
 
 class _Strategy(BaseStrategy):

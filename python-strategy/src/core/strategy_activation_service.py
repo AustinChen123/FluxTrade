@@ -5,7 +5,9 @@ import logging
 import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime
+from enum import Enum
 
 from sqlalchemy.orm import Session
 
@@ -15,6 +17,16 @@ from src.core.strategy_activation_intent import (
     ProfileActivationAdmission as ProfileActivationAdmission,
     ProfileActivationIntent as ProfileActivationIntent,
     classify_profile_activation_intent as classify_profile_activation_intent,
+    ProfileActivationRequest,
+    ProfileActivationCommand,
+)
+from src.core.strategy_activation_request_store import (
+    ProfileActivationRequestRecord,
+    ProfileActivationRequestStatus,
+    ProfileActivationRequestValidationError,
+    ProfileActivationRequestConflict,
+    lock_profile_activation_request,
+    terminalize_profile_activation_request,
 )
 from src.core.orm_models import StrategyState
 from src.core.portfolio_runtime import (
@@ -25,6 +37,8 @@ from src.core.portfolio_runtime import (
 from src.core.strategy_hydration_service import StrategyHydrationService
 from src.core.strategy_state_manager import (
     StaleStrategyStateVersion,
+    StrategyStateManager,
+    available_strategy_commands,
 )
 from src.strategies.base import BaseStrategy
 
@@ -35,6 +49,88 @@ ProductIdResolver = Callable[[dict], str]
 ReadinessValidator = Callable[[ArtifactClass], None]
 PortfolioBuilder = Callable[..., PortfolioDefinition]
 ContextCapabilityValidator = Callable[[tuple[BaseStrategy, ...]], None]
+
+
+class ProfileActivationConsumption(Enum):
+    CONSUMED_NOW = "CONSUMED_NOW"
+    ALREADY_CONSUMED = "ALREADY_CONSUMED"
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileActivationConsumptionResult:
+    disposition: ProfileActivationConsumption
+    record: ProfileActivationRequestRecord
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.disposition) is not ProfileActivationConsumption
+            or type(self.record) is not ProfileActivationRequestRecord
+            or self.record.status is not ProfileActivationRequestStatus.CONSUMED
+        ):
+            raise ProfileActivationRequestValidationError()
+
+
+def consume_profile_activation_request(
+    session: Session,
+    state_manager: StrategyStateManager,
+    expected: ProfileActivationRequest,
+    *,
+    terminal_at: datetime,
+) -> ProfileActivationConsumptionResult:
+    """Consume in the caller transaction; no durable/runtime activation claim."""
+    if (
+        type(expected) is not ProfileActivationRequest
+        or type(state_manager) is not StrategyStateManager
+        or type(terminal_at) is not datetime
+        or terminal_at.tzinfo is not UTC
+        or terminal_at.microsecond % 1000 != 0
+        or not isinstance(session, Session)
+        or not session.is_active
+        or not session.in_transaction()
+        or session.get_bind().dialect.name != "postgresql"
+    ):
+        raise ProfileActivationRequestValidationError()
+    reason = "ACTIVATION_COMMITTED"
+    state = state_manager.lock_state_in_transaction(
+        session, expected.intent.key.strategy_id
+    )
+    record = lock_profile_activation_request(session, expected)
+    if record.status is not ProfileActivationRequestStatus.PENDING:
+        if (record.status, record.terminal_at, record.terminal_reason) != (
+            ProfileActivationRequestStatus.CONSUMED,
+            terminal_at,
+            reason,
+        ):
+            raise ProfileActivationRequestConflict()
+        return ProfileActivationConsumptionResult(
+            ProfileActivationConsumption.ALREADY_CONSUMED, record
+        )
+    if state.version != expected.intent.expected_state_version:
+        raise StaleStrategyStateVersion("PROFILE_ACTIVATION_STATE_STALE")
+    if expected.command.value not in available_strategy_commands(state.status):
+        raise ProfileActivationRequestConflict()
+    if terminal_at < record.requested_at:
+        raise ProfileActivationRequestValidationError()
+    state_manager.transition_in_transaction(
+        session,
+        expected.intent.key.strategy_id,
+        StrategyStatus.ACTIVE,
+        actor=expected.actor,
+        reason=reason,
+        changed_at=terminal_at,
+        force=expected.command is ProfileActivationCommand.FORCE_RECOVER,
+        expected_version=expected.intent.expected_state_version,
+    )
+    record = terminalize_profile_activation_request(
+        session,
+        expected,
+        status=ProfileActivationRequestStatus.CONSUMED,
+        terminal_at=terminal_at,
+        terminal_reason=reason,
+    )
+    return ProfileActivationConsumptionResult(
+        ProfileActivationConsumption.CONSUMED_NOW, record
+    )
 
 
 class StrategyActivationService:
