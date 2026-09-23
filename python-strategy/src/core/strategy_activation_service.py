@@ -11,7 +11,11 @@ from enum import Enum
 
 from sqlalchemy.orm import Session
 
-from src.core.models import StrategyStatus
+from src.core.models import StrategyStatus, Candlestick
+from src.core.bootstrap_hydration_reader import BootstrapHydrationReader
+from src.core.market_data.profiles.bootstrap_seed import BootstrapSeed
+from src.core.market_data.profiles.bootstrap_seed_store import BootstrapSeedRecord
+from src.core.market_data.profiles.bootstrap_hydration import BoundBootstrapHydration
 from src.core.command_router import StrategyStartDisposition
 from src.core.product_registry import to_stream_key
 from src.core.market_data.profiles.bootstrap_seed import BootstrapKey
@@ -48,6 +52,7 @@ from src.core.strategy_hydration_service import StrategyHydrationService
 from src.core.strategy_state_manager import (
     StaleStrategyStateVersion,
     StrategyStateManager,
+    StrategyStateTransitionResult,
     available_strategy_commands,
 )
 from src.strategies.base import BaseStrategy
@@ -70,12 +75,18 @@ class ProfileActivationConsumption(Enum):
 class ProfileActivationConsumptionResult:
     disposition: ProfileActivationConsumption
     record: ProfileActivationRequestRecord
+    transition: StrategyStateTransitionResult | None = None
 
     def __post_init__(self) -> None:
         if (
             type(self.disposition) is not ProfileActivationConsumption
             or type(self.record) is not ProfileActivationRequestRecord
             or self.record.status is not ProfileActivationRequestStatus.CONSUMED
+            or (
+                type(self.transition) is not StrategyStateTransitionResult
+                if self.disposition is ProfileActivationConsumption.CONSUMED_NOW
+                else self.transition is not None
+            )
         ):
             raise ProfileActivationRequestValidationError()
 
@@ -121,7 +132,7 @@ def consume_profile_activation_request(
         raise ProfileActivationRequestConflict()
     if terminal_at < record.requested_at:
         raise ProfileActivationRequestValidationError()
-    state_manager.transition_in_transaction(
+    transition = state_manager.transition_in_transaction(
         session,
         expected.intent.key.strategy_id,
         StrategyStatus.ACTIVE,
@@ -139,7 +150,7 @@ def consume_profile_activation_request(
         terminal_reason=reason,
     )
     return ProfileActivationConsumptionResult(
-        ProfileActivationConsumption.CONSUMED_NOW, record
+        ProfileActivationConsumption.CONSUMED_NOW, record, transition
     )
 
 
@@ -161,6 +172,11 @@ class StrategyActivationService:
         event_logger: logging.Logger,
         profile_request_store: ProfileActivationRequestStore | None = None,
         profile_identity_resolver: IdentityResolver | None = None,
+        bootstrap_reader: BootstrapHydrationReader | None = None,
+        state_manager: StrategyStateManager | None = None,
+        artifact_resolver: Callable[[str], ArtifactClass | None] | None = None,
+        profile_seed_factory: Callable[[BaseStrategy, BootstrapKey, int], BootstrapSeed]
+        | None = None,
     ) -> None:
         self._db_session_factory = db_session_factory
         self._transition_to_running = transition_to_running
@@ -174,6 +190,121 @@ class StrategyActivationService:
         self._logger = event_logger
         self._profile_request_store = profile_request_store
         self._profile_identity_resolver = profile_identity_resolver
+        self._bootstrap_reader, self._state_manager = bootstrap_reader, state_manager
+        self._artifact_resolver, self._profile_seed_factory = (
+            artifact_resolver,
+            profile_seed_factory,
+        )
+
+    def cutover_pending_request(
+        self, record: ProfileActivationRequestRecord, candle: Candlestick
+    ) -> None:
+        """Single private-instance cutover; caller owns application/registration fences."""
+        if (
+            type(record) is not ProfileActivationRequestRecord
+            or record.status is not ProfileActivationRequestStatus.PENDING
+            or type(candle) is not Candlestick
+            or self._environment_identity() != "live"
+        ):
+            raise ProfileActivationRequestValidationError()
+        request, key = record.request, record.request.intent.key
+        if (key.environment, key.product_id, key.timeframe) != (
+            "live",
+            candle.product_id,
+            candle.timeframe,
+        ):
+            raise ProfileActivationRequestValidationError()
+        if (
+            self._bootstrap_reader is None
+            or self._state_manager is None
+            or self._artifact_resolver is None
+            or self._profile_seed_factory is None
+            or self._profile_identity_resolver is None
+        ):
+            raise ProfileActivationRequestValidationError()
+        artifact = self._artifact_resolver(key.strategy_id)
+        if (
+            not isinstance(artifact, type)
+            or not issubclass(artifact, BaseStrategy)
+            or issubclass(artifact, PortfolioFactory)
+        ):
+            raise ProfileActivationRequestValidationError()
+        instance = artifact(key.strategy_id, key.product_id)
+        identity = self._profile_identity_resolver(instance)
+        if (
+            type(identity) is not MarketDataDecisionCompositionIdentity
+            or (instance.strategy_id, instance.product_id)
+            != (key.strategy_id, key.product_id)
+            or (
+                identity.execution_scope_id,
+                identity.strategy_version,
+                identity.config_hash,
+            )
+            != (key.execution_scope_id, key.strategy_version, key.config_hash)
+            or instance.requirements != request.intent.requirements
+        ):
+            raise ProfileActivationRequestConflict()
+        factory = self._profile_seed_factory
+
+        def checked_factory(seed_key: BootstrapKey) -> BootstrapSeed:
+            if seed_key != key:
+                raise ProfileActivationRequestConflict()
+            return factory(instance, seed_key, candle.timestamp)
+
+        def verify(seed: BootstrapSeed) -> None:
+            requirements = request.intent.requirements
+            if (seed.key, seed.requirements, seed.lookback) != (
+                key,
+                requirements.profile_requirements,
+                requirements.lookback_window,
+            ):
+                raise ProfileActivationRequestConflict()
+
+        seed_record = self._bootstrap_reader.prepare_initial_seed_under_admission(
+            instance,
+            candle.timestamp,
+            factory=checked_factory,
+        )
+        if type(seed_record) is not BootstrapSeedRecord:
+            raise ProfileActivationRequestValidationError()
+        verify(seed_record.value)
+        bound = self._bootstrap_reader.prepare(
+            instance, candle.timestamp, "BEFORE_PENDING"
+        )
+        if type(bound) is not BoundBootstrapHydration or bound.strategy is not instance:
+            raise ProfileActivationRequestValidationError()
+        verify(bound.plan.seed)
+        self._hydration.hydrate_candles(
+            instance, bound.candles, decision_scope_loader=bound.decision_scope_loader
+        )
+        now = datetime.now(UTC)
+        now = now.replace(microsecond=now.microsecond // 1000 * 1000)
+        with self._db_session_factory() as session:
+            with session.begin():
+                result = consume_profile_activation_request(
+                    session, self._state_manager, request, terminal_at=now
+                )
+        if result.disposition is not ProfileActivationConsumption.CONSUMED_NOW:
+            raise ProfileActivationRequestConflict()
+        try:
+            self._register_strategy(instance)
+            assert result.transition is not None
+            self._state_manager.after_committed_transition(result.transition)
+        except BaseException:
+            try:
+                self._unregister_runtime_artifact(key.strategy_id)
+            except BaseException:
+                self._logger.error("profile_cutover_unregister_failed")
+            try:
+                self._transition_to_error(
+                    key.strategy_id,
+                    "PROFILE_CUTOVER_FAILED",
+                    actor="system",
+                    expected_version=request.intent.expected_state_version + 1,
+                )
+            except BaseException:
+                self._logger.error("profile_cutover_cleanup_failed")
+            raise
 
     def persistent_pending_channels(self) -> tuple[str, ...]:
         """Discover subscription intent from durable requests after restart."""

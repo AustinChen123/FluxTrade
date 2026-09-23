@@ -18,8 +18,13 @@ from src.core.strategy_activation_request_store import (
     ProfileActivationRequestStatus as RequestStatus,
     ProfileActivationRequestConflict as Conflict,
 )
-from src.core.strategy_state_manager import StrategyStateManager, LockedStrategyState
+from src.core.strategy_state_manager import (
+    StrategyStateManager,
+    LockedStrategyState,
+    StrategyStateTransitionResult,
+)
 from test_profile_activation_request import request
+from src.core.market_data.profiles import bootstrap_hydration as bootstrap
 
 from src.core.models import Candlestick, Signal, StrategyStatus
 from src.core.portfolio_runtime import (
@@ -49,6 +54,9 @@ def consume_setup(monkeypatch, status=StrategyStatus.READY, command=Command.STAR
     calls.request.return_value = Record(value, RequestStatus.PENDING, now)
     calls.terminal.return_value = Record(
         value, RequestStatus.CONSUMED, now, now, "ACTIVATION_COMMITTED"
+    )
+    calls.transition.return_value = StrategyStateTransitionResult(
+        value.intent.key.strategy_id, status, StrategyStatus.ACTIVE, 1, now
     )
     monkeypatch.setattr(manager, "lock_state_in_transaction", calls.state)
     monkeypatch.setattr(manager, "transition_in_transaction", calls.transition)
@@ -250,6 +258,157 @@ class _ProfileStrategy(_Strategy):
     @property
     def requirements(self):
         return replace(request().intent.requirements, product_id=self.product_id)
+
+
+@pytest.mark.parametrize(
+    "phase",
+    "success commit register postcommit factory_key seed_scope seed_config bound_scope bound_config".split(),
+)
+def test_single_pending_cutover_order_and_failures(monkeypatch, phase):
+    value, now = request(), datetime(2026, 1, 1, tzinfo=UTC)
+    value = replace(
+        value,
+        intent=replace(
+            value.intent,
+            requirements=replace(value.intent.requirements, lookback_window=0),
+        ),
+    )
+
+    class CutoverStrategy(_ProfileStrategy):
+        def replay_configuration(self):
+            return {}
+
+        @property
+        def requirements(self):
+            return value.intent.requirements
+
+    record = Record(value, RequestStatus.PENDING, now)
+    candle = Candlestick(
+        product_id=value.intent.key.product_id,
+        timeframe="1m",
+        timestamp=60_000,
+        open=Decimal(1),
+        high=Decimal(1),
+        low=Decimal(1),
+        close=Decimal(1),
+        volume=Decimal(1),
+    )
+    reader, manager, resolver, factory = [MagicMock() for _ in range(4)]
+    resolver.return_value = consumption.MarketDataDecisionCompositionIdentity(
+        "deployment", "v1", "a" * 64
+    )
+    service, _, db, legacy, hydration, runtime = _build_service(
+        state=None,
+        environment="live",
+        profile_identity_resolver=resolver,
+        bootstrap_reader=reader,
+        state_manager=manager,
+        artifact_resolver=lambda _: CutoverStrategy,
+        profile_seed_factory=factory,
+    )
+    log, error = [], RuntimeError("fixed cutover fault")
+
+    def action(name):
+        def run(*args, **kwargs):
+            log.append(name)
+            if phase == name:
+                raise error
+
+        return run
+
+    def seed(instance, boundary, *, factory):
+        action("seed")()
+        assert boundary == candle.timestamp
+        factory(
+            replace(value.intent.key, execution_scope_id="other")
+            if phase == "factory_key"
+            else value.intent.key
+        )
+        return consumption.BootstrapSeedRecord(make_seed("seed"), now, True)
+
+    def make_seed(stage):
+        key = value.intent.key
+        if phase.startswith(stage + "_"):
+            key = (
+                replace(key, execution_scope_id="other")
+                if phase.endswith("scope")
+                else replace(key, config_hash="b" * 64)
+            )
+        return consumption.BootstrapSeed(
+            key,
+            value.intent.requirements.profile_requirements,
+            candle.timestamp,
+            0,
+            "policy",
+            "a" * 64,
+            "b" * 64,
+            (),
+            max_seed_candles=1,
+        )
+
+    def prepare(instance, *_):
+        log.append("prepare")
+        seed = make_seed("bound")
+        plan = bootstrap.BootstrapHydrationPlan(
+            seed, (), None, 1, 1, seed.key, seed.requirements, 0
+        )
+        return bootstrap.BoundBootstrapHydration(
+            plan,
+            instance,
+            replace(
+                resolver.return_value,
+                execution_scope_id=seed.key.execution_scope_id,
+                config_hash=seed.key.config_hash,
+            ),
+            (),
+        )
+
+    reader.prepare_initial_seed_under_admission.side_effect = seed
+    reader.prepare.side_effect = prepare
+    hydration.hydrate_candles.side_effect = action("hydrate")
+
+    def consume(session, state_manager, expected, *, terminal_at):
+        action("consume")()
+        assert session is db and state_manager is manager and expected is value
+        return consumption.ProfileActivationConsumptionResult(
+            consumption.ProfileActivationConsumption.CONSUMED_NOW,
+            Record(
+                value, RequestStatus.CONSUMED, now, terminal_at, "ACTIVATION_COMMITTED"
+            ),
+            StrategyStateTransitionResult(
+                "strategy", StrategyStatus.READY, StrategyStatus.ACTIVE, 1, terminal_at
+            ),
+        )
+
+    monkeypatch.setattr(consumption, "consume_profile_activation_request", consume)
+    db.begin.return_value.__exit__.side_effect = action("commit")
+    runtime.register_strategy.side_effect = action("register")
+    manager.after_committed_transition.side_effect = action("postcommit")
+    if phase == "success":
+        service.cutover_pending_request(record, candle)
+        assert log == "seed prepare hydrate consume commit register postcommit".split()
+        instance = runtime.register_strategy.call_args.args[0]
+        factory.assert_called_once_with(instance, value.intent.key, candle.timestamp)
+        reader.prepare.assert_called_once_with(
+            instance, candle.timestamp, "BEFORE_PENDING"
+        )
+        assert hydration.hydrate_candles.call_args.args == (instance, ())
+    else:
+        with pytest.raises((RuntimeError, ValueError)) as caught:
+            service.cutover_pending_request(record, candle)
+        if phase in ("commit", "register", "postcommit"):
+            assert caught.value is error
+        if phase in ("register", "postcommit"):
+            runtime.unregister.assert_called_once_with("strategy")
+            legacy.transition_to_error.assert_called_once()
+        else:
+            runtime.register_strategy.assert_not_called()
+            manager.after_committed_transition.assert_not_called()
+        if phase.startswith(("seed_", "bound_", "factory_")):
+            hydration.hydrate_candles.assert_not_called()
+            assert "consume" not in log
+        if phase == "factory_key":
+            factory.assert_not_called()
 
 
 @pytest.mark.parametrize("capability", ["configured", "store", "resolver", "nonlive"])
@@ -476,6 +635,7 @@ def _build_service(
     | None = None,
     profile_request_store=None,
     profile_identity_resolver=None,
+    **cutover_capabilities,
 ):
     events: list[str] = []
     if isinstance(state, _State):
@@ -501,6 +661,7 @@ def _build_service(
         event_logger=MagicMock(),
         profile_request_store=profile_request_store,
         profile_identity_resolver=profile_identity_resolver,
+        **cutover_capabilities,
     )
     return service, events, db, state_manager, hydration, runtime_artifacts
 
