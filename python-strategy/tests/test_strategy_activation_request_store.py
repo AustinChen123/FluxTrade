@@ -1,17 +1,22 @@
 from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timezone, timedelta
 from unittest.mock import MagicMock
-from typing import Any
+from typing import Any, cast
+from contextlib import nullcontext
 
 import pytest
 from sqlalchemy import PickleType, create_engine, literal, select
 from sqlalchemy.engine import RowMapping
+from sqlalchemy.dialects.postgresql import dialect
 
 from src.core import strategy_activation_request_store as owner
 from src.core.strategy_activation_request_store import (
     ProfileActivationRequestRecord as Record,
     ProfileActivationRequestStatus as Status,
     ProfileActivationRequestIntegrityError as Integrity,
+    ProfileActivationRequestValidationError as Validation,
+    ProfileActivationRequestConflict as Conflict,
+    ProfileActivationRequestStore as Store,
     _hydrate,
     _validate_request_id,
 )
@@ -139,7 +144,7 @@ def test_terminal_domain(field, value):
 
 @pytest.mark.parametrize("invalid", [None, True, "A" * 64, "a" * 63, Text("a" * 64)])
 def test_request_id_exact_validation(invalid):
-    with pytest.raises(Integrity):
+    with pytest.raises(Validation):
         _validate_request_id(invalid)
 
 
@@ -189,3 +194,136 @@ def test_exact_request_and_binary_subclasses():
         data["canonical_payload"] = raw
         with pytest.raises(Integrity):
             _hydrate(data, value.request_id)
+
+
+def store_harness():
+    sessions, calls, exits = [], [], []
+    rows = [row()]
+
+    def fresh():
+        session = MagicMock()
+        session.get_bind.return_value.dialect.name = "postgresql"
+        session.in_transaction.return_value = False
+
+        def execute(statement):
+            compiled = statement.compile(dialect=dialect())
+            calls.append((str(compiled), compiled.params))
+            result = MagicMock()
+            result.mappings.return_value.all.return_value = rows
+            return result
+
+        session.execute.side_effect = execute
+        session.begin.return_value.__exit__.side_effect = lambda *_: exits.append(
+            "transaction"
+        )
+        context = MagicMock()
+        context.__enter__.return_value = session
+        context.__exit__.side_effect = lambda *_: exits.append("session")
+        sessions.append(session)
+        return context
+
+    factory = MagicMock(side_effect=fresh)
+    return Store(factory), rows, sessions, calls, exits, factory
+
+
+def test_fresh_readonly_get_confirm_and_missing():
+    store, rows, sessions, calls, exits, factory = store_harness()
+    rows[0].update(status="CONSUMED", terminal_at=NOW, terminal_reason="DONE")
+    record = store.get(request().request_id)
+    assert exits == ["transaction", "session"]
+    assert record is not None and record.status is Status.CONSUMED
+    assert store.confirm(request()) == record
+    assert sessions[0] is not sessions[1]
+    assert calls[0][0] == "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY"
+    assert calls[1][1] == {"lock_timeout": "2000ms", "statement_timeout": "10000ms"}
+    assert "set_config('TimeZone', 'UTC', true)" in calls[1][0]
+    assert "WHERE strategy_profile_activation_request.request_id =" in calls[2][0]
+    assert " OR " not in calls[2][0]
+    assert calls[2][1] == {"request_id_1": request().request_id, "param_1": 2}
+    rows.clear()
+    assert store.get(request().request_id) is None and store.confirm(request()) is None
+    assert factory.call_count == 4 and len(calls) == 12
+    assert all(sql.startswith(("SET", "SELECT")) for sql, _ in calls)
+
+
+def test_public_validation_before_session_and_hydration_remapping():
+    store, _, _, _, _, factory = store_harness()
+    for invalid in (None, True, "SECRET", Text("a" * 64)):
+        with pytest.raises(Validation):
+            store.get(cast(Any, invalid))
+        with pytest.raises(Validation):
+            store.confirm(cast(Any, invalid))
+
+    class RequestSubclass(owner.ProfileActivationRequest):
+        pass
+
+    value = request()
+    with pytest.raises(Validation):
+        store.confirm(
+            RequestSubclass(
+                value.actor, value.idempotency_key, value.command, value.intent
+            )
+        )
+    factory.assert_not_called()
+    with pytest.raises(Integrity):
+        _hydrate(row(), "SECRET")
+
+
+def test_valid_conflict_only_after_full_integrity():
+    store, rows, *_ = store_harness()
+    value = request()
+    changed = replace(value, command=type(value.command).RESUME)
+    assert changed.command_ref == value.command_ref
+    with pytest.raises(Conflict, match="^PROFILE_ACTIVATION_REQUEST_CONFLICT$"):
+        store.confirm(changed)
+    rows[0]["payload_digest"] = "SECRET"
+    with pytest.raises(Integrity):
+        store.confirm(changed)
+    rows.append(row())
+    with pytest.raises(Integrity):
+        store.get(value.request_id)
+
+
+@pytest.mark.parametrize("phase", ["query", "transaction_exit", "session_exit"])
+@pytest.mark.parametrize("error", [RuntimeError("SECRET"), KeyboardInterrupt()])
+def test_db_and_exit_errors_propagate_without_retry(phase, error):
+    store, _, sessions, _, exits, factory = store_harness()
+    context = factory.side_effect()
+    factory.side_effect = lambda: context
+    session = sessions[0]
+    if phase == "query":
+        execute = session.execute.side_effect
+        calls = 0
+
+        def fail_select(statement):
+            nonlocal calls
+            calls += 1
+            if calls == 3:
+                raise error
+            return execute(statement)
+
+        session.execute.side_effect = fail_select
+    elif phase == "transaction_exit":
+        session.begin.return_value.__exit__.side_effect = error
+    else:
+        context.__exit__.side_effect = error
+    with pytest.raises(type(error)) as caught:
+        store.get(request().request_id)
+    assert caught.value is error and factory.call_count == 1
+    session.commit.assert_not_called()
+    session.rollback.assert_not_called()
+
+
+@pytest.mark.parametrize("guard", ["dialect", "active"])
+def test_fresh_postgres_guard(guard):
+    store, _, sessions, calls, _, factory = store_harness()
+    factory.side_effect()
+    session = sessions[0]
+    factory.side_effect = lambda: nullcontext(session)
+    if guard == "dialect":
+        session.get_bind.return_value.dialect.name = "sqlite"
+    else:
+        session.in_transaction.return_value = True
+    with pytest.raises(Integrity):
+        store.get(request().request_id)
+    assert calls == []

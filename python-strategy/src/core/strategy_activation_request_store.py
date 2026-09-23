@@ -1,16 +1,34 @@
 """Strict durable readback only; no admission, writes, retries or runtime work."""
 
 from dataclasses import dataclass
+from collections.abc import Callable
+from contextlib import AbstractContextManager
 from datetime import datetime, timezone
 import re
-from typing import Any
+from typing import Any, cast
 from enum import Enum
 from sqlalchemy.engine import RowMapping
+from sqlalchemy import Table, select, text
+from sqlalchemy.orm import Session
 
 from src.core.strategy_activation_intent import (
     ProfileActivationRequest,
     MAX_ACTIVATION_REQUEST_BYTES,
 )
+from src.core.market_data.profiles.orm import ProfileActivationRequest as RequestRow
+from src.core.market_data.profiles.repository import TransactionWaitPolicy
+
+_TABLE = cast(Table, RequestRow.__table__)
+
+
+class ProfileActivationRequestValidationError(ValueError):
+    def __init__(self) -> None:
+        super().__init__("PROFILE_ACTIVATION_REQUEST_INVALID")
+
+
+class ProfileActivationRequestConflict(ValueError):
+    def __init__(self) -> None:
+        super().__init__("PROFILE_ACTIVATION_REQUEST_CONFLICT")
 
 
 class ProfileActivationRequestIntegrityError(ValueError):
@@ -27,7 +45,7 @@ class ProfileActivationRequestStatus(Enum):
 
 def _validate_request_id(value: str) -> None:
     if type(value) is not str or re.fullmatch(r"[0-9a-f]{64}", value, re.ASCII) is None:
-        raise ProfileActivationRequestIntegrityError()
+        raise ProfileActivationRequestValidationError()
 
 
 def _stamp(value: object) -> bool:
@@ -107,3 +125,61 @@ def _hydrate(
         )
     except (ValueError, TypeError, KeyError, OverflowError):
         raise ProfileActivationRequestIntegrityError() from None
+
+
+class ProfileActivationRequestStore:
+    def __init__(
+        self,
+        sessions: Callable[[], AbstractContextManager[Session]],
+        policy: TransactionWaitPolicy = TransactionWaitPolicy(),
+    ) -> None:
+        if type(policy) is not TransactionWaitPolicy:
+            raise ProfileActivationRequestValidationError()
+        self._sessions, self._policy = sessions, policy
+
+    def get(self, request_id: str) -> ProfileActivationRequestRecord | None:
+        _validate_request_id(request_id)
+        with self._sessions() as session:
+            if (
+                session.get_bind().dialect.name != "postgresql"
+                or session.in_transaction()
+            ):
+                raise ProfileActivationRequestIntegrityError()
+            with session.begin():
+                session.execute(
+                    text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY")
+                )
+                session.execute(
+                    text(
+                        "SELECT set_config('lock_timeout', :lock_timeout, true), "
+                        "set_config('statement_timeout', :statement_timeout, true), "
+                        "set_config('TimeZone', 'UTC', true)"
+                    ).bindparams(
+                        lock_timeout=f"{self._policy.lock_timeout_ms}ms",
+                        statement_timeout=f"{self._policy.statement_timeout_ms}ms",
+                    )
+                )
+                rows = (
+                    session.execute(
+                        select(_TABLE).where(_TABLE.c.request_id == request_id).limit(2)
+                    )
+                    .mappings()
+                    .all()
+                )
+                if len(rows) > 1:
+                    raise ProfileActivationRequestIntegrityError()
+                record = _hydrate(rows[0], request_id) if rows else None
+        return record
+
+    def confirm(
+        self, expected: ProfileActivationRequest
+    ) -> ProfileActivationRequestRecord | None:
+        if type(expected) is not ProfileActivationRequest:
+            raise ProfileActivationRequestValidationError()
+        record = self.get(expected.request_id)
+        if (
+            record is not None
+            and record.request.canonical_bytes != expected.canonical_bytes
+        ):
+            raise ProfileActivationRequestConflict()
+        return record
