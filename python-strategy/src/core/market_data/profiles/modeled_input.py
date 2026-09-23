@@ -1,12 +1,18 @@
 """Run-scoped modeled profile input boundary; providers must already be preloaded."""
 
+from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from typing import Protocol
 
 from src.core.data_provider import timeframe_to_ms
+from src.core.models import Candlestick
+from src.core.strategy_context import StrategyContext
+from src.strategies.base import BaseStrategy
 
 from .context_enrichment import (
     ProfileContextEnrichmentError,
+    enrich_profile_context,
     validate_profile_context_coverage,
 )
 from .decision_context import ProfileDecisionBasis, StrategyMarketDataContext
@@ -38,6 +44,13 @@ class ModeledProfileContextProvider(Protocol):
 class ModeledProfileInputError(ValueError):
     def __init__(self) -> None:
         super().__init__("MODELED_PROFILE_INPUT_INVALID")
+
+
+ModeledWarmupScope = Callable[
+    [BaseStrategy, Candlestick, StrategyContext | None],
+    AbstractContextManager[StrategyContext | None],
+]
+ModeledWarmupScopeLoader = Callable[[Candlestick], ModeledWarmupScope]
 
 
 def _provider_identity(
@@ -116,14 +129,20 @@ class ModeledProfileInput:
             self.availability_policy_digest,
             self.dataset_digest,
         )
-        if _provider_identity(self.provider, self.availability_policy_id) != expected_identity:
+        if (
+            _provider_identity(self.provider, self.availability_policy_id)
+            != expected_identity
+        ):
             raise ModeledProfileInputError() from None
         result = self.provider.context_for(
             requirements,
             decision_time_ms=decision_time_ms,
             availability_policy_id=self.availability_policy_id,
         )
-        if _provider_identity(self.provider, self.availability_policy_id) != expected_identity:
+        if (
+            _provider_identity(self.provider, self.availability_policy_id)
+            != expected_identity
+        ):
             raise ModeledProfileInputError() from None
         try:
             if type(result) is not StrategyMarketDataContext:
@@ -141,3 +160,58 @@ class ModeledProfileInput:
         except (ValueError, ProfileContextEnrichmentError):
             raise ModeledProfileInputError() from None
         return result
+
+
+def modeled_profile_warmup_scope_loader(
+    modeled_input: ModeledProfileInput,
+) -> ModeledWarmupScopeLoader:
+    """Create a pure completed-candle warm-up scope with no I/O or persistence."""
+    if type(modeled_input) is not ModeledProfileInput:
+        raise ModeledProfileInputError()
+
+    def load(bound_candle: Candlestick) -> ModeledWarmupScope:
+        if type(bound_candle) is not Candlestick:
+            raise ModeledProfileInputError()
+        decision_time_ms = completed_candle_decision_time_ms(
+            bound_candle.timestamp,
+            bound_candle.timeframe,
+        )
+
+        def scope(
+            strategy: BaseStrategy,
+            candle: Candlestick,
+            context: StrategyContext | None,
+        ) -> AbstractContextManager[StrategyContext | None]:
+            if not isinstance(strategy, BaseStrategy) or candle is not bound_candle:
+                raise ModeledProfileInputError()
+            requirements = strategy.requirements.profile_requirements
+            if not requirements:
+                return nullcontext(context)
+            if (
+                strategy.product_id != candle.product_id
+                or strategy.requirements.timeframe != candle.timeframe
+                or type(context) is not StrategyContext
+                or context.strategy_id != strategy.strategy_id
+                or context.product_id != candle.product_id
+                or context.timestamp != candle.timestamp
+                or context.market_data is not None
+            ):
+                raise ModeledProfileInputError()
+            market_data = modeled_input.resolve(
+                requirements,
+                decision_time_ms=decision_time_ms,
+            )
+            try:
+                enriched = enrich_profile_context(
+                    context,
+                    requirements,
+                    market_data,
+                    decision_time_ms=decision_time_ms,
+                )
+            except ProfileContextEnrichmentError:
+                raise ModeledProfileInputError() from None
+            return nullcontext(enriched)
+
+        return scope
+
+    return load
