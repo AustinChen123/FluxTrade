@@ -686,6 +686,49 @@ def terminalize(session, **changes):
     return owner.terminalize_profile_activation_request(session, request(), **args)
 
 
+def test_request_lock_and_terminal_delegation(monkeypatch):
+    db = terminal_harness()
+    result = owner.lock_profile_activation_request(db, request())
+    assert result == _hydrate(row(), request().request_id)
+    sql = db.execute.call_args.args[0].compile(dialect=dialect())
+    assert (
+        "WHERE strategy_profile_activation_request.request_id = %(request_id_1)s"
+        in str(sql)
+    )
+    assert (
+        "FOR UPDATE" in str(sql) and sql.params["request_id_1"] == request().request_id
+    )
+    db = terminal_harness(
+        first=[row() | dict(status="CONSUMED", terminal_at=NOW, terminal_reason="DONE")]
+    )
+    lock = MagicMock(return_value=result)
+    monkeypatch.setattr(owner, "lock_profile_activation_request", lock)
+    assert terminalize(db).status is Status.CONSUMED
+    lock.assert_called_once_with(db, request())
+    assert db.execute.call_count == 1 and str(db.execute.call_args.args[0]).startswith(
+        "UPDATE"
+    )
+
+
+@pytest.mark.parametrize(
+    "guard", ["type", "inactive", "transaction", "dialect", "request"]
+)
+def test_request_lock_guards_zero_sql(guard):
+    db = terminal_harness()
+    if guard == "inactive":
+        db.is_active = False
+    if guard == "transaction":
+        db.in_transaction.return_value = False
+    if guard == "dialect":
+        db.get_bind.return_value.dialect.name = "sqlite"
+    with pytest.raises(Validation):
+        owner.lock_profile_activation_request(
+            cast(Any, object()) if guard == "type" else db,
+            cast(Any, None) if guard == "request" else request(),
+        )
+    db.execute.assert_not_called()
+
+
 @pytest.mark.parametrize("status", [Status.CONSUMED, Status.CANCELLED, Status.STALE])
 def test_terminalize_locked_update_and_no_lifecycle_ownership(status):
     terminal = row() | dict(

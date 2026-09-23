@@ -239,6 +239,48 @@ def active_pg_session():
     return db
 
 
+def test_public_state_lock_fresh_scalar_max_version(monkeypatch):
+    db = _FakeSession([_state("s1", StrategyStatus.READY)])
+    db.states["s1"].version = 2**31 - 1
+    monkeypatch.setattr(db, "in_transaction", lambda: True)
+    monkeypatch.setattr(db, "get_bind", lambda: active_pg_session().get_bind())
+    manager = _manager(db)
+    result = manager.lock_state_in_transaction(db, "s1")
+    assert result.status is StrategyStatus.READY and result.version == 2**31 - 1
+    assert db.lock_count == 1 and not db.transitions and db.commit_count == 0
+    with pytest.raises(FrozenInstanceError):
+        setattr(result, "version", 0)
+    with pytest.raises(StrategyStateEvidenceError):
+        manager._write_transition(db, "s1", StrategyStatus.ACTIVE, **transaction_args())
+    assert not db.transitions and manager.get_status("s1") is None
+
+
+@pytest.mark.parametrize("guard", ["type", "inactive", "transaction", "dialect", "id"])
+def test_state_lock_guard_zero_query(guard):
+    db = active_pg_session()
+    if guard == "inactive":
+        db.is_active = False
+    if guard == "transaction":
+        db.in_transaction.return_value = False
+    if guard == "dialect":
+        db.get_bind.return_value.dialect.name = "sqlite"
+    with pytest.raises(StrategyStateTransactionValidationError):
+        _manager(db).lock_state_in_transaction(
+            cast(Session, object()) if guard == "type" else db,
+            cast(str, None) if guard == "id" else "s1",
+        )
+    db.query.assert_not_called()
+
+
+@pytest.mark.parametrize("error", [RuntimeError("SQL"), BaseException("SQL")])
+def test_state_lock_error_identity(error):
+    db = active_pg_session()
+    db.query.side_effect = error
+    with pytest.raises(type(error)) as caught:
+        _manager(db).lock_state_in_transaction(db, "s1")
+    assert caught.value is error
+
+
 @pytest.mark.parametrize(
     "changes",
     [

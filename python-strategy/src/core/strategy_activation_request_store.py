@@ -172,23 +172,12 @@ def _hydrate(
         raise ProfileActivationRequestIntegrityError() from None
 
 
-def terminalize_profile_activation_request(
+def lock_profile_activation_request(
     session: Session,
     expected: ProfileActivationRequest,
-    *,
-    status: ProfileActivationRequestStatus,
-    terminal_at: datetime,
-    terminal_reason: str,
 ) -> ProfileActivationRequestRecord:
-    """Mutate within the caller transaction; return is not durable or ACTIVE proof."""
-    if (
-        type(expected) is not ProfileActivationRequest
-        or type(status) is not ProfileActivationRequestStatus
-        or status is ProfileActivationRequestStatus.PENDING
-        or not _stamp(terminal_at)
-        or type(terminal_reason) is not str
-        or re.fullmatch(r"[A-Z][A-Z0-9_]{0,127}", terminal_reason, re.ASCII) is None
-    ):
+    """Lock and verify request evidence inside the caller transaction."""
+    if type(expected) is not ProfileActivationRequest:
         raise ProfileActivationRequestValidationError()
     if (
         not isinstance(session, Session)
@@ -212,6 +201,28 @@ def terminalize_profile_activation_request(
     existing = _hydrate(rows[0], expected.request_id)
     if existing.request.canonical_bytes != expected.canonical_bytes:
         raise ProfileActivationRequestConflict()
+    return existing
+
+
+def terminalize_profile_activation_request(
+    session: Session,
+    expected: ProfileActivationRequest,
+    *,
+    status: ProfileActivationRequestStatus,
+    terminal_at: datetime,
+    terminal_reason: str,
+) -> ProfileActivationRequestRecord:
+    """Mutate within the caller transaction; return is not durable or ACTIVE proof."""
+    if (
+        type(expected) is not ProfileActivationRequest
+        or type(status) is not ProfileActivationRequestStatus
+        or status is ProfileActivationRequestStatus.PENDING
+        or not _stamp(terminal_at)
+        or type(terminal_reason) is not str
+        or re.fullmatch(r"[A-Z][A-Z0-9_]{0,127}", terminal_reason, re.ASCII) is None
+    ):
+        raise ProfileActivationRequestValidationError()
+    existing = lock_profile_activation_request(session, expected)
     if existing.status is not ProfileActivationRequestStatus.PENDING:
         if (existing.status, existing.terminal_at, existing.terminal_reason) != (
             status,

@@ -57,6 +57,13 @@ class StrategyStateTransactionValidationError(ValueError):
 
 
 @dataclass(frozen=True, slots=True)
+class LockedStrategyState:
+    strategy_id: str
+    status: StrategyStatus
+    version: int
+
+
+@dataclass(frozen=True, slots=True)
 class StrategyStateTransitionResult:
     strategy_id: str
     from_status: StrategyStatus
@@ -339,12 +346,9 @@ class StrategyStateManager:
                     or not 0 <= expected_version <= 2**31 - 1
                 )
             )
-            or not isinstance(session, Session)
-            or not session.is_active
-            or not session.in_transaction()
-            or session.get_bind().dialect.name != "postgresql"
         ):
             raise StrategyStateTransactionValidationError()
+        self._validate_transaction(session)
         return self._write_transition(
             session,
             strategy_id,
@@ -355,6 +359,48 @@ class StrategyStateManager:
             force=force,
             expected_version=expected_version,
         )
+
+    @staticmethod
+    def _validate_transaction(session: Session) -> None:
+        if (
+            not isinstance(session, Session)
+            or not session.is_active
+            or not session.in_transaction()
+            or session.get_bind().dialect.name != "postgresql"
+        ):
+            raise StrategyStateTransactionValidationError()
+
+    def lock_state_in_transaction(
+        self, session: Session, strategy_id: str
+    ) -> LockedStrategyState:
+        """Read fresh locked state; not an authorization token or commit proof."""
+        if type(strategy_id) is not str:
+            raise StrategyStateTransactionValidationError()
+        self._validate_transaction(session)
+        return self._lock_state(session, strategy_id)
+
+    @staticmethod
+    def _lock_state(db: Session, strategy_id: str) -> LockedStrategyState:
+        with db.no_autoflush:
+            state = (
+                db.query(StrategyState.status, StrategyState.version)
+                .filter(StrategyState.strategy_id == strategy_id)
+                .with_for_update()
+                .first()
+            )
+        if state is None:
+            raise KeyError(f"strategy state not found: {strategy_id}")
+        if (
+            type(state.status) is not str
+            or type(state.version) is not int
+            or not 0 <= state.version <= 2**31 - 1
+        ):
+            raise StrategyStateEvidenceError()
+        try:
+            status = StrategyStatus(state.status)
+        except ValueError:
+            raise StrategyStateEvidenceError() from None
+        return LockedStrategyState(strategy_id, status, state.version)
 
     def _write_transition(
         self,
@@ -371,25 +417,10 @@ class StrategyStateManager:
         """Write transaction-local evidence; no commit/cache/publication ownership."""
         now = changed_at
         with db.no_autoflush:
-            state = (
-                db.query(StrategyState.status, StrategyState.version)
-                .filter(StrategyState.strategy_id == strategy_id)
-                .with_for_update()
-                .first()
-            )
-            if state is None:
-                raise KeyError(f"strategy state not found: {strategy_id}")
-
-            if (
-                type(state.status) is not str
-                or type(state.version) is not int
-                or not 0 <= state.version < 2**31 - 1
-            ):
+            state = self._lock_state(db, strategy_id)
+            if state.version == 2**31 - 1:
                 raise StrategyStateEvidenceError()
-            try:
-                from_status = StrategyStatus(state.status)
-            except ValueError:
-                raise StrategyStateEvidenceError() from None
+            from_status = state.status
             if (
                 from_status == StrategyStatus.ERROR
                 and to_status == StrategyStatus.ACTIVE
