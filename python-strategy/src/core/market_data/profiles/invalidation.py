@@ -17,6 +17,7 @@ _EVENT = cast(Table, MarketDataInvalidation.__table__)
 _SNAPSHOT = cast(Table, VolumeProfileSnapshot.__table__)
 _FIELDS = ("event_id", "snapshot_id", "reason_code", "replacement_snapshot_id", "source")
 _LOGICAL = ("product_id", "window_start_ms", "window_end_ms", "grid_id", "algorithm_version")
+MAX_INVALIDATION_MEMBERSHIP_IDS = 32 * 90  # Decision-input profiles × manifest days.
 
 
 class InvalidationConflict(ValueError):
@@ -126,6 +127,22 @@ class ProfileInvalidationStore:
             if winner is None:
                 raise InvalidationIntegrityError("invalid stored invalidation")
             return _existing(winner, request)
+
+    def any_revoked(self, snapshot_ids: tuple[str, ...]) -> bool:
+        """One bounded membership read; no event materialization or automatic retry."""
+        if type(snapshot_ids) is not tuple or len(snapshot_ids) > MAX_INVALIDATION_MEMBERSHIP_IDS:
+            raise ValueError("invalid invalidation membership input")
+        for identifier in snapshot_ids:
+            _hex(identifier)
+        identifiers = tuple(sorted(set(snapshot_ids)))
+        if not identifiers:
+            return False
+        with self._transaction(read_only=True) as session:
+            result = session.execute(select(select(_EVENT.c.snapshot_id).where(
+                _EVENT.c.snapshot_id.in_(identifiers)).exists())).scalar_one()
+            if type(result) is not bool:
+                raise InvalidationIntegrityError("invalid invalidation membership result")
+            return result
 
     def get(self, event_id: str) -> ProfileInvalidation | None:
         _safe(event_id, 128)

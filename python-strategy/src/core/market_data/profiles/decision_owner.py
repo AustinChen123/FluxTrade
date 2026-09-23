@@ -60,6 +60,7 @@ class MarketDataDecisionOwner:
         input_store: DecisionInputStore,
         utc_ms: Callable[[], int],
         monotonic_ms: Callable[[], int],
+        revoked_checker: Callable[[tuple[str, ...]], bool] | None = None,
     ) -> None:
         if (
             type(environment) is not str
@@ -69,6 +70,7 @@ class MarketDataDecisionOwner:
             or not callable(identity_resolver)
             or not callable(utc_ms)
             or not callable(monotonic_ms)
+            or (revoked_checker is not None and not callable(revoked_checker))
             or not callable(getattr(cache, "decision_many", None))
             or not callable(getattr(cache, "live_requests", None))
             or not callable(getattr(input_store, "get", None))
@@ -82,6 +84,7 @@ class MarketDataDecisionOwner:
         self._input_store = input_store
         self._utc_ms = utc_ms
         self._monotonic_ms = monotonic_ms
+        self._revoked_checker = revoked_checker
 
     def begin_candle(self, candle: Candlestick) -> "MarketDataCandleDecision":
         try:
@@ -390,6 +393,21 @@ class MarketDataCandleDecision:
                 or existing.value.requirements != requirements
             ):
                 raise MarketDataDecisionOwnerError()
+            identifiers = tuple(
+                sorted(
+                    {
+                        day.snapshot_id
+                        for item in existing.value.context.profiles
+                        if item.profile is not None
+                        for day in item.profile.manifest.days
+                    }
+                )
+            )
+            suppressed = False
+            if identifiers and self._owner._revoked_checker is not None:
+                suppressed = self._owner._revoked_checker(identifiers)
+                if type(suppressed) is not bool:
+                    raise MarketDataDecisionOwnerError()
             enriched = enrich_profile_context(
                 context,
                 requirements,
@@ -401,6 +419,8 @@ class MarketDataCandleDecision:
                 input_id=existing.value.input_id,
                 input_digest=existing.value.input_digest,
                 context=enriched,
+                signal_suppressed=suppressed,
+                suppression_reason="SNAPSHOT_REVOKED" if suppressed else None,
             )
         requests = self._owner._cache.live_requests(
             requirements, selection_time_ms=self._decision_time_ms
