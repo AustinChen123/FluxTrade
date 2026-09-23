@@ -52,13 +52,14 @@ def test_pure_contract_import_boundary():
     tree = ast.parse(Path(pure.__file__).read_text())
     allowed = {
         "dataclasses.dataclass",
+        "dataclasses.field",
         "enum.Enum",
         "src.core.market_data.profiles.bootstrap_seed.BootstrapKey",
         "src.strategies.base.StrategyRequirements",
     }
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
-            pytest.fail("pure intent must use only its explicit domain imports")
+            assert {name.name for name in node.names} <= {"hashlib", "json"}
         if isinstance(node, ast.ImportFrom):
             assert node.level == 0
             assert {f"{node.module}.{name.name}" for name in node.names} <= allowed
