@@ -18,6 +18,20 @@ from test_profile_read_results import DAY, event, manifest
 
 DELAY = 20 * 60 * 1000
 
+
+class Reader:
+    def __init__(self, outputs) -> None:
+        self.outputs = iter(outputs)
+        self.calls = []
+
+    def get_manifest(self, pinned):
+        self.calls.append(pinned)
+        value = next(self.outputs)
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+
 def requirement(days: int = 1, *, output: str = "btc_spot_usdt_10_v1") -> ProfileRequirement:
     return ProfileRequirement("BINANCE:BTCUSDT-SPOT", "btc_spot_usdt_10_v1", output,
                               "vp-v1", days, "utc_complete_strict_v1")
@@ -159,3 +173,50 @@ def test_wrong_composite_identity_never_publishes_provider(monkeypatch, result) 
     monkeypatch.setattr(owner, "compose_profile", lambda _read: cast(Any, result))
     with pytest.raises(owner.PreloadedModeledProfileError):
         owner.PreloadedModeledProfileProvider((reading(),))
+
+
+def test_preload_reads_exact_manifests_once_before_runtime(monkeypatch) -> None:
+    composed = []
+    monkeypatch.setattr(owner, "compose_profile", lambda read: composed.append(read) or fake(read))
+    one, two = reading(), reading(2)
+    reader = Reader((one, two))
+    provider = owner.preload_modeled_profile_provider(reader, (one.manifest, two.manifest))
+    assert reader.calls == [one.manifest, two.manifest] and composed == [one, two]
+    before = provider.dataset_digest
+    context = provider.context_for((requirement(2),), decision_time_ms=2 * DAY + DELAY,
+                                   availability_policy_id=MODELED_DAILY_DELAY_20M_V1)
+    assert context.profiles[0].status is ProfileDecisionStatus.FRESH
+    assert reader.calls == [one.manifest, two.manifest] and composed == [one, two]
+    assert provider.dataset_digest == before
+
+
+def test_preload_admission_rejects_without_io(monkeypatch) -> None:
+    monkeypatch.setattr(owner, "compose_profile", fake)
+    read = reading()
+    for reader, manifests in ((Reader(()), [read.manifest]),
+                              (Reader(()), (read.manifest, read.manifest)),
+                              (object(), (read.manifest,))):
+        with pytest.raises(owner.PreloadedModeledProfileError):
+            owner.preload_modeled_profile_provider(cast(Any, reader), cast(Any, manifests))
+        if isinstance(reader, Reader):
+            assert reader.calls == []
+
+
+@pytest.mark.parametrize("last", [None, reading(30)])
+def test_preload_missing_or_mismatched_read_never_composes(monkeypatch, last) -> None:
+    calls = []
+    monkeypatch.setattr(owner, "compose_profile", lambda read: calls.append(read) or fake(read))
+    one, two = reading(), reading(2)
+    reader = Reader((one, last))
+    with pytest.raises(owner.PreloadedModeledProfileError):
+        owner.preload_modeled_profile_provider(reader, (one.manifest, two.manifest))
+    assert reader.calls == [one.manifest, two.manifest] and calls == []
+
+
+def test_preload_reader_failure_preserves_identity(monkeypatch) -> None:
+    monkeypatch.setattr(owner, "compose_profile", fake)
+    marker = RuntimeError("reader unavailable")
+    reader = Reader((marker,))
+    with pytest.raises(RuntimeError) as caught:
+        owner.preload_modeled_profile_provider(reader, (reading().manifest,))
+    assert caught.value is marker and len(reader.calls) == 1

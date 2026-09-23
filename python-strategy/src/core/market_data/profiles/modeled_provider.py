@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 from types import MappingProxyType
-from typing import Mapping
+from typing import Mapping, Protocol
 
 from .composite import compose_profile
 from .composite_types import CompositeProfile
@@ -21,17 +21,23 @@ from .modeled_selection import (
     select_modeled_profile,
 )
 from .read_results import VerifiedManifestRead
-from .read_types import ProfileQueryRequest, _integer
+from .read_types import OrderedProfileManifest, ProfileQueryRequest, _integer
 from .requirements import ProfileRequirement
 
 _DAY = 86_400_000
-_MAX_WINDOWS = 1000
+MAX_PRELOADED_MODELED_WINDOWS = 1000
 _WindowKey = tuple[str, str, str, int, int]
 
 
 class PreloadedModeledProfileError(ValueError):
     def __init__(self) -> None:
         super().__init__("PRELOADED_MODELED_PROFILE_INVALID")
+
+
+class ModeledManifestReader(Protocol):
+    def get_manifest(
+        self, manifest: OrderedProfileManifest
+    ) -> VerifiedManifestRead | None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,7 +98,7 @@ class PreloadedModeledProfileProvider:
     def __init__(self, reads: tuple[VerifiedManifestRead, ...]) -> None:
         if (
             type(reads) is not tuple
-            or len(reads) > _MAX_WINDOWS
+            or len(reads) > MAX_PRELOADED_MODELED_WINDOWS
             or any(type(read) is not VerifiedManifestRead for read in reads)
         ):
             raise PreloadedModeledProfileError() from None
@@ -218,3 +224,35 @@ class PreloadedModeledProfileProvider:
             request, decision_time_ms, ProfileDecisionBasis.MODELED,
             ProfileDecisionStatus.FRESH, profile=profile,
             available_at_ms=selection.available_at_ms)
+
+
+def preload_modeled_profile_provider(
+    reader: ModeledManifestReader,
+    manifests: tuple[OrderedProfileManifest, ...],
+) -> PreloadedModeledProfileProvider:
+    """Perform fixed-manifest I/O before a run; never select or replace revisions."""
+    if (
+        not callable(getattr(reader, "get_manifest", None))
+        or type(manifests) is not tuple
+        or len(manifests) > MAX_PRELOADED_MODELED_WINDOWS
+        or any(type(manifest) is not OrderedProfileManifest for manifest in manifests)
+    ):
+        raise PreloadedModeledProfileError() from None
+    keys = []
+    for manifest in manifests:
+        keys.append((
+            manifest.product_id,
+            manifest.base_grid_id,
+            manifest.algorithm_version,
+            manifest.days[0].window_start_ms,
+            manifest.days[-1].window_end_ms,
+        ))
+    if len(set(keys)) != len(keys):
+        raise PreloadedModeledProfileError() from None
+    reads = []
+    for manifest in manifests:
+        read = reader.get_manifest(manifest)
+        if type(read) is not VerifiedManifestRead or read.manifest != manifest:
+            raise PreloadedModeledProfileError() from None
+        reads.append(read)
+    return PreloadedModeledProfileProvider(tuple(reads))
