@@ -54,6 +54,7 @@ def harness(count=3, referenced=False):
     inputs.get.side_effect = lambda key: by_key.get(key)
     inputs.reset_mock()
     application.read_applied_candle.side_effect = records
+    db.execute.return_value.scalars.return_value = [c.timestamp for c, _ in records]
     owner = MarketDataDecisionOwner(
         environment="live",
         execution_scope_id="deployment",
@@ -108,6 +109,21 @@ def test_boundaries_and_detached_scopes(mode, count, referenced):
     seeds.get.assert_called_once_with(plan.seed.key)
     seeds.pin.assert_not_called()
     assert application.read_applied_candle.call_count == count
+    if count:
+        with reader._sessions() as db:
+            statement = cast(Any, db).execute.call_args.args[0]
+        query = statement.compile(dialect=dialect())
+        assert "FROM candlestick" in str(
+            query
+        ) and "ORDER BY candlestick.timestamp" in str(query)
+        assert query.params == {
+            "product_id_1": plan.seed.key.product_id,
+            "timeframe_1": "1m",
+            "timestamp_1": plan.seed.cutover_ms,
+            "timestamp_2": boundary,
+        }
+        assert ("candlestick.timestamp <=" in str(query)) == (mode == "THROUGH_APPLIED")
+        assert statement.get_execution_options()["yield_per"] == 128
     assert inputs.get.call_count == count - (count > 1)
     for index, call in enumerate(application.read_applied_candle.call_args_list):
         assert call.kwargs["bar_start_ms"] == plan.seed.cutover_ms + index * 60000
@@ -132,7 +148,7 @@ def test_boundaries_and_detached_scopes(mode, count, referenced):
                 assert enriched is not None and enriched.market_data is not None
 
 
-@pytest.mark.parametrize("delta", [-60000, -1, 1, 4 * 60000])
+@pytest.mark.parametrize("delta", [-60000, -1, 1])
 def test_boundary_limit_before_suffix_io(delta):
     reader, plan, strategy, _, application, _, events = harness()
     with pytest.raises(BootstrapHydrationReaderError):
@@ -212,8 +228,11 @@ def test_multi_strategy_record_pairs_target_at_nonzero_index(target_present):
     multi_record = DecisionBatchRecord(multi, NOW, True, inputs)
     application.read_applied_candle.side_effect = [(candle, multi_record)]
     if not target_present:
-        with pytest.raises(BootstrapHydrationReaderError):
-            reader.prepare(strategy, plan.seed.cutover_ms + 60000)
+        bound = reader.prepare(strategy, plan.seed.cutover_ms + 60000)
+        assert (
+            bound.plan.recorded == ()
+            and bound.plan.completed_recorded_through_ms is None
+        )
     else:
         assert multi.outcomes[1] is target
         bound = reader.prepare(strategy, plan.seed.cutover_ms + 60000)
@@ -224,6 +243,62 @@ def test_multi_strategy_record_pairs_target_at_nonzero_index(target_present):
         assert bound.suffix[0][1].pinned_input is pinned
     assert application.read_applied_candle.call_count == 1
     assert events == ["enter", "closed"]
+
+
+@pytest.mark.parametrize("limit", [1, 2])
+def test_complete_nonparticipant_batch_is_a_legal_stop_gap(limit):
+    reader, plan, strategy, _, application, _, _ = harness(count=3)
+    rows = list(application.read_applied_candle.side_effect)
+    candle, evidence = rows[1]
+    rows[1] = (
+        candle,
+        DecisionBatchRecord(
+            replace(evidence.batch, participants=(), outcomes=()),
+            NOW,
+            True,
+            (),
+        ),
+    )
+    application.read_applied_candle.side_effect = rows
+    reader._max_recorded = limit
+    if limit == 1:
+        with pytest.raises(BootstrapHydrationReaderError):
+            reader.prepare(strategy, plan.seed.cutover_ms + 3 * 60_000)
+    else:
+        bound = reader.prepare(strategy, plan.seed.cutover_ms + 3 * 60_000)
+        assert [c.timestamp for c, _ in bound.suffix] == [
+            rows[0][0].timestamp,
+            rows[2][0].timestamp,
+        ]
+        assert bound.plan.completed_recorded_through_ms == rows[2][0].timestamp
+    assert application.read_applied_candle.call_count == 3
+
+
+def test_declared_participant_missing_outcome_is_not_a_stop_gap():
+    from test_profile_decision_application_store import harness as store_harness
+    from src.core.market_data.profiles import decision_application_store as store
+
+    reader, plan, strategy, _, application, _, _ = harness(count=1)
+    candle, record = next(application.read_applied_candle.side_effect)
+    outcome = replace(
+        record.batch.outcomes[0],
+        disposition="SKIPPED",
+        input_id=None,
+        input_digest=None,
+        reason="INPUT_STORE_FAILED",
+    )
+    batch = replace(record.batch, outcomes=(outcome,))
+    db, state, _ = store_harness()
+    store.append_decision_batch(db, batch)
+    state["outcomes"] = []  # Header still declares this participant.
+
+    def read(**kwargs):
+        return candle, store.read_decision_batch(db, **store._identity(batch))
+
+    application.read_applied_candle.side_effect = read
+    with pytest.raises(store.DecisionBatchIntegrityError):
+        reader.prepare(strategy, plan.seed.cutover_ms + 60_000)
+    application.read_applied_candle.assert_called_once()
 
 
 def test_suffix_failure_closes_session_without_fallback():

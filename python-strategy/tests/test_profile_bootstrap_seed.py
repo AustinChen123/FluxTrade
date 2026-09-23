@@ -251,6 +251,39 @@ def test_seed_canonical_stateful_replay_and_decimal_stability(status):
     assert not hasattr(value, "__dict__")
 
 
+@pytest.mark.parametrize(
+    "damage", [None, "order", "duplicate", "unaligned", "terminal"]
+)
+def test_actual_participation_sequence_with_gap(damage):
+    value = seed()
+    rows = (suffix(value, 0, skipped=True), suffix(value, 2, skipped=True))
+    end = value.cutover_ms + 2 * MINUTE
+    if damage == "order":
+        rows = rows[::-1]
+    elif damage == "duplicate":
+        rows = (rows[0], rows[0])
+    elif damage == "unaligned":
+        rows = (
+            rows[0],
+            (replace(rows[1][0], key=value.key.decision_key(end + 1)), None),
+        )
+    elif damage == "terminal":
+        end += MINUTE
+    if damage is None:
+        assert (
+            classify(
+                value,
+                recorded=rows,
+                completed_recorded_through_ms=end,
+                max_recorded_candles=2,
+            )
+            is owner.BootstrapDisposition.REPLAY
+        )
+    else:
+        with pytest.raises(owner.BootstrapSeedError):
+            classify(value, recorded=rows, completed_recorded_through_ms=end)
+
+
 def test_empty_lookback_legacy_and_unknown_history():
     value = seed(count=0)
     assert value.candles == () and classify(value) is owner.BootstrapDisposition.REPLAY

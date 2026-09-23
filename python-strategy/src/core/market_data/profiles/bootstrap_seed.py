@@ -434,24 +434,29 @@ def classify_bootstrap(
             raise BootstrapSeedError("CONFLICT")
         duration = timeframe_to_ms(stored.key.timeframe)
         end = completed_recorded_through_ms
-        count = 0
         if end is not None:
             _integer(end)
             if end < stored.cutover_ms or end % duration:
                 raise ValueError
-            count = (end - stored.cutover_ms) // duration + 1
-        if count > max_recorded_candles or len(recorded) != count:
+        if len(recorded) > max_recorded_candles or bool(recorded) != (end is not None):
             raise ValueError
-        for index, pair in enumerate(recorded):
+        previous = stored.cutover_ms - duration
+        for pair in recorded:
             if type(pair) is not tuple or len(pair) != 2:
                 raise ValueError
             outcome, pinned = pair
-            expected_key = stored.key.decision_key(stored.cutover_ms + index * duration)
+            if type(outcome) is not MarketDataDecisionOutcome:
+                raise ValueError
+            start = int(outcome.key.trigger_id.split(":")[1])
+            expected_key = stored.key.decision_key(start)
             if (
-                type(outcome) is not MarketDataDecisionOutcome
+                start <= previous
+                or start < stored.cutover_ms
+                or start % duration
                 or outcome.key != expected_key
             ):
                 raise ValueError
+            previous = start
             if outcome.disposition == "SKIPPED" and outcome.input_id is None:
                 # An orphan pin does not override terminal evidence that callback was skipped.
                 if pinned is not None and type(pinned) is not MarketDataDecisionInput:
@@ -464,6 +469,8 @@ def classify_bootstrap(
                 or pinned.requirements != wanted
             ):
                 raise ValueError
+        if recorded and previous != end:
+            raise ValueError
         return BootstrapDisposition.REPLAY
     except BootstrapSeedError:
         raise

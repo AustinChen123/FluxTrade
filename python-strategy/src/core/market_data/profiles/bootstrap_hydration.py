@@ -35,6 +35,8 @@ from .decision_owner import PreparedRecordedDecision
 
 @dataclass(frozen=True, slots=True)
 class BootstrapHydrationPlan:
+    """Actual participant sequence; the reader verifies complete batches across gaps."""
+
     seed: BootstrapSeed
     recorded: tuple[
         tuple[MarketDataDecisionOutcome, MarketDataDecisionInput | None], ...

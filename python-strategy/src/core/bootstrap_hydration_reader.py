@@ -42,6 +42,7 @@ from src.core.market_data.profiles.decision_owner import (
 from src.core.market_data.profiles.read_types import _integer
 from src.core.market_data.profiles.orm import MarketDataDecisionOutcome
 from src.strategies.base import BaseStrategy, StrategyRequirements
+from src.core.orm_models import Candlestick as CandleRow
 
 
 class BootstrapHydrationReaderError(ValueError):
@@ -303,17 +304,40 @@ class BootstrapHydrationReader:
         count = (boundary_bar_start_ms - seed.cutover_ms) // duration + (
             mode == "THROUGH_APPLIED"
         )
-        if count > self._max_recorded:
-            raise BootstrapHydrationReaderError()
-        through = seed.cutover_ms + (count - 1) * duration if count else None
+        through = None
         recorded, suffix = [], []
         if count:
             with self._sessions() as db:
-                for index in range(count):
+                candles = CandleRow.__table__
+                starts = db.execute(
+                    select(candles.c.timestamp)
+                    .where(
+                        candles.c.product_id == key.product_id,
+                        candles.c.timeframe == key.timeframe,
+                        candles.c.timestamp >= seed.cutover_ms,
+                        candles.c.timestamp <= boundary_bar_start_ms
+                        if mode == "THROUGH_APPLIED"
+                        else candles.c.timestamp < boundary_bar_start_ms,
+                    )
+                    .order_by(candles.c.timestamp)
+                    .execution_options(yield_per=128)
+                ).scalars()
+                previous = seed.cutover_ms - duration
+                for start in starts:
+                    if (
+                        type(start) is not int
+                        or start <= previous
+                        or start < seed.cutover_ms
+                        or start % duration
+                        or start > boundary_bar_start_ms
+                        or (start == boundary_bar_start_ms and mode == "BEFORE_PENDING")
+                    ):
+                        raise BootstrapHydrationReaderError()
+                    previous = start
                     candle, evidence = self._application.read_applied_candle(
                         product_id=key.product_id,
                         timeframe=key.timeframe,
-                        bar_start_ms=seed.cutover_ms + index * duration,
+                        bar_start_ms=start,
                         db=db,
                     )
                     if type(evidence) is not DecisionBatchRecord:
@@ -323,7 +347,9 @@ class BootstrapHydrationReader:
                         for i, outcome in enumerate(evidence.batch.outcomes)
                         if outcome.key.strategy_id == strategy.strategy_id
                     ]
-                    if len(positions) != 1:
+                    if not positions:
+                        continue
+                    if len(positions) != 1 or len(recorded) >= self._max_recorded:
                         raise BootstrapHydrationReaderError()
                     position = positions[0]
                     prepared = self._owner.prepare_replay_candle(
@@ -336,6 +362,7 @@ class BootstrapHydrationReader:
                         )
                     )
                     suffix.append((candle, prepared))
+                    through = start
         plan = BootstrapHydrationPlan(
             seed,
             tuple(recorded),
