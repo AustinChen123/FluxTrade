@@ -36,6 +36,47 @@ def _finite(table: str, *columns: str) -> tuple[CheckConstraint, ...]:
     )
 
 
+class BootstrapSeed(Base):
+    __tablename__ = "market_data_bootstrap_seed"
+    seed_id: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False, primary_key=True)
+    environment: Mapped[str] = mapped_column(String(128, collation="C"), nullable=False)
+    execution_scope_id: Mapped[str] = mapped_column(String(128, collation="C"), nullable=False)
+    strategy_id: Mapped[str] = mapped_column(String(128, collation="C"), nullable=False)
+    strategy_version: Mapped[str] = mapped_column(String(128, collation="C"), nullable=False)
+    config_hash: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    requirements_digest: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    policy_digest: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    dataset_digest: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    seed_digest: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    product_id: Mapped[str] = mapped_column(String(64), ForeignKey("product.id"), nullable=False)
+    timeframe: Mapped[str] = mapped_column(String(32, collation="C"), nullable=False)
+    contract_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    cutover_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    lookback: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    canonical_payload: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=text("date_trunc('milliseconds', clock_timestamp())"))
+    __table_args__ = (
+        UniqueConstraint("environment", "execution_scope_id", "strategy_id", "strategy_version", "config_hash", "product_id", "timeframe", "contract_version", name="uq_mbs_key"),
+        CheckConstraint("seed_id COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_mbs_seed_id"),
+        CheckConstraint("config_hash COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_mbs_config_hash"),
+        CheckConstraint("requirements_digest COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_mbs_requirements_digest"),
+        CheckConstraint("policy_digest COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_mbs_policy_digest"),
+        CheckConstraint("dataset_digest COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_mbs_dataset_digest"),
+        CheckConstraint("seed_digest COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_mbs_seed_digest"),
+        CheckConstraint("environment COLLATE \"C\" ~ '^[A-Za-z0-9_-]{1,128}$'", name="ck_mbs_environment"),
+        CheckConstraint("execution_scope_id COLLATE \"C\" ~ '^[A-Za-z0-9_-]{1,128}$'", name="ck_mbs_execution_scope_id"),
+        CheckConstraint("strategy_id COLLATE \"C\" ~ '^[A-Za-z0-9_-]{1,128}$'", name="ck_mbs_strategy_id"),
+        CheckConstraint("strategy_version COLLATE \"C\" ~ '^[A-Za-z0-9_-]{1,128}$'", name="ck_mbs_strategy_version"),
+        CheckConstraint("product_id COLLATE \"C\" ~ '^[A-Z0-9_]+:[A-Z0-9_-]+$'", name="ck_mbs_product"),
+        CheckConstraint("timeframe COLLATE \"C\" ~ '^[A-Za-z0-9_-]{1,32}$'", name="ck_mbs_timeframe"),
+        CheckConstraint("contract_version = 1", name="ck_mbs_contract"),
+        CheckConstraint("cutover_ms >= 0", name="ck_mbs_cutover"),
+        CheckConstraint("lookback >= 0", name="ck_mbs_lookback"),
+        CheckConstraint("octet_length(canonical_payload) BETWEEN 1 AND 33554432", name="ck_mbs_payload"),
+        CheckConstraint("recorded_at >= TIMESTAMPTZ '0001-01-01 00:00:00+00' AND recorded_at < TIMESTAMPTZ '10000-01-01 00:00:00+00' AND recorded_at = date_trunc('milliseconds', recorded_at)", name="ck_mbs_recorded"),
+    )
+
+
 class MarketDataDecisionBatch(Base):
     __tablename__ = "market_data_decision_batch"
     environment: Mapped[str] = mapped_column(String(64), nullable=False)
