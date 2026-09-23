@@ -64,7 +64,7 @@ class _AdmissionLease:
 class BootstrapSeedAdmission:
     """Granted shared lease; authority covers cooperating startup callers only.
 
-    SQL history authority is not configured; this handle is not ABSENT proof.
+    Any same-scope batch is UNKNOWN until bounded payload decoding is added.
     This does not enable activation or protect against raw writers.
     """
 
@@ -109,8 +109,79 @@ class BootstrapSeedAdmission:
                 raise ValueError
         except ValueError:
             raise BootstrapSeedAdmissionError() from None
-        # SQL history authority is not configured in this lifecycle slice.
-        raise BootstrapSeedAdmissionError()
+        # Boundary is evidence identity, never a history time filter.
+        try:
+            params = {
+                name: getattr(key, name)
+                for name in (
+                    "environment",
+                    "execution_scope_id",
+                    "strategy_id",
+                    "product_id",
+                    "timeframe",
+                )
+            }
+            scope = "environment=:environment AND execution_scope_id=:execution_scope_id AND product_id=:product_id"
+            queries = [
+                f"EXISTS (SELECT 1 FROM {table} WHERE {scope} AND strategy_id=:strategy_id AND {timeframe})"
+                for table, timeframe in (
+                    ("market_data_bootstrap_seed", "timeframe=:timeframe"),
+                    (
+                        "market_data_decision_input",
+                        "split_part(trigger_id, ':', 1)=:timeframe",
+                    ),
+                    ("market_data_decision_outcome", "timeframe=:timeframe"),
+                )
+            ]
+            present = self._lease.connection.execute(
+                text("SELECT " + " OR ".join(queries)), params
+            ).scalar_one()
+            if type(present) is not bool:
+                raise BootstrapSeedAdmissionError()
+            state = "PRESENT"
+            if not present:
+                batch = self._lease.connection.execute(
+                    text(
+                        f"SELECT EXISTS (SELECT 1 FROM market_data_decision_batch WHERE {scope} AND timeframe=:timeframe)"
+                    ),
+                    params,
+                ).scalar_one()
+                if type(batch) is not bool:
+                    raise BootstrapSeedAdmissionError()
+                state = "UNKNOWN"
+                if not batch:
+                    row = (
+                        self._lease.connection.execute(
+                            text(
+                                "SELECT status, version, (SELECT count(*) FROM strategy_state_transitions "
+                                "WHERE strategy_id=:strategy_id) AS audit_count, "
+                                "EXISTS (SELECT 1 FROM strategy_state_transitions WHERE strategy_id=:strategy_id "
+                                "AND (from_status NOT IN ('DISCOVERED','READY','WARNING') OR to_status NOT IN ('DISCOVERED','READY','WARNING'))) AS ran "
+                                "FROM strategy_state WHERE strategy_id=:strategy_id"
+                            ),
+                            {"strategy_id": key.strategy_id},
+                        )
+                        .mappings()
+                        .one_or_none()
+                    )
+                    if (
+                        row is not None
+                        and type(row["status"]) is str
+                        and type(row["version"]) is int
+                        and row["version"] >= 0
+                        and type(row["audit_count"]) is int
+                        and row["audit_count"] == row["version"]
+                        and row["ran"] is False
+                        and (
+                            row["status"] in ("READY", "WARNING")
+                            or row["status"] == "DISCOVERED"
+                            and row["version"] == 0
+                        )
+                    ):
+                        state = "ABSENT"
+            return BootstrapHistoryEvidence(key, boundary_bar_start_ms, state)
+        except Exception:
+            raise BootstrapSeedAdmissionError() from None
 
 
 def _admission_lock_key(key: BootstrapKey) -> int:

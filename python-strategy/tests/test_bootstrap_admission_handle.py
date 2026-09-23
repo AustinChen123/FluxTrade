@@ -37,8 +37,6 @@ def test_handle_closes_before_unlock(exit_kind):
             assert not hasattr(handle, "__dict__")
             with pytest.raises(FrozenInstanceError):
                 setattr(handle, "key", replace(key, strategy_id="other"))
-            with pytest.raises(BootstrapSeedAdmissionError):
-                handle.read_history(key, 60000)
             assert connection.execute.call_count == 1
             if exit_kind != "normal":
                 raise error
