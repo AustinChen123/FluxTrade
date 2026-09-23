@@ -5,11 +5,12 @@ authoritatively supplies completed (never pending) suffix evidence. No latest
 lookup, clock, provider, replay execution, or fallback is performed here.
 """
 
-from dataclasses import InitVar, asdict, dataclass
-from decimal import Decimal
+from dataclasses import InitVar, asdict, dataclass, fields
+from decimal import Decimal, DecimalException
 from enum import Enum
 import hashlib
 import json
+from typing import Any
 
 from src.core.data_provider import timeframe_to_ms
 from src.core.decimal_math import canonical_decimal_text
@@ -23,6 +24,9 @@ from .decision_input import (
     MAX_INPUT_BYTES,
     MAX_INPUT_NODES,
     MAX_INPUT_BINS_PER_PROFILE,
+    _context,
+    _decimal_text,
+    _keys,
 )
 from .publication import _canonical
 from .read_types import _hex, _integer, _safe
@@ -258,6 +262,99 @@ class BootstrapSeed:
     @property
     def digest(self) -> str:
         return hashlib.sha256(self.canonical_bytes).hexdigest()
+
+    @classmethod
+    def from_canonical_bytes(
+        cls, raw: bytes, *, max_seed_candles: int
+    ) -> "BootstrapSeed":
+        """Restore bounded bootstrap evidence only; never create a live input key."""
+
+        def pairs(items: list[tuple[str, Any]]) -> dict[str, Any]:
+            if len(dict(items)) != len(items):
+                raise ValueError
+            return dict(items)
+
+        def reject(value: str) -> Any:
+            raise ValueError
+
+        def versioned(value: Any, names: set[str]) -> dict[str, Any]:
+            row = _keys(value, names | {"schema_version"})
+            version = row.pop("schema_version")
+            if type(version) is not int or version != 1:
+                raise ValueError
+            return row
+
+        try:
+            _integer(max_seed_candles, 1)
+            if type(raw) is not bytes or len(raw) > MAX_BOOTSTRAP_BYTES:
+                raise ValueError
+            data = json.loads(
+                raw.decode("utf-8"),
+                object_pairs_hook=pairs,
+                parse_float=reject,
+                parse_constant=reject,
+            )
+            if (
+                _canonical(
+                    data, max_bytes=MAX_BOOTSTRAP_BYTES, max_nodes=MAX_BOOTSTRAP_BYTES
+                ).encode("utf-8")
+                != raw
+            ):
+                raise ValueError
+            row = versioned(data, {f.name for f in fields(cls)} | {"contract_version"})
+            version = row.pop("contract_version")
+            if type(version) is not int or version != 1:
+                raise ValueError
+            key = versioned(row["key"], {f.name for f in fields(BootstrapKey)})
+            requirements = row["requirements"]
+            candles = row["candles"]
+            if (
+                type(requirements) is not list
+                or len(requirements) > MAX_INPUT_PROFILES
+                or type(candles) is not list
+                or len(candles) > max_seed_candles
+            ):
+                raise ValueError
+            row["key"] = BootstrapKey(**key)
+            row["requirements"] = tuple(
+                ProfileRequirement(
+                    **versioned(r, {f.name for f in fields(ProfileRequirement)})
+                )
+                for r in requirements
+            )
+            decoded = []
+            for entry in candles:
+                entry = _keys(entry, {"candle", "modeled_evidence"})
+                evidence = entry["modeled_evidence"]
+                _canonical(
+                    evidence, max_bytes=MAX_INPUT_BYTES, max_nodes=MAX_INPUT_NODES
+                )
+                evidence = versioned(evidence, {"evidence_kind", "context"})
+                if evidence["evidence_kind"] != "BOOTSTRAP_MODELED":
+                    raise ValueError
+                values = _keys(
+                    entry["candle"],
+                    {"bar_start_ms", "open", "high", "low", "close", "volume"},
+                )
+                for name in ("open", "high", "low", "close", "volume"):
+                    values[name] = _decimal_text(values[name])
+                decoded.append(
+                    BootstrapCandle(**values, context=_context(evidence["context"]))
+                )
+            row["candles"] = tuple(decoded)
+            result = cls(**row, max_seed_candles=max_seed_candles)
+            if result.canonical_bytes != raw:
+                raise ValueError
+            return result
+        except (
+            ValueError,
+            TypeError,
+            OverflowError,
+            RecursionError,
+            KeyError,
+            DecimalException,
+        ):
+            raise BootstrapSeedError() from None
 
 
 class BootstrapDisposition(str, Enum):
