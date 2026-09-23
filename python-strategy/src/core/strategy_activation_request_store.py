@@ -270,18 +270,29 @@ def _validate_pending_identity(environment: str, strategy_id: str) -> None:
         raise ProfileActivationRequestValidationError()
 
 
-def _pending_request(
-    session: Session, environment: str, strategy_id: str, *, lock: bool
+def _request_in_status(
+    session: Session,
+    environment: str,
+    strategy_id: str,
+    *,
+    lock: bool,
+    status: str,
+    expected_state_version: int | None = None,
 ) -> ProfileActivationRequestRecord | None:
     statement = (
         select(_TABLE)
         .where(
             _TABLE.c.environment == environment,
             _TABLE.c.strategy_id == strategy_id,
-            _TABLE.c.status == "PENDING",
+            _TABLE.c.status == status,
         )
+        .order_by(_TABLE.c.request_id)
         .limit(2)
     )
+    if expected_state_version is not None:
+        statement = statement.where(
+            _TABLE.c.expected_state_version == expected_state_version
+        )
     rows = (
         session.execute(statement.with_for_update() if lock else statement)
         .mappings()
@@ -292,10 +303,15 @@ def _pending_request(
     if not rows:
         return None
     record = _hydrate(rows[0], cast(str, rows[0].get("request_id")))
-    if record.status is not ProfileActivationRequestStatus.PENDING or (
+    if record.status.value != status or (
         record.request.intent.key.environment,
         record.request.intent.key.strategy_id,
     ) != (environment, strategy_id):
+        raise ProfileActivationRequestIntegrityError()
+    if (
+        expected_state_version is not None
+        and record.request.intent.expected_state_version != expected_state_version
+    ):
         raise ProfileActivationRequestIntegrityError()
     return record
 
@@ -312,7 +328,9 @@ def lock_pending_profile_activation_request(
         or session.get_bind().dialect.name != "postgresql"
     ):
         raise ProfileActivationRequestValidationError()
-    return _pending_request(session, environment, strategy_id, lock=True)
+    return _request_in_status(
+        session, environment, strategy_id, lock=True, status="PENDING"
+    )
 
 
 class ProfileActivationRequestStore:
@@ -376,7 +394,30 @@ class ProfileActivationRequestStore:
     ) -> ProfileActivationRequestRecord | None:
         _validate_pending_identity(environment, strategy_id)
         with self._transaction(read_only=True) as session:
-            record = _pending_request(session, environment, strategy_id, lock=False)
+            record = _request_in_status(
+                session, environment, strategy_id, lock=False, status="PENDING"
+            )
+        return record
+
+    def get_consumed(
+        self, *, environment: str, strategy_id: str, expected_state_version: int
+    ) -> ProfileActivationRequestRecord | None:
+        """Read one activation generation, not the latest historical request."""
+        _validate_pending_identity(environment, strategy_id)
+        if (
+            type(expected_state_version) is not int
+            or not 0 <= expected_state_version <= 2**31 - 1
+        ):
+            raise ProfileActivationRequestValidationError()
+        with self._transaction(read_only=True) as session:
+            record = _request_in_status(
+                session,
+                environment,
+                strategy_id,
+                lock=False,
+                status="CONSUMED",
+                expected_state_version=expected_state_version,
+            )
         return record
 
     def list_pending(

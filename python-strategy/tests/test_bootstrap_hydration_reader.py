@@ -1,10 +1,11 @@
 import ast
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+from sqlalchemy.dialects.postgresql import dialect
 from typing import Any, cast
 
 from src.core.bootstrap_hydration_reader import (
@@ -233,6 +234,94 @@ def test_suffix_failure_closes_session_without_fallback():
         reader.prepare(strategy, plan.seed.cutover_ms + 60000)
     assert caught.value is error and events == ["enter", "closed"]
     seeds.pin.assert_not_called()
+
+
+@pytest.mark.parametrize("offset", [None, 0, 120_000])
+def test_latest_applied_exact_lineage_readonly(monkeypatch, offset):
+    reader, plan, strategy, *_ = harness()
+    db = MagicMock()
+    db.get_bind.return_value.dialect.name = "postgresql"
+    db.in_transaction.return_value = False
+    latest = None if offset is None else plan.seed.cutover_ms + offset
+    db.execute.return_value.scalar_one.return_value = latest
+    reader._sessions = lambda: nullcontext(db)
+    prepared = MagicMock()
+    monkeypatch.setattr(reader, "prepare", prepared)
+    assert reader.prepare_latest_applied(strategy) is prepared.return_value
+    prepared.assert_called_once_with(
+        strategy,
+        plan.seed.cutover_ms if latest is None else latest,
+        "BEFORE_PENDING" if latest is None else "THROUGH_APPLIED",
+    )
+    assert (
+        str(db.execute.call_args_list[0].args[0])
+        == "SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY"
+    )
+    query = db.execute.call_args_list[1].args[0].compile(dialect=dialect())
+    assert query.params == {
+        f"{name}_1": getattr(plan.seed.key, name)
+        for name in (
+            "environment",
+            "execution_scope_id",
+            "strategy_id",
+            "strategy_version",
+            "config_hash",
+            "product_id",
+            "timeframe",
+        )
+    } | {"trigger_kind_1": "CANDLE"}
+    assert "max(market_data_decision_outcome.bar_start_ms)" in str(query)
+    assert "market_data_application" not in str(query) and db.execute.call_count == 2
+    db.begin.return_value.__exit__.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "latest", [True, -1, 2**63, "60000", "early", "unaligned", "error"]
+)
+def test_latest_applied_invalid_or_error_no_prepare(monkeypatch, latest):
+    reader, plan, strategy, *_ = harness()
+    db = MagicMock()
+    db.get_bind.return_value.dialect.name = "postgresql"
+    db.in_transaction.return_value = False
+    reader._sessions = lambda: nullcontext(db)
+    if latest == "early":
+        latest = plan.seed.cutover_ms - 60_000
+    elif latest == "unaligned":
+        latest = plan.seed.cutover_ms + 1
+    error = RuntimeError("query failed")
+    if latest == "error":
+        db.execute.side_effect = error
+    else:
+        db.execute.return_value.scalar_one.return_value = latest
+    prepared = MagicMock()
+    monkeypatch.setattr(reader, "prepare", prepared)
+    with pytest.raises((BootstrapHydrationReaderError, RuntimeError)) as caught:
+        reader.prepare_latest_applied(strategy)
+    if latest == "error":
+        assert caught.value is error
+    prepared.assert_not_called()
+
+
+@pytest.mark.parametrize("damage", ["missing", "scope"])
+def test_latest_applied_seed_mismatch_before_sql(damage):
+    reader, plan, strategy, seeds, *_ = harness()
+    if damage == "missing":
+        seeds.get.return_value = None
+    elif damage == "scope":
+        seeds.get.return_value = BootstrapSeedRecord(
+            replace(
+                plan.seed,
+                key=replace(plan.seed.key, execution_scope_id="other"),
+                max_seed_candles=10,
+            ),
+            NOW,
+            True,
+        )
+    sessions = MagicMock(side_effect=AssertionError("unexpected SQL"))
+    reader._sessions = sessions
+    with pytest.raises(BootstrapHydrationReaderError):
+        reader.prepare_latest_applied(strategy)
+    sessions.assert_not_called()
 
 
 def test_dependency_boundary():

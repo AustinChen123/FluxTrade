@@ -10,6 +10,7 @@ from contextlib import AbstractContextManager
 from typing import Literal
 
 from sqlalchemy.orm import Session
+from sqlalchemy import func, select, text
 
 from src.core.data_provider import timeframe_to_ms
 from src.core.live_candle_application import LiveCandleApplicationService
@@ -39,6 +40,7 @@ from src.core.market_data.profiles.decision_owner import (
     IdentityResolver,
 )
 from src.core.market_data.profiles.read_types import _integer
+from src.core.market_data.profiles.orm import MarketDataDecisionOutcome
 from src.strategies.base import BaseStrategy, StrategyRequirements
 
 
@@ -207,6 +209,54 @@ class BootstrapHydrationReader:
         ):
             raise BootstrapHydrationReaderError()
         return result.record
+
+    def prepare_latest_applied(self, strategy: BaseStrategy) -> BoundBootstrapHydration:
+        """Use this strategy's terminal lineage, never the global candle head."""
+        key, requirements = self._initial_identity(strategy, 0)
+        record = self._seeds.get(key)
+        if (
+            type(record) is not BootstrapSeedRecord
+            or record.value.key != key
+            or record.value.requirements != requirements.profile_requirements
+            or record.value.lookback != requirements.lookback_window
+        ):
+            raise BootstrapHydrationReaderError()
+        table = MarketDataDecisionOutcome.__table__
+        with self._sessions() as db:
+            if db.get_bind().dialect.name != "postgresql" or db.in_transaction():
+                raise BootstrapHydrationReaderError()
+            with db.begin():
+                db.execute(
+                    text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY")
+                )
+                latest = db.execute(
+                    select(func.max(table.c.bar_start_ms)).where(
+                        *(
+                            getattr(table.c, name) == getattr(key, name)
+                            for name in (
+                                "environment",
+                                "execution_scope_id",
+                                "strategy_id",
+                                "strategy_version",
+                                "config_hash",
+                                "product_id",
+                                "timeframe",
+                            )
+                        ),
+                        table.c.trigger_kind == "CANDLE",
+                    )
+                ).scalar_one()
+        if latest is None:
+            return self.prepare(strategy, record.value.cutover_ms, "BEFORE_PENDING")
+        try:
+            _integer(latest)
+            if latest < record.value.cutover_ms or latest % timeframe_to_ms(
+                key.timeframe
+            ):
+                raise ValueError
+        except ValueError:
+            raise BootstrapHydrationReaderError() from None
+        return self.prepare(strategy, latest, "THROUGH_APPLIED")
 
     def prepare(
         self,

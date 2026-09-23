@@ -710,6 +710,111 @@ def test_pending_preflight_uses_fresh_readonly_transaction():
     assert "READ ONLY" in calls[0][0] and "FOR UPDATE" not in calls[-1][0]
 
 
+@pytest.mark.parametrize("count", [0, 1, 2])
+def test_consumed_discovery_bounded_readonly(count):
+    store, rows, sessions, calls, exits, factory = store_harness()
+    data = row() | dict(status="CONSUMED", terminal_at=NOW, terminal_reason="DONE")
+    rows[:] = [data] * count
+    if count == 2:
+        with pytest.raises(Integrity):
+            store.get_consumed(
+                environment="live", strategy_id="strategy", expected_state_version=0
+            )
+    else:
+        result = store.get_consumed(
+            environment="live", strategy_id="strategy", expected_state_version=0
+        )
+        assert result == (_hydrate(data, data["request_id"]) if count else None)
+    assert factory.call_count == 1 and len(sessions) == 1
+    assert exits == ["transaction", "session"]
+    assert "READ ONLY" in calls[0][0]
+    sql, params = calls[-1]
+    assert "FOR UPDATE" not in sql and "ORDER BY" in sql
+    assert set(params.values()) == {"live", "strategy", "CONSUMED", 2, 0}
+    assert "strategy_profile_activation_request.expected_state_version =" in sql
+
+
+@pytest.mark.parametrize("damage", ["status", "scope", "duplicate", "corrupt", "sql"])
+def test_consumed_discovery_fail_closed(damage):
+    store, rows, _, _, _, _ = store_harness()
+    rows[0].update(status="CONSUMED", terminal_at=NOW, terminal_reason="DONE")
+    kwargs: dict[str, Any] = dict(
+        environment="live", strategy_id="strategy", expected_state_version=0
+    )
+    if damage == "status":
+        rows[0].update(status="CANCELLED")
+    elif damage == "scope":
+        kwargs["strategy_id"] = "other"
+    elif damage == "duplicate":
+        rows.append(dict(rows[0]))
+    elif damage == "corrupt":
+        rows[0]["payload_digest"] = "bad"
+    else:
+        error = RuntimeError("query failed")
+        store._sessions = MagicMock(side_effect=error)
+        with pytest.raises(RuntimeError) as caught:
+            store.get_consumed(**kwargs)
+        assert caught.value is error
+        return
+    with pytest.raises(Integrity):
+        store.get_consumed(**kwargs)
+
+
+def test_consumed_generations_are_selected_exactly(monkeypatch):
+    records = []
+    for version in (0, 2):
+        value = replace(
+            request(),
+            idempotency_key=f"generation-{version}",
+            intent=replace(request().intent, expected_state_version=version),
+        )
+        records.append(
+            row()
+            | dict(
+                request_id=value.request_id,
+                canonical_payload=value.canonical_bytes,
+                payload_digest=value.payload_digest,
+                expected_state_version=version,
+                status="CONSUMED",
+                terminal_at=NOW,
+                terminal_reason="DONE",
+            )
+        )
+    db, store = MagicMock(), Store(MagicMock())
+
+    def execute(statement):
+        compiled = statement.compile(dialect=dialect())
+        version = compiled.params["expected_state_version_1"]
+        result = MagicMock()
+        result.mappings.return_value.all.return_value = [
+            r for r in records if r["expected_state_version"] == version
+        ]
+        return result
+
+    db.execute.side_effect = execute
+    monkeypatch.setattr(store, "_transaction", lambda **_: nullcontext(db))
+    for version, data in zip((0, 2), records, strict=True):
+        assert store.get_consumed(
+            environment="live", strategy_id="strategy", expected_state_version=version
+        ) == _hydrate(data, data["request_id"])
+
+
+def test_consumed_invalid_identity_zero_session():
+    store, *_, factory = store_harness()
+    with pytest.raises(Validation):
+        store.get_consumed(
+            environment="bad scope", strategy_id="strategy", expected_state_version=0
+        )
+    for version in (True, -1, 2**31):
+        with pytest.raises(Validation):
+            store.get_consumed(
+                environment="live",
+                strategy_id="strategy",
+                expected_state_version=version,
+            )
+    factory.assert_not_called()
+
+
 def test_list_pending_bounded_ordered_readonly(monkeypatch):
     assert owner.MAX_PENDING_ACTIVATION_REQUESTS == 256
     store, rows, sessions, calls, exits, factory = store_harness()
