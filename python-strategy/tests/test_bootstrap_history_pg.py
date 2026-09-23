@@ -23,7 +23,9 @@ from src.core.market_data.profiles.decision_input_store import DecisionInputStor
 from src.core.market_data.profiles.decision_application import MarketDataDecisionOutcome
 from src.core.market_data.profiles.decision_application_store import (
     append_decision_batch,
+    _header,
 )
+from src.core.market_data.profiles.orm import MarketDataDecisionBatch as BatchRow
 from src.core.market_data.profiles.repository import TransactionWaitPolicy
 from test_profile_bootstrap_seed_store_pg import sample
 from test_profile_decision_input import sample as decision_input
@@ -88,7 +90,8 @@ def test_real_lifecycle_audit(
         ("orphan_input", "PRESENT"),
         ("outcome", "PRESENT"),
         ("receipt", "ABSENT"),
-        ("empty_batch", "UNKNOWN"),
+        ("empty_batch", "ABSENT"),
+        ("target_header_only", "UNKNOWN"),
     ],
 )
 def test_real_row_precedence_and_ignored_version_config_boundary(
@@ -121,12 +124,15 @@ def test_real_row_precedence_and_ignored_version_config_boundary(
             db.flush()
             if evidence != "receipt":
                 terminal = batch()
-                if evidence == "outcome":
+                if evidence in ("outcome", "target_header_only"):
                     outcome = MarketDataDecisionOutcome(
                         key(), "SKIPPED", None, None, "INPUT_STORE_FAILED"
                     )
                     terminal = batch((key(),), (outcome,))
-                append_decision_batch(db, terminal)
+                if evidence == "target_header_only":
+                    db.execute(insert(BatchRow).values(**_header(terminal)))
+                else:
+                    append_decision_batch(db, terminal)
     wanted = replace(sample().key, strategy_version="different", config_hash="f" * 64)
     with store.initial_admission(wanted) as admission:
         # Even C=0 cannot hide later immutable lineage history.

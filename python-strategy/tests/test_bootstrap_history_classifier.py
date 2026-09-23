@@ -9,13 +9,14 @@ from src.core.market_data.profiles.bootstrap_seed_store import (
 )
 from test_bootstrap_seed_admission import harness
 from test_profile_bootstrap_seed import seed
+from test_profile_bootstrap_history import row as batch_row, KEY
+from src.core.market_data.profiles import bootstrap_seed_store as owner
 
 
-def run(*, present=False, batch=False, row=None, error=None, error_at=1):
+def run(*, present=False, batch=(), row=None, error=None, error_at=1):
     store, _, connection, _ = harness()
     original = connection.execute.side_effect
     queries = []
-    replies = iter((present, batch))
 
     def execute(sql, params):
         sql = str(sql)
@@ -26,7 +27,9 @@ def run(*, present=False, batch=False, row=None, error=None, error_at=1):
             raise error
         if "FROM strategy_state WHERE" in sql:
             return MagicMock(mappings=lambda: MagicMock(one_or_none=lambda: row))
-        return MagicMock(scalar_one=lambda: next(replies))
+        if "FROM market_data_decision_batch" in sql:
+            return MagicMock(mappings=lambda: MagicMock(all=lambda: batch))
+        return MagicMock(scalar_one=lambda: present)
 
     connection.execute.side_effect = execute
     return store, connection, queries
@@ -77,18 +80,21 @@ def test_clean_absent_and_exact_sql_scope_and_binds():
     assert queries[2][1] == {"strategy_id": key.strategy_id}
 
 
-def test_present_precedes_batch_and_lifecycle():
+def test_present_precedes_batch_and_lifecycle(monkeypatch):
+    classifier = MagicMock(side_effect=AssertionError("PRESENT must short-circuit"))
+    monkeypatch.setattr(owner, "classify_batch_history", classifier)
     store, connection, queries = run(present=True)
     key = replace(seed().key, strategy_version="v2", config_hash="f" * 64)
     with store.initial_admission(key) as handle:
         assert handle.read_history(key, 0).state == "PRESENT"
     assert len(queries) == 1 and connection.execute.call_count == 3
+    classifier.assert_not_called()
 
 
-def test_any_batch_is_conservative_unknown_until_bounded_codec_slice():
-    store, _, queries = run(batch=True)
-    with store.initial_admission(seed().key) as handle:
-        assert handle.read_history(seed().key, 0).state == "UNKNOWN"
+def test_target_batch_without_outcome_is_unknown():
+    store, _, queries = run(batch=(batch_row(strategy="s"),))
+    with store.initial_admission(KEY) as handle:
+        assert handle.read_history(KEY, 0).state == "UNKNOWN"
     assert len(queries) == 2
 
 
@@ -210,3 +216,41 @@ def test_malformed_lifecycle_cannot_prove_absence(row):
                 handle.read_history(seed().key, 0)
         else:
             assert handle.read_history(seed().key, 0).state == "UNKNOWN"
+
+
+@pytest.mark.parametrize(
+    "count,expected", [(0, "ABSENT"), (1, "ABSENT"), (32, "ABSENT"), (33, "UNKNOWN")]
+)
+def test_bounded_batch_query_and_unique_classifier(count, expected, monkeypatch):
+    rows = [batch_row(i * 60000) for i in range(count)]
+    store, _, queries = run(
+        batch=rows, row=dict(status="DISCOVERED", version=0, audit_count=0, ran=False)
+    )
+    classifier = MagicMock(wraps=owner.classify_batch_history)
+    monkeypatch.setattr(owner, "classify_batch_history", classifier)
+    with store.initial_admission(KEY) as handle:
+        assert handle.read_history(KEY, 0).state == expected
+    classifier.assert_called_once_with(tuple(rows), KEY)
+    assert type(classifier.call_args.args[0]) is tuple
+    assert len(queries) == (2 if count == 33 else 3)
+    assert queries[1] == (
+        "SELECT environment, execution_scope_id, product_id, timeframe, bar_start_ms, "
+        "contract_version, participant_count, canonical_payload, batch_digest "
+        "FROM market_data_decision_batch WHERE environment=:environment AND "
+        "execution_scope_id=:execution_scope_id AND product_id=:product_id AND timeframe=:timeframe "
+        "ORDER BY bar_start_ms ASC LIMIT :batch_limit",
+        dict(
+            environment=KEY.environment,
+            execution_scope_id=KEY.execution_scope_id,
+            product_id=KEY.product_id,
+            timeframe=KEY.timeframe,
+            batch_limit=33,
+        ),
+    )
+
+
+def test_malformed_batch_stops_before_lifecycle():
+    store, _, queries = run(batch=(batch_row() | {"batch_digest": "f" * 64},))
+    with store.initial_admission(KEY) as handle:
+        assert handle.read_history(KEY, 0).state == "UNKNOWN"
+    assert len(queries) == 2

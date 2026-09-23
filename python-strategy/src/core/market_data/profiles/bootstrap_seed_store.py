@@ -7,7 +7,7 @@ policy digest is the seed's already-bound availability policy digest. C is conte
 not part of the durable key. This owner makes no callback/replay completion claim.
 """
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -29,6 +29,7 @@ from .bootstrap_seed import (
 )
 from .orm import BootstrapSeed as InputRow
 from .repository import TransactionWaitPolicy
+from .bootstrap_history import classify_batch_history, MAX_HISTORY_BATCH_ROWS
 from .read_types import _integer
 from src.core.data_provider import timeframe_to_ms
 
@@ -64,7 +65,7 @@ class _AdmissionLease:
 class BootstrapSeedAdmission:
     """Granted shared lease; authority covers cooperating startup callers only.
 
-    Any same-scope batch is UNKNOWN until bounded payload decoding is added.
+    Bounded batch verification precedes lifecycle absence classification.
     This does not enable activation or protect against raw writers.
     """
 
@@ -140,16 +141,31 @@ class BootstrapSeedAdmission:
                 raise BootstrapSeedAdmissionError()
             state = "PRESENT"
             if not present:
-                batch = self._lease.connection.execute(
-                    text(
-                        f"SELECT EXISTS (SELECT 1 FROM market_data_decision_batch WHERE {scope} AND timeframe=:timeframe)"
-                    ),
-                    params,
-                ).scalar_one()
-                if type(batch) is not bool:
-                    raise BootstrapSeedAdmissionError()
+                rows = (
+                    self._lease.connection.execute(
+                        text(
+                            "SELECT environment, execution_scope_id, product_id, timeframe, "
+                            "bar_start_ms, contract_version, participant_count, canonical_payload, batch_digest "
+                            f"FROM market_data_decision_batch WHERE {scope} AND timeframe=:timeframe "
+                            "ORDER BY bar_start_ms ASC LIMIT :batch_limit"
+                        ),
+                        {
+                            name: value
+                            for name, value in params.items()
+                            if name != "strategy_id"
+                        }
+                        | {"batch_limit": MAX_HISTORY_BATCH_ROWS + 1},
+                    )
+                    .mappings()
+                    .all()
+                )
                 state = "UNKNOWN"
-                if not batch:
+                if (
+                    classify_batch_history(
+                        cast(tuple[Mapping[str, object], ...], tuple(rows)), key
+                    )
+                    == "CLEAR"
+                ):
                     row = (
                         self._lease.connection.execute(
                             text(
