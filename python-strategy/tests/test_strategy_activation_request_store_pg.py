@@ -22,6 +22,7 @@ from src.core.strategy_activation_request_store import (
     ProfileActivationRequestConflict as Conflict,
     ProfileActivationRequestStale as Stale,
     ProfileActivationRequestStatus as Status,
+    terminalize_profile_activation_request as terminalize,
 )
 from test_profile_activation_request import request
 
@@ -33,6 +34,184 @@ pytestmark = [
         reason="explicit isolated PostgreSQL opt-in required",
     ),
 ]
+
+
+@contextmanager
+def terminal_sql_log(engine):
+    statements = []
+
+    def capture(conn, cursor, statement, parameters, context, executemany):
+        if "strategy_profile_activation_request" in statement:
+            statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        yield statements
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+
+
+@pytest.mark.parametrize("status", [Status.CONSUMED, Status.CANCELLED, Status.STALE])
+def test_terminal_commit_and_exact_reentry(profile_repository_pg, status):
+    engine, value = profile_repository_pg, request()
+    prepare(engine, value)
+    store = Store(sessionmaker(engine))
+    admitted = store.admit(value, current=value.intent)
+    with Session(engine) as session, session.begin():
+        result = terminalize(
+            session,
+            value,
+            status=status,
+            terminal_at=admitted.requested_at,
+            terminal_reason="DONE",
+        )
+        assert session.in_transaction()
+        assert (
+            session.execute(
+                text("SELECT status FROM strategy_profile_activation_request")
+            ).scalar_one()
+            == status.value
+        )
+    assert store.confirm(value) == result
+    with terminal_sql_log(engine) as sql, Session(engine) as session, session.begin():
+        assert (
+            terminalize(
+                session,
+                value,
+                status=status,
+                terminal_at=admitted.requested_at,
+                terminal_reason="DONE",
+            )
+            == result
+        )
+    assert not any(statement.startswith("UPDATE") for statement in sql)
+    assert store.confirm(value) == result and count(engine) == 1
+
+
+@pytest.mark.parametrize("phase", ["rollback", "ack_lost"])
+def test_terminal_caller_transaction_faults(profile_repository_pg, phase):
+    engine, value = profile_repository_pg, request()
+    prepare(engine, value)
+    store = Store(sessionmaker(engine))
+    admitted = store.admit(value, current=value.intent)
+    error = RuntimeError("fixed caller transaction fault")
+    result = None
+    with terminal_sql_log(engine) as sql, pytest.raises(RuntimeError) as caught:
+        with Session(engine) as session:
+            with session.begin():
+                result = terminalize(
+                    session,
+                    value,
+                    status=Status.CONSUMED,
+                    terminal_at=admitted.requested_at,
+                    terminal_reason="DONE",
+                )
+                assert (
+                    session.execute(
+                        text("SELECT status FROM strategy_profile_activation_request")
+                    ).scalar_one()
+                    == "CONSUMED"
+                )
+                if phase == "rollback":
+                    raise error
+            raise error  # The real transaction has committed: simulate lost ACK.
+    assert caught.value is error
+    assert result is not None
+    assert sum(statement.startswith("UPDATE") for statement in sql) == 1
+    assert store.confirm(value) == (admitted if phase == "rollback" else result)
+    assert count(engine) == 1
+
+
+@pytest.mark.parametrize("same", [True, False])
+def test_terminal_two_backend_race(profile_repository_pg, same):
+    engine, value = profile_repository_pg, request()
+    prepare(engine, value)
+    store = Store(sessionmaker(engine))
+    admitted = store.admit(value, current=value.intent)
+    barrier, pids = Barrier(2), []
+
+    def attempt(status):
+        with engine.connect() as connection:
+            pids.append(
+                connection.execute(text("SELECT pg_backend_pid()")).scalar_one()
+            )
+            connection.rollback()
+            with Session(bind=connection) as session:
+                try:
+                    with session.begin():
+                        session.execute(
+                            text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+                        )
+                        assert (
+                            session.execute(
+                                text("SHOW transaction_isolation")
+                            ).scalar_one()
+                            == "read committed"
+                        )
+                        barrier.wait(timeout=10)
+                        result = terminalize(
+                            session,
+                            value,
+                            status=status,
+                            terminal_at=admitted.requested_at,
+                            terminal_reason="DONE",
+                        )
+                    return result
+                except Conflict:
+                    return None
+
+    with terminal_sql_log(engine) as sql, ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [
+            pool.submit(attempt, status)
+            for status in (
+                Status.CONSUMED,
+                Status.CONSUMED if same else Status.CANCELLED,
+            )
+        ]
+        results = [future.result(timeout=15) for future in futures]
+    assert len(set(pids)) == 2
+    assert sum(statement.startswith("UPDATE") for statement in sql) == 1
+    winner = store.confirm(value)
+    assert winner is not None and winner.status is not Status.PENDING
+    assert results.count(None) == (0 if same else 1)
+    assert all(result == winner for result in results if result is not None)
+    assert count(engine) == 1
+
+
+def test_terminal_row_lock_timeout_has_no_retry(profile_repository_pg):
+    engine, value = profile_repository_pg, request()
+    prepare(engine, value)
+    store = Store(sessionmaker(engine))
+    admitted = store.admit(value, current=value.intent)
+    with engine.connect() as holder:
+        holder_pid = holder.execute(text("SELECT pg_backend_pid()")).scalar_one()
+        holder.execute(
+            text(
+                "SELECT request_id FROM strategy_profile_activation_request WHERE request_id=:id FOR UPDATE"
+            ),
+            {"id": value.request_id},
+        )
+        with engine.connect() as contender:
+            assert (
+                contender.execute(text("SELECT pg_backend_pid()")).scalar_one()
+                != holder_pid
+            )
+            contender.rollback()
+            with terminal_sql_log(engine) as sql, Session(bind=contender) as session:
+                with pytest.raises(DBAPIError) as caught:
+                    with session.begin():
+                        session.execute(text("SET LOCAL lock_timeout='25ms'"))
+                        terminalize(
+                            session,
+                            value,
+                            status=Status.CONSUMED,
+                            terminal_at=admitted.requested_at,
+                            terminal_reason="DONE",
+                        )
+                assert cast(Any, caught.value.orig).pgcode == "55P03"
+            assert len(sql) == 1 and "FOR UPDATE" in sql[0]
+        holder.rollback()
+    assert store.confirm(value) == admitted
 
 
 def prepare(engine, *values):
