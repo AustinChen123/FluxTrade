@@ -3,6 +3,8 @@
 from dataclasses import dataclass
 from typing import Protocol
 
+from src.core.data_provider import timeframe_to_ms
+
 from .context_enrichment import (
     ProfileContextEnrichmentError,
     validate_profile_context_coverage,
@@ -27,6 +29,22 @@ class ModeledProfileContextProvider(Protocol):
 class ModeledProfileInputError(ValueError):
     def __init__(self) -> None:
         super().__init__("MODELED_PROFILE_INPUT_INVALID")
+
+
+def completed_candle_decision_time_ms(candle_timestamp_ms: int, timeframe: str) -> int:
+    """Return the exclusive end of one completed decision candle."""
+    try:
+        _integer(candle_timestamp_ms)
+        if type(timeframe) is not str:
+            raise ValueError
+        duration_ms = timeframe_to_ms(timeframe)
+        if type(duration_ms) is not int or duration_ms <= 0:
+            raise ValueError
+        result = candle_timestamp_ms + duration_ms
+        _integer(result)
+        return result
+    except (IndexError, TypeError, ValueError):
+        raise ModeledProfileInputError() from None
 
 
 @dataclass(frozen=True, slots=True)

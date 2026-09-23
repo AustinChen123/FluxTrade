@@ -11,6 +11,7 @@ from src.core.market_data.profiles.decision_context import (
 from src.core.market_data.profiles.modeled_input import (
     ModeledProfileInput,
     ModeledProfileInputError,
+    completed_candle_decision_time_ms,
 )
 from src.core.market_data.profiles.requirements import ProfileRequirement
 from test_profile_context_enrichment import fixture
@@ -18,6 +19,40 @@ from test_profile_context_enrichment import fixture
 DAY = 86_400_000
 DECISION = DAY + 3
 POLICY = "utc_day_0020_conservative_v1"
+
+
+@pytest.mark.parametrize(
+    ("timestamp", "timeframe", "expected"),
+    [
+        (DAY - 60_000, "1m", DAY),
+        (DAY, "1m", DAY + 60_000),
+        (DAY, "7d", 8 * DAY),
+        (DAY, "30d", 31 * DAY),
+    ],
+)
+def test_completed_decision_time_is_exclusive_candle_end(
+    timestamp, timeframe, expected
+):
+    assert completed_candle_decision_time_ms(timestamp, timeframe) == expected
+
+
+@pytest.mark.parametrize(
+    ("timestamp", "timeframe"),
+    [
+        (True, "1m"),
+        (-1, "1m"),
+        ((1 << 63) - 59_999, "1m"),
+        (0, "0m"),
+        (0, "-1m"),
+        (0, ""),
+        (0, None),
+    ],
+)
+def test_completed_decision_time_rejects_invalid_or_overflowing_input(
+    timestamp, timeframe
+):
+    with pytest.raises(ModeledProfileInputError):
+        completed_candle_decision_time_ms(cast(Any, timestamp), cast(Any, timeframe))
 
 
 class Provider:
