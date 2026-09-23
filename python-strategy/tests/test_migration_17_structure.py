@@ -30,7 +30,7 @@ def test_invalidation_is_only_new_head() -> None:
     config = Config()
     config.set_main_option("script_location", str(ROOT))
     script = ScriptDirectory.from_config(config)
-    assert script.get_heads() == ["c84f1a92d607"]
+    assert script.get_heads() == ["d95a2b73e608"]
     revision = script.get_revision(REVISION)
     assert revision is not None and revision.down_revision == "6c2f8a91d4e7"
     assert re.fullmatch(r"[0-9a-f]{12}", REVISION)

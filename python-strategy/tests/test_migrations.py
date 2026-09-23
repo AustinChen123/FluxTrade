@@ -2271,6 +2271,7 @@ def test_live_application_terminal_atomic_pg(profile_repository_pg: Engine, monk
 # Selected non-legacy tables that must exist at HEAD and be gone
 # after a full downgrade to ``base``.
 HEAD_ONLY_TABLES = {
+    "strategy_profile_activation_request",
     "market_data_bootstrap_seed",
     "market_data_decision_batch",
     "market_data_decision_outcome",
@@ -3078,7 +3079,7 @@ def test_order_identity_incompatible_downgrade_keeps_scoped_indexes(
                 conn.execute(
                     text("SELECT version_num FROM alembic_version")
                 ).scalar_one()
-                == "c84f1a92d607"
+                == "d95a2b73e608"
             )
     finally:
         engine.dispose()

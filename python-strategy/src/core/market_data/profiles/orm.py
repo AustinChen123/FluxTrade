@@ -36,6 +36,78 @@ def _finite(table: str, *columns: str) -> tuple[CheckConstraint, ...]:
     )
 
 
+class ProfileActivationRequest(Base):
+    __tablename__ = "strategy_profile_activation_request"
+    request_id: Mapped[str] = mapped_column(String(64, collation="C"), primary_key=True)
+    environment: Mapped[str] = mapped_column(String(128, collation="C"))
+    execution_scope_id: Mapped[str] = mapped_column(String(128, collation="C"))
+    strategy_id: Mapped[str] = mapped_column(
+        String(128, collation="C"), ForeignKey("strategy.id")
+    )
+    expected_state_version: Mapped[int] = mapped_column(Integer)
+    canonical_payload: Mapped[bytes] = mapped_column(LargeBinary)
+    payload_digest: Mapped[str] = mapped_column(String(64, collation="C"))
+    contract_version: Mapped[int] = mapped_column(Integer)
+    requested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=text("date_trunc('milliseconds', clock_timestamp())"),
+    )
+    status: Mapped[str] = mapped_column(String(16, collation="C"))
+    terminal_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    terminal_reason: Mapped[str | None] = mapped_column(String(128, collation="C"))
+    __table_args__ = (
+        *(
+            CheckConstraint(
+                f"{column} COLLATE \"C\" ~ '^[0-9a-f]{{64}}$'", name=f"ck_spar_{column}"
+            )
+            for column in ("request_id", "payload_digest")
+        ),
+        *(
+            CheckConstraint(
+                f"{column} COLLATE \"C\" ~ '^[A-Za-z0-9_-]{{1,128}}$'",
+                name=f"ck_spar_{column}",
+            )
+            for column in ("environment", "execution_scope_id", "strategy_id")
+        ),
+        CheckConstraint(
+            "expected_state_version BETWEEN 0 AND 2147483647", name="ck_spar_version"
+        ),
+        CheckConstraint("contract_version = 1", name="ck_spar_contract"),
+        CheckConstraint(
+            "octet_length(canonical_payload) BETWEEN 1 AND 65536",
+            name="ck_spar_payload",
+        ),
+        CheckConstraint(
+            "status IN ('PENDING', 'CONSUMED', 'CANCELLED', 'STALE')",
+            name="ck_spar_status",
+        ),
+        CheckConstraint(
+            "(status = 'PENDING' AND terminal_at IS NULL AND terminal_reason IS NULL) OR (status <> 'PENDING' AND terminal_at IS NOT NULL AND terminal_reason IS NOT NULL)",
+            name="ck_spar_terminal",
+        ),
+        CheckConstraint(
+            "terminal_reason COLLATE \"C\" ~ '^[A-Z][A-Z0-9_]{0,127}$'",
+            name="ck_spar_reason",
+        ),
+        CheckConstraint(
+            "requested_at >= TIMESTAMPTZ '0001-01-01 00:00:00+00' AND requested_at < TIMESTAMPTZ '10000-01-01 00:00:00+00' AND requested_at = date_trunc('milliseconds', requested_at)",
+            name="ck_spar_requested",
+        ),
+        CheckConstraint(
+            "terminal_at >= requested_at AND terminal_at >= TIMESTAMPTZ '0001-01-01 00:00:00+00' AND terminal_at < TIMESTAMPTZ '10000-01-01 00:00:00+00' AND terminal_at = date_trunc('milliseconds', terminal_at)",
+            name="ck_spar_terminal_time",
+        ),
+        Index(
+            "uq_spar_pending",
+            "environment",
+            "execution_scope_id",
+            "strategy_id",
+            unique=True,
+            postgresql_where=text("status = 'PENDING'"),
+        ),
+    )
+
+
 class BootstrapSeed(Base):
     __tablename__ = "market_data_bootstrap_seed"
     seed_id: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False, primary_key=True)

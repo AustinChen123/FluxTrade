@@ -39,7 +39,7 @@ def test_head_parity_and_guard():
     config = Config(str(ROOT / "alembic.ini"))
     config.set_main_option("script_location", str(ROOT / "alembic"))
     script = ScriptDirectory.from_config(config)
-    assert script.get_heads() == ["c84f1a92d607"]
+    assert script.get_heads() == ["d95a2b73e608"]
     revision = script.get_revision(REVISION)
     assert revision is not None and revision.down_revision == "2f6c8a1e9b04"
     up = sql("upgrade")
