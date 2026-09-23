@@ -100,6 +100,30 @@ class StrategyHydrationService:
         self.sync_position_state(instance)
         return len(candles)
 
+    def hydrate_candles(
+        self,
+        instance: BaseStrategy,
+        candles: tuple[Candlestick, ...],
+        *,
+        decision_scope_loader: StrategyDecisionScopeLoader,
+    ) -> int:
+        """Replay supplied candles once; caller exposes the instance only on success.
+
+        Failure may leave this private instance partially hydrated. No publication,
+        rollback, retry, or authoritative-history claim is made by this method.
+        """
+        if (
+            not callable(decision_scope_loader)
+            or type(candles) is not tuple
+            or any(type(c) is not Candlestick for c in candles)
+        ):
+            raise ValueError("invalid hydration candles")
+        self._signal_processor.warm_up(
+            instance, list(candles), decision_scope_loader=decision_scope_loader
+        )
+        self.sync_position_state(instance)
+        return len(candles)
+
     @staticmethod
     def fresh_instance_for_replay(current: BaseStrategy) -> BaseStrategy:
         current_configuration = current.replay_configuration()
