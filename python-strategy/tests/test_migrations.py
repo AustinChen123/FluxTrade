@@ -38,7 +38,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from threading import Barrier, Event
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import sqlalchemy as sa
@@ -1716,6 +1716,208 @@ def _schema_fingerprint(engine: Engine) -> tuple:
 # --------------------------------------------------------------------------- #
 # Tests
 # --------------------------------------------------------------------------- #
+
+
+def _activation_request_row(engine: Engine):
+    from test_profile_activation_request import request
+
+    value = request()
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO strategy (id, name, configuration_json) "
+                "VALUES (:id, 'fixture', '{}')"
+            ),
+            {"id": value.intent.key.strategy_id},
+        )
+    table = sa.Table(
+        "strategy_profile_activation_request", sa.MetaData(), autoload_with=engine
+    )
+    row = dict(
+        request_id=value.request_id,
+        environment=value.intent.key.environment,
+        execution_scope_id=value.intent.key.execution_scope_id,
+        strategy_id=value.intent.key.strategy_id,
+        expected_state_version=value.intent.expected_state_version,
+        canonical_payload=value.canonical_bytes,
+        payload_digest=value.payload_digest,
+        contract_version=1,
+        status="PENDING",
+    )
+    return table, row, value
+
+
+@pytest.mark.parametrize("terminal", ["CONSUMED", "CANCELLED", "STALE"])
+def test_profile_activation_request_lifecycle_pg(
+    profile_repository_pg: Engine, terminal: str
+) -> None:
+    engine = profile_repository_pg
+    table, row, value = _activation_request_row(engine)
+    with engine.begin() as conn:
+        original = dict(
+            conn.execute(table.insert().values(**row).returning(table)).mappings().one()
+        )
+    stamp = original["requested_at"]
+    assert stamp.utcoffset() == timedelta(0) and stamp.microsecond % 1000 == 0
+    assert bytes(original["canonical_payload"]) == value.canonical_bytes
+    assert original["request_id"] == value.command_ref
+    assert original["payload_digest"] == value.payload_digest
+    second = replace(value, idempotency_key="second")
+    next_row = {
+        **row,
+        "request_id": second.request_id,
+        "canonical_payload": second.canonical_bytes,
+        "payload_digest": second.payload_digest,
+    }
+    with pytest.raises(DBAPIError) as caught, engine.begin() as conn:
+        conn.execute(table.insert().values(**next_row))
+    assert cast(Any, caught.value.orig).pgcode == "23505"
+    assert cast(Any, caught.value.orig).diag.constraint_name == "uq_spar_pending"
+    updates = [
+        {"status": "PENDING"},
+        {"status": terminal, "terminal_at": stamp, "terminal_reason": "DONE"},
+    ]
+    # Every immutable field is challenged during an otherwise valid transition.
+    for name, changed in {
+        "request_id": "f" * 64,
+        "environment": "other",
+        "execution_scope_id": "other",
+        "strategy_id": "other",
+        "expected_state_version": 1,
+        "canonical_payload": b"{}",
+        "payload_digest": "f" * 64,
+        "contract_version": 2,
+        "requested_at": stamp - timedelta(milliseconds=1),
+    }.items():
+        updates.append({**updates[1], name: changed})
+    for changes in [updates[0], *updates[2:]]:
+        with pytest.raises(DBAPIError) as caught, engine.begin() as conn:
+            conn.execute(table.update().values(**changes))
+        assert cast(Any, caught.value.orig).pgcode == "55000"
+        assert (
+            "guard_profile_activation_request()"
+            in cast(Any, caught.value.orig).diag.context
+        )
+    with engine.begin() as conn:
+        conn.execute(table.update().values(**updates[1]))
+        conn.execute(table.insert().values(**next_row))
+    with engine.connect() as conn:
+        terminal_row = dict(
+            conn.execute(table.select().where(table.c.request_id == value.request_id))
+            .mappings()
+            .one()
+        )
+    assert terminal_row == {**original, **updates[1]}
+    for changes in (
+        {"status": terminal},
+        {"status": "PENDING", "terminal_at": None, "terminal_reason": None},
+    ):
+        with pytest.raises(DBAPIError) as caught, engine.begin() as conn:
+            conn.execute(
+                table.update()
+                .where(table.c.request_id == value.request_id)
+                .values(**changes)
+            )
+        assert cast(Any, caught.value.orig).pgcode == "55000"
+    for statement in (
+        "DELETE FROM strategy_profile_activation_request",
+        "DELETE FROM strategy_profile_activation_request WHERE false",
+        "TRUNCATE strategy_profile_activation_request",
+    ):
+        with pytest.raises(DBAPIError) as caught, engine.begin() as conn:
+            conn.execute(text(statement))
+        assert cast(Any, caught.value.orig).pgcode == "55000"
+        assert (
+            "guard_profile_activation_request()"
+            in cast(Any, caught.value.orig).diag.context
+        )
+    with engine.connect() as conn:
+        rows = conn.execute(table.select().order_by(table.c.status)).mappings().all()
+    assert len(rows) == 2
+    assert (
+        next(dict(r) for r in rows if r["request_id"] == value.request_id)
+        == terminal_row
+    )
+    assert (
+        next(r for r in rows if r["request_id"] == second.request_id)["status"]
+        == "PENDING"
+    )
+
+
+def test_profile_activation_request_constraints_pg(
+    profile_repository_pg: Engine,
+) -> None:
+    engine = profile_repository_pg
+    table, row, _ = _activation_request_row(engine)
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    invalid = [
+        {"canonical_payload": b""},
+        {"canonical_payload": b"x" * 65537},
+        {"request_id": "A" * 64},
+        {"payload_digest": "short"},
+        {"expected_state_version": -1},
+        {"expected_state_version": 2147483648},
+        {"contract_version": 2},
+        {"status": "UNKNOWN"},
+        {"environment": "bad!"},
+        {"execution_scope_id": "bad!"},
+        {"status": "CONSUMED"},
+        {"terminal_at": now},
+        {"terminal_reason": "DONE"},
+        {"status": "STALE", "terminal_at": now},
+        {"status": "CANCELLED", "terminal_reason": "DONE"},
+    ]
+    terminal = {"status": "CONSUMED", "terminal_at": now, "terminal_reason": "DONE"}
+    invalid += [
+        {**terminal, "terminal_reason": reason}
+        for reason in ("", "bad", "É", "A" * 129, "A-B")
+    ]
+    invalid.append({**terminal, "terminal_at": now - timedelta(milliseconds=1)})
+    for column, fields, constraint in (
+        ("requested_at", {}, "ck_spar_requested"),
+        ("terminal_at", terminal, "ck_spar_terminal_time"),
+    ):
+        for timestamp in (
+            "infinity",
+            "-infinity",
+            "10000-01-01 00:00:00+00",
+            "2026-01-01 00:00:00.000001+00",
+        ):
+            candidate = {
+                **row,
+                "requested_at": now,
+                **fields,
+                column: sa.literal_column(f"TIMESTAMPTZ '{timestamp}'"),
+            }
+            with pytest.raises(DBAPIError) as caught, engine.begin() as conn:
+                conn.execute(table.insert().values(**candidate))
+            assert cast(Any, caught.value.orig).pgcode == "23514"
+            assert cast(Any, caught.value.orig).diag.constraint_name == constraint
+    for changes in invalid:
+        with pytest.raises(DBAPIError) as caught, engine.begin() as conn:
+            conn.execute(
+                table.insert().values(**{**row, "requested_at": now, **changes})
+            )
+        assert cast(Any, caught.value.orig).pgcode in ("23514", "22003", "22001")
+    with pytest.raises(DBAPIError) as caught, engine.begin() as conn:
+        conn.execute(table.insert().values(**{**row, "strategy_id": "absent"}))
+    assert cast(Any, caught.value.orig).pgcode == "23503"
+    # Exact byte/version/reason boundaries remain accepted (rolled back per case).
+    for changes in (
+        {"canonical_payload": b"x" * 65536, "expected_state_version": 2147483647},
+        {**terminal, "terminal_reason": "A" * 128},
+    ):
+        with engine.connect() as conn:
+            transaction = conn.begin()
+            conn.execute(
+                table.insert().values(**{**row, "requested_at": now, **changes})
+            )
+            transaction.rollback()
+    with engine.connect() as conn:
+        assert (
+            conn.execute(sa.select(sa.func.count()).select_from(table)).scalar_one()
+            == 0
+        )
 
 
 def test_decision_input_constraints_and_immutable_dml(
