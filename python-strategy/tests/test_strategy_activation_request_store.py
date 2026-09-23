@@ -327,3 +327,174 @@ def test_fresh_postgres_guard(guard):
     with pytest.raises(Integrity):
         store.get(request().request_id)
     assert calls == []
+
+
+def admission_harness(
+    existing=None, slot=None, version=0, winner=True, pk_loser=None, slot_loser=None
+):
+    store, _, sessions, calls, exits, factory = store_harness()
+    context = factory.side_effect()
+    factory.side_effect = lambda: context
+    state = dict(ids=0, slots=0)
+
+    def execute(statement):
+        compiled = statement.compile(dialect=dialect())
+        sql = str(compiled)
+        calls.append((sql, compiled.params))
+        result = MagicMock()
+        if "FOR UPDATE" in sql:
+            result.one_or_none.return_value = None if version is None else (version,)
+        elif sql.startswith("INSERT"):
+            result.mappings.return_value.one_or_none.return_value = (
+                row() if winner else None
+            )
+        elif "FROM strategy_profile_activation_request" in sql:
+            name = "slots" if "status =" in sql else "ids"
+            selected = (
+                (slot if state[name] == 0 else slot_loser)
+                if name == "slots"
+                else (existing if state[name] == 0 else pk_loser)
+            )
+            state[name] += 1
+            result.mappings.return_value.all.return_value = (
+                [] if selected is None else [selected]
+            )
+        return result
+
+    sessions[0].execute.side_effect = execute
+    return store, calls, exits, factory, sessions[0]
+
+
+def test_admission_order_lock_bind_and_one_insert():
+    store, calls, exits, factory, _ = admission_harness()
+    value = request()
+    assert store.admit(value, current=value.intent).request == value
+    assert exits == ["transaction", "session"] and factory.call_count == 1
+    assert calls[0][0] == "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"
+    assert calls[1][1] == {"lock_timeout": "2000ms", "statement_timeout": "10000ms"}
+    assert "TimeZone" in calls[1][0]
+    assert "FOR UPDATE" in calls[2][0] and calls[2][1] == {
+        "strategy_id_1": value.intent.key.strategy_id
+    }
+    assert "request_id =" in calls[3][0]
+    assert calls[4][1] == {
+        "environment_1": "live",
+        "execution_scope_id_1": "deployment",
+        "strategy_id_1": "strategy",
+        "status_1": "PENDING",
+        "param_1": 2,
+    }
+    assert "ON CONFLICT DO NOTHING RETURNING" in calls[5][0] and len(calls) == 6
+    assert calls[5][1] == {
+        k: v
+        for k, v in row().items()
+        if k not in ("requested_at", "terminal_at", "terminal_reason")
+    }
+
+
+@pytest.mark.parametrize("status", list(Status))
+@pytest.mark.parametrize("version", [99, True, -1, 1 << 31])
+def test_existing_before_stale_current_and_locked_version(status, version):
+    data = row()
+    data.update(status=status.value)
+    if status is not Status.PENDING:
+        data.update(terminal_at=NOW, terminal_reason="DONE")
+    store, calls, *_ = admission_harness(existing=data, version=version)
+    value = request()
+    current = replace(value.intent, expected_state_version=99)
+    if version == 99:
+        assert store.admit(value, current=current).status is status
+    else:
+        with pytest.raises(Integrity):
+            store.admit(value, current=current)
+    assert len(calls) == (4 if version == 99 else 3)
+
+
+@pytest.mark.parametrize(
+    "damage",
+    ["current", "version", "missing_state", "conflict", "corrupt"],
+)
+def test_admission_rejection_never_inserts(damage):
+    value = request()
+    kwargs: dict[str, Any] = {}
+    current = value.intent
+    expected = Integrity
+    if damage == "current":
+        current = replace(
+            current, requirements=replace(current.requirements, lookback_window=3)
+        )
+        expected = owner.ProfileActivationRequestStale
+    elif damage in ("version", "missing_state"):
+        kwargs["version"] = 1 if damage == "version" else None
+        if damage == "version":
+            expected = owner.ProfileActivationRequestStale
+    else:
+        data = row()
+        if damage == "conflict":
+            changed = replace(value, command=type(value.command).RESUME)
+            data.update(
+                canonical_payload=changed.canonical_bytes,
+                payload_digest=changed.payload_digest,
+            )
+            expected = Conflict
+        elif damage == "corrupt":
+            data["payload_digest"] = "SECRET"
+        kwargs["existing"] = data
+    store, calls, *_ = admission_harness(**kwargs)
+    with pytest.raises(expected):
+        store.admit(value, current=current)
+    assert not any(sql.startswith("INSERT") for sql, _ in calls)
+
+
+@pytest.mark.parametrize(
+    "loser",
+    "pk none slot slot_different slot_corrupt early early_different early_corrupt".split(),
+)
+def test_single_insert_loser_readback(loser):
+    data = row()
+    if "different" in loser:
+        changed = replace(request(), idempotency_key="other")
+        data.update(
+            request_id=changed.request_id,
+            canonical_payload=changed.canonical_bytes,
+            payload_digest=changed.payload_digest,
+        )
+    if "corrupt" in loser:
+        data["payload_digest"] = "SECRET"
+    store, calls, *_ = admission_harness(
+        winner=False,
+        slot=data if loser.startswith("early") else None,
+        pk_loser=row() if loser == "pk" else None,
+        slot_loser=data if loser.startswith("slot") else None,
+    )
+    value = request()
+    if loser in ("pk", "slot", "early"):
+        assert store.admit(value, current=value.intent).request == value
+    else:
+        with pytest.raises(Conflict if "different" in loser else Integrity):
+            store.admit(value, current=value.intent)
+    assert sum(sql.startswith("INSERT") for sql, _ in calls) == int(
+        not loser.startswith("early")
+    )
+    assert len(calls) == (5 if loser.startswith("early") else 7 if loser == "pk" else 8)
+
+
+@pytest.mark.parametrize("phase", ["query", "exit"])
+@pytest.mark.parametrize("error", [RuntimeError("SECRET"), KeyboardInterrupt()])
+def test_admission_error_identity(phase, error):
+    store, _, _, factory, session = admission_harness()
+    if phase == "query":
+        session.execute.side_effect = error
+    else:
+        session.begin.return_value.__exit__.side_effect = error
+    with pytest.raises(type(error)) as caught:
+        store.admit(request(), current=request().intent)
+    assert caught.value is error and factory.call_count == 1
+
+
+def test_admission_exact_inputs_before_session():
+    store, _, _, _, _, factory = store_harness()
+    for args in ((None, request().intent), (request(), None)):
+        with pytest.raises(Validation):
+            store.admit(cast(Any, args[0]), current=cast(Any, args[1]))
+    factory.assert_not_called()

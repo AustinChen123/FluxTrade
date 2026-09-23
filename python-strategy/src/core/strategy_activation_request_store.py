@@ -1,8 +1,8 @@
-"""Strict durable readback only; no admission, writes, retries or runtime work."""
+"""Durable request admission/readback; no terminal mutations, retries or runtime work."""
 
 from dataclasses import dataclass
-from collections.abc import Callable
-from contextlib import AbstractContextManager
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, contextmanager
 from datetime import datetime, timezone
 import re
 from typing import Any, cast
@@ -10,10 +10,15 @@ from enum import Enum
 from sqlalchemy.engine import RowMapping
 from sqlalchemy import Table, select, text
 from sqlalchemy.orm import Session
+from sqlalchemy.dialects.postgresql import insert
+from src.core.orm_models import StrategyState
 
 from src.core.strategy_activation_intent import (
     ProfileActivationRequest,
     MAX_ACTIVATION_REQUEST_BYTES,
+    ProfileActivationIntent,
+    ProfileActivationAdmission,
+    classify_profile_activation_intent,
 )
 from src.core.market_data.profiles.orm import ProfileActivationRequest as RequestRow
 from src.core.market_data.profiles.repository import TransactionWaitPolicy
@@ -29,6 +34,11 @@ class ProfileActivationRequestValidationError(ValueError):
 class ProfileActivationRequestConflict(ValueError):
     def __init__(self) -> None:
         super().__init__("PROFILE_ACTIVATION_REQUEST_CONFLICT")
+
+
+class ProfileActivationRequestStale(ValueError):
+    def __init__(self) -> None:
+        super().__init__("PROFILE_ACTIVATION_REQUEST_STALE")
 
 
 class ProfileActivationRequestIntegrityError(ValueError):
@@ -137,8 +147,8 @@ class ProfileActivationRequestStore:
             raise ProfileActivationRequestValidationError()
         self._sessions, self._policy = sessions, policy
 
-    def get(self, request_id: str) -> ProfileActivationRequestRecord | None:
-        _validate_request_id(request_id)
+    @contextmanager
+    def _transaction(self, *, read_only: bool) -> Iterator[Session]:
         with self._sessions() as session:
             if (
                 session.get_bind().dialect.name != "postgresql"
@@ -147,7 +157,10 @@ class ProfileActivationRequestStore:
                 raise ProfileActivationRequestIntegrityError()
             with session.begin():
                 session.execute(
-                    text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY")
+                    text(
+                        "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"
+                        + (", READ ONLY" if read_only else "")
+                    )
                 )
                 session.execute(
                     text(
@@ -159,17 +172,103 @@ class ProfileActivationRequestStore:
                         statement_timeout=f"{self._policy.statement_timeout_ms}ms",
                     )
                 )
-                rows = (
-                    session.execute(
-                        select(_TABLE).where(_TABLE.c.request_id == request_id).limit(2)
-                    )
-                    .mappings()
-                    .all()
-                )
-                if len(rows) > 1:
-                    raise ProfileActivationRequestIntegrityError()
-                record = _hydrate(rows[0], request_id) if rows else None
+                yield session
+
+    @staticmethod
+    def _lookup(
+        session: Session, predicate: Any
+    ) -> ProfileActivationRequestRecord | None:
+        rows = (
+            session.execute(select(_TABLE).where(predicate).limit(2)).mappings().all()
+        )
+        if len(rows) > 1:
+            raise ProfileActivationRequestIntegrityError()
+        return _hydrate(rows[0], rows[0]["request_id"]) if rows else None
+
+    def get(self, request_id: str) -> ProfileActivationRequestRecord | None:
+        _validate_request_id(request_id)
+        with self._transaction(read_only=True) as session:
+            record = self._lookup(session, _TABLE.c.request_id == request_id)
+            if record is not None and record.request.request_id != request_id:
+                raise ProfileActivationRequestIntegrityError()
         return record
+
+    def admit(
+        self, request: ProfileActivationRequest, *, current: ProfileActivationIntent
+    ) -> ProfileActivationRequestRecord:
+        """Current is a trusted artifact/config/requirements snapshot supplied by caller.
+        This store neither reconstructs nor authorizes that snapshot.
+        """
+        if (
+            type(request) is not ProfileActivationRequest
+            or type(current) is not ProfileActivationIntent
+        ):
+            raise ProfileActivationRequestValidationError()
+        key = request.intent.key
+        with self._transaction(read_only=False) as session:
+            state = session.execute(
+                select(StrategyState.version)
+                .where(StrategyState.strategy_id == key.strategy_id)
+                .with_for_update()
+            ).one_or_none()
+            if state is None:
+                raise ProfileActivationRequestIntegrityError()
+            version = state[0]
+            if type(version) is not int or not 0 <= version <= 2147483647:
+                raise ProfileActivationRequestIntegrityError()
+            existing = self._lookup(session, _TABLE.c.request_id == request.request_id)
+            if existing is None:
+                if (
+                    classify_profile_activation_intent(
+                        request.intent, current=current, pending=None
+                    )
+                    is ProfileActivationAdmission.STALE
+                    or version != request.intent.expected_state_version
+                ):
+                    raise ProfileActivationRequestStale()
+                slot = (
+                    (_TABLE.c.environment == key.environment)
+                    & (_TABLE.c.execution_scope_id == key.execution_scope_id)
+                    & (_TABLE.c.strategy_id == key.strategy_id)
+                    & (_TABLE.c.status == "PENDING")
+                )
+                existing = self._lookup(session, slot)
+                if existing is None:
+                    values = dict(
+                        request_id=request.request_id,
+                        environment=key.environment,
+                        execution_scope_id=key.execution_scope_id,
+                        strategy_id=key.strategy_id,
+                        expected_state_version=request.intent.expected_state_version,
+                        canonical_payload=request.canonical_bytes,
+                        payload_digest=request.payload_digest,
+                        contract_version=1,
+                        status="PENDING",
+                    )
+                    winner = (
+                        session.execute(
+                            insert(_TABLE)
+                            .values(**values)
+                            .on_conflict_do_nothing()
+                            .returning(_TABLE)
+                        )
+                        .mappings()
+                        .one_or_none()
+                    )
+                    existing = (
+                        _hydrate(winner, request.request_id)
+                        if winner is not None
+                        else self._lookup(
+                            session, _TABLE.c.request_id == request.request_id
+                        )
+                    )
+                    if existing is None:
+                        existing = self._lookup(session, slot)
+                        if existing is None:
+                            raise ProfileActivationRequestIntegrityError()
+            if existing.request.canonical_bytes != request.canonical_bytes:
+                raise ProfileActivationRequestConflict()
+        return existing
 
     def confirm(
         self, expected: ProfileActivationRequest
