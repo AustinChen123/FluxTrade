@@ -44,7 +44,7 @@ class _ProfileStrategy(DummyStrategy):
 
 
 class _NoContextProfileStrategy(_ProfileStrategy):
-    def on_candle(self, candle):
+    def on_candle(self, candle):  # pyright: ignore[reportIncompatibleMethodOverride]
         return None
 
 

@@ -24,8 +24,8 @@ class Reader:
         self.outputs = iter(outputs)
         self.calls = []
 
-    def get_manifest(self, pinned):
-        self.calls.append(pinned)
+    def get_manifest(self, manifest):
+        self.calls.append(manifest)
         value = next(self.outputs)
         if isinstance(value, BaseException):
             raise value
