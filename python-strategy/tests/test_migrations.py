@@ -1848,11 +1848,14 @@ def test_decision_input_constraints_and_immutable_dml(
         "UPDATE market_data_decision_input SET strategy_id='changed' WHERE false",
         "DELETE FROM market_data_decision_input",
         "DELETE FROM market_data_decision_input WHERE false",
-        "TRUNCATE market_data_decision_input",
+        "TRUNCATE market_data_decision_input CASCADE",
     ):
         with pytest.raises(DBAPIError) as caught, engine.begin() as conn:
             conn.execute(text(statement))
         assert getattr(caught.value.orig, "pgcode", None) == "55000"
+        guard_context = getattr(getattr(caught.value.orig, "diag", None), "context", None)
+        assert isinstance(guard_context, str)
+        assert "reject_market_data_decision_input_mutation()" in guard_context
         with engine.connect() as conn:
             assert dict(conn.execute(sa.select(table)).mappings().one()) == first
 
