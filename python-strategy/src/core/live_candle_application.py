@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import time
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -16,6 +17,7 @@ from src.core.models import Candlestick
 from src.core.orm_models import Candlestick as ORMCandlestick
 from src.core.orm_models import MarketDataApplication
 from src.core.product_master import ensure_product_registered
+from src.core.product_registry import validate_product_id
 from src.core.market_data.profiles.decision_application import MarketDataDecisionBatch
 from src.core.market_data.profiles.decision_application_store import (
     DecisionBatchIntegrityError,
@@ -102,10 +104,55 @@ class LiveCandleApplicationService:
                 return self.applied_decision_batch(candle, db=owned_db)
         applied, batch = self._applied_state(candle, db)
         if not applied:
-            raise RuntimeError(
-                "cannot read decision evidence for an unapplied candle"
-            )
+            raise RuntimeError("cannot read decision evidence for an unapplied candle")
         return batch
+
+    def read_applied_candle(
+        self,
+        *,
+        product_id: str,
+        timeframe: str,
+        bar_start_ms: int,
+        db: Session,
+    ) -> tuple[Candlestick, MarketDataDecisionBatch]:
+        """Read one canonical candle and complete contract evidence in caller session."""
+        if (
+            self._environment_identity() != "live"
+            or type(product_id) is not str
+            or not 1 <= len(product_id) <= 64
+            or type(timeframe) is not str
+            or re.fullmatch(r"[A-Za-z0-9_-]{1,32}", timeframe) is None
+            or type(bar_start_ms) is not int
+            or not 0 <= bar_start_ms <= 2**63 - 1
+        ):
+            raise DecisionBatchIntegrityError()
+        try:
+            validate_product_id(product_id)
+        except ValueError:
+            raise DecisionBatchIntegrityError() from None
+        identity = (product_id, timeframe, bar_start_ms)
+        row = db.get(ORMCandlestick, identity)
+        if row is None or (row.product_id, row.timeframe, row.timestamp) != identity:
+            raise DecisionBatchIntegrityError()
+        values = tuple(
+            getattr(row, name) for name in ("open", "high", "low", "close", "volume")
+        )
+        if any(type(value) is not Decimal or not value.is_finite() for value in values):
+            raise DecisionBatchIntegrityError()
+        candle = Candlestick(
+            product_id=product_id,
+            timeframe=timeframe,
+            timestamp=bar_start_ms,
+            open=values[0],
+            high=values[1],
+            low=values[2],
+            close=values[3],
+            volume=values[4],
+        )
+        applied, batch = self._applied_state(candle, db)
+        if not applied or batch is None:
+            raise DecisionBatchIntegrityError()
+        return candle, batch
 
     def _applied_state(
         self,
