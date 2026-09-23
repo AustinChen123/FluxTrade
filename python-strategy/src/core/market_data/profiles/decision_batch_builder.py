@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from contextlib import AbstractContextManager, contextmanager
-from typing import Iterator, TypeVar
+from contextlib import AbstractContextManager
+from types import TracebackType
+from typing import TypeVar
 
-from src.core.models import Candlestick
+from src.core.models import Candlestick, Signal
 
 from .decision_application import (
     MAX_DECISION_BATCH_PARTICIPANTS,
@@ -77,6 +78,8 @@ class DecisionBatchBuilder:
         input_id: str,
         input_digest: str,
         context: _Context,
+        signal_suppressed: bool = False,
+        suppression_reason: str | None = None,
     ) -> AbstractContextManager[_Context]:
         """Record APPLIED only after the wrapped callback returns normally."""
         try:
@@ -85,21 +88,42 @@ class DecisionBatchBuilder:
                 disposition="APPLIED",
                 input_id=input_id,
                 input_digest=input_digest,
+                signal_suppressed=signal_suppressed,
+                suppression_reason=suppression_reason,
             )
         except ValueError:
             raise DecisionBatchBuildError() from None
         self._admit(key)
 
-        @contextmanager
-        def scope() -> Iterator[_Context]:
-            try:
-                yield context
-            except BaseException:
-                raise
-            else:
-                self._outcomes[key.strategy_id] = outcome
+        outcomes = self._outcomes
 
-        return scope()
+        class AppliedScope(AbstractContextManager):
+            _state = "NEW"
+
+            def __enter__(self) -> _Context:
+                if self._state != "NEW":
+                    raise DecisionBatchBuildError()
+                self._state = "ENTERED"
+                return context
+
+            def __exit__(
+                self,
+                exc_type: type[BaseException] | None,
+                exc: BaseException | None,
+                traceback: TracebackType | None,
+            ) -> bool:
+                if self._state != "ENTERED":
+                    raise DecisionBatchBuildError()
+                self._state = "CLOSED"
+                if exc_type is None:
+                    outcomes[key.strategy_id] = outcome
+                return False
+
+            def filter_callback_signals(self, signals: list[Signal]) -> list[Signal]:
+                """Suppression affects signals only, never completed callback state."""
+                return [] if signal_suppressed else signals
+
+        return AppliedScope()
 
     def record_skipped(
         self,

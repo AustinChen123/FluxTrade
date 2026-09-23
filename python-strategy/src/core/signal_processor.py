@@ -10,7 +10,7 @@ from contextlib import AbstractContextManager, nullcontext
 from collections.abc import Callable
 from decimal import Decimal
 from enum import Enum
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, cast
 
 from src.core.client_order_id import market_signal_client_order_id
 from src.core.models import Candlestick, Signal, SignalType, Trade
@@ -268,6 +268,18 @@ class SignalProcessor:
                         raise
                     else:
                         manager.__exit__(None, None, None)
+                        policy = getattr(manager, "filter_callback_signals", None)
+                        if policy is not None:
+                            if not callable(policy):
+                                raise TypeError("invalid callback signal policy")
+                            filtered = policy(signals)
+                            if type(filtered) not in (list, tuple) or any(
+                                type(signal) is not Signal for signal in filtered
+                            ):
+                                raise TypeError("invalid callback signal policy result")
+                            signals = list(
+                                cast(list[Signal] | tuple[Signal, ...], filtered)
+                            )
                 decisions.append((strategy.strategy_id, signals))
 
             if emit_signals:
