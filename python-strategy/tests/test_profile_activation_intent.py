@@ -53,9 +53,12 @@ def test_pure_contract_import_boundary():
     allowed = {
         "dataclasses.dataclass",
         "dataclasses.field",
+        "typing.Self",
         "enum.Enum",
         "src.core.market_data.profiles.bootstrap_seed.BootstrapKey",
         "src.strategies.base.StrategyRequirements",
+        "src.strategies.base.StrategyContextCapability",
+        "src.core.market_data.profiles.requirements.ProfileRequirement",
     }
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):

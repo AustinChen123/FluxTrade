@@ -1,5 +1,7 @@
 from dataclasses import FrozenInstanceError, replace
 from typing import Any, cast
+import json
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -119,6 +121,10 @@ class Text(str):
     pass
 
 
+class Bytes(bytes):
+    pass
+
+
 @pytest.mark.parametrize("field,limit", [("actor", 64), ("idempotency_key", 128)])
 def test_text_domain_and_bounds(field, limit):
     value = request()
@@ -186,3 +192,170 @@ def test_collection_permutation_and_admission_caps(monkeypatch):
     )
     with pytest.raises(Error):
         replace(value)
+
+
+def wire(change=lambda data: None):
+    data = json.loads(request().canonical_bytes)
+    change(data)
+    return json.dumps(
+        data, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode()
+
+
+def test_decoder_roundtrip():
+    value = request()
+    decoded = Request.from_canonical_bytes(value.canonical_bytes)
+    assert type(decoded) is Request and decoded == value
+    assert decoded.canonical_bytes == value.canonical_bytes
+    with pytest.raises(Error):
+        Request.from_canonical_bytes(Bytes(value.canonical_bytes))
+
+
+PATHS = [
+    (),
+    ("intent",),
+    ("intent", "key"),
+    ("intent", "requirements"),
+    ("intent", "requirements", "profile_requirements", 0),
+]
+
+
+@pytest.mark.parametrize("path", PATHS)
+@pytest.mark.parametrize("damage", ["missing", "unknown", "duplicate", "list"])
+def test_exact_nested_shapes(path, damage):
+    data = json.loads(request().canonical_bytes)
+    node = data
+    for part in path:
+        node = node[part]
+    key = next(iter(node))
+    if damage == "missing":
+        del node[key]
+    elif damage == "unknown":
+        node["SECRET"] = 1
+    elif damage == "list":
+        if not path:
+            data = []
+        else:
+            parent = data
+            for part in path[:-1]:
+                parent = parent[part]
+            parent[path[-1]] = []
+    raw = json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
+    if damage == "duplicate":
+        fragment = json.dumps(node, sort_keys=True, separators=(",", ":")).encode()
+        duplicated = b"{" + json.dumps(key).encode() + b":null," + fragment[1:]
+        raw = raw.replace(fragment, duplicated, 1)
+    with pytest.raises(Error, match="^PROFILE_ACTIVATION_REQUEST_INVALID$") as caught:
+        Request.from_canonical_bytes(raw)
+    assert caught.value.__cause__ is None and "SECRET" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "path,value",
+    [
+        (("schema_version",), True),
+        (("intent", "key", "schema_version"), True),
+        (("intent", "key", "contract_version"), True),
+        (("intent", "requirements", "profile_requirements", 0, "schema_version"), True),
+        (
+            ("intent", "requirements", "required_context_capabilities"),
+            ["ENTRY_RISK", "ENTRY_RISK"],
+        ),
+        (("intent", "requirements", "required_context_capabilities"), ["SECRET"]),
+        (("intent", "requirements", "required_context_capabilities"), [True]),
+        (("command_ref",), "a" * 64),
+        (("actor",), "é"),
+        (("actor",), "a\x00"),
+        (("intent", "expected_state_version"), True),
+        (("command",), True),
+    ],
+)
+def test_decoder_domain_mutations(path, value):
+    def change(data):
+        node = data
+        for part in path[:-1]:
+            node = node[part]
+        node[path[-1]] = value
+
+    with pytest.raises(Error):
+        Request.from_canonical_bytes(wire(change))
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        None,
+        True,
+        "{}",
+        bytearray(b"{}"),
+        b"",
+        b"\xff",
+        b"\xef\xbb\xbf{}",
+        b'{"x":1.0}',
+        b'{"x":NaN}',
+        b'{"x":Infinity}',
+        b'{"x":-Infinity}',
+        b'{"actor":"\\ud800"}',
+    ],
+)
+def test_decoder_raw_rejections(raw):
+    with pytest.raises(Error):
+        Request.from_canonical_bytes(raw)
+
+
+@pytest.mark.parametrize(
+    "damage", ["space", "keys", "profiles", "escape", "float", "surrogate"]
+)
+def test_noncanonical_valid_shape_rejected(damage):
+    raw = request().canonical_bytes
+    if damage == "space":
+        raw += b" "
+    elif damage == "keys":
+        raw = json.dumps(dict(reversed(list(json.loads(raw).items())))).encode()
+    elif damage == "profiles":
+        raw = wire(
+            lambda d: d["intent"]["requirements"]["profile_requirements"].reverse()
+        )
+    elif damage == "escape":
+        raw = raw.replace(b'"ops"', b'"\\u006fps"')
+    elif damage == "float":
+        raw = raw.replace(b'"lookback_window":2', b'"lookback_window":2.0')
+    else:
+        raw = raw.replace(b'"ops"', b'"\\ud800"')
+    with pytest.raises(Error):
+        Request.from_canonical_bytes(raw)
+
+
+def test_profile_count_admission_before_constructor(monkeypatch):
+    def oversized(data):
+        requirements = data["intent"]["requirements"]
+        requirements["profile_requirements"] = (
+            requirements["profile_requirements"][:1] * 33
+        )
+
+    raw = wire(oversized)
+    constructor = MagicMock(side_effect=AssertionError("must not construct"))
+    monkeypatch.setattr(owner, "ProfileRequirement", constructor)
+    with pytest.raises(Error):
+        Request.from_canonical_bytes(raw)
+    constructor.assert_not_called()
+
+
+def test_raw_size_gate_before_json_parser(monkeypatch):
+    parser = MagicMock(side_effect=ValueError("SECRET"))
+    monkeypatch.setattr(owner.json, "loads", parser)
+    for size in (65536, 65537):
+        parser.reset_mock()
+        with pytest.raises(Error) as caught:
+            Request.from_canonical_bytes(b" " * size)
+        assert parser.call_count == int(size == 65536)
+        assert str(caught.value) == "PROFILE_ACTIVATION_REQUEST_INVALID"
+        assert caught.value.__cause__ is None
+
+
+def test_decoder_does_not_swallow_base_exception(monkeypatch):
+    error = KeyboardInterrupt()
+    monkeypatch.setattr(owner.json, "loads", MagicMock(side_effect=error))
+    with pytest.raises(KeyboardInterrupt) as caught:
+        Request.from_canonical_bytes(b"{}")
+    assert caught.value is error

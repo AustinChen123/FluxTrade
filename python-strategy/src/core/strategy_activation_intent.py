@@ -4,9 +4,11 @@ from dataclasses import dataclass, field
 from enum import Enum
 import hashlib
 import json
+from typing import Self
 
 from src.core.market_data.profiles.bootstrap_seed import BootstrapKey
-from src.strategies.base import StrategyRequirements
+from src.core.market_data.profiles.requirements import ProfileRequirement
+from src.strategies.base import StrategyRequirements, StrategyContextCapability
 
 MAX_ACTIVATION_REQUEST_BYTES = 65536
 
@@ -30,6 +32,30 @@ def _canonical(value: object) -> bytes:
         ensure_ascii=False,
         allow_nan=False,
     ).encode("utf-8")
+
+
+def _pairs(pairs: list[tuple[str, object]]) -> dict:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError
+        result[key] = value
+    return result
+
+
+def _reject_number(value: str) -> None:
+    raise ValueError
+
+
+def _shape(value: object, fields: str) -> dict:
+    if type(value) is not dict or set(value) != set(fields.split()):
+        raise ValueError
+    return value
+
+
+def _version(value: object) -> None:
+    if type(value) is not int or value != 1:
+        raise ValueError
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +137,89 @@ class ProfileActivationRequest:
     @property
     def payload_digest(self) -> str:
         return hashlib.sha256(self.canonical_bytes).hexdigest()
+
+    @classmethod
+    def from_canonical_bytes(cls, raw: bytes) -> Self:
+        try:
+            if (
+                type(raw) is not bytes
+                or not 1 <= len(raw) <= MAX_ACTIVATION_REQUEST_BYTES
+            ):
+                raise ValueError
+            data = _shape(
+                json.loads(
+                    raw.decode("utf-8"),
+                    object_pairs_hook=_pairs,
+                    parse_float=_reject_number,
+                    parse_constant=_reject_number,
+                ),
+                "schema_version actor idempotency_key command command_ref intent",
+            )
+            _version(data["schema_version"])
+            intent = _shape(data["intent"], "key requirements expected_state_version")
+            key = _shape(
+                intent["key"],
+                "schema_version contract_version environment execution_scope_id strategy_id strategy_version config_hash product_id timeframe",
+            )
+            _version(key["schema_version"])
+            _version(key["contract_version"])
+            requirements = _shape(
+                intent["requirements"],
+                "product_id timeframe lookback_window required_context_capabilities profile_requirements",
+            )
+            profiles = requirements["profile_requirements"]
+            capabilities = requirements["required_context_capabilities"]
+            if (
+                type(profiles) is not list
+                or not 1 <= len(profiles) <= 32
+                or type(capabilities) is not list
+                or any(type(c) is not str for c in capabilities)
+                or len(set(capabilities)) != len(capabilities)
+            ):
+                raise ValueError
+            decoded_capabilities = frozenset(
+                StrategyContextCapability(c) for c in capabilities
+            )
+            decoded_profiles = []
+            for profile in profiles:
+                profile = _shape(
+                    profile,
+                    "schema_version product_id base_grid_id output_grid_id algorithm_version window_days freshness_policy_id",
+                )
+                _version(profile["schema_version"])
+                decoded_profiles.append(
+                    ProfileRequirement(
+                        **{k: v for k, v in profile.items() if k != "schema_version"}
+                    )
+                )
+            if any(type(data[name]) is not str for name in ("command", "command_ref")):
+                raise ValueError
+            decoded_key = BootstrapKey(
+                **{k: v for k, v in key.items() if k != "schema_version"}
+            )
+            decoded_requirements = StrategyRequirements(
+                requirements["product_id"],
+                requirements["timeframe"],
+                requirements["lookback_window"],
+                decoded_capabilities,
+                tuple(decoded_profiles),
+            )
+            result = cls(
+                data["actor"],
+                data["idempotency_key"],
+                ProfileActivationCommand(data["command"]),
+                ProfileActivationIntent(
+                    decoded_key, decoded_requirements, intent["expected_state_version"]
+                ),
+            )
+            if (
+                data["command_ref"] != result.command_ref
+                or result.canonical_bytes != raw
+            ):
+                raise ValueError
+            return result
+        except (ValueError, TypeError, OverflowError, RecursionError):
+            raise ProfileActivationRequestError() from None
 
 
 class ProfileActivationIntentError(ValueError):
