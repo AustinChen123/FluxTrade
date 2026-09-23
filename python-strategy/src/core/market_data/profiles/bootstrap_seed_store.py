@@ -38,6 +38,30 @@ class BootstrapSeedIntegrityError(ValueError):
         super().__init__("BOOTSTRAP_SEED_INTEGRITY")
 
 
+class BootstrapSeedAdmissionError(ValueError):
+    def __init__(self) -> None:
+        super().__init__("BOOTSTRAP_SEED_ADMISSION")
+
+
+def _admission_lock_key(key: BootstrapKey) -> int:
+    if type(key) is not BootstrapKey:
+        raise BootstrapSeedAdmissionError()
+    scope = {
+        name: getattr(key, name)
+        for name in (
+            "environment",
+            "execution_scope_id",
+            "strategy_id",
+            "product_id",
+            "timeframe",
+        )
+    }
+    scope["namespace"] = "bootstrap_initial_admission_v1"
+    return int.from_bytes(
+        hashlib.sha256(_bytes(scope)).digest()[:8], "big", signed=True
+    )
+
+
 class BootstrapSeedPinStatus(StrEnum):
     CONFIRMED = "CONFIRMED"
     FAILED = "FAILED"
@@ -141,6 +165,55 @@ class BootstrapSeedStore:
         if type(policy) is not TransactionWaitPolicy:
             raise BootstrapSeedIntegrityError()
         self._sessions, self._policy = sessions, policy
+
+    @contextmanager
+    def initial_admission(self, key: BootstrapKey) -> Iterator[None]:
+        """Serialize cooperating startup callers only, not arbitrary raw writers.
+
+        Hold one physical connection until unlock; this is not history authority
+        and grants no capability outside the context. Pin uses a second connection.
+        """
+        lock_key = _admission_lock_key(key)
+        with self._sessions() as session:
+            if (
+                session.get_bind().dialect.name != "postgresql"
+                or session.in_transaction()
+            ):
+                raise BootstrapSeedAdmissionError()
+            with session.begin():
+                try:
+                    connection = session.connection()
+                except Exception as error:
+                    raise BootstrapSeedAdmissionError() from error
+                if connection.closed or connection.invalidated:
+                    raise BootstrapSeedAdmissionError()
+                try:
+                    acquired = connection.execute(
+                        text("SELECT pg_try_advisory_lock(:lock_key)"),
+                        {"lock_key": lock_key},
+                    ).scalar_one()
+                except BaseException as error:
+                    connection.invalidate()
+                    if not isinstance(error, Exception):
+                        raise
+                    raise BootstrapSeedAdmissionError() from error
+                if acquired is not True:
+                    if acquired is not False:
+                        connection.invalidate()
+                    raise BootstrapSeedAdmissionError()
+                try:
+                    yield
+                finally:
+                    try:
+                        released = connection.execute(
+                            text("SELECT pg_advisory_unlock(:lock_key)"),
+                            {"lock_key": lock_key},
+                        ).scalar_one()
+                        if released is not True:
+                            raise BootstrapSeedAdmissionError()
+                    except BaseException as error:
+                        connection.invalidate()
+                        raise BootstrapSeedAdmissionError() from error
 
     @contextmanager
     def _transaction(self, *, read_only: bool = False) -> Iterator[Session]:
