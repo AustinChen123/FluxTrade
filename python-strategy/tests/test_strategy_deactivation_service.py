@@ -23,7 +23,7 @@ from test_profile_activation_request import request
 
 @pytest.mark.parametrize(
     "case",
-    "success missing stale early transition_error base_error".split()
+    "success implicit missing stale early transition_error base_error".split()
     + [None, "", True, "x" * 65],
 )
 def test_cancel_pending_transaction_order_and_failures(monkeypatch, case):
@@ -72,11 +72,13 @@ def test_cancel_pending_transaction_order_and_failures(monkeypatch, case):
         return
     if case == "early":
         kwargs["terminal_at"] = now.replace(year=2025)
-    if case in ("success", "missing"):
+    if case == "implicit":
+        kwargs["expected_version"] = None
+    if case in ("success", "implicit", "missing"):
         result = owner.cancel_pending_profile_activation_request(
             session, manager, **kwargs
         )
-        if case == "success":
+        if case in ("success", "implicit"):
             assert result is not None and result.record is calls.terminal.return_value
             calls.transition.assert_called_once_with(
                 session,
@@ -109,9 +111,67 @@ def test_cancel_pending_transaction_order_and_failures(monkeypatch, case):
         if case in ("transition_error", "base_error"):
             assert caught.value is error
     assert [call[0] for call in calls.mock_calls][:2] == ["state", "pending"]
-    if case != "success":
+    if case not in ("success", "implicit"):
         calls.terminal.assert_not_called()
     assert not session.mock_calls and not manager._redis_client.mock_calls
+
+
+@pytest.mark.parametrize("phase", ["commit", "missing", "rollback", "ack_lost"])
+def test_pending_cancel_runtime_postcommit_order(monkeypatch, phase):
+    events, session = [], MagicMock()
+    context = MagicMock()
+    context.__enter__.return_value = session
+    error = RuntimeError("transaction uncertain")
+    session.begin.return_value.__exit__.side_effect = lambda *_: events.append("commit")
+    if phase == "ack_lost":
+        context.__exit__.side_effect = error
+    service, manager, runtime, registration, market = _service(
+        events=events,
+        profile_request_store=MagicMock(),
+        db_session_factory=lambda: context,
+        environment_identity=lambda: "live",
+    )
+    transition = StrategyStateTransitionResult(
+        "strategy",
+        StrategyStatus.READY,
+        StrategyStatus.STOPPED,
+        1,
+        datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+    def cancel(*args, **kwargs):
+        assert registration.held and market.held
+        assert args == (session, manager) and kwargs["expected_version"] is None
+        events.append("cancel")
+        if phase == "rollback":
+            raise error
+        return None if phase == "missing" else MagicMock(transition=transition)
+
+    monkeypatch.setattr(owner, "cancel_pending_profile_activation_request", cancel)
+    manager.after_committed_transition.side_effect = lambda result: events.append(
+        "postcommit"
+    )
+    manager.transition_to_stopped.side_effect = lambda *a, **k: events.append("legacy")
+    runtime.unregister_locked.side_effect = (
+        lambda _: events.append("unregister") or True
+    )
+    if phase in ("rollback", "ack_lost"):
+        with pytest.raises(RuntimeError) as caught:
+            service.deactivate_locked("strategy", actor="operator", reason=None)
+        assert caught.value is error
+        manager.after_committed_transition.assert_not_called()
+        runtime.unregister_locked.assert_not_called()
+    else:
+        assert service.deactivate_locked("strategy", actor="operator", reason=None)
+        assert events[2:-2] == [
+            "cancel",
+            "commit",
+            "legacy" if phase == "missing" else "postcommit",
+            "unregister",
+        ]
+        if phase == "commit":
+            manager.after_committed_transition.assert_called_once_with(transition)
+            manager.transition_to_stopped.assert_not_called()
 
 
 class _LockProbe:
@@ -131,7 +191,7 @@ class _LockProbe:
             self.events.append(f"exit:{self.name}")
 
 
-def _service(*, events, portfolio_id=None):
+def _service(*, events, portfolio_id=None, **capabilities):
     registration = _LockProbe("registration", events)
     market = _LockProbe("market", events)
     coordinator = MagicMock()
@@ -145,6 +205,7 @@ def _service(*, events, portfolio_id=None):
         registration_lock=registration.acquire(),
         market_processing_lock=market.acquire(),
         event_logger=MagicMock(),
+        **capabilities,
     )
     return service, state_manager, runtime_artifacts, registration, market
 

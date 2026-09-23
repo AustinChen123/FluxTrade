@@ -490,6 +490,12 @@ class StrategyStateManager:
             now,
         )
 
+    def after_committed_transition(self, result: StrategyStateTransitionResult) -> None:
+        """Caller invokes only after its transaction has confirmed commit."""
+        if type(result) is not StrategyStateTransitionResult:
+            raise StrategyStateTransactionValidationError()
+        self._after_committed_transition(result)
+
     def _after_committed_transition(
         self, result: StrategyStateTransitionResult
     ) -> None:

@@ -210,6 +210,30 @@ def test_core_result_is_transaction_local_and_immutable():
     assert not hasattr(result, "__dict__")
 
 
+def test_public_postcommit_seam_preserves_cache_then_publish(monkeypatch):
+    from src.core.strategy_state_manager import StrategyStateTransitionResult
+
+    manager = _manager(_FakeSession([]))
+    result = StrategyStateTransitionResult(
+        "s1",
+        StrategyStatus.READY,
+        StrategyStatus.STOPPED,
+        1,
+        datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    events = []
+    monkeypatch.setattr(
+        manager, "_apply_cached_state", lambda *args: events.append("cache")
+    )
+    monkeypatch.setattr(
+        manager, "_publish_state_change", lambda *args: events.append("publish")
+    )
+    manager.after_committed_transition(result)
+    assert events == ["cache", "publish"]
+    with pytest.raises(StrategyStateTransactionValidationError):
+        manager.after_committed_transition(cast(Any, None))
+
+
 @pytest.mark.parametrize("error", [RuntimeError("audit"), BaseException("audit")])
 def test_audit_failure_never_commits_or_publishes(monkeypatch, error):
     db = _FakeSession([_state("s1", StrategyStatus.READY)])

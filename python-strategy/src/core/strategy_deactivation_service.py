@@ -1,4 +1,5 @@
 import logging
+from collections.abc import Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -11,6 +12,7 @@ from src.core.strategy_activation_request_store import (
     lock_pending_profile_activation_request,
     terminalize_profile_activation_request,
     _validate_pending_identity,
+    ProfileActivationRequestStore,
 )
 
 from src.core.portfolio_runtime import PortfolioCoordinator
@@ -37,7 +39,7 @@ def cancel_pending_profile_activation_request(
     strategy_id: str,
     actor: str,
     terminal_at: datetime,
-    expected_version: int,
+    expected_version: int | None,
 ) -> ProfileActivationCancellationResult | None:
     """Cancel and STOP in caller transaction; no commit or postcommit ownership."""
     _validate_pending_identity(environment, strategy_id)
@@ -48,8 +50,13 @@ def cancel_pending_profile_activation_request(
         or type(terminal_at) is not datetime
         or terminal_at.tzinfo is not UTC
         or terminal_at.microsecond % 1000
-        or type(expected_version) is not int
-        or not 0 <= expected_version <= 2**31 - 1
+        or (
+            expected_version is not None
+            and (
+                type(expected_version) is not int
+                or not 0 <= expected_version <= 2**31 - 1
+            )
+        )
     ):
         raise ProfileActivationRequestValidationError()
     state = state_manager.lock_state_in_transaction(session, strategy_id)
@@ -58,6 +65,8 @@ def cancel_pending_profile_activation_request(
     )
     if record is None:
         return None
+    if expected_version is None:
+        expected_version = record.request.intent.expected_state_version
     if state.version != expected_version:
         raise StaleStrategyStateVersion("PROFILE_ACTIVATION_STATE_STALE")
     if terminal_at < record.requested_at:
@@ -94,6 +103,9 @@ class StrategyDeactivationService:
         registration_lock: AbstractContextManager[object],
         market_processing_lock: AbstractContextManager[object],
         event_logger: logging.Logger,
+        profile_request_store: ProfileActivationRequestStore | None = None,
+        db_session_factory: Callable[[], AbstractContextManager[Session]] | None = None,
+        environment_identity: Callable[[], str] = lambda: "",
     ) -> None:
         self._state_manager = state_manager
         self._portfolio_coordinator = portfolio_coordinator
@@ -101,6 +113,37 @@ class StrategyDeactivationService:
         self._registration_lock = registration_lock
         self._market_processing_lock = market_processing_lock
         self._logger = event_logger
+        self._profile_request_store = profile_request_store
+        self._db_session_factory = db_session_factory
+        self._environment_identity = environment_identity
+
+    def _cancel_pending(
+        self, strategy_id: str, actor: str, expected_version: int | None
+    ) -> bool:
+        if (
+            self._profile_request_store is None
+            or self._environment_identity() != "live"
+        ):
+            return False
+        if self._db_session_factory is None:
+            raise ProfileActivationRequestValidationError()
+        now = datetime.now(UTC)
+        now = now.replace(microsecond=now.microsecond // 1000 * 1000)
+        with self._db_session_factory() as session:
+            with session.begin():
+                result = cancel_pending_profile_activation_request(
+                    session,
+                    self._state_manager,
+                    environment="live",
+                    strategy_id=strategy_id,
+                    actor=actor,
+                    terminal_at=now,
+                    expected_version=expected_version,
+                )
+        if result is None:
+            return False
+        self._state_manager.after_committed_transition(result.transition)
+        return True
 
     def deactivate_locked(
         self,
@@ -124,10 +167,10 @@ class StrategyDeactivationService:
                 transition_kwargs = {"actor": actor, "reason": reason}
                 if expected_version is not None:
                     transition_kwargs["expected_version"] = expected_version
-                self._state_manager.transition_to_stopped(
-                    strategy_id,
-                    **transition_kwargs,
-                )
+                if not self._cancel_pending(strategy_id, actor, expected_version):
+                    self._state_manager.transition_to_stopped(
+                        strategy_id, **transition_kwargs
+                    )
             except (KeyError, InvalidStrategyStateTransition):
                 self._logger.warning("Strategy %s is not active.", strategy_id)
                 return False

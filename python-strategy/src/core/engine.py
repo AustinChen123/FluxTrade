@@ -303,7 +303,11 @@ class StrategyEngine:
             registration_lock=self._runtime_registration_lock,
             market_processing_lock=self._market_processing_lock,
             event_logger=logger,
+            profile_request_store=profile_request_store,
+            db_session_factory=lambda: self._db_session_factory(),
+            environment_identity=lambda: self.runtime_environment.identity,
         )
+        self._profile_request_store = profile_request_store
         self._daily_nav_snapshot_service = DailyNavSnapshotService(
             self._db_session_factory,
         )
@@ -1194,6 +1198,19 @@ class StrategyEngine:
                 f"found {current_version}"
             )
         if command not in available_strategy_commands(status):
+            if (
+                command == "STOP"
+                and self.runtime_environment.identity == "live"
+                and self._profile_request_store is not None
+            ):
+                pending = self._profile_request_store.get_pending(
+                    environment="live", strategy_id=strategy_id
+                )
+                if (
+                    pending is not None
+                    and pending.request.intent.expected_state_version == current_version
+                ):
+                    return
             raise InvalidStrategyStateTransition(
                 f"{command} is not allowed while {strategy_id} is {status.value}"
             )

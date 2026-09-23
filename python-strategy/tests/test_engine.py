@@ -12,6 +12,7 @@ Covers:
 """
 
 from contextlib import nullcontext
+from dataclasses import replace
 from decimal import Decimal
 import inspect
 import json
@@ -176,6 +177,49 @@ def test_engine_runtime_artifact_maps_are_owned_by_one_registry(engine) -> None:
     assert engine.strategies is engine._runtime_artifacts.strategies
     assert engine.strategy_instances is engine._runtime_artifacts.strategy_instances
     assert engine.portfolio_instances is engine._runtime_artifacts.portfolio_instances
+
+
+@pytest.mark.parametrize(
+    "command,pending_version,allowed",
+    [
+        ("STOP", 0, True),
+        ("STOP", 1, False),
+        ("STOP", None, False),
+        ("RESUME", 0, False),
+    ],
+)
+def test_pending_profile_stop_command_gate(
+    engine_factory, command, pending_version, allowed
+):
+    from test_profile_activation_request import request
+
+    store = MagicMock()
+    engine = engine_factory(profile_request_store=store)
+    engine.runtime_environment = MagicMock(identity="live")
+    db = MagicMock()
+    db.query.return_value.filter.return_value.first.return_value = MagicMock(
+        status="READY", version=0
+    )
+    engine._db_session_factory = lambda: nullcontext(db)
+    pending = MagicMock(request=request())
+    if pending_version is not None:
+        pending.request = replace(
+            pending.request,
+            intent=replace(
+                pending.request.intent, expected_state_version=pending_version
+            ),
+        )
+    store.get_pending.return_value = None if pending_version is None else pending
+    if allowed:
+        engine._assert_strategy_command_allowed(
+            strategy_id="strategy", command=command, expected_version=0
+        )
+    else:
+        with pytest.raises(InvalidStrategyStateTransition):
+            engine._assert_strategy_command_allowed(
+                strategy_id="strategy", command=command, expected_version=0
+            )
+    assert store.get_pending.call_count == (1 if command == "STOP" else 0)
 
 
 def test_engine_command_listener_delegates_current_runtime_seams(engine) -> None:
