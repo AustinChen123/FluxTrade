@@ -1,7 +1,7 @@
 """Pending candle replay and strategy-state reconstruction owner."""
 
 from collections.abc import Callable, Sequence
-from typing import ContextManager
+from typing import ContextManager, Literal
 
 from sqlalchemy.orm import Session
 
@@ -10,8 +10,7 @@ from src.core.live_candle_application import (
     PendingCandleCallback,
 )
 from src.core.models import Candlestick, Trade
-from src.core.market_data.profiles.decision_owner import MarketDataDecisionOwner
-from src.core.signal_processor import StrategyDecisionScopeLoader
+from src.core.bootstrap_hydration_reader import BootstrapHydrationReader
 from src.core.strategy_hydration_service import StrategyHydrationService
 from src.strategies.base import BaseStrategy
 
@@ -27,14 +26,14 @@ class PendingMarketReplayService:
         strategy_hydration: StrategyHydrationService,
         list_active_strategies: Callable[[], Sequence[BaseStrategy]],
         publish_replacement: Callable[[BaseStrategy], None],
-        market_data_decision_owner: MarketDataDecisionOwner | None = None,
+        bootstrap_hydration_reader: BootstrapHydrationReader | None = None,
     ) -> None:
         self._db_session_factory = db_session_factory
         self._live_candle_application = live_candle_application
         self._strategy_hydration = strategy_hydration
         self._list_active_strategies = list_active_strategies
         self._publish_replacement = publish_replacement
-        self._market_data_decision_owner = market_data_decision_owner
+        self._bootstrap_hydration_reader = bootstrap_hydration_reader
 
     def rewind_pending(self, models: Sequence[Candlestick | Trade]) -> None:
         """Rebuild affected strategies to immediately before pending candles."""
@@ -69,7 +68,7 @@ class PendingMarketReplayService:
                 self._warm_up(
                     db,
                     replacement,
-                    before_timestamp=cutoff,
+                    boundary_bar_start_ms=cutoff,
                 )
                 replacements.append(replacement)
         for replacement in replacements:
@@ -95,7 +94,8 @@ class PendingMarketReplayService:
                 self._warm_up(
                     db,
                     replacement,
-                    before_timestamp=candle.timestamp + 1,
+                    boundary_bar_start_ms=candle.timestamp,
+                    mode="THROUGH_APPLIED",
                 )
                 replacements.append(replacement)
         for replacement in replacements:
@@ -106,46 +106,29 @@ class PendingMarketReplayService:
         db: Session,
         replacement: BaseStrategy,
         *,
-        before_timestamp: int,
+        boundary_bar_start_ms: int,
+        mode: Literal["BEFORE_PENDING", "THROUGH_APPLIED"] = "BEFORE_PENDING",
     ) -> None:
-        decision_owner = self._market_data_decision_owner
-        if decision_owner is None or not replacement.requirements.profile_requirements:
+        if not replacement.requirements.profile_requirements:
             self._strategy_hydration.warm_up(
                 db,
                 replacement,
-                before_timestamp=before_timestamp,
+                before_timestamp=(
+                    boundary_bar_start_ms + 1
+                    if mode == "THROUGH_APPLIED"
+                    else boundary_bar_start_ms
+                ),
             )
             return
-        self._strategy_hydration.warm_up(
-            db,
+        reader = self._bootstrap_hydration_reader
+        if reader is None:
+            raise RuntimeError("profile bootstrap hydration reader is required")
+        bound = reader.prepare(replacement, boundary_bar_start_ms, mode)
+        self._strategy_hydration.hydrate_candles(
             replacement,
-            before_timestamp=before_timestamp,
-            decision_scope_loader=self._recorded_scope_loader(
-                db, decision_owner, replacement
-            ),
+            bound.candles,
+            decision_scope_loader=bound.decision_scope_loader,
         )
-
-    def _recorded_scope_loader(
-        self,
-        db: Session,
-        owner: MarketDataDecisionOwner,
-        strategy: BaseStrategy,
-    ) -> StrategyDecisionScopeLoader:
-        def load(replay_candle: Candlestick):
-            batch = self._live_candle_application.applied_decision_batch(
-                replay_candle,
-                db=db,
-            )
-            if batch is None:
-                raise RuntimeError(
-                    "recorded decision evidence is unavailable: "
-                    f"{replay_candle.product_id}:"
-                    f"{replay_candle.timeframe}:"
-                    f"{replay_candle.timestamp}"
-                )
-            return owner.prepare_replay_candle(strategy, replay_candle, batch)
-
-        return load
 
     def replay(
         self,

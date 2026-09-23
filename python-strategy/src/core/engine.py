@@ -60,6 +60,7 @@ from src.core.live_candle_application import LiveCandleApplicationService
 from src.core.market_data.profiles.decision_application import MarketDataDecisionBatch
 from src.core.market_data.profiles.decision_owner import MarketDataDecisionOwner
 from src.core.pending_market_replay import PendingMarketReplayService
+from src.core.bootstrap_hydration_reader import BootstrapHydrationReader
 from src.core.ops_safety import OpsSafetyService
 from src.core.ops_command_service import OpsCommandService
 from src.core.runtime_reconcile import PositionAuthorityState, RuntimeReconciliationJob
@@ -189,6 +190,7 @@ class StrategyEngine:
         signal_batch_observer: Callable[[tuple[Signal, ...]], None] | None = None,
         strategy_context_loader: StrategyContextLoader | None = None,
         market_data_decision_owner: MarketDataDecisionOwner | None = None,
+        bootstrap_hydration_reader: BootstrapHydrationReader | None = None,
         available_strategy_context_capabilities: frozenset[
             StrategyContextCapability
         ] = frozenset(),
@@ -465,7 +467,7 @@ class StrategyEngine:
             publish_replacement=lambda replacement: self._register_strategy_instance(
                 replacement
             ),
-            market_data_decision_owner=market_data_decision_owner,
+            bootstrap_hydration_reader=bootstrap_hydration_reader,
         )
         self.ops_safety = OpsSafetyService(
             self.execution_engine,

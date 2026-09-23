@@ -26,6 +26,13 @@ def test_decision_owner_requires_base_context_loader(engine_factory):
         engine_factory(market_data_decision_owner=MagicMock())
 
 
+def test_bootstrap_reader_capability_forwarded_unchanged(engine_factory):
+    reader = MagicMock()
+    engine = engine_factory(bootstrap_hydration_reader=reader)
+    assert engine._pending_market_replay._bootstrap_hydration_reader is reader
+    reader.prepare.assert_not_called()
+
+
 def test_live_profile_activation_waits_for_modeled_warmup_contract(engine_factory):
     engine = engine_factory(
         strategy_context_loader=MagicMock(),
@@ -73,9 +80,7 @@ def test_unpersisted_candle_passes_scope_and_returns_pending_batch(engine_factor
         side_effect=lambda value: events.append(("market", value)) or [fill]
     )
     engine._signal_processor.on_candle = MagicMock(
-        side_effect=lambda *args, **kwargs: events.append(
-            ("dispatch", args, kwargs)
-        )
+        side_effect=lambda *args, **kwargs: events.append(("dispatch", args, kwargs))
     )
 
     assert engine._apply_unpersisted_candle(candle) is pending
@@ -87,7 +92,9 @@ def test_unpersisted_candle_passes_scope_and_returns_pending_batch(engine_factor
             "dispatch",
             (candle,),
             {
-                "latest_fills": ({"order": fill["order"], "timestamp": candle.timestamp},),
+                "latest_fills": (
+                    {"order": fill["order"], "timestamp": candle.timestamp},
+                ),
                 "decision_scope": lifecycle,
             },
         ),
