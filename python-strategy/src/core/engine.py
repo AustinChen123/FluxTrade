@@ -47,7 +47,7 @@ from src.core.adapters.simulated import (
 from src.core.journal import StrategyJournal
 from src.core.redis_factory import create_redis_client
 from src.core.metrics import ACTIVE_STRATEGIES, BALANCE_USDT
-from src.core.command_router import CommandRouter
+from src.core.command_router import CommandRouter, StrategyStartDisposition
 from src.core.health_monitor import HealthMonitor
 from src.core.engine_heartbeat_service import EngineHeartbeatService
 from src.core.engine_boot_state_service import EngineBootStateService
@@ -161,9 +161,19 @@ class _EngineLifecycleAdapter:
     def __init__(self, engine: "StrategyEngine") -> None:
         self._engine = engine
 
-    def transition_to_running(self, strategy_id: str, **kwargs) -> None:
-        if self._engine.activate_strategy(strategy_id, **kwargs) is False:
+    def transition_to_running(
+        self, strategy_id: str, **kwargs
+    ) -> StrategyStartDisposition:
+        result: bool | StrategyStartDisposition = self._engine.activate_strategy(
+            strategy_id, **kwargs
+        )
+        if result is False:
             raise RuntimeError(f"strategy activation rejected: {strategy_id}")
+        if result is True:
+            return StrategyStartDisposition.ACTIVE
+        if result is StrategyStartDisposition.WAITING_FOR_CUTOVER:
+            return result
+        raise RuntimeError("invalid strategy activation result")
 
     def transition_to_stopped(self, strategy_id: str, **kwargs) -> None:
         if self._engine.deactivate_strategy(strategy_id, **kwargs) is False:

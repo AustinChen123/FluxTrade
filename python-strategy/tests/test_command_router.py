@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 from unittest.mock import MagicMock
+import pytest
 
-from src.core.command_router import CommandResult, CommandRouter
+from src.core.command_router import (
+    CommandResult,
+    CommandRouter,
+    StrategyStartDisposition,
+)
 from src.core.health_monitor import HealthMonitor
 from src.core.models import Candlestick, Signal, SignalType
 from src.core.strategy_context import StrategyContext
@@ -50,6 +55,7 @@ def test_command_result_dataclass() -> None:
 
 def test_start_delegates_to_state_manager() -> None:
     router = CommandRouter(StrategyRegistry(), MagicMock())
+    router.state_manager.transition_to_running.return_value = None
 
     result = router.handle(
         {
@@ -92,6 +98,7 @@ def test_stop_delegates_to_state_manager() -> None:
 
 def test_resume_delegates_to_forced_running_transition() -> None:
     router = CommandRouter(StrategyRegistry(), MagicMock())
+    router.state_manager.transition_to_running.return_value = None
 
     result = router.handle(
         {
@@ -115,6 +122,7 @@ def test_resume_delegates_to_forced_running_transition() -> None:
 
 def test_force_recover_delegates_to_forced_running_transition() -> None:
     router = CommandRouter(StrategyRegistry(), MagicMock())
+    router.state_manager.transition_to_running.return_value = None
 
     result = router.handle(
         {
@@ -138,6 +146,7 @@ def test_force_recover_delegates_to_forced_running_transition() -> None:
 
 def test_force_recover_forwards_expected_version() -> None:
     router = CommandRouter(StrategyRegistry(), MagicMock())
+    router.state_manager.transition_to_running.return_value = None
 
     result = router.handle(
         {
@@ -253,3 +262,45 @@ def test_malformed_command_returns_failure() -> None:
     assert router.handle({}).success is False
     assert router.handle({"command": "START"}).success is False
     assert router.handle({"command": "LIST", "params": "bad"}).success is False
+
+
+@pytest.mark.parametrize("command", ["START", "RESUME", "FORCE_RECOVER"])
+@pytest.mark.parametrize("disposition", [None, *StrategyStartDisposition])
+def test_start_completion_contract(command, disposition):
+    state = MagicMock()
+    state.transition_to_running.return_value = disposition
+    result = CommandRouter(StrategyRegistry(), state).handle(
+        {"command": command, "id": "s"}
+    )
+    waiting = disposition is StrategyStartDisposition.WAITING_FOR_CUTOVER
+    assert result.success is True and result.completed is (not waiting)
+    if waiting:
+        assert "Accepted" in result.message and "waiting" in result.message
+        assert "Started" not in result.message and "Resumed" not in result.message
+    state.transition_to_running.assert_called_once()
+
+
+@pytest.mark.parametrize("unknown", [True, False, 1, "ACTIVE", object()])
+def test_unknown_transition_result_fails_closed(unknown):
+    state = MagicMock()
+    state.transition_to_running.return_value = unknown
+    with pytest.raises(ValueError):
+        CommandRouter(StrategyRegistry(), state).handle({"command": "START", "id": "s"})
+
+
+@pytest.mark.parametrize(
+    "value", [True, False, StrategyStartDisposition.WAITING_FOR_CUTOVER, None]
+)
+def test_engine_adapter_preserves_typed_disposition(value):
+    from src.core.engine import _EngineLifecycleAdapter
+
+    engine = MagicMock()
+    engine.activate_strategy.return_value = value
+    adapter = _EngineLifecycleAdapter(engine)
+    if value is False or value is None:
+        with pytest.raises(RuntimeError):
+            adapter.transition_to_running("s")
+    else:
+        expected = StrategyStartDisposition.ACTIVE if value is True else value
+        assert adapter.transition_to_running("s") is expected
+    engine.activate_strategy.assert_called_once_with("s")
