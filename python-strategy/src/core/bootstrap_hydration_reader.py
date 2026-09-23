@@ -39,7 +39,7 @@ from src.core.market_data.profiles.decision_owner import (
     IdentityResolver,
 )
 from src.core.market_data.profiles.read_types import _integer
-from src.strategies.base import BaseStrategy
+from src.strategies.base import BaseStrategy, StrategyRequirements
 
 
 class BootstrapHydrationReaderError(ValueError):
@@ -92,6 +92,34 @@ class BootstrapHydrationReader:
         factory: Callable[[BootstrapKey], BootstrapSeed],
     ) -> BootstrapSeedRecord:
         """Caller must hold the authority/admission fence across this entire call."""
+        key, requirements = self._initial_identity(strategy, boundary_bar_start_ms)
+        return self._prepare_initial_seed(
+            key, requirements, boundary_bar_start_ms, history_reader, factory
+        )
+
+    def prepare_initial_seed_under_admission(
+        self,
+        strategy: BaseStrategy,
+        boundary_bar_start_ms: int,
+        *,
+        factory: Callable[[BootstrapKey], BootstrapSeed],
+    ) -> BootstrapSeedRecord:
+        """Compose cooperating-caller admission and authority; not activation."""
+        key, requirements = self._initial_identity(strategy, boundary_bar_start_ms)
+        if not callable(factory):
+            raise BootstrapHydrationReaderError()
+        with self._seeds.initial_admission(key) as admission:
+            return self._prepare_initial_seed(
+                key,
+                requirements,
+                boundary_bar_start_ms,
+                admission.read_history,
+                factory,
+            )
+
+    def _initial_identity(
+        self, strategy: BaseStrategy, boundary_bar_start_ms: int
+    ) -> tuple[BootstrapKey, StrategyRequirements]:
         try:
             _integer(boundary_bar_start_ms)
             if not isinstance(strategy, BaseStrategy):
@@ -117,6 +145,16 @@ class BootstrapHydrationReader:
             or boundary_bar_start_ms % timeframe_to_ms(key.timeframe)
         ):
             raise BootstrapHydrationReaderError()
+        return key, requirements
+
+    def _prepare_initial_seed(
+        self,
+        key: BootstrapKey,
+        requirements: StrategyRequirements,
+        boundary_bar_start_ms: int,
+        history_reader: Callable[[BootstrapKey, int], BootstrapHistoryEvidence],
+        factory: Callable[[BootstrapKey], BootstrapSeed],
+    ) -> BootstrapSeedRecord:
         record = self._seeds.get(key)
         if record is not None:
             if (

@@ -200,11 +200,18 @@ def test_no_profile_requirements_do_not_lookup_or_create_seed(monkeypatch):
 
 def test_initial_method_has_no_execution_or_clock_dependencies():
     tree = ast.parse(Path(owner.__file__).read_text())
-    method = next(
+    methods = [
         n
         for n in ast.walk(tree)
-        if isinstance(n, ast.FunctionDef) and n.name == "prepare_initial_seed"
-    )
+        if isinstance(n, ast.FunctionDef)
+        and n.name
+        in (
+            "prepare_initial_seed",
+            "prepare_initial_seed_under_admission",
+            "_initial_identity",
+            "_prepare_initial_seed",
+        )
+    ]
     forbidden = {
         "hydrate_candles",
         "warm_up",
@@ -227,5 +234,6 @@ def test_initial_method_has_no_execution_or_clock_dependencies():
         and n.attr in forbidden
         or isinstance(n, ast.Name)
         and n.id in forbidden
+        for method in methods
         for n in ast.walk(method)
     )

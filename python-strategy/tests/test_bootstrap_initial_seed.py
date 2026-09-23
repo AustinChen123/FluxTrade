@@ -1,5 +1,7 @@
 from dataclasses import replace
+from contextlib import contextmanager
 from unittest.mock import MagicMock
+from typing import Any, cast
 
 import pytest
 
@@ -143,3 +145,214 @@ def test_pin_not_exactly_confirmed_rejects(kind):
     with pytest.raises(BootstrapHydrationReaderError):
         call()
     store.pin_confirmed.assert_called_once()
+
+
+def admission_setup(monkeypatch, mode="ABSENT"):
+    reader, plan, strategy, store, application, inputs, sessions = harness(count=0)
+    resolver = MagicMock(wraps=reader._identity)
+    reader._identity = resolver
+    events, active = [], []
+    handle, factory = MagicMock(), MagicMock()
+    record = BootstrapSeedRecord(plan.seed, NOW, mode == "existing")
+
+    @contextmanager
+    def admission(key):
+        assert key == plan.seed.key
+        events.append("acquire")
+        if mode == "busy":
+            raise RuntimeError("busy")
+        active.append(True)
+        try:
+            yield handle
+        except BaseException:
+            events.append("body_error")
+            raise
+        finally:
+            active.clear()
+            events.append("release")
+
+    def phase(name, value):
+        def call(*args, **kwargs):
+            assert active == [True]
+            events.append(name)
+            return value
+
+        return call
+
+    store.initial_admission.side_effect = admission
+    store.get.side_effect = phase("lookup", record if mode == "existing" else None)
+    handle.read_history.side_effect = phase(
+        "history",
+        Proof(
+            plan.seed.key,
+            plan.seed.cutover_ms,
+            mode if mode in ("PRESENT", "UNKNOWN") else "ABSENT",
+        ),
+    )
+    factory.side_effect = phase("factory", plan.seed)
+    classifier = MagicMock(
+        side_effect=phase("classifier", owner.BootstrapDisposition.BOOTSTRAP)
+    )
+    monkeypatch.setattr(owner, "classify_bootstrap", classifier)
+    status = Status[mode] if mode in ("FAILED", "UNCONFIRMED") else Status.CONFIRMED
+    winner = (
+        replace(plan.seed, dataset_digest="f" * 64, max_seed_candles=10)
+        if mode == "wrong"
+        else plan.seed
+    )
+    store.pin_confirmed.side_effect = phase(
+        "pin",
+        BootstrapSeedPinResult(
+            status,
+            BootstrapSeedRecord(winner, NOW, False)
+            if status is Status.CONFIRMED
+            else None,
+        ),
+    )
+    return (
+        reader,
+        plan,
+        strategy,
+        store,
+        handle,
+        factory,
+        classifier,
+        resolver,
+        events,
+        active,
+        record,
+    )
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "existing",
+        "ABSENT",
+        "PRESENT",
+        "UNKNOWN",
+        "busy",
+        "FAILED",
+        "UNCONFIRMED",
+        "wrong",
+    ],
+)
+def test_authority_composition_order_and_terminal_matrix(monkeypatch, mode):
+    (
+        reader,
+        plan,
+        strategy,
+        store,
+        handle,
+        factory,
+        classifier,
+        resolver,
+        events,
+        active,
+        record,
+    ) = admission_setup(monkeypatch, mode)
+
+    def call():
+        return reader.prepare_initial_seed_under_admission(
+            strategy,
+            plan.seed.cutover_ms + (60000 if mode == "existing" else 0),
+            factory=factory,
+        )
+
+    if mode in ("existing", "ABSENT"):
+        result = call()
+        assert result.value is plan.seed
+        if mode == "existing":
+            assert result is record
+    else:
+        with pytest.raises(
+            RuntimeError if mode == "busy" else BootstrapHydrationReaderError
+        ):
+            call()
+    resolver.assert_called_once_with(strategy)
+    assert active == []
+    expected = ["acquire"]
+    if mode != "busy":
+        expected += ["lookup"]
+        if mode != "existing":
+            expected += ["history"]
+            if mode not in ("PRESENT", "UNKNOWN"):
+                expected += ["factory", "classifier", "pin"]
+        if mode not in ("existing", "ABSENT"):
+            expected += ["body_error"]
+        expected += ["release"]
+    assert events == expected
+    if "history" not in events:
+        handle.read_history.assert_not_called()
+    if "factory" not in events:
+        factory.assert_not_called()
+        classifier.assert_not_called()
+        store.pin_confirmed.assert_not_called()
+    if mode == "busy":
+        store.get.assert_not_called()
+
+
+class AdmissionHalt(BaseException):
+    pass
+
+
+@pytest.mark.parametrize(
+    "phase", ["acquire", "lookup", "history", "factory", "classifier", "pin"]
+)
+@pytest.mark.parametrize("error_type", [RuntimeError, AdmissionHalt])
+def test_authority_composition_unwinds_original_exception(
+    monkeypatch, phase, error_type
+):
+    (
+        reader,
+        plan,
+        strategy,
+        store,
+        handle,
+        factory,
+        classifier,
+        resolver,
+        events,
+        active,
+        _,
+    ) = admission_setup(monkeypatch)
+    error = error_type("SECRET")
+    target = {
+        "acquire": store.initial_admission,
+        "lookup": store.get,
+        "history": handle.read_history,
+        "factory": factory,
+        "classifier": classifier,
+        "pin": store.pin_confirmed,
+    }[phase]
+    target.side_effect = error
+    with pytest.raises(error_type) as caught:
+        reader.prepare_initial_seed_under_admission(
+            strategy, plan.seed.cutover_ms, factory=factory
+        )
+    assert caught.value is error and active == []
+    if phase == "acquire":
+        assert events == []
+        store.get.assert_not_called()
+        factory.assert_not_called()
+        store.pin_confirmed.assert_not_called()
+    else:
+        assert events[-1] == "release"
+    resolver.assert_called_once()
+
+
+@pytest.mark.parametrize("bad", ["boundary", "strategy", "factory", "no_profile"])
+def test_authority_invalid_input_before_admission(monkeypatch, bad):
+    reader, plan, strategy, store, *_ = harness(count=0)
+    if bad == "no_profile":
+        requirements = replace(strategy.requirements, profile_requirements=())
+        monkeypatch.setattr(
+            type(strategy), "requirements", property(lambda _: requirements)
+        )
+    with pytest.raises(BootstrapHydrationReaderError):
+        reader.prepare_initial_seed_under_admission(
+            cast(Any, None) if bad == "strategy" else strategy,
+            True if bad == "boundary" else plan.seed.cutover_ms,
+            factory=None if bad == "factory" else MagicMock(),
+        )
+    assert not store.mock_calls

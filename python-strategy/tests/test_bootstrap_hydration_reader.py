@@ -269,7 +269,7 @@ def test_dependency_boundary():
     initial = next(
         node
         for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef) and node.name == "prepare_initial_seed"
+        if isinstance(node, ast.FunctionDef) and node.name == "_prepare_initial_seed"
     )
     pins = [
         node
