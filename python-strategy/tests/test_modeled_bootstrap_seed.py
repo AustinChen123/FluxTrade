@@ -16,6 +16,8 @@ from src.core.market_data.profiles.bootstrap_seed import BootstrapSeed
 from test_profile_bootstrap_seed import seed
 from test_profile_modeled_input import modeled
 from test_profile_context_enrichment import S, Collection
+from test_profile_context_enrichment import fixture
+from test_bootstrap_initial_seed import admission_setup
 
 
 def setup(status=S.MISSING):
@@ -208,3 +210,64 @@ def test_second_resolve_exception_identity_no_partial(error):
     with pytest.raises(type(error)) as caught:
         build(data)
     assert caught.value is error and data[5].context_for.call_count == 2
+
+
+def test_dataset_and_context_change_content_not_durable_key_or_window():
+    original = build(setup(S.MISSING))
+    changed = setup(S.MISSING)
+    changed[5].dataset_digest = "f" * 64
+    changed = (
+        ModeledProfileInput(changed[5], changed[0].availability_policy_id),
+        *changed[1:],
+    )
+    provenance = build(changed)
+    content = build(setup(S.INVALID))
+    assert provenance.candles == original.candles
+    assert content.dataset_digest == original.dataset_digest
+    assert content.candles[0] == original.candles[0]
+    assert content.candles[1].context != original.candles[1].context
+    for candidate in (provenance, content):
+        assert candidate.key == original.key
+        assert candidate.cutover_ms == original.cutover_ms
+        assert candidate.canonical_bytes != original.canonical_bytes
+        assert candidate.digest != original.digest
+
+
+def test_live_evidence_rejected_by_builder_without_seed_return():
+    data = setup()
+    live, _ = fixture(status=S.MISSING)
+    end = data[3][0].timestamp + 60000
+    live = replace(live, decision_time_ms=end)
+    data[5].context_for.side_effect = [Collection(end, (live,))]
+    with pytest.raises(ModeledProfileInputError):
+        build(data)
+    data[5].context_for.assert_called_once()
+
+
+def test_existing_admission_record_never_executes_real_builder_closure(monkeypatch):
+    reader, plan, strategy, store, handle, _, classifier, _, events, _, record = (
+        admission_setup(monkeypatch, "existing")
+    )
+    data = setup()
+    factory = MagicMock(
+        side_effect=lambda key: build_modeled_bootstrap_seed(
+            data[0],
+            key,
+            strategy.requirements,
+            data[3],
+            cutover_ms=plan.seed.cutover_ms,
+            max_seed_candles=10,
+        )
+    )
+    assert (
+        reader.prepare_initial_seed_under_admission(
+            strategy, plan.seed.cutover_ms + 60000, factory=factory
+        )
+        is record
+    )
+    factory.assert_not_called()
+    data[5].context_for.assert_not_called()
+    handle.read_history.assert_not_called()
+    classifier.assert_not_called()
+    store.pin_confirmed.assert_not_called()
+    assert events == ["acquire", "lookup", "release"]
