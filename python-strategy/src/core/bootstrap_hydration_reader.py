@@ -2,10 +2,13 @@
 
 No pin, hydration, publication, provider, clock, retry, or modeled fallback. The
 caller owns authoritative boundary selection and the later exposure lifecycle.
+History evidence is only a trusted-reader contract: future ABSENT-to-pin use
+requires an upper-layer activation/application admission fence, not DTO typing.
 """
 
 from collections.abc import Callable
 from contextlib import AbstractContextManager
+from dataclasses import dataclass
 from typing import Literal
 
 from sqlalchemy.orm import Session
@@ -36,6 +39,28 @@ from src.strategies.base import BaseStrategy
 class BootstrapHydrationReaderError(ValueError):
     def __init__(self) -> None:
         super().__init__("BOOTSTRAP_HYDRATION_READER_INVALID")
+
+
+@dataclass(frozen=True, slots=True)
+class BootstrapHistoryEvidence:
+    """Trusted-reader result; exact typing alone does not establish DB authority."""
+
+    key: BootstrapKey
+    boundary_bar_start_ms: int
+    state: Literal["ABSENT", "PRESENT", "UNKNOWN"]
+
+    def __post_init__(self) -> None:
+        try:
+            _integer(self.boundary_bar_start_ms)
+            if (
+                type(self.key) is not BootstrapKey
+                or type(self.state) is not str
+                or self.state not in ("ABSENT", "PRESENT", "UNKNOWN")
+                or self.boundary_bar_start_ms % timeframe_to_ms(self.key.timeframe)
+            ):
+                raise ValueError
+        except ValueError:
+            raise BootstrapHydrationReaderError() from None
 
 
 class BootstrapHydrationReader:
