@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from dataclasses import replace
 from threading import Barrier
 from typing import Any, cast
+from unittest.mock import patch
 import os
 
 import pytest
@@ -14,6 +15,9 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from src.core.market_data.profiles.repository import TransactionWaitPolicy
 from src.core.strategy_activation_request_store import (
+    ProfileActivationAdmissionResult,
+    ProfileActivationAdmissionStatus as AdmissionStatus,
+    ProfileActivationRequestRecord,
     ProfileActivationRequestStore as Store,
     ProfileActivationRequestConflict as Conflict,
     ProfileActivationRequestStale as Stale,
@@ -226,3 +230,81 @@ def test_commit_fault_identity_and_fresh_confirmation(profile_repository_pg, pha
         assert (
             record.request.payload_digest == value.payload_digest and count(engine) == 1
         )
+
+
+@pytest.mark.parametrize(
+    ("phase", "expected"),
+    [
+        ("before_commit", AdmissionStatus.FAILED),
+        ("ack_lost", AdmissionStatus.CONFIRMED),
+        ("readback_failed", AdmissionStatus.UNCONFIRMED),
+    ],
+)
+def test_admit_confirmed_real_commit_faults(profile_repository_pg, phase, expected):
+    engine, value = profile_repository_pg, request()
+    prepare(engine, value)
+    admission_error = RuntimeError("SECRET admission fault")
+    readback_error = RuntimeError("SECRET readback fault")
+    opened, exited, statements = [], [], []
+
+    class FaultSession(Session):
+        pass
+
+    def before_commit(session):
+        if phase == "before_commit":
+            raise admission_error
+
+    def before_execute(state):
+        statements.append(state.session)
+        if state.session is opened[1] and phase == "readback_failed":
+            raise readback_error
+
+    @contextmanager
+    def sessions():
+        admission = not opened
+        session = FaultSession(engine) if admission else Session(engine)
+        opened.append(session)
+        if not admission:
+            assert exited == [opened[0]]
+            event.listen(session, "do_orm_execute", before_execute)
+        try:
+            with session:
+                yield session
+        finally:
+            exited.append(session)
+        if admission:
+            # The store's transaction has really committed before this ACK loss.
+            raise admission_error
+
+    event.listen(FaultSession, "before_commit", before_commit)
+    store = Store(sessions)
+    try:
+        with (
+            insert_log(engine) as inserts,
+            patch.object(store, "admit", wraps=store.admit) as admit,
+            patch.object(store, "confirm", wraps=store.confirm) as confirm,
+        ):
+            result = store.admit_confirmed(value, current=value.intent)
+        admit.assert_called_once_with(value, current=value.intent)
+        confirm.assert_called_once_with(value)
+        assert len(inserts) == 1
+    finally:
+        event.remove(FaultSession, "before_commit", before_commit)
+    assert len(opened) == 2 and opened[0] is not opened[1]
+    assert exited == opened and statements and all(s is opened[1] for s in statements)
+    assert type(result) is ProfileActivationAdmissionResult
+    assert result.status is expected and "SECRET" not in repr(result)
+    # Independent normal session establishes authoritative truth after faults.
+    authoritative = Store(sessionmaker(engine)).confirm(value)
+    if phase == "before_commit":
+        assert authoritative is None and count(engine) == 0
+    else:
+        assert type(authoritative) is ProfileActivationRequestRecord
+        assert authoritative.request.canonical_bytes == value.canonical_bytes
+        assert authoritative.request.payload_digest == value.payload_digest
+        assert authoritative.status is Status.PENDING and count(engine) == 1
+    if expected is AdmissionStatus.CONFIRMED:
+        assert type(result.record) is ProfileActivationRequestRecord
+        assert result.record == authoritative
+    else:
+        assert result.record is None
