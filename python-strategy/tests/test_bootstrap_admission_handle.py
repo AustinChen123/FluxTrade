@@ -1,9 +1,11 @@
 from dataclasses import FrozenInstanceError, replace
+from copy import copy, deepcopy
 from typing import Any, cast
 
 import pytest
 
 from src.core.market_data.profiles.bootstrap_seed_store import (
+    BootstrapSeedAdmission,
     BootstrapSeedAdmissionError,
 )
 from test_bootstrap_seed_admission import harness, Halt
@@ -11,7 +13,7 @@ from test_profile_bootstrap_seed import seed
 
 
 @pytest.mark.parametrize("exit_kind", ["normal", "exception", "base_exception"])
-def test_handle_closes_before_unlock_and_never_manufactures_history(exit_kind):
+def test_handle_closes_before_unlock(exit_kind):
     store, _, connection, _ = harness()
     key = seed().key
     original = connection.execute.side_effect
@@ -51,6 +53,25 @@ def test_handle_closes_before_unlock_and_never_manufactures_history(exit_kind):
         with pytest.raises(BootstrapSeedAdmissionError):
             handles[0].read_history(key, 60000)
     assert connection.execute.call_count == 2
+
+
+def test_manual_construction_replace_and_deepcopy_cannot_escape_lease():
+    key = seed().key
+    with pytest.raises(BootstrapSeedAdmissionError):
+        BootstrapSeedAdmission(key)
+    store, session, connection, _ = harness()
+    with store.initial_admission(key) as handle:
+        with pytest.raises(BootstrapSeedAdmissionError):
+            replace(handle)
+        cloned = copy(handle)
+        deep = deepcopy(handle)
+        assert deep is handle and cloned._lease is handle._lease
+    for instance in (handle, cloned, deep):
+        assert not instance._active
+        with pytest.raises(BootstrapSeedAdmissionError):
+            instance.read_history(key, 0)
+    assert connection.execute.call_count == 2
+    assert session.execute.call_count == 2
 
 
 @pytest.mark.parametrize("bad", [True, -60000, 1, 2**63, "0"])

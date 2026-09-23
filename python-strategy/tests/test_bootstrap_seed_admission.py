@@ -15,6 +15,7 @@ from src.core.market_data.profiles.bootstrap_seed_store import (
     _admission_lock_key,
 )
 from test_profile_bootstrap_seed import seed
+from src.core.market_data.profiles.repository import TransactionWaitPolicy
 
 
 def harness(acquired=True, released=True):
@@ -35,6 +36,9 @@ def harness(acquired=True, released=True):
     session.get_bind.return_value.dialect.name = "postgresql"
     session.in_transaction.return_value = False
     session.connection.return_value = connection
+    session.execute.side_effect = lambda sql, params=None: events.append(
+        (str(sql), params)
+    )
 
     @contextmanager
     def transaction():
@@ -110,6 +114,12 @@ def test_exact_order_single_connection_no_early_pool_return():
     assert events == [
         "session",
         "begin",
+        ("SET TRANSACTION ISOLATION LEVEL READ COMMITTED", None),
+        (
+            "SELECT set_config('lock_timeout', :lock_timeout, true), "
+            "set_config('statement_timeout', :statement_timeout, true)",
+            {"lock_timeout": "2000ms", "statement_timeout": "10000ms"},
+        ),
         ("SELECT pg_try_advisory_lock(:lock_key)", params),
         "body",
         ("SELECT pg_advisory_unlock(:lock_key)", params),
@@ -117,9 +127,20 @@ def test_exact_order_single_connection_no_early_pool_return():
         "session exit",
     ]
     session.connection.assert_called_once_with()
-    session.execute.assert_not_called()
+    assert session.execute.call_count == 2
     assert connection.execute.call_count == 2
     connection.invalidate.assert_not_called()
+
+
+def test_admission_uses_injected_transaction_wait_policy():
+    original, session, _, _ = harness()
+    store = BootstrapSeedStore(original._sessions, TransactionWaitPolicy(17, 29))
+    with store.initial_admission(seed().key):
+        pass
+    assert session.execute.call_args_list[1].args[1] == {
+        "lock_timeout": "17ms",
+        "statement_timeout": "29ms",
+    }
 
 
 @pytest.mark.parametrize(

@@ -50,21 +50,50 @@ class BootstrapSeedAdmissionError(ValueError):
         super().__init__("BOOTSTRAP_SEED_ADMISSION")
 
 
-@dataclass(frozen=True, slots=True)
-class BootstrapSeedAdmission:
-    """Scoped handle, not ABSENT proof. History SQL authority is not configured.
+_ADMISSION_GRANT = object()
 
-    This does not enable activation. The physical connection stays private and
-    the handle is permanently inactive before context unlock begins.
+
+@dataclass(slots=True)
+class _AdmissionLease:
+    key: BootstrapKey
+    connection: Connection
+    active: bool = True
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class BootstrapSeedAdmission:
+    """Granted shared lease; authority covers cooperating startup callers only.
+
+    SQL history authority is not configured; this handle is not ABSENT proof.
+    This does not enable activation or protect against raw writers.
     """
 
     key: BootstrapKey
-    _connection: Connection = field(repr=False, compare=False)
-    _active: bool = field(default=True, init=False, repr=False, compare=False)
+    _lease: _AdmissionLease = field(repr=False)
 
-    def __post_init__(self) -> None:
-        if type(self.key) is not BootstrapKey:
+    def __init__(
+        self,
+        key: BootstrapKey | None = None,
+        *,
+        _grant: object = None,
+        _lease: _AdmissionLease | None = None,
+    ) -> None:
+        if (
+            _grant is not _ADMISSION_GRANT
+            or type(key) is not BootstrapKey
+            or type(_lease) is not _AdmissionLease
+            or _lease.key is not key
+        ):
             raise BootstrapSeedAdmissionError()
+        object.__setattr__(self, "_lease", _lease)
+        object.__setattr__(self, "key", key)
+
+    @property
+    def _active(self) -> bool:
+        return self._lease.active
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> "BootstrapSeedAdmission":
+        return self
 
     def read_history(
         self, key: BootstrapKey, boundary_bar_start_ms: int
@@ -80,7 +109,7 @@ class BootstrapSeedAdmission:
                 raise ValueError
         except ValueError:
             raise BootstrapSeedAdmissionError() from None
-        # C2b will install the authoritative same-connection classifier here.
+        # SQL history authority is not configured in this lifecycle slice.
         raise BootstrapSeedAdmissionError()
 
 
@@ -228,6 +257,17 @@ class BootstrapSeedStore:
                     raise BootstrapSeedAdmissionError() from error
                 if connection.closed or connection.invalidated:
                     raise BootstrapSeedAdmissionError()
+                session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
+                session.execute(
+                    text(
+                        "SELECT set_config('lock_timeout', :lock_timeout, true), "
+                        "set_config('statement_timeout', :statement_timeout, true)"
+                    ),
+                    {
+                        "lock_timeout": f"{self._policy.lock_timeout_ms}ms",
+                        "statement_timeout": f"{self._policy.statement_timeout_ms}ms",
+                    },
+                )
                 try:
                     acquired = connection.execute(
                         text("SELECT pg_try_advisory_lock(:lock_key)"),
@@ -242,11 +282,14 @@ class BootstrapSeedStore:
                     if acquired is not False:
                         connection.invalidate()
                     raise BootstrapSeedAdmissionError()
-                admission = BootstrapSeedAdmission(key, connection)
+                lease = _AdmissionLease(key, connection)
+                admission = BootstrapSeedAdmission(
+                    key, _grant=_ADMISSION_GRANT, _lease=lease
+                )
                 try:
                     yield admission
                 finally:
-                    object.__setattr__(admission, "_active", False)
+                    lease.active = False
                     try:
                         released = connection.execute(
                             text("SELECT pg_advisory_unlock(:lock_key)"),
