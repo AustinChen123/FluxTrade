@@ -98,6 +98,41 @@ class ProfileActivationRequestRecord:
             raise ProfileActivationRequestIntegrityError()
 
 
+class ProfileActivationAdmissionStatus(Enum):
+    CONFIRMED = "CONFIRMED"
+    STALE = "STALE"
+    CONFLICT = "CONFLICT"
+    FAILED = "FAILED"
+    UNCONFIRMED = "UNCONFIRMED"
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileActivationAdmissionResult:
+    status: ProfileActivationAdmissionStatus
+    record: ProfileActivationRequestRecord | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.status) is not ProfileActivationAdmissionStatus or (
+            type(self.record) is not ProfileActivationRequestRecord
+            if self.status is ProfileActivationAdmissionStatus.CONFIRMED
+            else self.record is not None
+        ):
+            raise ProfileActivationRequestValidationError()
+
+
+def _admission_result(
+    record: object, request: ProfileActivationRequest
+) -> ProfileActivationAdmissionResult:
+    if (
+        type(record) is ProfileActivationRequestRecord
+        and record.request.canonical_bytes == request.canonical_bytes
+    ):
+        return ProfileActivationAdmissionResult(
+            ProfileActivationAdmissionStatus.CONFIRMED, record
+        )
+    return ProfileActivationAdmissionResult(ProfileActivationAdmissionStatus.FAILED)
+
+
 def _hydrate(
     row: dict[str, Any] | RowMapping, request_id: str
 ) -> ProfileActivationRequestRecord:
@@ -282,3 +317,41 @@ class ProfileActivationRequestStore:
         ):
             raise ProfileActivationRequestConflict()
         return record
+
+    def admit_confirmed(
+        self,
+        request: ProfileActivationRequest,
+        *,
+        current: ProfileActivationIntent,
+    ) -> ProfileActivationAdmissionResult:
+        """Confirm durable request evidence, not activation; never re-admit after error."""
+        status = ProfileActivationAdmissionStatus
+        if (
+            type(request) is not ProfileActivationRequest
+            or type(current) is not ProfileActivationIntent
+        ):
+            return ProfileActivationAdmissionResult(status.FAILED)
+        try:
+            record = self.admit(request, current=current)
+        except ProfileActivationRequestStale:
+            return ProfileActivationAdmissionResult(status.STALE)
+        except ProfileActivationRequestConflict:
+            return ProfileActivationAdmissionResult(status.CONFLICT)
+        except (
+            ProfileActivationRequestIntegrityError,
+            ProfileActivationRequestValidationError,
+        ):
+            return ProfileActivationAdmissionResult(status.FAILED)
+        except Exception:
+            try:
+                record = self.confirm(request)
+            except ProfileActivationRequestConflict:
+                return ProfileActivationAdmissionResult(status.CONFLICT)
+            except (
+                ProfileActivationRequestIntegrityError,
+                ProfileActivationRequestValidationError,
+            ):
+                return ProfileActivationAdmissionResult(status.FAILED)
+            except Exception:
+                return ProfileActivationAdmissionResult(status.UNCONFIRMED)
+        return _admission_result(record, request)

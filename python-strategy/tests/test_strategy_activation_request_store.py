@@ -498,3 +498,162 @@ def test_admission_exact_inputs_before_session():
         with pytest.raises(Validation):
             store.admit(cast(Any, args[0]), current=cast(Any, args[1]))
     factory.assert_not_called()
+
+
+@pytest.mark.parametrize("status", list(owner.ProfileActivationAdmissionStatus))
+def test_confirmed_result_exact_domain(status):
+    record = Record(request(), Status.PENDING, NOW)
+    confirmed = status is owner.ProfileActivationAdmissionStatus.CONFIRMED
+    result = owner.ProfileActivationAdmissionResult(
+        status, record if confirmed else None
+    )
+    with pytest.raises(Validation):
+        owner.ProfileActivationAdmissionResult(status, None if confirmed else record)
+    for invalid in (True, "CONFIRMED", None):
+        with pytest.raises(Validation):
+            owner.ProfileActivationAdmissionResult(cast(Any, invalid))
+    with pytest.raises(FrozenInstanceError):
+        setattr(result, "status", status)
+    assert not hasattr(result, "__dict__")
+
+
+def wrapper_harness():
+    store, _, _, _, _, factory = store_harness()
+    store.admit = MagicMock(return_value=Record(request(), Status.PENDING, NOW))
+    store.confirm = MagicMock()
+    return store, cast(MagicMock, store.admit), cast(MagicMock, store.confirm), factory
+
+
+@pytest.mark.parametrize(
+    "error,expected",
+    [
+        (owner.ProfileActivationRequestStale(), "STALE"),
+        (Conflict(), "CONFLICT"),
+        (Integrity(), "FAILED"),
+        (Validation(), "FAILED"),
+    ],
+)
+def test_known_admit_errors_never_confirm(error, expected):
+    store, admit, confirm, factory = wrapper_harness()
+    admit.side_effect = error
+    result = store.admit_confirmed(request(), current=request().intent)
+    assert result.status.value == expected and result.record is None
+    admit.assert_called_once()
+    confirm.assert_not_called()
+    factory.assert_not_called()
+
+
+@pytest.mark.parametrize("status", list(Status))
+@pytest.mark.parametrize("fallback", [False, True])
+def test_exact_pending_or_terminal_confirmation(status, fallback):
+    store, admit, confirm, _ = wrapper_harness()
+    value = request()
+    record = Record(
+        value,
+        status,
+        NOW,
+        None if status is Status.PENDING else NOW,
+        None if status is Status.PENDING else "DONE",
+    )
+    if fallback:
+        admit.side_effect = RuntimeError("SECRET")
+        confirm.return_value = record
+    else:
+        admit.return_value = record
+    result = store.admit_confirmed(value, current=value.intent)
+    assert result.status is owner.ProfileActivationAdmissionStatus.CONFIRMED
+    assert result.record is record
+    admit.assert_called_once_with(value, current=value.intent)
+    assert confirm.call_count == int(fallback)
+    if fallback:
+        confirm.assert_called_once_with(value)
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+def test_malformed_wrong_and_subclass_record_never_confirmed(fallback):
+    class Subclass(Record):
+        pass
+
+    class Falsey:
+        def __bool__(self):
+            raise AssertionError("must not test truthiness")
+
+    wrong = replace(request(), command=type(request().command).RESUME)
+    for returned in (
+        None,
+        Falsey(),
+        Subclass(request(), Status.PENDING, NOW),
+        Record(wrong, Status.PENDING, NOW),
+    ):
+        store, admit, confirm, _ = wrapper_harness()
+        if fallback:
+            admit.side_effect = RuntimeError("SECRET")
+            confirm.return_value = returned
+        else:
+            admit.return_value = returned
+        result = store.admit_confirmed(request(), current=request().intent)
+        assert result.status is owner.ProfileActivationAdmissionStatus.FAILED
+        assert result.record is None and "SECRET" not in repr(result)
+        assert admit.call_count == 1 and confirm.call_count == int(fallback)
+    with pytest.raises(Validation):
+        owner.ProfileActivationAdmissionResult(
+            owner.ProfileActivationAdmissionStatus.CONFIRMED,
+            Subclass(request(), Status.PENDING, NOW),
+        )
+
+
+@pytest.mark.parametrize(
+    "error,expected",
+    [
+        (Conflict(), "CONFLICT"),
+        (Integrity(), "FAILED"),
+        (Validation(), "FAILED"),
+        (RuntimeError("SECRET"), "UNCONFIRMED"),
+    ],
+)
+def test_confirmation_error_taxonomy(error, expected):
+    store, admit, confirm, _ = wrapper_harness()
+    admit.side_effect = RuntimeError("SECRET")
+    confirm.side_effect = error
+    result = store.admit_confirmed(request(), current=request().intent)
+    assert result.status.value == expected and result.record is None
+    assert "SECRET" not in repr(result) and admit.call_count == confirm.call_count == 1
+
+
+@pytest.mark.parametrize("phase", ["admit", "confirm"])
+def test_wrapper_base_exception_identity(phase):
+    store, admit, confirm, _ = wrapper_harness()
+    error = KeyboardInterrupt()
+    admit.side_effect = error if phase == "admit" else RuntimeError("SECRET")
+    confirm.side_effect = error
+    with pytest.raises(KeyboardInterrupt) as caught:
+        store.admit_confirmed(request(), current=request().intent)
+    assert caught.value is error and admit.call_count == 1
+    assert confirm.call_count == int(phase == "confirm")
+
+
+def test_wrapper_prevalidation_zero_attempts():
+    store, admit, confirm, factory = wrapper_harness()
+
+    class RequestSubclass(owner.ProfileActivationRequest):
+        pass
+
+    class IntentSubclass(owner.ProfileActivationIntent):
+        pass
+
+    original = request()
+    subclass = RequestSubclass(
+        original.actor, original.idempotency_key, original.command, original.intent
+    )
+    current_subclass = IntentSubclass(
+        original.intent.key, original.intent.requirements, 0
+    )
+    for value, current in (
+        (None, original.intent),
+        (original, None),
+        (subclass, original.intent),
+        (original, current_subclass),
+    ):
+        result = store.admit_confirmed(cast(Any, value), current=cast(Any, current))
+        assert result.status is owner.ProfileActivationAdmissionStatus.FAILED
+    assert not admit.mock_calls and not confirm.mock_calls and not factory.mock_calls
