@@ -1,9 +1,11 @@
 from dataclasses import FrozenInstanceError, replace
 from typing import Any, cast
+import ast
+from pathlib import Path
 
 import pytest
 
-from src.core.strategy_activation_service import (
+from src.core.strategy_activation_intent import (
     ProfileActivationAdmission as Admission,
     ProfileActivationIntent as Intent,
     ProfileActivationIntentError,
@@ -29,6 +31,37 @@ def intent():
         product, "1m", 2, profile_requirements=(profile,)
     )
     return Intent(key, requirements, 0)
+
+
+def test_service_reexports_exact_contract_objects():
+    from src.core import strategy_activation_intent as pure
+    from src.core import strategy_activation_service as service
+
+    for name in (
+        "ProfileActivationIntentError",
+        "ProfileActivationAdmission",
+        "ProfileActivationIntent",
+        "classify_profile_activation_intent",
+    ):
+        assert getattr(service, name) is getattr(pure, name)
+
+
+def test_pure_contract_import_boundary():
+    from src.core import strategy_activation_intent as pure
+
+    tree = ast.parse(Path(pure.__file__).read_text())
+    allowed = {
+        "dataclasses.dataclass",
+        "enum.Enum",
+        "src.core.market_data.profiles.bootstrap_seed.BootstrapKey",
+        "src.strategies.base.StrategyRequirements",
+    }
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            pytest.fail("pure intent must use only its explicit domain imports")
+        if isinstance(node, ast.ImportFrom):
+            assert node.level == 0
+            assert {f"{node.module}.{name.name}" for name in node.names} <= allowed
 
 
 @pytest.mark.parametrize("drift", ["version", "config", "requirements", "state"])
