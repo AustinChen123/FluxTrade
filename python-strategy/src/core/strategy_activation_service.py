@@ -8,6 +8,7 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import Enum
+from typing import Protocol
 
 from sqlalchemy.orm import Session
 
@@ -63,7 +64,15 @@ DbSessionFactory = Callable[[], AbstractContextManager[Session]]
 ProductIdResolver = Callable[[dict], str]
 ReadinessValidator = Callable[[ArtifactClass], None]
 PortfolioBuilder = Callable[..., PortfolioDefinition]
-ContextCapabilityValidator = Callable[[tuple[BaseStrategy, ...]], None]
+
+
+class ContextCapabilityValidator(Protocol):
+    def __call__(
+        self,
+        strategies: tuple[BaseStrategy, ...],
+        *,
+        profile_warmup_ready: bool = False,
+    ) -> None: ...
 
 
 class ProfileActivationConsumption(Enum):
@@ -177,6 +186,7 @@ class StrategyActivationService:
         artifact_resolver: Callable[[str], ArtifactClass | None] | None = None,
         profile_seed_factory: Callable[[BaseStrategy, BootstrapKey, int], BootstrapSeed]
         | None = None,
+        cutover_unregister_locked: Callable[[str], bool] | None = None,
     ) -> None:
         self._db_session_factory = db_session_factory
         self._transition_to_running = transition_to_running
@@ -190,11 +200,26 @@ class StrategyActivationService:
         self._logger = event_logger
         self._profile_request_store = profile_request_store
         self._profile_identity_resolver = profile_identity_resolver
+        self._cutover_unregister_locked = cutover_unregister_locked
         self._bootstrap_reader, self._state_manager = bootstrap_reader, state_manager
         self._artifact_resolver, self._profile_seed_factory = (
             artifact_resolver,
             profile_seed_factory,
         )
+
+    def cutover_pending_candle(self, candle: Candlestick) -> int:
+        if (
+            self._environment_identity() != "live"
+            or self._profile_request_store is None
+        ):
+            return 0
+        count = 0
+        for record in self._profile_request_store.list_pending("live"):
+            key = record.request.intent.key
+            if (key.product_id, key.timeframe) == (candle.product_id, candle.timeframe):
+                self.cutover_pending_request(record, candle)
+                count += 1
+        return count
 
     def cutover_pending_request(
         self, record: ProfileActivationRequestRecord, candle: Candlestick
@@ -220,6 +245,7 @@ class StrategyActivationService:
             or self._artifact_resolver is None
             or self._profile_seed_factory is None
             or self._profile_identity_resolver is None
+            or self._cutover_unregister_locked is None
         ):
             raise ProfileActivationRequestValidationError()
         artifact = self._artifact_resolver(key.strategy_id)
@@ -244,6 +270,7 @@ class StrategyActivationService:
             or instance.requirements != request.intent.requirements
         ):
             raise ProfileActivationRequestConflict()
+        self._assert_context_capabilities((instance,), profile_warmup_ready=True)
         factory = self._profile_seed_factory
 
         def checked_factory(seed_key: BootstrapKey) -> BootstrapSeed:
@@ -292,7 +319,7 @@ class StrategyActivationService:
             self._state_manager.after_committed_transition(result.transition)
         except BaseException:
             try:
-                self._unregister_runtime_artifact(key.strategy_id)
+                self._cutover_unregister_locked(key.strategy_id)
             except BaseException:
                 self._logger.error("profile_cutover_unregister_failed")
             try:

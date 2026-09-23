@@ -4,7 +4,7 @@ import json
 from collections.abc import Callable
 from contextlib import nullcontext
 from decimal import Decimal
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
@@ -32,7 +32,10 @@ from src.core.portfolio_runtime import (
     PortfolioFactory,
     PortfolioSleeve,
 )
-from src.core.strategy_activation_service import StrategyActivationService
+from src.core.strategy_activation_service import (
+    ContextCapabilityValidator,
+    StrategyActivationService,
+)
 from src.core.strategy_context import StrategyContext
 from src.core.strategy_state_manager import StaleStrategyStateVersion
 from src.strategies.base import BaseStrategy, StrategyRequirements
@@ -228,6 +231,47 @@ def test_consume_invalid_arguments_before_locks(monkeypatch, bad):
     assert not calls.mock_calls
 
 
+@pytest.mark.parametrize("environment", ["live", "backtest"])
+def test_cutover_candle_multiple_matching_pending(environment):
+    value, now = request(), datetime(2026, 1, 1, tzinfo=UTC)
+    second = replace(
+        value,
+        intent=replace(
+            value.intent, key=replace(value.intent.key, strategy_id="second")
+        ),
+    )
+    other = replace(
+        value,
+        intent=replace(
+            value.intent,
+            key=replace(value.intent.key, timeframe="5m"),
+            requirements=replace(value.intent.requirements, timeframe="5m"),
+        ),
+    )
+    rows = tuple(
+        Record(item, RequestStatus.PENDING, now) for item in (value, other, second)
+    )
+    store = MagicMock()
+    store.list_pending.return_value = rows
+    service, *_ = _build_service(
+        state=None, environment=environment, profile_request_store=store
+    )
+    service.cutover_pending_request = MagicMock()
+    candle = MagicMock(product_id=value.intent.key.product_id, timeframe="1m")
+    assert service.cutover_pending_candle(candle) == (2 if environment == "live" else 0)
+    assert service.cutover_pending_request.call_args_list == (
+        [call(rows[0], candle), call(rows[2], candle)] if environment == "live" else []
+    )
+    if environment == "live":
+        error = RuntimeError("cutover failure")
+        service.cutover_pending_request.side_effect = error
+        with pytest.raises(RuntimeError) as caught:
+            service.cutover_pending_candle(candle)
+        assert caught.value is error
+    else:
+        store.list_pending.assert_not_called()
+
+
 class _Strategy(BaseStrategy):
     events: list[str] = []
 
@@ -262,9 +306,9 @@ class _ProfileStrategy(_Strategy):
 
 @pytest.mark.parametrize(
     "phase",
-    "success commit register postcommit factory_key seed_scope seed_config bound_scope bound_config".split(),
+    "success capabilities missing_owner missing_loader commit register postcommit factory_key seed_scope seed_config bound_scope bound_config".split(),
 )
-def test_single_pending_cutover_order_and_failures(monkeypatch, phase):
+def test_single_pending_cutover_order_and_failures(monkeypatch, phase, engine_factory):
     value, now = request(), datetime(2026, 1, 1, tzinfo=UTC)
     value = replace(
         value,
@@ -294,6 +338,7 @@ def test_single_pending_cutover_order_and_failures(monkeypatch, phase):
         volume=Decimal(1),
     )
     reader, manager, resolver, factory = [MagicMock() for _ in range(4)]
+    unregister_locked, forbidden_lock = MagicMock(), MagicMock()
     resolver.return_value = consumption.MarketDataDecisionCompositionIdentity(
         "deployment", "v1", "a" * 64
     )
@@ -305,6 +350,7 @@ def test_single_pending_cutover_order_and_failures(monkeypatch, phase):
         state_manager=manager,
         artifact_resolver=lambda _: CutoverStrategy,
         profile_seed_factory=factory,
+        cutover_unregister_locked=unregister_locked,
     )
     log, error = [], RuntimeError("fixed cutover fault")
 
@@ -325,6 +371,22 @@ def test_single_pending_cutover_order_and_failures(monkeypatch, phase):
             else value.intent.key
         )
         return consumption.BootstrapSeedRecord(make_seed("seed"), now, True)
+
+    def capabilities(strategies, *, profile_warmup_ready=False):
+        assert profile_warmup_ready is True and len(strategies) == 1
+        action("capabilities")()
+
+    service._assert_context_capabilities = capabilities
+    if phase.startswith("missing_"):
+        engine = engine_factory()
+        engine.runtime_environment = MagicMock(identity="live")
+        engine._strategy_context_loader_enabled = phase != "missing_loader"
+        engine._market_data_decision_owner = (
+            None if phase == "missing_owner" else MagicMock()
+        )
+        service._assert_context_capabilities = (
+            engine._assert_strategy_context_capabilities
+        )
 
     def make_seed(stage):
         key = value.intent.key
@@ -384,9 +446,20 @@ def test_single_pending_cutover_order_and_failures(monkeypatch, phase):
     db.begin.return_value.__exit__.side_effect = action("commit")
     runtime.register_strategy.side_effect = action("register")
     manager.after_committed_transition.side_effect = action("postcommit")
+    cleanup_fence = nullcontext()
+    if phase in ("register", "postcommit"):
+        engine = engine_factory()
+        cleanup_fence = engine._market_processing_lock
+        forbidden_lock.__enter__.side_effect = AssertionError("market reacquisition")
+        engine._runtime_artifacts._market_processing_lock = forbidden_lock
+        unregister_locked.side_effect = (
+            engine._strategy_activation._cutover_unregister_locked
+        )
     if phase == "success":
         service.cutover_pending_request(record, candle)
-        assert log == "seed prepare hydrate consume commit register postcommit".split()
+        assert log == (
+            "capabilities seed prepare hydrate consume commit register postcommit".split()
+        )
         instance = runtime.register_strategy.call_args.args[0]
         factory.assert_called_once_with(instance, value.intent.key, candle.timestamp)
         reader.prepare.assert_called_once_with(
@@ -395,12 +468,15 @@ def test_single_pending_cutover_order_and_failures(monkeypatch, phase):
         assert hydration.hydrate_candles.call_args.args == (instance, ())
     else:
         with pytest.raises((RuntimeError, ValueError)) as caught:
-            service.cutover_pending_request(record, candle)
-        if phase in ("commit", "register", "postcommit"):
+            with cleanup_fence:
+                service.cutover_pending_request(record, candle)
+        if phase in ("capabilities", "commit", "register", "postcommit"):
             assert caught.value is error
         if phase in ("register", "postcommit"):
-            runtime.unregister.assert_called_once_with("strategy")
+            unregister_locked.assert_called_once_with("strategy")
+            runtime.unregister.assert_not_called()
             legacy.transition_to_error.assert_called_once()
+            forbidden_lock.__enter__.assert_not_called()
         else:
             runtime.register_strategy.assert_not_called()
             manager.after_committed_transition.assert_not_called()
@@ -409,6 +485,10 @@ def test_single_pending_cutover_order_and_failures(monkeypatch, phase):
             assert "consume" not in log
         if phase == "factory_key":
             factory.assert_not_called()
+        if phase == "capabilities" or phase.startswith("missing_"):
+            reader.prepare_initial_seed_under_admission.assert_not_called()
+            hydration.hydrate_candles.assert_not_called()
+            assert "consume" not in log
 
 
 @pytest.mark.parametrize("capability", ["configured", "store", "resolver", "nonlive"])
@@ -631,8 +711,7 @@ def _build_service(
     *,
     state: object | None,
     environment: str = "simulated",
-    assert_context_capabilities: Callable[[tuple[BaseStrategy, ...]], None]
-    | None = None,
+    assert_context_capabilities: ContextCapabilityValidator | None = None,
     profile_request_store=None,
     profile_identity_resolver=None,
     **cutover_capabilities,
@@ -656,7 +735,8 @@ def _build_service(
         unregister_runtime_artifact=runtime_artifacts.unregister,
         environment_identity=lambda: environment,
         assert_context_capabilities=(
-            assert_context_capabilities or (lambda _strategies: None)
+            assert_context_capabilities
+            or (lambda strategies, *, profile_warmup_ready=False: None)
         ),
         event_logger=MagicMock(),
         profile_request_store=profile_request_store,

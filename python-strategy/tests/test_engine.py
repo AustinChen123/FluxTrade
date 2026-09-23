@@ -270,6 +270,118 @@ def strategy_instance(mock_strategy_class):
     return mock_strategy_class("test_strat", "BINANCE:BTCUSDT-PERP")
 
 
+@pytest.mark.parametrize("fail", [False, True])
+@pytest.mark.parametrize("replay", [False, True])
+def test_cutover_hook_fenced_before_execution(engine, fail, replay):
+    from contextlib import contextmanager
+
+    events = []
+
+    @contextmanager
+    def lock(name):
+        events.append(name)
+        yield
+
+    engine._runtime_registration_lock = lock("registration")
+    engine._market_processing_lock = lock("market")
+    engine._live_candle_application.application_fence = lambda _: lock("application")
+    engine._live_candle_application.apply = lambda candle, **kwargs: kwargs[
+        "apply_new"
+    ](candle)
+
+    def pending(candle, *, apply_new):
+        with engine._live_candle_application.application_fence(candle):
+            apply_new(candle)
+
+    engine._pending_market_replay.replay = pending
+    entry = engine.replay_pending_market_data if replay else engine.on_market_data
+    error = RuntimeError("cutover failed")
+
+    def cutover(candle):
+        events.append("cutover")
+        if fail:
+            raise error
+
+    engine._strategy_activation.cutover_pending_candle = cutover
+    engine.execution_engine.process_market_data = (
+        lambda _: events.append("execution") or []
+    )
+    engine._signal_processor.on_candle = lambda *args, **kwargs: events.append(
+        "callback"
+    )
+    if fail:
+        with pytest.raises(RuntimeError) as caught:
+            entry(_make_candle())
+        assert caught.value is error
+    else:
+        entry(_make_candle())
+    assert events == ["registration", "market", "application", "cutover"] + (
+        [] if fail else ["execution", "callback"]
+    )
+
+
+def test_engine_cutover_capabilities_forwarded(engine_factory):
+    reader, factory = MagicMock(), MagicMock()
+    engine = engine_factory(
+        bootstrap_hydration_reader=reader, profile_seed_factory=factory
+    )
+    activation = engine._strategy_activation
+    assert activation._bootstrap_reader is reader
+    assert activation._profile_seed_factory is factory
+    assert activation._state_manager is engine._strategy_state_manager
+    assert activation._artifact_resolver == engine._get_loaded_strategy_class
+    assert (
+        activation._cutover_unregister_locked
+        == engine._runtime_artifacts.unregister_locked
+    )
+
+
+def test_profile_warmup_ready_preserves_other_gates(
+    engine_factory, mock_strategy_class
+):
+    from test_profile_activation_request import request
+
+    engine = engine_factory()
+    engine.runtime_environment = RuntimeEnvironment("live")
+    strategy = mock_strategy_class("strategy", request().intent.key.product_id)
+    strategy_type = type(strategy)
+    requirements = request().intent.requirements
+
+    class ProfileStrategy(strategy_type):
+        __fluxtrade_readiness__ = "LIVE_APPROVED"
+
+        @property
+        def requirements(self):
+            return requirements
+
+    instance = ProfileStrategy(strategy.strategy_id, strategy.product_id)
+    engine._available_strategy_context_capabilities = (
+        requirements.required_context_capabilities
+    )
+    for loader, owner in ((False, None), (True, None), (False, MagicMock())):
+        engine._strategy_context_loader_enabled = loader
+        engine._market_data_decision_owner = owner
+        with pytest.raises(RuntimeError, match="profile_execution_capability_missing"):
+            engine._assert_strategy_context_capabilities(
+                (instance,), profile_warmup_ready=True
+            )
+    engine._strategy_context_loader_enabled = True
+    engine._market_data_decision_owner = MagicMock()
+    engine._assert_strategy_context_capabilities((instance,), profile_warmup_ready=True)
+    for not_ready in (False, 1, "ready"):
+        with pytest.raises(RuntimeError, match="requires_modeled_warmup"):
+            engine._assert_strategy_context_capabilities(
+                (instance,), profile_warmup_ready=not_ready
+            )
+    with pytest.raises(RuntimeError, match="requires_modeled_warmup"):
+        engine.add_strategy(instance)
+    engine._available_strategy_context_capabilities = frozenset()
+    with pytest.raises(RuntimeError, match="ENTRY_RISK"):
+        engine._assert_strategy_context_capabilities(
+            (instance,), profile_warmup_ready=True
+        )
+
+
 def _make_candle(
     product_id="BINANCE:BTCUSDT-PERP",
     timeframe="1m",

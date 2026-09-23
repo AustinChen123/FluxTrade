@@ -61,6 +61,7 @@ from src.core.market_data.profiles.decision_application import MarketDataDecisio
 from src.core.market_data.profiles.decision_owner import MarketDataDecisionOwner
 from src.core.pending_market_replay import PendingMarketReplayService
 from src.core.bootstrap_hydration_reader import BootstrapHydrationReader
+from src.core.market_data.profiles.bootstrap_seed import BootstrapKey, BootstrapSeed
 from src.core.strategy_activation_request_store import ProfileActivationRequestStore
 from src.core.market_data.profiles.decision_owner import IdentityResolver
 from src.core.ops_safety import OpsSafetyService
@@ -205,6 +206,8 @@ class StrategyEngine:
         bootstrap_hydration_reader: BootstrapHydrationReader | None = None,
         profile_request_store: ProfileActivationRequestStore | None = None,
         profile_identity_resolver: IdentityResolver | None = None,
+        profile_seed_factory: Callable[[BaseStrategy, BootstrapKey, int], BootstrapSeed]
+        | None = None,
         available_strategy_context_capabilities: frozenset[
             StrategyContextCapability
         ] = frozenset(),
@@ -478,6 +481,11 @@ class StrategyEngine:
             event_logger=logger,
             profile_request_store=profile_request_store,
             profile_identity_resolver=profile_identity_resolver,
+            bootstrap_reader=bootstrap_hydration_reader,
+            state_manager=self._strategy_state_manager,
+            artifact_resolver=self._get_loaded_strategy_class,
+            profile_seed_factory=profile_seed_factory,
+            cutover_unregister_locked=self._runtime_artifacts.unregister_locked,
         )
         self._pending_market_replay = PendingMarketReplayService(
             db_session_factory=lambda: self._db_session_factory(),
@@ -1230,6 +1238,8 @@ class StrategyEngine:
     def _assert_strategy_context_capabilities(
         self,
         strategies: tuple[BaseStrategy, ...],
+        *,
+        profile_warmup_ready: bool = False,
     ) -> None:
         if self._is_backtest or self.runtime_environment.identity != "live":
             return
@@ -1238,11 +1248,16 @@ class StrategyEngine:
             for strategy in strategies
             if strategy.requirements.profile_requirements
         )
-        if profile_strategies:
+        if profile_strategies and profile_warmup_ready is not True:
             raise RuntimeError(
                 "strategy_profile_activation_requires_modeled_warmup: "
                 + ",".join(profile_strategies)
             )
+        if profile_strategies and (
+            not self._strategy_context_loader_enabled
+            or self._market_data_decision_owner is None
+        ):
+            raise RuntimeError("strategy_profile_execution_capability_missing")
         required = frozenset(
             capability
             for strategy in strategies
@@ -1292,6 +1307,7 @@ class StrategyEngine:
     def _apply_unpersisted_candle(
         self, candle: Candlestick
     ) -> MarketDataDecisionBatch | None:
+        self._strategy_activation.cutover_pending_candle(candle)
         fills = self.execution_engine.process_market_data(candle)
         decision = (
             None
@@ -1333,7 +1349,7 @@ class StrategyEngine:
             raise RuntimeError(
                 "pending trade replay has no durable strategy-state boundary"
             )
-        with self._market_processing_lock:
+        with self._runtime_registration_lock, self._market_processing_lock:
             self._pending_market_replay.replay(
                 data,
                 apply_new=self._apply_unpersisted_candle,
@@ -1647,15 +1663,16 @@ class StrategyEngine:
         """
         Callback triggered by DataConsumer when new market data arrives.
         """
-        with self._market_processing_lock:
-            if isinstance(data, Candlestick):
+        if isinstance(data, Candlestick):
+            with self._runtime_registration_lock, self._market_processing_lock:
                 with self._live_candle_application.application_fence(data):
                     self._live_candle_application.apply(
                         data,
                         apply_new=self._apply_unpersisted_candle,
                         rebuild_applied=self._pending_market_replay.rebuild_applied,
                     )
-                return
+            return
+        with self._market_processing_lock:
             if isinstance(data, Trade):
                 self._signal_processor.on_trade(data)
 
