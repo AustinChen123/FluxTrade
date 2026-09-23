@@ -246,6 +246,146 @@ class _Portfolio(PortfolioFactory):
         raise AssertionError("the test injects the validated definition builder")
 
 
+class _ProfileStrategy(_Strategy):
+    @property
+    def requirements(self):
+        return replace(request().intent.requirements, product_id=self.product_id)
+
+
+@pytest.mark.parametrize(
+    "command,status",
+    [
+        (Command.START, StrategyStatus.READY),
+        (Command.RESUME, StrategyStatus.STOPPED),
+        (Command.FORCE_RECOVER, StrategyStatus.ERROR),
+    ],
+)
+@pytest.mark.parametrize(
+    "admission",
+    list(consumption.ProfileActivationAdmissionStatus)
+    + [
+        RequestStatus.CONSUMED,
+        RequestStatus.CANCELLED,
+        RequestStatus.STALE,
+        "missing_store",
+        "missing_resolver",
+        "missing_key",
+        "illegal",
+        "identity_error",
+        "admission_error",
+    ],
+)
+def test_live_profile_durable_waiting_has_no_activation_side_effects(
+    command, status, admission
+):
+    store, resolver = MagicMock(), MagicMock()
+    resolver.return_value = consumption.MarketDataDecisionCompositionIdentity(
+        "deployment", "v1", "a" * 64
+    )
+
+    def admit(value, *, current):
+        assert current is value.intent
+        assert value.command is command and value.idempotency_key == "key"
+        assert value.actor == "operator" and current.expected_state_version == 7
+        assert current.key.execution_scope_id == "deployment"
+        if (
+            type(admission) is consumption.ProfileActivationAdmissionStatus
+            and admission is not consumption.ProfileActivationAdmissionStatus.CONFIRMED
+        ):
+            return consumption.ProfileActivationAdmissionResult(admission)
+        terminal = (
+            admission if type(admission) is RequestStatus else RequestStatus.PENDING
+        )
+        now = datetime(2026, 1, 1, tzinfo=UTC)
+        record = Record(
+            value,
+            terminal,
+            now,
+            None if terminal is RequestStatus.PENDING else now,
+            None if terminal is RequestStatus.PENDING else "DONE",
+        )
+        return consumption.ProfileActivationAdmissionResult(
+            consumption.ProfileActivationAdmissionStatus.CONFIRMED, record
+        )
+
+    store.admit_confirmed.side_effect = admit
+    if admission == "identity_error":
+        resolver.side_effect = RuntimeError("SECRET")
+    if admission == "admission_error":
+        store.admit_confirmed.side_effect = RuntimeError("SECRET")
+    if admission == "illegal":
+        status = (
+            StrategyStatus.WARNING
+            if command is not Command.START
+            else StrategyStatus.STOPPED
+        )
+    service, events, db, state_manager, hydration, runtime = _build_service(
+        state=_State([], status=status),
+        environment="live",
+        profile_request_store=None if admission == "missing_store" else store,
+        profile_identity_resolver=None if admission == "missing_resolver" else resolver,
+    )
+    result = service.activate_locked(
+        "strategy",
+        artifact_cls=_ProfileStrategy,
+        actor="operator",
+        reason=None,
+        force=command is not Command.START,
+        expected_version=None,
+        resolve_product_id=lambda _: "BINANCE:BTCUSDT-PERP",
+        assert_live_readiness=lambda _: None,
+        build_portfolio_definition=MagicMock(),
+        activation_command=command.value,
+        idempotency_key=None if admission == "missing_key" else "key",
+    )
+    waiting = admission in (
+        consumption.ProfileActivationAdmissionStatus.CONFIRMED,
+        RequestStatus.CONSUMED,
+    )
+    assert result is (
+        consumption.StrategyStartDisposition.WAITING_FOR_CUTOVER if waiting else False
+    )
+    assert (
+        not hydration.mock_calls
+        and not runtime.mock_calls
+        and not state_manager.mock_calls
+    )
+    db.commit.assert_not_called()
+    assert store.admit_confirmed.call_count == (
+        1 if admission == "admission_error" or not isinstance(admission, str) else 0
+    )
+    if admission in ("identity_error", "admission_error"):
+        cast(Any, service._logger).error.assert_called_once_with(
+            "profile_activation_admission_failed phase=%s",
+            "identity" if admission == "identity_error" else "admission",
+        )
+        assert "SECRET" not in str(cast(Any, service._logger).mock_calls)
+    if admission == "illegal":
+        resolver.assert_not_called()
+
+
+@pytest.mark.parametrize("phase", ["identity", "admission"])
+def test_profile_admission_baseexception_propagates(phase):
+    store, resolver, error = MagicMock(), MagicMock(), BaseException("SECRET")
+    resolver.return_value = consumption.MarketDataDecisionCompositionIdentity(
+        "deployment", "v1", "a" * 64
+    )
+    (resolver if phase == "identity" else store.admit_confirmed).side_effect = error
+    service, *_ = _build_service(
+        state=None, profile_request_store=store, profile_identity_resolver=resolver
+    )
+    with pytest.raises(BaseException) as caught:
+        service._admit_profile(
+            _ProfileStrategy("strategy", "BINANCE:BTCUSDT-PERP"),
+            0,
+            StrategyStatus.READY,
+            "operator",
+            "START",
+            "key",
+        )
+    assert caught.value is error
+
+
 class _State:
     events: list[str]
     strategy_id: str
@@ -280,6 +420,8 @@ def _build_service(
     environment: str = "simulated",
     assert_context_capabilities: Callable[[tuple[BaseStrategy, ...]], None]
     | None = None,
+    profile_request_store=None,
+    profile_identity_resolver=None,
 ):
     events: list[str] = []
     if isinstance(state, _State):
@@ -303,6 +445,8 @@ def _build_service(
             assert_context_capabilities or (lambda _strategies: None)
         ),
         event_logger=MagicMock(),
+        profile_request_store=profile_request_store,
+        profile_identity_resolver=profile_identity_resolver,
     )
     return service, events, db, state_manager, hydration, runtime_artifacts
 
@@ -320,7 +464,7 @@ def _activate(
         [type[BaseStrategy] | type[PortfolioFactory]], None
     ] = lambda _artifact_cls: None,
     build_portfolio_definition: Callable[..., PortfolioDefinition] = MagicMock(),
-) -> bool:
+) -> bool | consumption.StrategyStartDisposition:
     return service.activate_locked(
         "strategy",
         artifact_cls=artifact_cls,

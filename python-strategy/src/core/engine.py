@@ -61,6 +61,8 @@ from src.core.market_data.profiles.decision_application import MarketDataDecisio
 from src.core.market_data.profiles.decision_owner import MarketDataDecisionOwner
 from src.core.pending_market_replay import PendingMarketReplayService
 from src.core.bootstrap_hydration_reader import BootstrapHydrationReader
+from src.core.strategy_activation_request_store import ProfileActivationRequestStore
+from src.core.market_data.profiles.decision_owner import IdentityResolver
 from src.core.ops_safety import OpsSafetyService
 from src.core.ops_command_service import OpsCommandService
 from src.core.runtime_reconcile import PositionAuthorityState, RuntimeReconciliationJob
@@ -201,6 +203,8 @@ class StrategyEngine:
         strategy_context_loader: StrategyContextLoader | None = None,
         market_data_decision_owner: MarketDataDecisionOwner | None = None,
         bootstrap_hydration_reader: BootstrapHydrationReader | None = None,
+        profile_request_store: ProfileActivationRequestStore | None = None,
+        profile_identity_resolver: IdentityResolver | None = None,
         available_strategy_context_capabilities: frozenset[
             StrategyContextCapability
         ] = frozenset(),
@@ -468,6 +472,8 @@ class StrategyEngine:
             environment_identity=lambda: self.runtime_environment.identity,
             assert_context_capabilities=self._assert_strategy_context_capabilities,
             event_logger=logger,
+            profile_request_store=profile_request_store,
+            profile_identity_resolver=profile_identity_resolver,
         )
         self._pending_market_replay = PendingMarketReplayService(
             db_session_factory=lambda: self._db_session_factory(),
@@ -1109,7 +1115,9 @@ class StrategyEngine:
         reason: Optional[str] = None,
         force: bool = False,
         expected_version: int | None = None,
-    ) -> bool:
+        activation_command: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> bool | StrategyStartDisposition:
         """Instantiate/register a strategy and transition it to ACTIVE."""
         with self._strategy_lifecycle_lock(strategy_id):
             return self._strategy_activation.activate_locked(
@@ -1119,6 +1127,14 @@ class StrategyEngine:
                 reason=reason,
                 force=force,
                 expected_version=expected_version,
+                **(
+                    {
+                        "activation_command": activation_command,
+                        "idempotency_key": idempotency_key,
+                    }
+                    if idempotency_key is not None
+                    else {}
+                ),
                 resolve_product_id=self._strategy_product_id,
                 assert_live_readiness=self._assert_strategy_live_readiness,
                 build_portfolio_definition=self._build_portfolio_definition,

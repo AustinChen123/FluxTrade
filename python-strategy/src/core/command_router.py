@@ -92,6 +92,15 @@ class CommandRouter:
             {} if expected_version is None else {"expected_version": expected_version}
         )
 
+    @staticmethod
+    def _activation_kwargs(params: dict, command: str) -> dict:
+        key = params.get("idempotency_key")
+        return (
+            {"activation_command": command, "idempotency_key": key}
+            if type(key) is str
+            else {}
+        )
+
     def _handle_start(
         self, strategy_id: str, params: dict, message: dict
     ) -> CommandResult:
@@ -102,6 +111,7 @@ class CommandRouter:
             actor=actor,
             reason=reason,
             **self._expected_version_kwargs(params),
+            **self._activation_kwargs(params, "START"),
         )
         return self._start_result(disposition, strategy_id, "Started")
 
@@ -129,6 +139,7 @@ class CommandRouter:
             force=True,
             reason=reason,
             **self._expected_version_kwargs(params),
+            **self._activation_kwargs(params, "RESUME"),
         )
         return self._start_result(disposition, strategy_id, "Resumed")
 
@@ -143,6 +154,7 @@ class CommandRouter:
             force=True,
             reason=reason,
             **self._expected_version_kwargs(params),
+            **self._activation_kwargs(params, "FORCE_RECOVER"),
         )
         return self._start_result(disposition, strategy_id, "Force recovered")
 

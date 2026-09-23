@@ -53,6 +53,32 @@ def test_command_result_dataclass() -> None:
     assert result.data == {"value": 1}
 
 
+@pytest.mark.parametrize("command", ["START", "RESUME", "FORCE_RECOVER"])
+def test_activation_request_identity_forwarded_and_waiting_not_completed(command):
+    router = CommandRouter(StrategyRegistry(), MagicMock())
+    router.state_manager.transition_to_running.return_value = (
+        StrategyStartDisposition.WAITING_FOR_CUTOVER
+    )
+    result = router.handle(
+        {"command": command, "params": {"id": "s1", "idempotency_key": "stable"}}
+    )
+    kwargs = router.state_manager.transition_to_running.call_args.kwargs
+    assert (
+        kwargs["activation_command"] == command
+        and kwargs["idempotency_key"] == "stable"
+    )
+    assert result.success and not result.completed
+
+
+def test_engine_injects_profile_admission(engine_factory):
+    store, resolver = MagicMock(), MagicMock()
+    engine = engine_factory(
+        profile_request_store=store, profile_identity_resolver=resolver
+    )
+    assert engine._strategy_activation._profile_request_store is store
+    assert engine._strategy_activation._profile_identity_resolver is resolver
+
+
 def test_start_delegates_to_state_manager() -> None:
     router = CommandRouter(StrategyRegistry(), MagicMock())
     router.state_manager.transition_to_running.return_value = None

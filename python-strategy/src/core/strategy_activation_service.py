@@ -12,6 +12,12 @@ from enum import Enum
 from sqlalchemy.orm import Session
 
 from src.core.models import StrategyStatus
+from src.core.command_router import StrategyStartDisposition
+from src.core.market_data.profiles.bootstrap_seed import BootstrapKey
+from src.core.market_data.profiles.decision_owner import IdentityResolver
+from src.core.market_data.profiles.decision_identity import (
+    MarketDataDecisionCompositionIdentity,
+)
 from src.core.strategy_activation_intent import (
     ProfileActivationIntentError as ProfileActivationIntentError,
     ProfileActivationAdmission as ProfileActivationAdmission,
@@ -27,6 +33,9 @@ from src.core.strategy_activation_request_store import (
     ProfileActivationRequestConflict,
     lock_profile_activation_request,
     terminalize_profile_activation_request,
+    ProfileActivationRequestStore,
+    ProfileActivationAdmissionStatus,
+    ProfileActivationAdmissionResult,
 )
 from src.core.orm_models import StrategyState
 from src.core.portfolio_runtime import (
@@ -149,6 +158,8 @@ class StrategyActivationService:
         environment_identity: Callable[[], str],
         assert_context_capabilities: ContextCapabilityValidator,
         event_logger: logging.Logger,
+        profile_request_store: ProfileActivationRequestStore | None = None,
+        profile_identity_resolver: IdentityResolver | None = None,
     ) -> None:
         self._db_session_factory = db_session_factory
         self._transition_to_running = transition_to_running
@@ -160,6 +171,8 @@ class StrategyActivationService:
         self._environment_identity = environment_identity
         self._assert_context_capabilities = assert_context_capabilities
         self._logger = event_logger
+        self._profile_request_store = profile_request_store
+        self._profile_identity_resolver = profile_identity_resolver
 
     def activate_locked(
         self,
@@ -173,7 +186,9 @@ class StrategyActivationService:
         resolve_product_id: ProductIdResolver,
         assert_live_readiness: ReadinessValidator,
         build_portfolio_definition: PortfolioBuilder,
-    ) -> bool:
+        activation_command: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> bool | StrategyStartDisposition:
         """Run under Engine's per-strategy lifecycle lock."""
         self._logger.info("🚀 Starting Strategy: %s", strategy_id)
         if artifact_cls is None:
@@ -227,6 +242,18 @@ class StrategyActivationService:
                     )
                 else:
                     instance = artifact_cls(strategy_id, product_id)
+                    if (
+                        self._environment_identity() == "live"
+                        and instance.requirements.profile_requirements
+                    ):
+                        return self._admit_profile(
+                            instance,
+                            state.version,
+                            StrategyStatus(state.status),
+                            actor,
+                            activation_command,
+                            idempotency_key,
+                        )
                     self._assert_context_capabilities((instance,))
                     self._hydration.warm_up(db, instance)
                     if self._environment_identity() == "live":
@@ -273,6 +300,66 @@ class StrategyActivationService:
             )
             return False
         return True
+
+    def _admit_profile(
+        self,
+        instance: BaseStrategy,
+        version: int,
+        status: StrategyStatus,
+        actor: str,
+        command: str | None,
+        key: str | None,
+    ) -> bool | StrategyStartDisposition:
+        """Admission only; no hydration, registration or lifecycle transition."""
+        if (
+            self._profile_request_store is None
+            or self._profile_identity_resolver is None
+            or type(key) is not str
+            or type(command) is not str
+            or command not in available_strategy_commands(status)
+        ):
+            return False
+        phase = "identity"
+        try:
+            identity = self._profile_identity_resolver(instance)
+            if type(identity) is not MarketDataDecisionCompositionIdentity:
+                return False
+            intent = ProfileActivationIntent(
+                BootstrapKey(
+                    self._environment_identity(),
+                    identity.execution_scope_id,
+                    instance.strategy_id,
+                    identity.strategy_version,
+                    identity.config_hash,
+                    instance.product_id,
+                    instance.requirements.timeframe,
+                ),
+                instance.requirements,
+                version,
+            )
+            request = ProfileActivationRequest(
+                actor, key, ProfileActivationCommand(command), intent
+            )
+            phase = "admission"
+            result = self._profile_request_store.admit_confirmed(
+                request, current=intent
+            )
+            if (
+                type(result) is ProfileActivationAdmissionResult
+                and result.status is ProfileActivationAdmissionStatus.CONFIRMED
+                and result.record is not None
+                and result.record.request.canonical_bytes == request.canonical_bytes
+                and result.record.status
+                in (
+                    ProfileActivationRequestStatus.PENDING,
+                    ProfileActivationRequestStatus.CONSUMED,
+                )
+            ):
+                return StrategyStartDisposition.WAITING_FOR_CUTOVER
+        except Exception:
+            self._logger.error("profile_activation_admission_failed phase=%s", phase)
+            return False
+        return False
 
     def _assert_expected_version(
         self,

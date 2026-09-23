@@ -3425,7 +3425,7 @@ class TestHandleCommand:
             return True
 
         engine.redis_client.set.side_effect = claim_once
-        engine.activate_strategy = MagicMock()
+        engine.activate_strategy = MagicMock(return_value=True)
         mock_state = MagicMock(status="ERROR", version=3)
         mock_db = MagicMock()
         mock_db.query.return_value.filter.return_value.first.return_value = mock_state
@@ -3449,6 +3449,8 @@ class TestHandleCommand:
             force=True,
             reason=None,
             expected_version=3,
+            activation_command="FORCE_RECOVER",
+            idempotency_key="strategy-recover-1",
         )
         first_set = engine.redis_client.set.call_args_list[0]
         assert first_set.args[1] == "claimed"
@@ -5917,7 +5919,9 @@ class TestStopStrategy:
         """Stopping a non-active strategy should not crash."""
         mock_db = MagicMock()
         mock_db.query.return_value.filter.return_value.first.return_value = None
+        mock_db.query.return_value.filter.return_value.with_for_update.return_value.first.return_value = None
         engine._db_session_factory = lambda: nullcontext(mock_db)
+        engine._strategy_state_manager._db_session_factory = engine._db_session_factory
 
         engine.stop_strategy("nonexistent")
         # Should complete without error
@@ -6425,6 +6429,9 @@ class TestStrategyWarmup:
         )
         query = MagicMock()
         query.filter.return_value.first.return_value = state
+        query.filter.return_value.with_for_update.return_value.first.return_value = (
+            MagicMock(status=StrategyStatus.READY.value, version=3)
+        )
         query.filter_by.return_value.first.return_value = state
         query.filter_by.return_value.filter.return_value.update.return_value = 1
         mock_db = MagicMock()
