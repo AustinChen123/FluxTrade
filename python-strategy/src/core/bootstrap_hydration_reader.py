@@ -7,7 +7,6 @@ ABSENT through pin; DTO typing is not authority. This seam is not activation.
 
 from collections.abc import Callable
 from contextlib import AbstractContextManager
-from dataclasses import dataclass
 from typing import Literal
 
 from sqlalchemy.orm import Session
@@ -19,6 +18,7 @@ from src.core.market_data.profiles.bootstrap_hydration import (
     BoundBootstrapHydration,
 )
 from src.core.market_data.profiles.bootstrap_seed import (
+    BootstrapHistoryEvidence as BootstrapHistoryEvidence,
     BootstrapKey,
     BootstrapSeed,
     BootstrapDisposition,
@@ -45,28 +45,6 @@ from src.strategies.base import BaseStrategy
 class BootstrapHydrationReaderError(ValueError):
     def __init__(self) -> None:
         super().__init__("BOOTSTRAP_HYDRATION_READER_INVALID")
-
-
-@dataclass(frozen=True, slots=True)
-class BootstrapHistoryEvidence:
-    """Trusted-reader result; exact typing alone does not establish DB authority."""
-
-    key: BootstrapKey
-    boundary_bar_start_ms: int
-    state: Literal["ABSENT", "PRESENT", "UNKNOWN"]
-
-    def __post_init__(self) -> None:
-        try:
-            _integer(self.boundary_bar_start_ms)
-            if (
-                type(self.key) is not BootstrapKey
-                or type(self.state) is not str
-                or self.state not in ("ABSENT", "PRESENT", "UNKNOWN")
-                or self.boundary_bar_start_ms % timeframe_to_ms(self.key.timeframe)
-            ):
-                raise ValueError
-        except ValueError:
-            raise BootstrapHydrationReaderError() from None
 
 
 class BootstrapHydrationReader:

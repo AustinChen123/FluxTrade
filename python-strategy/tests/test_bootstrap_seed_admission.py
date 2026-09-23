@@ -11,6 +11,7 @@ import pytest
 from src.core.market_data.profiles.bootstrap_seed_store import (
     BootstrapSeedStore,
     BootstrapSeedAdmissionError,
+    BootstrapSeedAdmission,
     _admission_lock_key,
 )
 from test_profile_bootstrap_seed import seed
@@ -100,7 +101,7 @@ def test_exact_order_single_connection_no_early_pool_return():
     store, session, connection, events = harness()
     key = seed().key
     with store.initial_admission(key) as token:
-        assert token is None
+        assert type(token) is BootstrapSeedAdmission and token.key is key
         events.append("body")
         session.commit.assert_not_called()
         session.rollback.assert_not_called()

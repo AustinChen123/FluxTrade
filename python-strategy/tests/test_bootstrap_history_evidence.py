@@ -5,13 +5,20 @@ import pytest
 
 from src.core.bootstrap_hydration_reader import (
     BootstrapHistoryEvidence,
-    BootstrapHydrationReaderError,
 )
-from src.core.market_data.profiles.bootstrap_seed import BootstrapKey
+from src.core.market_data.profiles.bootstrap_seed import (
+    BootstrapKey,
+    BootstrapSeedError,
+    BootstrapHistoryEvidence as DomainEvidence,
+)
 from test_profile_bootstrap_seed import seed
 
 KEY = seed().key
 MAX = (1 << 63) - 1
+
+
+def test_reader_reexports_pure_domain_type():
+    assert BootstrapHistoryEvidence is DomainEvidence
 
 
 @pytest.mark.parametrize("state", ["ABSENT", "PRESENT", "UNKNOWN"])
@@ -39,7 +46,7 @@ def test_closed_states_exact_key_and_aligned_boundary(state, boundary):
     ],
 )
 def test_exact_clock_domain_and_alignment(bad):
-    with pytest.raises(BootstrapHydrationReaderError):
+    with pytest.raises(BootstrapSeedError):
         BootstrapHistoryEvidence(KEY, bad, "ABSENT")
 
 
@@ -47,9 +54,9 @@ def test_exact_clock_domain_and_alignment(bad):
     "bad", [None, True, "absent", "", "SECRET", type("Text", (str,), {})("ABSENT")]
 )
 def test_state_type_and_domain_are_closed(bad):
-    with pytest.raises(BootstrapHydrationReaderError) as caught:
+    with pytest.raises(BootstrapSeedError) as caught:
         replace(BootstrapHistoryEvidence(KEY, 0, "ABSENT"), state=bad)
-    assert str(caught.value) == "BOOTSTRAP_HYDRATION_READER_INVALID"
+    assert str(caught.value) == "PROFILE_BOOTSTRAP_HISTORY_EVIDENCE_INVALID"
     assert caught.value.__cause__ is None
 
 
@@ -58,12 +65,12 @@ def test_exact_key_not_subclass_mapping_or_mutable_object():
         pass
 
     for bad in (None, asdict(KEY), DerivedKey(**asdict(KEY)), object()):
-        with pytest.raises(BootstrapHydrationReaderError):
+        with pytest.raises(BootstrapSeedError):
             BootstrapHistoryEvidence(cast(Any, bad), 0, "ABSENT")
 
 
 def test_boundary_alignment_uses_bound_keys_timeframe():
     hourly = replace(KEY, timeframe="1h")
-    with pytest.raises(BootstrapHydrationReaderError):
+    with pytest.raises(BootstrapSeedError):
         BootstrapHistoryEvidence(hourly, 60000, "ABSENT")
     assert BootstrapHistoryEvidence(hourly, 3600000, "UNKNOWN").key is hourly

@@ -10,7 +10,7 @@ from decimal import Decimal, DecimalException
 from enum import Enum
 import hashlib
 import json
-from typing import Any
+from typing import Any, Literal
 
 from src.core.data_provider import timeframe_to_ms
 from src.core.decimal_math import canonical_decimal_text
@@ -107,6 +107,28 @@ class BootstrapKey:
     @property
     def seed_id(self) -> str:
         return hashlib.sha256(self.canonical_bytes).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class BootstrapHistoryEvidence:
+    """Trusted-reader result; exact typing alone does not establish DB authority."""
+
+    key: BootstrapKey
+    boundary_bar_start_ms: int
+    state: Literal["ABSENT", "PRESENT", "UNKNOWN"]
+
+    def __post_init__(self) -> None:
+        try:
+            _integer(self.boundary_bar_start_ms)
+            if (
+                type(self.key) is not BootstrapKey
+                or type(self.state) is not str
+                or self.state not in ("ABSENT", "PRESENT", "UNKNOWN")
+                or self.boundary_bar_start_ms % timeframe_to_ms(self.key.timeframe)
+            ):
+                raise ValueError
+        except ValueError:
+            raise BootstrapSeedError("HISTORY_EVIDENCE_INVALID") from None
 
 
 @dataclass(frozen=True, slots=True)

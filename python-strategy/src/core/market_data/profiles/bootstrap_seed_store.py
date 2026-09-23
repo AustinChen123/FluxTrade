@@ -9,7 +9,7 @@ not part of the durable key. This owner makes no callback/replay completion clai
 
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import StrEnum
 import hashlib
@@ -18,12 +18,19 @@ from typing import Any, cast
 
 from sqlalchemy import Table, and_, or_, select, text
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.engine import RowMapping
+from sqlalchemy.engine import Connection, RowMapping
 from sqlalchemy.orm import Session
 
-from .bootstrap_seed import BootstrapKey, BootstrapSeed, _bytes
+from .bootstrap_seed import (
+    BootstrapHistoryEvidence,
+    BootstrapKey,
+    BootstrapSeed,
+    _bytes,
+)
 from .orm import BootstrapSeed as InputRow
 from .repository import TransactionWaitPolicy
+from .read_types import _integer
+from src.core.data_provider import timeframe_to_ms
 
 _TABLE = cast(Table, InputRow.__table__)
 
@@ -41,6 +48,40 @@ class BootstrapSeedIntegrityError(ValueError):
 class BootstrapSeedAdmissionError(ValueError):
     def __init__(self) -> None:
         super().__init__("BOOTSTRAP_SEED_ADMISSION")
+
+
+@dataclass(frozen=True, slots=True)
+class BootstrapSeedAdmission:
+    """Scoped handle, not ABSENT proof. History SQL authority is not configured.
+
+    This does not enable activation. The physical connection stays private and
+    the handle is permanently inactive before context unlock begins.
+    """
+
+    key: BootstrapKey
+    _connection: Connection = field(repr=False, compare=False)
+    _active: bool = field(default=True, init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if type(self.key) is not BootstrapKey:
+            raise BootstrapSeedAdmissionError()
+
+    def read_history(
+        self, key: BootstrapKey, boundary_bar_start_ms: int
+    ) -> BootstrapHistoryEvidence:
+        try:
+            _integer(boundary_bar_start_ms)
+            if (
+                not self._active
+                or type(key) is not BootstrapKey
+                or key != self.key
+                or boundary_bar_start_ms % timeframe_to_ms(key.timeframe)
+            ):
+                raise ValueError
+        except ValueError:
+            raise BootstrapSeedAdmissionError() from None
+        # C2b will install the authoritative same-connection classifier here.
+        raise BootstrapSeedAdmissionError()
 
 
 def _admission_lock_key(key: BootstrapKey) -> int:
@@ -167,7 +208,7 @@ class BootstrapSeedStore:
         self._sessions, self._policy = sessions, policy
 
     @contextmanager
-    def initial_admission(self, key: BootstrapKey) -> Iterator[None]:
+    def initial_admission(self, key: BootstrapKey) -> Iterator[BootstrapSeedAdmission]:
         """Serialize cooperating startup callers only, not arbitrary raw writers.
 
         Hold one physical connection until unlock; this is not history authority
@@ -201,9 +242,11 @@ class BootstrapSeedStore:
                     if acquired is not False:
                         connection.invalidate()
                     raise BootstrapSeedAdmissionError()
+                admission = BootstrapSeedAdmission(key, connection)
                 try:
-                    yield
+                    yield admission
                 finally:
+                    object.__setattr__(admission, "_active", False)
                     try:
                         released = connection.execute(
                             text("SELECT pg_advisory_unlock(:lock_key)"),
