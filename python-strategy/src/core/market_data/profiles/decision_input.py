@@ -13,7 +13,7 @@ from typing import Any
 
 from src.core.decimal_math import canonical_decimal_text
 from .composite_types import CompositeProfile, CompositeProfilePoc
-from .context_enrichment import _validate_coverage
+from .context_enrichment import validate_profile_context_coverage
 from .decision_application import MarketDataDecisionKey
 from .decision_context import (
     ProfileDecisionContext,
@@ -156,7 +156,9 @@ class MarketDataDecisionInput:
                 or len(self.context.profiles) > MAX_INPUT_PROFILES
             ):
                 raise ValueError
-            _validate_coverage(self.requirements, self.context, self.decision_time_ms)
+            validate_profile_context_coverage(
+                self.requirements, self.context, self.decision_time_ms
+            )
             if any(
                 item.profile is not None
                 and len(item.profile.bins) > MAX_INPUT_BINS_PER_PROFILE

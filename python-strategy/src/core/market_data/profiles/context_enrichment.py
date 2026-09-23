@@ -28,11 +28,11 @@ def enrich_profile_context(
     """Exact coverage, no callback suppression; account timestamp remains untouched."""
     if type(context) is not StrategyContext or context.market_data is not None:
         raise ProfileContextEnrichmentError() from None
-    _validate_coverage(requirements, market_data, decision_time_ms)
+    validate_profile_context_coverage(requirements, market_data, decision_time_ms)
     return replace(context, market_data=market_data) if requirements else context
 
 
-def _validate_coverage(
+def validate_profile_context_coverage(
     requirements: tuple[ProfileRequirement, ...],
     market_data: StrategyMarketDataContext,
     decision_time_ms: int,
