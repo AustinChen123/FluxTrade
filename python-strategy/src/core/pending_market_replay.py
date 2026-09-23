@@ -120,13 +120,16 @@ class PendingMarketReplayService:
             db,
             replacement,
             before_timestamp=before_timestamp,
-            decision_scope_loader=self._recorded_scope_loader(db, decision_owner),
+            decision_scope_loader=self._recorded_scope_loader(
+                db, decision_owner, replacement
+            ),
         )
 
     def _recorded_scope_loader(
         self,
         db: Session,
         owner: MarketDataDecisionOwner,
+        strategy: BaseStrategy,
     ) -> StrategyDecisionScopeLoader:
         def load(replay_candle: Candlestick):
             batch = self._live_candle_application.applied_decision_batch(
@@ -140,7 +143,7 @@ class PendingMarketReplayService:
                     f"{replay_candle.timeframe}:"
                     f"{replay_candle.timestamp}"
                 )
-            return owner.replay_candle(replay_candle, batch)
+            return owner.prepare_replay_candle(strategy, replay_candle, batch)
 
         return load
 

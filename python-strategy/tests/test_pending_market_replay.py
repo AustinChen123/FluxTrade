@@ -209,7 +209,7 @@ def test_rewind_profile_strategy_rebuilds_only_from_recorded_scopes() -> None:
     hydration.fresh_instance_for_replay.return_value = replacement
     decision_owner = MagicMock()
     scope = MagicMock()
-    decision_owner.replay_candle.return_value = scope
+    decision_owner.prepare_replay_candle.return_value = scope
     service, application, _hydration, publish, db = _service(
         hydration=hydration,
         active=[current],
@@ -230,7 +230,9 @@ def test_rewind_profile_strategy_rebuilds_only_from_recorded_scopes() -> None:
     service.rewind_pending((pending,))
 
     application.applied_decision_batch.assert_called_once_with(recorded, db=db)
-    decision_owner.replay_candle.assert_called_once_with(recorded, batch)
+    decision_owner.prepare_replay_candle.assert_called_once_with(
+        replacement, recorded, batch
+    )
     publish.assert_called_once_with(replacement)
 
 
@@ -280,7 +282,7 @@ def test_rebuild_profile_strategy_replays_each_durable_decision_scope() -> None:
     hydration.fresh_instance_for_replay.return_value = replacement
     decision_owner = MagicMock()
     scopes = (MagicMock(), MagicMock())
-    decision_owner.replay_candle.side_effect = scopes
+    decision_owner.prepare_replay_candle.side_effect = scopes
     service, application, _hydration, publish, db = _service(
         hydration=hydration,
         active=[current],
@@ -303,8 +305,9 @@ def test_rebuild_profile_strategy_replays_each_durable_decision_scope() -> None:
     assert application.applied_decision_batch.call_args_list == [
         call(item, db=db) for item in historical
     ]
-    assert decision_owner.replay_candle.call_args_list == [
-        call(item, batch) for item, batch in zip(historical, batches, strict=True)
+    assert decision_owner.prepare_replay_candle.call_args_list == [
+        call(replacement, item, batch)
+        for item, batch in zip(historical, batches, strict=True)
     ]
     publish.assert_called_once_with(replacement)
 
@@ -325,14 +328,14 @@ def test_rebuild_profile_strategy_rejects_legacy_receipt_without_publication() -
     candle = _candle(timestamp=500)
     application.was_applied.return_value = True
     application.applied_decision_batch.return_value = None
-    hydration.warm_up.side_effect = (
-        lambda _db, _replacement, **kwargs: kwargs["decision_scope_loader"](candle)
-    )
+    hydration.warm_up.side_effect = lambda _db, _replacement, **kwargs: kwargs[
+        "decision_scope_loader"
+    ](candle)
 
     with pytest.raises(RuntimeError, match="recorded decision evidence is unavailable"):
         service.rebuild_applied(candle)
 
-    decision_owner.replay_candle.assert_not_called()
+    decision_owner.prepare_replay_candle.assert_not_called()
     publish.assert_not_called()
 
 
@@ -350,12 +353,12 @@ def test_late_profile_evidence_failure_publishes_no_earlier_replacement() -> Non
     for item in (*active, *replacements.values()):
         item.requirements.profile_requirements = (MagicMock(),)
     hydration = MagicMock()
-    hydration.fresh_instance_for_replay.side_effect = (
-        lambda current: replacements[current.strategy_id]
-    )
+    hydration.fresh_instance_for_replay.side_effect = lambda current: replacements[
+        current.strategy_id
+    ]
     decision_owner = MagicMock()
     scope = MagicMock()
-    decision_owner.replay_candle.return_value = scope
+    decision_owner.prepare_replay_candle.return_value = scope
     service, application, _hydration, publish, db = _service(
         hydration=hydration,
         active=active,
@@ -386,8 +389,8 @@ def test_late_profile_evidence_failure_publishes_no_earlier_replacement() -> Non
         call(historical["replacement-a"], db=db),
         call(historical["replacement-b"], db=db),
     ]
-    decision_owner.replay_candle.assert_called_once_with(
-        historical["replacement-a"], batch
+    decision_owner.prepare_replay_candle.assert_called_once_with(
+        replacements["a"], historical["replacement-a"], batch
     )
     publish.assert_not_called()
 
@@ -416,7 +419,7 @@ def test_rebuild_non_profile_strategy_preserves_legacy_hydration_path() -> None:
         before_timestamp=501,
     )
     application.applied_decision_batch.assert_not_called()
-    decision_owner.replay_candle.assert_not_called()
+    decision_owner.prepare_replay_candle.assert_not_called()
     publish.assert_called_once_with(replacement)
 
 

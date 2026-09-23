@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import InitVar, dataclass, field
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 
@@ -10,9 +11,16 @@ from src.core.strategy_context import StrategyContext
 from src.strategies.base import BaseStrategy
 
 from .context_enrichment import enrich_profile_context
-from .decision_application import MarketDataDecisionBatch, MarketDataDecisionKey
+from .decision_application import (
+    MarketDataDecisionBatch,
+    MarketDataDecisionKey,
+    MarketDataDecisionOutcome,
+)
 from .decision_batch_builder import DecisionBatchBuilder
-from .decision_identity import MarketDataDecisionCompositionIdentity
+from .decision_identity import (
+    MarketDataDecisionCompositionIdentity,
+    decision_config_hash,
+)
 from .decision_input import MarketDataDecisionInput
 from .decision_input_store import (
     DecisionInputRecord,
@@ -25,6 +33,7 @@ from .snapshot_cache import ProfileSnapshotCache
 logger = logging.getLogger(__name__)
 
 IdentityResolver = Callable[[BaseStrategy], MarketDataDecisionCompositionIdentity]
+_PREPARED_TOKEN = object()
 
 
 class MarketDataDecisionOwnerError(ValueError):
@@ -97,6 +106,12 @@ class MarketDataDecisionOwner:
         candle: Candlestick,
         batch: MarketDataDecisionBatch,
     ) -> "RecordedMarketDataCandleDecision":
+        self._validate_replay_candle(candle, batch)
+        return RecordedMarketDataCandleDecision(self, candle, batch)
+
+    def _validate_replay_candle(
+        self, candle: Candlestick, batch: MarketDataDecisionBatch
+    ) -> None:
         if (
             type(candle) is not Candlestick
             or type(batch) is not MarketDataDecisionBatch
@@ -107,48 +122,41 @@ class MarketDataDecisionOwner:
             or batch.bar_start_ms != candle.timestamp
         ):
             raise MarketDataDecisionOwnerError()
-        return RecordedMarketDataCandleDecision(self, candle, batch)
 
-
-class RecordedMarketDataCandleDecision:
-    """Replay terminal outcomes without consulting the current cache view."""
-
-    def __init__(
-        self,
-        owner: MarketDataDecisionOwner,
-        candle: Candlestick,
-        batch: MarketDataDecisionBatch,
-    ) -> None:
-        self._owner = owner
-        self._candle = candle
-        self._outcomes = {
-            outcome.key.strategy_id: outcome for outcome in batch.outcomes
-        }
-
-    def __call__(
+    def prepare_replay_candle(
         self,
         strategy: BaseStrategy,
         candle: Candlestick,
-        context: StrategyContext | None,
-    ) -> AbstractContextManager[StrategyContext | None]:
-        if not isinstance(strategy, BaseStrategy) or candle is not self._candle:
+        batch: MarketDataDecisionBatch,
+    ) -> "PreparedRecordedDecision":
+        self._validate_replay_candle(candle, batch)
+        if not isinstance(strategy, BaseStrategy):
             raise MarketDataDecisionOwnerError()
         requirements = strategy.requirements.profile_requirements
-        outcome = self._outcomes.get(strategy.strategy_id)
+        outcome = next(
+            (
+                item
+                for item in batch.outcomes
+                if item.key.strategy_id == strategy.strategy_id
+            ),
+            None,
+        )
         if not requirements:
             if outcome is not None:
                 raise MarketDataDecisionOwnerError()
-            return nullcontext(context)
-        if outcome is None:
-            raise MarketDataDecisionOwnerError()
-        identity = self._owner._identity_resolver(strategy)
+            return PreparedRecordedDecision(
+                strategy, candle, None, None, _PREPARED_TOKEN
+            )
+        identity = self._identity_resolver(strategy)
         if (
             type(identity) is not MarketDataDecisionCompositionIdentity
-            or identity.execution_scope_id != self._owner._execution_scope_id
+            or identity.execution_scope_id != self._execution_scope_id
+            or strategy.product_id != candle.product_id
+            or strategy.requirements.timeframe != candle.timeframe
         ):
             raise MarketDataDecisionOwnerError()
         key = MarketDataDecisionKey.for_candle(
-            environment=self._owner._environment,
+            environment=self._environment,
             execution_scope_id=identity.execution_scope_id,
             strategy_id=strategy.strategy_id,
             strategy_version=identity.strategy_version,
@@ -157,9 +165,118 @@ class RecordedMarketDataCandleDecision:
             timeframe=candle.timeframe,
             bar_start_ms=candle.timestamp,
         )
-        if outcome.key != key:
+        if outcome is None or outcome.key != key:
             raise MarketDataDecisionOwnerError()
-        if outcome.disposition == "SKIPPED":
+        pinned = None
+        if outcome.disposition == "APPLIED":
+            record = self._input_store.get(key)
+            if type(record) is not DecisionInputRecord:
+                raise MarketDataDecisionOwnerError()
+            pinned = record.value
+        return PreparedRecordedDecision(
+            strategy, candle, outcome, pinned, _PREPARED_TOKEN, key
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedRecordedDecision:
+    """Validated fixed replay evidence; no owner, store, session, cache, or clock."""
+
+    strategy: BaseStrategy
+    candle: Candlestick
+    outcome: MarketDataDecisionOutcome | None
+    pinned_input: MarketDataDecisionInput | None
+    _token: InitVar[object] = None
+    _expected_key: InitVar[MarketDataDecisionKey | None] = None
+    _strategy_state: str = field(init=False, repr=False)
+    _candle_state: tuple[object, ...] = field(init=False, repr=False)
+
+    def _snapshot(self) -> tuple[str, tuple[object, ...]]:
+        strategy = self.strategy
+        state = decision_config_hash(
+            {
+                "strategy_id": strategy.strategy_id,
+                "product_id": strategy.product_id,
+                "requirements": strategy.requirements,
+                "version": getattr(
+                    type(strategy), "__fluxtrade_artifact_version__", None
+                ),
+                "configuration": strategy.replay_configuration()
+                if self.outcome is not None
+                else None,
+            }
+        )
+        values = tuple(
+            getattr(self.candle, name)
+            for name in (
+                "product_id",
+                "timeframe",
+                "timestamp",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+            )
+        )
+        return state, tuple((type(value), value) for value in values)
+
+    def __post_init__(
+        self, _token: object, _expected_key: MarketDataDecisionKey | None
+    ) -> None:
+        if (
+            _token is not _PREPARED_TOKEN
+            or not isinstance(self.strategy, BaseStrategy)
+            or type(self.candle) is not Candlestick
+        ):
+            raise MarketDataDecisionOwnerError()
+        outcome, pinned = self.outcome, self.pinned_input
+        requirements = self.strategy.requirements.profile_requirements
+        if outcome is None:
+            if requirements or pinned is not None or _expected_key is not None:
+                raise MarketDataDecisionOwnerError()
+        else:
+            if (
+                type(outcome) is not MarketDataDecisionOutcome
+                or type(_expected_key) is not MarketDataDecisionKey
+                or outcome.key != _expected_key
+                or outcome.key.strategy_id != self.strategy.strategy_id
+                or outcome.key.product_id != self.strategy.product_id
+                or outcome.key.product_id != self.candle.product_id
+                or outcome.key.trigger_id
+                != f"{self.candle.timeframe}:{self.candle.timestamp}"
+            ):
+                raise MarketDataDecisionOwnerError()
+            if outcome.disposition == "SKIPPED":
+                if pinned is not None:
+                    raise MarketDataDecisionOwnerError()
+            elif (
+                type(pinned) is not MarketDataDecisionInput
+                or pinned.key != outcome.key
+                or pinned.input_id != outcome.input_id
+                or pinned.input_digest != outcome.input_digest
+                or pinned.requirements != requirements
+            ):
+                raise MarketDataDecisionOwnerError()
+        state, candle_state = self._snapshot()
+        object.__setattr__(self, "_strategy_state", state)
+        object.__setattr__(self, "_candle_state", candle_state)
+
+    def __call__(
+        self,
+        strategy: BaseStrategy,
+        candle: Candlestick,
+        context: StrategyContext | None,
+    ) -> AbstractContextManager[StrategyContext | None]:
+        if strategy is not self.strategy or candle is not self.candle:
+            raise MarketDataDecisionOwnerError()
+        if self._snapshot() != (self._strategy_state, self._candle_state):
+            raise MarketDataDecisionOwnerError()
+        if self.outcome is None:
+            if strategy.requirements.profile_requirements:
+                raise MarketDataDecisionOwnerError()
+            return nullcontext(context)
+        if self.outcome.disposition == "SKIPPED" and context is None:
             return _skipped_scope()
         if (
             type(context) is not StrategyContext
@@ -168,22 +285,46 @@ class RecordedMarketDataCandleDecision:
             or context.timestamp != candle.timestamp
         ):
             raise MarketDataDecisionOwnerError()
-        record = self._owner._input_store.get(key)
+        if self.outcome.disposition == "SKIPPED":
+            return _skipped_scope()
+        pinned = self.pinned_input
         if (
-            type(record) is not DecisionInputRecord
-            or record.value.key != key
-            or record.value.requirements != requirements
-            or record.value.input_id != outcome.input_id
-            or record.value.input_digest != outcome.input_digest
+            pinned is None
+            or pinned.requirements != strategy.requirements.profile_requirements
         ):
             raise MarketDataDecisionOwnerError()
-        enriched = enrich_profile_context(
-            context,
-            requirements,
-            record.value.context,
-            decision_time_ms=record.value.decision_time_ms,
+        return nullcontext(
+            enrich_profile_context(
+                context,
+                pinned.requirements,
+                pinned.context,
+                decision_time_ms=pinned.decision_time_ms,
+            )
         )
-        return nullcontext(enriched)
+
+
+class RecordedMarketDataCandleDecision:
+    """Compatibility callable delegates all evidence validation to prepare."""
+
+    def __init__(
+        self,
+        owner: MarketDataDecisionOwner,
+        candle: Candlestick,
+        batch: MarketDataDecisionBatch,
+    ) -> None:
+        self._owner, self._candle, self._batch = owner, candle, batch
+
+    def __call__(
+        self,
+        strategy: BaseStrategy,
+        candle: Candlestick,
+        context: StrategyContext | None,
+    ) -> AbstractContextManager[StrategyContext | None]:
+        if candle is not self._candle:
+            raise MarketDataDecisionOwnerError()
+        return self._owner.prepare_replay_candle(strategy, candle, self._batch)(
+            strategy, candle, context
+        )
 
 
 class MarketDataCandleDecision:
