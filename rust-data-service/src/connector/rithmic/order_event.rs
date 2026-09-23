@@ -62,7 +62,14 @@ pub(crate) fn decode_order_event(
         optional_nonnegative_quantity(response.total_fill_size, "total fill size")?;
     let unfilled_quantity =
         optional_nonnegative_quantity(response.total_unfilled_size, "total unfilled size")?;
-    let quantity = optional_positive_quantity(response.quantity, "order quantity")?;
+    let quantity = optional_positive_quantity(response.quantity, "order quantity")?.or_else(|| {
+        // Only an explicitly complete Fill proves the missing original quantity.
+        (notify_type == protocol::exchange_order_notification::NotifyType::Fill
+            && unfilled_quantity == Some(Decimal::ZERO))
+        .then_some(cumulative_filled_quantity)
+        .flatten()
+        .filter(|filled| *filled > Decimal::ZERO)
+    });
     let status = classify_status(
         notify_type,
         response.status.as_deref(),
