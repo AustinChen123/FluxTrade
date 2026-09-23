@@ -77,7 +77,9 @@ def _identity(window: _Window) -> dict[str, object]:
         "manifest": json.loads(manifest.canonical_bytes),
         "manifest_digest": manifest.manifest_digest,
         "invalidations": _invalidations(read),
-        "merge_algorithm_version": "aligned-sum-v1",
+        "merge_algorithm_version": (
+            "aligned-sum-v1" if profile is None else profile.merge_algorithm_version
+        ),
         "composite_id": None if profile is None else profile.composite_id,
     }
 
@@ -105,7 +107,12 @@ class PreloadedModeledProfileProvider:
         windows = []
         for key, read in staged:
             revoked = any(day.invalidations for day in read.days)
-            windows.append((key, _Window(read, None if revoked else compose_profile(read))))
+            profile = None if revoked else compose_profile(read)
+            if not revoked and (
+                type(profile) is not CompositeProfile or profile.manifest != read.manifest
+            ):
+                raise PreloadedModeledProfileError() from None
+            windows.append((key, _Window(read, profile)))
         windows.sort(key=lambda item: item[0])
         projection = {
             "schema_version": 1,
@@ -140,6 +147,10 @@ class PreloadedModeledProfileProvider:
                 or availability_policy_id != MODELED_AVAILABILITY_POLICY.policy_id
                 or type(requirements) is not tuple
                 or any(type(value) is not ProfileRequirement for value in requirements)
+                or any(
+                    value.freshness_policy_id != "utc_complete_strict_v1"
+                    for value in requirements
+                )
                 or len({value.canonical_bytes for value in requirements}) != len(requirements)
             ):
                 raise ValueError
@@ -181,20 +192,20 @@ class PreloadedModeledProfileProvider:
                 ProfileDecisionStatus.MISSING, "PROFILE_NOT_READY")
         selection = select_modeled_profile(request, window.read)
         if isinstance(selection, ModeledProfileSelectionUnavailable):
-            status = (
-                ProfileDecisionStatus.INVALID
-                if selection.reason == "SNAPSHOT_REVOKED"
-                else ProfileDecisionStatus.MISSING
-            )
-            return ProfileDecisionContext(
-                request, decision_time_ms, ProfileDecisionBasis.MODELED,
-                status, selection.reason)
-        assert isinstance(selection, ModeledProfileSelection)
+            if selection.reason == "SNAPSHOT_REVOKED":
+                return ProfileDecisionContext(
+                    request, decision_time_ms, ProfileDecisionBasis.MODELED,
+                    ProfileDecisionStatus.INVALID, selection.reason)
         profile = window.profile
         if profile is None or request.output_grid_id != profile.output_grid.grid_id:
             return ProfileDecisionContext(
                 request, decision_time_ms, ProfileDecisionBasis.MODELED,
                 ProfileDecisionStatus.INVALID, "INVALID_PROFILE")
+        if isinstance(selection, ModeledProfileSelectionUnavailable):
+            return ProfileDecisionContext(
+                request, decision_time_ms, ProfileDecisionBasis.MODELED,
+                ProfileDecisionStatus.MISSING, selection.reason)
+        assert isinstance(selection, ModeledProfileSelection)
         return ProfileDecisionContext(
             request, decision_time_ms, ProfileDecisionBasis.MODELED,
             ProfileDecisionStatus.FRESH, profile=profile,
