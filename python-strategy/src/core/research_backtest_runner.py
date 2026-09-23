@@ -66,6 +66,11 @@ from src.core.signal_order_intent import (
     resolve_signal_order_intent,
 )
 from src.core.strategy_context import RejectionSnapshot, StrategyContext
+from src.core.market_data.profiles.context_enrichment import enrich_profile_context
+from src.core.market_data.profiles.modeled_input import (
+    ModeledProfileInput,
+    completed_candle_decision_time_ms,
+)
 from src.core.signal_processor import (
     StrategyContextInvocationMode,
     apply_strategy_position_state,
@@ -139,6 +144,7 @@ class ResearchBacktestRunner:
         external_funding_events: Sequence[ExternalFundingEvent] = (),
         external_funding_account_id: str | None = None,
         market_slippage_bps: Decimal = Decimal("0"),
+        modeled_profile_input: ModeledProfileInput | None = None,
     ):
         self.start_time = start_time
         self.end_time = end_time
@@ -162,6 +168,12 @@ class ResearchBacktestRunner:
         self.external_funding_events = tuple(external_funding_events)
         self.external_funding_account_id = external_funding_account_id
         self.contract_multiplier = resolve_contract_multiplier(instrument_spec)
+        if (
+            modeled_profile_input is not None
+            and type(modeled_profile_input) is not ModeledProfileInput
+        ):
+            raise TypeError("modeled_profile_input must be ModeledProfileInput")
+        self._modeled_profile_input = modeled_profile_input
         self._reserved_entry_capital: dict[str, tuple[str, Decimal]] = {}
         self._latest_rejections: dict[str, tuple[RejectionSnapshot, ...]] = {}
         self._invalid_order_intent_rejections: list[InvalidOrderIntentRejection] = []
@@ -170,10 +182,19 @@ class ResearchBacktestRunner:
 
     def add_strategy(self, strategy: BaseStrategy) -> None:
         if strategy.requirements.profile_requirements:
-            raise RuntimeError(
-                "profile_market_data_provider_required: "
-                f"runner=research strategy_id={strategy.strategy_id}"
-            )
+            if self._modeled_profile_input is None:
+                raise RuntimeError(
+                    "profile_market_data_provider_required: "
+                    f"runner=research strategy_id={strategy.strategy_id}"
+                )
+            if (
+                strategy_context_invocation_mode(strategy)
+                is StrategyContextInvocationMode.NONE
+            ):
+                raise RuntimeError(
+                    "profile_strategy_context_required: "
+                    f"runner=research strategy_id={strategy.strategy_id}"
+                )
         self._strategies.append(strategy)
 
     def run(self) -> dict:
@@ -247,6 +268,10 @@ class ResearchBacktestRunner:
             "external_funding_account_id": self.external_funding_account_id,
             "strategies": strategy_configuration_contract(self._strategies),
         }
+        if self._modeled_profile_input is not None:
+            configuration_contract["profile_availability_policy_id"] = (
+                self._modeled_profile_input.availability_policy_id
+            )
         runner_configuration_contract = {
             **configuration_contract,
             "runner_kind": "research",
@@ -333,6 +358,24 @@ class ResearchBacktestRunner:
                     peak_equity_by_strategy=peak_equity_by_strategy,
                     max_drawdown_by_strategy=max_drawdown_by_strategy,
                 )
+                requirements = strategy.requirements.profile_requirements
+                if requirements:
+                    modeled_input = self._modeled_profile_input
+                    if modeled_input is None:
+                        raise RuntimeError(
+                            "profile modeled input missing after admission"
+                        )
+                    decision_time_ms = completed_candle_decision_time_ms(
+                        candle.timestamp, candle.timeframe
+                    )
+                    context = enrich_profile_context(
+                        context,
+                        requirements,
+                        modeled_input.resolve(
+                            requirements, decision_time_ms=decision_time_ms
+                        ),
+                        decision_time_ms=decision_time_ms,
+                    )
                 decision_snapshots.append(canonical_decision_snapshot(context))
                 contexts.append(context)
                 signals = self._signals_from_strategy(

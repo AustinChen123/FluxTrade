@@ -82,8 +82,11 @@ def _full(provider=None) -> BacktestRunner:
     return BacktestRunner(0, 60_000, PRODUCT, "1m", modeled_profile_input=modeled)
 
 
-def _research() -> ResearchBacktestRunner:
-    return ResearchBacktestRunner(0, 60_000, PRODUCT, "1m")
+def _research(provider=None) -> ResearchBacktestRunner:
+    modeled = None if provider is None else ModeledProfileInput(provider, POLICY)
+    return ResearchBacktestRunner(
+        0, 60_000, PRODUCT, "1m", modeled_profile_input=modeled
+    )
 
 
 def test_full_runner_rejects_profile_strategy_before_registration():
@@ -220,6 +223,96 @@ def test_full_runner_split_path_and_provenance_are_causally_wired(
     )
 
 
+@pytest.mark.rust
+def test_full_and_research_runners_share_exact_modeled_input_semantics(tmp_path):
+    pytest.importorskip("fluxtrade_core")
+    from integration.test_research_backtest_runner import (
+        _sqlite_backtest_session_factory,
+    )
+
+    bucket = 2 * DAY
+    execution = [
+        Candlestick(
+            product_id=PRODUCT,
+            timeframe="1m",
+            timestamp=bucket + minute * 60_000,
+            open=Decimal("1"),
+            high=Decimal("1"),
+            low=Decimal("1"),
+            close=Decimal("1"),
+            volume=Decimal("1"),
+        )
+        for minute in range(6)
+    ]
+    decision = Candlestick(
+        product_id=PRODUCT,
+        timeframe="5m",
+        timestamp=bucket,
+        open=Decimal("1"),
+        high=Decimal("1"),
+        low=Decimal("1"),
+        close=Decimal("1"),
+        volume=Decimal("5"),
+    )
+    full_provider, research_provider = _Provider(), _Provider()
+    full_strategy = _ProfileStrategy("profile", timeframe="5m")
+    research_strategy = _ProfileStrategy("profile", timeframe="5m")
+    full = BacktestRunner(
+        bucket,
+        bucket + 300_000,
+        PRODUCT,
+        "5m",
+        data_source=MemoryDataSource(execution),
+        max_drawdown_limit=None,
+        execution_timeframe="1m",
+        report_config={
+            key: False
+            for key in (
+                "csv_trades",
+                "markdown_report",
+                "equity_curve",
+                "journal_export",
+            )
+        },
+        db_session_factory=_sqlite_backtest_session_factory(tmp_path, PRODUCT),
+        modeled_profile_input=ModeledProfileInput(full_provider, POLICY),
+    )
+    research = ResearchBacktestRunner(
+        bucket,
+        bucket + 300_000,
+        PRODUCT,
+        "5m",
+        data_source=MemoryDataSource([decision]),
+        modeled_profile_input=ModeledProfileInput(research_provider, POLICY),
+    )
+    full.add_strategy(full_strategy)
+    research.add_strategy(research_strategy)
+
+    full_result, research_result = full.run(), research.run()
+
+    assert full_result is not None
+    full_context = full_strategy.contexts[0]
+    research_context = research_strategy.contexts[0]
+    assert full_context.market_data is not None
+    assert research_context.market_data is not None
+    assert (
+        full_context.market_data.canonical_bytes
+        == research_context.market_data.canonical_bytes
+    )
+    assert full_context.market_data.digest == research_context.market_data.digest
+    assert full_result["decision_snapshots"] == research_result["decision_snapshots"]
+    assert (
+        full_result["provenance"].configuration_sha256
+        == research_result["provenance"].configuration_sha256
+    )
+    expected = (
+        full_strategy.requirements.profile_requirements,
+        bucket + 300_000,
+        POLICY,
+    )
+    assert full_provider.calls == research_provider.calls == [expected]
+
+
 def test_research_runner_rejects_profile_strategy_before_registration():
     runner = _research()
 
@@ -231,6 +324,21 @@ def test_research_runner_rejects_profile_strategy_before_registration():
         runner.add_strategy(_ProfileStrategy("profile"))
 
     assert runner._strategies == []
+
+
+def test_research_runner_accepts_preloaded_input_and_requires_context_contract():
+    runner = _research(_Provider())
+    strategy = _ProfileStrategy("profile")
+    runner.add_strategy(strategy)
+    assert runner._strategies == [strategy]
+
+    rejected = _research(_Provider())
+    with pytest.raises(
+        RuntimeError,
+        match="^profile_strategy_context_required: runner=research strategy_id=bad$",
+    ):
+        rejected.add_strategy(_NoContextProfileStrategy("bad"))
+    assert rejected._strategies == []
 
 
 def test_full_portfolio_profile_rejection_is_atomic_and_sorted():
