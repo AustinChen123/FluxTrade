@@ -1,4 +1,4 @@
-"""Durable request admission/readback; no terminal mutations, retries or runtime work."""
+"""Request evidence persistence; terminal mutation uses caller-owned transactions."""
 
 from dataclasses import dataclass
 from collections.abc import Callable, Iterator
@@ -8,7 +8,7 @@ import re
 from typing import Any, cast
 from enum import Enum
 from sqlalchemy.engine import RowMapping
-from sqlalchemy import Table, select, text
+from sqlalchemy import Table, select, text, update
 from sqlalchemy.orm import Session
 from sqlalchemy.dialects.postgresql import insert
 from src.core.orm_models import StrategyState
@@ -170,6 +170,83 @@ def _hydrate(
         )
     except (ValueError, TypeError, KeyError, OverflowError):
         raise ProfileActivationRequestIntegrityError() from None
+
+
+def terminalize_profile_activation_request(
+    session: Session,
+    expected: ProfileActivationRequest,
+    *,
+    status: ProfileActivationRequestStatus,
+    terminal_at: datetime,
+    terminal_reason: str,
+) -> ProfileActivationRequestRecord:
+    """Mutate within the caller transaction; return is not durable or ACTIVE proof."""
+    if (
+        type(expected) is not ProfileActivationRequest
+        or type(status) is not ProfileActivationRequestStatus
+        or status is ProfileActivationRequestStatus.PENDING
+        or not _stamp(terminal_at)
+        or type(terminal_reason) is not str
+        or re.fullmatch(r"[A-Z][A-Z0-9_]{0,127}", terminal_reason, re.ASCII) is None
+    ):
+        raise ProfileActivationRequestValidationError()
+    if (
+        not isinstance(session, Session)
+        or not session.is_active
+        or not session.in_transaction()
+        or session.get_bind().dialect.name != "postgresql"
+    ):
+        raise ProfileActivationRequestValidationError()
+    rows = (
+        session.execute(
+            select(_TABLE)
+            .where(_TABLE.c.request_id == expected.request_id)
+            .with_for_update()
+            .limit(2)
+        )
+        .mappings()
+        .all()
+    )
+    if len(rows) != 1:
+        raise ProfileActivationRequestIntegrityError()
+    existing = _hydrate(rows[0], expected.request_id)
+    if existing.request.canonical_bytes != expected.canonical_bytes:
+        raise ProfileActivationRequestConflict()
+    if existing.status is not ProfileActivationRequestStatus.PENDING:
+        if (existing.status, existing.terminal_at, existing.terminal_reason) != (
+            status,
+            terminal_at,
+            terminal_reason,
+        ):
+            raise ProfileActivationRequestConflict()
+        return existing
+    if terminal_at < existing.requested_at:
+        raise ProfileActivationRequestValidationError()
+    rows = (
+        session.execute(
+            update(_TABLE)
+            .where(
+                _TABLE.c.request_id == expected.request_id,
+                _TABLE.c.status == "PENDING",
+            )
+            .values(
+                status=status.value,
+                terminal_at=terminal_at,
+                terminal_reason=terminal_reason,
+            )
+            .returning(_TABLE)
+        )
+        .mappings()
+        .all()
+    )
+    if len(rows) != 1:
+        raise ProfileActivationRequestIntegrityError()
+    result = _hydrate(rows[0], expected.request_id)
+    if result != ProfileActivationRequestRecord(
+        expected, status, existing.requested_at, terminal_at, terminal_reason
+    ):
+        raise ProfileActivationRequestIntegrityError()
+    return result
 
 
 class ProfileActivationRequestStore:

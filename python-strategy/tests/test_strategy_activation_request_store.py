@@ -8,6 +8,7 @@ import pytest
 from sqlalchemy import PickleType, create_engine, literal, select
 from sqlalchemy.engine import RowMapping
 from sqlalchemy.dialects.postgresql import dialect
+from sqlalchemy.orm import Session
 
 from src.core import strategy_activation_request_store as owner
 from src.core.strategy_activation_request_store import (
@@ -657,3 +658,209 @@ def test_wrapper_prevalidation_zero_attempts():
         result = store.admit_confirmed(cast(Any, value), current=cast(Any, current))
         assert result.status is owner.ProfileActivationAdmissionStatus.FAILED
     assert not admit.mock_calls and not confirm.mock_calls and not factory.mock_calls
+
+
+def terminal_harness(first=None, second=None):
+    session = MagicMock(spec=Session)
+    session.is_active = True
+    session.in_transaction.return_value = True
+    session.get_bind.return_value.dialect.name = "postgresql"
+    terminal = row() | dict(status="CONSUMED", terminal_at=NOW, terminal_reason="DONE")
+    responses = []
+    for rows in (
+        [row()] if first is None else first,
+        [terminal] if second is None else second,
+    ):
+        response = MagicMock()
+        response.mappings.return_value.all.return_value = rows
+        responses.append(response)
+    session.execute.side_effect = responses
+    return session
+
+
+def terminalize(session, **changes):
+    args: dict[str, Any] = dict(
+        status=Status.CONSUMED, terminal_at=NOW, terminal_reason="DONE"
+    )
+    args.update(changes)
+    return owner.terminalize_profile_activation_request(session, request(), **args)
+
+
+@pytest.mark.parametrize("status", [Status.CONSUMED, Status.CANCELLED, Status.STALE])
+def test_terminalize_locked_update_and_no_lifecycle_ownership(status):
+    terminal = row() | dict(
+        status=status.value, terminal_at=NOW, terminal_reason="DONE"
+    )
+    session = terminal_harness(second=[terminal])
+    assert terminalize(session, status=status) == _hydrate(
+        terminal, request().request_id
+    )
+    select_sql, update_sql = [
+        str(c.args[0].compile(dialect=dialect()))
+        for c in session.execute.call_args_list
+    ]
+    assert "FOR UPDATE" in select_sql and "LIMIT %(param_1)s" in select_sql
+    assert (
+        "WHERE strategy_profile_activation_request.request_id = %(request_id_1)s"
+        in select_sql
+    )
+    selected = session.execute.call_args_list[0].args[0].compile(dialect=dialect())
+    assert selected.params == {"request_id_1": request().request_id, "param_1": 2}
+    assert update_sql.startswith("UPDATE") and "RETURNING" in update_sql
+    params = session.execute.call_args_list[1].args[0].compile(dialect=dialect()).params
+    assert set(params.values()) == {
+        status.value,
+        NOW,
+        "DONE",
+        request().request_id,
+        "PENDING",
+    }
+    for name in ("begin", "commit", "rollback", "close", "connection"):
+        getattr(session, name).assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"status": Status.PENDING},
+        {"status": "CONSUMED"},
+        {"terminal_at": None},
+        {"terminal_at": NOW.replace(tzinfo=None)},
+        {"terminal_at": NOW.replace(microsecond=1)},
+        {"terminal_reason": ""},
+        {"terminal_reason": "SECRET sql"},
+        {"terminal_reason": True},
+    ],
+)
+def test_terminalize_invalid_arguments_zero_sql(changes):
+    session = terminal_harness()
+    with pytest.raises(Validation):
+        terminalize(session, **changes)
+    session.execute.assert_not_called()
+
+
+@pytest.mark.parametrize("guard", ["dialect", "transaction", "inactive", "type"])
+def test_terminalize_session_guard(guard):
+    session = terminal_harness()
+    if guard == "dialect":
+        session.get_bind.return_value.dialect.name = "sqlite"
+    elif guard == "transaction":
+        session.in_transaction.return_value = False
+    elif guard == "inactive":
+        session.is_active = False
+    with pytest.raises(Validation):
+        terminalize(object() if guard == "type" else session)
+    session.execute.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "rows", [[], [row(), row()], [row() | {"payload_digest": "b" * 64}]]
+)
+@pytest.mark.parametrize("phase", [0, 1])
+def test_terminalize_missing_duplicate_corrupt_readback(rows, phase):
+    session = terminal_harness(**({"first": rows} if phase == 0 else {"second": rows}))
+    with pytest.raises(Integrity):
+        terminalize(session)
+    assert session.execute.call_count == phase + 1
+
+
+def test_terminalize_canonical_conflict_and_early_timestamp():
+    session = terminal_harness()
+    with pytest.raises(Conflict):
+        owner.terminalize_profile_activation_request(
+            session,
+            replace(request(), command=type(request().command).RESUME),
+            status=Status.CONSUMED,
+            terminal_at=NOW,
+            terminal_reason="DONE",
+        )
+    assert session.execute.call_count == 1
+    session = terminal_harness()
+    with pytest.raises(Validation):
+        terminalize(session, terminal_at=NOW - timedelta(milliseconds=1))
+    assert session.execute.call_count == 1
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {},
+        {"status": Status.STALE},
+        {"terminal_reason": "OTHER"},
+        {"terminal_at": NOW + timedelta(milliseconds=1)},
+    ],
+)
+def test_terminalize_exact_terminal_idempotence_only(changes):
+    data = row() | dict(status="CONSUMED", terminal_at=NOW, terminal_reason="DONE")
+    session = terminal_harness(first=[data])
+    if changes:
+        with pytest.raises(Conflict):
+            terminalize(session, **changes)
+    else:
+        assert terminalize(session) == _hydrate(data, request().request_id)
+    assert session.execute.call_count == 1
+
+
+@pytest.mark.parametrize("phase", [0, 1])
+@pytest.mark.parametrize("error", [RuntimeError("SECRET"), BaseException("SECRET")])
+def test_terminalize_query_errors_propagate_identity(phase, error):
+    session = terminal_harness()
+    responses = list(session.execute.side_effect)
+    responses[phase] = error
+    session.execute.side_effect = responses
+    with pytest.raises(type(error)) as caught:
+        terminalize(session)
+    assert caught.value is error and session.execute.call_count == phase + 1
+
+
+def test_terminalize_exact_public_domains():
+    class RequestSubclass(owner.ProfileActivationRequest):
+        pass
+
+    class Text(str):
+        pass
+
+    class Stamp(datetime):
+        pass
+
+    value = request()
+    subclass = RequestSubclass(
+        value.actor, value.idempotency_key, value.command, value.intent
+    )
+    session = terminal_harness()
+    for expected in (None, subclass):
+        with pytest.raises(Validation):
+            owner.terminalize_profile_activation_request(
+                session,
+                cast(Any, expected),
+                status=Status.CONSUMED,
+                terminal_at=NOW,
+                terminal_reason="DONE",
+            )
+    for changes in (
+        {"terminal_reason": Text("DONE")},
+        {"terminal_at": Stamp(2026, 1, 1, tzinfo=timezone.utc)},
+    ):
+        with pytest.raises(Validation):
+            terminalize(session, **changes)
+    session.execute.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"status": "CANCELLED"},
+        {"terminal_reason": "OTHER"},
+        {"terminal_at": NOW + timedelta(milliseconds=1)},
+        {"requested_at": NOW - timedelta(milliseconds=1)},
+    ],
+)
+def test_terminalize_valid_but_wrong_returning_record(change):
+    data = (
+        row()
+        | dict(status="CONSUMED", terminal_at=NOW, terminal_reason="DONE")
+        | change
+    )
+    _hydrate(data, request().request_id)  # Valid row, but not the requested mutation.
+    with pytest.raises(Integrity):
+        terminalize(terminal_harness(second=[data]))
