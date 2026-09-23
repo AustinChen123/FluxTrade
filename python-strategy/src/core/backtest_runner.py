@@ -775,6 +775,12 @@ class BacktestRunner:
             configuration_contract["profile_availability_policy_id"] = (
                 self._modeled_profile_input.availability_policy_id
             )
+            configuration_contract["profile_availability_policy_digest"] = (
+                self._modeled_profile_input.availability_policy_digest
+            )
+            configuration_contract["profile_modeled_dataset_digest"] = (
+                self._modeled_profile_input.dataset_digest
+            )
         runner_configuration_contract = {
             **configuration_contract,
             "runner_kind": "full",

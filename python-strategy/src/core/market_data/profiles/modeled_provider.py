@@ -130,6 +130,14 @@ class PreloadedModeledProfileProvider:
         return self._canonical_bytes
 
     @property
+    def availability_policy_id(self) -> str:
+        return MODELED_AVAILABILITY_POLICY.policy_id
+
+    @property
+    def availability_policy_digest(self) -> str:
+        return MODELED_AVAILABILITY_POLICY.digest
+
+    @property
     def dataset_digest(self) -> str:
         return self._dataset_digest
 

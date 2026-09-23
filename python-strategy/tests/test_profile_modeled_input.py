@@ -13,12 +13,13 @@ from src.core.market_data.profiles.modeled_input import (
     ModeledProfileInputError,
     completed_candle_decision_time_ms,
 )
+from src.core.market_data.profiles.modeled_selection import MODELED_AVAILABILITY_POLICY
 from src.core.market_data.profiles.requirements import ProfileRequirement
 from test_profile_context_enrichment import fixture
 
 DAY = 86_400_000
 DECISION = DAY + 3
-POLICY = "utc_day_0020_conservative_v1"
+POLICY = MODELED_AVAILABILITY_POLICY.policy_id
 
 
 @pytest.mark.parametrize(
@@ -59,6 +60,9 @@ class Provider:
     def __init__(self, result: object) -> None:
         self.result = result
         self.calls: list[tuple[object, int, str]] = []
+        self.availability_policy_id = POLICY
+        self.availability_policy_digest = MODELED_AVAILABILITY_POLICY.digest
+        self.dataset_digest = "a" * 64
 
     def context_for(
         self,
@@ -224,3 +228,56 @@ def test_decision_context_itself_rejects_wrong_modeled_as_of():
 def test_configuration_is_explicit_and_safe(provider, policy):
     with pytest.raises(ModeledProfileInputError):
         ModeledProfileInput(cast(Any, provider), policy)
+
+
+def test_provider_identity_is_validated_and_snapshotted() -> None:
+    provider = Provider(None)
+    configured = ModeledProfileInput(provider, POLICY)
+    provider.dataset_digest = "b" * 64
+    provider.availability_policy_digest = "c" * 64
+    assert configured.dataset_digest == "a" * 64
+    assert configured.availability_policy_digest == MODELED_AVAILABILITY_POLICY.digest
+
+
+def test_pre_call_identity_drift_rejects_without_provider_call() -> None:
+    value, requirement = modeled(ProfileDecisionStatus.MISSING)
+    provider = Provider(StrategyMarketDataContext(DECISION, (value,)))
+    configured = ModeledProfileInput(provider, POLICY)
+    provider.dataset_digest = "b" * 64
+    with pytest.raises(ModeledProfileInputError):
+        configured.resolve((requirement,), decision_time_ms=DECISION)
+    assert provider.calls == []
+
+
+@pytest.mark.parametrize("field,value", [("dataset_digest", "b" * 64),
+    ("availability_policy_digest", "c" * 64), ("availability_policy_id", "other")])
+def test_in_call_identity_drift_rejects_returned_context(field, value) -> None:
+    item, requirement = modeled(ProfileDecisionStatus.MISSING)
+
+    class DriftingProvider(Provider):
+        def context_for(self, *args, **kwargs):
+            result = super().context_for(*args, **kwargs)
+            setattr(self, field, value)
+            return result
+
+    provider = DriftingProvider(StrategyMarketDataContext(DECISION, (item,)))
+    configured = ModeledProfileInput(provider, POLICY)
+    with pytest.raises(ModeledProfileInputError):
+        configured.resolve((requirement,), decision_time_ms=DECISION)
+    assert len(provider.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("availability_policy_id", "other"),
+        ("availability_policy_digest", "short"),
+        ("dataset_digest", "g" * 64),
+        ("dataset_digest", type("SubStr", (str,), {})("a" * 64)),
+    ],
+)
+def test_provider_identity_rejects_mismatch_or_malformed_digest(field, value) -> None:
+    provider = Provider(None)
+    setattr(provider, field, value)
+    with pytest.raises(ModeledProfileInputError):
+        ModeledProfileInput(provider, POLICY)

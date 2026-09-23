@@ -16,13 +16,14 @@ from src.core.market_data.profiles.decision_context import (
     StrategyMarketDataContext,
 )
 from src.core.market_data.profiles.modeled_input import ModeledProfileInput
+from src.core.market_data.profiles.modeled_selection import MODELED_AVAILABILITY_POLICY
 from src.core.market_data.profiles.read_types import ProfileQueryRequest
 from test_profile_decision_input import sample
 from test_signal_processor import DummyStrategy
 
 PRODUCT = "BINANCE:BTCUSDT-PERP"
 DAY = 86_400_000
-POLICY = "utc_day_0020_conservative_v1"
+POLICY = MODELED_AVAILABILITY_POLICY.policy_id
 
 
 class _ProfileStrategy(DummyStrategy):
@@ -48,8 +49,11 @@ class _NoContextProfileStrategy(_ProfileStrategy):
 
 
 class _Provider:
-    def __init__(self):
+    def __init__(self, dataset_digest="a" * 64):
         self.calls = []
+        self.availability_policy_id = POLICY
+        self.availability_policy_digest = MODELED_AVAILABILITY_POLICY.digest
+        self.dataset_digest = dataset_digest
 
     def context_for(self, requirements, *, decision_time_ms, availability_policy_id):
         self.calls.append((requirements, decision_time_ms, availability_policy_id))
@@ -195,11 +199,11 @@ def test_full_runner_split_path_and_provenance_are_causally_wired(
         ModeledProfileInput(plain_provider, POLICY),
     )
     run("plain-unset", DummyStrategy("plain", timeframe="5m"))
-    alternate = "utc_day_0030_conservative_v1"
+    alternate_dataset = "b" * 64
     second = run(
         "profile-b",
         _ProfileStrategy("profile", timeframe="5m"),
-        ModeledProfileInput(_Provider(), alternate),
+        ModeledProfileInput(_Provider(alternate_dataset), POLICY),
     )
 
     assert first is not None and second is not None
@@ -214,9 +218,23 @@ def test_full_runner_split_path_and_provenance_are_causally_wired(
         POLICY,
         POLICY,
         None,
-        alternate,
+        POLICY,
     ]
     assert "profile_availability_policy_id" not in captured[2]
+    assert [item.get("profile_availability_policy_digest") for item in captured] == [
+        MODELED_AVAILABILITY_POLICY.digest,
+        MODELED_AVAILABILITY_POLICY.digest,
+        None,
+        MODELED_AVAILABILITY_POLICY.digest,
+    ]
+    assert [item.get("profile_modeled_dataset_digest") for item in captured] == [
+        "a" * 64,
+        "a" * 64,
+        None,
+        alternate_dataset,
+    ]
+    assert "profile_availability_policy_digest" not in captured[2]
+    assert "profile_modeled_dataset_digest" not in captured[2]
     assert (
         first["provenance"].configuration_sha256
         != second["provenance"].configuration_sha256

@@ -1,6 +1,6 @@
 """Run-scoped modeled profile input boundary; providers must already be preloaded."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 from src.core.data_provider import timeframe_to_ms
@@ -10,12 +10,21 @@ from .context_enrichment import (
     validate_profile_context_coverage,
 )
 from .decision_context import ProfileDecisionBasis, StrategyMarketDataContext
-from .read_types import _integer, _safe
+from .read_types import _hex, _integer, _safe
 from .requirements import ProfileRequirement
 
 
 class ModeledProfileContextProvider(Protocol):
     """Deterministic in-memory lookup; HTTP, DB and latest reads are forbidden."""
+
+    @property
+    def availability_policy_id(self) -> str: ...
+
+    @property
+    def availability_policy_digest(self) -> str: ...
+
+    @property
+    def dataset_digest(self) -> str: ...
 
     def context_for(
         self,
@@ -29,6 +38,27 @@ class ModeledProfileContextProvider(Protocol):
 class ModeledProfileInputError(ValueError):
     def __init__(self) -> None:
         super().__init__("MODELED_PROFILE_INPUT_INVALID")
+
+
+def _provider_identity(
+    provider: ModeledProfileContextProvider, expected_policy_id: str
+) -> tuple[str, str]:
+    try:
+        provider_policy_id = getattr(provider, "availability_policy_id")
+        policy_digest = getattr(provider, "availability_policy_digest")
+        dataset_digest = getattr(provider, "dataset_digest")
+        if (
+            type(provider_policy_id) is not str
+            or provider_policy_id != expected_policy_id
+            or type(policy_digest) is not str
+            or type(dataset_digest) is not str
+        ):
+            raise ValueError
+        _hex(policy_digest)
+        _hex(dataset_digest)
+        return policy_digest, dataset_digest
+    except (AttributeError, ValueError):
+        raise ModeledProfileInputError() from None
 
 
 def completed_candle_decision_time_ms(candle_timestamp_ms: int, timeframe: str) -> int:
@@ -51,14 +81,21 @@ def completed_candle_decision_time_ms(candle_timestamp_ms: int, timeframe: str) 
 class ModeledProfileInput:
     provider: ModeledProfileContextProvider
     availability_policy_id: str
+    availability_policy_digest: str = field(init=False)
+    dataset_digest: str = field(init=False)
 
     def __post_init__(self) -> None:
         try:
             if not callable(getattr(self.provider, "context_for", None)):
                 raise ValueError
             _safe(self.availability_policy_id)
+            policy_digest, dataset_digest = _provider_identity(
+                self.provider, self.availability_policy_id
+            )
         except ValueError:
             raise ModeledProfileInputError() from None
+        object.__setattr__(self, "availability_policy_digest", policy_digest)
+        object.__setattr__(self, "dataset_digest", dataset_digest)
 
     def resolve(
         self,
@@ -75,11 +112,19 @@ class ModeledProfileInput:
                 raise ValueError
         except ValueError:
             raise ModeledProfileInputError() from None
+        expected_identity = (
+            self.availability_policy_digest,
+            self.dataset_digest,
+        )
+        if _provider_identity(self.provider, self.availability_policy_id) != expected_identity:
+            raise ModeledProfileInputError() from None
         result = self.provider.context_for(
             requirements,
             decision_time_ms=decision_time_ms,
             availability_policy_id=self.availability_policy_id,
         )
+        if _provider_identity(self.provider, self.availability_policy_id) != expected_identity:
+            raise ModeledProfileInputError() from None
         try:
             if type(result) is not StrategyMarketDataContext:
                 raise ValueError
