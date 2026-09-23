@@ -129,7 +129,23 @@ def _imports(source):
     return {part for name in names for part in name.split(".") if part}
 
 
-def _assert_boundary(source, *, store=False, service=False):
+def _assert_boundary(source, *, store=False, service=False, binding=False):
+    tree = ast.parse(source)
+    for node in tuple(tree.body):
+        if isinstance(node, ast.ImportFrom) and node.module == "decision_owner":
+            assert binding
+            assert node.level == 1 and [item.name for item in node.names] == [
+                "PreparedRecordedDecision"
+            ]
+            tree.body.remove(node)
+        if (
+            binding
+            and isinstance(node, ast.ImportFrom)
+            and node.module == "src.strategies.base"
+        ):
+            assert [item.name for item in node.names] == ["BaseStrategy"]
+            tree.body.remove(node)
+    source = ast.unparse(tree)
     imports = _imports(source)
     if service:
         assert "profiles" not in imports
@@ -186,6 +202,7 @@ def test_architecture_import_ratchet():
         _assert_boundary(
             (root / "market_data/profiles" / filename).read_text(),
             store=filename == "bootstrap_seed_store.py",
+            binding=filename == "bootstrap_hydration.py",
         )
     _assert_boundary((root / "strategy_hydration_service.py").read_text(), service=True)
 
