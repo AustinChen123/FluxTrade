@@ -24,6 +24,7 @@ from src.core.market_data.profiles.orm import ProfileActivationRequest as Reques
 from src.core.market_data.profiles.repository import TransactionWaitPolicy
 
 _TABLE = cast(Table, RequestRow.__table__)
+MAX_PENDING_ACTIVATION_REQUESTS = 256
 
 
 class ProfileActivationRequestValidationError(ValueError):
@@ -377,6 +378,39 @@ class ProfileActivationRequestStore:
         with self._transaction(read_only=True) as session:
             record = _pending_request(session, environment, strategy_id, lock=False)
         return record
+
+    def list_pending(
+        self, environment: str
+    ) -> tuple[ProfileActivationRequestRecord, ...]:
+        """Bounded durable discovery; no lifecycle changes or row locks."""
+        _validate_pending_identity(environment, environment)
+        with self._transaction(read_only=True) as session:
+            rows = (
+                session.execute(
+                    select(_TABLE)
+                    .where(
+                        _TABLE.c.environment == environment,
+                        _TABLE.c.status == "PENDING",
+                    )
+                    .order_by(_TABLE.c.request_id)
+                    .limit(MAX_PENDING_ACTIVATION_REQUESTS + 1)
+                )
+                .mappings()
+                .all()
+            )
+            if len(rows) > MAX_PENDING_ACTIVATION_REQUESTS:
+                raise ProfileActivationRequestIntegrityError()
+            records = tuple(
+                _hydrate(row, cast(str, row.get("request_id"))) for row in rows
+            )
+            ids = tuple(record.request.request_id for record in records)
+            if ids != tuple(sorted(set(ids))) or any(
+                record.status is not ProfileActivationRequestStatus.PENDING
+                or record.request.intent.key.environment != environment
+                for record in records
+            ):
+                raise ProfileActivationRequestIntegrityError()
+        return records
 
     def admit(
         self, request: ProfileActivationRequest, *, current: ProfileActivationIntent

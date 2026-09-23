@@ -2514,6 +2514,20 @@ class TestAddStrategy:
 
 
 class TestBuildStreamChannels:
+    def test_active_and_durable_pending_union(self, engine, strategy_instance):
+        engine._registry.register(strategy_instance)
+        pending = engine._strategy_activation.persistent_pending_channels = MagicMock(
+            return_value=(
+                "stream:market:binance:btcusdt:5m",
+                "stream:market:binance:btcusdt:1m",
+            )
+        )
+        assert engine.build_stream_channels() == [
+            "stream:market:binance:btcusdt:1m",
+            "stream:market:binance:btcusdt:5m",
+        ]
+        pending.assert_called_once_with()
+
     def test_empty_when_no_strategies(self, engine):
         """Should return empty list when no strategies registered."""
         assert engine.build_stream_channels() == []

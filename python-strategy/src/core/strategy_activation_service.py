@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from src.core.models import StrategyStatus
 from src.core.command_router import StrategyStartDisposition
+from src.core.product_registry import to_stream_key
 from src.core.market_data.profiles.bootstrap_seed import BootstrapKey
 from src.core.market_data.profiles.decision_owner import IdentityResolver
 from src.core.market_data.profiles.decision_identity import (
@@ -173,6 +174,26 @@ class StrategyActivationService:
         self._logger = event_logger
         self._profile_request_store = profile_request_store
         self._profile_identity_resolver = profile_identity_resolver
+
+    def persistent_pending_channels(self) -> tuple[str, ...]:
+        """Discover subscription intent from durable requests after restart."""
+        if (
+            self._profile_request_store is None
+            or self._profile_identity_resolver is None
+            or self._environment_identity() != "live"
+        ):
+            return ()
+        return tuple(
+            sorted(
+                {
+                    to_stream_key(
+                        record.request.intent.key.product_id,
+                        record.request.intent.key.timeframe,
+                    )
+                    for record in self._profile_request_store.list_pending("live")
+                }
+            )
+        )
 
     def activate_locked(
         self,

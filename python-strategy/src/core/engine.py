@@ -1640,6 +1640,7 @@ class StrategyEngine:
                     strat.requirements.timeframe,
                 )
             )
+        channels.update(self._strategy_activation.persistent_pending_channels())
         return sorted(channels)
 
     def on_market_data(self, data: Union[Candlestick, Trade]):

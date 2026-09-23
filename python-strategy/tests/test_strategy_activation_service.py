@@ -252,6 +252,60 @@ class _ProfileStrategy(_Strategy):
         return replace(request().intent.requirements, product_id=self.product_id)
 
 
+@pytest.mark.parametrize("capability", ["configured", "store", "resolver", "nonlive"])
+def test_persistent_pending_channels_after_fresh_service(capability):
+    store, resolver = MagicMock(), MagicMock()
+    value, now = request(), datetime(2026, 1, 1, tzinfo=UTC)
+    other = replace(
+        value,
+        intent=replace(
+            value.intent,
+            key=replace(value.intent.key, timeframe="5m"),
+            requirements=replace(value.intent.requirements, timeframe="5m"),
+        ),
+    )
+    store.list_pending.return_value = tuple(
+        Record(item, RequestStatus.PENDING, now) for item in (other, value, other)
+    )
+    for _ in range(2):
+        service, *_ = _build_service(
+            state=None,
+            environment="simulated" if capability == "nonlive" else "live",
+            profile_request_store=None if capability == "store" else store,
+            profile_identity_resolver=None if capability == "resolver" else resolver,
+        )
+        assert service.persistent_pending_channels() == (
+            tuple(
+                sorted(
+                    {
+                        consumption.to_stream_key(
+                            value.intent.key.product_id, timeframe
+                        )
+                        for timeframe in ("1m", "5m")
+                    }
+                )
+            )
+            if capability == "configured"
+            else ()
+        )
+    assert store.list_pending.call_count == (2 if capability == "configured" else 0)
+    resolver.assert_not_called()
+
+
+def test_pending_channel_query_errors_propagate():
+    error, store = RuntimeError("failure"), MagicMock()
+    store.list_pending.side_effect = error
+    service, *_ = _build_service(
+        state=None,
+        environment="live",
+        profile_request_store=store,
+        profile_identity_resolver=MagicMock(),
+    )
+    with pytest.raises(RuntimeError) as caught:
+        service.persistent_pending_channels()
+    assert caught.value is error
+
+
 @pytest.mark.parametrize(
     "command,status",
     [

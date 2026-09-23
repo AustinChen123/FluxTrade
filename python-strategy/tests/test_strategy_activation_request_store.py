@@ -710,6 +710,78 @@ def test_pending_preflight_uses_fresh_readonly_transaction():
     assert "READ ONLY" in calls[0][0] and "FOR UPDATE" not in calls[-1][0]
 
 
+def test_list_pending_bounded_ordered_readonly(monkeypatch):
+    assert owner.MAX_PENDING_ACTIVATION_REQUESTS == 256
+    store, rows, sessions, calls, exits, factory = store_harness()
+    monkeypatch.setattr(owner, "MAX_PENDING_ACTIVATION_REQUESTS", 1)
+    assert store.list_pending("live") == (_hydrate(row(), request().request_id),)
+    sql, params = calls[-1]
+    assert "ORDER BY strategy_profile_activation_request.request_id" in sql
+    assert "FOR UPDATE" not in sql and set(params.values()) == {"live", "PENDING", 2}
+    assert "READ ONLY" in calls[0][0] and exits == ["transaction", "session"]
+    rows.clear()
+    assert store.list_pending("live") == () and len(sessions) == 2
+
+
+@pytest.mark.parametrize(
+    "damage", ["overflow", "duplicate", "corrupt", "terminal", "environment"]
+)
+def test_list_pending_fail_closed(monkeypatch, damage):
+    store, rows, *_ = store_harness()
+    if damage in ("overflow", "duplicate"):
+        rows.append(row())
+        if damage == "overflow":
+            monkeypatch.setattr(owner, "MAX_PENDING_ACTIVATION_REQUESTS", 1)
+            monkeypatch.setattr(
+                owner, "_hydrate", MagicMock(side_effect=AssertionError("no decode"))
+            )
+    elif damage == "corrupt":
+        rows[0]["payload_digest"] = "b" * 64
+    elif damage == "terminal":
+        rows[0].update(status="CANCELLED", terminal_at=NOW, terminal_reason="DONE")
+    with pytest.raises(Integrity):
+        store.list_pending("other" if damage == "environment" else "live")
+
+
+@pytest.mark.parametrize("environment", [None, True, "", "live:bad", "é"])
+def test_list_pending_invalid_environment_zero_session(environment):
+    store, _, _, _, _, factory = store_harness()
+    with pytest.raises(Validation):
+        store.list_pending(environment)
+    factory.assert_not_called()
+
+
+def test_list_pending_requires_unique_canonical_order():
+    store, rows, *_ = store_harness()
+    second = replace(request(), idempotency_key="second")
+    rows.append(
+        row()
+        | dict(
+            request_id=second.request_id,
+            canonical_payload=second.canonical_bytes,
+            payload_digest=second.payload_digest,
+        )
+    )
+    rows.sort(key=lambda item: item["request_id"])
+    assert tuple(
+        record.request.request_id for record in store.list_pending("live")
+    ) == tuple(item["request_id"] for item in rows)
+    rows.reverse()
+    with pytest.raises(Integrity):
+        store.list_pending("live")
+
+
+@pytest.mark.parametrize("error", [RuntimeError("SQL"), BaseException("SQL")])
+def test_list_pending_query_errors_propagate(monkeypatch, error):
+    session = MagicMock()
+    session.execute.side_effect = error
+    store = Store(MagicMock())
+    monkeypatch.setattr(store, "_transaction", lambda **_: nullcontext(session))
+    with pytest.raises(type(error)) as caught:
+        store.list_pending("live")
+    assert caught.value is error and session.execute.call_count == 1
+
+
 @pytest.mark.parametrize(
     "damage", [{"payload_digest": "b" * 64}, {"status": "CONSUMED"}]
 )
