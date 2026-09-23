@@ -1,10 +1,117 @@
 from contextlib import contextmanager
 from unittest.mock import MagicMock
+from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 
 from src.core.strategy_deactivation_service import StrategyDeactivationService
 from src.core.strategy_state_manager import InvalidStrategyStateTransition
+from src.core import strategy_deactivation_service as owner
+from src.core.strategy_state_manager import (
+    StrategyStateManager,
+    LockedStrategyState,
+    StrategyStateTransitionResult,
+)
+from src.core.models import StrategyStatus
+from src.core.strategy_activation_request_store import (
+    ProfileActivationRequestRecord,
+    ProfileActivationRequestStatus,
+)
+from test_profile_activation_request import request
+
+
+@pytest.mark.parametrize(
+    "case",
+    "success missing stale early transition_error base_error".split()
+    + [None, "", True, "x" * 65],
+)
+def test_cancel_pending_transaction_order_and_failures(monkeypatch, case):
+    manager = StrategyStateManager(MagicMock(), MagicMock())
+    session, calls = MagicMock(), MagicMock()
+    value, now = request(), datetime(2026, 1, 1, tzinfo=UTC)
+    calls.state.return_value = LockedStrategyState(
+        "strategy", StrategyStatus.READY, 1 if case == "stale" else 0
+    )
+    calls.pending.return_value = (
+        None
+        if case == "missing"
+        else ProfileActivationRequestRecord(
+            value, ProfileActivationRequestStatus.PENDING, now
+        )
+    )
+    calls.transition.return_value = StrategyStateTransitionResult(
+        "strategy", StrategyStatus.READY, StrategyStatus.STOPPED, 1, now
+    )
+    calls.terminal.return_value = ProfileActivationRequestRecord(
+        value,
+        ProfileActivationRequestStatus.CANCELLED,
+        now,
+        now,
+        "ACTIVATION_CANCELLED",
+    )
+    monkeypatch.setattr(manager, "lock_state_in_transaction", calls.state)
+    monkeypatch.setattr(manager, "transition_in_transaction", calls.transition)
+    monkeypatch.setattr(owner, "lock_pending_profile_activation_request", calls.pending)
+    monkeypatch.setattr(owner, "terminalize_profile_activation_request", calls.terminal)
+    error = BaseException("SECRET") if case == "base_error" else RuntimeError("SECRET")
+    if case in ("transition_error", "base_error"):
+        calls.transition.side_effect = error
+    kwargs: dict[str, Any] = dict(
+        environment=value.intent.key.environment,
+        strategy_id="strategy",
+        actor="operator",
+        terminal_at=now,
+        expected_version=0,
+    )
+    if case in (None, "", True, "x" * 65):
+        kwargs["actor"] = case
+        with pytest.raises(owner.ProfileActivationRequestValidationError):
+            owner.cancel_pending_profile_activation_request(session, manager, **kwargs)
+        assert not calls.mock_calls
+        return
+    if case == "early":
+        kwargs["terminal_at"] = now.replace(year=2025)
+    if case in ("success", "missing"):
+        result = owner.cancel_pending_profile_activation_request(
+            session, manager, **kwargs
+        )
+        if case == "success":
+            assert result is not None and result.record is calls.terminal.return_value
+            calls.transition.assert_called_once_with(
+                session,
+                "strategy",
+                StrategyStatus.STOPPED,
+                actor="operator",
+                reason="ACTIVATION_CANCELLED",
+                changed_at=now,
+                expected_version=0,
+            )
+            calls.terminal.assert_called_once_with(
+                session,
+                value,
+                status=ProfileActivationRequestStatus.CANCELLED,
+                terminal_at=now,
+                terminal_reason="ACTIVATION_CANCELLED",
+            )
+        else:
+            assert result is None
+    else:
+        expected = (
+            owner.StaleStrategyStateVersion
+            if case == "stale"
+            else owner.ProfileActivationRequestValidationError
+            if case == "early"
+            else type(error)
+        )
+        with pytest.raises(expected) as caught:
+            owner.cancel_pending_profile_activation_request(session, manager, **kwargs)
+        if case in ("transition_error", "base_error"):
+            assert caught.value is error
+    assert [call[0] for call in calls.mock_calls][:2] == ["state", "pending"]
+    if case != "success":
+        calls.terminal.assert_not_called()
+    assert not session.mock_calls and not manager._redis_client.mock_calls
 
 
 class _LockProbe:

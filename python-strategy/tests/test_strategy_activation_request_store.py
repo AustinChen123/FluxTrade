@@ -678,6 +678,64 @@ def terminal_harness(first=None, second=None):
     return session
 
 
+@pytest.mark.parametrize("count", [0, 1, 2])
+def test_pending_discovery_and_lock_cardinality(count):
+    data = row()
+    session = terminal_harness(first=[data] * count)
+    kwargs = dict(environment=data["environment"], strategy_id=data["strategy_id"])
+    if count == 2:
+        with pytest.raises(Integrity):
+            owner.lock_pending_profile_activation_request(session, **kwargs)
+    else:
+        result = owner.lock_pending_profile_activation_request(session, **kwargs)
+        assert result == (_hydrate(data, data["request_id"]) if count else None)
+    query = session.execute.call_args.args[0].compile(dialect=dialect())
+    assert "FOR UPDATE" in str(query) and "execution_scope_id =" not in str(query)
+    assert set(query.params.values()) == {
+        data["environment"],
+        data["strategy_id"],
+        "PENDING",
+        2,
+    }
+
+
+def test_pending_preflight_uses_fresh_readonly_transaction():
+    store, rows, sessions, calls, exits, factory = store_harness()
+    value = request()
+    assert store.get_pending(
+        environment=value.intent.key.environment,
+        strategy_id=value.intent.key.strategy_id,
+    ) == _hydrate(row(), value.request_id)
+    assert exits == ["transaction", "session"] and factory.call_count == 1
+    assert "READ ONLY" in calls[0][0] and "FOR UPDATE" not in calls[-1][0]
+
+
+@pytest.mark.parametrize(
+    "damage", [{"payload_digest": "b" * 64}, {"status": "CONSUMED"}]
+)
+def test_pending_corruption_is_not_absence(damage):
+    data = row()
+    with pytest.raises(Integrity):
+        owner.lock_pending_profile_activation_request(
+            terminal_harness(first=[data | damage]),
+            environment=data["environment"],
+            strategy_id=data["strategy_id"],
+        )
+
+
+@pytest.mark.parametrize("value", [None, "", "a:b", "é", True, "_live", "-live"])
+def test_pending_invalid_identity_zero_sql(value):
+    session = terminal_harness()
+    if value in ("_live", "-live"):
+        owner._validate_pending_identity(value, value)
+        return
+    with pytest.raises(Validation):
+        owner.lock_pending_profile_activation_request(
+            session, environment=value, strategy_id="strategy"
+        )
+    session.execute.assert_not_called()
+
+
 def terminalize(session, **changes):
     args: dict[str, Any] = dict(
         status=Status.CONSUMED, terminal_at=NOW, terminal_reason="DONE"

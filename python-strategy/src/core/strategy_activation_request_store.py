@@ -260,6 +260,60 @@ def terminalize_profile_activation_request(
     return result
 
 
+def _validate_pending_identity(environment: str, strategy_id: str) -> None:
+    if any(
+        type(value) is not str
+        or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", value, re.ASCII) is None
+        for value in (environment, strategy_id)
+    ):
+        raise ProfileActivationRequestValidationError()
+
+
+def _pending_request(
+    session: Session, environment: str, strategy_id: str, *, lock: bool
+) -> ProfileActivationRequestRecord | None:
+    statement = (
+        select(_TABLE)
+        .where(
+            _TABLE.c.environment == environment,
+            _TABLE.c.strategy_id == strategy_id,
+            _TABLE.c.status == "PENDING",
+        )
+        .limit(2)
+    )
+    rows = (
+        session.execute(statement.with_for_update() if lock else statement)
+        .mappings()
+        .all()
+    )
+    if len(rows) > 1:
+        raise ProfileActivationRequestIntegrityError()
+    if not rows:
+        return None
+    record = _hydrate(rows[0], cast(str, rows[0].get("request_id")))
+    if record.status is not ProfileActivationRequestStatus.PENDING or (
+        record.request.intent.key.environment,
+        record.request.intent.key.strategy_id,
+    ) != (environment, strategy_id):
+        raise ProfileActivationRequestIntegrityError()
+    return record
+
+
+def lock_pending_profile_activation_request(
+    session: Session, *, environment: str, strategy_id: str
+) -> ProfileActivationRequestRecord | None:
+    """Lock the sole pending request across scopes; ambiguity is not absence."""
+    _validate_pending_identity(environment, strategy_id)
+    if (
+        not isinstance(session, Session)
+        or not session.is_active
+        or not session.in_transaction()
+        or session.get_bind().dialect.name != "postgresql"
+    ):
+        raise ProfileActivationRequestValidationError()
+    return _pending_request(session, environment, strategy_id, lock=True)
+
+
 class ProfileActivationRequestStore:
     def __init__(
         self,
@@ -314,6 +368,14 @@ class ProfileActivationRequestStore:
             record = self._lookup(session, _TABLE.c.request_id == request_id)
             if record is not None and record.request.request_id != request_id:
                 raise ProfileActivationRequestIntegrityError()
+        return record
+
+    def get_pending(
+        self, *, environment: str, strategy_id: str
+    ) -> ProfileActivationRequestRecord | None:
+        _validate_pending_identity(environment, strategy_id)
+        with self._transaction(read_only=True) as session:
+            record = _pending_request(session, environment, strategy_id, lock=False)
         return record
 
     def admit(

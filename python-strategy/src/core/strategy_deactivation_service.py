@@ -1,12 +1,85 @@
 import logging
 from contextlib import AbstractContextManager
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from sqlalchemy.orm import Session
+from src.core.models import StrategyStatus
+from src.core.strategy_activation_request_store import (
+    ProfileActivationRequestRecord,
+    ProfileActivationRequestStatus,
+    ProfileActivationRequestValidationError,
+    lock_pending_profile_activation_request,
+    terminalize_profile_activation_request,
+    _validate_pending_identity,
+)
 
 from src.core.portfolio_runtime import PortfolioCoordinator
 from src.core.runtime_artifact_registry import RuntimeArtifactRegistry
 from src.core.strategy_state_manager import (
     InvalidStrategyStateTransition,
     StrategyStateManager,
+    StrategyStateTransitionResult,
+    StaleStrategyStateVersion,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileActivationCancellationResult:
+    transition: StrategyStateTransitionResult
+    record: ProfileActivationRequestRecord
+
+
+def cancel_pending_profile_activation_request(
+    session: Session,
+    state_manager: StrategyStateManager,
+    *,
+    environment: str,
+    strategy_id: str,
+    actor: str,
+    terminal_at: datetime,
+    expected_version: int,
+) -> ProfileActivationCancellationResult | None:
+    """Cancel and STOP in caller transaction; no commit or postcommit ownership."""
+    _validate_pending_identity(environment, strategy_id)
+    if (
+        type(state_manager) is not StrategyStateManager
+        or type(actor) is not str
+        or not 1 <= len(actor) <= 64
+        or type(terminal_at) is not datetime
+        or terminal_at.tzinfo is not UTC
+        or terminal_at.microsecond % 1000
+        or type(expected_version) is not int
+        or not 0 <= expected_version <= 2**31 - 1
+    ):
+        raise ProfileActivationRequestValidationError()
+    state = state_manager.lock_state_in_transaction(session, strategy_id)
+    record = lock_pending_profile_activation_request(
+        session, environment=environment, strategy_id=strategy_id
+    )
+    if record is None:
+        return None
+    if state.version != expected_version:
+        raise StaleStrategyStateVersion("PROFILE_ACTIVATION_STATE_STALE")
+    if terminal_at < record.requested_at:
+        raise ProfileActivationRequestValidationError()
+    reason = "ACTIVATION_CANCELLED"
+    transition = state_manager.transition_in_transaction(
+        session,
+        strategy_id,
+        StrategyStatus.STOPPED,
+        actor=actor,
+        reason=reason,
+        changed_at=terminal_at,
+        expected_version=expected_version,
+    )
+    record = terminalize_profile_activation_request(
+        session,
+        record.request,
+        status=ProfileActivationRequestStatus.CANCELLED,
+        terminal_at=terminal_at,
+        terminal_reason=reason,
+    )
+    return ProfileActivationCancellationResult(transition, record)
 
 
 class StrategyDeactivationService:
