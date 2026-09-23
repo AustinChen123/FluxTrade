@@ -353,6 +353,65 @@ class StrategyActivationService:
             )
         )
 
+    def _restore_profile_active(self, instance: BaseStrategy, version: int) -> bool:
+        """Rebuild runtime from this ACTIVE generation without lifecycle writes."""
+        if (
+            type(version) is not int
+            or not 1 <= version <= 2**31 - 1
+            or self._profile_request_store is None
+            or self._profile_identity_resolver is None
+            or self._bootstrap_reader is None
+        ):
+            raise ProfileActivationRequestValidationError()
+        record = self._profile_request_store.get_consumed(
+            environment="live",
+            strategy_id=instance.strategy_id,
+            expected_state_version=version - 1,
+        )
+        if (
+            type(record) is not ProfileActivationRequestRecord
+            or record.status is not ProfileActivationRequestStatus.CONSUMED
+        ):
+            raise ProfileActivationRequestValidationError()
+        identity = self._profile_identity_resolver(instance)
+        if type(identity) is not MarketDataDecisionCompositionIdentity:
+            raise ProfileActivationRequestValidationError()
+        key = BootstrapKey(
+            "live",
+            identity.execution_scope_id,
+            instance.strategy_id,
+            identity.strategy_version,
+            identity.config_hash,
+            instance.product_id,
+            instance.requirements.timeframe,
+        )
+        if (
+            record.request.intent.key != key
+            or record.request.intent.requirements != instance.requirements
+            or record.request.intent.expected_state_version != version - 1
+        ):
+            raise ProfileActivationRequestConflict()
+        self._assert_context_capabilities((instance,), profile_warmup_ready=True)
+        bound = self._bootstrap_reader.prepare_latest_applied(instance)
+        if (
+            type(bound) is not BoundBootstrapHydration
+            or bound.strategy is not instance
+            or bound.plan.seed.key != key
+            or bound.plan.seed.requirements
+            != instance.requirements.profile_requirements
+            or bound.plan.seed.lookback != instance.requirements.lookback_window
+        ):
+            raise ProfileActivationRequestConflict()
+        self._hydration.hydrate_candles(
+            instance, bound.candles, decision_scope_loader=bound.decision_scope_loader
+        )
+        try:
+            self._register_strategy(instance)
+        except BaseException:
+            self._unregister_runtime_artifact(instance.strategy_id)
+            raise
+        return True
+
     def activate_locked(
         self,
         strategy_id: str,
@@ -395,6 +454,7 @@ class StrategyActivationService:
                 )
                 return False
 
+            restoring_profile = False
             try:
                 config = json.loads(state.config_json or "{}")
                 product_id = resolve_product_id(config)
@@ -425,6 +485,13 @@ class StrategyActivationService:
                         self._environment_identity() == "live"
                         and instance.requirements.profile_requirements
                     ):
+                        restoring_profile = (
+                            state.status == StrategyStatus.ACTIVE
+                            and actor == "system"
+                            and reason == "startup_restore"
+                        )
+                        if restoring_profile:
+                            return self._restore_profile_active(instance, state.version)
                         return self._admit_profile(
                             instance,
                             state.version,
@@ -446,6 +513,8 @@ class StrategyActivationService:
                     product_id,
                 )
             except Exception as error:
+                if restoring_profile:
+                    raise
                 self._unregister_runtime_artifact(strategy_id)
                 state.performance_json = json.dumps({"error": str(error)})
                 db.commit()

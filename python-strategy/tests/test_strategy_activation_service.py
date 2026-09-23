@@ -773,6 +773,102 @@ def _activate(
     )
 
 
+@pytest.mark.parametrize("failure", [None, "missing", "identity", "context", "hydrate"])
+def test_profile_active_restart_restores_only_runtime(failure):
+    from test_profile_bootstrap_binding import setup
+
+    plan, target, identity, suffix, *_ = setup()
+    value = replace(
+        request(),
+        intent=consumption.ProfileActivationIntent(
+            plan.seed.key,
+            target.requirements,
+            6,
+        ),
+    )
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    store, reader, validator = MagicMock(), MagicMock(), MagicMock()
+    store.get_consumed.return_value = (
+        None
+        if failure == "missing"
+        else Record(value, RequestStatus.CONSUMED, now, now, "ACTIVATION_COMMITTED")
+    )
+    state = _State([], status=StrategyStatus.ACTIVE)
+    state.config_json = json.dumps({"product_id": target.product_id})
+    service, events, db, manager, hydration, runtime = _build_service(
+        state=state,
+        environment="live",
+        profile_request_store=store,
+        profile_identity_resolver=lambda _: replace(identity, config_hash="f" * 64)
+        if failure == "identity"
+        else identity,
+        bootstrap_reader=reader,
+        assert_context_capabilities=validator,
+    )
+    order = []
+    error = RuntimeError("restore failure")
+
+    def validate(*args, **kwargs):
+        order.append("context")
+        assert kwargs == {"profile_warmup_ready": True}
+        if failure == "context":
+            raise error
+
+    validator.side_effect = validate
+
+    def prepare(instance):
+        order.append("latest")
+        return bootstrap.BoundBootstrapHydration(plan, instance, identity, suffix)
+
+    reader.prepare_latest_applied.side_effect = prepare
+
+    def hydrate(instance, candles, *, decision_scope_loader):
+        order.append("hydrate")
+        assert len(candles) == plan.seed.lookback
+        assert callable(decision_scope_loader)
+        if failure == "hydrate":
+            raise error
+
+    hydration.hydrate_candles.side_effect = hydrate
+    runtime.register_strategy.side_effect = lambda _: order.append("register")
+
+    def restore():
+        return service.activate_locked(
+            target.strategy_id,
+            artifact_cls=type(target),
+            actor="system",
+            reason="startup_restore",
+            force=True,
+            expected_version=None,
+            resolve_product_id=lambda config: config["product_id"],
+            assert_live_readiness=lambda _: None,
+            build_portfolio_definition=MagicMock(),
+        )
+
+    if failure is None:
+        assert restore() is True
+        assert order == ["context", "latest", "hydrate", "register"]
+        assert runtime.register_strategy.call_args.args[0] is not target
+    else:
+        with pytest.raises((ValueError, RuntimeError)) as caught:
+            restore()
+        if failure in ("context", "hydrate"):
+            assert caught.value is error
+        runtime.register_strategy.assert_not_called()
+    store.get_consumed.assert_called_once_with(
+        environment="live", strategy_id=target.strategy_id, expected_state_version=6
+    )
+    assert store.mock_calls == [
+        call.get_consumed(
+            environment="live", strategy_id=target.strategy_id, expected_state_version=6
+        )
+    ]
+    assert not manager.mock_calls and not events
+    db.commit.assert_not_called()
+    hydration.warm_up.assert_not_called()
+    reader.prepare_initial_seed_under_admission.assert_not_called()
+
+
 def test_unloaded_artifact_returns_before_state_or_runtime_work() -> None:
     service, _events, db, state_manager, hydration, runtime_artifacts = _build_service(
         state=None
