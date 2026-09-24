@@ -2,6 +2,7 @@
 
 import ast
 from dataclasses import FrozenInstanceError, replace
+from importlib.util import resolve_name
 from pathlib import Path
 from unittest.mock import Mock
 from typing import Any, cast
@@ -117,15 +118,22 @@ def test_classifier_is_authoritative(monkeypatch):
     assert classifier.call_args.kwargs["stored"] is value
 
 
-def _imports(source):
+def _qualified_imports(source, *, package=None):
     names = set()
     for node in ast.walk(ast.parse(source)):
         if isinstance(node, ast.Import):
             names.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
             prefix = "." * node.level + (node.module or "")
+            if node.level and package is not None:
+                prefix = resolve_name(prefix, package)
             names.add(prefix)
             names.update(prefix.rstrip(".") + "." + alias.name for alias in node.names)
+    return names
+
+
+def _imports(source):
+    names = _qualified_imports(source)
     return {part for name in names for part in name.split(".") if part}
 
 
@@ -182,14 +190,11 @@ def _assert_boundary(source, *, store=False, service=False, binding=False):
     assert not imports & forbidden
     if store:
         assert not any(
-            name.startswith("src.core.engine")
-            for name in (
-                node.module or ""
-                for node in ast.walk(ast.parse(source))
-                if isinstance(node, ast.ImportFrom)
+            name == "src.core.engine" or name.startswith("src.core.engine.")
+            for name in _qualified_imports(
+                source, package="src.core.market_data.profiles"
             )
         )
-        assert not ({"core", "engine"} <= imports)
 
 
 def test_architecture_import_ratchet():
@@ -226,6 +231,30 @@ def test_architecture_import_ratchet():
 def test_import_ratchet_negative_controls(source):
     with pytest.raises(AssertionError):
         _assert_boundary(source)
+
+
+def test_store_import_ratchet_distinguishes_qualified_modules():
+    _assert_boundary(
+        "from sqlalchemy.engine import Connection\n"
+        "from src.core.data_provider import timeframe_to_ms",
+        store=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "from src.core import engine",
+        "from src.core.engine import Connection",
+        "import src.core.engine",
+        "from ... import engine",
+        "from ...engine import Connection",
+        "from ....core import engine",
+    ],
+)
+def test_store_import_ratchet_negative_controls(source):
+    with pytest.raises(AssertionError):
+        _assert_boundary(source, store=True)
 
 
 @pytest.mark.parametrize(
