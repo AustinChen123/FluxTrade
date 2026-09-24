@@ -179,7 +179,7 @@ jobs:
           profile_python="$(uv run --offline --no-sync python -c 'import os,sys; print(os.path.abspath(sys.executable))')"
           [[ -n "$profile_python" && "$profile_python" = /* && -x "$profile_python" ]]
           dir="$(mktemp -d "$RUNNER_TEMP/profile-composite.XXXXXX")"
-          uv run --offline --no-sync maturin build --manifest-path ../rust-data-service/Cargo.toml --interpreter "$profile_python" --no-default-features --features extension-module --locked --offline --target-dir "$dir/target" --out "$dir/wheels"
+          uv run --offline --no-sync maturin build --manifest-path ../rust-data-service/Cargo.toml --interpreter "$profile_python" --no-default-features --features extension-module --locked --target-dir "$dir/target" --out "$dir/wheels"
           shopt -s nullglob
           wheels=("$dir/wheels/"*.whl)
           [[ ${#wheels[@]} -eq 1 ]]
