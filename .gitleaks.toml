@@ -10,3 +10,24 @@ regex = '''\b(CC[0-9]{5,})\b'''
 secretGroup = 1
 keywords = ["CC"]
 tags = ["rithmic", "account-id", "privacy"]
+
+[[allowlists]]
+description = "Ignore one exact bootstrap-reader test scope mutation"
+targetRules = ["generic-api-key"]
+condition = "AND"
+regexTarget = "line"
+paths = ['''^python-strategy/tests/test_bootstrap_hydration_reader\.py$''']
+regexes = [
+  '''^\s*key=replace\(plan\.seed\.key, execution_scope_id="other"\),\s*$''',
+]
+
+[[allowlists]]
+description = "Ignore two exact activation-service test scope mutations"
+targetRules = ["generic-api-key"]
+condition = "AND"
+regexTarget = "line"
+paths = ['''^python-strategy/tests/test_strategy_activation_service\.py$''']
+regexes = [
+  '''^\s*replace\(value\.intent\.key, execution_scope_id="other"\)\s*$''',
+  '''^\s*replace\(key, execution_scope_id="other"\)\s*$''',
+]
