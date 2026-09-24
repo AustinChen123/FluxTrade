@@ -1,12 +1,16 @@
 """Pending candle replay and strategy-state reconstruction owner."""
 
 from collections.abc import Callable, Sequence
-from typing import ContextManager
+from typing import ContextManager, Literal
 
 from sqlalchemy.orm import Session
 
-from src.core.live_candle_application import LiveCandleApplicationService
+from src.core.live_candle_application import (
+    LiveCandleApplicationService,
+    PendingCandleCallback,
+)
 from src.core.models import Candlestick, Trade
+from src.core.bootstrap_hydration_reader import BootstrapHydrationReader
 from src.core.strategy_hydration_service import StrategyHydrationService
 from src.strategies.base import BaseStrategy
 
@@ -22,12 +26,14 @@ class PendingMarketReplayService:
         strategy_hydration: StrategyHydrationService,
         list_active_strategies: Callable[[], Sequence[BaseStrategy]],
         publish_replacement: Callable[[BaseStrategy], None],
+        bootstrap_hydration_reader: BootstrapHydrationReader | None = None,
     ) -> None:
         self._db_session_factory = db_session_factory
         self._live_candle_application = live_candle_application
         self._strategy_hydration = strategy_hydration
         self._list_active_strategies = list_active_strategies
         self._publish_replacement = publish_replacement
+        self._bootstrap_hydration_reader = bootstrap_hydration_reader
 
     def rewind_pending(self, models: Sequence[Candlestick | Trade]) -> None:
         """Rebuild affected strategies to immediately before pending candles."""
@@ -59,10 +65,10 @@ class PendingMarketReplayService:
                 replacement = self._strategy_hydration.fresh_instance_for_replay(
                     current
                 )
-                self._strategy_hydration.warm_up(
+                self._warm_up(
                     db,
                     replacement,
-                    before_timestamp=cutoff,
+                    boundary_bar_start_ms=cutoff,
                 )
                 replacements.append(replacement)
         for replacement in replacements:
@@ -85,20 +91,50 @@ class PendingMarketReplayService:
                 replacement = self._strategy_hydration.fresh_instance_for_replay(
                     current
                 )
-                self._strategy_hydration.warm_up(
+                self._warm_up(
                     db,
                     replacement,
-                    before_timestamp=candle.timestamp + 1,
+                    boundary_bar_start_ms=candle.timestamp,
+                    mode="THROUGH_APPLIED",
                 )
                 replacements.append(replacement)
         for replacement in replacements:
             self._publish_replacement(replacement)
 
+    def _warm_up(
+        self,
+        db: Session,
+        replacement: BaseStrategy,
+        *,
+        boundary_bar_start_ms: int,
+        mode: Literal["BEFORE_PENDING", "THROUGH_APPLIED"] = "BEFORE_PENDING",
+    ) -> None:
+        if not replacement.requirements.profile_requirements:
+            self._strategy_hydration.warm_up(
+                db,
+                replacement,
+                before_timestamp=(
+                    boundary_bar_start_ms + 1
+                    if mode == "THROUGH_APPLIED"
+                    else boundary_bar_start_ms
+                ),
+            )
+            return
+        reader = self._bootstrap_hydration_reader
+        if reader is None:
+            raise RuntimeError("profile bootstrap hydration reader is required")
+        bound = reader.prepare(replacement, boundary_bar_start_ms, mode)
+        self._strategy_hydration.hydrate_candles(
+            replacement,
+            bound.candles,
+            decision_scope_loader=bound.decision_scope_loader,
+        )
+
     def replay(
         self,
         data: Candlestick | Trade,
         *,
-        apply_new: Callable[[Candlestick], None],
+        apply_new: PendingCandleCallback,
     ) -> None:
         if not isinstance(data, Candlestick):
             raise RuntimeError(

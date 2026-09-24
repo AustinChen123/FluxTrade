@@ -5,11 +5,12 @@ from __future__ import annotations
 import logging
 import inspect
 import weakref
-from contextlib import nullcontext
+import sys
+from contextlib import AbstractContextManager, nullcontext
 from collections.abc import Callable
 from decimal import Decimal
 from enum import Enum
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, cast
 
 from src.core.client_order_id import market_signal_client_order_id
 from src.core.models import Candlestick, Signal, SignalType, Trade
@@ -28,6 +29,18 @@ StrategyContextLoader = Callable[
     [BaseStrategy, Candlestick, tuple[dict[str, Any], ...]],
     StrategyContext,
 ]
+StrategyDecisionScope = Callable[
+    [BaseStrategy, Candlestick, StrategyContext | None],
+    AbstractContextManager[StrategyContext | None],
+]
+StrategyDecisionScopeLoader = Callable[[Candlestick], StrategyDecisionScope | None]
+
+
+class StrategyDecisionSkipped(RuntimeError):
+    """Only scope admission may skip a callback that has not started."""
+
+    def __init__(self) -> None:
+        super().__init__("STRATEGY_DECISION_SKIPPED")
 
 
 class SignalObserverError(RuntimeError):
@@ -177,6 +190,7 @@ class SignalProcessor:
         emit_signals: bool = True,
         respect_state: bool = True,
         latest_fills: tuple[dict[str, Any], ...] = (),
+        decision_scope: StrategyDecisionScope | None = None,
     ) -> None:
         """Route a candle to matching, running strategies.
 
@@ -231,12 +245,41 @@ class SignalProcessor:
                             candle,
                             latest_fills,
                         )
-                signals = self._dispatch_to_strategy(
-                    strategy,
-                    candle,
-                    context,
-                    invocation_mode=invocation_mode,
+                manager = (
+                    nullcontext(context)
+                    if decision_scope is None
+                    else decision_scope(strategy, candle, context)
                 )
+                try:
+                    enriched = manager.__enter__()
+                except StrategyDecisionSkipped:
+                    signals = []
+                else:
+                    try:
+                        signals = self._dispatch_to_strategy(
+                            strategy,
+                            candle,
+                            enriched,
+                            invocation_mode=invocation_mode,
+                        )
+                    except BaseException:
+                        # A scope cannot suppress a started callback failure into success.
+                        manager.__exit__(*sys.exc_info())
+                        raise
+                    else:
+                        manager.__exit__(None, None, None)
+                        policy = getattr(manager, "filter_callback_signals", None)
+                        if policy is not None:
+                            if not callable(policy):
+                                raise TypeError("invalid callback signal policy")
+                            filtered = policy(signals)
+                            if type(filtered) not in (list, tuple) or any(
+                                type(signal) is not Signal for signal in filtered
+                            ):
+                                raise TypeError("invalid callback signal policy result")
+                            signals = list(
+                                cast(list[Signal] | tuple[Signal, ...], filtered)
+                            )
                 decisions.append((strategy.strategy_id, signals))
 
             if emit_signals:
@@ -348,6 +391,7 @@ class SignalProcessor:
         candles: list[Candlestick],
         *,
         require_complete_trade_state: bool = False,
+        decision_scope_loader: StrategyDecisionScopeLoader | None = None,
     ) -> None:
         """Replay candles through one strategy without emitting orders.
 
@@ -367,7 +411,38 @@ class SignalProcessor:
                     continue
                 if strategy.requirements.timeframe != candle.timeframe:
                     continue
-                self._dispatch_to_strategy(strategy, candle)
+                if decision_scope_loader is None:
+                    self._dispatch_to_strategy(strategy, candle)
+                    continue
+                invocation_mode = self._context_invocation_mode(strategy)
+                context = None
+                if (
+                    self.strategy_context_loader is not None
+                    and invocation_mode is not StrategyContextInvocationMode.NONE
+                ):
+                    context = self.strategy_context_loader(strategy, candle, ())
+                scope = decision_scope_loader(candle)
+                manager = (
+                    nullcontext(context)
+                    if scope is None
+                    else scope(strategy, candle, context)
+                )
+                try:
+                    enriched = manager.__enter__()
+                except StrategyDecisionSkipped:
+                    continue
+                try:
+                    self._dispatch_to_strategy(
+                        strategy,
+                        candle,
+                        enriched,
+                        invocation_mode=invocation_mode,
+                    )
+                except BaseException:
+                    manager.__exit__(*sys.exc_info())
+                    raise
+                else:
+                    manager.__exit__(None, None, None)
         finally:
             if require_complete_trade_state:
                 strategy.restore_walk_forward_trade_state(complete_trade_state)

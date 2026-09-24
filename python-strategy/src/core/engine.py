@@ -47,7 +47,7 @@ from src.core.adapters.simulated import (
 from src.core.journal import StrategyJournal
 from src.core.redis_factory import create_redis_client
 from src.core.metrics import ACTIVE_STRATEGIES, BALANCE_USDT
-from src.core.command_router import CommandRouter
+from src.core.command_router import CommandRouter, StrategyStartDisposition
 from src.core.health_monitor import HealthMonitor
 from src.core.engine_heartbeat_service import EngineHeartbeatService
 from src.core.engine_boot_state_service import EngineBootStateService
@@ -57,7 +57,13 @@ from src.core.engine_runtime_reconciliation_service import (
     EngineRuntimeReconciliationService,
 )
 from src.core.live_candle_application import LiveCandleApplicationService
+from src.core.market_data.profiles.decision_application import MarketDataDecisionBatch
+from src.core.market_data.profiles.decision_owner import MarketDataDecisionOwner
 from src.core.pending_market_replay import PendingMarketReplayService
+from src.core.bootstrap_hydration_reader import BootstrapHydrationReader
+from src.core.market_data.profiles.bootstrap_seed import BootstrapKey, BootstrapSeed
+from src.core.strategy_activation_request_store import ProfileActivationRequestStore
+from src.core.market_data.profiles.decision_owner import IdentityResolver
 from src.core.ops_safety import OpsSafetyService
 from src.core.ops_command_service import OpsCommandService
 from src.core.runtime_reconcile import PositionAuthorityState, RuntimeReconciliationJob
@@ -158,9 +164,19 @@ class _EngineLifecycleAdapter:
     def __init__(self, engine: "StrategyEngine") -> None:
         self._engine = engine
 
-    def transition_to_running(self, strategy_id: str, **kwargs) -> None:
-        if self._engine.activate_strategy(strategy_id, **kwargs) is False:
+    def transition_to_running(
+        self, strategy_id: str, **kwargs
+    ) -> StrategyStartDisposition:
+        result: bool | StrategyStartDisposition = self._engine.activate_strategy(
+            strategy_id, **kwargs
+        )
+        if result is False:
             raise RuntimeError(f"strategy activation rejected: {strategy_id}")
+        if result is True:
+            return StrategyStartDisposition.ACTIVE
+        if result is StrategyStartDisposition.WAITING_FOR_CUTOVER:
+            return result
+        raise RuntimeError("invalid strategy activation result")
 
     def transition_to_stopped(self, strategy_id: str, **kwargs) -> None:
         if self._engine.deactivate_strategy(strategy_id, **kwargs) is False:
@@ -186,6 +202,12 @@ class StrategyEngine:
         leadership_guard: Callable[[], None] | None = None,
         signal_batch_observer: Callable[[tuple[Signal, ...]], None] | None = None,
         strategy_context_loader: StrategyContextLoader | None = None,
+        market_data_decision_owner: MarketDataDecisionOwner | None = None,
+        bootstrap_hydration_reader: BootstrapHydrationReader | None = None,
+        profile_request_store: ProfileActivationRequestStore | None = None,
+        profile_identity_resolver: IdentityResolver | None = None,
+        profile_seed_factory: Callable[[BaseStrategy, BootstrapKey, int], BootstrapSeed]
+        | None = None,
         available_strategy_context_capabilities: frozenset[
             StrategyContextCapability
         ] = frozenset(),
@@ -221,6 +243,9 @@ class StrategyEngine:
         self._boot_id = uuid.uuid4().hex
         self._boot_started = False
         self._strategy_context_loader_enabled = strategy_context_loader is not None
+        if market_data_decision_owner is not None and strategy_context_loader is None:
+            raise ValueError("market data decisions require a context loader")
+        self._market_data_decision_owner = market_data_decision_owner
         self._is_backtest = is_backtest is True
         self._available_strategy_context_capabilities = frozenset(
             available_strategy_context_capabilities
@@ -281,7 +306,11 @@ class StrategyEngine:
             registration_lock=self._runtime_registration_lock,
             market_processing_lock=self._market_processing_lock,
             event_logger=logger,
+            profile_request_store=profile_request_store,
+            db_session_factory=lambda: self._db_session_factory(),
+            environment_identity=lambda: self.runtime_environment.identity,
         )
+        self._profile_request_store = profile_request_store
         self._daily_nav_snapshot_service = DailyNavSnapshotService(
             self._db_session_factory,
         )
@@ -450,6 +479,13 @@ class StrategyEngine:
             environment_identity=lambda: self.runtime_environment.identity,
             assert_context_capabilities=self._assert_strategy_context_capabilities,
             event_logger=logger,
+            profile_request_store=profile_request_store,
+            profile_identity_resolver=profile_identity_resolver,
+            bootstrap_reader=bootstrap_hydration_reader,
+            state_manager=self._strategy_state_manager,
+            artifact_resolver=self._get_loaded_strategy_class,
+            profile_seed_factory=profile_seed_factory,
+            cutover_unregister_locked=self._runtime_artifacts.unregister_locked,
         )
         self._pending_market_replay = PendingMarketReplayService(
             db_session_factory=lambda: self._db_session_factory(),
@@ -459,6 +495,7 @@ class StrategyEngine:
             publish_replacement=lambda replacement: self._register_strategy_instance(
                 replacement
             ),
+            bootstrap_hydration_reader=bootstrap_hydration_reader,
         )
         self.ops_safety = OpsSafetyService(
             self.execution_engine,
@@ -747,11 +784,7 @@ class StrategyEngine:
                 self._system_state_key,
                 SYSTEM_STATE_OK,
             ),
-            clear_local_halt=lambda: setattr(
-                self,
-                "_kill_switch_halted",
-                False,
-            ),
+            clear_local_halt=lambda: self._clear_local_kill_switch_halt(),
             finalize_external_drift_clear=lambda **kwargs: (
                 self._venue_runtime.finalize_external_order_drift_clear(**kwargs)
             ),
@@ -1094,7 +1127,9 @@ class StrategyEngine:
         reason: Optional[str] = None,
         force: bool = False,
         expected_version: int | None = None,
-    ) -> bool:
+        activation_command: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> bool | StrategyStartDisposition:
         """Instantiate/register a strategy and transition it to ACTIVE."""
         with self._strategy_lifecycle_lock(strategy_id):
             return self._strategy_activation.activate_locked(
@@ -1104,6 +1139,14 @@ class StrategyEngine:
                 reason=reason,
                 force=force,
                 expected_version=expected_version,
+                **(
+                    {
+                        "activation_command": activation_command,
+                        "idempotency_key": idempotency_key,
+                    }
+                    if idempotency_key is not None
+                    else {}
+                ),
                 resolve_product_id=self._strategy_product_id,
                 assert_live_readiness=self._assert_strategy_live_readiness,
                 build_portfolio_definition=self._build_portfolio_definition,
@@ -1163,6 +1206,19 @@ class StrategyEngine:
                 f"found {current_version}"
             )
         if command not in available_strategy_commands(status):
+            if (
+                command == "STOP"
+                and self.runtime_environment.identity == "live"
+                and self._profile_request_store is not None
+            ):
+                pending = self._profile_request_store.get_pending(
+                    environment="live", strategy_id=strategy_id
+                )
+                if (
+                    pending is not None
+                    and pending.request.intent.expected_state_version == current_version
+                ):
+                    return
             raise InvalidStrategyStateTransition(
                 f"{command} is not allowed while {strategy_id} is {status.value}"
             )
@@ -1182,9 +1238,26 @@ class StrategyEngine:
     def _assert_strategy_context_capabilities(
         self,
         strategies: tuple[BaseStrategy, ...],
+        *,
+        profile_warmup_ready: bool = False,
     ) -> None:
         if self._is_backtest or self.runtime_environment.identity != "live":
             return
+        profile_strategies = sorted(
+            strategy.strategy_id
+            for strategy in strategies
+            if strategy.requirements.profile_requirements
+        )
+        if profile_strategies and profile_warmup_ready is not True:
+            raise RuntimeError(
+                "strategy_profile_activation_requires_modeled_warmup: "
+                + ",".join(profile_strategies)
+            )
+        if profile_strategies and (
+            not self._strategy_context_loader_enabled
+            or self._market_data_decision_owner is None
+        ):
+            raise RuntimeError("strategy_profile_execution_capability_missing")
         required = frozenset(
             capability
             for strategy in strategies
@@ -1231,15 +1304,32 @@ class StrategyEngine:
             )
         return (artifact_cls(strategy_id, product_id),)
 
-    def _apply_unpersisted_candle(self, candle: Candlestick) -> None:
+    def _apply_unpersisted_candle(
+        self, candle: Candlestick
+    ) -> MarketDataDecisionBatch | None:
+        self._strategy_activation.cutover_pending_candle(candle)
         fills = self.execution_engine.process_market_data(candle)
+        decision = (
+            None
+            if self._market_data_decision_owner is None
+            else self._market_data_decision_owner.begin_candle(candle)
+        )
         if self._strategy_context_loader_enabled:
-            self._signal_processor.on_candle(
-                candle,
-                latest_fills=self._timestamped_fills(fills, candle.timestamp),
-            )
+            latest_fills = self._timestamped_fills(fills, candle.timestamp)
+            if decision is None:
+                self._signal_processor.on_candle(
+                    candle,
+                    latest_fills=latest_fills,
+                )
+            else:
+                self._signal_processor.on_candle(
+                    candle,
+                    latest_fills=latest_fills,
+                    decision_scope=decision,
+                )
         else:
             self._signal_processor.on_candle(candle)
+        return None if decision is None else decision.build()
 
     @staticmethod
     def _timestamped_fills(
@@ -1259,7 +1349,7 @@ class StrategyEngine:
             raise RuntimeError(
                 "pending trade replay has no durable strategy-state boundary"
             )
-        with self._market_processing_lock:
+        with self._runtime_registration_lock, self._market_processing_lock:
             self._pending_market_replay.replay(
                 data,
                 apply_new=self._apply_unpersisted_candle,
@@ -1446,6 +1536,8 @@ class StrategyEngine:
         self.execution_engine.halt_and_drain(timeout=0)
 
     def _clear_local_kill_switch_halt(self) -> None:
+        if self._entry_admission_gate is not None:
+            self._entry_admission_gate.rearm_after_verified_recovery()
         self._kill_switch_halted = False
 
     def _resume_after_kill_switch(self) -> None:
@@ -1564,21 +1656,23 @@ class StrategyEngine:
                     strat.requirements.timeframe,
                 )
             )
+        channels.update(self._strategy_activation.persistent_pending_channels())
         return sorted(channels)
 
     def on_market_data(self, data: Union[Candlestick, Trade]):
         """
         Callback triggered by DataConsumer when new market data arrives.
         """
-        with self._market_processing_lock:
-            if isinstance(data, Candlestick):
+        if isinstance(data, Candlestick):
+            with self._runtime_registration_lock, self._market_processing_lock:
                 with self._live_candle_application.application_fence(data):
                     self._live_candle_application.apply(
                         data,
                         apply_new=self._apply_unpersisted_candle,
                         rebuild_applied=self._pending_market_replay.rebuild_applied,
                     )
-                return
+            return
+        with self._market_processing_lock:
             if isinstance(data, Trade):
                 self._signal_processor.on_trade(data)
 

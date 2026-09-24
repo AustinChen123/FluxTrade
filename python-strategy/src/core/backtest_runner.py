@@ -79,6 +79,15 @@ from src.core.product_registry import (
     resolve_fee_model,
 )
 from src.core.strategy_context import StrategyContext
+from src.core.market_data.profiles.context_enrichment import enrich_profile_context
+from src.core.market_data.profiles.modeled_input import (
+    ModeledProfileInput,
+    completed_candle_decision_time_ms,
+)
+from src.core.signal_processor import (
+    StrategyContextInvocationMode,
+    strategy_context_invocation_mode,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -334,6 +343,7 @@ class BacktestRunner:
         external_funding_events: Sequence[ExternalFundingEvent] = (),
         external_funding_account_id: str | None = None,
         market_slippage_bps: Decimal = Decimal("0"),
+        modeled_profile_input: ModeledProfileInput | None = None,
     ):
         self.start_time = start_time
         self.end_time = end_time
@@ -371,6 +381,12 @@ class BacktestRunner:
         self.contract_multiplier = resolve_contract_multiplier(instrument_spec)
         self.fee_model = resolve_fee_model(instrument_spec)
         self.signal_batch_observer = signal_batch_observer
+        if (
+            modeled_profile_input is not None
+            and type(modeled_profile_input) is not ModeledProfileInput
+        ):
+            raise TypeError("modeled_profile_input must be ModeledProfileInput")
+        self._modeled_profile_input = modeled_profile_input
 
         self.clock = BacktestClock(start_time=start_time / 1000)
         self._strategies_buffer: List[BaseStrategy] = []
@@ -379,12 +395,16 @@ class BacktestRunner:
         self.engine = None
 
     def add_strategy(self, strategy: BaseStrategy):
+        self._validate_profile_admission((strategy,))
         if self._primary_runtime_id is None:
             self._primary_runtime_id = strategy.strategy_id
         self._strategies_buffer.append(strategy)
 
     def add_portfolio(self, definition: PortfolioDefinition) -> None:
         """Add a portfolio while retaining strategy-scoped fills and metrics."""
+        self._validate_profile_admission(
+            tuple(sleeve.strategy for sleeve in definition.sleeves)
+        )
         decision_timeframe = definition.sleeves[0].strategy.requirements.timeframe
         if (
             definition.product_id != self.product_id
@@ -397,6 +417,53 @@ class BacktestRunner:
             self._primary_runtime_id = definition.portfolio_id
         self._portfolios_buffer.append(definition)
         self._strategies_buffer.extend(sleeve.strategy for sleeve in definition.sleeves)
+
+    def _validate_profile_admission(self, strategies: tuple[BaseStrategy, ...]) -> None:
+        profile_strategies = tuple(
+            strategy
+            for strategy in strategies
+            if strategy.requirements.profile_requirements
+        )
+        if not profile_strategies:
+            return
+        ids = ",".join(sorted(strategy.strategy_id for strategy in profile_strategies))
+        if self._modeled_profile_input is None:
+            raise RuntimeError(
+                "profile_market_data_provider_required: runner=full strategy_id=" + ids
+            )
+        if any(
+            strategy_context_invocation_mode(strategy)
+            is StrategyContextInvocationMode.NONE
+            for strategy in profile_strategies
+        ):
+            raise RuntimeError(
+                "profile_strategy_context_required: runner=full strategy_id=" + ids
+            )
+
+    def _enrich_profile_decision_context(
+        self,
+        strategy: BaseStrategy,
+        candle: Candlestick,
+        context: StrategyContext,
+    ) -> StrategyContext:
+        requirements = strategy.requirements.profile_requirements
+        if not requirements:
+            return context
+        modeled_input = self._modeled_profile_input
+        if modeled_input is None:
+            raise RuntimeError("profile modeled input missing after admission")
+        decision_time_ms = completed_candle_decision_time_ms(
+            candle.timestamp, candle.timeframe
+        )
+        market_data = modeled_input.resolve(
+            requirements, decision_time_ms=decision_time_ms
+        )
+        return enrich_profile_context(
+            context,
+            requirements,
+            market_data,
+            decision_time_ms=decision_time_ms,
+        )
 
     def _ensure_strategies_registered(self, db_session: Session):
         """Register all added strategies in the DB to avoid FK constraints"""
@@ -704,6 +771,16 @@ class BacktestRunner:
             "external_funding_account_id": self.external_funding_account_id,
             "strategies": strategy_configuration_contract(self._strategies_buffer),
         }
+        if self._modeled_profile_input is not None:
+            configuration_contract["profile_availability_policy_id"] = (
+                self._modeled_profile_input.availability_policy_id
+            )
+            configuration_contract["profile_availability_policy_digest"] = (
+                self._modeled_profile_input.availability_policy_digest
+            )
+            configuration_contract["profile_modeled_dataset_digest"] = (
+                self._modeled_profile_input.dataset_digest
+            )
         runner_configuration_contract = {
             **configuration_contract,
             "runner_kind": "full",
@@ -759,6 +836,9 @@ class BacktestRunner:
                     current_drawdown=current_drawdown,
                     max_drawdown=max_drawdown,
                 )
+            decision_context = self._enrich_profile_decision_context(
+                strategy, candle, decision_context
+            )
             decision_snapshots.append(canonical_decision_snapshot(decision_context))
             return decision_context
 

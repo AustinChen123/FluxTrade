@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from sqlalchemy.engine import URL
+from sqlalchemy.engine import URL, make_url
+from sqlalchemy.exc import ArgumentError
 
 
 _REQUIRED_POSTGRES_SETTINGS = (
@@ -12,6 +13,34 @@ _REQUIRED_POSTGRES_SETTINGS = (
     "POSTGRES_PORT",
     "POSTGRES_DB",
 )
+
+
+def select_migration_url(
+    configured_url: str | None,
+    settings: Mapping[str, str | None],
+    expected_database: object = None,
+) -> URL:
+    """Prefer an explicit Alembic URL; placeholder configuration requires full env.
+
+    An optional isolated-database guard is checked before engine construction.
+    Parsing/guard errors deliberately omit URLs, credentials and database names.
+    """
+    if configured_url and configured_url != "driver://user:pass@localhost/dbname":
+        try:
+            url = make_url(configured_url)
+        except (ArgumentError, TypeError, ValueError):
+            # SQLAlchemy URL parsing can raise ArgumentError with the raw input.
+            raise ValueError("invalid configured migration URL") from None
+    else:
+        url = build_postgres_url(settings)
+    if expected_database is not None and (
+        not isinstance(expected_database, str)
+        or not expected_database
+        or url.database != expected_database
+        or bool(url.query)
+    ):
+        raise ValueError("migration database isolation mismatch")
+    return url
 
 
 def build_postgres_url(settings: Mapping[str, str | None]) -> URL:

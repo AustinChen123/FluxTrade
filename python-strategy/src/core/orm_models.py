@@ -60,6 +60,11 @@ class Candlestick(Base):
 
 class MarketDataApplication(Base):
     __tablename__ = "market_data_application"
+    decision_contract_version = Column(Integer, nullable=True)
+    __table_args__ = (
+        CheckConstraint("decision_contract_version IS NULL OR decision_contract_version = 1", name="ck_mda_decision_contract"),
+        UniqueConstraint("environment", "product_id", "timeframe", "timestamp", "decision_contract_version", name="uq_mda_decision_contract"),
+    )
 
     environment = Column(String(64), primary_key=True)
     product_id = Column(String, ForeignKey("product.id"), primary_key=True)

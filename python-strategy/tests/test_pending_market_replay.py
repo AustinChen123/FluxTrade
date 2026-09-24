@@ -32,7 +32,9 @@ def _strategy(strategy_id: str, product_id: str, timeframe: str) -> MagicMock:
     strategy = MagicMock(name=strategy_id)
     strategy.strategy_id = strategy_id
     strategy.product_id = product_id
-    strategy.requirements = SimpleNamespace(timeframe=timeframe)
+    strategy.requirements = SimpleNamespace(
+        timeframe=timeframe, profile_requirements=()
+    )
     return strategy
 
 
@@ -43,6 +45,7 @@ def _service(
     active: list[MagicMock] | None = None,
     publish: MagicMock | None = None,
     events: list[str] | None = None,
+    bootstrap_reader: MagicMock | None = None,
 ) -> tuple[
     PendingMarketReplayService,
     MagicMock,
@@ -76,8 +79,85 @@ def _service(
         strategy_hydration=hydration,
         list_active_strategies=lambda: tuple(active),
         publish_replacement=publish_replacement,
+        bootstrap_hydration_reader=bootstrap_reader,
     )
     return service, application, hydration, publish, db
+
+
+@pytest.mark.parametrize("applied", [False, True])
+def test_profile_uses_exact_bootstrap_binding(applied):
+    current = _strategy("a", "BINANCE:BTCUSDT-PERP", "1m")
+    replacement = _strategy("replacement", current.product_id, "1m")
+    current.requirements.profile_requirements = (
+        replacement.requirements.profile_requirements
+    ) = (MagicMock(),)
+    hydration, reader = MagicMock(), MagicMock()
+    hydration.fresh_instance_for_replay.return_value = replacement
+    candles, loader = (_candle(timestamp=100), _candle(timestamp=200)), MagicMock()
+    reader.prepare.return_value = SimpleNamespace(
+        candles=candles, decision_scope_loader=loader
+    )
+    events = []
+    service, application, _, publish, db = _service(
+        hydration=hydration, active=[current], bootstrap_reader=reader, events=events
+    )
+    service._warm_up = MagicMock(wraps=service._warm_up)
+    application.was_applied.return_value = applied
+    candle = _candle(timestamp=500)
+    if applied:
+        service.rebuild_applied(candle)
+    else:
+        service.rewind_pending((candle,))
+    expected: dict[str, object] = {"boundary_bar_start_ms": 500}
+    if applied:
+        expected["mode"] = "THROUGH_APPLIED"
+    service._warm_up.assert_called_once_with(db, replacement, **expected)
+    reader.prepare.assert_called_once_with(
+        replacement, 500, "THROUGH_APPLIED" if applied else "BEFORE_PENDING"
+    )
+    hydration.hydrate_candles.assert_called_once_with(
+        replacement, candles, decision_scope_loader=loader
+    )
+    assert hydration.hydrate_candles.call_args.args[1] is candles
+    hydration.warm_up.assert_not_called()
+    publish.assert_called_once_with(replacement)
+    assert events[-2:] == ["db-exit", "publish:replacement"]
+
+
+@pytest.mark.parametrize("failure", ["missing_reader", "reader", "hydration"])
+@pytest.mark.parametrize("applied", [False, True])
+def test_profile_failure_never_falls_back_or_partially_publishes(failure, applied):
+    active = [_strategy(name, "BINANCE:BTCUSDT-PERP", "1m") for name in ("a", "b")]
+    replacements = [
+        _strategy("new_" + item.strategy_id, item.product_id, "1m") for item in active
+    ]
+    for item in (*active, *replacements):
+        item.requirements.profile_requirements = (MagicMock(),)
+    hydration, reader = MagicMock(), MagicMock()
+    hydration.fresh_instance_for_replay.side_effect = replacements
+    bound = SimpleNamespace(candles=(_candle(),), decision_scope_loader=MagicMock())
+    error = RuntimeError("injected")
+    reader.prepare.side_effect = (
+        [bound, error] if failure == "reader" else [bound, bound]
+    )
+    if failure == "hydration":
+        hydration.hydrate_candles.side_effect = [None, error]
+    service, application, _, publish, _ = _service(
+        hydration=hydration,
+        active=active,
+        bootstrap_reader=None if failure == "missing_reader" else reader,
+    )
+    application.was_applied.return_value = applied
+    with pytest.raises(RuntimeError) as caught:
+        if applied:
+            service.rebuild_applied(_candle())
+        else:
+            service.rewind_pending((_candle(),))
+    if failure != "missing_reader":
+        assert caught.value is error
+        assert reader.prepare.call_count == 2
+    hydration.warm_up.assert_not_called()
+    publish.assert_not_called()
 
 
 def test_empty_rewind_performs_no_owner_or_database_work() -> None:
@@ -233,6 +313,34 @@ def test_rebuild_rejects_unapplied_candle_before_hydration() -> None:
 
     hydration.fresh_instance_for_replay.assert_not_called()
     publish.assert_not_called()
+
+
+def test_rebuild_non_profile_strategy_preserves_legacy_hydration_path() -> None:
+    current = _strategy("a", "BINANCE:BTCUSDT-PERP", "1m")
+    current.requirements.profile_requirements = ()
+    replacement = _strategy("replacement-a", current.product_id, "1m")
+    replacement.requirements.profile_requirements = ()
+    hydration = MagicMock()
+    hydration.fresh_instance_for_replay.return_value = replacement
+    bootstrap_reader = MagicMock()
+    service, application, _hydration, publish, db = _service(
+        hydration=hydration,
+        active=[current],
+        bootstrap_reader=bootstrap_reader,
+    )
+    candle = _candle(timestamp=500)
+    application.was_applied.return_value = True
+
+    service.rebuild_applied(candle)
+
+    hydration.warm_up.assert_called_once_with(
+        db,
+        replacement,
+        before_timestamp=501,
+    )
+    application.applied_decision_batch.assert_not_called()
+    bootstrap_reader.prepare.assert_not_called()
+    publish.assert_called_once_with(replacement)
 
 
 def test_replay_delegates_exact_rewind_apply_and_rebuild_callbacks() -> None:

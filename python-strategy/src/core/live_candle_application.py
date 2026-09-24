@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import time
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -16,10 +17,19 @@ from src.core.models import Candlestick
 from src.core.orm_models import Candlestick as ORMCandlestick
 from src.core.orm_models import MarketDataApplication
 from src.core.product_master import ensure_product_registered
+from src.core.product_registry import validate_product_id
+from src.core.market_data.profiles.decision_application import MarketDataDecisionBatch
+from src.core.market_data.profiles.decision_application_store import (
+    DecisionBatchIntegrityError,
+    DecisionBatchRecord,
+    append_decision_batch,
+    read_decision_batch,
+)
 
 
 LIVE_CANDLE_FENCE_TIMEOUT_SECONDS = 5.0
 CandleCallback = Callable[[Candlestick], None]
+PendingCandleCallback = Callable[[Candlestick], MarketDataDecisionBatch | None]
 
 
 class LiveCandleApplicationService:
@@ -80,12 +90,85 @@ class LiveCandleApplicationService:
             with self._db_session_factory() as owned_db:
                 return self.was_applied(candle, db=owned_db)
 
+        applied, _batch = self._applied_state(candle, db)
+        return applied
+
+    def applied_decision_batch(
+        self,
+        candle: Candlestick,
+        *,
+        db: Session | None = None,
+    ) -> MarketDataDecisionBatch | None:
+        """Read exact terminal evidence for one already-applied live candle."""
+        if db is None:
+            with self._db_session_factory() as owned_db:
+                return self.applied_decision_batch(candle, db=owned_db)
+        applied, batch = self._applied_state(candle, db)
+        if not applied:
+            raise RuntimeError("cannot read decision evidence for an unapplied candle")
+        return batch.batch if batch is not None else None
+
+    def read_applied_candle(
+        self,
+        *,
+        product_id: str,
+        timeframe: str,
+        bar_start_ms: int,
+        db: Session,
+    ) -> tuple[Candlestick, DecisionBatchRecord]:
+        """Read one canonical candle and complete contract evidence in caller session."""
+        if (
+            self._environment_identity() != "live"
+            or type(product_id) is not str
+            or not 1 <= len(product_id) <= 64
+            or type(timeframe) is not str
+            or re.fullmatch(r"[A-Za-z0-9_-]{1,32}", timeframe) is None
+            or type(bar_start_ms) is not int
+            or not 0 <= bar_start_ms <= 2**63 - 1
+        ):
+            raise DecisionBatchIntegrityError()
+        try:
+            validate_product_id(product_id)
+        except ValueError:
+            raise DecisionBatchIntegrityError() from None
+        identity = (product_id, timeframe, bar_start_ms)
+        row = db.get(ORMCandlestick, identity)
+        if row is None or (row.product_id, row.timeframe, row.timestamp) != identity:
+            raise DecisionBatchIntegrityError()
+        values = tuple(
+            getattr(row, name) for name in ("open", "high", "low", "close", "volume")
+        )
+        if any(type(value) is not Decimal or not value.is_finite() for value in values):
+            raise DecisionBatchIntegrityError()
+        candle = Candlestick(
+            product_id=product_id,
+            timeframe=timeframe,
+            timestamp=bar_start_ms,
+            open=values[0],
+            high=values[1],
+            low=values[2],
+            close=values[3],
+            volume=values[4],
+        )
+        applied, batch = self._applied_state(candle, db)
+        if not applied or batch is None:
+            raise DecisionBatchIntegrityError()
+        return candle, batch
+
+    def _applied_state(
+        self,
+        candle: Candlestick,
+        db: Session,
+    ) -> tuple[bool, DecisionBatchRecord | None]:
+        if self._environment_identity() != "live":
+            return False, None
+
         application = db.get(
             MarketDataApplication,
             self._application_identity(candle),
         )
         if application is None:
-            return False
+            return False, None
         if self._application_values(application) != self._candle_values(candle):
             raise RuntimeError(
                 "live application receipt conflicts with market payload: "
@@ -102,7 +185,22 @@ class LiveCandleApplicationService:
                 "live application receipt has no matching canonical candle: "
                 f"{candle.product_id}:{candle.timeframe}:{candle.timestamp}"
             )
-        return True
+        marker = application.decision_contract_version
+        batch = None
+        if marker is not None:
+            if type(marker) is not int or marker != 1:
+                raise DecisionBatchIntegrityError()
+            record = read_decision_batch(
+                db,
+                environment=self._environment_identity(),
+                product_id=candle.product_id,
+                timeframe=candle.timeframe,
+                bar_start_ms=candle.timestamp,
+            )
+            if record is None:
+                raise DecisionBatchIntegrityError()
+            batch = record
+        return True, batch
 
     def assert_newer(
         self,
@@ -148,9 +246,22 @@ class LiveCandleApplicationService:
                     f"{candle.product_id}:{candle.timeframe}:{candle.timestamp}"
                 )
 
-    def _persist(self, candle: Candlestick) -> None:
+    def _persist(
+        self, candle: Candlestick, pending: MarketDataDecisionBatch | None = None
+    ) -> None:
         if self._environment_identity() != "live":
             return
+        if pending is not None and (
+            type(pending) is not MarketDataDecisionBatch
+            or (
+                pending.environment,
+                pending.product_id,
+                pending.timeframe,
+                pending.bar_start_ms,
+            )
+            != self._application_identity(candle)
+        ):
+            raise DecisionBatchIntegrityError()
         with self._db_session_factory() as db:
             try:
                 ensure_product_registered(db, candle.product_id)
@@ -196,8 +307,12 @@ class LiveCandleApplicationService:
                         low=candle.low,
                         close=candle.close,
                         volume=candle.volume,
+                        decision_contract_version=1 if pending is not None else None,
                     )
                 )
+                if pending is not None:
+                    db.flush()
+                    append_decision_batch(db, pending)
                 db.commit()
             except Exception:
                 db.rollback()
@@ -252,7 +367,7 @@ class LiveCandleApplicationService:
         self,
         candle: Candlestick,
         *,
-        apply_new: CandleCallback,
+        apply_new: PendingCandleCallback,
         rebuild_applied: CandleCallback,
     ) -> None:
         if self.was_applied(candle):
@@ -260,15 +375,15 @@ class LiveCandleApplicationService:
             return
         self.assert_newer(candle)
         self._assert_compatible(candle)
-        apply_new(candle)
-        self._persist(candle)
+        pending = apply_new(candle)
+        self._persist(candle, pending)
 
     def replay(
         self,
         candle: Candlestick,
         *,
         rewind_pending: CandleCallback,
-        apply_new: CandleCallback,
+        apply_new: PendingCandleCallback,
         rebuild_applied: CandleCallback,
     ) -> None:
         with self.application_fence(candle):

@@ -34,6 +34,8 @@ from src.control_plane.strategy_control import (
     StrategyControlUnavailable,
 )
 from src.control_plane.strategy_state_query import StrategyStateQueryService
+from src.control_plane.profile_http_query import ProfileQueryService
+from src.control_plane.profile_http_contract import ProfileHttpError
 
 
 logger = logging.getLogger(__name__)
@@ -69,6 +71,7 @@ class ControlPlaneApp:
         redis_client: Any | None = None,
         browser_auth: BrowserAuthProvider | None = None,
         readiness_probe: Callable[[], None] | None = None,
+        profile_query_service: ProfileQueryService | None = None,
     ) -> None:
         if api_key == "":
             raise ValueError("api_key must be non-empty when provided")
@@ -81,6 +84,7 @@ class ControlPlaneApp:
         self.redis_client = redis_client
         self.browser_auth = browser_auth
         self.readiness_probe = readiness_probe
+        self.profile_query_service = profile_query_service
 
     def shutdown(self, timeout: float) -> bool:
         """Stop accepting queued work and wait up to ``timeout`` for active jobs."""
@@ -147,6 +151,28 @@ class ControlPlaneApp:
         )
         if browser_policy_response is not None:
             return browser_policy_response
+
+        if method == "GET" and clean_path == "/api/v1/market-data/volume-profiles":
+            if body is not None and not (
+                type(body) is bytes and body == b"" or type(body) is str and body == ""
+            ):
+                return HttpResponse(400, {"error": "INVALID_REQUEST"})
+            try:
+                raw_query = parsed_url.query.encode("ascii", errors="strict")
+            except UnicodeEncodeError:
+                return HttpResponse(400, {"error": "INVALID_REQUEST"})
+            if self.profile_query_service is None:
+                return HttpResponse(503, {"error": "BACKEND_UNAVAILABLE"})
+            result = self.profile_query_service.query(raw_query)
+            if isinstance(result, ProfileHttpError):
+                return HttpResponse(result.status, {"error": result.code})
+            try:
+                payload = json.loads(result)
+                if type(payload) is not dict:
+                    raise ValueError
+            except (ValueError, TypeError):
+                return HttpResponse(503, {"error": "BACKEND_UNAVAILABLE"})
+            return HttpResponse(200, payload)
 
         if method == "GET" and clean_path == "/api/v1/auth/session":
             if self.browser_auth is None:

@@ -1,0 +1,582 @@
+"""Request evidence persistence; terminal mutation uses caller-owned transactions."""
+
+from dataclasses import dataclass
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, contextmanager
+from datetime import datetime, timezone
+import re
+from typing import Any, cast
+from enum import Enum
+from sqlalchemy.engine import RowMapping
+from sqlalchemy import Table, select, text, update
+from sqlalchemy.orm import Session
+from sqlalchemy.dialects.postgresql import insert
+from src.core.orm_models import StrategyState
+
+from src.core.strategy_activation_intent import (
+    ProfileActivationRequest,
+    MAX_ACTIVATION_REQUEST_BYTES,
+    ProfileActivationIntent,
+    ProfileActivationAdmission,
+    classify_profile_activation_intent,
+)
+from src.core.market_data.profiles.orm import ProfileActivationRequest as RequestRow
+from src.core.market_data.profiles.repository import TransactionWaitPolicy
+
+_TABLE = cast(Table, RequestRow.__table__)
+MAX_PENDING_ACTIVATION_REQUESTS = 256
+
+
+class ProfileActivationRequestValidationError(ValueError):
+    def __init__(self) -> None:
+        super().__init__("PROFILE_ACTIVATION_REQUEST_INVALID")
+
+
+class ProfileActivationRequestConflict(ValueError):
+    def __init__(self) -> None:
+        super().__init__("PROFILE_ACTIVATION_REQUEST_CONFLICT")
+
+
+class ProfileActivationRequestStale(ValueError):
+    def __init__(self) -> None:
+        super().__init__("PROFILE_ACTIVATION_REQUEST_STALE")
+
+
+class ProfileActivationRequestIntegrityError(ValueError):
+    def __init__(self) -> None:
+        super().__init__("PROFILE_ACTIVATION_REQUEST_INTEGRITY")
+
+
+class ProfileActivationRequestStatus(Enum):
+    PENDING = "PENDING"
+    CONSUMED = "CONSUMED"
+    CANCELLED = "CANCELLED"
+    STALE = "STALE"
+
+
+def _validate_request_id(value: str) -> None:
+    if type(value) is not str or re.fullmatch(r"[0-9a-f]{64}", value, re.ASCII) is None:
+        raise ProfileActivationRequestValidationError()
+
+
+def _stamp(value: object) -> bool:
+    return (
+        type(value) is datetime
+        and value.tzinfo is timezone.utc
+        and value.microsecond % 1000 == 0
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileActivationRequestRecord:
+    request: ProfileActivationRequest
+    status: ProfileActivationRequestStatus
+    requested_at: datetime
+    terminal_at: datetime | None = None
+    terminal_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.request) is not ProfileActivationRequest
+            or type(self.status) is not ProfileActivationRequestStatus
+            or not _stamp(self.requested_at)
+        ):
+            raise ProfileActivationRequestIntegrityError()
+        if self.status is ProfileActivationRequestStatus.PENDING:
+            valid = self.terminal_at is None and self.terminal_reason is None
+        else:
+            valid = (
+                _stamp(self.terminal_at)
+                and self.terminal_at is not None
+                and self.terminal_at >= self.requested_at
+                and type(self.terminal_reason) is str
+                and re.fullmatch(
+                    r"[A-Z][A-Z0-9_]{0,127}", self.terminal_reason, re.ASCII
+                )
+                is not None
+            )
+        if not valid:
+            raise ProfileActivationRequestIntegrityError()
+
+
+class ProfileActivationAdmissionStatus(Enum):
+    CONFIRMED = "CONFIRMED"
+    STALE = "STALE"
+    CONFLICT = "CONFLICT"
+    FAILED = "FAILED"
+    UNCONFIRMED = "UNCONFIRMED"
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileActivationAdmissionResult:
+    status: ProfileActivationAdmissionStatus
+    record: ProfileActivationRequestRecord | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.status) is not ProfileActivationAdmissionStatus or (
+            type(self.record) is not ProfileActivationRequestRecord
+            if self.status is ProfileActivationAdmissionStatus.CONFIRMED
+            else self.record is not None
+        ):
+            raise ProfileActivationRequestValidationError()
+
+
+def _admission_result(
+    record: object, request: ProfileActivationRequest
+) -> ProfileActivationAdmissionResult:
+    if (
+        type(record) is ProfileActivationRequestRecord
+        and record.request.canonical_bytes == request.canonical_bytes
+    ):
+        return ProfileActivationAdmissionResult(
+            ProfileActivationAdmissionStatus.CONFIRMED, record
+        )
+    return ProfileActivationAdmissionResult(ProfileActivationAdmissionStatus.FAILED)
+
+
+def _hydrate(
+    row: dict[str, Any] | RowMapping, request_id: str
+) -> ProfileActivationRequestRecord:
+    try:
+        _validate_request_id(request_id)
+        if type(row) not in (dict, RowMapping) or type(row["status"]) is not str:
+            raise ValueError
+        raw = row["canonical_payload"]
+        if type(raw) is memoryview:
+            if not 1 <= raw.nbytes <= MAX_ACTIVATION_REQUEST_BYTES:
+                raise ValueError
+            raw = raw.tobytes()
+        value = ProfileActivationRequest.from_canonical_bytes(raw)
+        key = value.intent.key
+        expected = dict(
+            request_id=value.request_id,
+            payload_digest=value.payload_digest,
+            environment=key.environment,
+            execution_scope_id=key.execution_scope_id,
+            strategy_id=key.strategy_id,
+            expected_state_version=value.intent.expected_state_version,
+            contract_version=1,
+        )
+        if value.request_id != request_id or any(
+            type(row[name]) is not type(item) or row[name] != item
+            for name, item in expected.items()
+        ):
+            raise ValueError
+        return ProfileActivationRequestRecord(
+            value,
+            ProfileActivationRequestStatus(row["status"]),
+            row["requested_at"],
+            row["terminal_at"],
+            row["terminal_reason"],
+        )
+    except (ValueError, TypeError, KeyError, OverflowError):
+        raise ProfileActivationRequestIntegrityError() from None
+
+
+def lock_profile_activation_request(
+    session: Session,
+    expected: ProfileActivationRequest,
+) -> ProfileActivationRequestRecord:
+    """Lock and verify request evidence inside the caller transaction."""
+    if type(expected) is not ProfileActivationRequest:
+        raise ProfileActivationRequestValidationError()
+    if (
+        not isinstance(session, Session)
+        or not session.is_active
+        or not session.in_transaction()
+        or session.get_bind().dialect.name != "postgresql"
+    ):
+        raise ProfileActivationRequestValidationError()
+    rows = (
+        session.execute(
+            select(_TABLE)
+            .where(_TABLE.c.request_id == expected.request_id)
+            .with_for_update()
+            .limit(2)
+        )
+        .mappings()
+        .all()
+    )
+    if len(rows) != 1:
+        raise ProfileActivationRequestIntegrityError()
+    existing = _hydrate(rows[0], expected.request_id)
+    if existing.request.canonical_bytes != expected.canonical_bytes:
+        raise ProfileActivationRequestConflict()
+    return existing
+
+
+def terminalize_profile_activation_request(
+    session: Session,
+    expected: ProfileActivationRequest,
+    *,
+    status: ProfileActivationRequestStatus,
+    terminal_at: datetime,
+    terminal_reason: str,
+) -> ProfileActivationRequestRecord:
+    """Mutate within the caller transaction; return is not durable or ACTIVE proof."""
+    if (
+        type(expected) is not ProfileActivationRequest
+        or type(status) is not ProfileActivationRequestStatus
+        or status is ProfileActivationRequestStatus.PENDING
+        or not _stamp(terminal_at)
+        or type(terminal_reason) is not str
+        or re.fullmatch(r"[A-Z][A-Z0-9_]{0,127}", terminal_reason, re.ASCII) is None
+    ):
+        raise ProfileActivationRequestValidationError()
+    existing = lock_profile_activation_request(session, expected)
+    if existing.status is not ProfileActivationRequestStatus.PENDING:
+        if (existing.status, existing.terminal_at, existing.terminal_reason) != (
+            status,
+            terminal_at,
+            terminal_reason,
+        ):
+            raise ProfileActivationRequestConflict()
+        return existing
+    if terminal_at < existing.requested_at:
+        raise ProfileActivationRequestValidationError()
+    rows = (
+        session.execute(
+            update(_TABLE)
+            .where(
+                _TABLE.c.request_id == expected.request_id,
+                _TABLE.c.status == "PENDING",
+            )
+            .values(
+                status=status.value,
+                terminal_at=terminal_at,
+                terminal_reason=terminal_reason,
+            )
+            .returning(_TABLE)
+        )
+        .mappings()
+        .all()
+    )
+    if len(rows) != 1:
+        raise ProfileActivationRequestIntegrityError()
+    result = _hydrate(rows[0], expected.request_id)
+    if result != ProfileActivationRequestRecord(
+        expected, status, existing.requested_at, terminal_at, terminal_reason
+    ):
+        raise ProfileActivationRequestIntegrityError()
+    return result
+
+
+def _validate_pending_identity(environment: str, strategy_id: str) -> None:
+    if any(
+        type(value) is not str
+        or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", value, re.ASCII) is None
+        for value in (environment, strategy_id)
+    ):
+        raise ProfileActivationRequestValidationError()
+
+
+def _request_in_status(
+    session: Session,
+    environment: str,
+    strategy_id: str,
+    *,
+    lock: bool,
+    status: str,
+    expected_state_version: int | None = None,
+) -> ProfileActivationRequestRecord | None:
+    statement = (
+        select(_TABLE)
+        .where(
+            _TABLE.c.environment == environment,
+            _TABLE.c.strategy_id == strategy_id,
+            _TABLE.c.status == status,
+        )
+        .order_by(_TABLE.c.request_id)
+        .limit(2)
+    )
+    if expected_state_version is not None:
+        statement = statement.where(
+            _TABLE.c.expected_state_version == expected_state_version
+        )
+    rows = (
+        session.execute(statement.with_for_update() if lock else statement)
+        .mappings()
+        .all()
+    )
+    if len(rows) > 1:
+        raise ProfileActivationRequestIntegrityError()
+    if not rows:
+        return None
+    record = _hydrate(rows[0], cast(str, rows[0].get("request_id")))
+    if record.status.value != status or (
+        record.request.intent.key.environment,
+        record.request.intent.key.strategy_id,
+    ) != (environment, strategy_id):
+        raise ProfileActivationRequestIntegrityError()
+    if (
+        expected_state_version is not None
+        and record.request.intent.expected_state_version != expected_state_version
+    ):
+        raise ProfileActivationRequestIntegrityError()
+    return record
+
+
+def lock_pending_profile_activation_request(
+    session: Session, *, environment: str, strategy_id: str
+) -> ProfileActivationRequestRecord | None:
+    """Lock the sole pending request across scopes; ambiguity is not absence."""
+    _validate_pending_identity(environment, strategy_id)
+    if (
+        not isinstance(session, Session)
+        or not session.is_active
+        or not session.in_transaction()
+        or session.get_bind().dialect.name != "postgresql"
+    ):
+        raise ProfileActivationRequestValidationError()
+    return _request_in_status(
+        session, environment, strategy_id, lock=True, status="PENDING"
+    )
+
+
+class ProfileActivationRequestStore:
+    def __init__(
+        self,
+        sessions: Callable[[], AbstractContextManager[Session]],
+        policy: TransactionWaitPolicy = TransactionWaitPolicy(),
+    ) -> None:
+        if type(policy) is not TransactionWaitPolicy:
+            raise ProfileActivationRequestValidationError()
+        self._sessions, self._policy = sessions, policy
+
+    @contextmanager
+    def _transaction(self, *, read_only: bool) -> Iterator[Session]:
+        with self._sessions() as session:
+            if (
+                session.get_bind().dialect.name != "postgresql"
+                or session.in_transaction()
+            ):
+                raise ProfileActivationRequestIntegrityError()
+            with session.begin():
+                session.execute(
+                    text(
+                        "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"
+                        + (", READ ONLY" if read_only else "")
+                    )
+                )
+                session.execute(
+                    text(
+                        "SELECT set_config('lock_timeout', :lock_timeout, true), "
+                        "set_config('statement_timeout', :statement_timeout, true), "
+                        "set_config('TimeZone', 'UTC', true)"
+                    ).bindparams(
+                        lock_timeout=f"{self._policy.lock_timeout_ms}ms",
+                        statement_timeout=f"{self._policy.statement_timeout_ms}ms",
+                    )
+                )
+                yield session
+
+    @staticmethod
+    def _lookup(
+        session: Session, predicate: Any
+    ) -> ProfileActivationRequestRecord | None:
+        rows = (
+            session.execute(select(_TABLE).where(predicate).limit(2)).mappings().all()
+        )
+        if len(rows) > 1:
+            raise ProfileActivationRequestIntegrityError()
+        return _hydrate(rows[0], rows[0]["request_id"]) if rows else None
+
+    def get(self, request_id: str) -> ProfileActivationRequestRecord | None:
+        _validate_request_id(request_id)
+        with self._transaction(read_only=True) as session:
+            record = self._lookup(session, _TABLE.c.request_id == request_id)
+            if record is not None and record.request.request_id != request_id:
+                raise ProfileActivationRequestIntegrityError()
+        return record
+
+    def get_pending(
+        self, *, environment: str, strategy_id: str
+    ) -> ProfileActivationRequestRecord | None:
+        _validate_pending_identity(environment, strategy_id)
+        with self._transaction(read_only=True) as session:
+            record = _request_in_status(
+                session, environment, strategy_id, lock=False, status="PENDING"
+            )
+        return record
+
+    def get_consumed(
+        self, *, environment: str, strategy_id: str, expected_state_version: int
+    ) -> ProfileActivationRequestRecord | None:
+        """Read one activation generation, not the latest historical request."""
+        _validate_pending_identity(environment, strategy_id)
+        if (
+            type(expected_state_version) is not int
+            or not 0 <= expected_state_version <= 2**31 - 1
+        ):
+            raise ProfileActivationRequestValidationError()
+        with self._transaction(read_only=True) as session:
+            record = _request_in_status(
+                session,
+                environment,
+                strategy_id,
+                lock=False,
+                status="CONSUMED",
+                expected_state_version=expected_state_version,
+            )
+        return record
+
+    def list_pending(
+        self, environment: str
+    ) -> tuple[ProfileActivationRequestRecord, ...]:
+        """Bounded durable discovery; no lifecycle changes or row locks."""
+        _validate_pending_identity(environment, environment)
+        with self._transaction(read_only=True) as session:
+            rows = (
+                session.execute(
+                    select(_TABLE)
+                    .where(
+                        _TABLE.c.environment == environment,
+                        _TABLE.c.status == "PENDING",
+                    )
+                    .order_by(_TABLE.c.request_id)
+                    .limit(MAX_PENDING_ACTIVATION_REQUESTS + 1)
+                )
+                .mappings()
+                .all()
+            )
+            if len(rows) > MAX_PENDING_ACTIVATION_REQUESTS:
+                raise ProfileActivationRequestIntegrityError()
+            records = tuple(
+                _hydrate(row, cast(str, row.get("request_id"))) for row in rows
+            )
+            ids = tuple(record.request.request_id for record in records)
+            if ids != tuple(sorted(set(ids))) or any(
+                record.status is not ProfileActivationRequestStatus.PENDING
+                or record.request.intent.key.environment != environment
+                for record in records
+            ):
+                raise ProfileActivationRequestIntegrityError()
+        return records
+
+    def admit(
+        self, request: ProfileActivationRequest, *, current: ProfileActivationIntent
+    ) -> ProfileActivationRequestRecord:
+        """Current is a trusted artifact/config/requirements snapshot supplied by caller.
+        This store neither reconstructs nor authorizes that snapshot.
+        """
+        if (
+            type(request) is not ProfileActivationRequest
+            or type(current) is not ProfileActivationIntent
+        ):
+            raise ProfileActivationRequestValidationError()
+        key = request.intent.key
+        with self._transaction(read_only=False) as session:
+            state = session.execute(
+                select(StrategyState.version)
+                .where(StrategyState.strategy_id == key.strategy_id)
+                .with_for_update()
+            ).one_or_none()
+            if state is None:
+                raise ProfileActivationRequestIntegrityError()
+            version = state[0]
+            if type(version) is not int or not 0 <= version <= 2147483647:
+                raise ProfileActivationRequestIntegrityError()
+            existing = self._lookup(session, _TABLE.c.request_id == request.request_id)
+            if existing is None:
+                if (
+                    classify_profile_activation_intent(
+                        request.intent, current=current, pending=None
+                    )
+                    is ProfileActivationAdmission.STALE
+                    or version != request.intent.expected_state_version
+                ):
+                    raise ProfileActivationRequestStale()
+                slot = (
+                    (_TABLE.c.environment == key.environment)
+                    & (_TABLE.c.execution_scope_id == key.execution_scope_id)
+                    & (_TABLE.c.strategy_id == key.strategy_id)
+                    & (_TABLE.c.status == "PENDING")
+                )
+                existing = self._lookup(session, slot)
+                if existing is None:
+                    values = dict(
+                        request_id=request.request_id,
+                        environment=key.environment,
+                        execution_scope_id=key.execution_scope_id,
+                        strategy_id=key.strategy_id,
+                        expected_state_version=request.intent.expected_state_version,
+                        canonical_payload=request.canonical_bytes,
+                        payload_digest=request.payload_digest,
+                        contract_version=1,
+                        status="PENDING",
+                    )
+                    winner = (
+                        session.execute(
+                            insert(_TABLE)
+                            .values(**values)
+                            .on_conflict_do_nothing()
+                            .returning(_TABLE)
+                        )
+                        .mappings()
+                        .one_or_none()
+                    )
+                    existing = (
+                        _hydrate(winner, request.request_id)
+                        if winner is not None
+                        else self._lookup(
+                            session, _TABLE.c.request_id == request.request_id
+                        )
+                    )
+                    if existing is None:
+                        existing = self._lookup(session, slot)
+                        if existing is None:
+                            raise ProfileActivationRequestIntegrityError()
+            if existing.request.canonical_bytes != request.canonical_bytes:
+                raise ProfileActivationRequestConflict()
+        return existing
+
+    def confirm(
+        self, expected: ProfileActivationRequest
+    ) -> ProfileActivationRequestRecord | None:
+        if type(expected) is not ProfileActivationRequest:
+            raise ProfileActivationRequestValidationError()
+        record = self.get(expected.request_id)
+        if (
+            record is not None
+            and record.request.canonical_bytes != expected.canonical_bytes
+        ):
+            raise ProfileActivationRequestConflict()
+        return record
+
+    def admit_confirmed(
+        self,
+        request: ProfileActivationRequest,
+        *,
+        current: ProfileActivationIntent,
+    ) -> ProfileActivationAdmissionResult:
+        """Confirm durable request evidence, not activation; never re-admit after error."""
+        status = ProfileActivationAdmissionStatus
+        if (
+            type(request) is not ProfileActivationRequest
+            or type(current) is not ProfileActivationIntent
+        ):
+            return ProfileActivationAdmissionResult(status.FAILED)
+        try:
+            record = self.admit(request, current=current)
+        except ProfileActivationRequestStale:
+            return ProfileActivationAdmissionResult(status.STALE)
+        except ProfileActivationRequestConflict:
+            return ProfileActivationAdmissionResult(status.CONFLICT)
+        except (
+            ProfileActivationRequestIntegrityError,
+            ProfileActivationRequestValidationError,
+        ):
+            return ProfileActivationAdmissionResult(status.FAILED)
+        except Exception:
+            try:
+                record = self.confirm(request)
+            except ProfileActivationRequestConflict:
+                return ProfileActivationAdmissionResult(status.CONFLICT)
+            except (
+                ProfileActivationRequestIntegrityError,
+                ProfileActivationRequestValidationError,
+            ):
+                return ProfileActivationAdmissionResult(status.FAILED)
+            except Exception:
+                return ProfileActivationAdmissionResult(status.UNCONFIRMED)
+        return _admission_result(record, request)

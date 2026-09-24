@@ -1177,6 +1177,79 @@ mod tests {
     }
 
     #[test]
+    fn missing_quantity_requires_explicit_complete_fill_totals() {
+        use protocol::exchange_order_notification::NotifyType;
+        use rust_decimal::Decimal;
+        let event = |notify, quantity, filled, unfilled| {
+            codec::encode(&protocol::ExchangeOrderNotification {
+                template_id: EXCHANGE_ORDER_NOTIFICATION,
+                notify_type: Some(notify as i32),
+                fcm_id: Some("FCM".to_string()),
+                ib_id: Some("IB".to_string()),
+                account_id: Some("ACCOUNT".to_string()),
+                basket_id: Some("basket-1".to_string()),
+                exchange: Some("CME".to_string()),
+                symbol: Some("NQU6".to_string()),
+                transaction_type: Some(
+                    protocol::exchange_order_notification::TransactionType::Buy as i32,
+                ),
+                quantity,
+                total_fill_size: filled,
+                total_unfilled_size: unfilled,
+                fill_size: Some(1),
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        let cumulative =
+            decode_order_event(&event(NotifyType::Fill, None, Some(2), Some(0)), &account())
+                .unwrap();
+        assert_eq!(cumulative.status, "filled");
+        assert_eq!(cumulative.quantity, Some(Decimal::from(2)));
+        assert_eq!(
+            cumulative.cumulative_filled_quantity,
+            Some(Decimal::from(2))
+        );
+        assert_eq!(cumulative.last_fill_quantity, Some(Decimal::ONE));
+        for (quantity, filled, unfilled, expected) in [
+            (None, Some(1), Some(0), "filled"),
+            (Some(2), Some(1), Some(1), "partially_filled"),
+            (Some(2), Some(2), Some(0), "filled"),
+        ] {
+            let decoded = decode_order_event(
+                &event(NotifyType::Fill, quantity, filled, unfilled),
+                &account(),
+            )
+            .unwrap();
+            assert_eq!(decoded.status, expected);
+            assert_eq!(decoded.quantity, Some(Decimal::from(quantity.unwrap_or(1))));
+        }
+        for (quantity, filled, unfilled) in [
+            (None, None, Some(0)),
+            (None, Some(1), None),
+            (None, None, None),
+            (None, Some(0), Some(0)),
+            (None, Some(-1), Some(0)),
+            (None, Some(1), Some(1)),
+            (None, Some(1), Some(-1)),
+            (Some(0), Some(1), Some(0)),
+            (Some(-1), Some(1), Some(0)),
+            (Some(2), Some(1), Some(0)),
+        ] {
+            assert!(decode_order_event(
+                &event(NotifyType::Fill, quantity, filled, unfilled),
+                &account()
+            )
+            .is_err());
+        }
+        for notify in [NotifyType::Status, NotifyType::Cancel, NotifyType::Reject] {
+            assert!(
+                decode_order_event(&event(notify, None, Some(1), Some(0)), &account()).is_err()
+            );
+        }
+    }
+
+    #[test]
     fn missing_status_uses_complete_fill_progress_when_quantity_is_present() {
         use protocol::exchange_order_notification::NotifyType;
         for (filled, expected) in [(1, "partially_filled"), (2, "filled")] {

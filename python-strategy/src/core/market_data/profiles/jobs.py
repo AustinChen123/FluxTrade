@@ -1,0 +1,554 @@
+"""Job-local PostgreSQL leases. Callers must omit secrets from error details/JSON."""
+
+import re
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, contextmanager
+from dataclasses import asdict, dataclass, replace
+from datetime import datetime, timedelta, timezone
+from typing import cast
+
+from sqlalchemy import Table, and_, func, or_, select, update
+from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.engine import RowMapping
+from sqlalchemy.orm import Session
+
+from src.core.product_registry import validate_product_id
+
+from .orm import VolumeProfileIngestJob, VolumeProfileSnapshot
+from .publication import CanonicalJsonObject, VerifiedProfilePublication
+from .repository import (
+    ProfileIntegrityError, PublishedProfile, TransactionWaitPolicy, _configure_write_transaction,
+    _logical, _publish_in_transaction, _result, _verify,
+)
+from .types import BIGINT_MAX, DAY_MS
+
+_JOB = cast(Table, VolumeProfileIngestJob.__table__)
+_SNAPSHOT = cast(Table, VolumeProfileSnapshot.__table__)
+
+
+class JobIntegrityError(ValueError):
+    """Malformed persisted job state; never a global trading lock."""
+
+
+class JobConflict(ValueError):
+    """The immutable specification differs for an existing job ID."""
+
+
+class JobCompletionError(ValueError):
+    """The snapshot cannot complete this job; no persistent mutation is accepted."""
+
+
+class LeaseLost(ValueError):
+    """The claim is stale, expired, or no longer running."""
+
+
+def _safe(value: str, limit: int = 64) -> None:
+    if type(value) is not str or not re.fullmatch(r"[A-Za-z0-9_-]{1," + str(limit) + "}", value):
+        raise ValueError("invalid job identifier")
+
+
+def _integer(value: int, minimum: int = 0) -> None:
+    if type(value) is not int or not minimum <= value <= BIGINT_MAX:
+        raise ValueError("invalid job integer")
+
+
+def _utc(value: object) -> datetime:
+    if type(value) is not datetime or value.tzinfo is None:
+        raise ValueError("invalid job timestamp")
+    try:
+        if value.utcoffset() is None:
+            raise ValueError
+        return value.astimezone(timezone.utc)
+    except Exception:
+        raise ValueError("invalid job timestamp") from None
+
+
+def _duration(value: timedelta, zero: bool = False) -> None:
+    # All lease/retry intervals are bounded to one day; no float conversion.
+    if type(value) is not timedelta or not timedelta(0) <= value <= timedelta(days=1) or (not zero and not value):
+        raise ValueError("invalid job duration")
+
+
+def _error(code: str, detail: str) -> None:
+    _safe(code)
+    if type(detail) is not str or len(detail) > 512 or any(ord(c) < 32 or ord(c) == 127 for c in detail):
+        raise ValueError("invalid job error detail")
+    try:
+        detail.encode("utf-8")
+    except UnicodeError:
+        raise ValueError("invalid job error detail") from None
+
+
+@dataclass(frozen=True, slots=True)
+class JobSpec:
+    id: str
+    product_id: str
+    window_start_ms: int
+    window_end_ms: int
+    grid_id: str
+    algorithm_version: str
+    config_sha256: str
+
+    def __post_init__(self) -> None:
+        _safe(self.id)
+        _safe(self.grid_id)
+        _safe(self.algorithm_version, 32)
+        if type(self.product_id) is not str or len(self.product_id) > 64:
+            raise ValueError("invalid job product")
+        validate_product_id(self.product_id)
+        _integer(self.window_start_ms)
+        _integer(self.window_end_ms)
+        if self.window_start_ms % DAY_MS or self.window_end_ms - self.window_start_ms != DAY_MS:
+            raise ValueError("invalid job daily window")
+        if type(self.config_sha256) is not str or not re.fullmatch(r"[0-9a-f]{64}", self.config_sha256):
+            raise ValueError("invalid job config digest")
+
+
+@dataclass(frozen=True, slots=True)
+class JobClaim:
+    spec: JobSpec
+    worker_id: str
+    attempt: int
+    lease_expires_at: datetime
+    source_cursor: CanonicalJsonObject
+    progress_manifest: CanonicalJsonObject
+
+    def __post_init__(self) -> None:
+        if type(self.spec) is not JobSpec or any(
+            type(v) is not CanonicalJsonObject for v in (self.source_cursor, self.progress_manifest)
+        ):
+            raise ValueError("invalid job claim values")
+        _safe(self.worker_id, 128)
+        _integer(self.attempt, 1)
+        object.__setattr__(self, "lease_expires_at", _utc(self.lease_expires_at))
+
+
+@dataclass(frozen=True, slots=True)
+class JobState:
+    spec: JobSpec
+    status: str
+    attempt: int
+    source_cursor: CanonicalJsonObject
+    progress_manifest: CanonicalJsonObject
+    lease_owner: str | None
+    lease_expires_at: datetime | None
+    retry_after_at: datetime | None
+    last_error_code: str | None
+    last_error_detail: str | None
+    completed_snapshot_id: str | None
+    created_at: datetime
+    updated_at: datetime
+
+    def __post_init__(self) -> None:
+        _integer(self.attempt)
+        if type(self.spec) is not JobSpec or any(
+            type(v) is not CanonicalJsonObject for v in (self.source_cursor, self.progress_manifest)
+        ):
+            raise ValueError("invalid job state values")
+        if type(self.status) is not str or self.status not in (
+            "RUNNING",
+            "RETRYABLE",
+            "FAILED",
+            "DONE",
+        ):
+            raise ValueError("invalid job status")
+        for key in ("created_at", "updated_at", "lease_expires_at", "retry_after_at"):
+            value = getattr(self, key)
+            if value is not None or key in ("created_at", "updated_at"):
+                object.__setattr__(self, key, _utc(value))
+        if self.status == "RUNNING":
+            self.claim()
+        elif self.lease_owner is not None or self.lease_expires_at is not None:
+            raise ValueError("invalid inactive lease")
+        if (self.last_error_code is None) != (self.last_error_detail is None):
+            raise ValueError("invalid job error pair")
+        if self.last_error_code is not None:
+            _error(self.last_error_code, cast(str, self.last_error_detail))
+        if self.status in ("RUNNING", "DONE") and self.last_error_code is not None:
+            raise ValueError("invalid active/completed job error")
+        if self.status == "FAILED" and self.last_error_code is None:
+            raise ValueError("missing failed job error")
+        if self.status != "RETRYABLE":
+            _integer(self.attempt, 1)
+        if self.retry_after_at is not None and self.status != "RETRYABLE":
+            raise ValueError("invalid retry state")
+        if self.status == "DONE":
+            if (
+                type(self.completed_snapshot_id) is not str
+                or not re.fullmatch(r"[0-9a-f]{64}", self.completed_snapshot_id)
+            ):
+                raise ValueError("invalid completed state")
+        elif self.completed_snapshot_id is not None:
+            raise ValueError("unexpected completed snapshot")
+
+    def claim(self) -> JobClaim:
+        if self.status != "RUNNING":
+            raise ValueError("job is not running")
+        return JobClaim(
+            self.spec,
+            cast(str, self.lease_owner),
+            self.attempt,
+            cast(datetime, self.lease_expires_at),
+            self.source_cursor,
+            self.progress_manifest,
+        )
+
+
+def _state(row: RowMapping) -> JobState:
+    try:
+        spec = JobSpec(**{key: row[key] for key in JobSpec.__dataclass_fields__})
+        values = {key: row[key] for key in JobState.__dataclass_fields__ if key != "spec"}
+        for key in ("source_cursor", "progress_manifest"):
+            values[key] = CanonicalJsonObject(values[key])
+        return JobState(spec, **values)
+    except (ValueError, TypeError, KeyError, OverflowError):
+        raise JobIntegrityError("job integrity check failed") from None
+
+
+@dataclass(frozen=True, slots=True)
+class JobPublicationResult:
+    profile: PublishedProfile
+    job: JobState
+    recovered_after_commit: bool
+
+    def __post_init__(self) -> None:
+        if type(self.profile) is not PublishedProfile or type(self.job) is not JobState or type(self.recovered_after_commit) is not bool:
+            raise ValueError("invalid job publication result")
+        if self.job.status != "DONE" or self.job.completed_snapshot_id != self.profile.snapshot_id:
+            raise ValueError("inconsistent job publication result")
+
+
+def _require_live_claim(state: JobState | None, claim: JobClaim, now: datetime) -> None:
+    if (state is None or state.status != "RUNNING" or state.spec != claim.spec
+            or state.lease_owner != claim.worker_id or state.attempt != claim.attempt
+            or cast(datetime, state.lease_expires_at) <= now):
+        raise LeaseLost("job lease lost")
+
+
+@dataclass(frozen=True, slots=True)
+class RawRetentionResult:
+    completion: JobPublicationResult
+    already_deleted: bool
+
+    def __post_init__(self) -> None:
+        if (type(self.completion) is not JobPublicationResult or type(self.already_deleted) is not bool
+                or self.completion.profile.publication.raw_retention_state != "DELETED"
+                or not self.completion.profile.already_present or not self.completion.recovered_after_commit):
+            raise ValueError("invalid raw retention result")
+
+
+class ProfileIngestJobStore:
+    def __init__(self, sessions: Callable[[], AbstractContextManager[Session]],
+                 policy: TransactionWaitPolicy = TransactionWaitPolicy()) -> None:
+        if type(policy) is not TransactionWaitPolicy:
+            raise ValueError("expected exact profile transaction wait policy")
+        self._sessions = sessions
+        self._policy = policy
+
+    @contextmanager
+    def _transaction(self, write: bool = True) -> Iterator[Session]:
+        with self._sessions() as session:
+            if session.get_bind().dialect.name != "postgresql" or session.in_transaction():
+                raise ValueError("job store requires fresh PostgreSQL transaction")
+            with session.begin():
+                if write:
+                    _configure_write_transaction(session, self._policy)
+                yield session
+
+    def register(self, spec: JobSpec) -> JobState:
+        if type(spec) is not JobSpec:
+            raise ValueError("expected exact job spec")
+        with self._transaction() as session:
+            session.execute(
+                insert(_JOB)
+                .values(
+                    **asdict(spec),
+                    status="RETRYABLE",
+                    attempt=0,
+                    source_cursor={},
+                    progress_manifest={},
+                )
+                .on_conflict_do_nothing(index_elements=[_JOB.c.id])
+            )
+            row = session.execute(select(_JOB).where(_JOB.c.id == spec.id)).mappings().one()
+            state = _state(row)
+            if state.spec != spec:
+                raise JobConflict("job specification conflict")
+            return state
+
+    def get(self, job_id: str) -> JobState | None:
+        _safe(job_id)
+        with self._transaction(False) as session:
+            row = session.execute(select(_JOB).where(_JOB.c.id == job_id)).mappings().one_or_none()
+            return None if row is None else _state(row)
+
+    def claim_next(self, worker_id: str, lease_duration: timedelta) -> JobClaim | None:
+        return self._claim(None, worker_id, lease_duration)
+
+    def claim(self, job_id: str, worker_id: str, lease_duration: timedelta) -> JobClaim | None:
+        """Claim only this due job; a locked or unavailable job returns None."""
+        _safe(job_id)
+        return self._claim(job_id, worker_id, lease_duration)
+
+    def _claim(self, job_id: str | None, worker_id: str, lease_duration: timedelta) -> JobClaim | None:
+        _safe(worker_id, 128)
+        _duration(lease_duration)
+        with self._transaction() as session:
+            due = or_(
+                and_(
+                    _JOB.c.status == "RETRYABLE",
+                    or_(
+                        _JOB.c.retry_after_at.is_(None),
+                        _JOB.c.retry_after_at <= func.clock_timestamp(),
+                    ),
+                ),
+                and_(
+                    _JOB.c.status == "RUNNING",
+                    _JOB.c.lease_expires_at <= func.clock_timestamp(),
+                ),
+            )
+            row = (
+                session.execute(
+                    select(_JOB)
+                    .where(due, *([] if job_id is None else [_JOB.c.id == job_id]))
+                    .order_by(_JOB.c.window_start_ms, _JOB.c.id)
+                    .limit(1)
+                    .with_for_update(skip_locked=True)
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if row is None:
+                return None
+            state = _state(row)
+            if state.attempt == BIGINT_MAX:
+                raise JobIntegrityError("job attempt exhausted")
+            now = _utc(session.scalar(select(func.clock_timestamp())))
+            row = (
+                session.execute(
+                    update(_JOB)
+                    .where(_JOB.c.id == state.spec.id)
+                    .values(
+                        status="RUNNING",
+                        attempt=state.attempt + 1,
+                        lease_owner=worker_id,
+                        lease_expires_at=now + lease_duration,
+                        retry_after_at=None,
+                        last_error_code=None,
+                        last_error_detail=None,
+                        updated_at=now,
+                    )
+                    .returning(*_JOB.c)
+                )
+                .mappings()
+                .one()
+            )
+            return _state(row).claim()
+
+    @contextmanager
+    def _fenced(self, claim: JobClaim) -> Iterator[tuple[Session, datetime]]:
+        if type(claim) is not JobClaim:
+            raise ValueError("expected exact job claim")
+        with self._transaction() as session:
+            row = (
+                session.execute(select(_JOB).where(_JOB.c.id == claim.spec.id).with_for_update())
+                .mappings()
+                .one_or_none()
+            )
+            now = _utc(session.scalar(select(func.clock_timestamp())))
+            state = None if row is None else _state(row)
+            _require_live_claim(state, claim, now)
+            yield session, now
+
+    def _save(self, session: Session, claim: JobClaim, now: datetime, **values: object) -> JobState:
+        fence = and_(
+            _JOB.c.id == claim.spec.id,
+            _JOB.c.status == "RUNNING",
+            _JOB.c.lease_owner == claim.worker_id,
+            _JOB.c.attempt == claim.attempt,
+            _JOB.c.lease_expires_at > func.clock_timestamp(),
+        )
+        row = (
+            session.execute(update(_JOB).where(fence).values(updated_at=now, **values).returning(*_JOB.c))
+            .mappings()
+            .one_or_none()
+        )
+        if row is None:
+            raise LeaseLost("job lease lost")
+        return _state(row)
+
+    def checkpoint(
+        self,
+        claim: JobClaim,
+        cursor: CanonicalJsonObject,
+        manifest: CanonicalJsonObject,
+        extend_duration: timedelta,
+    ) -> JobClaim:
+        if type(cursor) is not CanonicalJsonObject or type(manifest) is not CanonicalJsonObject:
+            raise ValueError("expected canonical checkpoint objects")
+        _duration(extend_duration)
+        with self._fenced(claim) as (session, now):
+            return self._save(
+                session,
+                claim,
+                now,
+                source_cursor=cursor.thaw(),
+                progress_manifest=manifest.thaw(),
+                lease_expires_at=now + extend_duration,
+            ).claim()
+
+    def retry(self, claim: JobClaim, delay: timedelta, error_code: str, detail: str) -> JobState:
+        _duration(delay, zero=True)
+        _error(error_code, detail)
+        with self._fenced(claim) as (session, now):
+            return self._save(
+                session,
+                claim,
+                now,
+                status="RETRYABLE",
+                lease_owner=None,
+                lease_expires_at=None,
+                retry_after_at=now + delay,
+                last_error_code=error_code,
+                last_error_detail=detail,
+            )
+
+    def fail(self, claim: JobClaim, error_code: str, detail: str) -> JobState:
+        _error(error_code, detail)
+        with self._fenced(claim) as (session, now):
+            return self._save(
+                session,
+                claim,
+                now,
+                status="FAILED",
+                lease_owner=None,
+                lease_expires_at=None,
+                last_error_code=error_code,
+                last_error_detail=detail,
+            )
+
+    def complete(self, claim: JobClaim, snapshot_id: str) -> JobState:
+        if type(snapshot_id) is not str or not re.fullmatch(r"[0-9a-f]{64}", snapshot_id):
+            raise ValueError("invalid completed snapshot ID")
+        with self._fenced(claim) as (session, now):
+            row = session.execute(select(_SNAPSHOT).where(_SNAPSHOT.c.id == snapshot_id)).mappings().one_or_none()
+            if row is None:
+                raise JobCompletionError("job completion verification failed")
+            try:
+                content = _verify(session, row).content
+            except ProfileIntegrityError:
+                raise JobCompletionError("job completion verification failed") from None
+            keys = ("product_id", "window_start_ms", "window_end_ms", "grid_id", "algorithm_version")
+            if any(getattr(content, key) != getattr(claim.spec, key) for key in keys):
+                raise JobCompletionError("job completion verification failed")
+            return self._save(session, claim, now, status="DONE", completed_snapshot_id=snapshot_id,
+                              lease_owner=None, lease_expires_at=None, retry_after_at=None,
+                              last_error_code=None, last_error_detail=None)
+
+    def publish_and_complete(self, claim: JobClaim, publication: VerifiedProfilePublication) -> JobPublicationResult:
+        if type(claim) is not JobClaim or type(publication) is not VerifiedProfilePublication:
+            raise ValueError("expected exact job claim and publication")
+        if any(value != getattr(claim.spec, key) for key, value in _logical(publication.content).items()):
+            raise JobCompletionError("job publication identity mismatch")
+        with self._transaction() as session:
+            row = session.execute(select(_JOB).where(_JOB.c.id == claim.spec.id).with_for_update()).mappings().one_or_none()
+            state = None if row is None else _state(row)
+            if state is not None and state.status == "DONE":
+                # DONE retains attempt/spec, not worker identity. Exact readback is mandatory.
+                if state.spec != claim.spec or state.attempt != claim.attempt:
+                    raise JobCompletionError("job publication recovery mismatch")
+                return self._recover_completed(session, state, claim.spec, publication)
+            now = _utc(session.scalar(select(func.clock_timestamp())))
+            _require_live_claim(state, claim, now)
+            profile = _publish_in_transaction(session, publication)
+            if profile.publication != publication:
+                raise JobCompletionError("job publication metadata mismatch")
+            done = self._save(session, claim, now, status="DONE", completed_snapshot_id=profile.snapshot_id,
+                              lease_owner=None, lease_expires_at=None, retry_after_at=None,
+                              last_error_code=None, last_error_detail=None)
+            return JobPublicationResult(profile, done, False)
+
+    def recover_completed(self, spec: JobSpec, publication: VerifiedProfilePublication) -> JobPublicationResult | None:
+        """Read committed completion evidence, without authorizing or mutating work."""
+        if type(spec) is not JobSpec or type(publication) is not VerifiedProfilePublication:
+            raise ValueError("expected exact job spec and publication")
+        with self._transaction(False) as session:
+            row = session.execute(select(_JOB).where(_JOB.c.id == spec.id)).mappings().one_or_none()
+            state = None if row is None else _state(row)
+            if state is None or state.status != "DONE":
+                return None
+            return self._recover_completed(session, state, spec, publication)
+
+    def recover_completed_snapshot(self, spec: JobSpec) -> JobPublicationResult | None:
+        """Read exact bound DONE evidence, including confirmed deleted raw retention."""
+        if type(spec) is not JobSpec:
+            raise ValueError("expected exact job spec")
+        with self._transaction(False) as session:
+            row = session.execute(select(_JOB).where(_JOB.c.id == spec.id)).mappings().one_or_none()
+            if row is None or row["status"] != "DONE":
+                return None
+            state = self._retention_state(row)
+            snapshot = session.execute(select(_SNAPSHOT).where(_SNAPSHOT.c.id == state.completed_snapshot_id)).mappings().one_or_none()
+            return self._bound_completion(session, state, spec, snapshot)
+
+    @staticmethod
+    def _retention_state(row: RowMapping) -> JobState:
+        try:
+            return _state(row)
+        except JobIntegrityError:
+            raise JobCompletionError("job retention verification failed") from None
+
+    @staticmethod
+    def _bound_completion(session: Session, state: JobState, spec: JobSpec,
+                          snapshot: RowMapping | None) -> JobPublicationResult:
+        from .handoff import _validate_publication_binding
+
+        if state.status != "DONE" or state.spec != spec or snapshot is None or snapshot["id"] != state.completed_snapshot_id:
+            raise JobCompletionError("job retention verification failed")
+        try:
+            publication = _verify(session, snapshot)
+            _validate_publication_binding(spec, publication, allow_deleted=True)
+        except (ProfileIntegrityError, ValueError):
+            raise JobCompletionError("job retention verification failed") from None
+        return JobPublicationResult(_result(snapshot, publication, True), state, True)
+
+    def mark_raw_deleted(self, spec: JobSpec, snapshot_id: str) -> RawRetentionResult:
+        """Call only after durable cleanup success; this transaction proves no filesystem fact."""
+        if type(spec) is not JobSpec or type(snapshot_id) is not str or not re.fullmatch(r"[0-9a-f]{64}", snapshot_id):
+            raise ValueError("expected exact job spec and snapshot ID")
+        with self._transaction() as session:
+            job = session.execute(select(_JOB).where(_JOB.c.id == spec.id).with_for_update()).mappings().one_or_none()
+            if job is None:
+                raise JobCompletionError("job retention verification failed")
+            state = self._retention_state(job)
+            if state.completed_snapshot_id != snapshot_id or state.status != "DONE" or state.spec != spec:
+                raise JobCompletionError("job retention verification failed")
+            snapshot = session.execute(select(_SNAPSHOT).where(_SNAPSHOT.c.id == snapshot_id).with_for_update()).mappings().one_or_none()
+            before = self._bound_completion(session, state, spec, snapshot)
+            if before.profile.publication.raw_retention_state == "DELETED":
+                return RawRetentionResult(before, True)
+            after = session.execute(update(_SNAPSHOT).where(
+                _SNAPSHOT.c.id == snapshot_id, _SNAPSHOT.c.quality == "VERIFIED",
+                _SNAPSHOT.c.raw_retention_state == "PRESENT",
+            ).values(raw_retention_state="DELETED").returning(_SNAPSHOT)).mappings().one_or_none()
+            result = self._bound_completion(session, state, spec, after)
+            expected = replace(before.profile.publication, raw_retention_state="DELETED")
+            current_job = session.execute(select(_JOB).where(_JOB.c.id == spec.id)).mappings().one_or_none()
+            if (dict(after or {}) != {**dict(snapshot or {}), "raw_retention_state": "DELETED"}
+                    or result.profile.publication != expected or current_job != job):
+                raise JobCompletionError("job retention verification failed")
+            return RawRetentionResult(result, False)
+
+    @staticmethod
+    def _recover_completed(session: Session, state: JobState, spec: JobSpec,
+                           publication: VerifiedProfilePublication) -> JobPublicationResult:
+        if state.spec != spec or any(value != getattr(spec, key) for key, value in _logical(publication.content).items()):
+            raise JobCompletionError("job publication recovery mismatch")
+        snapshot = session.execute(select(_SNAPSHOT).where(_SNAPSHOT.c.id == state.completed_snapshot_id)).mappings().one_or_none()
+        if snapshot is None:
+            raise JobCompletionError("job publication recovery mismatch")
+        try:
+            verified = _verify(session, snapshot, expected=publication)
+        except ProfileIntegrityError:
+            raise JobCompletionError("job publication recovery mismatch") from None
+        return JobPublicationResult(_result(snapshot, verified, True), state, True)

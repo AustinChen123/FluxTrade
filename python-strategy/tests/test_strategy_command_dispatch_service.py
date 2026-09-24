@@ -6,6 +6,43 @@ from src.core.command_router import CommandResult
 from src.core.strategy_command_dispatch_service import StrategyCommandDispatchService
 
 
+@pytest.mark.parametrize("command", ["START", "RESUME", "FORCE_RECOVER"])
+@pytest.mark.parametrize("completed", [True, False, 1])
+def test_completion_marker_requires_exact_completed(command, completed):
+    events = []
+    service, router, _, logger = _service(events)
+    router.handle.side_effect = None
+    router.handle.return_value = CommandResult(True, "accepted", completed=completed)
+    service.dispatch(
+        {"command": command, "params": {"id": "s", "idempotency_key": "key"}}
+    )
+    assert events.count("claim") == 1
+    assert events.count("complete") == int(completed is True)
+    router.handle.assert_called_once()
+    expected = "succeeded" if completed is True else "accepted, pending completion"
+    assert logger.info.call_args.args == (
+        f"Command %s {expected}: %s",
+        command,
+        "accepted",
+    )
+    logger.warning.assert_not_called()
+
+
+@pytest.mark.parametrize("error", [RuntimeError("failure"), KeyboardInterrupt()])
+def test_exception_never_marks_completed(error):
+    events = []
+    service, router, _, _ = _service(events)
+    router.handle.side_effect = error
+    message = {"command": "START", "params": {"id": "s", "idempotency_key": "key"}}
+    if isinstance(error, Exception):
+        service.dispatch(message)
+    else:
+        with pytest.raises(type(error)) as caught:
+            service.dispatch(message)
+        assert caught.value is error
+    assert events.count("claim") == 1 and "complete" not in events
+
+
 def _service(events: list[str]):
     logger = MagicMock()
     router = MagicMock()

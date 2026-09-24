@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 from src.core.models import OrderSide, PositionSide
+from src.core.market_data.profiles.decision_context import StrategyMarketDataContext
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,3 +109,11 @@ class StrategyContext:
     latest_rejections: tuple[RejectionSnapshot, ...] = ()
     risk: RiskSnapshot = RiskSnapshot()
     capital: CapitalSnapshot | None = None
+    market_data: StrategyMarketDataContext | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            self.market_data is not None
+            and type(self.market_data) is not StrategyMarketDataContext
+        ):
+            raise ValueError("invalid strategy market data context")

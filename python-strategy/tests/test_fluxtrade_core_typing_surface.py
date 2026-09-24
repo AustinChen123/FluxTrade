@@ -17,7 +17,90 @@ COMMON_EXPORTS = (
     "PyMatchingEngine",
     "ScaledCandlestick",
     "Trade",
+    "VolumeProfileMergeResult",
 )
+
+MERGE_PARAMETERS = (
+    "product_id",
+    "bin_origin",
+    "bin_step",
+    "unit",
+    "days",
+    "output_step",
+)
+
+
+def _annotation(node: ast.expr | None) -> str:
+    assert node is not None
+    return ast.unparse(node)
+
+
+def test_profile_merge_stub_contract() -> None:
+    tree = ast.parse(STUB_PATH.read_text())
+    functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
+    assert [node.name for node in functions] == ["merge_volume_profiles"]
+    function = functions[0]
+    assert tuple(arg.arg for arg in function.args.args) == MERGE_PARAMETERS
+    assert not function.args.defaults and not function.args.kwonlyargs
+    assert _annotation(function.returns) == "VolumeProfileMergeResult"
+    assert [_annotation(arg.annotation) for arg in function.args.args] == [
+        "str",
+        "str",
+        "str",
+        "str",
+        "list[_ProfileDay] | tuple[_ProfileDay, ...]",
+        "str",
+    ]
+    aliases = {
+        ast.unparse(node.targets[0]): ast.unparse(node.value)
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+    }
+    assert aliases == {
+        "_ProfileBin": "tuple[int, str, str, int]",
+        "_ProfileDay": "tuple[int, int, list[_ProfileBin] | tuple[_ProfileBin, ...]]",
+    }
+    result = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "VolumeProfileMergeResult"
+    )
+    assert [ast.unparse(item) for item in result.decorator_list] == ["final"]
+    expected = {
+        "product_id": "str",
+        "window_start_ms": "int",
+        "window_end_ms": "int",
+        "bin_origin": "str",
+        "bin_step": "str",
+        "unit": "str",
+        "bins": "list[tuple[int, str, str, int]]",
+        "base_volume": "str",
+        "quote_volume": "str",
+        "aggregate_count": "int",
+        "poc_index": "int | None",
+        "poc_low": "str | None",
+        "poc_high_exclusive": "str | None",
+    }
+    constructor = result.body[0]
+    assert isinstance(constructor, ast.FunctionDef)
+    assert constructor.name == "__init__" and not constructor.decorator_list
+    assert [arg.arg for arg in constructor.args.args] == ["self", "_not_constructible"]
+    assert _annotation(constructor.args.args[1].annotation) == "Never"
+    assert _annotation(constructor.returns) == "None"
+    assert not constructor.args.defaults and not constructor.args.kwonlyargs
+    assert len(result.body) == len(expected) + 1
+    for member in result.body[1:]:
+        assert isinstance(member, ast.FunctionDef)
+        assert [ast.unparse(item) for item in member.decorator_list] == ["property"]
+        assert [arg.arg for arg in member.args.args] == ["self"]
+        assert _annotation(member.returns) == expected.pop(member.name)
+    assert not expected
+
+
+def test_profile_merge_runtime_signature() -> None:
+    function = fluxtrade_core.merge_volume_profiles
+    assert function.__name__ == "merge_volume_profiles"
+    assert tuple(inspect.signature(function).parameters) == MERGE_PARAMETERS
 
 
 def test_common_typing_surface_is_explicit_and_feature_independent() -> None:

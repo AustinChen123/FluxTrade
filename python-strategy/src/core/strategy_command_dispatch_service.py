@@ -5,6 +5,9 @@ from typing import Callable, Protocol
 
 class _CommandResult(Protocol):
     @property
+    def completed(self) -> bool: ...
+
+    @property
     def success(self) -> bool: ...
 
     @property
@@ -124,13 +127,24 @@ class StrategyCommandDispatchService:
                     )
                     return
             result = self._command_router().handle(data)
-            if cmd in _STATE_COMMANDS and isinstance(idempotency_key, str):
+            if (
+                cmd in _STATE_COMMANDS
+                and isinstance(idempotency_key, str)
+                and result.completed is True
+            ):
                 self._mark_strategy_command_operation_completed(
                     actor=actor,
                     idempotency_key=idempotency_key,
                 )
             if result.success:
-                event_logger.info("Command %s succeeded: %s", cmd, result.message)
+                if result.completed is True:
+                    event_logger.info("Command %s succeeded: %s", cmd, result.message)
+                else:
+                    event_logger.info(
+                        "Command %s accepted, pending completion: %s",
+                        cmd,
+                        result.message,
+                    )
             else:
                 event_logger.warning("Command %s failed: %s", cmd, result.message)
         except Exception as error:

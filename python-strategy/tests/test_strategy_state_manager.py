@@ -7,6 +7,9 @@ import threading
 import time
 from contextlib import nullcontext
 from unittest.mock import MagicMock
+from dataclasses import FrozenInstanceError
+from datetime import UTC, datetime
+from typing import Any, cast
 
 import pytest
 from sqlalchemy import create_engine, select, text
@@ -19,6 +22,8 @@ from src.core.strategy_state_manager import (
     STATE_CHANGE_CHANNEL,
     StaleStrategyStateVersion,
     StrategyStateManager,
+    StrategyStateEvidenceError,
+    StrategyStateTransactionValidationError,
 )
 
 
@@ -38,9 +43,24 @@ class _FakeQuery:
         return self
 
     def filter(self, *criteria):
+        if self._model == "scalars":
+            self._strategy_id = criteria[0].right.value
+        return self
+
+    def with_for_update(self):
+        self._db.lock_count += 1
         return self
 
     def first(self):
+        if self._model == "scalars":
+            state = self._db.states.get(self._strategy_id)
+            return (
+                None
+                if state is None
+                else type(
+                    "ScalarRow", (), {"status": state.status, "version": state.version}
+                )()
+            )
         if self._model is StrategyState:
             return self._db.states.get(self._strategy_id)
         return None
@@ -64,13 +84,24 @@ class _FakeSession(Session):
         self.commit_count = 0
         self.rollback_count = 0
         self.force_stale_update = False
+        self.lock_count = 0
+        self.flush_count = 0
         object.__setattr__(self, "query", self._fake_query)
         object.__setattr__(self, "add", self._fake_add)
         object.__setattr__(self, "commit", self._fake_commit)
         object.__setattr__(self, "rollback", self._fake_rollback)
+        object.__setattr__(self, "flush", self._fake_flush)
+        object.__setattr__(self, "execute", self._fake_execute)
 
-    def _fake_query(self, model):
-        return _FakeQuery(model, self)
+    def _fake_query(self, *models):
+        return _FakeQuery(models[0] if len(models) == 1 else "scalars", self)
+
+    def _fake_flush(self):
+        self.flush_count += 1
+
+    def _fake_execute(self, statement):
+        assert statement.table.name == "strategy_state_transitions"
+        self.transitions.append(StrategyStateTransition(**statement.compile().params))
 
     def _fake_add(self, row):
         if isinstance(row, StrategyStateTransition):
@@ -92,6 +123,362 @@ def _manager(db: _FakeSession, redis_client=None) -> StrategyStateManager:
         db_session_factory=lambda: nullcontext(db),
         redis_client=redis_client or MagicMock(),
     )
+
+
+def test_same_status_uses_single_core_then_commit_cache_publish(monkeypatch):
+    db = _FakeSession([_state("s1", StrategyStatus.ACTIVE)])
+    manager = _manager(db)
+    events = []
+    original = manager._write_transition
+    core = MagicMock(wraps=original)
+    monkeypatch.setattr(manager, "_write_transition", core)
+    monkeypatch.setattr(db, "commit", lambda: events.append("commit"))
+    monkeypatch.setattr(
+        manager, "_apply_cached_state", lambda *args: events.append("cache")
+    )
+    monkeypatch.setattr(
+        manager, "_publish_state_change", lambda *args: events.append("publish")
+    )
+    manager.transition_to_running("s1")
+    core.assert_called_once()
+    assert events == ["commit", "cache", "publish"]
+    assert db.lock_count == len(db.transitions) == 1 and db.flush_count == 0
+    assert db.states["s1"].version == 1
+    from_status = cast(str, db.transitions[0].from_status)
+    to_status = cast(str, db.transitions[0].to_status)
+    assert from_status == "ACTIVE"
+    assert to_status == "ACTIVE"
+
+
+@pytest.mark.parametrize("error", [RuntimeError("commit"), BaseException("commit")])
+def test_commit_error_never_runs_postcommit(monkeypatch, error):
+    db = _FakeSession([_state("s1", StrategyStatus.READY)])
+    manager = _manager(db)
+    post = MagicMock()
+    monkeypatch.setattr(manager, "_after_committed_transition", post)
+    monkeypatch.setattr(db, "commit", MagicMock(side_effect=error))
+    with pytest.raises(type(error)) as caught:
+        manager.transition_to_running("s1")
+    assert caught.value is error
+    post.assert_not_called()
+    assert len(db.transitions) == 1 and manager.get_status("s1") is None
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("version", None),
+        ("version", True),
+        ("version", -1),
+        ("version", 2**31 - 1),
+        ("status", "SECRET"),
+        ("status", None),
+    ],
+)
+def test_corrupt_transition_evidence_rejected_before_writes(field, value):
+    db = _FakeSession([_state("s1", StrategyStatus.READY)])
+    setattr(db.states["s1"], field, value)
+    with pytest.raises(
+        StrategyStateEvidenceError, match="^STRATEGY_STATE_EVIDENCE_INVALID$"
+    ):
+        _manager(db).transition_to_running("s1")
+    assert db.transitions == [] and db.flush_count == db.commit_count == 0
+
+
+def test_core_result_is_transaction_local_and_immutable():
+    db = _FakeSession([_state("s1", StrategyStatus.READY)])
+    manager = _manager(db)
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    result = manager._write_transition(
+        db, "s1", StrategyStatus.ACTIVE, actor="system", reason=None, changed_at=now
+    )
+    assert (
+        result.strategy_id,
+        result.from_status,
+        result.to_status,
+        result.version,
+        result.changed_at,
+    ) == ("s1", StrategyStatus.READY, StrategyStatus.ACTIVE, 1, now)
+    assert (
+        len(db.transitions) == 1
+        and db.flush_count == db.commit_count == db.rollback_count == 0
+    )
+    assert manager.get_status("s1") is None
+    manager._redis_client.publish.assert_not_called()
+    with pytest.raises(FrozenInstanceError):
+        setattr(result, "version", 2)
+    assert not hasattr(result, "__dict__")
+
+
+def test_public_postcommit_seam_preserves_cache_then_publish(monkeypatch):
+    from src.core.strategy_state_manager import StrategyStateTransitionResult
+
+    manager = _manager(_FakeSession([]))
+    result = StrategyStateTransitionResult(
+        "s1",
+        StrategyStatus.READY,
+        StrategyStatus.STOPPED,
+        1,
+        datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    events = []
+    monkeypatch.setattr(
+        manager, "_apply_cached_state", lambda *args: events.append("cache")
+    )
+    monkeypatch.setattr(
+        manager, "_publish_state_change", lambda *args: events.append("publish")
+    )
+    manager.after_committed_transition(result)
+    assert events == ["cache", "publish"]
+    with pytest.raises(StrategyStateTransactionValidationError):
+        manager.after_committed_transition(cast(Any, None))
+
+
+@pytest.mark.parametrize("error", [RuntimeError("audit"), BaseException("audit")])
+def test_audit_failure_never_commits_or_publishes(monkeypatch, error):
+    db = _FakeSession([_state("s1", StrategyStatus.READY)])
+    manager = _manager(db)
+    query = MagicMock(wraps=db.query)
+    monkeypatch.setattr(db, "query", query)
+    monkeypatch.setattr(db, "execute", MagicMock(side_effect=error))
+    with pytest.raises(type(error)) as caught:
+        manager.transition_to_running("s1")
+    assert caught.value is error and db.commit_count == 0
+    assert query.call_args_list[0].args == (StrategyState.status, StrategyState.version)
+    assert db.lock_count == 1 and manager.get_status("s1") is None
+    manager._redis_client.publish.assert_not_called()
+
+
+def transaction_args() -> dict[str, Any]:
+    return dict(
+        actor="system", reason=None, changed_at=datetime(2026, 1, 1, tzinfo=UTC)
+    )
+
+
+def active_pg_session():
+    db = MagicMock(spec=Session)
+    db.is_active = True
+    db.in_transaction.return_value = True
+    db.get_bind.return_value.dialect.name = "postgresql"
+    return db
+
+
+def test_public_state_lock_fresh_scalar_max_version(monkeypatch):
+    db = _FakeSession([_state("s1", StrategyStatus.READY)])
+    db.states["s1"].version = 2**31 - 1
+    monkeypatch.setattr(db, "in_transaction", lambda: True)
+    monkeypatch.setattr(db, "get_bind", lambda: active_pg_session().get_bind())
+    manager = _manager(db)
+    result = manager.lock_state_in_transaction(db, "s1")
+    assert result.status is StrategyStatus.READY and result.version == 2**31 - 1
+    assert db.lock_count == 1 and not db.transitions and db.commit_count == 0
+    with pytest.raises(FrozenInstanceError):
+        setattr(result, "version", 0)
+    with pytest.raises(StrategyStateEvidenceError):
+        manager._write_transition(db, "s1", StrategyStatus.ACTIVE, **transaction_args())
+    assert not db.transitions and manager.get_status("s1") is None
+
+
+@pytest.mark.parametrize("guard", ["type", "inactive", "transaction", "dialect", "id"])
+def test_state_lock_guard_zero_query(guard):
+    db = active_pg_session()
+    if guard == "inactive":
+        db.is_active = False
+    if guard == "transaction":
+        db.in_transaction.return_value = False
+    if guard == "dialect":
+        db.get_bind.return_value.dialect.name = "sqlite"
+    with pytest.raises(StrategyStateTransactionValidationError):
+        _manager(db).lock_state_in_transaction(
+            cast(Session, object()) if guard == "type" else db,
+            cast(str, None) if guard == "id" else "s1",
+        )
+    db.query.assert_not_called()
+
+
+@pytest.mark.parametrize("error", [RuntimeError("SQL"), BaseException("SQL")])
+def test_state_lock_error_identity(error):
+    db = active_pg_session()
+    db.query.side_effect = error
+    with pytest.raises(type(error)) as caught:
+        _manager(db).lock_state_in_transaction(db, "s1")
+    assert caught.value is error
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"to_status": "ACTIVE"},
+        {"force": 1},
+        {"changed_at": None},
+        {"changed_at": datetime(2026, 1, 1)},
+        {"expected_version": True},
+        {"expected_version": -1},
+        {"expected_version": 2**31},
+    ],
+)
+def test_public_transaction_invalid_args_zero_core(monkeypatch, changes):
+    db = active_pg_session()
+    manager = _manager(db)
+    core = MagicMock()
+    monkeypatch.setattr(manager, "_write_transition", core)
+    args = transaction_args() | {"to_status": StrategyStatus.ACTIVE} | changes
+    with pytest.raises(StrategyStateTransactionValidationError):
+        manager.transition_in_transaction(db, "s1", **args)
+    core.assert_not_called()
+    db.execute.assert_not_called()
+
+
+@pytest.mark.parametrize("guard", ["type", "inactive", "transaction", "dialect"])
+def test_public_transaction_session_guards(monkeypatch, guard):
+    db = MagicMock(spec=Session)
+    db.is_active = guard != "inactive"
+    db.in_transaction.return_value = guard != "transaction"
+    db.get_bind.return_value.dialect.name = (
+        "sqlite" if guard == "dialect" else "postgresql"
+    )
+    manager = _manager(db)
+    core = MagicMock()
+    monkeypatch.setattr(manager, "_write_transition", core)
+    with pytest.raises(StrategyStateTransactionValidationError):
+        manager.transition_in_transaction(
+            cast(Session, object()) if guard == "type" else db,
+            "s1",
+            StrategyStatus.ACTIVE,
+            **transaction_args(),
+        )
+    core.assert_not_called()
+    db.execute.assert_not_called()
+
+
+@pytest.mark.parametrize("error", [None, RuntimeError("SQL"), BaseException("SQL")])
+def test_public_transaction_delegates_once_no_lifecycle(monkeypatch, error):
+    db = MagicMock(spec=Session)
+    db.is_active = True
+    db.in_transaction.return_value = True
+    db.get_bind.return_value.dialect.name = "postgresql"
+    manager = _manager(db)
+    core = MagicMock(side_effect=error)
+    monkeypatch.setattr(manager, "_write_transition", core)
+    if error is None:
+        assert (
+            manager.transition_in_transaction(
+                db, "s1", StrategyStatus.ACTIVE, **transaction_args()
+            )
+            is core.return_value
+        )
+    else:
+        with pytest.raises(type(error)) as caught:
+            manager.transition_in_transaction(
+                db, "s1", StrategyStatus.ACTIVE, **transaction_args()
+            )
+        assert caught.value is error
+    core.assert_called_once_with(
+        db,
+        "s1",
+        StrategyStatus.ACTIVE,
+        **transaction_args(),
+        force=False,
+        expected_version=None,
+    )
+    for name in ("begin", "commit", "rollback", "flush", "add", "execute"):
+        getattr(db, name).assert_not_called()
+    assert manager.get_status("s1") is None
+    manager._redis_client.publish.assert_not_called()
+
+
+def test_core_does_not_flush_caller_pending_objects():
+    engine = create_engine("sqlite://")
+    StrategyState.__table__.create(engine)
+    StrategyStateTransition.__table__.create(engine)
+    with Session(engine) as db:
+        db.add_all(
+            [_state(name, StrategyStatus.READY) for name in ("s1", "dirty", "deleted")]
+        )
+        db.commit()
+        dirty = db.get(StrategyState, "dirty")
+        deleted = db.get(StrategyState, "deleted")
+        assert dirty is not None and deleted is not None
+        dirty.status = StrategyStatus.ERROR.value
+        fresh = _state("new", StrategyStatus.READY)
+        db.add(fresh)
+        db.delete(deleted)
+        pending = (set(db.new), set(db.dirty), set(db.deleted))
+        manager = StrategyStateManager(lambda: nullcontext(db), MagicMock())
+        result = manager._write_transition(
+            db, "s1", StrategyStatus.ACTIVE, **transaction_args()
+        )
+        assert result.version == 1 and pending == (
+            set(db.new),
+            set(db.dirty),
+            set(db.deleted),
+        )
+        with db.no_autoflush:
+            assert (
+                db.execute(
+                    text("SELECT status FROM strategy_state WHERE strategy_id='dirty'")
+                ).scalar_one()
+                == "READY"
+            )
+            assert (
+                db.execute(
+                    text("SELECT count(*) FROM strategy_state WHERE strategy_id='new'")
+                ).scalar_one()
+                == 0
+            )
+            assert (
+                db.execute(
+                    text(
+                        "SELECT count(*) FROM strategy_state WHERE strategy_id='deleted'"
+                    )
+                ).scalar_one()
+                == 1
+            )
+            assert (
+                db.execute(
+                    text("SELECT count(*) FROM strategy_state_transitions")
+                ).scalar_one()
+                == 1
+            )
+        db.rollback()
+    engine.dispose()
+
+
+def test_public_transaction_exact_clock_and_version_types(monkeypatch):
+    class Stamp(datetime):
+        pass
+
+    class Version(int):
+        pass
+
+    db = active_pg_session()
+    manager = _manager(db)
+    core = MagicMock()
+    monkeypatch.setattr(manager, "_write_transition", core)
+    for change in (
+        {"changed_at": Stamp(2026, 1, 1, tzinfo=UTC)},
+        {"expected_version": Version(0)},
+    ):
+        with pytest.raises(StrategyStateTransactionValidationError):
+            manager.transition_in_transaction(
+                db, "s1", StrategyStatus.ACTIVE, **(transaction_args() | change)
+            )
+    core.assert_not_called()
+    db.execute.assert_not_called()
+
+
+@pytest.mark.parametrize("version", [0, 2**31 - 1])
+def test_public_transaction_valid_domain_control(monkeypatch, version):
+    db = active_pg_session()
+    manager = _manager(db)
+    core = MagicMock()
+    monkeypatch.setattr(manager, "_write_transition", core)
+    args = transaction_args() | {"force": True, "expected_version": version}
+    assert (
+        manager.transition_in_transaction(db, "s1", StrategyStatus.ACTIVE, **args)
+        is core.return_value
+    )
+    core.assert_called_once_with(db, "s1", StrategyStatus.ACTIVE, **args)
 
 
 def test_initialize_cache_from_db_loads_statuses() -> None:

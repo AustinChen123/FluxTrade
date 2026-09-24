@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Optional
 
 from src.core.health_monitor import HealthMonitor
@@ -12,11 +13,17 @@ from src.core.strategy_registry import StrategyRegistry
 logger = logging.getLogger(__name__)
 
 
+class StrategyStartDisposition(Enum):
+    ACTIVE = "ACTIVE"
+    WAITING_FOR_CUTOVER = "WAITING_FOR_CUTOVER"
+
+
 @dataclass(frozen=True)
 class CommandResult:
     success: bool
     message: str
     data: Optional[dict] = None
+    completed: bool = True
 
 
 class CommandRouter:
@@ -72,7 +79,9 @@ class CommandRouter:
                 or not isinstance(expected_version, int)
                 or expected_version < 0
             ):
-                return CommandResult(False, "expected_version must be a non-negative integer")
+                return CommandResult(
+                    False, "expected_version must be a non-negative integer"
+                )
             return handler(str(strategy_id), params, message)
         return handler()
 
@@ -80,23 +89,35 @@ class CommandRouter:
     def _expected_version_kwargs(params: dict) -> dict:
         expected_version = params.get("expected_version")
         return (
-            {}
-            if expected_version is None
-            else {"expected_version": expected_version}
+            {} if expected_version is None else {"expected_version": expected_version}
         )
 
-    def _handle_start(self, strategy_id: str, params: dict, message: dict) -> CommandResult:
+    @staticmethod
+    def _activation_kwargs(params: dict, command: str) -> dict:
+        key = params.get("idempotency_key")
+        return (
+            {"activation_command": command, "idempotency_key": key}
+            if type(key) is str
+            else {}
+        )
+
+    def _handle_start(
+        self, strategy_id: str, params: dict, message: dict
+    ) -> CommandResult:
         actor = params.get("actor", "operator")
         reason = params.get("reason") or message.get("reason")
-        self.state_manager.transition_to_running(
+        disposition = self.state_manager.transition_to_running(
             strategy_id,
             actor=actor,
             reason=reason,
             **self._expected_version_kwargs(params),
+            **self._activation_kwargs(params, "START"),
         )
-        return CommandResult(True, f"Started strategy {strategy_id}")
+        return self._start_result(disposition, strategy_id, "Started")
 
-    def _handle_stop(self, strategy_id: str, params: dict, message: dict) -> CommandResult:
+    def _handle_stop(
+        self, strategy_id: str, params: dict, message: dict
+    ) -> CommandResult:
         actor = params.get("actor", "operator")
         reason = params.get("reason") or message.get("reason")
         self.state_manager.transition_to_stopped(
@@ -107,31 +128,53 @@ class CommandRouter:
         )
         return CommandResult(True, f"Stopped strategy {strategy_id}")
 
-    def _handle_resume(self, strategy_id: str, params: dict, message: dict) -> CommandResult:
+    def _handle_resume(
+        self, strategy_id: str, params: dict, message: dict
+    ) -> CommandResult:
         actor = params.get("actor", "operator")
         reason = params.get("reason") or message.get("reason")
-        self.state_manager.transition_to_running(
+        disposition = self.state_manager.transition_to_running(
             strategy_id,
             actor=actor,
             force=True,
             reason=reason,
             **self._expected_version_kwargs(params),
+            **self._activation_kwargs(params, "RESUME"),
         )
-        return CommandResult(True, f"Resumed strategy {strategy_id}")
+        return self._start_result(disposition, strategy_id, "Resumed")
 
-    def _handle_force_recover(self, strategy_id: str, params: dict, message: dict) -> CommandResult:
+    def _handle_force_recover(
+        self, strategy_id: str, params: dict, message: dict
+    ) -> CommandResult:
         actor = params.get("actor", "operator")
         reason = params.get("reason") or message.get("reason")
-        self.state_manager.transition_to_running(
+        disposition = self.state_manager.transition_to_running(
             strategy_id,
             actor=actor,
             force=True,
             reason=reason,
             **self._expected_version_kwargs(params),
+            **self._activation_kwargs(params, "FORCE_RECOVER"),
         )
-        return CommandResult(True, f"Force recovered strategy {strategy_id}")
+        return self._start_result(disposition, strategy_id, "Force recovered")
 
-    def _handle_reload(self, strategy_id: str, params: dict, message: dict) -> CommandResult:
+    @staticmethod
+    def _start_result(
+        disposition: object, strategy_id: str, verb: str
+    ) -> CommandResult:
+        if disposition is None or disposition is StrategyStartDisposition.ACTIVE:
+            return CommandResult(True, f"{verb} strategy {strategy_id}")
+        if disposition is StrategyStartDisposition.WAITING_FOR_CUTOVER:
+            return CommandResult(
+                True,
+                f"Accepted strategy {strategy_id}; waiting for cutover",
+                completed=False,
+            )
+        raise ValueError("invalid strategy start disposition")
+
+    def _handle_reload(
+        self, strategy_id: str, params: dict, message: dict
+    ) -> CommandResult:
         logger.warning("Strategy reload is not implemented yet: %s", strategy_id)
         return CommandResult(
             False,
@@ -147,7 +190,9 @@ class CommandRouter:
             }
             for strategy in self.registry.list_active()
         ]
-        return CommandResult(True, "Listed active strategies", {"strategies": strategies})
+        return CommandResult(
+            True, "Listed active strategies", {"strategies": strategies}
+        )
 
     def _handle_health_check(self) -> CommandResult:
         if self.health_monitor is None:

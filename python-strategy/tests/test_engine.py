@@ -12,6 +12,7 @@ Covers:
 """
 
 from contextlib import nullcontext
+from dataclasses import replace
 from decimal import Decimal
 import inspect
 import json
@@ -178,6 +179,49 @@ def test_engine_runtime_artifact_maps_are_owned_by_one_registry(engine) -> None:
     assert engine.portfolio_instances is engine._runtime_artifacts.portfolio_instances
 
 
+@pytest.mark.parametrize(
+    "command,pending_version,allowed",
+    [
+        ("STOP", 0, True),
+        ("STOP", 1, False),
+        ("STOP", None, False),
+        ("RESUME", 0, False),
+    ],
+)
+def test_pending_profile_stop_command_gate(
+    engine_factory, command, pending_version, allowed
+):
+    from test_profile_activation_request import request
+
+    store = MagicMock()
+    engine = engine_factory(profile_request_store=store)
+    engine.runtime_environment = MagicMock(identity="live")
+    db = MagicMock()
+    db.query.return_value.filter.return_value.first.return_value = MagicMock(
+        status="READY", version=0
+    )
+    engine._db_session_factory = lambda: nullcontext(db)
+    pending = MagicMock(request=request())
+    if pending_version is not None:
+        pending.request = replace(
+            pending.request,
+            intent=replace(
+                pending.request.intent, expected_state_version=pending_version
+            ),
+        )
+    store.get_pending.return_value = None if pending_version is None else pending
+    if allowed:
+        engine._assert_strategy_command_allowed(
+            strategy_id="strategy", command=command, expected_version=0
+        )
+    else:
+        with pytest.raises(InvalidStrategyStateTransition):
+            engine._assert_strategy_command_allowed(
+                strategy_id="strategy", command=command, expected_version=0
+            )
+    assert store.get_pending.call_count == (1 if command == "STOP" else 0)
+
+
 def test_engine_command_listener_delegates_current_runtime_seams(engine) -> None:
     returned_thread = MagicMock()
 
@@ -224,6 +268,118 @@ def engine(engine_factory):
 def strategy_instance(mock_strategy_class):
     """A concrete strategy instance."""
     return mock_strategy_class("test_strat", "BINANCE:BTCUSDT-PERP")
+
+
+@pytest.mark.parametrize("fail", [False, True])
+@pytest.mark.parametrize("replay", [False, True])
+def test_cutover_hook_fenced_before_execution(engine, fail, replay):
+    from contextlib import contextmanager
+
+    events = []
+
+    @contextmanager
+    def lock(name):
+        events.append(name)
+        yield
+
+    engine._runtime_registration_lock = lock("registration")
+    engine._market_processing_lock = lock("market")
+    engine._live_candle_application.application_fence = lambda _: lock("application")
+    engine._live_candle_application.apply = lambda candle, **kwargs: kwargs[
+        "apply_new"
+    ](candle)
+
+    def pending(candle, *, apply_new):
+        with engine._live_candle_application.application_fence(candle):
+            apply_new(candle)
+
+    engine._pending_market_replay.replay = pending
+    entry = engine.replay_pending_market_data if replay else engine.on_market_data
+    error = RuntimeError("cutover failed")
+
+    def cutover(candle):
+        events.append("cutover")
+        if fail:
+            raise error
+
+    engine._strategy_activation.cutover_pending_candle = cutover
+    engine.execution_engine.process_market_data = (
+        lambda _: events.append("execution") or []
+    )
+    engine._signal_processor.on_candle = lambda *args, **kwargs: events.append(
+        "callback"
+    )
+    if fail:
+        with pytest.raises(RuntimeError) as caught:
+            entry(_make_candle())
+        assert caught.value is error
+    else:
+        entry(_make_candle())
+    assert events == ["registration", "market", "application", "cutover"] + (
+        [] if fail else ["execution", "callback"]
+    )
+
+
+def test_engine_cutover_capabilities_forwarded(engine_factory):
+    reader, factory = MagicMock(), MagicMock()
+    engine = engine_factory(
+        bootstrap_hydration_reader=reader, profile_seed_factory=factory
+    )
+    activation = engine._strategy_activation
+    assert activation._bootstrap_reader is reader
+    assert activation._profile_seed_factory is factory
+    assert activation._state_manager is engine._strategy_state_manager
+    assert activation._artifact_resolver == engine._get_loaded_strategy_class
+    assert (
+        activation._cutover_unregister_locked
+        == engine._runtime_artifacts.unregister_locked
+    )
+
+
+def test_profile_warmup_ready_preserves_other_gates(
+    engine_factory, mock_strategy_class
+):
+    from test_profile_activation_request import request
+
+    engine = engine_factory()
+    engine.runtime_environment = RuntimeEnvironment("live")
+    strategy = mock_strategy_class("strategy", request().intent.key.product_id)
+    strategy_type = type(strategy)
+    requirements = request().intent.requirements
+
+    class ProfileStrategy(strategy_type):
+        __fluxtrade_readiness__ = "LIVE_APPROVED"
+
+        @property
+        def requirements(self):
+            return requirements
+
+    instance = ProfileStrategy(strategy.strategy_id, strategy.product_id)
+    engine._available_strategy_context_capabilities = (
+        requirements.required_context_capabilities
+    )
+    for loader, owner in ((False, None), (True, None), (False, MagicMock())):
+        engine._strategy_context_loader_enabled = loader
+        engine._market_data_decision_owner = owner
+        with pytest.raises(RuntimeError, match="profile_execution_capability_missing"):
+            engine._assert_strategy_context_capabilities(
+                (instance,), profile_warmup_ready=True
+            )
+    engine._strategy_context_loader_enabled = True
+    engine._market_data_decision_owner = MagicMock()
+    engine._assert_strategy_context_capabilities((instance,), profile_warmup_ready=True)
+    for not_ready in (False, 1, "ready"):
+        with pytest.raises(RuntimeError, match="requires_modeled_warmup"):
+            engine._assert_strategy_context_capabilities(
+                (instance,), profile_warmup_ready=not_ready
+            )
+    with pytest.raises(RuntimeError, match="requires_modeled_warmup"):
+        engine.add_strategy(instance)
+    engine._available_strategy_context_capabilities = frozenset()
+    with pytest.raises(RuntimeError, match="ENTRY_RISK"):
+        engine._assert_strategy_context_capabilities(
+            (instance,), profile_warmup_ready=True
+        )
 
 
 def _make_candle(
@@ -2470,6 +2626,20 @@ class TestAddStrategy:
 
 
 class TestBuildStreamChannels:
+    def test_active_and_durable_pending_union(self, engine, strategy_instance):
+        engine._registry.register(strategy_instance)
+        pending = engine._strategy_activation.persistent_pending_channels = MagicMock(
+            return_value=(
+                "stream:market:binance:btcusdt:5m",
+                "stream:market:binance:btcusdt:1m",
+            )
+        )
+        assert engine.build_stream_channels() == [
+            "stream:market:binance:btcusdt:1m",
+            "stream:market:binance:btcusdt:5m",
+        ]
+        pending.assert_called_once_with()
+
     def test_empty_when_no_strategies(self, engine):
         """Should return empty list when no strategies registered."""
         assert engine.build_stream_channels() == []
@@ -3425,7 +3595,7 @@ class TestHandleCommand:
             return True
 
         engine.redis_client.set.side_effect = claim_once
-        engine.activate_strategy = MagicMock()
+        engine.activate_strategy = MagicMock(return_value=True)
         mock_state = MagicMock(status="ERROR", version=3)
         mock_db = MagicMock()
         mock_db.query.return_value.filter.return_value.first.return_value = mock_state
@@ -3449,6 +3619,8 @@ class TestHandleCommand:
             force=True,
             reason=None,
             expected_version=3,
+            activation_command="FORCE_RECOVER",
+            idempotency_key="strategy-recover-1",
         )
         first_set = engine.redis_client.set.call_args_list[0]
         assert first_set.args[1] == "claimed"
@@ -4556,7 +4728,7 @@ class TestHeartbeatRecording:
 
         assert entry._in_position is False
         assert entry.restore_calls == 1
-        engine._live_candle_application._persist.assert_called_once_with(candle)
+        engine._live_candle_application._persist.assert_called_once_with(candle, None)
         engine.execution_engine.execute_signal.assert_called_once()
         assert (
             engine.execution_engine.execute_signal.call_args.args[0].type
@@ -5009,7 +5181,9 @@ class TestHeartbeatRecording:
 
         assert active._in_position is False
         assert active.restore_calls == 1
-        engine._live_candle_application._persist.assert_called_once_with(entry_candle)
+        engine._live_candle_application._persist.assert_called_once_with(
+            entry_candle, None
+        )
         engine.risk_manager.check_risk.assert_called_once()
         engine.execution_engine.execute_signal.assert_called_once()
         assert (
@@ -5915,7 +6089,9 @@ class TestStopStrategy:
         """Stopping a non-active strategy should not crash."""
         mock_db = MagicMock()
         mock_db.query.return_value.filter.return_value.first.return_value = None
+        mock_db.query.return_value.filter.return_value.with_for_update.return_value.first.return_value = None
         engine._db_session_factory = lambda: nullcontext(mock_db)
+        engine._strategy_state_manager._db_session_factory = engine._db_session_factory
 
         engine.stop_strategy("nonexistent")
         # Should complete without error
@@ -6423,6 +6599,9 @@ class TestStrategyWarmup:
         )
         query = MagicMock()
         query.filter.return_value.first.return_value = state
+        query.filter.return_value.with_for_update.return_value.first.return_value = (
+            MagicMock(status=StrategyStatus.READY.value, version=3)
+        )
         query.filter_by.return_value.first.return_value = state
         query.filter_by.return_value.filter.return_value.update.return_value = 1
         mock_db = MagicMock()
@@ -8520,6 +8699,26 @@ class TestExchangeOrderEventThread:
             engine.execution_engine._submission_gate_owner.try_begin_submission()
             == "order_event_stream_failed"
         )
+
+    def test_successful_clear_rearms_entry_gate_before_releasing_local_halt(
+        self,
+        engine,
+    ) -> None:
+        gate = MagicMock(spec=RithmicPublisherLivenessGate)
+        gate.rearm_after_verified_recovery.side_effect = lambda: (
+            engine._kill_switch_halted is True
+            or pytest.fail("local halt released before admission gate rearm")
+        )
+        engine._entry_admission_gate = gate
+        engine._kill_switch_halted = True
+        engine.ops_safety.clear_kill_switch = MagicMock(
+            return_value={"cleared": True, "reason": None}
+        )
+
+        engine._handle_command({"command": "CLEAR_KILL_SWITCH", "params": {}})
+
+        gate.rearm_after_verified_recovery.assert_called_once_with()
+        assert engine._kill_switch_halted is False
 
     def test_rithmic_clear_reasserts_lockdown_when_new_drift_is_detected(
         self,

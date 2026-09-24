@@ -9,3 +9,4 @@ pub mod rithmic_market;
 pub mod rithmic_order;
 pub mod scaled;
 pub(crate) mod spot_ledger;
+pub mod volume_profile;
