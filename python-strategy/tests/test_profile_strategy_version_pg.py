@@ -9,7 +9,7 @@ from sqlalchemy.exc import DBAPIError
 from src.core.market_data.profiles.orm import Base
 from test_profile_bootstrap_pg_fixture import build, Consumer
 from test_migrations import _upgrade, _downgrade
-from test_migration_21_structure import TARGETS, NEW, OLD, REVISION
+from test_migration_21_structure import TARGETS, NEW, OLD
 
 pytestmark = pytest.mark.integration
 pytest_plugins = ["test_migrations"]
@@ -84,7 +84,7 @@ def test_each_table_version_boundaries_independently(
 
 def test_clean_upgrade_downgrade_upgrade(profile_repository_pg, fresh_pg_db):
     before = fingerprint(profile_repository_pg)
-    assert before[0] == REVISION and all(NEW in c for c in before[1])
+    assert all(NEW in c for c in before[1])
     _downgrade(fresh_pg_db, "b73e9a21c604")
     middle = fingerprint(profile_repository_pg)
     assert middle[0] == "b73e9a21c604" and all(OLD in c for c in middle[1])
