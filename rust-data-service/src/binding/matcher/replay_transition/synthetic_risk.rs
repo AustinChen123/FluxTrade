@@ -6,6 +6,8 @@ use rust_decimal::Decimal;
 
 use super::Fault;
 
+mod scenario_account;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Product {
     Btc,
@@ -195,7 +197,7 @@ impl FrozenScenario {
             }
             let (spec, tier_version) = self.resolve(position.product, input.effective_at)?;
             if position.contracts <= Decimal::ZERO
-                || position.entry <= Decimal::ZERO
+                || position.lots.is_empty()
                 || position.contracts < spec.minimum
                 || position.contracts.checked_rem(spec.lot) != Some(Decimal::ZERO)
             {
@@ -220,11 +222,24 @@ impl FrozenScenario {
                 spec.multiplier,
             )?;
             let value = mul(base, mark.price)?;
-            let difference = match position.side {
-                Side::Long => add(mark.price, -position.entry),
-                Side::Short => add(position.entry, -mark.price),
-            }?;
-            let upl = mul(base, difference)?;
+            let mut lot_contracts = Decimal::ZERO;
+            let mut lot_upl = Vec::new();
+            for lot in &position.lots {
+                if lot.contracts <= Decimal::ZERO || lot.entry <= Decimal::ZERO {
+                    return Err("INVALID_POSITION_LOT");
+                }
+                lot_contracts = add(lot_contracts, lot.contracts)?;
+                let lot_base = mul(mul(lot.contracts, spec.contract_value)?, spec.multiplier)?;
+                let difference = match position.side {
+                    Side::Long => add(mark.price, -lot.entry),
+                    Side::Short => add(lot.entry, -mark.price),
+                }?;
+                lot_upl.push(mul(lot_base, difference)?);
+            }
+            if lot_contracts != position.contracts {
+                return Err("POSITION_LOT_QUANTITY_MISMATCH");
+            }
+            let upl = signed_sum(&lot_upl)?;
             let contribution = mul(value, tier.mmr)?;
             // Initialization admits configured leverage 10 only, never tier IMR.
             let margin = exact(value.mantissa(), value.scale() + 1)?;
@@ -268,9 +283,9 @@ fn mul(left: Decimal, right: Decimal) -> Result<Decimal, Fault> {
     )
 }
 
-// Exact accumulator only for cash plus the two admitted product UPL terms.
+// Exact signed accumulation for lot UPL and cash plus product UPL.
 fn signed_sum(terms: &[Decimal]) -> Result<Decimal, Fault> {
-    if terms.is_empty() || terms.len() > 3 {
+    if terms.is_empty() {
         return Err("INVALID_VALUATION_TERMS");
     }
     let mut scale = terms.iter().map(Decimal::scale).max().unwrap_or(0);
@@ -348,6 +363,12 @@ struct NetPosition {
     product: Product,
     side: Side,
     contracts: Decimal,
+    lots: Vec<ValuationLot>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ValuationLot {
+    contracts: Decimal,
     entry: Decimal,
 }
 
@@ -424,7 +445,10 @@ mod tests {
             product,
             side: Side::Long,
             contracts: d(quantity),
-            entry: d(entry),
+            lots: vec![ValuationLot {
+                contracts: d(quantity),
+                entry: d(entry),
+            }],
         }
     }
 
