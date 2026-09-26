@@ -5,6 +5,8 @@ use rust_decimal::Decimal;
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
+mod settlement;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FeeModel {
     PercentageNotional,
@@ -25,7 +27,7 @@ impl FeeModel {
 
 use crate::binding::models::{Candlestick, FillEvent, Order, Position};
 use crate::binding::scaled::ScaledCandlestick;
-use crate::binding::spot_ledger::{CashSpotLedger, CashSpotSettlement, SpotFeeAsset};
+use crate::binding::spot_ledger::{CashSpotLedger, SpotFeeAsset};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SettlementModel {
@@ -469,23 +471,14 @@ impl PyMatchingEngine {
                     continue;
                 }
             };
-            let fee = if self.settlement_model == SettlementModel::CashSpot {
-                match self.settle_spot_order(&order, fill_price, true) {
-                    Ok(settlement) => {
-                        self.update_spot_position(&order, fill_price, settlement);
-                        settlement.fee
-                    }
-                    Err(reason) => {
-                        self.reject_order(&order, candle.timestamp, reason);
-                        continue;
-                    }
+            let calculated_fee = settlement::calculate_fee(self, fill_price, order.quantity, true);
+            let fee = match settlement::settle_fill(self, &order, fill_price, true, calculated_fee)
+            {
+                Ok(fee) => fee,
+                Err(reason) => {
+                    self.reject_order(&order, candle.timestamp, reason);
+                    continue;
                 }
-            } else {
-                let fee = self.calculate_fee(fill_price, order.quantity, true);
-                self.update_position(&order, fill_price);
-                let charged_fee = std::cmp::min(fee, self.balance);
-                self.balance -= charged_fee;
-                fee
             };
 
             let fill = FillEvent {
@@ -542,7 +535,7 @@ impl PyMatchingEngine {
                 continue;
             }
 
-            let position_key = Self::position_key(&order.strategy_id, &order.product_id);
+            let position_key = settlement::position_key(&order.strategy_id, &order.product_id);
             let Some(protected_side) = self
                 .positions
                 .get(&position_key)
@@ -567,7 +560,7 @@ impl PyMatchingEngine {
                     continue;
                 }
             };
-            let fee = self.calculate_fee(fill_price, order.quantity, true);
+            let fee = settlement::calculate_fee(self, fill_price, order.quantity, true);
             Self::consider_exit_candidate(
                 ExitCandidate {
                     order,
@@ -592,7 +585,7 @@ impl PyMatchingEngine {
                 remaining_orders.push(order);
                 continue;
             }
-            let position_key = Self::position_key(&order.strategy_id, &order.product_id);
+            let position_key = settlement::position_key(&order.strategy_id, &order.product_id);
             let Some(protected_side) = self
                 .positions
                 .get(&position_key)
@@ -603,7 +596,7 @@ impl PyMatchingEngine {
                 continue;
             };
             let fill_price = order.price;
-            let fee = self.calculate_fee(fill_price, order.quantity, false);
+            let fee = settlement::calculate_fee(self, fill_price, order.quantity, false);
             Self::consider_exit_candidate(
                 ExitCandidate {
                     order,
@@ -619,26 +612,18 @@ impl PyMatchingEngine {
         }
 
         for candidate in selected_exit_candidates {
-            let fee = if self.settlement_model == SettlementModel::CashSpot {
-                match self.settle_spot_order(&candidate.order, candidate.fill_price, true) {
-                    Ok(settlement) => {
-                        self.update_spot_position(
-                            &candidate.order,
-                            candidate.fill_price,
-                            settlement,
-                        );
-                        settlement.fee
-                    }
-                    Err(reason) => {
-                        self.reject_order(&candidate.order, candle.timestamp, reason);
-                        continue;
-                    }
+            let fee = match settlement::settle_fill(
+                self,
+                &candidate.order,
+                candidate.fill_price,
+                true,
+                candidate.fee,
+            ) {
+                Ok(fee) => fee,
+                Err(reason) => {
+                    self.reject_order(&candidate.order, candle.timestamp, reason);
+                    continue;
                 }
-            } else {
-                self.update_position(&candidate.order, candidate.fill_price);
-                let charged_fee = std::cmp::min(candidate.fee, self.balance);
-                self.balance -= charged_fee;
-                candidate.fee
             };
             fills.push(FillEvent {
                 order_id: candidate.order.id.clone(),
@@ -667,7 +652,7 @@ impl PyMatchingEngine {
             if cancelled_ids.contains(&order.id) {
                 return false;
             }
-            let position_key = Self::position_key(&order.strategy_id, &order.product_id);
+            let position_key = settlement::position_key(&order.strategy_id, &order.product_id);
             if matches!(
                 order.order_type.as_str(),
                 "STOP_LOSS" | "TAKE_PROFIT" | "TRAILING_STOP"
@@ -728,7 +713,7 @@ impl PyMatchingEngine {
     }
 
     fn reduces_current_position(&self, order: &Order) -> bool {
-        let position_key = Self::position_key(&order.strategy_id, &order.product_id);
+        let position_key = settlement::position_key(&order.strategy_id, &order.product_id);
         self.positions.get(&position_key).is_some_and(|position| {
             position.quantity > Decimal::ZERO && position.side != order.side
         })
@@ -748,23 +733,13 @@ impl PyMatchingEngine {
             return Some(order);
         }
 
-        let fee = if self.settlement_model == SettlementModel::CashSpot {
-            match self.settle_spot_order(&order, order.price, false) {
-                Ok(settlement) => {
-                    self.update_spot_position(&order, order.price, settlement);
-                    settlement.fee
-                }
-                Err(reason) => {
-                    self.reject_order(&order, candle.timestamp, reason);
-                    return None;
-                }
+        let calculated_fee = settlement::calculate_fee(self, order.price, order.quantity, false);
+        let fee = match settlement::settle_fill(self, &order, order.price, false, calculated_fee) {
+            Ok(fee) => fee,
+            Err(reason) => {
+                self.reject_order(&order, candle.timestamp, reason);
+                return None;
             }
-        } else {
-            let fee = self.calculate_fee(order.price, order.quantity, false);
-            self.update_position(&order, order.price);
-            let charged_fee = std::cmp::min(fee, self.balance);
-            self.balance -= charged_fee;
-            fee
         };
         fills.push(FillEvent {
             order_id: order.id.clone(),
@@ -906,78 +881,6 @@ impl PyMatchingEngine {
         }
     }
 
-    fn calculate_fee(&self, price: Decimal, quantity: Decimal, is_taker: bool) -> Decimal {
-        let fee = if is_taker {
-            self.taker_fee
-        } else {
-            self.maker_fee
-        };
-        if let Some(ledger) = &self.spot_ledger {
-            return match ledger.fee_asset {
-                SpotFeeAsset::Base => quantity * fee,
-                SpotFeeAsset::Quote => price * quantity * fee,
-            };
-        }
-        match self.fee_model {
-            FeeModel::PercentageNotional => price * quantity * self.contract_multiplier * fee,
-            FeeModel::PerContract => quantity * fee,
-        }
-    }
-
-    fn settle_spot_order(
-        &mut self,
-        order: &Order,
-        fill_price: Decimal,
-        is_taker: bool,
-    ) -> Result<CashSpotSettlement, String> {
-        let fee_rate = if is_taker {
-            self.taker_fee
-        } else {
-            self.maker_fee
-        };
-        let mut settlement_order = order.clone();
-        if matches!(
-            order.order_type.as_str(),
-            "STOP_LOSS" | "TAKE_PROFIT" | "TRAILING_STOP"
-        ) {
-            if order.side != "LONG" {
-                return Err("cash_spot conditional order cannot close a short position".to_string());
-            }
-            settlement_order.side = "SHORT".to_string();
-        }
-        if settlement_order.side == "SHORT" {
-            let ledger = self
-                .spot_ledger
-                .as_ref()
-                .ok_or_else(|| "cash_spot ledger is unavailable".to_string())?;
-            let fee = match ledger.fee_asset {
-                SpotFeeAsset::Base => order.quantity * fee_rate,
-                SpotFeeAsset::Quote => fill_price * order.quantity * fee_rate,
-            };
-            let required_position = order.quantity
-                + if ledger.fee_asset == SpotFeeAsset::Base {
-                    fee
-                } else {
-                    Decimal::ZERO
-                };
-            let position_key = Self::position_key(&order.strategy_id, &order.product_id);
-            let available_position = self
-                .positions
-                .get(&position_key)
-                .filter(|position| position.side == "LONG")
-                .map_or(Decimal::ZERO, |position| position.quantity);
-            if required_position > available_position {
-                return Err(format!(
-                    "cash_spot insufficient strategy position at fill: required={required_position} available={available_position}"
-                ));
-            }
-        }
-        self.spot_ledger
-            .as_mut()
-            .ok_or_else(|| "cash_spot ledger is unavailable".to_string())?
-            .settle(&settlement_order, fill_price, fee_rate)
-    }
-
     fn reject_order(&mut self, order: &Order, timestamp: i64, reason: String) {
         if let Some(ledger) = self.spot_ledger.as_mut() {
             ledger.release(&order.id);
@@ -989,141 +892,6 @@ impl PyMatchingEngine {
             ("timestamp".to_string(), timestamp.to_string()),
             ("reason".to_string(), reason),
         ]));
-    }
-
-    fn update_spot_position(
-        &mut self,
-        order: &Order,
-        fill_price: Decimal,
-        settlement: CashSpotSettlement,
-    ) {
-        let key = Self::position_key(&order.strategy_id, &order.product_id);
-        let mut position = self.positions.remove(&key).unwrap_or(Position {
-            product_id: order.product_id.clone(),
-            strategy_id: order.strategy_id.clone(),
-            side: "FLAT".to_string(),
-            quantity: Decimal::ZERO,
-            entry_price: Decimal::ZERO,
-            unrealized_pnl: Decimal::ZERO,
-        });
-
-        if settlement.base_delta > Decimal::ZERO {
-            let acquired_cost = -settlement.quote_delta;
-            let prior_cost = position.quantity * position.entry_price;
-            let new_quantity = position.quantity + settlement.base_delta;
-            position.side = "LONG".to_string();
-            position.quantity = new_quantity;
-            position.entry_price = (prior_cost + acquired_cost) / new_quantity;
-            self.spot_cost_basis += acquired_cost;
-            self.positions.insert(key, position);
-            return;
-        }
-
-        let reduction = -settlement.base_delta;
-        let removed_cost = position.entry_price * reduction;
-        let proceeds = settlement.quote_delta;
-        self.spot_cost_basis -= removed_cost;
-        self.spot_realized_pnl += proceeds - removed_cost;
-        position.quantity -= reduction;
-        if position.quantity > Decimal::ZERO {
-            self.positions.insert(key, position);
-        }
-
-        debug_assert!(fill_price > Decimal::ZERO);
-    }
-
-    fn position_key(strategy_id: &str, product_id: &str) -> String {
-        format!("{strategy_id}:{product_id}")
-    }
-
-    fn update_position(&mut self, order: &Order, fill_price: Decimal) {
-        let key = Self::position_key(&order.strategy_id, &order.product_id);
-        let mut pos = self.positions.remove(&key).unwrap_or(Position {
-            product_id: order.product_id.clone(),
-            strategy_id: order.strategy_id.clone(),
-            side: "FLAT".to_string(),
-            quantity: Decimal::ZERO,
-            entry_price: Decimal::ZERO,
-            unrealized_pnl: Decimal::ZERO,
-        });
-
-        let is_closing_order = matches!(
-            order.order_type.as_str(),
-            "STOP_LOSS" | "TAKE_PROFIT" | "TRAILING_STOP"
-        );
-
-        if is_closing_order {
-            self.close_position(&mut pos, order, fill_price);
-        } else {
-            self.apply_position_change(&mut pos, order, fill_price);
-        }
-
-        if pos.quantity > Decimal::ZERO && pos.side != "FLAT" {
-            self.positions.insert(key, pos);
-        }
-    }
-
-    /// Close position for conditional orders (SL/TP/Trailing).
-    fn close_position(&mut self, pos: &mut Position, order: &Order, fill_price: Decimal) {
-        if pos.quantity.is_zero() || pos.side == "FLAT" {
-            return;
-        }
-
-        let close_qty = order.quantity.min(pos.quantity);
-        let price_diff = if pos.side == "LONG" {
-            fill_price - pos.entry_price
-        } else {
-            pos.entry_price - fill_price
-        };
-        let realized_pnl = price_diff * close_qty * self.contract_multiplier;
-        self.balance += realized_pnl;
-
-        let remaining = pos.quantity - close_qty;
-        if remaining > Decimal::ZERO {
-            pos.quantity = remaining;
-        } else {
-            pos.side = "FLAT".to_string();
-            pos.quantity = Decimal::ZERO;
-            pos.entry_price = Decimal::ZERO;
-        }
-    }
-
-    /// Apply position change for MARKET/LIMIT orders (open, increase, reduce, flip).
-    fn apply_position_change(&mut self, pos: &mut Position, order: &Order, fill_price: Decimal) {
-        if pos.quantity.is_zero() || pos.side == "FLAT" {
-            pos.side = order.side.clone();
-            pos.quantity = order.quantity;
-            pos.entry_price = fill_price;
-        } else if pos.side == order.side {
-            let total_cost = pos.quantity * pos.entry_price + order.quantity * fill_price;
-            let new_qty = pos.quantity + order.quantity;
-            pos.entry_price = total_cost / new_qty;
-            pos.quantity = new_qty;
-        } else {
-            let close_qty = order.quantity.min(pos.quantity);
-            let price_diff = if pos.side == "LONG" {
-                fill_price - pos.entry_price
-            } else {
-                pos.entry_price - fill_price
-            };
-            let realized_pnl = price_diff * close_qty * self.contract_multiplier;
-            self.balance += realized_pnl;
-
-            let remaining = pos.quantity - close_qty;
-            let excess = order.quantity - close_qty;
-
-            if remaining > Decimal::ZERO {
-                pos.quantity = remaining;
-            } else if excess > Decimal::ZERO {
-                pos.side = order.side.clone();
-                pos.quantity = excess;
-                pos.entry_price = fill_price;
-            } else {
-                pos.side = "FLAT".to_string();
-                pos.quantity = Decimal::ZERO;
-                pos.entry_price = Decimal::ZERO;
-            }
-        }
     }
 }
 
@@ -1215,6 +983,89 @@ mod tests {
         }
     }
 
+    fn assert_position(
+        engine: &PyMatchingEngine,
+        strategy_id: &str,
+        product_id: &str,
+        side: &str,
+        quantity: Decimal,
+        entry_price: Decimal,
+    ) {
+        let position = engine
+            .positions
+            .get(&pos_key(strategy_id, product_id))
+            .expect("expected position");
+        assert_eq!(position.product_id, product_id);
+        assert_eq!(position.strategy_id, strategy_id);
+        assert_eq!(position.side, side);
+        assert_eq!(position.quantity, quantity);
+        assert_eq!(position.entry_price, entry_price);
+        assert_eq!(position.unrealized_pnl, Decimal::ZERO);
+    }
+
+    fn matcher_settlement_ownership_violations(source: &str) -> Vec<&'static str> {
+        const FORBIDDEN_WRITES: [&str; 14] = [
+            "self.balance =",
+            "self.balance +=",
+            "self.balance -=",
+            "self.positions.clear(",
+            "self.positions.entry(",
+            "self.positions.insert(",
+            "self.positions.remove(",
+            "self.spot_cost_basis =",
+            "self.spot_cost_basis +=",
+            "self.spot_cost_basis -=",
+            "self.spot_realized_pnl =",
+            "self.spot_realized_pnl +=",
+            "self.spot_realized_pnl -=",
+            "self.positions =",
+        ];
+        FORBIDDEN_WRITES
+            .into_iter()
+            .filter(|candidate| source.contains(candidate))
+            .collect()
+    }
+
+    #[test]
+    fn matcher_facade_delegates_all_financial_state_writes_to_settlement() {
+        let source = include_str!("matcher.rs");
+        let production_source = source
+            .split_once("#[cfg(test)]")
+            .expect("matcher tests marker")
+            .0;
+        let compact_source: String = production_source
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect();
+
+        assert_eq!(
+            matcher_settlement_ownership_violations(production_source),
+            Vec::<&str>::new()
+        );
+        assert_eq!(
+            production_source
+                .matches("settlement::settle_fill(")
+                .count(),
+            3,
+            "market, selected-exit, and limit fills must share the settlement entry"
+        );
+        assert!(
+            compact_source.contains(
+                "settlement::settle_fill(self,&candidate.order,candidate.fill_price,true,candidate.fee,)"
+            ),
+            "selected exits must settle the fee frozen during candidate evaluation"
+        );
+    }
+
+    #[test]
+    fn matcher_settlement_ownership_ratchet_detects_direct_write_fixture() {
+        let fixture = "self.balance -= fee; self.positions.insert(key, position);";
+        assert_eq!(
+            matcher_settlement_ownership_violations(fixture),
+            vec!["self.balance -=", "self.positions.insert("]
+        );
+    }
+
     // ── Market Orders ──
 
     #[test]
@@ -1237,6 +1088,67 @@ mod tests {
         assert_eq!(pos.quantity, dec!(1));
         assert_eq!(pos.entry_price, dec!(50000));
         assert_eq!(pos.strategy_id, STRATEGY);
+    }
+
+    #[test]
+    fn characterization_derivatives_settlement_trace_is_exact() {
+        let mut engine = make_engine(dec!(100000));
+
+        engine
+            .open_orders
+            .push(make_order("open", "LONG", "MARKET", Decimal::ZERO, dec!(2)));
+        let open_fills = engine
+            .process_candle_logic(make_candle(dec!(100), dec!(100), dec!(100), dec!(100)))
+            .unwrap();
+        assert_eq!(open_fills.len(), 1);
+        assert_eq!(open_fills[0].price, dec!(100));
+        assert_eq!(open_fills[0].quantity, dec!(2));
+        assert_eq!(open_fills[0].fee, dec!(0.1200));
+        assert_eq!(engine.balance, dec!(99999.8800));
+        assert!(engine.open_orders.is_empty());
+        assert_position(&engine, STRATEGY, PRODUCT, "LONG", dec!(2), dec!(100));
+
+        engine
+            .open_orders
+            .push(make_order("increase", "LONG", "LIMIT", dec!(100), dec!(1)));
+        let increase_fills = engine
+            .process_candle_logic(make_candle(dec!(100), dec!(100), dec!(100), dec!(100)))
+            .unwrap();
+        assert_eq!(increase_fills.len(), 1);
+        assert_eq!(increase_fills[0].fee, dec!(0.0200));
+        assert_eq!(engine.balance, dec!(99999.8600));
+        assert_position(&engine, STRATEGY, PRODUCT, "LONG", dec!(3), dec!(100));
+
+        engine.open_orders.push(make_order(
+            "reduce",
+            "SHORT",
+            "MARKET",
+            Decimal::ZERO,
+            dec!(1),
+        ));
+        let reduce_fills = engine
+            .process_candle_logic(make_candle(dec!(110), dec!(110), dec!(110), dec!(110)))
+            .unwrap();
+        assert_eq!(reduce_fills.len(), 1);
+        assert_eq!(reduce_fills[0].fee, dec!(0.0660));
+        assert_eq!(engine.balance, dec!(100009.7940));
+        assert_position(&engine, STRATEGY, PRODUCT, "LONG", dec!(2), dec!(100));
+
+        engine.open_orders.push(make_order(
+            "flip",
+            "SHORT",
+            "MARKET",
+            Decimal::ZERO,
+            dec!(3),
+        ));
+        let flip_fills = engine
+            .process_candle_logic(make_candle(dec!(90), dec!(90), dec!(90), dec!(90)))
+            .unwrap();
+        assert_eq!(flip_fills.len(), 1);
+        assert_eq!(flip_fills[0].fee, dec!(0.1620));
+        assert_eq!(engine.balance, dec!(99989.6320));
+        assert!(engine.open_orders.is_empty());
+        assert_position(&engine, STRATEGY, PRODUCT, "SHORT", dec!(1), dec!(90));
     }
 
     #[test]
@@ -1479,8 +1391,14 @@ mod tests {
         engine.maker_fee = dec!(0.001);
         engine.taker_fee = dec!(0.002);
 
-        assert_eq!(engine.calculate_fee(dec!(100), dec!(3), false), dec!(0.6));
-        assert_eq!(engine.calculate_fee(dec!(100), dec!(3), true), dec!(1.2));
+        assert_eq!(
+            settlement::calculate_fee(&engine, dec!(100), dec!(3), false),
+            dec!(0.6)
+        );
+        assert_eq!(
+            settlement::calculate_fee(&engine, dec!(100), dec!(3), true),
+            dec!(1.2)
+        );
     }
 
     #[test]
@@ -1491,8 +1409,14 @@ mod tests {
         engine.maker_fee = dec!(1.25);
         engine.taker_fee = dec!(1.75);
 
-        assert_eq!(engine.calculate_fee(dec!(100), dec!(3), false), dec!(3.75));
-        assert_eq!(engine.calculate_fee(dec!(100), dec!(3), true), dec!(5.25));
+        assert_eq!(
+            settlement::calculate_fee(&engine, dec!(100), dec!(3), false),
+            dec!(3.75)
+        );
+        assert_eq!(
+            settlement::calculate_fee(&engine, dec!(100), dec!(3), true),
+            dec!(5.25)
+        );
     }
 
     #[test]
@@ -2449,12 +2373,16 @@ mod tests {
         engine.maker_fee = Decimal::ZERO;
         engine.taker_fee = Decimal::ZERO;
         engine.contract_multiplier = dec!(2);
-        let mut position = make_position(PRODUCT, STRATEGY, "LONG", dec!(1), dec!(100));
+        engine.positions.insert(
+            pos_key(STRATEGY, PRODUCT),
+            make_position(PRODUCT, STRATEGY, "LONG", dec!(1), dec!(100)),
+        );
         let order = make_order("mnq_tp", "LONG", "TAKE_PROFIT", Decimal::ZERO, dec!(1));
 
-        engine.close_position(&mut position, &order, dec!(110));
+        settlement::settle_fill(&mut engine, &order, dec!(110), true, Decimal::ZERO).unwrap();
 
         assert_eq!(engine.balance, dec!(100020));
+        assert!(engine.positions.is_empty());
     }
 
     #[test]
@@ -2463,13 +2391,30 @@ mod tests {
         engine.maker_fee = Decimal::ZERO;
         engine.taker_fee = Decimal::ZERO;
         engine.contract_multiplier = dec!(2);
-        let mut position = make_position(PRODUCT, STRATEGY, "SHORT", dec!(2), dec!(100));
+        engine.positions.insert(
+            pos_key(STRATEGY, PRODUCT),
+            make_position(PRODUCT, STRATEGY, "SHORT", dec!(2), dec!(100)),
+        );
         let order = make_order("mnq_reduce", "LONG", "MARKET", Decimal::ZERO, dec!(1));
 
-        engine.apply_position_change(&mut position, &order, dec!(90));
+        settlement::settle_fill(&mut engine, &order, dec!(90), true, Decimal::ZERO).unwrap();
 
         assert_eq!(engine.balance, dec!(100020));
-        assert_eq!(position.quantity, dec!(1));
+        assert_position(&engine, STRATEGY, PRODUCT, "SHORT", dec!(1), dec!(100));
+    }
+
+    #[test]
+    fn settlement_uses_precomputed_derivatives_fee_without_recalculation() {
+        let mut engine = make_engine(dec!(100));
+        engine.taker_fee = dec!(0.25);
+        let order = make_order("precomputed", "LONG", "MARKET", Decimal::ZERO, dec!(1));
+
+        let reported_fee =
+            settlement::settle_fill(&mut engine, &order, dec!(10), true, dec!(1.5)).unwrap();
+
+        assert_eq!(reported_fee, dec!(1.5));
+        assert_eq!(engine.balance, dec!(98.5));
+        assert_position(&engine, STRATEGY, PRODUCT, "LONG", dec!(1), dec!(10));
     }
 
     #[test]
@@ -2700,6 +2645,82 @@ mod tests {
         let mut candle = make_candle(open, open, open, open);
         candle.product_id = "BINANCE:BTCUSDT-SPOT".to_string();
         candle
+    }
+
+    #[test]
+    fn characterization_spot_rejection_and_oco_trace_is_exact() {
+        let mut engine = make_spot_engine(dec!(100), Decimal::ZERO, Decimal::ZERO, "quote");
+        engine
+            .submit_order(make_spot_order("buy", "LONG", "MARKET", dec!(50), dec!(1)))
+            .unwrap();
+        let buy_fills = engine
+            .process_candle_logic(make_spot_candle(dec!(50)))
+            .unwrap();
+        assert_eq!(buy_fills.len(), 1);
+        assert_eq!(buy_fills[0].fee, Decimal::ZERO);
+        assert_eq!(engine.get_asset_balance("USDT", "total").unwrap(), "50");
+        assert_eq!(engine.get_asset_balance("BTC", "total").unwrap(), "1");
+
+        let mut stop = make_spot_order("stop", "LONG", "STOP_LOSS", Decimal::ZERO, dec!(1));
+        stop.trigger_price = Some(dec!(40));
+        stop.linked_order_id = Some("take-profit".to_string());
+        let mut take_profit =
+            make_spot_order("take-profit", "LONG", "TAKE_PROFIT", Decimal::ZERO, dec!(1));
+        take_profit.trigger_price = Some(dec!(60));
+        take_profit.linked_order_id = Some("stop".to_string());
+        engine.submit_order(stop).unwrap();
+        engine.submit_order(take_profit).unwrap();
+
+        let mut exit_candle = make_spot_candle(dec!(50));
+        exit_candle.high = dec!(65);
+        exit_candle.low = dec!(35);
+        let exit_fills = engine.process_candle_logic(exit_candle).unwrap();
+        assert_eq!(exit_fills.len(), 1);
+        assert_eq!(exit_fills[0].order_id, "stop");
+        assert_eq!(exit_fills[0].price, dec!(40));
+        assert_eq!(engine.get_asset_balance("USDT", "total").unwrap(), "90");
+        assert_eq!(engine.get_asset_balance("BTC", "total").unwrap(), "0");
+        assert_eq!(engine.spot_cost_basis, Decimal::ZERO);
+        assert_eq!(engine.spot_realized_pnl, dec!(-10));
+        assert!(engine.positions.is_empty());
+        assert!(engine.open_orders.is_empty());
+
+        let mut rejected = make_spot_engine(dec!(50), Decimal::ZERO, Decimal::ZERO, "quote");
+        rejected
+            .submit_order(make_spot_order("gap", "LONG", "MARKET", dec!(50), dec!(1)))
+            .unwrap();
+        let rejected_fills = rejected
+            .process_candle_logic(make_spot_candle(dec!(60)))
+            .unwrap();
+        assert!(rejected_fills.is_empty());
+        assert_eq!(rejected.get_asset_balance("USDT", "total").unwrap(), "50");
+        assert_eq!(rejected.get_asset_balance("USDT", "reserved").unwrap(), "0");
+        assert_eq!(rejected.get_asset_balance("BTC", "total").unwrap(), "0");
+        assert!(rejected.positions.is_empty());
+        assert!(rejected.open_orders.is_empty());
+        let rejections = rejected.drain_rejections();
+        assert_eq!(rejections.len(), 1);
+        assert_eq!(rejections[0]["order_id"], "gap");
+        assert!(rejections[0]["reason"].contains("insufficient available USDT at fill"));
+    }
+
+    #[test]
+    fn spot_fee_mismatch_rejects_before_mutation_and_releases_reservation() {
+        let mut engine = make_spot_engine(dec!(100), Decimal::ZERO, Decimal::ZERO, "quote");
+        let order = make_spot_order("mismatch", "LONG", "MARKET", dec!(50), dec!(1));
+        engine.submit_order(order.clone()).unwrap();
+
+        let reason = settlement::settle_fill(&mut engine, &order, dec!(50), true, dec!(1))
+            .expect_err("mismatched precomputed fee must fail before settlement");
+        assert!(reason.contains("cash_spot settlement fee mismatch"));
+        assert_eq!(engine.get_asset_balance("USDT", "total").unwrap(), "100");
+        assert_eq!(engine.get_asset_balance("USDT", "reserved").unwrap(), "50");
+        assert_eq!(engine.get_asset_balance("BTC", "total").unwrap(), "0");
+        assert!(engine.positions.is_empty());
+
+        engine.reject_order(&order, 1000, reason);
+        assert_eq!(engine.get_asset_balance("USDT", "reserved").unwrap(), "0");
+        assert_eq!(engine.drain_rejections().len(), 1);
     }
 
     #[test]
