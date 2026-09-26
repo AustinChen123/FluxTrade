@@ -1,9 +1,12 @@
-//! Incomplete 4B-1 clean-run storage. No admission, settlement or reservation output.
+//! Incomplete clean-run storage with pure financial projections; no admission or execution commit.
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 
 use super::super::{hash_fields, identity, AccountKey, Gate, Hash};
 use super::*;
+
+mod hypothetical_settlement;
+mod reservation;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SeedLot {
@@ -167,6 +170,15 @@ fn aligned(value: Decimal, step: Decimal) -> bool {
 }
 
 impl ScenarioAccount {
+    fn reservation(&self) -> Result<reservation::Snapshot, Fault> {
+        reservation::calculate(
+            &self.projection(),
+            &self.orders.values().map(|o| &o.facts).collect::<Vec<_>>(),
+            &self.scenario,
+            &self.marks,
+        )
+    }
+
     fn from_seed(
         seed: &CleanSeed,
         scenario: &FrozenScenario,

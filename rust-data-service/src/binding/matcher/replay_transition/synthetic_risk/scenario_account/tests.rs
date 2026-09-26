@@ -1,11 +1,11 @@
 use super::*;
 use std::str::FromStr;
 
-fn d(value: &str) -> Decimal {
+pub(super) fn d(value: &str) -> Decimal {
     Decimal::from_str(value).unwrap()
 }
 
-fn fixture() -> (CleanSeed, FrozenScenario, Vec<Mark>) {
+pub(super) fn fixture() -> (CleanSeed, FrozenScenario, Vec<Mark>) {
     let mut specs = Vec::new();
     let mut tiers = Vec::new();
     for product in [Product::Btc, Product::Eth] {
