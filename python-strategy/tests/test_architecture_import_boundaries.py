@@ -16,6 +16,7 @@ _ORM_FREE_APPLICATION_MODULES = frozenset(
         "src.core.execution_conditional_orders",
         "src.core.execution_order_cancellation",
         "src.core.execution_verified_net_reduction",
+        "src.core.replay_contract",
     }
 )
 _FORBIDDEN_APPLICATION_IMPORTS = frozenset(
@@ -290,6 +291,32 @@ def test_tracked_production_orm_free_port_imports_match_exact_baseline() -> None
     sources, packages = _tracked_production_sources()
     assert (
         _orm_free_pairs(sources, package_modules=packages) == _LEGACY_PORT_ORM_IMPORTS
+    )
+
+
+def test_replay_contract_is_provider_and_orm_free_before_staging() -> None:
+    importer = "src.core.replay_contract"
+    source = (_PYTHON_ROOT / "src/core/replay_contract.py").read_text()
+    sources, packages = _tracked_production_sources()
+    sources[importer] = source
+    assert (
+        _provider_pairs(sources, package_modules=packages) == _LEGACY_PROVIDER_IMPORTS
+    )
+    assert (
+        _orm_free_pairs(sources, package_modules=packages) == _LEGACY_PORT_ORM_IMPORTS
+    )
+    assert (importer, "src.core.adapters.live_binance") in _provider_pairs(
+        sources
+        | {importer: "from src.core.adapters.live_binance import LiveBinanceAdapter"},
+        package_modules=packages,
+    )
+    assert (importer, "src.core.adapters") in _provider_pairs(
+        sources | {importer: "from src.core import adapters"},
+        package_modules=packages,
+    )
+    assert (importer, "src.core.orm_models.Order") in _orm_free_pairs(
+        sources | {importer: "from src.core.orm_models import Order"},
+        package_modules=packages,
     )
 
 
