@@ -6,6 +6,9 @@ use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 mod account_state;
+// Private GT-02 kernel; intentionally not connected to the legacy/Python facade.
+#[allow(dead_code)]
+mod replay_transition;
 mod settlement;
 
 use account_state::AccountState;

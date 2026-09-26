@@ -7,6 +7,7 @@ use crate::binding::spot_ledger::CashSpotLedger;
 
 /// Sole storage owner of the legacy matcher's mutable account state.
 /// Matching and settlement retain their existing mutation responsibilities.
+#[derive(Clone)]
 pub(super) struct AccountState {
     pub(super) balance: Decimal,
     pub(super) positions: HashMap<String, Position>,
