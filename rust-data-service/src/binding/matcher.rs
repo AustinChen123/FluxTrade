@@ -5,7 +5,10 @@ use rust_decimal::Decimal;
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
+mod account_state;
 mod settlement;
+
+use account_state::AccountState;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FeeModel {
@@ -57,11 +60,7 @@ struct ExitCandidate {
 
 #[pyclass]
 pub struct PyMatchingEngine {
-    pub balance: Decimal,
-    #[pyo3(get)]
-    pub positions: HashMap<String, Position>,
-    #[pyo3(get)]
-    pub open_orders: Vec<Order>,
+    account: AccountState,
     maker_fee: Decimal,
     taker_fee: Decimal,
     market_slippage_bps: Decimal,
@@ -69,9 +68,6 @@ pub struct PyMatchingEngine {
     contract_multiplier: Decimal,
     fee_model: FeeModel,
     settlement_model: SettlementModel,
-    spot_ledger: Option<CashSpotLedger>,
-    spot_cost_basis: Decimal,
-    spot_realized_pnl: Decimal,
     rejections: Vec<HashMap<String, String>>,
     warnings: Vec<HashMap<String, String>>,
     scaled_price_tick: Option<Decimal>,
@@ -144,9 +140,7 @@ impl PyMatchingEngine {
             None
         };
         Ok(PyMatchingEngine {
-            balance: initial_balance,
-            positions: HashMap::new(),
-            open_orders: Vec::new(),
+            account: AccountState::new(initial_balance, spot_ledger),
             maker_fee: parse_decimal(&maker_fee, "maker_fee")?,
             taker_fee: parse_decimal(&taker_fee, "taker_fee")?,
             market_slippage_bps,
@@ -154,9 +148,6 @@ impl PyMatchingEngine {
             contract_multiplier,
             fee_model,
             settlement_model,
-            spot_ledger,
-            spot_cost_basis: Decimal::ZERO,
-            spot_realized_pnl: Decimal::ZERO,
             rejections: Vec::new(),
             warnings: Vec::new(),
             scaled_price_tick: None,
@@ -166,14 +157,14 @@ impl PyMatchingEngine {
 
     #[getter]
     fn balance(&self) -> String {
-        match &self.spot_ledger {
+        match &self.account.spot_ledger {
             Some(ledger) => ledger.quote_available().to_string(),
-            None => self.balance.to_string(),
+            None => self.account.balance.to_string(),
         }
     }
 
     fn submit_order(&mut self, order: Order) -> PyResult<String> {
-        if let Some(ledger) = self.spot_ledger.as_mut() {
+        if let Some(ledger) = self.account.spot_ledger.as_mut() {
             if matches!(order.order_type.as_str(), "MARKET" | "LIMIT") {
                 let fee_rate = if order.order_type == "MARKET" {
                     self.taker_fee
@@ -198,12 +189,22 @@ impl PyMatchingEngine {
             }
         }
         let id = order.id.clone();
-        self.open_orders.push(order);
+        self.account.open_orders.push(order);
         Ok(id)
     }
 
     fn get_positions(&self) -> HashMap<String, Position> {
-        self.positions.clone()
+        self.account.positions.clone()
+    }
+
+    #[getter(positions)]
+    fn positions_property(&self) -> HashMap<String, Position> {
+        self.get_positions()
+    }
+
+    #[getter]
+    fn open_orders(&self) -> Vec<Order> {
+        self.account.open_orders.clone()
     }
 
     fn drain_rejections(&mut self) -> Vec<HashMap<String, String>> {
@@ -215,7 +216,7 @@ impl PyMatchingEngine {
     }
 
     fn get_asset_balance(&self, asset: &str, balance_type: &str) -> PyResult<String> {
-        let Some(ledger) = &self.spot_ledger else {
+        let Some(ledger) = &self.account.spot_ledger else {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "asset balances require cash_spot settlement",
             ));
@@ -252,7 +253,7 @@ impl PyMatchingEngine {
 
     fn apply_external_funding(&mut self, asset: &str, amount: String) -> PyResult<String> {
         let amount = parse_decimal(&amount, "external_funding_amount")?;
-        let ledger = self.spot_ledger.as_mut().ok_or_else(|| {
+        let ledger = self.account.spot_ledger.as_mut().ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err(
                 "external funding requires cash_spot settlement",
             )
@@ -264,7 +265,7 @@ impl PyMatchingEngine {
     }
 
     fn cash_spot_account_snapshot(&self, mark_price: String) -> PyResult<HashMap<String, String>> {
-        let Some(ledger) = &self.spot_ledger else {
+        let Some(ledger) = &self.account.spot_ledger else {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "cash_spot account snapshot requires cash_spot settlement",
             ));
@@ -275,7 +276,7 @@ impl PyMatchingEngine {
                 "cash_spot mark_price must be positive",
             ));
         }
-        let unrealized_pnl = ledger.base_total() * mark_price - self.spot_cost_basis;
+        let unrealized_pnl = ledger.base_total() * mark_price - self.account.spot_cost_basis;
         Ok(HashMap::from([
             ("base_asset".to_string(), ledger.base_asset.clone()),
             ("quote_asset".to_string(), ledger.quote_asset.clone()),
@@ -298,10 +299,13 @@ impl PyMatchingEngine {
                 "quote_reserved".to_string(),
                 ledger.quote_reserved().to_string(),
             ),
-            ("cost_basis".to_string(), self.spot_cost_basis.to_string()),
+            (
+                "cost_basis".to_string(),
+                self.account.spot_cost_basis.to_string(),
+            ),
             (
                 "realized_pnl".to_string(),
-                self.spot_realized_pnl.to_string(),
+                self.account.spot_realized_pnl.to_string(),
             ),
             ("unrealized_pnl".to_string(), unrealized_pnl.to_string()),
             (
@@ -314,7 +318,7 @@ impl PyMatchingEngine {
     /// Get position for a specific strategy and product.
     fn get_position(&self, strategy_id: &str, product_id: &str) -> Option<Position> {
         let key = format!("{strategy_id}:{product_id}");
-        self.positions.get(&key).cloned()
+        self.account.positions.get(&key).cloned()
     }
 
     fn on_candle(&mut self, candle: Candlestick) -> PyResult<Vec<FillEvent>> {
@@ -367,11 +371,11 @@ impl PyMatchingEngine {
     }
 
     fn cancel_order(&mut self, order_id: String) -> bool {
-        let before = self.open_orders.len();
-        self.open_orders.retain(|o| o.id != order_id);
-        let cancelled = self.open_orders.len() < before;
+        let before = self.account.open_orders.len();
+        self.account.open_orders.retain(|o| o.id != order_id);
+        let cancelled = self.account.open_orders.len() < before;
         if cancelled {
-            if let Some(ledger) = self.spot_ledger.as_mut() {
+            if let Some(ledger) = self.account.spot_ledger.as_mut() {
                 ledger.release(&order_id);
             }
         }
@@ -444,7 +448,7 @@ impl PyMatchingEngine {
         let mut conditional_orders: Vec<Order> = Vec::new();
         let mut limit_orders: Vec<Order> = Vec::new();
 
-        for order in self.open_orders.drain(..) {
+        for order in self.account.open_orders.drain(..) {
             match order.order_type.as_str() {
                 "MARKET" => market_orders.push(order),
                 "STOP_LOSS" | "TAKE_PROFIT" | "TRAILING_STOP" => conditional_orders.push(order),
@@ -537,6 +541,7 @@ impl PyMatchingEngine {
 
             let position_key = settlement::position_key(&order.strategy_id, &order.product_id);
             let Some(protected_side) = self
+                .account
                 .positions
                 .get(&position_key)
                 .filter(|position| position.side == order.side && position.quantity > Decimal::ZERO)
@@ -587,6 +592,7 @@ impl PyMatchingEngine {
             }
             let position_key = settlement::position_key(&order.strategy_id, &order.product_id);
             let Some(protected_side) = self
+                .account
                 .positions
                 .get(&position_key)
                 .filter(|position| position.quantity > Decimal::ZERO && position.side != order.side)
@@ -635,13 +641,13 @@ impl PyMatchingEngine {
                 timestamp: candle.timestamp,
                 fill_type: candidate.order.order_type.clone(),
             });
-            let still_protected_position =
-                self.positions
-                    .get(&candidate.position_key)
-                    .is_some_and(|position| {
-                        position.side == candidate.protected_side
-                            && position.quantity > Decimal::ZERO
-                    });
+            let still_protected_position = self
+                .account
+                .positions
+                .get(&candidate.position_key)
+                .is_some_and(|position| {
+                    position.side == candidate.protected_side && position.quantity > Decimal::ZERO
+                });
             if !still_protected_position {
                 closed_position_sides.insert(candidate.position_key, candidate.protected_side);
             }
@@ -657,8 +663,11 @@ impl PyMatchingEngine {
                 order.order_type.as_str(),
                 "STOP_LOSS" | "TAKE_PROFIT" | "TRAILING_STOP"
             ) {
-                let protects_current_position =
-                    self.positions.get(&position_key).is_some_and(|position| {
+                let protects_current_position = self
+                    .account
+                    .positions
+                    .get(&position_key)
+                    .is_some_and(|position| {
                         position.side == order.side && position.quantity > Decimal::ZERO
                     });
                 let protects_pending_entry = pending_entries.contains(&(
@@ -675,8 +684,8 @@ impl PyMatchingEngine {
                 _ => true,
             }
         });
-        self.open_orders = remaining_orders;
-        if let Some(ledger) = self.spot_ledger.as_mut() {
+        self.account.open_orders = remaining_orders;
+        if let Some(ledger) = self.account.spot_ledger.as_mut() {
             for cancelled_id in cancelled_ids {
                 ledger.release(&cancelled_id);
             }
@@ -714,9 +723,12 @@ impl PyMatchingEngine {
 
     fn reduces_current_position(&self, order: &Order) -> bool {
         let position_key = settlement::position_key(&order.strategy_id, &order.product_id);
-        self.positions.get(&position_key).is_some_and(|position| {
-            position.quantity > Decimal::ZERO && position.side != order.side
-        })
+        self.account
+            .positions
+            .get(&position_key)
+            .is_some_and(|position| {
+                position.quantity > Decimal::ZERO && position.side != order.side
+            })
     }
 
     fn match_limit_order(
@@ -882,7 +894,7 @@ impl PyMatchingEngine {
     }
 
     fn reject_order(&mut self, order: &Order, timestamp: i64, reason: String) {
-        if let Some(ledger) = self.spot_ledger.as_mut() {
+        if let Some(ledger) = self.account.spot_ledger.as_mut() {
             ledger.release(&order.id);
         }
         self.rejections.push(HashMap::from([
@@ -917,9 +929,7 @@ mod tests {
 
     fn make_engine(balance: Decimal) -> PyMatchingEngine {
         PyMatchingEngine {
-            balance,
-            positions: HashMap::new(),
-            open_orders: Vec::new(),
+            account: AccountState::new(balance, None),
             maker_fee: dec!(0.0002),
             taker_fee: dec!(0.0006),
             market_slippage_bps: Decimal::ZERO,
@@ -927,9 +937,6 @@ mod tests {
             contract_multiplier: Decimal::ONE,
             fee_model: FeeModel::PercentageNotional,
             settlement_model: SettlementModel::Derivatives,
-            spot_ledger: None,
-            spot_cost_basis: Decimal::ZERO,
-            spot_realized_pnl: Decimal::ZERO,
             rejections: Vec::new(),
             warnings: Vec::new(),
             scaled_price_tick: None,
@@ -992,6 +999,7 @@ mod tests {
         entry_price: Decimal,
     ) {
         let position = engine
+            .account
             .positions
             .get(&pos_key(strategy_id, product_id))
             .expect("expected position");
@@ -1005,20 +1013,20 @@ mod tests {
 
     fn matcher_settlement_ownership_violations(source: &str) -> Vec<&'static str> {
         const FORBIDDEN_WRITES: [&str; 14] = [
-            "self.balance =",
-            "self.balance +=",
-            "self.balance -=",
-            "self.positions.clear(",
-            "self.positions.entry(",
-            "self.positions.insert(",
-            "self.positions.remove(",
-            "self.spot_cost_basis =",
-            "self.spot_cost_basis +=",
-            "self.spot_cost_basis -=",
-            "self.spot_realized_pnl =",
-            "self.spot_realized_pnl +=",
-            "self.spot_realized_pnl -=",
-            "self.positions =",
+            "self.account.balance =",
+            "self.account.balance +=",
+            "self.account.balance -=",
+            "self.account.positions.clear(",
+            "self.account.positions.entry(",
+            "self.account.positions.insert(",
+            "self.account.positions.remove(",
+            "self.account.spot_cost_basis =",
+            "self.account.spot_cost_basis +=",
+            "self.account.spot_cost_basis -=",
+            "self.account.spot_realized_pnl =",
+            "self.account.spot_realized_pnl +=",
+            "self.account.spot_realized_pnl -=",
+            "self.account.positions =",
         ];
         FORBIDDEN_WRITES
             .into_iter()
@@ -1059,19 +1067,153 @@ mod tests {
 
     #[test]
     fn matcher_settlement_ownership_ratchet_detects_direct_write_fixture() {
-        let fixture = "self.balance -= fee; self.positions.insert(key, position);";
+        let fixture = "self.account.balance -= fee; self.account.positions.insert(key, position);";
         assert_eq!(
             matcher_settlement_ownership_violations(fixture),
-            vec!["self.balance -=", "self.positions.insert("]
+            vec!["self.account.balance -=", "self.account.positions.insert("]
         );
     }
 
     // ── Market Orders ──
 
+    fn struct_fields(source: &str, name: &str) -> Vec<String> {
+        source
+            .split_once(&format!("struct {name} {{"))
+            .expect("state struct declaration")
+            .1
+            .split_once('}')
+            .expect("state struct end")
+            .0
+            .lines()
+            .filter(|line| line.contains(':'))
+            .map(|line| line.trim().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn account_storage_has_one_physical_owner() {
+        let source = include_str!("matcher.rs");
+        let fields = struct_fields(source, "PyMatchingEngine");
+        // Exhaustive facade ratchet: new fields require an ownership review,
+        // including a renamed second AccountState or financial cache.
+        assert_eq!(
+            fields,
+            [
+                "account: AccountState,",
+                "maker_fee: Decimal,",
+                "taker_fee: Decimal,",
+                "market_slippage_bps: Decimal,",
+                "market_slippage_price_tick: Option<Decimal>,",
+                "contract_multiplier: Decimal,",
+                "fee_model: FeeModel,",
+                "settlement_model: SettlementModel,",
+                "rejections: Vec<HashMap<String, String>>,",
+                "warnings: Vec<HashMap<String, String>>,",
+                "scaled_price_tick: Option<Decimal>,",
+                "scaled_volume_step: Option<Decimal>,",
+            ]
+        );
+        let owner = struct_fields(include_str!("matcher/account_state.rs"), "AccountState");
+        assert_eq!(
+            owner,
+            [
+                "pub(super) balance: Decimal,",
+                "pub(super) positions: HashMap<String, Position>,",
+                "pub(super) open_orders: Vec<Order>,",
+                "pub(super) spot_ledger: Option<CashSpotLedger>,",
+                "pub(super) spot_cost_basis: Decimal,",
+                "pub(super) spot_realized_pnl: Decimal,",
+            ]
+        );
+        for duplicate in [
+            "balance: Decimal,",
+            "cache: AccountState,",
+            "spot_ledger: Option<CashSpotLedger>,",
+        ] {
+            let mutant = source.replacen(
+                "account: AccountState,",
+                &format!("account: AccountState,\n{duplicate}"),
+                1,
+            );
+            assert_ne!(struct_fields(&mutant, "PyMatchingEngine"), fields);
+        }
+    }
+
+    #[test]
+    fn account_initial_state_and_python_facade_are_detached() {
+        let engine = PyMatchingEngine::new(
+            "100.00".into(),
+            "0".into(),
+            "0".into(),
+            "1".into(),
+            "percentage_notional".into(),
+            "derivatives".into(),
+            "".into(),
+            "".into(),
+            "quote".into(),
+            "0".into(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(engine.account.balance, dec!(100.00));
+        assert!(engine.account.positions.is_empty());
+        assert!(engine.account.open_orders.is_empty());
+        assert!(engine.account.spot_ledger.is_none());
+        assert_eq!(engine.account.spot_cost_basis, Decimal::ZERO);
+        assert_eq!(engine.account.spot_realized_pnl, Decimal::ZERO);
+        Python::with_gil(|py| {
+            let engine = Py::new(py, engine).unwrap();
+            let bound = engine.bind(py);
+            assert_eq!(
+                bound
+                    .getattr("balance")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "100.00"
+            );
+            for attribute in ["balance", "positions", "open_orders"] {
+                assert!(bound.setattr(attribute, py.None()).is_err());
+            }
+            for snapshot in [
+                bound.getattr("positions").unwrap(),
+                bound.call_method0("get_positions").unwrap(),
+            ] {
+                snapshot.set_item("injected", "not a position").unwrap();
+            }
+            bound
+                .getattr("open_orders")
+                .unwrap()
+                .call_method1("append", ("injected",))
+                .unwrap();
+            let borrowed = engine.borrow(py);
+            assert!(borrowed.account.positions.is_empty());
+            assert!(borrowed.account.open_orders.is_empty());
+        });
+    }
+
+    #[test]
+    fn direct_settlement_uses_account_owner_without_consuming_open_orders() {
+        let mut engine = make_engine(dec!(100));
+        let order = make_order("direct", "LONG", "MARKET", dec!(10), dec!(2));
+        engine.submit_order(order.clone()).unwrap();
+        settlement::settle_fill(&mut engine, &order, dec!(10), true, dec!(0.012)).unwrap();
+        assert_eq!(engine.account.balance, dec!(99.988));
+        assert_position(&engine, STRATEGY, PRODUCT, "LONG", dec!(2), dec!(10));
+        assert_eq!(engine.open_orders()[0].id, "direct");
+        let mut positions = engine.positions_property();
+        positions.values_mut().next().unwrap().quantity = dec!(999);
+        let mut orders = engine.open_orders();
+        orders[0].quantity = dec!(999);
+        assert_eq!(engine.account.open_orders[0].quantity, dec!(2));
+        assert_position(&engine, STRATEGY, PRODUCT, "LONG", dec!(2), dec!(10));
+    }
+
     #[test]
     fn test_market_order_long_fills_at_open() {
         let mut engine = make_engine(dec!(100000));
         engine
+            .account
             .open_orders
             .push(make_order("m1", "LONG", "MARKET", Decimal::ZERO, dec!(1)));
 
@@ -1083,7 +1225,7 @@ mod tests {
         assert_eq!(fills[0].fill_type, "MARKET");
 
         let key = pos_key(STRATEGY, PRODUCT);
-        let pos = engine.positions.get(&key).unwrap();
+        let pos = engine.account.positions.get(&key).unwrap();
         assert_eq!(pos.side, "LONG");
         assert_eq!(pos.quantity, dec!(1));
         assert_eq!(pos.entry_price, dec!(50000));
@@ -1094,9 +1236,13 @@ mod tests {
     fn characterization_derivatives_settlement_trace_is_exact() {
         let mut engine = make_engine(dec!(100000));
 
-        engine
-            .open_orders
-            .push(make_order("open", "LONG", "MARKET", Decimal::ZERO, dec!(2)));
+        engine.account.open_orders.push(make_order(
+            "open",
+            "LONG",
+            "MARKET",
+            Decimal::ZERO,
+            dec!(2),
+        ));
         let open_fills = engine
             .process_candle_logic(make_candle(dec!(100), dec!(100), dec!(100), dec!(100)))
             .unwrap();
@@ -1104,22 +1250,26 @@ mod tests {
         assert_eq!(open_fills[0].price, dec!(100));
         assert_eq!(open_fills[0].quantity, dec!(2));
         assert_eq!(open_fills[0].fee, dec!(0.1200));
-        assert_eq!(engine.balance, dec!(99999.8800));
-        assert!(engine.open_orders.is_empty());
+        assert_eq!(engine.account.balance, dec!(99999.8800));
+        assert!(engine.account.open_orders.is_empty());
         assert_position(&engine, STRATEGY, PRODUCT, "LONG", dec!(2), dec!(100));
 
-        engine
-            .open_orders
-            .push(make_order("increase", "LONG", "LIMIT", dec!(100), dec!(1)));
+        engine.account.open_orders.push(make_order(
+            "increase",
+            "LONG",
+            "LIMIT",
+            dec!(100),
+            dec!(1),
+        ));
         let increase_fills = engine
             .process_candle_logic(make_candle(dec!(100), dec!(100), dec!(100), dec!(100)))
             .unwrap();
         assert_eq!(increase_fills.len(), 1);
         assert_eq!(increase_fills[0].fee, dec!(0.0200));
-        assert_eq!(engine.balance, dec!(99999.8600));
+        assert_eq!(engine.account.balance, dec!(99999.8600));
         assert_position(&engine, STRATEGY, PRODUCT, "LONG", dec!(3), dec!(100));
 
-        engine.open_orders.push(make_order(
+        engine.account.open_orders.push(make_order(
             "reduce",
             "SHORT",
             "MARKET",
@@ -1131,10 +1281,10 @@ mod tests {
             .unwrap();
         assert_eq!(reduce_fills.len(), 1);
         assert_eq!(reduce_fills[0].fee, dec!(0.0660));
-        assert_eq!(engine.balance, dec!(100009.7940));
+        assert_eq!(engine.account.balance, dec!(100009.7940));
         assert_position(&engine, STRATEGY, PRODUCT, "LONG", dec!(2), dec!(100));
 
-        engine.open_orders.push(make_order(
+        engine.account.open_orders.push(make_order(
             "flip",
             "SHORT",
             "MARKET",
@@ -1146,8 +1296,8 @@ mod tests {
             .unwrap();
         assert_eq!(flip_fills.len(), 1);
         assert_eq!(flip_fills[0].fee, dec!(0.1620));
-        assert_eq!(engine.balance, dec!(99989.6320));
-        assert!(engine.open_orders.is_empty());
+        assert_eq!(engine.account.balance, dec!(99989.6320));
+        assert!(engine.account.open_orders.is_empty());
         assert_position(&engine, STRATEGY, PRODUCT, "SHORT", dec!(1), dec!(90));
     }
 
@@ -1157,7 +1307,7 @@ mod tests {
             let mut engine = make_engine(dec!(100000));
             engine.market_slippage_bps = dec!(1);
             engine.market_slippage_price_tick = Some(dec!(0.05));
-            engine.open_orders.push(make_order(
+            engine.account.open_orders.push(make_order(
                 "slipped",
                 side,
                 "MARKET",
@@ -1179,7 +1329,7 @@ mod tests {
             let mut engine = make_engine(dec!(100000));
             engine.market_slippage_bps = dec!(0.0000000000000000000000000001);
             engine.market_slippage_price_tick = Some(dec!(0.01));
-            engine.open_orders.push(make_order(
+            engine.account.open_orders.push(make_order(
                 "smallest-bps",
                 side,
                 "MARKET",
@@ -1201,6 +1351,7 @@ mod tests {
         engine.market_slippage_bps = dec!(10);
         engine.market_slippage_price_tick = Some(dec!(0.01));
         engine
+            .account
             .open_orders
             .push(make_order("limit", "LONG", "LIMIT", dec!(99), dec!(1)));
 
@@ -1216,21 +1367,21 @@ mod tests {
         let mut engine = make_engine(dec!(100000));
         engine.market_slippage_bps = dec!(1);
         engine.market_slippage_price_tick = Some(dec!(1));
-        engine.open_orders.push(make_order(
+        engine.account.open_orders.push(make_order(
             "filled-before-rejection",
             "LONG",
             "MARKET",
             Decimal::ZERO,
             dec!(1),
         ));
-        engine.open_orders.push(make_order(
+        engine.account.open_orders.push(make_order(
             "invalid-rounded-price",
             "SHORT",
             "MARKET",
             Decimal::ZERO,
             dec!(1),
         ));
-        engine.open_orders.push(make_order(
+        engine.account.open_orders.push(make_order(
             "filled-after-rejection",
             "LONG",
             "MARKET",
@@ -1240,7 +1391,7 @@ mod tests {
         let mut other_product =
             make_order("other-product", "LONG", "MARKET", Decimal::ZERO, dec!(1));
         other_product.product_id = "OTHER".to_string();
-        engine.open_orders.push(other_product);
+        engine.account.open_orders.push(other_product);
 
         let fills = engine
             .process_candle_logic(make_candle(dec!(1), dec!(1), dec!(1), dec!(1)))
@@ -1253,13 +1404,17 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["filled-before-rejection", "filled-after-rejection"]
         );
-        assert_eq!(engine.open_orders.len(), 1);
-        assert_eq!(engine.open_orders[0].id, "other-product");
+        assert_eq!(engine.account.open_orders.len(), 1);
+        assert_eq!(engine.account.open_orders[0].id, "other-product");
         let rejections = engine.drain_rejections();
         assert_eq!(rejections.len(), 1);
         assert_eq!(rejections[0]["order_id"], "invalid-rounded-price");
         assert!(rejections[0]["reason"].contains("non-positive tick-rounded fill price"));
-        let position = engine.positions.get(&pos_key(STRATEGY, PRODUCT)).unwrap();
+        let position = engine
+            .account
+            .positions
+            .get(&pos_key(STRATEGY, PRODUCT))
+            .unwrap();
         assert_eq!(position.side, "LONG");
         assert_eq!(position.quantity, dec!(2));
         assert_eq!(position.entry_price, dec!(2));
@@ -1270,7 +1425,7 @@ mod tests {
         let mut engine = make_engine(dec!(100000));
         engine.market_slippage_bps = dec!(1);
         engine.market_slippage_price_tick = Some(dec!(0.01));
-        engine.open_orders.push(make_order(
+        engine.account.open_orders.push(make_order(
             "overflow",
             "LONG",
             "MARKET",
@@ -1280,7 +1435,7 @@ mod tests {
         let mut other_product =
             make_order("other-product", "LONG", "MARKET", Decimal::ZERO, dec!(1));
         other_product.product_id = "OTHER".to_string();
-        engine.open_orders.push(other_product);
+        engine.account.open_orders.push(other_product);
 
         let fills = engine
             .process_candle_logic(make_candle(
@@ -1292,9 +1447,9 @@ mod tests {
             .unwrap();
 
         assert!(fills.is_empty());
-        assert_eq!(engine.open_orders.len(), 1);
-        assert_eq!(engine.open_orders[0].id, "other-product");
-        assert!(engine.positions.is_empty());
+        assert_eq!(engine.account.open_orders.len(), 1);
+        assert_eq!(engine.account.open_orders[0].id, "other-product");
+        assert!(engine.account.positions.is_empty());
         let rejections = engine.drain_rejections();
         assert_eq!(rejections.len(), 1);
         assert_eq!(rejections[0]["order_id"], "overflow");
@@ -1306,9 +1461,13 @@ mod tests {
         let mut decimal_engine = make_engine(dec!(100000));
         decimal_engine.market_slippage_bps = dec!(10);
         decimal_engine.market_slippage_price_tick = Some(dec!(0.01));
-        decimal_engine
-            .open_orders
-            .push(make_order("m1", "LONG", "MARKET", Decimal::ZERO, dec!(1)));
+        decimal_engine.account.open_orders.push(make_order(
+            "m1",
+            "LONG",
+            "MARKET",
+            Decimal::ZERO,
+            dec!(1),
+        ));
         let decimal_fills = decimal_engine
             .process_candle_logic(make_candle(
                 dec!(50000),
@@ -1321,9 +1480,13 @@ mod tests {
         let mut scaled_engine = make_engine(dec!(100000));
         scaled_engine.market_slippage_bps = dec!(10);
         scaled_engine.market_slippage_price_tick = Some(dec!(0.01));
-        scaled_engine
-            .open_orders
-            .push(make_order("m1", "LONG", "MARKET", Decimal::ZERO, dec!(1)));
+        scaled_engine.account.open_orders.push(make_order(
+            "m1",
+            "LONG",
+            "MARKET",
+            Decimal::ZERO,
+            dec!(1),
+        ));
         scaled_engine.scaled_price_tick = Some(dec!(0.01));
         scaled_engine.scaled_volume_step = Some(dec!(0.001));
         let scaled_fills = scaled_engine
@@ -1343,13 +1506,16 @@ mod tests {
         assert_eq!(decimal_fills[0].price, dec!(50050));
         assert_eq!(scaled_fills[0].price, decimal_fills[0].price);
         assert_eq!(scaled_fills[0].fee, decimal_fills[0].fee);
-        assert_eq!(scaled_engine.balance, decimal_engine.balance);
+        assert_eq!(
+            scaled_engine.account.balance,
+            decimal_engine.account.balance
+        );
     }
 
     #[test]
     fn test_market_order_short_fills_at_open() {
         let mut engine = make_engine(dec!(100000));
-        engine.open_orders.push(make_order(
+        engine.account.open_orders.push(make_order(
             "m2",
             "SHORT",
             "MARKET",
@@ -1364,7 +1530,7 @@ mod tests {
         assert_eq!(fills[0].price, dec!(48000));
 
         let key = pos_key(STRATEGY, PRODUCT);
-        let pos = engine.positions.get(&key).unwrap();
+        let pos = engine.account.positions.get(&key).unwrap();
         assert_eq!(pos.side, "SHORT");
         assert_eq!(pos.quantity, dec!(0.5));
     }
@@ -1373,6 +1539,7 @@ mod tests {
     fn test_market_order_taker_fee_deducted() {
         let mut engine = make_engine(dec!(100000));
         engine
+            .account
             .open_orders
             .push(make_order("m3", "LONG", "MARKET", Decimal::ZERO, dec!(1)));
 
@@ -1381,7 +1548,7 @@ mod tests {
 
         let expected_fee = dec!(50000) * dec!(1) * dec!(0.0006);
         assert_eq!(fills[0].fee, expected_fee);
-        assert!(engine.balance < dec!(100000));
+        assert!(engine.account.balance < dec!(100000));
     }
 
     #[test]
@@ -1444,13 +1611,13 @@ mod tests {
         let mut engine = make_engine(dec!(100000));
         let mut order = make_order("m4", "LONG", "MARKET", Decimal::ZERO, dec!(1));
         order.product_id = "BINANCE:ETHUSDT-PERP".to_string();
-        engine.open_orders.push(order);
+        engine.account.open_orders.push(order);
 
         let candle = make_candle(dec!(50000), dec!(51000), dec!(49000), dec!(50500));
         let fills = engine.process_candle_logic(candle).unwrap();
 
         assert_eq!(fills.len(), 0);
-        assert_eq!(engine.open_orders.len(), 1);
+        assert_eq!(engine.account.open_orders.len(), 1);
     }
 
     // ── Limit Orders ──
@@ -1460,7 +1627,7 @@ mod tests {
         let mut engine = make_engine(dec!(100000));
         let mut order = make_order("l1", "LONG", "LIMIT", dec!(49500), dec!(1));
         order.price = dec!(49500);
-        engine.open_orders.push(order);
+        engine.account.open_orders.push(order);
 
         let candle = make_candle(dec!(50000), dec!(51000), dec!(49000), dec!(50500));
         let fills = engine.process_candle_logic(candle).unwrap();
@@ -1474,6 +1641,7 @@ mod tests {
     fn test_limit_order_long_not_filled_when_low_above_price() {
         let mut engine = make_engine(dec!(100000));
         engine
+            .account
             .open_orders
             .push(make_order("l2", "LONG", "LIMIT", dec!(48000), dec!(1)));
 
@@ -1481,13 +1649,14 @@ mod tests {
         let fills = engine.process_candle_logic(candle).unwrap();
 
         assert_eq!(fills.len(), 0);
-        assert_eq!(engine.open_orders.len(), 1);
+        assert_eq!(engine.account.open_orders.len(), 1);
     }
 
     #[test]
     fn test_limit_order_short_fills_when_high_touches_price() {
         let mut engine = make_engine(dec!(100000));
         engine
+            .account
             .open_orders
             .push(make_order("l3", "SHORT", "LIMIT", dec!(50500), dec!(1)));
 
@@ -1502,6 +1671,7 @@ mod tests {
     fn test_limit_order_uses_maker_fee() {
         let mut engine = make_engine(dec!(100000));
         engine
+            .account
             .open_orders
             .push(make_order("l4", "LONG", "LIMIT", dec!(49500), dec!(1)));
 
@@ -1523,7 +1693,10 @@ mod tests {
             make_order("take_profit", "LONG", "TAKE_PROFIT", Decimal::ZERO, dec!(1));
         take_profit.trigger_price = Some(dec!(110));
         take_profit.linked_order_id = Some("stop".to_string());
-        engine.open_orders.extend([entry, stop, take_profit]);
+        engine
+            .account
+            .open_orders
+            .extend([entry, stop, take_profit]);
 
         let fills = engine
             .process_candle_logic(make_candle(dec!(105), dec!(115), dec!(85), dec!(100)))
@@ -1532,8 +1705,8 @@ mod tests {
         assert_eq!(fills.len(), 2);
         assert_eq!(fills[0].fill_type, "LIMIT");
         assert_eq!(fills[1].fill_type, "STOP_LOSS");
-        assert!(engine.positions.is_empty());
-        assert!(engine.open_orders.is_empty());
+        assert!(engine.account.positions.is_empty());
+        assert!(engine.account.open_orders.is_empty());
     }
 
     #[test]
@@ -1543,14 +1716,14 @@ mod tests {
         let mut take_profit =
             make_order("take_profit", "LONG", "TAKE_PROFIT", Decimal::ZERO, dec!(1));
         take_profit.trigger_price = Some(dec!(110));
-        engine.open_orders.extend([entry, take_profit]);
+        engine.account.open_orders.extend([entry, take_profit]);
 
         let fills = engine
             .process_candle_logic(make_candle(dec!(100), dec!(115), dec!(95), dec!(105)))
             .unwrap();
 
         assert!(fills.is_empty());
-        assert_eq!(engine.open_orders.len(), 2);
+        assert_eq!(engine.account.open_orders.len(), 2);
     }
 
     // ── Stop Loss ──
@@ -1559,14 +1732,14 @@ mod tests {
     fn test_stop_loss_long_triggers_when_low_hits() {
         let mut engine = make_engine(dec!(100000));
         let key = pos_key(STRATEGY, PRODUCT);
-        engine.positions.insert(
+        engine.account.positions.insert(
             key.clone(),
             make_position(PRODUCT, STRATEGY, "LONG", dec!(1), dec!(50000)),
         );
 
         let mut sl = make_order("sl1", "LONG", "STOP_LOSS", Decimal::ZERO, dec!(1));
         sl.trigger_price = Some(dec!(49000));
-        engine.open_orders.push(sl);
+        engine.account.open_orders.push(sl);
 
         let candle = make_candle(dec!(50000), dec!(50500), dec!(48500), dec!(49200));
         let fills = engine.process_candle_logic(candle).unwrap();
@@ -1575,25 +1748,25 @@ mod tests {
         assert_eq!(fills[0].fill_type, "STOP_LOSS");
         assert_eq!(fills[0].price, dec!(49000));
 
-        assert!(!engine.positions.contains_key(&key));
+        assert!(!engine.account.positions.contains_key(&key));
 
         // PnL: (49000 - 50000) * 1 = -1000
         let expected_balance = dec!(100000) - dec!(1000) - fills[0].fee;
-        assert_eq!(engine.balance, expected_balance);
+        assert_eq!(engine.account.balance, expected_balance);
     }
 
     #[test]
     fn test_stop_loss_short_triggers_when_high_hits() {
         let mut engine = make_engine(dec!(100000));
         let key = pos_key(STRATEGY, PRODUCT);
-        engine.positions.insert(
+        engine.account.positions.insert(
             key,
             make_position(PRODUCT, STRATEGY, "SHORT", dec!(1), dec!(50000)),
         );
 
         let mut sl = make_order("sl2", "SHORT", "STOP_LOSS", Decimal::ZERO, dec!(1));
         sl.trigger_price = Some(dec!(51000));
-        engine.open_orders.push(sl);
+        engine.account.open_orders.push(sl);
 
         let candle = make_candle(dec!(50200), dec!(51500), dec!(49800), dec!(50800));
         let fills = engine.process_candle_logic(candle).unwrap();
@@ -1603,27 +1776,27 @@ mod tests {
 
         // PnL: (50000 - 51000) * 1 = -1000
         let expected_balance = dec!(100000) - dec!(1000) - fills[0].fee;
-        assert_eq!(engine.balance, expected_balance);
+        assert_eq!(engine.account.balance, expected_balance);
     }
 
     #[test]
     fn test_stop_loss_not_triggered_when_price_doesnt_reach() {
         let mut engine = make_engine(dec!(100000));
         let key = pos_key(STRATEGY, PRODUCT);
-        engine.positions.insert(
+        engine.account.positions.insert(
             key,
             make_position(PRODUCT, STRATEGY, "LONG", dec!(1), dec!(50000)),
         );
 
         let mut sl = make_order("sl3", "LONG", "STOP_LOSS", Decimal::ZERO, dec!(1));
         sl.trigger_price = Some(dec!(48000));
-        engine.open_orders.push(sl);
+        engine.account.open_orders.push(sl);
 
         let candle = make_candle(dec!(50000), dec!(51000), dec!(49000), dec!(50500));
         let fills = engine.process_candle_logic(candle).unwrap();
 
         assert_eq!(fills.len(), 0);
-        assert_eq!(engine.open_orders.len(), 1);
+        assert_eq!(engine.account.open_orders.len(), 1);
     }
 
     // ── Take Profit ──
@@ -1632,14 +1805,14 @@ mod tests {
     fn test_take_profit_long_triggers_when_high_hits() {
         let mut engine = make_engine(dec!(100000));
         let key = pos_key(STRATEGY, PRODUCT);
-        engine.positions.insert(
+        engine.account.positions.insert(
             key,
             make_position(PRODUCT, STRATEGY, "LONG", dec!(1), dec!(50000)),
         );
 
         let mut tp = make_order("tp1", "LONG", "TAKE_PROFIT", Decimal::ZERO, dec!(1));
         tp.trigger_price = Some(dec!(52000));
-        engine.open_orders.push(tp);
+        engine.account.open_orders.push(tp);
 
         let candle = make_candle(dec!(50500), dec!(52500), dec!(50000), dec!(52000));
         let fills = engine.process_candle_logic(candle).unwrap();
@@ -1649,21 +1822,21 @@ mod tests {
 
         // PnL: (52000 - 50000) * 1 = +2000
         let expected_balance = dec!(100000) + dec!(2000) - fills[0].fee;
-        assert_eq!(engine.balance, expected_balance);
+        assert_eq!(engine.account.balance, expected_balance);
     }
 
     #[test]
     fn test_take_profit_short_triggers_when_low_hits() {
         let mut engine = make_engine(dec!(100000));
         let key = pos_key(STRATEGY, PRODUCT);
-        engine.positions.insert(
+        engine.account.positions.insert(
             key,
             make_position(PRODUCT, STRATEGY, "SHORT", dec!(1), dec!(50000)),
         );
 
         let mut tp = make_order("tp2", "SHORT", "TAKE_PROFIT", Decimal::ZERO, dec!(1));
         tp.trigger_price = Some(dec!(48000));
-        engine.open_orders.push(tp);
+        engine.account.open_orders.push(tp);
 
         let candle = make_candle(dec!(49000), dec!(49500), dec!(47500), dec!(48200));
         let fills = engine.process_candle_logic(candle).unwrap();
@@ -1672,7 +1845,7 @@ mod tests {
 
         // PnL: (50000 - 48000) * 1 = +2000
         let expected_balance = dec!(100000) + dec!(2000) - fills[0].fee;
-        assert_eq!(engine.balance, expected_balance);
+        assert_eq!(engine.account.balance, expected_balance);
     }
 
     // ── Trailing Stop ──
@@ -1681,7 +1854,7 @@ mod tests {
     fn test_trailing_stop_long_updates_and_triggers() {
         let mut engine = make_engine(dec!(100000));
         let key = pos_key(STRATEGY, PRODUCT);
-        engine.positions.insert(
+        engine.account.positions.insert(
             key,
             make_position(PRODUCT, STRATEGY, "LONG", dec!(1), dec!(50000)),
         );
@@ -1689,14 +1862,14 @@ mod tests {
         let mut ts = make_order("ts1", "LONG", "TRAILING_STOP", Decimal::ZERO, dec!(1));
         ts.trigger_price = Some(dec!(49000));
         ts.trailing_distance = Some(dec!(1000));
-        engine.open_orders.push(ts);
+        engine.account.open_orders.push(ts);
 
         // Candle 1: high=52000 → new trigger = 52000 - 1000 = 51000
         let c1 = make_candle(dec!(51500), dec!(52000), dec!(51200), dec!(51800));
         let fills = engine.process_candle_logic(c1).unwrap();
         assert_eq!(fills.len(), 0);
 
-        let updated_trigger = engine.open_orders[0].trigger_price.unwrap();
+        let updated_trigger = engine.account.open_orders[0].trigger_price.unwrap();
         assert_eq!(updated_trigger, dec!(51000));
 
         // Candle 2: low=50500 <= 51000 → triggers
@@ -1710,7 +1883,7 @@ mod tests {
     fn test_trailing_stop_short_updates_and_triggers() {
         let mut engine = make_engine(dec!(100000));
         let key = pos_key(STRATEGY, PRODUCT);
-        engine.positions.insert(
+        engine.account.positions.insert(
             key,
             make_position(PRODUCT, STRATEGY, "SHORT", dec!(1), dec!(50000)),
         );
@@ -1718,14 +1891,14 @@ mod tests {
         let mut ts = make_order("ts2", "SHORT", "TRAILING_STOP", Decimal::ZERO, dec!(1));
         ts.trigger_price = Some(dec!(51000));
         ts.trailing_distance = Some(dec!(1000));
-        engine.open_orders.push(ts);
+        engine.account.open_orders.push(ts);
 
         // Candle 1: low=48000 → new trigger = 48000 + 1000 = 49000
         let c1 = make_candle(dec!(48500), dec!(48800), dec!(48000), dec!(48300));
         let fills = engine.process_candle_logic(c1).unwrap();
         assert_eq!(fills.len(), 0);
 
-        let updated_trigger = engine.open_orders[0].trigger_price.unwrap();
+        let updated_trigger = engine.account.open_orders[0].trigger_price.unwrap();
         assert_eq!(updated_trigger, dec!(49000));
 
         // Candle 2: high=49500 >= 49000 → triggers
@@ -1742,13 +1915,16 @@ mod tests {
         let mut ts = make_order("ts3", "LONG", "TRAILING_STOP", Decimal::ZERO, dec!(1));
         ts.trigger_price = Some(dec!(49000));
         ts.trailing_distance = Some(dec!(1000));
-        engine.open_orders.push(ts);
+        engine.account.open_orders.push(ts);
 
         // high=49500 → new_trigger = 49500 - 1000 = 48500 < 49000 → should NOT move down
         let c = make_candle(dec!(49000), dec!(49500), dec!(48800), dec!(49200));
-        PyMatchingEngine::update_trailing_stop(&mut engine.open_orders[0], &c);
+        PyMatchingEngine::update_trailing_stop(&mut engine.account.open_orders[0], &c);
 
-        assert_eq!(engine.open_orders[0].trigger_price.unwrap(), dec!(49000));
+        assert_eq!(
+            engine.account.open_orders[0].trigger_price.unwrap(),
+            dec!(49000)
+        );
     }
 
     // ── OCO (One-Cancels-Other) ──
@@ -1757,7 +1933,7 @@ mod tests {
     fn test_oco_sl_triggers_cancels_tp() {
         let mut engine = make_engine(dec!(100000));
         let key = pos_key(STRATEGY, PRODUCT);
-        engine.positions.insert(
+        engine.account.positions.insert(
             key,
             make_position(PRODUCT, STRATEGY, "LONG", dec!(1), dec!(50000)),
         );
@@ -1765,26 +1941,26 @@ mod tests {
         let mut sl = make_order("sl_oco", "LONG", "STOP_LOSS", Decimal::ZERO, dec!(1));
         sl.trigger_price = Some(dec!(49000));
         sl.linked_order_id = Some("tp_oco".to_string());
-        engine.open_orders.push(sl);
+        engine.account.open_orders.push(sl);
 
         let mut tp = make_order("tp_oco", "LONG", "TAKE_PROFIT", Decimal::ZERO, dec!(1));
         tp.trigger_price = Some(dec!(52000));
         tp.linked_order_id = Some("sl_oco".to_string());
-        engine.open_orders.push(tp);
+        engine.account.open_orders.push(tp);
 
         let candle = make_candle(dec!(50000), dec!(50500), dec!(48500), dec!(49200));
         let fills = engine.process_candle_logic(candle).unwrap();
 
         assert_eq!(fills.len(), 1);
         assert_eq!(fills[0].order_id, "sl_oco");
-        assert!(engine.open_orders.is_empty());
+        assert!(engine.account.open_orders.is_empty());
     }
 
     #[test]
     fn test_oco_tp_triggers_cancels_sl() {
         let mut engine = make_engine(dec!(100000));
         let key = pos_key(STRATEGY, PRODUCT);
-        engine.positions.insert(
+        engine.account.positions.insert(
             key,
             make_position(PRODUCT, STRATEGY, "LONG", dec!(1), dec!(50000)),
         );
@@ -1792,19 +1968,19 @@ mod tests {
         let mut sl = make_order("sl_oco2", "LONG", "STOP_LOSS", Decimal::ZERO, dec!(1));
         sl.trigger_price = Some(dec!(48000));
         sl.linked_order_id = Some("tp_oco2".to_string());
-        engine.open_orders.push(sl);
+        engine.account.open_orders.push(sl);
 
         let mut tp = make_order("tp_oco2", "LONG", "TAKE_PROFIT", Decimal::ZERO, dec!(1));
         tp.trigger_price = Some(dec!(51000));
         tp.linked_order_id = Some("sl_oco2".to_string());
-        engine.open_orders.push(tp);
+        engine.account.open_orders.push(tp);
 
         let candle = make_candle(dec!(50500), dec!(51500), dec!(50000), dec!(51200));
         let fills = engine.process_candle_logic(candle).unwrap();
 
         assert_eq!(fills.len(), 1);
         assert_eq!(fills[0].order_id, "tp_oco2");
-        assert!(engine.open_orders.is_empty());
+        assert!(engine.account.open_orders.is_empty());
     }
 
     #[test]
@@ -1823,7 +1999,7 @@ mod tests {
         for (side, high, low, expected_fill_type) in cases {
             for reverse_submission_order in [false, true] {
                 let mut engine = make_engine(dec!(100000));
-                engine.positions.insert(
+                engine.account.positions.insert(
                     pos_key(STRATEGY, PRODUCT),
                     make_position(PRODUCT, STRATEGY, side, dec!(1), dec!(50000)),
                 );
@@ -1841,9 +2017,9 @@ mod tests {
                 tp.linked_order_id = Some("matrix_sl".to_string());
 
                 if reverse_submission_order {
-                    engine.open_orders.extend([tp, sl]);
+                    engine.account.open_orders.extend([tp, sl]);
                 } else {
-                    engine.open_orders.extend([sl, tp]);
+                    engine.account.open_orders.extend([sl, tp]);
                 }
 
                 let candle = make_candle(dec!(50000), high, low, dec!(50000));
@@ -1853,11 +2029,11 @@ mod tests {
                     Some(expected) => {
                         assert_eq!(fills.len(), 1, "side={side} high={high} low={low}");
                         assert_eq!(fills[0].fill_type, expected);
-                        assert!(engine.open_orders.is_empty());
+                        assert!(engine.account.open_orders.is_empty());
                     }
                     None => {
                         assert!(fills.is_empty(), "side={side} high={high} low={low}");
-                        assert_eq!(engine.open_orders.len(), 2);
+                        assert_eq!(engine.account.open_orders.len(), 2);
                     }
                 }
             }
@@ -1873,13 +2049,13 @@ mod tests {
 
         for (side, trigger, open, high, low) in cases {
             let mut engine = make_engine(dec!(100000));
-            engine.positions.insert(
+            engine.account.positions.insert(
                 pos_key(STRATEGY, PRODUCT),
                 make_position(PRODUCT, STRATEGY, side, dec!(1), dec!(50000)),
             );
             let mut stop = make_order("gap_sl", side, "STOP_LOSS", Decimal::ZERO, dec!(1));
             stop.trigger_price = Some(trigger);
-            engine.open_orders.push(stop);
+            engine.account.open_orders.push(stop);
 
             let fills = engine
                 .process_candle_logic(make_candle(open, high, low, open))
@@ -1893,7 +2069,7 @@ mod tests {
     #[test]
     fn test_market_exit_discards_protection_before_it_can_reopen_position() {
         let mut engine = make_engine(dec!(100000));
-        engine.positions.insert(
+        engine.account.positions.insert(
             pos_key(STRATEGY, PRODUCT),
             make_position(PRODUCT, STRATEGY, "LONG", dec!(1), dec!(100)),
         );
@@ -1905,7 +2081,7 @@ mod tests {
             make_order("take_profit", "LONG", "TAKE_PROFIT", Decimal::ZERO, dec!(1));
         take_profit.trigger_price = Some(dec!(110));
         take_profit.linked_order_id = Some("stop".to_string());
-        engine.open_orders.extend([stop, take_profit, exit]);
+        engine.account.open_orders.extend([stop, take_profit, exit]);
 
         let fills = engine
             .process_candle_logic(make_candle(dec!(100), dec!(115), dec!(85), dec!(100)))
@@ -1913,8 +2089,8 @@ mod tests {
 
         assert_eq!(fills.len(), 1);
         assert_eq!(fills[0].fill_type, "MARKET");
-        assert!(engine.positions.is_empty());
-        assert!(engine.open_orders.is_empty());
+        assert!(engine.account.positions.is_empty());
+        assert!(engine.account.open_orders.is_empty());
     }
 
     #[test]
@@ -1998,7 +2174,7 @@ mod tests {
             cases
         {
             let mut engine = make_engine(dec!(100000));
-            engine.positions.insert(
+            engine.account.positions.insert(
                 pos_key(STRATEGY, PRODUCT),
                 make_position(PRODUCT, STRATEGY, position_side, dec!(1), dec!(100)),
             );
@@ -2019,7 +2195,7 @@ mod tests {
             if protection_type == "TRAILING_STOP" {
                 protection.trailing_distance = Some(dec!(10));
             }
-            engine.open_orders.extend([exit, protection]);
+            engine.account.open_orders.extend([exit, protection]);
 
             let fills = engine
                 .process_candle_logic(make_candle(dec!(100), dec!(115), dec!(85), dec!(100)))
@@ -2032,22 +2208,22 @@ mod tests {
             );
             assert_eq!(fills[0].fill_type, expected_type);
             assert_eq!(fills[0].price, expected_price);
-            assert!(engine.positions.is_empty());
-            assert!(engine.open_orders.is_empty());
+            assert!(engine.account.positions.is_empty());
+            assert!(engine.account.open_orders.is_empty());
         }
     }
 
     #[test]
     fn test_filled_limit_exit_discards_untouched_protection() {
         let mut engine = make_engine(dec!(100000));
-        engine.positions.insert(
+        engine.account.positions.insert(
             pos_key(STRATEGY, PRODUCT),
             make_position(PRODUCT, STRATEGY, "LONG", dec!(1), dec!(100)),
         );
         let exit = make_order("exit", "SHORT", "LIMIT", dec!(110), dec!(1));
         let mut stop = make_order("stop", "LONG", "STOP_LOSS", Decimal::ZERO, dec!(1));
         stop.trigger_price = Some(dec!(90));
-        engine.open_orders.extend([exit, stop]);
+        engine.account.open_orders.extend([exit, stop]);
 
         let fills = engine
             .process_candle_logic(make_candle(dec!(100), dec!(115), dec!(95), dec!(110)))
@@ -2055,8 +2231,8 @@ mod tests {
 
         assert_eq!(fills.len(), 1);
         assert_eq!(fills[0].fill_type, "LIMIT");
-        assert!(engine.positions.is_empty());
-        assert!(engine.open_orders.is_empty());
+        assert!(engine.account.positions.is_empty());
+        assert!(engine.account.open_orders.is_empty());
     }
 
     #[test]
@@ -2078,7 +2254,7 @@ mod tests {
 
         for (side, trigger, distance, candle) in cases {
             let mut engine = make_engine(dec!(100000));
-            engine.positions.insert(
+            engine.account.positions.insert(
                 pos_key(STRATEGY, PRODUCT),
                 make_position(PRODUCT, STRATEGY, side, dec!(1), dec!(50000)),
             );
@@ -2091,7 +2267,7 @@ mod tests {
             );
             trailing.trigger_price = Some(trigger);
             trailing.trailing_distance = Some(distance);
-            engine.open_orders.push(trailing);
+            engine.account.open_orders.push(trailing);
 
             let fills = engine.process_candle_logic(candle).unwrap();
 
@@ -2119,7 +2295,7 @@ mod tests {
 
         for (side, old_trigger, expected_fill, candle) in cases {
             let mut engine = make_engine(dec!(100000));
-            engine.positions.insert(
+            engine.account.positions.insert(
                 pos_key(STRATEGY, PRODUCT),
                 make_position(PRODUCT, STRATEGY, side, dec!(1), dec!(50000)),
             );
@@ -2132,7 +2308,7 @@ mod tests {
             );
             trailing.trigger_price = Some(old_trigger);
             trailing.trailing_distance = Some(dec!(1000));
-            engine.open_orders.push(trailing);
+            engine.account.open_orders.push(trailing);
 
             let fills = engine.process_candle_logic(candle).unwrap();
 
@@ -2158,7 +2334,7 @@ mod tests {
 
         for (side, expected_fill, candle) in cases {
             let mut engine = make_engine(dec!(100000));
-            engine.positions.insert(
+            engine.account.positions.insert(
                 pos_key(STRATEGY, PRODUCT),
                 make_position(PRODUCT, STRATEGY, side, dec!(1), dec!(100)),
             );
@@ -2170,7 +2346,7 @@ mod tests {
                 dec!(1),
             );
             trailing.trailing_distance = Some(dec!(10));
-            engine.open_orders.push(trailing);
+            engine.account.open_orders.push(trailing);
 
             let fills = engine.process_candle_logic(candle).unwrap();
 
@@ -2184,22 +2360,30 @@ mod tests {
     #[test]
     fn test_position_add_to_existing_averages_cost() {
         let mut engine = make_engine(dec!(100000));
-        engine
-            .open_orders
-            .push(make_order("add1", "LONG", "MARKET", Decimal::ZERO, dec!(1)));
+        engine.account.open_orders.push(make_order(
+            "add1",
+            "LONG",
+            "MARKET",
+            Decimal::ZERO,
+            dec!(1),
+        ));
 
         let c1 = make_candle(dec!(50000), dec!(51000), dec!(49000), dec!(50500));
         engine.process_candle_logic(c1).unwrap();
 
-        engine
-            .open_orders
-            .push(make_order("add2", "LONG", "MARKET", Decimal::ZERO, dec!(1)));
+        engine.account.open_orders.push(make_order(
+            "add2",
+            "LONG",
+            "MARKET",
+            Decimal::ZERO,
+            dec!(1),
+        ));
 
         let c2 = make_candle(dec!(52000), dec!(53000), dec!(51000), dec!(52500));
         engine.process_candle_logic(c2).unwrap();
 
         let key = pos_key(STRATEGY, PRODUCT);
-        let pos = engine.positions.get(&key).unwrap();
+        let pos = engine.account.positions.get(&key).unwrap();
         assert_eq!(pos.quantity, dec!(2));
         // avg: (50000*1 + 52000*1) / 2 = 51000
         assert_eq!(pos.entry_price, dec!(51000));
@@ -2209,19 +2393,19 @@ mod tests {
     fn test_position_partial_close_reduces_quantity() {
         let mut engine = make_engine(dec!(100000));
         let key = pos_key(STRATEGY, PRODUCT);
-        engine.positions.insert(
+        engine.account.positions.insert(
             key.clone(),
             make_position(PRODUCT, STRATEGY, "LONG", dec!(2), dec!(50000)),
         );
 
         let mut sl = make_order("pc1", "LONG", "STOP_LOSS", Decimal::ZERO, dec!(1));
         sl.trigger_price = Some(dec!(49000));
-        engine.open_orders.push(sl);
+        engine.account.open_orders.push(sl);
 
         let candle = make_candle(dec!(50000), dec!(50500), dec!(48500), dec!(49200));
         engine.process_candle_logic(candle).unwrap();
 
-        let pos = engine.positions.get(&key).unwrap();
+        let pos = engine.account.positions.get(&key).unwrap();
         assert_eq!(pos.quantity, dec!(1));
         assert_eq!(pos.side, "LONG");
     }
@@ -2230,12 +2414,12 @@ mod tests {
     fn test_position_flip_long_to_short() {
         let mut engine = make_engine(dec!(100000));
         let key = pos_key(STRATEGY, PRODUCT);
-        engine.positions.insert(
+        engine.account.positions.insert(
             key.clone(),
             make_position(PRODUCT, STRATEGY, "LONG", dec!(1), dec!(50000)),
         );
 
-        engine.open_orders.push(make_order(
+        engine.account.open_orders.push(make_order(
             "flip1",
             "SHORT",
             "MARKET",
@@ -2248,14 +2432,14 @@ mod tests {
 
         assert_eq!(fills.len(), 1);
 
-        let pos = engine.positions.get(&key).unwrap();
+        let pos = engine.account.positions.get(&key).unwrap();
         assert_eq!(pos.side, "SHORT");
         assert_eq!(pos.quantity, dec!(1));
         assert_eq!(pos.entry_price, dec!(48000));
 
         // Realized PnL from closing long: (48000 - 50000) * 1 = -2000
         let expected_balance = dec!(100000) - dec!(2000) - fills[0].fee;
-        assert_eq!(engine.balance, expected_balance);
+        assert_eq!(engine.account.balance, expected_balance);
     }
 
     // ── Cancel Order ──
@@ -2264,16 +2448,18 @@ mod tests {
     fn test_cancel_order_removes_from_open_orders() {
         let mut engine = make_engine(dec!(100000));
         engine
+            .account
             .open_orders
             .push(make_order("c1", "LONG", "LIMIT", dec!(49000), dec!(1)));
         engine
+            .account
             .open_orders
             .push(make_order("c2", "SHORT", "LIMIT", dec!(51000), dec!(1)));
 
         let removed = engine.cancel_order("c1".to_string());
         assert!(removed);
-        assert_eq!(engine.open_orders.len(), 1);
-        assert_eq!(engine.open_orders[0].id, "c2");
+        assert_eq!(engine.account.open_orders.len(), 1);
+        assert_eq!(engine.account.open_orders[0].id, "c2");
     }
 
     #[test]
@@ -2289,15 +2475,19 @@ mod tests {
     fn test_order_priority_market_before_conditional() {
         let mut engine = make_engine(dec!(100000));
 
-        engine
-            .open_orders
-            .push(make_order("mkt", "LONG", "MARKET", Decimal::ZERO, dec!(1)));
+        engine.account.open_orders.push(make_order(
+            "mkt",
+            "LONG",
+            "MARKET",
+            Decimal::ZERO,
+            dec!(1),
+        ));
         let mut sl = make_order("cond", "LONG", "STOP_LOSS", Decimal::ZERO, dec!(0.5));
         sl.trigger_price = Some(dec!(49500));
-        engine.open_orders.push(sl);
+        engine.account.open_orders.push(sl);
 
         let key = pos_key(STRATEGY, PRODUCT);
-        engine.positions.insert(
+        engine.account.positions.insert(
             key,
             make_position(PRODUCT, STRATEGY, "LONG", dec!(0.5), dec!(50000)),
         );
@@ -2325,22 +2515,20 @@ mod tests {
         let mut engine = make_engine(dec!(100000));
         let mut sl = make_order("flat_sl", "LONG", "STOP_LOSS", Decimal::ZERO, dec!(1));
         sl.trigger_price = Some(dec!(49000));
-        engine.open_orders.push(sl);
+        engine.account.open_orders.push(sl);
 
         let candle = make_candle(dec!(50000), dec!(50500), dec!(48000), dec!(49200));
         let fills = engine.process_candle_logic(candle).unwrap();
 
         assert!(fills.is_empty());
-        assert!(engine.open_orders.is_empty());
-        assert_eq!(engine.balance, dec!(100000));
+        assert!(engine.account.open_orders.is_empty());
+        assert_eq!(engine.account.balance, dec!(100000));
     }
 
     #[test]
     fn test_zero_fee_engine() {
         let mut engine = PyMatchingEngine {
-            balance: dec!(100000),
-            positions: HashMap::new(),
-            open_orders: Vec::new(),
+            account: AccountState::new(dec!(100000), None),
             maker_fee: Decimal::ZERO,
             taker_fee: Decimal::ZERO,
             market_slippage_bps: Decimal::ZERO,
@@ -2348,23 +2536,24 @@ mod tests {
             contract_multiplier: Decimal::ONE,
             fee_model: FeeModel::PercentageNotional,
             settlement_model: SettlementModel::Derivatives,
-            spot_ledger: None,
-            spot_cost_basis: Decimal::ZERO,
-            spot_realized_pnl: Decimal::ZERO,
             rejections: Vec::new(),
             warnings: Vec::new(),
             scaled_price_tick: None,
             scaled_volume_step: None,
         };
-        engine
-            .open_orders
-            .push(make_order("zf1", "LONG", "MARKET", Decimal::ZERO, dec!(1)));
+        engine.account.open_orders.push(make_order(
+            "zf1",
+            "LONG",
+            "MARKET",
+            Decimal::ZERO,
+            dec!(1),
+        ));
 
         let candle = make_candle(dec!(50000), dec!(51000), dec!(49000), dec!(50500));
         let fills = engine.process_candle_logic(candle).unwrap();
 
         assert_eq!(fills[0].fee, Decimal::ZERO);
-        assert_eq!(engine.balance, dec!(100000));
+        assert_eq!(engine.account.balance, dec!(100000));
     }
 
     #[test]
@@ -2373,7 +2562,7 @@ mod tests {
         engine.maker_fee = Decimal::ZERO;
         engine.taker_fee = Decimal::ZERO;
         engine.contract_multiplier = dec!(2);
-        engine.positions.insert(
+        engine.account.positions.insert(
             pos_key(STRATEGY, PRODUCT),
             make_position(PRODUCT, STRATEGY, "LONG", dec!(1), dec!(100)),
         );
@@ -2381,8 +2570,8 @@ mod tests {
 
         settlement::settle_fill(&mut engine, &order, dec!(110), true, Decimal::ZERO).unwrap();
 
-        assert_eq!(engine.balance, dec!(100020));
-        assert!(engine.positions.is_empty());
+        assert_eq!(engine.account.balance, dec!(100020));
+        assert!(engine.account.positions.is_empty());
     }
 
     #[test]
@@ -2391,7 +2580,7 @@ mod tests {
         engine.maker_fee = Decimal::ZERO;
         engine.taker_fee = Decimal::ZERO;
         engine.contract_multiplier = dec!(2);
-        engine.positions.insert(
+        engine.account.positions.insert(
             pos_key(STRATEGY, PRODUCT),
             make_position(PRODUCT, STRATEGY, "SHORT", dec!(2), dec!(100)),
         );
@@ -2399,7 +2588,7 @@ mod tests {
 
         settlement::settle_fill(&mut engine, &order, dec!(90), true, Decimal::ZERO).unwrap();
 
-        assert_eq!(engine.balance, dec!(100020));
+        assert_eq!(engine.account.balance, dec!(100020));
         assert_position(&engine, STRATEGY, PRODUCT, "SHORT", dec!(1), dec!(100));
     }
 
@@ -2413,7 +2602,7 @@ mod tests {
             settlement::settle_fill(&mut engine, &order, dec!(10), true, dec!(1.5)).unwrap();
 
         assert_eq!(reported_fee, dec!(1.5));
-        assert_eq!(engine.balance, dec!(98.5));
+        assert_eq!(engine.account.balance, dec!(98.5));
         assert_position(&engine, STRATEGY, PRODUCT, "LONG", dec!(1), dec!(10));
     }
 
@@ -2450,12 +2639,12 @@ mod tests {
         // Strategy A goes LONG
         let mut order_a = make_order("a1", "LONG", "MARKET", Decimal::ZERO, dec!(1));
         order_a.strategy_id = "strategy_a".to_string();
-        engine.open_orders.push(order_a);
+        engine.account.open_orders.push(order_a);
 
         // Strategy B goes SHORT on the same product
         let mut order_b = make_order("b1", "SHORT", "MARKET", Decimal::ZERO, dec!(0.5));
         order_b.strategy_id = "strategy_b".to_string();
-        engine.open_orders.push(order_b);
+        engine.account.open_orders.push(order_b);
 
         let candle = make_candle(dec!(50000), dec!(51000), dec!(49000), dec!(50500));
         let fills = engine.process_candle_logic(candle).unwrap();
@@ -2468,12 +2657,12 @@ mod tests {
         let key_a = pos_key("strategy_a", PRODUCT);
         let key_b = pos_key("strategy_b", PRODUCT);
 
-        let pos_a = engine.positions.get(&key_a).unwrap();
+        let pos_a = engine.account.positions.get(&key_a).unwrap();
         assert_eq!(pos_a.side, "LONG");
         assert_eq!(pos_a.quantity, dec!(1));
         assert_eq!(pos_a.strategy_id, "strategy_a");
 
-        let pos_b = engine.positions.get(&key_b).unwrap();
+        let pos_b = engine.account.positions.get(&key_b).unwrap();
         assert_eq!(pos_b.side, "SHORT");
         assert_eq!(pos_b.quantity, dec!(0.5));
         assert_eq!(pos_b.strategy_id, "strategy_b");
@@ -2486,11 +2675,11 @@ mod tests {
         let key_b = pos_key("strategy_b", PRODUCT);
 
         // Both strategies have LONG positions
-        engine.positions.insert(
+        engine.account.positions.insert(
             key_a.clone(),
             make_position(PRODUCT, "strategy_a", "LONG", dec!(1), dec!(50000)),
         );
-        engine.positions.insert(
+        engine.account.positions.insert(
             key_b.clone(),
             make_position(PRODUCT, "strategy_b", "LONG", dec!(2), dec!(48000)),
         );
@@ -2499,7 +2688,7 @@ mod tests {
         let mut sl_a = make_order("sl_a", "LONG", "STOP_LOSS", Decimal::ZERO, dec!(1));
         sl_a.strategy_id = "strategy_a".to_string();
         sl_a.trigger_price = Some(dec!(49000));
-        engine.open_orders.push(sl_a);
+        engine.account.open_orders.push(sl_a);
 
         let candle = make_candle(dec!(50000), dec!(50500), dec!(48500), dec!(49200));
         let fills = engine.process_candle_logic(candle).unwrap();
@@ -2508,10 +2697,10 @@ mod tests {
         assert_eq!(fills[0].strategy_id, "strategy_a");
 
         // Strategy A's position is closed
-        assert!(!engine.positions.contains_key(&key_a));
+        assert!(!engine.account.positions.contains_key(&key_a));
 
         // Strategy B's position is untouched
-        let pos_b = engine.positions.get(&key_b).unwrap();
+        let pos_b = engine.account.positions.get(&key_b).unwrap();
         assert_eq!(pos_b.side, "LONG");
         assert_eq!(pos_b.quantity, dec!(2));
         assert_eq!(pos_b.entry_price, dec!(48000));
@@ -2524,12 +2713,12 @@ mod tests {
         let key_b = pos_key("strategy_b", PRODUCT);
 
         // Strategy A: LONG 1 BTC @ 50000
-        engine.positions.insert(
+        engine.account.positions.insert(
             key_a.clone(),
             make_position(PRODUCT, "strategy_a", "LONG", dec!(1), dec!(50000)),
         );
         // Strategy B: SHORT 1 BTC @ 50000
-        engine.positions.insert(
+        engine.account.positions.insert(
             key_b.clone(),
             make_position(PRODUCT, "strategy_b", "SHORT", dec!(1), dec!(50000)),
         );
@@ -2538,13 +2727,13 @@ mod tests {
         let mut tp_a = make_order("tp_a", "LONG", "TAKE_PROFIT", Decimal::ZERO, dec!(1));
         tp_a.strategy_id = "strategy_a".to_string();
         tp_a.trigger_price = Some(dec!(52000));
-        engine.open_orders.push(tp_a);
+        engine.account.open_orders.push(tp_a);
 
         // Strategy B closes with SL at 52000 (-2000 PnL)
         let mut sl_b = make_order("sl_b", "SHORT", "STOP_LOSS", Decimal::ZERO, dec!(1));
         sl_b.strategy_id = "strategy_b".to_string();
         sl_b.trigger_price = Some(dec!(52000));
-        engine.open_orders.push(sl_b);
+        engine.account.open_orders.push(sl_b);
 
         let candle = make_candle(dec!(51000), dec!(52500), dec!(50500), dec!(52000));
         let fills = engine.process_candle_logic(candle).unwrap();
@@ -2552,19 +2741,19 @@ mod tests {
         assert_eq!(fills.len(), 2);
 
         // Both positions closed
-        assert!(!engine.positions.contains_key(&key_a));
-        assert!(!engine.positions.contains_key(&key_b));
+        assert!(!engine.account.positions.contains_key(&key_a));
+        assert!(!engine.account.positions.contains_key(&key_b));
 
         // Net PnL = +2000 - 2000 = 0, minus fees
         let total_fees = fills[0].fee + fills[1].fee;
-        assert_eq!(engine.balance, dec!(100000) - total_fees);
+        assert_eq!(engine.account.balance, dec!(100000) - total_fees);
     }
 
     #[test]
     fn test_get_position_method() {
         let mut engine = make_engine(dec!(100000));
         let key = pos_key("my_strategy", PRODUCT);
-        engine.positions.insert(
+        engine.account.positions.insert(
             key,
             make_position(PRODUCT, "my_strategy", "LONG", dec!(1), dec!(50000)),
         );
@@ -2592,11 +2781,11 @@ mod tests {
         // Open positions for two strategies
         let mut order_a = make_order("a1", "LONG", "MARKET", Decimal::ZERO, dec!(1));
         order_a.strategy_id = "alpha".to_string();
-        engine.open_orders.push(order_a);
+        engine.account.open_orders.push(order_a);
 
         let mut order_b = make_order("b1", "SHORT", "MARKET", Decimal::ZERO, dec!(1));
         order_b.strategy_id = "beta".to_string();
-        engine.open_orders.push(order_b);
+        engine.account.open_orders.push(order_b);
 
         let candle = make_candle(dec!(50000), dec!(51000), dec!(49000), dec!(50500));
         engine.process_candle_logic(candle).unwrap();
@@ -2648,6 +2837,59 @@ mod tests {
     }
 
     #[test]
+    fn spot_account_owner_contains_reservations_and_settlement_totals() {
+        let mut engine = make_spot_engine(dec!(100), Decimal::ZERO, Decimal::ZERO, "quote");
+        assert_eq!(engine.account.spot_cost_basis, Decimal::ZERO);
+        assert_eq!(engine.account.spot_realized_pnl, Decimal::ZERO);
+        assert!(engine.account.positions.is_empty());
+        assert!(engine.account.open_orders.is_empty());
+        let buy = make_spot_order("buy", "LONG", "LIMIT", dec!(10), dec!(2));
+        engine.submit_order(buy.clone()).unwrap();
+        assert_eq!(
+            engine
+                .account
+                .spot_ledger
+                .as_ref()
+                .unwrap()
+                .quote_reserved(),
+            dec!(20)
+        );
+        settlement::settle_fill(&mut engine, &buy, dec!(10), false, Decimal::ZERO).unwrap();
+        assert_eq!(
+            engine
+                .account
+                .spot_ledger
+                .as_ref()
+                .unwrap()
+                .quote_reserved(),
+            Decimal::ZERO
+        );
+        assert_eq!(engine.account.spot_cost_basis, dec!(20));
+        assert_eq!(
+            engine.account.positions.values().next().unwrap().quantity,
+            dec!(2)
+        );
+        // Settlement does not own matching's removal from the open-order queue.
+        assert_eq!(engine.account.open_orders.len(), 1);
+        let sell = make_spot_order("sell", "SHORT", "LIMIT", dec!(12), dec!(1));
+        engine.submit_order(sell.clone()).unwrap();
+        settlement::settle_fill(&mut engine, &sell, dec!(12), false, Decimal::ZERO).unwrap();
+        assert_eq!(engine.account.spot_cost_basis, dec!(10));
+        assert_eq!(engine.account.spot_realized_pnl, dec!(2));
+        assert_eq!(
+            engine.account.spot_ledger.as_ref().unwrap().base_reserved(),
+            Decimal::ZERO
+        );
+        let mut snapshot = engine.cash_spot_account_snapshot("12".into()).unwrap();
+        assert_eq!(snapshot["quote_total"], "92");
+        snapshot.insert("quote_total".into(), "0".into());
+        assert_eq!(
+            engine.cash_spot_account_snapshot("12".into()).unwrap()["quote_total"],
+            "92"
+        );
+    }
+
+    #[test]
     fn characterization_spot_rejection_and_oco_trace_is_exact() {
         let mut engine = make_spot_engine(dec!(100), Decimal::ZERO, Decimal::ZERO, "quote");
         engine
@@ -2680,10 +2922,10 @@ mod tests {
         assert_eq!(exit_fills[0].price, dec!(40));
         assert_eq!(engine.get_asset_balance("USDT", "total").unwrap(), "90");
         assert_eq!(engine.get_asset_balance("BTC", "total").unwrap(), "0");
-        assert_eq!(engine.spot_cost_basis, Decimal::ZERO);
-        assert_eq!(engine.spot_realized_pnl, dec!(-10));
-        assert!(engine.positions.is_empty());
-        assert!(engine.open_orders.is_empty());
+        assert_eq!(engine.account.spot_cost_basis, Decimal::ZERO);
+        assert_eq!(engine.account.spot_realized_pnl, dec!(-10));
+        assert!(engine.account.positions.is_empty());
+        assert!(engine.account.open_orders.is_empty());
 
         let mut rejected = make_spot_engine(dec!(50), Decimal::ZERO, Decimal::ZERO, "quote");
         rejected
@@ -2696,8 +2938,8 @@ mod tests {
         assert_eq!(rejected.get_asset_balance("USDT", "total").unwrap(), "50");
         assert_eq!(rejected.get_asset_balance("USDT", "reserved").unwrap(), "0");
         assert_eq!(rejected.get_asset_balance("BTC", "total").unwrap(), "0");
-        assert!(rejected.positions.is_empty());
-        assert!(rejected.open_orders.is_empty());
+        assert!(rejected.account.positions.is_empty());
+        assert!(rejected.account.open_orders.is_empty());
         let rejections = rejected.drain_rejections();
         assert_eq!(rejections.len(), 1);
         assert_eq!(rejections[0]["order_id"], "gap");
@@ -2716,7 +2958,7 @@ mod tests {
         assert_eq!(engine.get_asset_balance("USDT", "total").unwrap(), "100");
         assert_eq!(engine.get_asset_balance("USDT", "reserved").unwrap(), "50");
         assert_eq!(engine.get_asset_balance("BTC", "total").unwrap(), "0");
-        assert!(engine.positions.is_empty());
+        assert!(engine.account.positions.is_empty());
 
         engine.reject_order(&order, 1000, reason);
         assert_eq!(engine.get_asset_balance("USDT", "reserved").unwrap(), "0");
@@ -2808,7 +3050,7 @@ mod tests {
             Decimal::from_str(&engine.get_asset_balance("USDT", "total").unwrap()).unwrap(),
             dec!(99.80000)
         );
-        assert_eq!(engine.spot_realized_pnl, dec!(-0.20000));
+        assert_eq!(engine.account.spot_realized_pnl, dec!(-0.20000));
     }
 
     #[test]
@@ -2859,7 +3101,7 @@ mod tests {
             .unwrap();
 
         assert!(fills.is_empty());
-        assert!(engine.positions.is_empty());
+        assert!(engine.account.positions.is_empty());
         assert_eq!(engine.get_asset_balance("USDT", "total").unwrap(), "100");
         assert_eq!(
             engine.get_asset_balance("USDT", "reserved").unwrap(),
