@@ -59,6 +59,15 @@ pub(super) struct Decision {
     pub insolvent: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Stage {
+    Prepared,
+    ActionDrafted(usize),
+    BeforeSwap(usize),
+    LiquidationPrepared(i64),
+    LiquidationBeforeSwap(i64),
+}
+
 impl ScenarioAccount {
     pub(super) fn execution_snapshot_after(
         &mut self,
@@ -138,14 +147,10 @@ impl ScenarioAccount {
         })
     }
 
-    pub(super) fn immediate_risk(&mut self, stamp: &cancel::Stamp) -> Result<(), Fault> {
-        self.immediate_risk_checked(stamp, |_| Ok(()))
-    }
-
     pub(super) fn immediate_risk_checked(
         &mut self,
         stamp: &cancel::Stamp,
-        hook: impl FnMut(cancel::Stage) -> Result<(), Fault>,
+        mut hook: impl FnMut(Stage) -> Result<(), Fault>,
     ) -> Result<(), Fault> {
         if !matches!(self.profile, ProfileContext::BtcEthScenario { .. }) {
             self.transition.lifecycle = if self
@@ -173,11 +178,11 @@ impl ScenarioAccount {
                         .map(|id| (id.clone(), decision.reason.expect("selected policy")))
                         .collect(),
                 },
-                hook,
+                &mut hook,
             )?;
         }
         if decision.liquidation_required && self.gate == Gate::Running {
-            self.gate = Gate::Failed("UNSUPPORTED_RISK_TRANSITION");
+            self.liquidation_loop(hook)?;
         }
         Ok(())
     }

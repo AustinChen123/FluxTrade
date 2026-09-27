@@ -83,6 +83,8 @@ pub(super) enum Stage {
     AfterSwap,
     RiskActionDrafted(usize),
     RiskBeforeSwap,
+    LiquidationPrepared(i64),
+    LiquidationBeforeSwap(i64),
 }
 
 impl ScenarioAccount {
@@ -117,6 +119,12 @@ impl ScenarioAccount {
                             hook(Stage::RiskBeforeSwap)
                         }
                         risk_transition::cancel::Stage::Prepared => Ok(()),
+                        risk_transition::Stage::LiquidationPrepared(step) => {
+                            hook(Stage::LiquidationPrepared(step))
+                        }
+                        risk_transition::Stage::LiquidationBeforeSwap(step) => {
+                            hook(Stage::LiquidationBeforeSwap(step))
+                        }
                     })
                 }))
                 .map_err(|_| "CONTEXT_PANIC")

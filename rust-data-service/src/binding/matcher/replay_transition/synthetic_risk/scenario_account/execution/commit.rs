@@ -20,6 +20,7 @@ pub(in super::super) enum Stage {
     OrdersDrafted,
     Valued,
     ReceiptDrafted,
+    Risk(risk_transition::Stage),
 }
 
 impl ScenarioAccount {
@@ -93,7 +94,9 @@ impl ScenarioAccount {
             Ok((reply, draft)) => {
                 if let Some(draft) = draft {
                     *self = draft;
-                    if let Err(fault) = self.immediate_risk(stamp) {
+                    if let Err(fault) =
+                        self.immediate_risk_checked(stamp, |stage| hook(Stage::Risk(stage)))
+                    {
                         return Err(self.fail_execution(fault));
                     }
                     if let Reply::Committed { receipt, .. } = reply {
@@ -274,4 +277,4 @@ mod cancel_tests;
 #[cfg(test)]
 mod review_tests;
 #[cfg(test)]
-mod tests;
+pub(in super::super) mod tests;

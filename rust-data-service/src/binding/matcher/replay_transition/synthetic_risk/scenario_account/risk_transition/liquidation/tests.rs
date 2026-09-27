@@ -55,7 +55,7 @@ pub(super) fn anchor(
 }
 
 #[test]
-fn long_short_exact_preparation_is_pure_and_production_remains_unwired() {
+fn long_short_exact_preparation_is_pure_and_integrated_result_reconciles() {
     for (side, quantity, cash, at, mark, qty, fee, pnl, equity, mmr, decision) in [
         (
             Side::Long,
@@ -145,9 +145,24 @@ fn long_short_exact_preparation_is_pure_and_production_remains_unwired() {
         let (_, marks) = production.btc_context().unwrap();
         let input = activation(&production, at + 1, mark_rows(marks, at + 1));
         production.activate_context(&input).unwrap();
-        assert_eq!(production.gate, Gate::Failed("UNSUPPORTED_RISK_TRANSITION"));
-        assert_eq!(production.fees, Decimal::ZERO);
-        assert_eq!(production.positions, owner.positions);
+        assert_eq!(production.gate, Gate::Running);
+        assert_eq!(
+            production.fees,
+            d(if side == Side::Long {
+                "3006.98398"
+            } else {
+                "3.01602"
+            })
+        );
+        assert_eq!(
+            production.cash,
+            d(if side == Side::Long {
+                "-1007.98398"
+            } else {
+                "-1.01602"
+            })
+        );
+        assert!(production.positions.is_empty());
     }
 }
 

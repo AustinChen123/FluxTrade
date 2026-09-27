@@ -175,12 +175,7 @@ pub(in super::super) struct Facts {
     pub actions: BTreeMap<Hash, Action>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in super::super) enum Stage {
-    Prepared,
-    ActionDrafted(usize),
-    BeforeSwap(usize),
-}
+pub(in super::super) use super::Stage;
 
 impl ScenarioAccount {
     pub(in super::super) fn automatic_cancel(&mut self, input: &RequestInput) -> Result<(), Fault> {
@@ -625,7 +620,7 @@ impl ScenarioAccount {
                 Ok((draft, receipt)) => {
                     *self = draft;
                     batch.receipts.push(receipt);
-                    if let Err(f) = self.immediate_risk(&input.stamp) {
+                    if let Err(f) = self.immediate_risk_checked(&input.stamp, &mut hook) {
                         batch.failure = Some(self.cancel_failure(f));
                         batch.stopping_action = Some(action.id);
                         break;

@@ -4,6 +4,15 @@ use cancel::identity::{classify, Encoding, Stored};
 use hypothetical_settlement::FeePolicy;
 mod commit;
 
+impl ScenarioAccount {
+    pub(in super::super) fn liquidation_ids(&self) -> impl Iterator<Item = Hash> + '_ {
+        self.transition
+            .liquidations
+            .iter()
+            .map(|r| r.liquidation_id)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StepDecision {
     ContinueLiquidation,
@@ -320,5 +329,7 @@ fn prepare(owner: &ScenarioAccount, history: &[Receipt]) -> Result<Receipt, Faul
     prepare_step(owner, history).map(|p| p.receipt)
 }
 
+#[cfg(test)]
+mod integration_tests;
 #[cfg(test)]
 mod tests;

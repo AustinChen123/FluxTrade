@@ -97,10 +97,15 @@ fn exact_mmr_boundary_requests_reducing_order_and_stops_only_after_effect() {
                 )],
             };
             let result = owner.effect_cancel(&effect).unwrap();
-            assert_eq!(owner.state_version, 3);
+            assert_eq!(owner.state_version, 4);
             assert_eq!(owner.orders["O1"].version, 2);
-            assert_eq!(owner.reservation().unwrap().used_margin, d("50"));
-            assert_eq!(owner.gate, Gate::Failed("UNSUPPORTED_RISK_TRANSITION"));
+            assert_eq!(owner.reservation().unwrap().used_margin, d("0"));
+            assert_eq!(owner.gate, Gate::Running);
+            assert_eq!(
+                owner.cash,
+                d(if cash == "2.99" { "-1.02" } else { "-1.01" })
+            );
+            assert_eq!(owner.transition.lifecycle, Lifecycle::LiquidatedInsolvent);
             assert!(
                 result.receipts[0]
                     .risk_after
@@ -108,8 +113,8 @@ fn exact_mmr_boundary_requests_reducing_order_and_stops_only_after_effect() {
                     .unwrap()
                     .liquidation_required
             );
-            assert_eq!(owner.commit_sequence, 1);
-            assert_eq!(owner.fees, Decimal::ZERO);
+            assert_eq!(owner.commit_sequence, 2);
+            assert_eq!(owner.fees, d("3.01"));
         } else {
             assert!(owner.transition.episode.is_none());
             assert!(owner.transition.batches.is_empty());
@@ -121,7 +126,7 @@ fn exact_mmr_boundary_requests_reducing_order_and_stops_only_after_effect() {
 }
 
 #[test]
-fn tier_activation_retains_fact_at_missing_liquidation_boundary() {
+fn tier_activation_retains_source_fact_before_exact_liquidation() {
     let (mut seed, config, marks) = fixture();
     seed.effective_at = 999;
     seed.cash = d("2100");
@@ -147,9 +152,12 @@ fn tier_activation_retains_fact_at_missing_liquidation_boundary() {
     assert_eq!(receipt.after.maintenance_margin, d("2250"));
     assert_eq!(receipt.after.equity, d("2100"));
     assert_eq!(receipt.after.available_margin, d("-47900"));
-    assert_eq!(owner.state_version, 1);
-    assert_eq!(owner.gate, Gate::Failed("UNSUPPORTED_RISK_TRANSITION"));
-    assert_eq!(owner.fees, Decimal::ZERO);
+    assert_eq!(owner.state_version, 2);
+    assert_eq!(owner.gate, Gate::Running);
+    assert_eq!(owner.fees, d("3010"));
+    assert_eq!(owner.cash, d("-910"));
+    assert_eq!(receipt.after_version, 1);
+    assert_eq!(owner.transition.lifecycle, Lifecycle::LiquidatedInsolvent);
     assert_eq!(owner.seed_effective_at, 999);
 }
 
@@ -409,7 +417,10 @@ fn context_and_group_invalid_shape_and_fault_retention_are_atomic() {
     }
     let mut owner = original.clone();
     let result = owner.apply_group(&group).unwrap();
-    assert_eq!(result.committed, vec!["activate"]);
+    assert_eq!(
+        result.committed,
+        vec![group::Reference::Source("activate".into())]
+    );
     let before = owner.clone();
     assert_eq!(owner.apply_group(&group).unwrap(), result);
     assert_eq!(owner, before);

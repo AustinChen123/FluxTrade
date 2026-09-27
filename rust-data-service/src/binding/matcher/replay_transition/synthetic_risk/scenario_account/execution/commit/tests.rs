@@ -2,6 +2,50 @@ use super::super::super::tests::{d, fixture};
 use super::super::tests::fixture_candidate;
 use super::*;
 
+#[test]
+fn liquidation_fault_after_execution_retains_immutable_source_commit() {
+    for panic in [false, true] {
+        let mut owner = flat("2.1", "50000", &[(Side::Long, "1", "50000")]);
+        let candidate = input(&owner, "O0", "risk", "1", "50000");
+        let fault = if panic {
+            "LIQUIDATION_PANIC"
+        } else {
+            "INJECTED_LIQUIDATION"
+        };
+        assert_eq!(
+            owner.execute_checked(&candidate, |stage| {
+                if stage == Stage::Risk(risk_transition::Stage::LiquidationBeforeSwap(1)) {
+                    if panic {
+                        panic!("liquidation hook");
+                    }
+                    return Err("INJECTED_LIQUIDATION");
+                }
+                Ok(())
+            }),
+            Err(fault)
+        );
+        assert_eq!(
+            (
+                owner.cash,
+                owner.fees,
+                owner.state_version,
+                owner.commit_sequence
+            ),
+            (d("1.6"), d("0.5"), 1, 1)
+        );
+        assert_eq!(
+            owner.positions.btc().unwrap()[&Product::Btc].contracts,
+            d("1")
+        );
+        assert_eq!(owner.execution_receipts.len(), 1);
+        assert_eq!(owner.liquidation_ids().count(), 0);
+        assert_eq!(owner.gate, Gate::Failed(fault));
+        let before = owner.clone();
+        assert!(matches!(owner.execute(&candidate), Ok(Reply::Duplicate(_))));
+        assert_eq!(owner, before);
+    }
+}
+
 fn flat(cash: &str, mark: &str, orders: &[(Side, &str, &str)]) -> ScenarioAccount {
     let (mut seed, config, mut marks) = fixture();
     seed.cash = d(cash);
@@ -29,7 +73,7 @@ fn flat(cash: &str, mark: &str, orders: &[(Side, &str, &str)]) -> ScenarioAccoun
     ScenarioAccount::from_seed(&seed, &config, &marks).unwrap()
 }
 
-pub(super) fn input(
+pub(in super::super::super) fn input(
     owner: &ScenarioAccount,
     order_id: &str,
     execution: &str,
@@ -392,7 +436,7 @@ fn every_prepublication_fault_and_panic_discards_the_draft() {
 }
 
 #[test]
-fn committed_risk_failure_is_retained_and_negative_available_can_be_stable() {
+fn committed_source_receipt_survives_liquidation_and_negative_available_can_be_stable() {
     for (cash, extra_order, failed) in [
         ("2.1", false, true),
         ("40", true, false),
@@ -411,19 +455,27 @@ fn committed_risk_failure_is_retained_and_negative_available_can_be_stable() {
         else {
             panic!("must retain commit");
         };
-        assert_eq!(
-            terminal_reason,
-            failed.then_some("UNSUPPORTED_RISK_TRANSITION")
-        );
+        assert_eq!(terminal_reason, None);
         assert_eq!(
             (
                 owner.state_version,
                 owner.orders["O0"].version,
                 owner.commit_sequence
             ),
-            (if extra_order { 2 } else { 1 }, 1, 1)
+            (
+                if extra_order || failed { 2 } else { 1 },
+                1,
+                if failed { 2 } else { 1 }
+            )
         );
-        assert_eq!(owner.cash, d(cash) - d("0.5"));
+        assert_eq!(
+            owner.cash,
+            if failed {
+                d("-1.41")
+            } else {
+                d(cash) - d("0.5")
+            }
+        );
         assert!(owner.reservation().unwrap().available_margin < d("0"));
         assert!(owner.pending_actions.is_empty());
         let before = owner.clone();
@@ -433,10 +485,12 @@ fn committed_risk_failure_is_retained_and_negative_available_can_be_stable() {
             let mut conflict = candidate.clone();
             conflict.template.quantity = d("0.9");
             assert_eq!(owner.execute(&conflict), Err("EXECUTION_ID_CONFLICT"));
-            assert_eq!(owner, before);
+            let mut expected = before;
+            expected.gate = Gate::Failed("EXECUTION_ID_CONFLICT");
+            assert_eq!(owner, expected);
             let next = input(&owner, "O0", "next", "1", "50000");
-            assert_eq!(owner.execute(&next), Err("RUN_FAILED"));
-            assert_eq!(owner, before);
+            assert_eq!(owner.execute(&next), Ok(Reply::Rejected("RUN_TERMINAL")));
+            assert_eq!(owner, expected);
         }
     }
     let (mut seed, config, mut marks) = fixture();

@@ -36,7 +36,7 @@ fn m01_m02_atomic_steps_reconcile_and_repeat_exactly() {
         );
         assert_eq!(first.valuation_after.products[0].unrealized_pnl, d("-1000"));
         assert_eq!(first.post_step_decision, StepDecision::ContinueLiquidation);
-        let rest = owner.liquidate_for_test(|_| Ok(())).unwrap();
+        let rest = owner.liquidation_loop(|_| Ok(())).unwrap();
         assert_eq!(rest.len(), 1);
         let last = &rest[0];
         assert_eq!(
@@ -78,16 +78,13 @@ fn m01_m02_atomic_steps_reconcile_and_repeat_exactly() {
             Ok(terminal.transition.liquidations[0].clone())
         );
         assert_eq!(owner, terminal);
-        assert_eq!(owner.liquidate_for_test(|_| Ok(())), Err("RUN_TERMINAL"));
+        assert_eq!(owner.liquidation_loop(|_| Ok(())), Err("RUN_TERMINAL"));
         assert_eq!(owner, terminal);
         runs.push(owner);
     }
     assert_eq!(runs[0], runs[1]);
     let mut uninterrupted = breached("3000");
-    assert_eq!(
-        uninterrupted.liquidate_for_test(|_| Ok(())).unwrap().len(),
-        2
-    );
+    assert_eq!(uninterrupted.liquidation_loop(|_| Ok(())).unwrap().len(), 2);
     assert_eq!(uninterrupted, runs[0]);
 }
 
@@ -115,7 +112,7 @@ fn tier_activation_and_partial_recovery_use_exact_owner_commits() {
     let (source, draft) = initial.prepare_context(&input).unwrap();
     let mut owner = draft.unwrap();
     assert_eq!(source.after.maintenance_margin, d("2250"));
-    let receipts = owner.liquidate_for_test(|_| Ok(())).unwrap();
+    let receipts = owner.liquidation_loop(|_| Ok(())).unwrap();
     assert_eq!(receipts.len(), 1);
     assert_eq!(
         (owner.cash, owner.fees, owner.gross_realized),
@@ -126,7 +123,7 @@ fn tier_activation_and_partial_recovery_use_exact_owner_commits() {
     assert_eq!(owner.transition.lifecycle, Lifecycle::LiquidatedInsolvent);
 
     let mut owner = breached("3001");
-    let receipts = owner.liquidate_for_test(|_| Ok(())).unwrap();
+    let receipts = owner.liquidation_loop(|_| Ok(())).unwrap();
     assert_eq!(receipts.len(), 1);
     assert_eq!(receipts[0].post_step_decision, StepDecision::RiskStable);
     assert_eq!(
@@ -151,7 +148,10 @@ fn tier_activation_and_partial_recovery_use_exact_owner_commits() {
 #[test]
 fn every_pre_swap_fault_and_panic_retains_only_committed_prefix() {
     for step in [1, 2] {
-        for stage in [Stage::Prepared(step), Stage::BeforeSwap(step)] {
+        for stage in [
+            Stage::LiquidationPrepared(step),
+            Stage::LiquidationBeforeSwap(step),
+        ] {
             for panic in [false, true] {
                 let mut owner = breached("3000");
                 let mut expected = owner.clone();
@@ -164,7 +164,7 @@ fn every_pre_swap_fault_and_panic_retains_only_committed_prefix() {
                 } else {
                     "INJECTED_LIQUIDATION"
                 };
-                let result = owner.liquidate_for_test(|point| {
+                let result = owner.liquidation_loop(|point| {
                     if point == stage {
                         if panic {
                             panic!("liquidation before swap");
@@ -180,7 +180,7 @@ fn every_pre_swap_fault_and_panic_retains_only_committed_prefix() {
                 assert_eq!(owner.cash, d(if step == 1 { "3000" } else { "2995.99602" }));
                 let before = owner.clone();
                 assert_eq!(
-                    owner.liquidate_for_test(|_| panic!("failed hook")),
+                    owner.liquidation_loop(|_| panic!("failed hook")),
                     Err("RUN_FAILED")
                 );
                 assert_eq!(owner, before);
@@ -194,7 +194,7 @@ fn historical_precedence_stale_preparation_and_reconciliation_fail_closed() {
     let original = breached("3000");
     let prepared = prepare_step(&original, &[]).unwrap();
     let mut owner = original.clone();
-    owner.liquidate_for_test(|_| Ok(())).unwrap();
+    owner.liquidation_loop(|_| Ok(())).unwrap();
     let terminal = owner.clone();
     let mut conflict = prepared.clone();
     conflict.receipt.mark = d("49901");
@@ -243,7 +243,7 @@ fn historical_precedence_stale_preparation_and_reconciliation_fail_closed() {
     let mut expected = orphan.clone();
     expected.gate = Gate::Failed("INVALID_RISK_EPISODE");
     assert_eq!(
-        orphan.liquidate_for_test(|_| Ok(())),
+        orphan.liquidation_loop(|_| Ok(())),
         Err("INVALID_RISK_EPISODE")
     );
     assert_eq!(orphan, expected);
@@ -261,7 +261,7 @@ fn frozen_tier_one_breach_cannot_liquidate_to_solvent_flat() {
         }
     }
     let mut short = source_draft(&anchor(Side::Short, "1", "50000", "3", 1500, "50100"), 1501);
-    short.liquidate_for_test(|_| Ok(())).unwrap();
+    short.liquidation_loop(|_| Ok(())).unwrap();
     assert_eq!(
         (short.cash, short.fees, short.gross_realized),
         (d("-1.01602"), d("3.01602"), d("-1"))
@@ -274,7 +274,7 @@ fn frozen_loop_bound_includes_both_products_and_rejects_non_decreasing_tier() {
     let (seed, config, marks) = two_product_seed("4.25", "2.5");
     let initial = ScenarioAccount::from_seed(&seed, &config, &marks).unwrap();
     let mut owner = source_draft(&initial, 500);
-    let receipts = owner.liquidate_for_test(|_| Ok(())).unwrap();
+    let receipts = owner.liquidation_loop(|_| Ok(())).unwrap();
     assert_eq!(
         receipts.iter().map(|r| r.product).collect::<Vec<_>>(),
         vec![Product::Btc, Product::Eth]

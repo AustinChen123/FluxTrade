@@ -32,10 +32,16 @@ pub(super) struct Group {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum Reference {
+    Source(String),
+    Liquidation(Hash),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Completion {
     pub group: Group,
     pub digest: Hash,
-    pub committed: Vec<String>,
+    pub committed: Vec<Reference>,
     pub rejections: Vec<(String, Fault)>,
     pub failure: Option<Fault>,
 }
@@ -163,6 +169,14 @@ impl Member {
 
 impl ScenarioAccount {
     pub(super) fn apply_group(&mut self, group: &Group) -> Result<Completion, Fault> {
+        self.apply_group_checked(group, |_| Ok(()))
+    }
+
+    pub(super) fn apply_group_checked(
+        &mut self,
+        group: &Group,
+        mut hook: impl FnMut(risk_transition::Stage) -> Result<(), Fault>,
+    ) -> Result<Completion, Fault> {
         let result = self.prepare_group(group);
         let (digest, members, duplicate) = match result {
             Ok(prepared) => prepared,
@@ -191,10 +205,24 @@ impl ScenarioAccount {
         );
         for (member, _) in members {
             let version_before = self.state_version;
+            let liquidation_before = self.liquidation_ids().count();
             let result = match &member.input {
-                Input::Context(input) => self.activate_context(input).map(|_| None),
+                Input::Context(input) => self
+                    .activate_context_checked(input, |stage| match stage {
+                        context::Stage::LiquidationPrepared(step) => {
+                            hook(risk_transition::Stage::LiquidationPrepared(step))
+                        }
+                        context::Stage::LiquidationBeforeSwap(step) => {
+                            hook(risk_transition::Stage::LiquidationBeforeSwap(step))
+                        }
+                        _ => Ok(()),
+                    })
+                    .map(|_| None),
                 Input::Execution(input) => self
-                    .execute_stamped(input, &member.stamp, |_| Ok(()))
+                    .execute_stamped(input, &member.stamp, |stage| match stage {
+                        execution::commit::Stage::Risk(stage) => hook(stage),
+                        _ => Ok(()),
+                    })
                     .map(|reply| match reply {
                         execution::commit::Reply::Rejected(reason) => Some(reason),
                         _ => None,
@@ -202,12 +230,14 @@ impl ScenarioAccount {
                 Input::Intent(input) => self.group_admit(&member.stamp, input),
                 Input::Request(input) => self.request_cancel(input).map(|r| r.rejected),
                 Input::Effect(input) => self
-                    .effect_cancel(input)
+                    .effect_cancel_checked(input, &mut hook)
                     .and_then(|r| r.failure.map_or(Ok(r.rejected), Err)),
             };
             match result {
                 Ok(None) => {
-                    completion.committed.push(member.stamp.event_id.clone());
+                    completion
+                        .committed
+                        .push(Reference::Source(member.stamp.event_id.clone()));
                 }
                 Ok(Some(reason)) => completion
                     .rejections
@@ -220,11 +250,20 @@ impl ScenarioAccount {
                         continue;
                     }
                     if self.state_version != version_before {
-                        completion.committed.push(member.stamp.event_id.clone());
+                        completion
+                            .committed
+                            .push(Reference::Source(member.stamp.event_id.clone()));
                     }
                     completion.failure = Some(f);
-                    break;
                 }
+            }
+            completion.committed.extend(
+                self.liquidation_ids()
+                    .skip(liquidation_before)
+                    .map(Reference::Liquidation),
+            );
+            if completion.failure.is_some() {
+                break;
             }
             if let Gate::Failed(f) = self.gate {
                 completion.failure = Some(f);

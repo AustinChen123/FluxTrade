@@ -48,12 +48,6 @@ pub(super) struct Prepared {
     pub(super) positions: PositionState,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Stage {
-    Prepared(i64),
-    BeforeSwap(i64),
-}
-
 fn history(owner: &ScenarioAccount) -> Result<Vec<Receipt>, Fault> {
     let episode = owner
         .transition
@@ -112,7 +106,7 @@ impl ScenarioAccount {
             {
                 return Err("INVALID_RISK_EPISODE");
             }
-            hook(Stage::Prepared(r.step_index))?;
+            hook(Stage::LiquidationPrepared(r.step_index))?;
             let mut draft = self.clone();
             draft.cash = prepared.cash;
             draft.fees = prepared.fees;
@@ -158,7 +152,7 @@ impl ScenarioAccount {
                 draft.transition.completed_episodes.push(episode);
             }
             draft.transition.liquidations.push(r.clone());
-            hook(Stage::BeforeSwap(r.step_index))?;
+            hook(Stage::LiquidationBeforeSwap(r.step_index))?;
             *self = draft;
             Ok(r.clone())
         }))
@@ -167,7 +161,7 @@ impl ScenarioAccount {
         result.map_err(|fault| self.source_failure(fault))
     }
 
-    fn liquidation_loop(
+    pub(in super::super) fn liquidation_loop(
         &mut self,
         mut hook: impl FnMut(Stage) -> Result<(), Fault>,
     ) -> Result<Vec<Receipt>, Fault> {
@@ -196,14 +190,6 @@ impl ScenarioAccount {
         .map_err(|_| "LIQUIDATION_PANIC")
         .and_then(|r| r);
         result.map_err(|fault| self.source_failure(fault))
-    }
-
-    #[cfg(test)]
-    fn liquidate_for_test(
-        &mut self,
-        hook: impl FnMut(Stage) -> Result<(), Fault>,
-    ) -> Result<Vec<Receipt>, Fault> {
-        self.liquidation_loop(hook)
     }
 }
 

@@ -115,7 +115,10 @@ fn wrapper_event_identity_conflicts_after_success_and_partial_group_failure() {
         );
         let completion = owner.apply_group(&original).unwrap();
         assert_eq!(completion.failure.is_some(), partial);
-        assert_eq!(completion.committed[0], "request");
+        assert_eq!(
+            completion.committed[0],
+            group::Reference::Source("request".into())
+        );
         let before = owner.clone();
         assert_eq!(owner.apply_group(&original), Ok(completion));
         assert_eq!(owner, before);
