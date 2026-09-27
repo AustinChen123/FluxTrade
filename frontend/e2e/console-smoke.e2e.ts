@@ -881,3 +881,68 @@ for (const view of ["strategies", "research"] as const) {
     });
   }
 }
+
+
+for (const roster of ["empty", "single", "multiple"] as const) {
+  test(`strategy controls target cards with ${roster} roster`, async ({ page }, testInfo) => {
+    const commands: { path: string; body: unknown }[] = [];
+    const states = roster === "empty" ? [] : [STRATEGY_PAGE.states[0],
+      ...(roster === "multiple" ? [{ ...STOPPED_STRATEGY_PAGE.states[0], strategy_id: "portfolio-parent" }] : [])];
+    await page.route("**/*", async (route) => {
+      const req = route.request();
+      const path = new URL(req.url()).pathname;
+      if (path === "/api/v1/auth/session") return route.fulfill({ json: BROWSER_SESSION });
+      if (path === "/strategy-states") return route.fulfill({ json: { ...STRATEGY_PAGE, total: states.length, states } });
+      if (req.method() !== "GET") {
+        commands.push({ path, body: req.postDataJSON() });
+        return route.fulfill({ json: { status: "accepted" } });
+      }
+      return route.continue();
+    });
+    await page.goto("http://127.0.0.1:4174/?view=strategies");
+    await page.locator("#language").selectOption("en");
+    await expect(page.locator(".strategy-list > li")).toHaveCount(states.length);
+    const safety = page.getByRole("region", { name: "LOCKDOWN status unavailable" });
+    await expect(safety).toBeVisible();
+    await expect(safety.getByRole("button", { name: "Unlock LOCKDOWN" })).toBeDisabled();
+    if (states.length === 0) await expect(page.getByText("No strategy state yet")).toBeVisible();
+    for (const row of await page.locator(".strategy-list > li").all()) {
+      const header = row.locator(".strategy-card-header");
+      await expect(header.getByRole("button")).toBeVisible();
+      expect(await header.evaluate((node) => Boolean(node.compareDocumentPosition(node.parentElement!.querySelector("dl")!) & Node.DOCUMENT_POSITION_FOLLOWING))).toBe(true);
+      const button = header.getByRole("button");
+      await button.focus();
+      await expect(button).toBeFocused();
+      expect(await button.evaluate((node) => getComputedStyle(node).outlineStyle)).not.toBe("none");
+      expect((await button.boundingBox())!.height).toBeGreaterThanOrEqual(44);
+    }
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+    if (states.length) {
+      expect(await safety.evaluate((node) => Boolean(node.compareDocumentPosition(document.querySelector(".strategy-list")!) & Node.DOCUMENT_POSITION_FOLLOWING))).toBe(true);
+      const target = roster === "multiple" ? "portfolio-parent" : "active-strategy";
+      const row = page.locator(".strategy-list > li").filter({ hasText: target });
+      const dialogMessages: string[] = [];
+      page.once("dialog", async (dialog) => { dialogMessages.push(dialog.message()); await dialog.accept(); });
+      await row.getByRole("button").press("Enter");
+      await expect(row.getByRole("button")).toBeDisabled();
+      await expect(page.locator(".strategy-notice")).toContainText("Awaiting state confirmation");
+      expect(dialogMessages).toEqual([`Run “${roster === "multiple" ? "Resume strategy" : "Stop strategy"}” for ${target}?`]);
+      expect(commands).toEqual([{ path: `/strategies/${target}/commands`, body: {
+        command: roster === "multiple" ? "RESUME" : "STOP", expected_version: states[states.length - 1].version
+      } }]);
+      if (roster === "multiple") await expect(page.getByRole("button", { name: "Stop strategy", exact: true })).toBeEnabled();
+      await page.reload();
+      await expect(page.locator(".strategy-list > li").filter({ hasText: target }).getByRole("button")).toBeDisabled();
+      expect(commands).toHaveLength(1);
+    }
+    await page.screenshot({ path: testInfo.outputPath(`strategy-${roster}.png`), fullPage: true });
+    await page.locator("#language").selectOption("zh-TW");
+    await expect(page.getByRole("region", { name: "LOCKDOWN 狀態未接通" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "解除 LOCKDOWN" })).toBeDisabled();
+    await expect(page.getByText("停止策略不代表撤單或平倉。", { exact: true })).toHaveCount(states.length);
+    if (roster === "multiple") await expect(page.getByRole("button", { name: "停止策略", exact: true })).toBeVisible();
+    if (roster === "empty") await expect(page.getByText("尚無策略狀態")).toBeVisible();
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+    await page.screenshot({ path: testInfo.outputPath(`strategy-${roster}-zh.png`), fullPage: true });
+  });
+}

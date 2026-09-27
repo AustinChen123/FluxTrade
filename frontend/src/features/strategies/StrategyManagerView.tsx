@@ -122,6 +122,25 @@ export function StrategyManagerView({
         </p>
       )}
 
+      <section className="strategy-safety" aria-labelledby="strategy-safety-title">
+        <div>
+          <h3 id="strategy-safety-title">
+            <svg aria-hidden="true" viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M12 3 3 7v5c0 5 9 9 9 9s9-4 9-9V7Z" />
+              <path d="M12 8v5m0 3v1" />
+            </svg>
+            {t("strategies.lockdownUnavailable")}
+          </h3>
+          <p id="strategy-recovery-unavailable">{t("strategies.recoveryUnavailable")}</p>
+        </div>
+        <button type="button" disabled aria-describedby="strategy-recovery-unavailable">
+          {t("strategies.unlockLockdown")}
+        </button>
+      </section>
+      {strategies.length > 0 && (loading || error?.kind === "load" || error?.kind === "refresh") && (
+        <p className="strategy-control-note">{t("strategies.lastKnownState")}</p>
+      )}
+
       {(strategies.length > 0 || (!loading && error === null)) && (
         <>
           <dl className="strategy-summary" aria-label={t("strategies.summary")}>
@@ -157,16 +176,46 @@ export function StrategyManagerView({
                 );
                 return (
                   <li key={strategy.strategy_id}>
-                    <div className="strategy-identity">
-                      <span
-                        className={`strategy-status status-${strategy.status.toLowerCase()}`}
-                        aria-hidden="true"
-                      />
-                      <div>
-                        <strong>{strategy.strategy_id}</strong>
-                        <span>{t(`strategies.status.${strategy.status}`)}</span>
+                    <div className="strategy-card-header">
+                      <div className="strategy-identity">
+                        <span
+                          className={`strategy-status status-${strategy.status.toLowerCase()}`}
+                          aria-hidden="true"
+                        />
+                        <div>
+                          <strong>{strategy.strategy_id}</strong>
+                          <span>{t(`strategies.status.${strategy.status}`)}</span>
+                        </div>
+                      </div>
+                      <div className="strategy-action">
+                        {strategy.last_error_message && (
+                          <p title={strategy.last_error_message}>
+                            {strategy.last_error_message}
+                          </p>
+                        )}
+                        {strategy.available_commands.map((command) => (
+                          <button
+                            key={command}
+                            type="button"
+                            className={command === "STOP" ? "danger-action" : ""}
+                            disabled={pendingStrategyId !== null || awaitingState}
+                            onClick={() => void submit(strategy, command)}
+                          >
+                            {pending
+                              ? t("strategies.pending")
+                              : awaitingState
+                                ? t("strategies.awaitingState")
+                                : commandLabel(command, t)}
+                          </button>
+                        ))}
                       </div>
                     </div>
+                    <p className="strategy-control-note">{t("strategies.stopExplanation")}</p>
+                    {(pendingStrategyId !== null || awaitingState) && (
+                      <p className="strategy-control-note">
+                        {t(pendingStrategyId !== null ? "strategies.pendingExplanation" : "strategies.awaitingExplanation")}
+                      </p>
+                    )}
                     <dl>
                       <div>
                         <dt>{t("strategies.heartbeat")}</dt>
@@ -191,28 +240,7 @@ export function StrategyManagerView({
                         <dd>{strategy.version.toLocaleString(locale)}</dd>
                       </div>
                     </dl>
-                    <div className="strategy-action">
-                      {strategy.last_error_message && (
-                        <p title={strategy.last_error_message}>
-                          {strategy.last_error_message}
-                        </p>
-                      )}
-                      {strategy.available_commands.map((command) => (
-                        <button
-                          key={command}
-                          type="button"
-                          className={command === "STOP" ? "danger-action" : ""}
-                          disabled={pendingStrategyId !== null || awaitingState}
-                          onClick={() => void submit(strategy, command)}
-                        >
-                          {pending
-                            ? t("strategies.pending")
-                            : awaitingState
-                              ? t("strategies.awaitingState")
-                              : commandLabel(command, t)}
-                        </button>
-                      ))}
-                    </div>
+
                   </li>
                 );
               })}

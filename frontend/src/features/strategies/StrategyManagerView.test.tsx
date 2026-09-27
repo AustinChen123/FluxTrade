@@ -160,3 +160,19 @@ describe("StrategyManagerView", () => {
     expect(screen.getByText(body)).toBeTruthy();
   });
 });
+
+
+it.each(["en", "zh-TW"])("keeps recovery unavailable even with no strategies in %s", async (locale) => {
+  await i18n.changeLanguage(locale);
+  const submit = vi.fn();
+  render(<StrategyManagerView strategies={[]} loading={false} error={null} notice=""
+    pendingStrategyId={null} awaitingStrategies={new Map()} locale={locale as "en" | "zh-TW"}
+    t={i18n.t} refresh={vi.fn()} submit={submit} />);
+  const unlock = screen.getByRole("button", { name: i18n.t("strategies.unlockLockdown") }) as HTMLButtonElement;
+  expect(unlock.disabled).toBe(true);
+  expect(document.getElementById(unlock.getAttribute("aria-describedby")! )?.textContent)
+    .toBe(i18n.t("strategies.recoveryUnavailable"));
+  fireEvent.click(unlock);
+  expect(submit).not.toHaveBeenCalled();
+  expect(screen.getByText(i18n.t("strategies.emptyTitle"))).toBeTruthy();
+});
