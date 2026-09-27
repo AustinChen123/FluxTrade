@@ -946,3 +946,133 @@ for (const roster of ["empty", "single", "multiple"] as const) {
     await page.screenshot({ path: testInfo.outputPath(`strategy-${roster}-zh.png`), fullPage: true });
   });
 }
+
+for (const failure of [401, 403, 409, 408, 503, "listener", "network", "malformed", "refresh"] as const) {
+  test(`strategy command failure ${failure} preserves lock semantics`, async ({ page }) => {
+    let sent = 0;
+    await page.route("**/*", async (route) => {
+      const path = new URL(route.request().url()).pathname;
+      if (path === "/api/v1/auth/session") return route.fulfill({ json: BROWSER_SESSION });
+      if (path === "/strategy-states") {
+        if (failure === "refresh" && sent > 0) return route.fulfill({ status: 503, json: { error: "unavailable" } });
+        return route.fulfill({ json: { ...STRATEGY_PAGE, total: 2, states: [STRATEGY_PAGE.states[0], { ...STRATEGY_PAGE.states[0], strategy_id: "other-strategy" }] } });
+      }
+      if (route.request().method() !== "GET") {
+        expect(path).toBe("/strategies/active-strategy/commands");
+        sent += 1;
+        if (failure === "network") return route.abort();
+        if (failure === "malformed") return route.fulfill({ status: 200, body: "{" });
+        if (failure === "refresh") return route.fulfill({ json: { status: "accepted" } });
+        return route.fulfill({ status: failure === "listener" ? 503 : failure, json: { error: failure === "listener" ? "strategy_engine_listener_unavailable" : "SENSITIVE_SENTINEL" } });
+      }
+      return route.continue();
+    });
+    await page.goto("http://127.0.0.1:4174/?view=strategies");
+    await page.locator("#language").selectOption("en");
+    const active = page.locator(".strategy-list > li").filter({ hasText: "active-strategy" });
+    page.once("dialog", (dialog) => void dialog.accept());
+    await active.getByRole("button").click();
+    await expect(page.getByRole("alert")).toBeVisible();
+    await expect(page.getByRole("alert")).not.toContainText("SENSITIVE_SENTINEL");
+    const definite = [401, 403, 409, "listener"].includes(failure);
+    if (failure === "refresh") {
+      await expect(page.locator(".strategy-action button")).toHaveCount(0);
+      await expect(page.locator(".strategy-notice")).toContainText("Awaiting state confirmation");
+      await expect(page.getByText("Last-known strategy state. Refresh is required before using controls.")).toBeVisible();
+    } else {
+      if (definite) await expect(active.getByRole("button")).toBeEnabled();
+      else await expect(active.getByRole("button")).toBeDisabled();
+      await expect(page.locator(".strategy-list > li").filter({ hasText: "other-strategy" }).getByRole("button")).toBeEnabled();
+    }
+    await expect(page.getByRole("button", { name: "Unlock LOCKDOWN" })).toBeDisabled();
+    expect(sent).toBe(1);
+  });
+}
+
+
+for (const sessionCase of ["missing-permissions", "malformed-permissions", "expired-bootstrap", "expired-rejected"] as const) {
+  test(`strategy session ${sessionCase} keeps command access explicit`, async ({ page }) => {
+    const sessionMethods: string[] = [];
+    const mutations: string[] = [];
+    const faults: string[] = [];
+    page.on("pageerror", () => faults.push("pageerror"));
+    await page.route("**/*", async (route) => {
+      const req = route.request();
+      const path = new URL(req.url()).pathname;
+      if (path === "/api/v1/auth/session") {
+        sessionMethods.push(req.method());
+        if (sessionCase.startsWith("expired") && req.method() === "GET") {
+          return route.fulfill({ status: 401, json: { error: "session_expired" } });
+        }
+        if (sessionCase === "expired-rejected") return route.fulfill({ status: 403, json: { error: "denied" } });
+        const session = sessionCase === "missing-permissions"
+          ? { ...BROWSER_SESSION, permissions: undefined }
+          : sessionCase === "malformed-permissions"
+            ? { ...BROWSER_SESSION, permissions: { can_mutate: "true", can_step_up: true } }
+            : BROWSER_SESSION;
+        return route.fulfill({ json: session });
+      }
+      if (req.method() !== "GET") { mutations.push(path); return route.abort(); }
+      if (path === "/strategy-states") return route.fulfill({ json: STRATEGY_PAGE });
+      return route.continue();
+    });
+    await page.goto("http://127.0.0.1:4174/?view=strategies");
+    for (const locale of ["en", "zh-TW"]) {
+      await page.locator("#language").selectOption(locale);
+      await expect(page.getByRole("button", { name: locale === "en" ? "Unlock LOCKDOWN" : "解除 LOCKDOWN" })).toBeDisabled();
+      if (sessionCase === "expired-rejected") {
+        await expect(page.getByRole("alert")).toBeVisible();
+        await expect(page.locator(".strategy-action button")).toHaveCount(0);
+      } else if (sessionCase === "expired-bootstrap") {
+        await expect(page.getByRole("button", { name: locale === "en" ? "Stop strategy" : "停止策略", exact: true })).toBeEnabled();
+      } else {
+        await expect(page.getByRole("status")).toContainText(locale === "en" ? "Read-only session" : "唯讀工作階段");
+        await expect(page.locator(".strategy-action button")).toHaveCount(0);
+      }
+    }
+    expect(sessionMethods).toEqual(sessionCase.startsWith("expired") ? ["GET", "POST"] : ["GET"]);
+    expect(mutations).toEqual([]);
+    expect(faults).toEqual([]);
+  });
+}
+
+for (const snapshot of ["unchanged", "status-only", "version-only", "missing"] as const) {
+  test(`strategy snapshot ${snapshot} reconciles only its target`, async ({ page }) => {
+    let sent = 0;
+    let refreshes = 0;
+    await page.route("**/*", async (route) => {
+      const path = new URL(route.request().url()).pathname;
+      if (path === "/api/v1/auth/session") return route.fulfill({ json: BROWSER_SESSION });
+      if (path === "/strategy-states") {
+        refreshes += 1;
+        const initial = STRATEGY_PAGE.states[0];
+        const target = sent === 0 ? initial : snapshot === "missing" ? null
+          : snapshot === "status-only" ? { ...initial, status: "STOPPED", available_commands: ["RESUME"] }
+          : snapshot === "version-only" ? { ...initial, version: initial.version + 1 } : initial;
+        const states = [...(target ? [target] : []), { ...initial, strategy_id: "other-strategy" }];
+        return route.fulfill({ json: { ...STRATEGY_PAGE, total: states.length, states } });
+      }
+      if (route.request().method() !== "GET") {
+        expect(path).toBe("/strategies/active-strategy/commands");
+        sent += 1;
+        return route.fulfill({ json: { status: "accepted" } });
+      }
+      return route.continue();
+    });
+    await page.goto("http://127.0.0.1:4174/?view=strategies");
+    await page.locator("#language").selectOption("en");
+    const target = page.locator(".strategy-list > li").filter({ hasText: "active-strategy" });
+    page.once("dialog", (dialog) => void dialog.accept());
+    await target.getByRole("button").click();
+    await expect.poll(() => refreshes).toBe(2);
+    const locked = snapshot === "unchanged" || snapshot === "missing";
+    await expect.poll(() => page.evaluate(() => JSON.parse(sessionStorage.getItem("fluxtrade.strategy.awaiting") ?? "[]").length)).toBe(locked ? 1 : 0);
+    if (snapshot === "missing") await expect(target).toHaveCount(0);
+    else if (locked) await expect(target.getByRole("button")).toBeDisabled();
+    else await expect(target.getByRole("button")).toBeEnabled();
+    await expect(page.locator(".strategy-list > li").filter({ hasText: "other-strategy" }).getByRole("button")).toBeEnabled();
+    await expect(page.locator(".strategy-notice")).toContainText("Awaiting state confirmation");
+    await expect(page.getByRole("button", { name: "Unlock LOCKDOWN" })).toBeDisabled();
+    expect(sent).toBe(1);
+  });
+}

@@ -176,6 +176,11 @@ describe("useStrategyManager", () => {
 
   it.each([
     [new ApiError("bad_request", 400), false, "command"],
+    [new ApiError("unauthorized", 401), false, "command"],
+    [new ApiError("forbidden", 403), false, "command"],
+    [new ApiError("stale_version", 409), false, "command"],
+    [new ApiError("strategy_engine_listener_unavailable", 503), false, "command"],
+    [new Error("invalid_response"), true, "unknown"],
     [new ApiError("request_timeout", 408), true, "unknown"],
     [new ApiError("server_failure", 503), true, "unknown"],
     [new TypeError("Failed to fetch"), true, "unknown"]
