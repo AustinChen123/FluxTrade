@@ -149,9 +149,9 @@ export const en = {
     "error": {
       "title": "Research data not loaded",
       "unauthorized": "This session cannot read research results. Reopen the console through the trusted Tailscale entry point.",
-      "service": "Data service returned {{status}}: {{message}}",
+      "service": "Data service returned {{status}}. Check the service and try again.",
       "fallback": "Unable to load GA data",
-      "unexpected": "Unable to load GA data: {{message}}",
+      "unexpected": "Unable to load GA data. Check the connection and try again.",
       "retry": "Reload"
     },
     "empty": {

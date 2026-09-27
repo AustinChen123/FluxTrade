@@ -3,6 +3,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ensureBrowserSession,
   loadStrategyStates,
+  loadEpochs,
+  loadGenerationSummaries,
+  loadGenerationGenes,
   sendStrategyCommand,
   type BrowserSession,
   type StrategyState
@@ -146,4 +149,73 @@ describe("strategy control API", () => {
       })
     );
   });
+});
+
+
+describe("read-only response boundaries", () => {
+  afterEach(() => vi.unstubAllGlobals());
+  for (const [name, key, load] of [
+    ["strategies", "states", loadStrategyStates],
+    ["epochs", "epochs", loadEpochs],
+    ["generations", "generations", () => loadGenerationSummaries("epoch")],
+    ["genes", "genes", () => loadGenerationGenes("epoch", 0)]
+  ] as const) {
+    it.each([null, {}, [null], ["invalid"]])(`${name} rejects invalid rows %j before rendering`, async (items) => {
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response(200, {
+        total: 1, limit: 500, offset: 0, [key]: items
+      })));
+      await expect(load()).rejects.toThrow("invalid_response");
+    });
+    it(`${name} accepts an empty read-only page`, async () => {
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response(200, {
+        total: 0, limit: 500, offset: 0, [key]: []
+      })));
+      await expect(load()).resolves.toEqual([]);
+    });
+  }
+  it.each([401, 403, 503])("keeps HTTP status %s when an error body is not JSON", async (status) => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: false, status, json: async () => { throw new SyntaxError("SENSITIVE_SENTINEL"); }
+    }));
+    await expect(loadEpochs()).rejects.toMatchObject({ status, message: "invalid_response" });
+  });
+  it("rejects invalid pagination before allocating follow-up requests", async () => {
+    const fetch = vi.fn().mockResolvedValue(response(200, {
+      total: "invalid", limit: 500, offset: 0, states: []
+    }));
+    vi.stubGlobal("fetch", fetch);
+    await expect(loadStrategyStates()).rejects.toThrow("invalid_response");
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+});
+
+
+it("keeps a malformed mutation response ambiguous instead of authorizing a retry", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+    ok: false, status: 403, json: async () => { throw new SyntaxError("invalid"); }
+  }));
+  try {
+    await expect(sendStrategyCommand("s", "STOP", 1, "test-operation")).rejects.toThrow("invalid_response");
+    await expect(sendStrategyCommand("s", "STOP", 1, "test-operation")).rejects.not.toHaveProperty("status");
+  } finally {
+    vi.unstubAllGlobals();
+  }
+});
+
+
+it("accepts the backend BigInteger seed range without using seed for arithmetic", async () => {
+  const epoch = {
+    id: "epoch", strategy_id: "strategy", started_at: "2026-01-01T00:00:00Z",
+    finished_at: null, pop_size: 1, max_generations: 1, generations_run: 0,
+    best_score: null, seed: 2 ** 53, config_json: {}, status: "running",
+    eval_pair: "TEST", eval_timeframe: "1m", eval_start_date: "2026-01-01", eval_end_date: "2026-01-02"
+  };
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response(200, {
+    total: 1, limit: 100, offset: 0, epochs: [epoch]
+  })));
+  try {
+    await expect(loadEpochs()).resolves.toEqual([epoch]);
+  } finally {
+    vi.unstubAllGlobals();
+  }
 });

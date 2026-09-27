@@ -149,9 +149,9 @@ export const zhTW = {
     "error": {
       "title": "研究資料未載入",
       "unauthorized": "目前工作階段沒有讀取研究結果的權限。請從受信任的 Tailscale 入口重新開啟。",
-      "service": "資料服務回覆 {{status}}：{{message}}",
+      "service": "資料服務回覆 {{status}}。請確認服務狀態後重試。",
       "fallback": "無法讀取 GA 資料",
-      "unexpected": "無法讀取 GA 資料：{{message}}",
+      "unexpected": "無法讀取 GA 資料。請確認連線後重試。",
       "retry": "重新讀取"
     },
     "empty": {

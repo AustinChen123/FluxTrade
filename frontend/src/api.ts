@@ -100,13 +100,35 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       ...init?.headers
     }
   });
-  const body = (await response.json()) as T | { error?: string };
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    if (init?.method === "POST") throw new Error("invalid_response");
+    throw new ApiError("invalid_response", response.status);
+  }
   if (!response.ok) {
+    if (init?.method === "POST" && (body === null || typeof body !== "object")) {
+      throw new Error("invalid_response");
+    }
     const reason =
-      "error" in (body as object)
+      body !== null && typeof body === "object" && "error" in body
         ? String((body as { error?: string }).error)
         : response.statusText;
     throw new ApiError(reason, response.status);
+  }
+  if (path.startsWith("/strategy-states?") && !validPage(body, "states", validStrategy)) {
+    throw new Error("invalid_response");
+  }
+  if (path.startsWith("/evolution-epochs?") && !validPage(body, "epochs", validEpoch)) {
+    throw new Error("invalid_response");
+  }
+  if (path.endsWith("/generations") &&
+      (!record(body) || !rows(body.generations, validGeneration))) {
+    throw new Error("invalid_response");
+  }
+  if (path.startsWith("/genes?") && !validPage(body, "genes", validGene)) {
+    throw new Error("invalid_response");
   }
   return body as T;
 }
@@ -191,4 +213,49 @@ export async function loadGenerationGenes(
     offsets.map((offset) => request<Page<"genes", Gene>>(query(offset)))
   );
   return [first, ...remaining].flatMap((page) => page.genes);
+}
+
+// Validate read-only payload shapes before they enter React state.
+type RecordValue = Record<string, unknown>;
+const record = (value: unknown): value is RecordValue =>
+  value !== null && typeof value === "object" && !Array.isArray(value);
+const text = (value: unknown) => typeof value === "string";
+const integer = (value: unknown) => Number.isSafeInteger(value) && (value as number) >= 0;
+const nullableText = (value: unknown) => value === null || text(value);
+const nullableNumber = (value: unknown) => value === null ||
+  (typeof value === "number" && Number.isFinite(value));
+const rows = (value: unknown, valid: (row: unknown) => boolean) =>
+  Array.isArray(value) && value.every(valid);
+function validPage(value: unknown, key: string, valid: (row: unknown) => boolean) {
+  return record(value) && integer(value.total) && integer(value.offset) &&
+    integer(value.limit) && (value.limit as number) > 0 && rows(value[key], valid);
+}
+function validStrategy(value: unknown): boolean {
+  return record(value) && text(value.strategy_id) && integer(value.version) &&
+    ["DISCOVERED", "READY", "WARNING", "ACTIVE", "STOPPED", "ERROR"].includes(value.status as string) &&
+    rows(value.available_commands, (command) =>
+      ["START", "STOP", "RESUME", "FORCE_RECOVER"].includes(command as string)) &&
+    nullableNumber(value.last_heartbeat) && nullableNumber(value.uptime_start) &&
+    nullableText(value.last_error_message) &&
+    ["entered_error_at", "recovered_at", "stopped_at"].every((key) => nullableText(value[key])) &&
+    ["config", "performance"].every((key) => value[key] === null || record(value[key]));
+}
+function validEpoch(value: unknown): boolean {
+  return record(value) &&
+    ["id", "strategy_id", "started_at", "eval_pair", "eval_timeframe", "eval_start_date", "eval_end_date"].every((key) => text(value[key])) &&
+    ["pop_size", "max_generations"].every((key) => integer(value[key])) &&
+    (value.generations_run === null || integer(value.generations_run)) &&
+    nullableText(value.finished_at) && nullableText(value.best_score) &&
+    Number.isInteger(value.seed) && record(value.config_json) &&
+    ["running", "completed", "aborted"].includes(value.status as string);
+}
+function validGeneration(value: unknown): boolean {
+  return record(value) && integer(value.generation_index) && integer(value.candidate_count) &&
+    ["score_min", "score_max", "drawdown_min", "drawdown_max"].every((key) => text(value[key]));
+}
+function validGene(value: unknown): boolean {
+  return record(value) && integer(value.id) && integer(value.generation_index) &&
+    ["strategy_id", "candidate_id", "epoch_id", "created_at", "score_total", "max_drawdown"].every((key) => text(value[key])) &&
+    ["challenger", "champion", "retired"].includes(value.role as string) &&
+    record(value.param_pack) && record(value.score_breakdown);
 }

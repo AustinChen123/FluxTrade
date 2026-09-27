@@ -810,3 +810,74 @@ for (const scenario of SCENARIO_IDS) {
     }
   });
 }
+
+// Deterministic CI evidence only: these responses never represent a real proxy.
+for (const view of ["strategies", "research"] as const) {
+  for (const scenario of ["read-only", "operator", "401", "403", "network", "503", "schema", "session-denied"] as const) {
+    test(`${view} ${scenario} remains bounded and read-only`, async ({ page }) => {
+      const mutations: string[] = [];
+      const unsafeHeaders: string[] = [];
+      const failures: string[] = [];
+      page.on("pageerror", () => failures.push("pageerror"));
+      await page.route("**/*", async (route) => {
+        const request = route.request();
+        const path = new URL(request.url()).pathname;
+        if (!/^\/(api\/|strategy-states|evolution-epochs|genes)/.test(path)) {
+          await route.continue();
+          return;
+        }
+        const headers = await request.allHeaders();
+        for (const name of ["authorization", "cookie", "tailscale-user-login", "tailscale-app-capabilities"]) {
+          if (name in headers) unsafeHeaders.push(name);
+        }
+        if (request.method() !== "GET" && path !== "/api/v1/auth/session") {
+          mutations.push(path);
+          await route.abort();
+          return;
+        }
+        const session = path === "/api/v1/auth/session";
+        const entry = path === (view === "strategies" ? "/strategy-states" : "/evolution-epochs");
+        if ((session && scenario === "session-denied") || (entry && ["401", "403", "503"].includes(scenario))) {
+          await route.fulfill({ status: session ? 403 : Number(scenario), json: { error: "SENSITIVE_SENTINEL" } });
+        } else if (entry && scenario === "network") {
+          await route.abort("failed");
+        } else if (entry && scenario === "schema") {
+          await route.fulfill({ json: view === "strategies" ? { ...STRATEGY_PAGE, states: [null] } : { epochs: null } });
+        } else {
+          const body = session
+            ? { ...BROWSER_SESSION, permissions: { can_mutate: scenario === "operator", can_step_up: false } }
+            : path === "/strategy-states" ? STRATEGY_PAGE
+            : path === "/evolution-epochs" ? { total: 1, limit: 100, offset: 0, epochs: [EPOCH_A] }
+            : path.endsWith("/generations") ? { generations: [GENERATION_A] }
+            : { total: 1, limit: 10000, offset: 0, genes: [GENE_A] };
+          await route.fulfill({ json: body });
+        }
+      });
+      await page.goto(`http://127.0.0.1:4174/?view=${view}`);
+      const success = scenario === "read-only" || scenario === "operator";
+      if (success) {
+        await expect(page.getByText(view === "strategies" ? "active-strategy" : "candidate-a", { exact: true }).first()).toBeVisible();
+      } else {
+        await expect(page.getByRole("alert")).toBeVisible();
+      }
+      for (const locale of ["en", "zh-TW"]) {
+        await page.locator("#language").selectOption(locale);
+        if (!success) {
+          await expect(page.getByRole("alert")).not.toContainText("SENSITIVE_SENTINEL");
+          expect((await page.getByRole("alert").innerText()).length).toBeLessThan(350);
+          if (["401", "403", "session-denied"].includes(scenario)) {
+            await expect(page.getByRole("alert")).toContainText(locale === "en" ? "This session cannot" : "目前工作階段沒有");
+          }
+        } else if (view === "strategies") {
+          if (scenario === "read-only") {
+            await expect(page.getByRole("status")).toContainText(locale === "en" ? "Read-only session" : "唯讀工作階段");
+          }
+        }
+        await expect(page.locator(".strategy-action button")).toHaveCount(view === "strategies" && scenario === "operator" ? 1 : 0);
+      }
+      expect(mutations).toEqual([]);
+      expect(unsafeHeaders).toEqual([]);
+      expect(failures).toEqual([]);
+    });
+  }
+}

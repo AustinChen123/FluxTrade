@@ -99,7 +99,7 @@ describe("locale resources", () => {
 
   it("preserves the frozen complete locale payload", async () => {
     await expect(digest({ "zh-TW": zhTW, en })).resolves.toBe(
-      "b093554bf0d6b9b5c87e8ad8bba3e5d56203037d7ebf778b81437ede9c6f4617"
+      "e5ab565217fa8bfe19b596e3dba2c2b51be15d09cb394cbddec8c5a0b3c7f827"
     );
   });
 
