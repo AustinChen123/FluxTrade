@@ -1,5 +1,6 @@
-//! Slice 4A only: SCENARIO_ONLY / NOT_HISTORICAL_ADMISSIBLE.
-//! Pure frozen-input valuation; no account writer, orders, fees, or risk actions.
+//! Private SCENARIO_ONLY / NOT_HISTORICAL_ADMISSIBLE replay kernel.
+//! Covers 4A valuation and 4B account, reservation, admission, and execution;
+//! no public API, 4C actions, persistence, scheduling, or delivery semantics.
 use num_bigint_dig::BigInt;
 use num_traits::{ToPrimitive, Zero};
 use rust_decimal::Decimal;

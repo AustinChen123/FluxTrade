@@ -1,5 +1,7 @@
-//! Incomplete, in-memory GT-02 flat-opening kernel, not a replay/public API.
-//! No margin, reservation, risk action, persistence, or delivery semantics.
+//! Incomplete, in-memory replay kernels, not a public/PyO3 replay API.
+//! Includes GT-02 plus private synthetic 4A valuation and 4B account,
+//! reservation, admission, and execution behavior. No 4C cancel/liquidation
+//! transitions, persistence, scheduling, or delivery semantics.
 use std::collections::BTreeMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
