@@ -7,7 +7,7 @@ fn order(id: &str, side: Side, remaining: &str) -> SeedOrder {
         intent_id: format!("I{id}"),
         client_id: format!("C{id}"),
         strategy_id: "strategy".into(),
-        product: Product::Btc,
+        product: ProfileProduct::BtcEth(Product::Btc),
         side,
         price: d("50000"),
         reduce_only: false,

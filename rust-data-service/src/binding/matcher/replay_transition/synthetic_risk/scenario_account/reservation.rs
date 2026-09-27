@@ -39,6 +39,9 @@ pub(super) fn calculate(
     scenario: &FrozenScenario,
     marks: &[Mark],
 ) -> Result<Snapshot, Fault> {
+    for order in orders {
+        order.product.btc()?;
+    }
     FrozenScenario::new(
         scenario.leverage,
         scenario.specs.clone(),
@@ -75,7 +78,10 @@ pub(super) fn calculate(
             .map_or(Decimal::ZERO, |p| p.notional);
         let mut long = Decimal::ZERO;
         let mut short = Decimal::ZERO;
-        for order in orders.iter().filter(|o| o.product == product) {
+        for order in orders
+            .iter()
+            .filter(|o| o.product == ProfileProduct::BtcEth(product))
+        {
             if !identity(&order.order_id)
                 || !ids.insert(order.order_id.clone())
                 || order.remaining < spec.minimum

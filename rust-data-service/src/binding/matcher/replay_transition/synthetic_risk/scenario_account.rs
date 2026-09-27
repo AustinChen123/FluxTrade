@@ -1,10 +1,11 @@
-//! Incomplete clean-run storage with pure financial projections; no admission or execution commit.
+//! Private incomplete scenario account; no execution commit or public API.
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 
 use super::super::{hash_fields, identity, AccountKey, Gate, Hash};
 use super::*;
 
+mod admission;
 mod capacity;
 mod hypothetical_settlement;
 mod reservation;
@@ -16,6 +17,28 @@ enum ProfileContext {
         marks: Vec<Mark>,
     },
     GoldenCapacity(capacity::Config),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProfileProduct {
+    BtcEth(Product),
+    Pa,
+}
+
+impl ProfileProduct {
+    fn canonical_id(self) -> &'static str {
+        match self {
+            Self::BtcEth(product) => product_id(product),
+            Self::Pa => "P_A",
+        }
+    }
+
+    fn btc(self) -> Result<Product, Fault> {
+        match self {
+            Self::BtcEth(product) => Ok(product),
+            Self::Pa => Err("PROFILE_MISMATCH"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -41,7 +64,7 @@ struct SeedOrder {
     order_id: String,
     client_id: String,
     strategy_id: String,
-    product: Product,
+    product: ProfileProduct,
     side: Side,
     price: Decimal,
     reduce_only: bool,
@@ -101,8 +124,8 @@ struct ScenarioAccount {
     seed_orders: BTreeSet<String>,
     seed_executions: BTreeSet<Hash>,
     commit_sequence: u64,
-    // Uninhabited values: later slices introduce real receipts/actions, not fakes.
-    intent_results: BTreeMap<String, Infallible>,
+    intent_results: BTreeMap<String, admission::AdmissionResult>,
+    // Uninhabited values: later slices introduce real execution receipts/actions, not fakes.
     execution_receipts: BTreeMap<Hash, Infallible>,
     pending_actions: Vec<Infallible>,
 }
@@ -271,7 +294,8 @@ impl ScenarioAccount {
         let mut seed_intents = BTreeSet::new();
         let mut clients = BTreeSet::new();
         for order in &seed.orders {
-            let (spec, _) = scenario.resolve(order.product, seed.effective_at)?;
+            let product = order.product.btc()?;
+            let (spec, _) = scenario.resolve(product, seed.effective_at)?;
             if [
                 &order.intent_id,
                 &order.order_id,
@@ -300,7 +324,7 @@ impl ScenarioAccount {
             }
             if order.reduce_only
                 && !positions
-                    .get(&order.product)
+                    .get(&product)
                     .is_some_and(|p| p.side != order.side && order.remaining <= p.contracts)
             {
                 return Err("REDUCE_ONLY_NOT_REDUCING");

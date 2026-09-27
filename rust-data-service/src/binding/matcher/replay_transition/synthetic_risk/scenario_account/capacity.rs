@@ -2,22 +2,7 @@
 use super::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ProfileProduct {
-    BtcEth(Product),
-    Pa,
-}
-
-impl ProfileProduct {
-    fn canonical_id(self) -> &'static str {
-        match self {
-            Self::BtcEth(product) => product_id(product),
-            Self::Pa => "P_A",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Program {
+pub(super) enum Program {
     CapacityV1,
     CapacityTightV1,
 }
@@ -52,8 +37,8 @@ pub(super) struct Config {
     product: ProfileProduct,
     program_id: String,
     program_hash: Hash,
-    rule_data_version: String,
-    spec_version: String,
+    pub(super) rule_data_version: String,
+    pub(super) spec_version: String,
     quantity_unit: String,
     multiplier: Decimal,
     tick: Decimal,
@@ -65,7 +50,7 @@ pub(super) struct Config {
 }
 
 impl Config {
-    fn frozen(program: Program) -> Self {
+    pub(super) fn frozen(program: Program) -> Self {
         Self {
             product: ProfileProduct::Pa,
             program_id: program.id().into(),
@@ -128,10 +113,10 @@ impl Config {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Candidate {
-    product: ProfileProduct,
-    quantity: Decimal,
-    price: Decimal,
+pub(super) struct Candidate {
+    pub(super) product: ProfileProduct,
+    pub(super) quantity: Decimal,
+    pub(super) price: Decimal,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -141,13 +126,13 @@ struct RemainingOrder {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct CapacityProjection {
+pub(super) struct CapacityProjection {
     program: Program,
-    program_hash: Hash,
+    pub(super) program_hash: Hash,
     current: Decimal,
     new: Decimal,
-    required: Decimal,
-    threshold: Decimal,
+    pub(super) required: Decimal,
+    pub(super) threshold: Decimal,
     available: Decimal,
 }
 
@@ -198,7 +183,7 @@ fn calculate(
 }
 
 impl ScenarioAccount {
-    fn from_capacity_seed(seed: &CleanSeed, config: &Config) -> Result<Self, Fault> {
+    pub(super) fn from_capacity_seed(seed: &CleanSeed, config: &Config) -> Result<Self, Fault> {
         seed.key.validate()?;
         if !identity(&seed.config_id) {
             return Err("INVALID_CONFIG_ID");
@@ -230,18 +215,42 @@ impl ScenarioAccount {
         })
     }
 
-    fn capacity_projection(&self, candidate: &Candidate) -> Result<CapacityProjection, Fault> {
+    pub(super) fn capacity_projection(
+        &self,
+        candidate: &Candidate,
+    ) -> Result<CapacityProjection, Fault> {
         let ProfileContext::GoldenCapacity(config) = &self.profile else {
             return Err("PROFILE_MISMATCH");
         };
-        if !self.positions.is_empty() || !self.orders.is_empty() {
+        if !self.positions.is_empty() {
             return Err("UNSUPPORTED_CAPACITY_SEED_STATE");
         }
+        let orders = self
+            .orders
+            .values()
+            .map(|order| {
+                let facts = &order.facts;
+                if !matches!(facts.status.as_str(), "OPEN" | "PARTIALLY_FILLED")
+                    || add(facts.filled, facts.remaining)? != facts.original
+                    || facts.filled < Decimal::ZERO
+                {
+                    return Err("INVALID_CAPACITY_ORDER");
+                }
+                Ok(RemainingOrder {
+                    order_id: facts.order_id.clone(),
+                    remainder: Candidate {
+                        product: facts.product,
+                        quantity: facts.remaining,
+                        price: facts.price,
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>, Fault>>()?;
         calculate(
             config,
             self.seed_effective_at,
             Decimal::ZERO,
-            &[],
+            &orders,
             candidate,
         )
     }

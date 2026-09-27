@@ -48,7 +48,7 @@ pub(super) fn fixture() -> (CleanSeed, FrozenScenario, Vec<Mark>) {
             order_id: "O1".into(),
             client_id: "C1".into(),
             strategy_id: "strategy-c".into(),
-            product: Product::Btc,
+            product: ProfileProduct::BtcEth(Product::Btc),
             side: Side::Short,
             price: d("50000.1"),
             reduce_only: true,
