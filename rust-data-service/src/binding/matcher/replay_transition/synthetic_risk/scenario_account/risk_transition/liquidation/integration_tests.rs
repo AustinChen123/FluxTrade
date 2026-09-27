@@ -4,6 +4,79 @@ use super::*;
 use context::tests::{activation, mark_rows, stamp};
 use group::{Group, Input, Member, Reference};
 
+#[test]
+fn duplicate_intent_group_references_original_source_without_republication() {
+    let (seed, config, marks) = fixture();
+    let mut owner = ScenarioAccount::from_seed(&seed, &config, &marks).unwrap();
+    let intent = admission::fixture_intent(&owner, "I", Side::Short, d("0.01"), d("50000"));
+    assert_eq!(
+        admission::fixture_admit(&mut owner, "A", 500, &intent)
+            .unwrap()
+            .0,
+        "accepted"
+    );
+    let before = owner.clone();
+    let group = Group {
+        group_id: "G2".into(),
+        account_key: owner.key.clone(),
+        ordering_contract_id: "S_order_v1".into(),
+        group_effective_at: 501,
+        declared_member_count: 1,
+        members: vec![Member {
+            stamp: stamp("B", 501, 60),
+            input: Input::Intent(intent),
+        }],
+    };
+    let completion = owner.apply_group(&group).unwrap();
+    assert_eq!(completion.committed, vec![Reference::Source("A".into())]);
+    assert_eq!(completion.failure, None);
+    assert!(!owner.transition.events.contains_key("B"));
+    let mut expected = before;
+    expected.transition.admissions = owner.transition.admissions.clone();
+    expected.transition.groups = owner.transition.groups.clone();
+    assert_eq!(owner, expected);
+}
+
+#[test]
+fn terminal_unknown_effect_matches_direct_rejection_but_history_conflict_wins() {
+    let mut owner = anchor(Side::Long, "1001", "50000", "3000", 500, "49900");
+    let source = mark(&owner, 501, "terminal-mark");
+    owner.activate_context(&source).unwrap();
+    let input = cancel::EffectInput {
+        stamp: stamp("fresh", 502, 50),
+        effects: vec![(
+            "request".into(),
+            "unknown".into(),
+            cancel::Reason::ExplicitScenario,
+        )],
+    };
+    let group = Group {
+        group_id: "terminal".into(),
+        account_key: owner.key.clone(),
+        ordering_contract_id: "S_order_v1".into(),
+        group_effective_at: 502,
+        declared_member_count: 1,
+        members: vec![Member {
+            stamp: input.stamp.clone(),
+            input: Input::Effect(input.clone()),
+        }],
+    };
+    let before = owner.clone();
+    assert_eq!(owner.effect_cancel(&input), Err("RUN_TERMINAL"));
+    assert_eq!(owner, before);
+    assert_eq!(owner.apply_group(&group), Err("RUN_TERMINAL"));
+    assert_eq!(owner, before);
+    let mut conflict = group;
+    conflict.members[0].stamp.event_id = "terminal-mark".into();
+    if let Input::Effect(input) = &mut conflict.members[0].input {
+        input.stamp.event_id = "terminal-mark".into();
+    }
+    assert_eq!(owner.apply_group(&conflict), Err("EVENT_ID_CONFLICT"));
+    let mut expected = before;
+    expected.gate = Gate::Failed("EVENT_ID_CONFLICT");
+    assert_eq!(owner, expected);
+}
+
 fn mark(owner: &ScenarioAccount, at: i64, id: &str) -> context::Input {
     let (_, marks) = owner.btc_context().unwrap();
     let mut input = activation(owner, at, mark_rows(marks, at));

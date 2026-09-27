@@ -301,7 +301,11 @@ impl ScenarioAccount {
                 action.digest,
                 "CANCEL_ACTION_CONFLICT",
             )?;
-            if let Some(request) = self.target_order(&action.target)?.cancel.request() {
+            if let Some(request) = self
+                .orders
+                .get(&action.target)
+                .and_then(|o| o.cancel.request())
+            {
                 if request.effect_action_id != action.id || request.reason != action.reason {
                     return Err("CANCEL_ACTION_CONFLICT");
                 }
@@ -787,6 +791,9 @@ impl ScenarioAccount {
                 Some(self.classify_risk(snapshot)?)
             }
         } else {
+            if kind == Kind::Effect {
+                self.immediate_risk_checked(stamp, |_| Ok(()))?;
+            }
             None
         };
         Ok(Receipt {

@@ -196,6 +196,7 @@ fn golden() -> (ScenarioAccount, String) {
     let order = admission::admit_execution_fixture(&mut owner, Side::Long, d("10"), d("10"));
     (owner, order)
 }
+
 fn candidate(
     owner: &ScenarioAccount,
     id: &str,
@@ -350,6 +351,13 @@ fn gt03_partial_and_full_fill_cancel_traces_are_exact_and_repeatable() {
                 "0",
             );
             let receipt = &effective.receipts[0];
+            assert_eq!(
+                receipt.lifecycle_after,
+                risk_transition::Lifecycle::RiskStable
+            );
+            assert_eq!(receipt.lifecycle_after, owner.transition.lifecycle);
+            assert_eq!(receipt.episode_after, owner.transition.episode);
+            assert_eq!(receipt.risk_after, None);
             assert_eq!(
                 receipt.outcome,
                 if full {

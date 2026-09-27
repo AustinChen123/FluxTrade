@@ -206,6 +206,7 @@ impl ScenarioAccount {
         for (member, _) in members {
             let version_before = self.state_version;
             let liquidation_before = self.liquidation_ids().count();
+            let mut source_reference = member.stamp.event_id.clone();
             let result = match &member.input {
                 Input::Context(input) => self
                     .activate_context_checked(input, |stage| match stage {
@@ -227,7 +228,13 @@ impl ScenarioAccount {
                         execution::commit::Reply::Rejected(reason) => Some(reason),
                         _ => None,
                     }),
-                Input::Intent(input) => self.group_admit(&member.stamp, input),
+                Input::Intent(input) => {
+                    self.group_admit(&member.stamp, input)
+                        .map(|(reason, event)| {
+                            source_reference = event;
+                            reason
+                        })
+                }
                 Input::Request(input) => self.request_cancel(input).map(|r| r.rejected),
                 Input::Effect(input) => self
                     .effect_cancel_checked(input, &mut hook)
@@ -237,7 +244,7 @@ impl ScenarioAccount {
                 Ok(None) => {
                     completion
                         .committed
-                        .push(Reference::Source(member.stamp.event_id.clone()));
+                        .push(Reference::Source(source_reference));
                 }
                 Ok(Some(reason)) => completion
                     .rejections

@@ -226,8 +226,8 @@ impl ScenarioAccount {
         &mut self,
         stamp: &risk_transition::cancel::Stamp,
         intent: &OrderIntent,
-    ) -> Result<Option<Fault>, Fault> {
-        Ok(self
+    ) -> Result<(Option<Fault>, String), Fault> {
+        let result = self
             .admit_stamped_checked(
                 &Envelope {
                     event_id: &stamp.event_id,
@@ -237,8 +237,8 @@ impl ScenarioAccount {
                 stamp,
                 |_| Ok(()),
             )?
-            .result
-            .reason_code)
+            .result;
+        Ok((result.reason_code, result.created_at_event_id))
     }
     fn admit(&mut self, envelope: &Envelope<'_>) -> Result<Reply, Fault> {
         self.admit_checked(envelope, |_| Ok(()))
