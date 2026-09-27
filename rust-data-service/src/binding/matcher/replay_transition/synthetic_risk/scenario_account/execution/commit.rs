@@ -3,7 +3,7 @@ use super::*;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum Reply {
+pub(in super::super) enum Reply {
     Committed {
         receipt: CommittedExecution,
         terminal_reason: Option<Fault>,
@@ -13,7 +13,7 @@ pub(super) enum Reply {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Stage {
+pub(in super::super) enum Stage {
     Preparing,
     Validated,
     Settled,
@@ -23,7 +23,10 @@ pub(super) enum Stage {
 }
 
 impl ScenarioAccount {
-    pub(super) fn execute(&mut self, candidate: &ExecutionCandidate) -> Result<Reply, Fault> {
+    pub(in super::super) fn execute(
+        &mut self,
+        candidate: &ExecutionCandidate,
+    ) -> Result<Reply, Fault> {
         self.execute_checked(candidate, |_| Ok(()))
     }
 
@@ -31,11 +34,28 @@ impl ScenarioAccount {
     pub(super) fn execute_checked(
         &mut self,
         candidate: &ExecutionCandidate,
+        hook: impl FnMut(Stage) -> Result<(), Fault>,
+    ) -> Result<Reply, Fault> {
+        let stamp = risk_transition::cancel::Stamp {
+            event_id: candidate.event_id.clone(),
+            effective_at: candidate.template.matching_effective_at,
+            source_sequence: None,
+            causal_parent_ids: Vec::new(),
+            ordering_contract_id: "S_order_v1".into(),
+            scenario_ordinal: 30,
+        };
+        self.execute_stamped(candidate, &stamp, hook)
+    }
+
+    pub(in super::super) fn execute_stamped(
+        &mut self,
+        candidate: &ExecutionCandidate,
+        stamp: &risk_transition::cancel::Stamp,
         mut hook: impl FnMut(Stage) -> Result<(), Fault>,
     ) -> Result<Reply, Fault> {
         let prepared = catch_unwind(AssertUnwindSafe(|| {
             hook(Stage::Preparing)?;
-            let (execution_id, digest) = match self.prepare_execution(candidate)? {
+            let (execution_id, digest) = match self.prepare_execution_stamped(candidate, stamp)? {
                 Preparation::Duplicate(receipt) => {
                     return Ok((Reply::Duplicate(receipt.clone()), None))
                 }
@@ -47,7 +67,8 @@ impl ScenarioAccount {
             };
             hook(Stage::Validated)?;
             let mut draft = self.clone();
-            let receipt = draft.settle_execution(candidate, execution_id, digest, &mut hook)?;
+            let receipt =
+                draft.settle_execution(candidate, execution_id, digest, stamp, &mut hook)?;
             let terminal_reason = match draft.gate {
                 Gate::Running => None,
                 Gate::Failed(reason) => Some(reason),
@@ -55,6 +76,8 @@ impl ScenarioAccount {
             draft
                 .execution_receipts
                 .insert(execution_id, receipt.clone());
+            let (source_digest, source_kind) = draft.execution_source(candidate);
+            draft.publish_source(stamp, source_digest, source_kind, true);
             hook(Stage::ReceiptDrafted)?;
             Ok((
                 Reply::Committed {
@@ -70,6 +93,18 @@ impl ScenarioAccount {
             Ok((reply, draft)) => {
                 if let Some(draft) = draft {
                     *self = draft;
+                    if let Err(fault) = self.immediate_risk(stamp) {
+                        return Err(self.fail_execution(fault));
+                    }
+                    if let Reply::Committed { receipt, .. } = reply {
+                        return Ok(Reply::Committed {
+                            receipt,
+                            terminal_reason: match self.gate {
+                                Gate::Running => None,
+                                Gate::Failed(reason) => Some(reason),
+                            },
+                        });
+                    }
                 }
                 Ok(reply)
             }
@@ -83,6 +118,7 @@ impl ScenarioAccount {
         candidate: &ExecutionCandidate,
         execution_id: Hash,
         digest: Hash,
+        stamp: &risk_transition::cancel::Stamp,
         hook: &mut impl FnMut(Stage) -> Result<(), Fault>,
     ) -> Result<CommittedExecution, Fault> {
         let template = &candidate.template;
@@ -194,9 +230,16 @@ impl ScenarioAccount {
         .into();
         let order_version_after = order.version;
         hook(Stage::OrdersDrafted)?;
-        let (after_reservation, risk) = self.execution_snapshot_after()?;
+        let (after_reservation, risk) = self.execution_snapshot_after(stamp)?;
         hook(Stage::Valued)?;
         Ok(CommittedExecution {
+            risk_decision_after: if let FinancialSnapshot::BtcEth(snapshot) = &after_reservation {
+                Some(self.classify_risk(snapshot)?)
+            } else {
+                None
+            },
+            lifecycle_after: self.transition.lifecycle,
+            episode_after: self.transition.episode.clone(),
             account_key: self.key.clone(),
             execution_id,
             financial_payload_digest: digest,
@@ -228,5 +271,7 @@ impl ScenarioAccount {
 
 #[cfg(test)]
 mod cancel_tests;
+#[cfg(test)]
+mod review_tests;
 #[cfg(test)]
 mod tests;

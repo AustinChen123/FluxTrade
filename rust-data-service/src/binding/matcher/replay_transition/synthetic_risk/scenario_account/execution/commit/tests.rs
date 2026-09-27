@@ -29,7 +29,7 @@ fn flat(cash: &str, mark: &str, orders: &[(Side, &str, &str)]) -> ScenarioAccoun
     ScenarioAccount::from_seed(&seed, &config, &marks).unwrap()
 }
 
-fn input(
+pub(super) fn input(
     owner: &ScenarioAccount,
     order_id: &str,
     execution: &str,
@@ -41,6 +41,12 @@ fn input(
     result.template.key.account = owner.key.clone();
     result.template.key.product = order.facts.product;
     result.template.key.external_id = execution.into();
+    result.event_id = format!("event-{execution}");
+    result.template.matching_effective_at = owner
+        .transition
+        .accepted_stamp
+        .as_ref()
+        .map_or(owner.seed_effective_at, |s| s.effective_at + 1);
     result.template.order_id = order_id.into();
     result.template.side = order.facts.side;
     result.template.quantity = d(qty);
@@ -218,7 +224,7 @@ fn runtime_duplicate_conflict_seed_reference_and_first_failure_are_preserved() {
     assert_eq!(owner.execute(&conflicting), Err("SEED_IDENTITY_CONFLICT"));
     assert_eq!(owner, before);
     conflicting.template.key.namespace = "new".into();
-    assert_eq!(owner.execute(&conflicting), Err("RUN_FAILED"));
+    assert_eq!(owner.execute(&conflicting), Err("EVENT_ID_CONFLICT"));
     assert_eq!(owner, before);
 }
 
@@ -265,6 +271,8 @@ fn admitted_order_partial_full_versions_improved_prices_and_old_duplicate() {
         let mut stale = owner.clone();
         let mut stale_input = first.clone();
         stale_input.template.key.external_id = "stale".into();
+        stale_input.event_id = "stale-event".into();
+        stale_input.template.matching_effective_at += 1;
         assert_eq!(stale.execute(&stale_input), Err("STALE_VERSION"));
         let second = input(&owner, &order, "second", "1", "50000");
         let final_receipt = committed(&mut owner, &second);
@@ -309,6 +317,7 @@ fn same_external_id_isolated_by_account_product_and_namespace() {
             for namespace in ["first", "second"] {
                 let mut candidate = input(&owner, order, "same-external", "0.5", price);
                 candidate.template.key.namespace = namespace.into();
+                candidate.event_id = format!("event-{order}-{namespace}");
                 let receipt = committed(&mut owner, &candidate);
                 assert!(ids.insert(receipt.execution_id));
                 assert_eq!(receipt.account_key.account, account);
@@ -386,7 +395,7 @@ fn every_prepublication_fault_and_panic_discards_the_draft() {
 fn committed_risk_failure_is_retained_and_negative_available_can_be_stable() {
     for (cash, extra_order, failed) in [
         ("2.1", false, true),
-        ("40", true, true),
+        ("40", true, false),
         ("40", false, false),
     ] {
         let mut orders = vec![(Side::Long, "1", "50000")];
@@ -412,7 +421,7 @@ fn committed_risk_failure_is_retained_and_negative_available_can_be_stable() {
                 owner.orders["O0"].version,
                 owner.commit_sequence
             ),
-            (1, 1, 1)
+            (if extra_order { 2 } else { 1 }, 1, 1)
         );
         assert_eq!(owner.cash, d(cash) - d("0.5"));
         assert!(owner.reservation().unwrap().available_margin < d("0"));
@@ -441,11 +450,15 @@ fn committed_risk_failure_is_retained_and_negative_available_can_be_stable() {
     assert!(matches!(
         owner.execute(&candidate),
         Ok(Reply::Committed {
-            terminal_reason: Some("UNSUPPORTED_RISK_TRANSITION"),
+            terminal_reason: None,
             ..
         })
     ));
     assert!(owner.positions.is_empty());
+    assert_eq!(
+        owner.transition.lifecycle,
+        risk_transition::Lifecycle::LiquidatedInsolvent
+    );
     assert_eq!(owner.cash, d("-7.49"));
     assert_eq!(owner.execution_receipts.len(), 1);
     // Negative available with only a genuinely reducing remainder needs no 4C action.

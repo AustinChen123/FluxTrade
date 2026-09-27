@@ -7,12 +7,15 @@ use super::*;
 
 mod admission;
 mod capacity;
+mod context;
 mod event_limit;
 mod execution;
 mod golden_cancel;
+mod group;
 mod hypothetical_settlement;
 mod reservation;
 mod risk_transition;
+mod source;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ProfileContext {
@@ -217,6 +220,7 @@ struct ScenarioAccount {
     execution_receipts: BTreeMap<Hash, execution::CommittedExecution>,
     pending_actions: Vec<Infallible>,
     cancel_facts: risk_transition::cancel::Facts,
+    transition: risk_transition::Facts,
 }
 
 enum NewIdentity<'a> {
@@ -460,6 +464,7 @@ impl ScenarioAccount {
             execution_receipts: BTreeMap::new(),
             pending_actions: Vec::new(),
             cancel_facts: Default::default(),
+            transition: Default::default(),
         };
         let (scenario, marks) = owner.btc_context()?;
         if scenario.evaluate(&owner.projection()?, marks)?.risk != MaintenanceState::Safe {
@@ -473,7 +478,7 @@ impl ScenarioAccount {
         self.btc_context()?;
         Ok(ValuationInput {
             account_version: self.state_version,
-            effective_at: self.seed_effective_at,
+            effective_at: self.transition.context_at.unwrap_or(self.seed_effective_at),
             cash: self.cash,
             positions: self
                 .positions

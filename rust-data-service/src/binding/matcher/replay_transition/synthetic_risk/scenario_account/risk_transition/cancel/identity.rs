@@ -20,21 +20,42 @@ pub(super) fn classify<T>(
     }
 }
 
-struct Encoding(Vec<u8>);
+pub(in super::super::super) struct Encoding(Vec<u8>);
 impl Encoding {
-    fn new(kind: &str) -> Self {
+    pub(in super::super::super) fn optional_integer(&mut self, value: Option<i64>) {
+        match value {
+            Some(v) => {
+                self.0.push(1);
+                self.integer(v);
+            }
+            None => self.0.push(0),
+        }
+    }
+    pub(in super::super::super) fn optional_text(&mut self, value: Option<&str>) {
+        match value {
+            Some(v) => {
+                self.0.push(1);
+                self.text(v);
+            }
+            None => self.0.push(0),
+        }
+    }
+    pub(in super::super::super) fn hash(&mut self, value: Hash) {
+        self.0.extend_from_slice(&value);
+    }
+    pub(in super::super::super) fn new(kind: &str) -> Self {
         let mut e = Self(Vec::new());
         e.text(kind);
         e
     }
-    fn text(&mut self, value: &str) {
+    pub(in super::super::super) fn text(&mut self, value: &str) {
         self.integer(value.len() as i64);
         self.0.extend_from_slice(value.as_bytes());
     }
-    fn integer(&mut self, value: i64) {
+    pub(in super::super::super) fn integer(&mut self, value: i64) {
         self.0.extend_from_slice(&value.to_be_bytes());
     }
-    fn account(&mut self, key: &AccountKey) {
+    pub(in super::super::super) fn account(&mut self, key: &AccountKey) {
         self.text(&key.venue);
         self.text(&key.environment);
         self.text(&key.account);
@@ -46,7 +67,7 @@ impl Encoding {
             None => self.0.push(0),
         }
     }
-    fn stamp_tail(&mut self, stamp: &Stamp) {
+    pub(in super::super::super) fn stamp_tail(&mut self, stamp: &Stamp) {
         match stamp.source_sequence {
             Some(s) => {
                 self.0.push(1);
@@ -63,7 +84,7 @@ impl Encoding {
         self.text(&stamp.ordering_contract_id);
         self.integer(stamp.scenario_ordinal);
     }
-    fn finish(self) -> Hash {
+    pub(in super::super::super) fn finish(self) -> Hash {
         digest(&SHA256, &self.0)
             .as_ref()
             .try_into()
@@ -106,6 +127,7 @@ fn prepare(
         .into_iter()
         .map(|(detecting, target, reason)| {
             let request = CanonicalRequest {
+                reason,
                 request_id: derived(&owner.key, &detecting, &target, None),
                 detecting_event_id: detecting.clone(),
                 effect_action_id: derived(&owner.key, &detecting, &target, Some(1)),
@@ -128,11 +150,7 @@ fn prepare(
             if kind == Kind::Effect {
                 e.integer(1);
             }
-            e.text(if reason == Reason::ExplicitScenario {
-                "EXPLICIT_SCENARIO"
-            } else {
-                "UNSUPPORTED"
-            });
+            e.text(reason.name());
             e.integer(stamp.effective_at);
             e.stamp_tail(stamp);
             PreparedAction {
@@ -215,6 +233,7 @@ pub(super) fn validate(
     stamp: &Stamp,
     actions: &[PreparedAction],
 ) -> Result<(), Fault> {
+    stamp_shape(stamp, owner.transition.reverse_group)?;
     let mut ids = BTreeSet::new();
     let mut targets = BTreeSet::new();
     let mut parents = BTreeSet::new();
@@ -222,7 +241,9 @@ pub(super) fn validate(
         || stamp.effective_at < 0
         || stamp.scenario_ordinal <= 0
         || actions.is_empty()
-        || stamp.ordering_contract_id != "S_order_v1"
+        || !(stamp.ordering_contract_id == "S_order_v1"
+            || (owner.transition.reverse_group
+                && stamp.ordering_contract_id == "S_order_v1_reverse_execution_cancel_effective"))
         || stamp
             .causal_parent_ids
             .iter()
@@ -230,7 +251,7 @@ pub(super) fn validate(
         || actions.iter().any(|a| {
             !identity(&a.detecting)
                 || !identity(&a.target)
-                || a.reason != Reason::ExplicitScenario
+                || matches!(a.reason, Reason::Unsupported | Reason::SpecMigration)
                 || !ids.insert(a.id)
                 || !targets.insert(&a.target)
         })
@@ -239,5 +260,23 @@ pub(super) fn validate(
     }
     owner.validate_context(stamp.effective_at)?;
     owner.cancel_snapshot()?;
+    Ok(())
+}
+
+pub(in super::super::super) fn stamp_shape(stamp: &Stamp, reverse: bool) -> Result<(), Fault> {
+    if !identity(&stamp.event_id)
+        || stamp.effective_at < 0
+        || stamp.scenario_ordinal <= 0
+        || !(stamp.ordering_contract_id == "S_order_v1"
+            || (reverse
+                && stamp.ordering_contract_id == "S_order_v1_reverse_execution_cancel_effective"))
+        || stamp.causal_parent_ids.iter().any(|p| !identity(p))
+        || stamp
+            .causal_parent_ids
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+    {
+        return Err("INVALID_SCENARIO_GROUP");
+    }
     Ok(())
 }

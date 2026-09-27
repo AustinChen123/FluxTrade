@@ -9,8 +9,28 @@ pub(super) fn admit_execution_fixture(
     quantity: Decimal,
     price: Decimal,
 ) -> String {
-    let intent = OrderIntent {
-        intent_id: "execution-fixture".into(),
+    let intent = fixture_intent(owner, "execution-fixture", side, quantity, price);
+    let reply = owner
+        .admit(&Envelope {
+            event_id: "admission",
+            effective_at: 500,
+            intent: &intent,
+        })
+        .unwrap();
+    assert_eq!(reply.kind, ReplyKind::Accepted);
+    reply.result.order_id.unwrap()
+}
+
+#[cfg(test)]
+pub(super) fn fixture_intent(
+    owner: &ScenarioAccount,
+    id: &str,
+    side: Side,
+    quantity: Decimal,
+    price: Decimal,
+) -> OrderIntent {
+    OrderIntent {
+        intent_id: id.into(),
         client_order_id: "client".into(),
         account_key: owner.key.clone(),
         config_id: owner.config_id.clone(),
@@ -26,19 +46,35 @@ pub(super) fn admit_execution_fixture(
         limit_price: Some(price),
         reduce_only: false,
         requested_at: 500,
-    };
-    let reply = owner
-        .admit(&Envelope {
-            event_id: "admission",
-            effective_at: 500,
-            intent: &intent,
-        })
-        .unwrap();
-    assert_eq!(reply.kind, ReplyKind::Accepted);
-    reply.result.order_id.unwrap()
+    }
 }
 
 mod btc_policy;
+
+#[cfg(test)]
+pub(super) fn fixture_admit(
+    owner: &mut ScenarioAccount,
+    event_id: &str,
+    effective_at: i64,
+    intent: &OrderIntent,
+) -> Result<(&'static str, AdmissionResult), Fault> {
+    owner
+        .admit(&Envelope {
+            event_id,
+            effective_at,
+            intent,
+        })
+        .map(|r| {
+            (
+                match r.kind {
+                    ReplyKind::Accepted => "accepted",
+                    ReplyKind::Rejected => "rejected",
+                    ReplyKind::Duplicate => "duplicate",
+                },
+                r.result,
+            )
+        })
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OrderType {
@@ -48,7 +84,7 @@ enum OrderType {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct OrderIntent {
+pub(super) struct OrderIntent {
     intent_id: String,
     client_order_id: String,
     account_key: AccountKey,
@@ -64,6 +100,22 @@ struct OrderIntent {
 }
 
 impl OrderIntent {
+    pub(super) fn account_key(&self) -> &AccountKey {
+        &self.account_key
+    }
+    pub(super) fn preflight_identity(&self, owner: &ScenarioAccount) -> Result<(), Fault> {
+        if owner
+            .intent_results
+            .get(&self.intent_id)
+            .is_some_and(|receipt| receipt.canonical_payload_digest != self.digest())
+        {
+            return Err("IDEMPOTENCY_KEY_CONFLICT");
+        }
+        Ok(())
+    }
+    pub(super) fn group_identity(&self) -> (&str, Hash) {
+        (&self.intent_id, self.digest())
+    }
     fn digest(&self) -> Hash {
         hash_fields(&[
             Some("scenario-intent-v1".into()),
@@ -170,6 +222,24 @@ struct Prepared {
 }
 
 impl ScenarioAccount {
+    pub(super) fn group_admit(
+        &mut self,
+        stamp: &risk_transition::cancel::Stamp,
+        intent: &OrderIntent,
+    ) -> Result<Option<Fault>, Fault> {
+        Ok(self
+            .admit_stamped_checked(
+                &Envelope {
+                    event_id: &stamp.event_id,
+                    effective_at: stamp.effective_at,
+                    intent,
+                },
+                stamp,
+                |_| Ok(()),
+            )?
+            .result
+            .reason_code)
+    }
     fn admit(&mut self, envelope: &Envelope<'_>) -> Result<Reply, Fault> {
         self.admit_checked(envelope, |_| Ok(()))
     }
@@ -180,10 +250,19 @@ impl ScenarioAccount {
         envelope: &Envelope<'_>,
         hook: impl FnMut(PrepareStage) -> Result<(), Fault>,
     ) -> Result<Reply, Fault> {
-        if self.gate != Gate::Running {
-            return Err("RUN_FAILED");
+        let stamp = source::stamp(envelope.event_id, envelope.effective_at, 60);
+        self.admit_stamped_checked(envelope, &stamp, hook)
+    }
+
+    fn admit_stamped_checked(
+        &mut self,
+        envelope: &Envelope<'_>,
+        stamp: &risk_transition::cancel::Stamp,
+        hook: impl FnMut(PrepareStage) -> Result<(), Fault>,
+    ) -> Result<Reply, Fault> {
+        if self.seed_intents.contains(&envelope.intent.intent_id) {
+            return Err(self.source_failure("SEED_IDENTITY_CONFLICT"));
         }
-        self.guard_new_identity(NewIdentity::Intent(&envelope.intent.intent_id))?;
         if let Some(original) = self.intent_results.get(&envelope.intent.intent_id) {
             if original.canonical_payload_digest == envelope.intent.digest() {
                 return Ok(Reply {
@@ -191,27 +270,34 @@ impl ScenarioAccount {
                     result: original.clone(),
                 });
             }
-            self.gate = Gate::Failed("IDEMPOTENCY_KEY_CONFLICT");
-            return Err("IDEMPOTENCY_KEY_CONFLICT");
+            return Err(self.source_failure("IDEMPOTENCY_KEY_CONFLICT"));
         }
+        self.source_boundary(stamp, envelope.intent.digest(), source::Kind::Intent)
+            .map_err(|f| self.source_failure(f))?;
         let prepared = catch_unwind(AssertUnwindSafe(|| self.prepare_admission(envelope, hook)))
             .map_err(|_| "ADMISSION_PANIC")
             .and_then(|result| result);
-        let prepared = match prepared {
+        let mut prepared = match prepared {
             Ok(prepared) => prepared,
             Err(fault) => {
-                self.gate = Gate::Failed(fault);
-                return Err(fault);
+                return Err(self.source_failure(fault));
             }
         };
         let kind = match prepared.result.outcome {
             Outcome::Accepted => {
+                prepared.draft.publish_source(
+                    stamp,
+                    envelope.intent.digest(),
+                    source::Kind::Intent,
+                    true,
+                );
                 *self = prepared.draft;
                 ReplyKind::Accepted
             }
             Outcome::Rejected => {
                 self.intent_results
                     .insert(prepared.result.intent_id.clone(), prepared.result.clone());
+                self.publish_source(stamp, envelope.intent.digest(), source::Kind::Intent, false);
                 ReplyKind::Rejected
             }
         };

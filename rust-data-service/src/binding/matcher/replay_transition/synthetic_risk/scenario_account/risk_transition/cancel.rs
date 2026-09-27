@@ -3,13 +3,28 @@ use super::super::execution::FinancialSnapshot;
 use super::super::*;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-mod identity;
+pub(in super::super) mod identity;
 use identity::{classify, PreparedAction, Stored};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in super::super) enum Reason {
     ExplicitScenario,
+    RiskShortfall,
+    MmrBreach,
+    SpecMigration,
     Unsupported,
+}
+
+impl Reason {
+    pub(in super::super) fn name(self) -> &'static str {
+        match self {
+            Self::ExplicitScenario => "EXPLICIT_SCENARIO",
+            Self::RiskShortfall => "RISK_SHORTFALL",
+            Self::MmrBreach => "MMR_BREACH",
+            Self::SpecMigration => "SPEC_MIGRATION",
+            Self::Unsupported => "UNSUPPORTED",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -36,6 +51,7 @@ pub(in super::super) struct EffectInput {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(in super::super) struct CanonicalRequest {
+    pub reason: Reason,
     pub request_id: Hash,
     pub detecting_event_id: String,
     pub effect_action_id: Hash,
@@ -54,12 +70,13 @@ pub(in super::super) enum State {
     Requested(CanonicalRequest),
     EffectiveCanceled(EffectFact),
     EffectiveTooLate(EffectFact),
+    MigrationEffective(Hash),
 }
 
 impl State {
     fn request(&self) -> Option<&CanonicalRequest> {
         match self {
-            Self::None => None,
+            Self::None | Self::MigrationEffective(_) => None,
             Self::Requested(r) => Some(r),
             Self::EffectiveCanceled(f) | Self::EffectiveTooLate(f) => Some(&f.request),
         }
@@ -107,6 +124,9 @@ pub(in super::super) struct Receipt {
     pub after: SeedOrder,
     pub reservation_before: FinancialSnapshot,
     pub reservation_after: FinancialSnapshot,
+    pub risk_after: Option<super::Decision>,
+    pub lifecycle_after: super::Lifecycle,
+    pub episode_after: Option<super::Episode>,
     pub spec_version: String,
     pub rule_data_version: String,
     pub action_ids: Vec<Hash>,
@@ -122,6 +142,29 @@ pub(in super::super) struct BatchResult {
     pub stopping_action: Option<Hash>,
     pub account_version_before: u64,
     pub account_version_after: u64,
+}
+
+impl BatchResult {
+    fn duplicates(stamp: &Stamp, digest: Hash, receipts: Vec<Receipt>) -> Self {
+        Self {
+            event_id: stamp.event_id.clone(),
+            payload_digest: digest,
+            account_version_before: receipts
+                .iter()
+                .map(|r| r.account_version_before)
+                .min()
+                .unwrap_or(0),
+            account_version_after: receipts
+                .iter()
+                .map(|r| r.account_version_after)
+                .max()
+                .unwrap_or(0),
+            receipts,
+            rejected: None,
+            failure: None,
+            stopping_action: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -140,6 +183,208 @@ pub(in super::super) enum Stage {
 }
 
 impl ScenarioAccount {
+    pub(in super::super) fn automatic_cancel(&mut self, input: &RequestInput) -> Result<(), Fault> {
+        self.automatic_cancel_checked(input, |_| Ok(()))
+    }
+
+    pub(in super::super) fn automatic_cancel_checked(
+        &mut self,
+        input: &RequestInput,
+        mut hook: impl FnMut(Stage) -> Result<(), Fault>,
+    ) -> Result<(), Fault> {
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            self.prepare_automatic_cancel(input, &mut hook)
+        }))
+        .map_err(|_| "CANCEL_PANIC")
+        .and_then(|r| r);
+        match result {
+            Ok(draft) => {
+                *self = draft;
+                Ok(())
+            }
+            Err(f) => Err(self.cancel_failure(f)),
+        }
+    }
+
+    fn prepare_automatic_cancel(
+        &self,
+        input: &RequestInput,
+        hook: &mut impl FnMut(Stage) -> Result<(), Fault>,
+    ) -> Result<Self, Fault> {
+        let actions = identity::requests(self, input)?;
+        self.classify_cancel_actions(&actions, Kind::Request)?;
+        identity::validate(self, &input.stamp, &actions)?;
+        let episode = self
+            .transition
+            .episode
+            .clone()
+            .ok_or("INVALID_RISK_EPISODE")?;
+        let mut id = identity::Encoding::new("RISK_CANCEL_BATCH");
+        id.hash(episode.id);
+        id.text(episode.current_reason.name());
+        id.integer(actions.len() as i64);
+        for a in &actions {
+            id.hash(a.id);
+        }
+        let id = id.finish();
+        let mut digest = identity::Encoding::new("RISK_CANCEL_BATCH");
+        digest.hash(id);
+        digest.account(&self.key);
+        digest.hash(episode.id);
+        digest.text(episode.initial_reason.name());
+        digest.text(episode.current_reason.name());
+        digest.optional_text(episode.escalation_event.as_deref());
+        digest.integer(actions.len() as i64);
+        for a in &actions {
+            digest.hash(a.id);
+            digest.hash(a.digest);
+        }
+        let digest = digest.finish();
+        let mut draft = self.clone();
+        draft.state_version = self
+            .state_version
+            .checked_add(1)
+            .ok_or("VERSION_OVERFLOW")?;
+        let mut receipts = Vec::new();
+        hook(Stage::Prepared)?;
+        for (index, action) in actions.into_iter().enumerate() {
+            let receipt =
+                draft.apply_cancel(&action, &input.stamp, Kind::Request, self.state_version)?;
+            draft.cancel_facts.requests.insert(
+                action.id,
+                Stored {
+                    digest: action.digest,
+                    value: receipt.clone(),
+                },
+            );
+            receipts.push(receipt);
+            hook(Stage::ActionDrafted(index))?;
+        }
+        let batch = BatchResult {
+            event_id: input.stamp.event_id.clone(),
+            payload_digest: digest,
+            receipts,
+            rejected: None,
+            failure: None,
+            stopping_action: None,
+            account_version_before: self.state_version,
+            account_version_after: draft.state_version,
+        };
+        draft.transition.batches.insert(
+            id,
+            super::AutomaticReceipt {
+                id,
+                digest,
+                episode,
+                batch,
+            },
+        );
+        hook(Stage::BeforeSwap(0))?;
+        Ok(draft)
+    }
+    pub(in super::super) fn request_group_digest(
+        &self,
+        input: &RequestInput,
+    ) -> Result<Hash, Fault> {
+        let actions = identity::requests(self, input)?;
+        self.classify_cancel_actions(&actions, Kind::Request)?;
+        let digest = identity::batch_digest(&self.key, &input.stamp, Kind::Request, &actions);
+        classify(
+            self.cancel_facts
+                .batches
+                .get(&(Kind::Request, input.stamp.event_id.clone())),
+            digest,
+            "EVENT_ID_CONFLICT",
+        )?;
+        Ok(digest)
+    }
+    pub(in super::super) fn effect_group_digest(&self, input: &EffectInput) -> Result<Hash, Fault> {
+        let actions = identity::effects(self, input)?;
+        for action in &actions {
+            classify(
+                self.cancel_facts.effects.get(&action.id),
+                action.digest,
+                "CANCEL_ACTION_CONFLICT",
+            )?;
+            if let Some(request) = self.target_order(&action.target)?.cancel.request() {
+                if request.effect_action_id != action.id || request.reason != action.reason {
+                    return Err("CANCEL_ACTION_CONFLICT");
+                }
+            }
+        }
+        let digest = identity::batch_digest(&self.key, &input.stamp, Kind::Effect, &actions);
+        classify(
+            self.cancel_facts
+                .batches
+                .get(&(Kind::Effect, input.stamp.event_id.clone())),
+            digest,
+            "EVENT_ID_CONFLICT",
+        )?;
+        Ok(digest)
+    }
+    pub(in super::super) fn migrate_order(
+        &mut self,
+        id: &str,
+        stamp: &Stamp,
+    ) -> Result<Hash, Fault> {
+        let order = self.target_order(id)?.clone();
+        if !order.facts.projects_remainder("INVALID_CANCEL_ORDER")? {
+            return Err("INVALID_CANCEL_ORDER");
+        }
+        let action_id = if let State::Requested(request) = &order.cancel {
+            let input = EffectInput {
+                stamp: stamp.clone(),
+                effects: vec![(
+                    request.detecting_event_id.clone(),
+                    id.into(),
+                    request.reason,
+                )],
+            };
+            let action = identity::effects(self, &input)?.remove(0);
+            self.classify_cancel_actions(std::slice::from_ref(&action), Kind::Effect)?;
+            let receipt = self.apply_cancel(
+                &action,
+                stamp,
+                Kind::Effect,
+                self.state_version
+                    .checked_sub(1)
+                    .ok_or("VERSION_OVERFLOW")?,
+            )?;
+            self.cancel_facts.effects.insert(
+                action.id,
+                Stored {
+                    digest: action.digest,
+                    value: receipt,
+                },
+            );
+            action.id
+        } else if matches!(order.cancel, State::None) {
+            let input = EffectInput {
+                stamp: stamp.clone(),
+                effects: vec![(stamp.event_id.clone(), id.into(), Reason::SpecMigration)],
+            };
+            let action = identity::effects(self, &input)?.remove(0);
+            let receipt = self.apply_cancel(
+                &action,
+                stamp,
+                Kind::Effect,
+                self.state_version
+                    .checked_sub(1)
+                    .ok_or("VERSION_OVERFLOW")?,
+            )?;
+            self.cancel_facts.effects.insert(
+                action.id,
+                Stored {
+                    digest: action.digest,
+                    value: receipt,
+                },
+            );
+            action.id
+        } else {
+            return Err("CANCEL_ACTION_CONFLICT");
+        };
+        Ok(action_id)
+    }
     fn cancel_snapshot(&self) -> Result<FinancialSnapshot, Fault> {
         match self.profile {
             ProfileContext::BtcEthScenario { .. } => {
@@ -164,10 +409,7 @@ impl ScenarioAccount {
     }
 
     fn cancel_failure(&mut self, fault: Fault) -> Fault {
-        if self.gate == Gate::Running {
-            self.gate = Gate::Failed(fault);
-        }
-        fault
+        self.source_failure(fault)
     }
 
     pub(in super::super) fn request_cancel(
@@ -194,10 +436,18 @@ impl ScenarioAccount {
                 return Ok((original.clone(), None));
             }
             let duplicates = self.classify_cancel_actions(&actions, Kind::Request)?;
-            identity::validate(self, &input.stamp, &actions)?;
-            if self.gate != Gate::Running {
-                return Err("RUN_FAILED");
+            if !duplicates.is_empty() && duplicates.iter().all(Option::is_some) {
+                return Ok((
+                    BatchResult::duplicates(
+                        &input.stamp,
+                        digest,
+                        duplicates.into_iter().flatten().collect(),
+                    ),
+                    None,
+                ));
             }
+            self.source_boundary(&input.stamp, digest, source::Kind::CancelRequest)?;
+            identity::validate(self, &input.stamp, &actions)?;
             let mut batch = BatchResult {
                 event_id: input.stamp.event_id.clone(),
                 payload_digest: digest,
@@ -249,6 +499,12 @@ impl ScenarioAccount {
                 }
             }
             batch.account_version_after = draft.state_version;
+            draft.publish_source(
+                &input.stamp,
+                digest,
+                source::Kind::CancelRequest,
+                batch.rejected.is_none(),
+            );
             draft.cancel_facts.batches.insert(
                 key,
                 Stored {
@@ -296,10 +552,26 @@ impl ScenarioAccount {
                 return Ok((key, digest, actions, Vec::new(), Some(original.clone())));
             }
             let duplicates = self.classify_cancel_actions(&actions, Kind::Effect)?;
-            identity::validate(self, &input.stamp, &actions)?;
-            if duplicates.iter().any(Option::is_none) && self.gate != Gate::Running {
-                return Err("RUN_FAILED");
+            if !duplicates.is_empty() && duplicates.iter().all(Option::is_some) {
+                let original = BatchResult::duplicates(
+                    &input.stamp,
+                    digest,
+                    duplicates.into_iter().flatten().collect(),
+                );
+                return Ok((key, digest, actions, Vec::new(), Some(original)));
             }
+            self.source_boundary(&input.stamp, digest, source::Kind::CancelEffect)?;
+            for action in &actions {
+                if self
+                    .target_order(&action.target)?
+                    .cancel
+                    .request()
+                    .is_none()
+                {
+                    return Err("CANCEL_EFFECT_BEFORE_REQUEST");
+                }
+            }
+            identity::validate(self, &input.stamp, &actions)?;
             hook(Stage::Prepared)?;
             Ok((key, digest, actions, duplicates, None))
         }))
@@ -342,6 +614,7 @@ impl ScenarioAccount {
                         value: receipt.clone(),
                     },
                 );
+                draft.publish_source(&input.stamp, digest, source::Kind::CancelEffect, true);
                 hook(Stage::ActionDrafted(index))?;
                 hook(Stage::BeforeSwap(index))?;
                 Ok((draft, receipt))
@@ -352,6 +625,16 @@ impl ScenarioAccount {
                 Ok((draft, receipt)) => {
                     *self = draft;
                     batch.receipts.push(receipt);
+                    if let Err(f) = self.immediate_risk(&input.stamp) {
+                        batch.failure = Some(self.cancel_failure(f));
+                        batch.stopping_action = Some(action.id);
+                        break;
+                    }
+                    if let Gate::Failed(f) = self.gate {
+                        batch.failure = Some(f);
+                        batch.stopping_action = Some(action.id);
+                        break;
+                    }
                 }
                 Err(f) => {
                     batch.failure = Some(self.cancel_failure(f));
@@ -391,11 +674,15 @@ impl ScenarioAccount {
                 )? {
                     return Ok(Some(receipt.clone()));
                 }
-                let order = self.target_order(&action.target)?;
+                let Some(order) = self.orders.get(&action.target) else {
+                    return Ok(None);
+                };
                 match (kind, order.cancel.request()) {
                     (Kind::Request, Some(_)) => return Err("CANCEL_ACTION_CONFLICT"),
-                    (Kind::Effect, None) => return Err("CANCEL_EFFECT_BEFORE_REQUEST"),
-                    (Kind::Effect, Some(request)) if request.effect_action_id != action.id => {
+                    (Kind::Effect, Some(request))
+                        if request.effect_action_id != action.id
+                            || request.reason != action.reason =>
+                    {
                         return Err("CANCEL_ACTION_CONFLICT")
                     }
                     _ => {}
@@ -419,7 +706,10 @@ impl ScenarioAccount {
             .projects_remainder("INVALID_CANCEL_ORDER")?;
         let (spec_version, rule_data_version) =
             self.cancel_versions(&before_order.facts, stamp.effective_at)?;
-        let request = if kind == Kind::Request {
+        let direct_migration = kind == Kind::Effect
+            && action.reason == Reason::SpecMigration
+            && matches!(before_order.cancel, State::None);
+        let request = if kind == Kind::Request || direct_migration {
             action.request.clone()
         } else {
             before_order
@@ -437,10 +727,14 @@ impl ScenarioAccount {
             order.facts.canceled = add(order.facts.canceled, order.facts.remaining)?;
             order.facts.remaining = Decimal::ZERO;
             order.facts.status = "CANCELED".into();
-            order.cancel = State::EffectiveCanceled(EffectFact {
-                request: request.clone(),
-                action_id: action.id,
-            });
+            order.cancel = if direct_migration {
+                State::MigrationEffective(action.id)
+            } else {
+                State::EffectiveCanceled(EffectFact {
+                    request: request.clone(),
+                    action_id: action.id,
+                })
+            };
             Outcome::EffectiveCanceled
         } else {
             if order.facts.status != "FILLED" {
@@ -476,7 +770,7 @@ impl ScenarioAccount {
                     return Err("CANCEL_ACTION_CONFLICT");
                 }
             }
-        } else {
+        } else if !direct_migration {
             let pending = self
                 .cancel_facts
                 .actions
@@ -488,6 +782,18 @@ impl ScenarioAccount {
             pending.outcome = Some(outcome);
         }
         let reservation_after = self.cancel_snapshot()?;
+        if kind == Kind::Request {
+            self.transition.lifecycle = super::Lifecycle::AwaitingCancelEffective;
+        }
+        let risk_after = if let FinancialSnapshot::BtcEth(snapshot) = &reservation_after {
+            if kind == Kind::Effect {
+                Some(self.prepare_risk(stamp, snapshot)?)
+            } else {
+                Some(self.classify_risk(snapshot)?)
+            }
+        } else {
+            None
+        };
         Ok(Receipt {
             account_key: self.key.clone(),
             action_id: action.id,
@@ -495,7 +801,7 @@ impl ScenarioAccount {
             event_id: stamp.event_id.clone(),
             detecting_event_id: action.detecting.clone(),
             target_order_id: action.target.clone(),
-            reason: Reason::ExplicitScenario,
+            reason: action.reason,
             phase: if kind == Kind::Request { 0 } else { 1 },
             outcome,
             effective_at: stamp.effective_at,
@@ -507,6 +813,9 @@ impl ScenarioAccount {
             after: after_order.facts,
             reservation_before,
             reservation_after,
+            risk_after,
+            lifecycle_after: self.transition.lifecycle,
+            episode_after: self.transition.episode.clone(),
             spec_version,
             rule_data_version,
             action_ids: if kind == Kind::Request {

@@ -5,10 +5,164 @@ use super::super::super::risk_transition::cancel::{
 use super::super::super::tests::{d, fixture};
 use super::*;
 
+#[test]
+fn activated_tick_context_executes_aligned_price_against_fractional_origin_lot() {
+    use super::super::super::context::{tests::activation, Rows};
+    for (product, entry, price, cash) in [
+        (Product::Btc, "50000.1", "50000", "9999.7495"),
+        (Product::Eth, "2000.01", "2000", "9999.8995"),
+    ] {
+        let (mut seed, config, mut marks) = fixture();
+        seed.effective_at = 1999;
+        seed.positions[0].product = product;
+        seed.positions[0].contracts = d("1");
+        seed.positions[0].lots.truncate(1);
+        seed.positions[0].lots[0].entry = d(entry);
+        marks
+            .iter_mut()
+            .find(|m| m.product == product)
+            .unwrap()
+            .price = d(price);
+        let order = &mut seed.orders[0];
+        order.product = ProfileProduct::BtcEth(product);
+        order.price = d(price);
+        order.original = d("0.5");
+        order.filled = Decimal::ZERO;
+        order.remaining = d("0.5");
+        order.status = "OPEN".into();
+        let mut owner = ScenarioAccount::from_seed(&seed, &config, &marks).unwrap();
+        let input = activation(
+            &owner,
+            2000,
+            Rows::Specs(
+                [Product::Btc, Product::Eth]
+                    .into_iter()
+                    .map(|p| (p, "spec-v1".into(), "spec-v2".into(), 2000))
+                    .collect(),
+            ),
+        );
+        owner.activate_context(&input).unwrap();
+        let mut c = candidate(&owner, "O1", "after-activation", "0.5");
+        c.template.matching_effective_at = 2000;
+        c.spec_version = "spec-v2".into();
+        c.rule_data_version = "tier-v2".into();
+        let Reply::Committed { receipt, .. } = owner.execute(&c).unwrap() else {
+            panic!("commit")
+        };
+        assert_eq!(receipt.realized_pnl_delta, d("-0.0005"));
+        assert_eq!(owner.cash, d(cash));
+        assert_eq!(owner.state_version, 2);
+        assert_eq!(owner.commit_sequence, 2);
+        let lot = &owner.positions.btc().unwrap()[&product].lots[0];
+        assert_eq!(lot.origin_spec_version, "spec-v1");
+        assert_eq!(lot.source.entry, d(entry));
+        assert_eq!(lot.source.contracts, d("0.5"));
+    }
+}
+
+#[test]
+fn canonical_and_reserved_reverse_groups_retain_exact_gt03_prefix() {
+    use super::super::super::group::{Group, Input, Member};
+    for reverse in [false, true] {
+        let (mut owner, order) = golden();
+        fill(&mut owner, &order, "X1", "4");
+        owner.request_cancel(&request("C1", &[&order])).unwrap();
+        let ordering = if reverse {
+            "S_order_v1_reverse_execution_cancel_effective"
+        } else {
+            "S_order_v1"
+        };
+        let mut execution = candidate(&owner, &order, "X2", "3");
+        execution.event_id = "X2-event".into();
+        execution.template.matching_effective_at = 600;
+        if reverse {
+            execution.expected_account_version += 1;
+            execution.expected_order_version += 1;
+        }
+        let mut e_stamp = stamp("X2-event", if reverse { 50 } else { 30 });
+        e_stamp.effective_at = 600;
+        e_stamp.ordering_contract_id = ordering.into();
+        let mut effect = effect("effect", "C1", &[&order]);
+        effect.stamp.effective_at = 600;
+        effect.stamp.scenario_ordinal = if reverse { 30 } else { 50 };
+        effect.stamp.ordering_contract_id = ordering.into();
+        let group = Group {
+            group_id: if reverse {
+                "reverse-execution-cancel-effective-v1"
+            } else {
+                "canonical"
+            }
+            .into(),
+            account_key: owner.key.clone(),
+            ordering_contract_id: ordering.into(),
+            group_effective_at: 600,
+            declared_member_count: 2,
+            members: vec![
+                Member {
+                    stamp: e_stamp,
+                    input: Input::Execution(execution),
+                },
+                Member {
+                    stamp: effect.stamp.clone(),
+                    input: Input::Effect(effect),
+                },
+            ],
+        };
+        if !reverse {
+            for field in 0..5 {
+                let mut invalid = group.clone();
+                match field {
+                    0 => {
+                        invalid.members[0].stamp.source_sequence = Some(2);
+                        invalid.members[1].stamp.source_sequence = Some(1);
+                    }
+                    1 => {
+                        invalid.members[0].stamp.causal_parent_ids = vec!["effect".into()];
+                        invalid.members[1].stamp.causal_parent_ids = vec!["X2-event".into()];
+                    }
+                    2 => invalid.members[0].stamp.causal_parent_ids = vec!["unknown".into()],
+                    3 => invalid.members[1].stamp.scenario_ordinal = 30,
+                    _ => {
+                        invalid.members[0].stamp.source_sequence = Some(1);
+                        invalid.members[1].stamp.source_sequence = Some(1);
+                    }
+                }
+                let effect_stamp = invalid.members[1].stamp.clone();
+                if let Input::Effect(effect) = &mut invalid.members[1].input {
+                    effect.stamp = effect_stamp;
+                }
+                let mut actual = owner.clone();
+                assert!(actual.apply_group(&invalid).is_err());
+                let mut expected = owner.clone();
+                expected.gate = actual.gate.clone();
+                assert_eq!(actual, expected);
+            }
+        }
+        let completion = owner.apply_group(&group).unwrap();
+        assert_eq!(
+            completion.failure,
+            if reverse {
+                Some("UNSUPPORTED_EXECUTION")
+            } else {
+                None
+            }
+        );
+        assert_eq!(owner.state_version, if reverse { 4 } else { 5 });
+        assert_eq!(owner.cash, d(if reverse { "999.6" } else { "999.3" }));
+        assert_eq!(
+            owner.orders[&order].facts.canceled,
+            d(if reverse { "6" } else { "3" })
+        );
+        let before = owner.clone();
+        assert_eq!(owner.apply_group(&group).unwrap(), completion);
+        assert_eq!(owner, before);
+    }
+}
+
 fn stamp(event: &str, ordinal: i64) -> Stamp {
     Stamp {
         event_id: event.into(),
-        effective_at: 500,
+        effective_at: if ordinal == 40 { 510 } else { 520 },
         source_sequence: None,
         causal_parent_ids: Vec::new(),
         ordering_contract_id: "S_order_v1".into(),
@@ -53,6 +207,12 @@ fn candidate(
     c.template.key.account = owner.key.clone();
     c.template.key.product = order.facts.product;
     c.template.key.external_id = external.into();
+    c.event_id = format!("event-{external}");
+    c.template.matching_effective_at = owner
+        .transition
+        .accepted_stamp
+        .as_ref()
+        .map_or(owner.seed_effective_at, |s| s.effective_at + 1);
     c.template.order_id = id.into();
     c.template.side = order.facts.side;
     c.template.price = order.facts.price;
@@ -331,9 +491,9 @@ fn terminal_reduce_only_orders_fail_before_flat_position_role_rejection() {
             else {
                 panic!("full close required");
             };
-            let late = owner
-                .effect_cancel(&effect("late-first", "C", &["O1"]))
-                .unwrap();
+            let mut late_input = effect("late-first", "C", &["O1"]);
+            late_input.stamp.effective_at = closing.template.matching_effective_at + 1;
+            let late = owner.effect_cancel(&late_input).unwrap();
             assert_eq!(late.receipts[0].outcome, cancel::Outcome::EffectiveTooLate);
             assert!(owner.positions.is_empty());
             assert_eq!(

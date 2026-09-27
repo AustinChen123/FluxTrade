@@ -47,6 +47,14 @@ pub(super) fn fee_amount(
     mul(mul(base, price)?, policy.rate())
 }
 
+pub(super) fn validate_existing(
+    position: &ProductPosition,
+    context: Context<'_>,
+    fee: FeePolicy,
+) -> Result<(), Fault> {
+    validate_position(position, context, context.active(fee)?.maximum)
+}
+
 fn validate_position(
     position: &ProductPosition,
     context: Context<'_>,

@@ -2,7 +2,7 @@
 use super::*;
 mod golden_cancel;
 
-mod commit;
+pub(super) mod commit;
 mod event_c;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,7 +84,7 @@ impl ExecutionTemplate {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct ExecutionCandidate {
+pub(super) struct ExecutionCandidate {
     template: ExecutionTemplate,
     candidate_id: String,
     event_id: String,
@@ -94,6 +94,31 @@ struct ExecutionCandidate {
     expected_order_version: u64,
     spec_version: String,
     rule_data_version: String,
+}
+
+impl ExecutionCandidate {
+    pub(super) fn account_key(&self) -> &AccountKey {
+        &self.template.key.account
+    }
+    pub(super) fn preflight_identity(&self, owner: &ScenarioAccount) -> Result<(), Fault> {
+        let (_, _, key, digest) = self.group_identity();
+        if owner
+            .execution_receipts
+            .get(&key)
+            .is_some_and(|receipt| receipt.financial_payload_digest != digest)
+        {
+            return Err("EXECUTION_ID_CONFLICT");
+        }
+        Ok(())
+    }
+    pub(super) fn group_identity(&self) -> (&str, i64, Hash, Hash) {
+        (
+            &self.event_id,
+            self.template.matching_effective_at,
+            self.template.key.canonical_id(),
+            self.template.digest(),
+        )
+    }
 }
 
 // Closed BTC evidence for this checkpoint; neutral execution remains unsupported.
@@ -106,6 +131,9 @@ pub(super) enum FinancialSnapshot {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct CommittedExecution {
+    risk_decision_after: Option<risk_transition::Decision>,
+    lifecycle_after: risk_transition::Lifecycle,
+    episode_after: Option<risk_transition::Episode>,
     account_key: AccountKey,
     execution_id: Hash,
     financial_payload_digest: Hash,
@@ -166,9 +194,37 @@ pub(super) fn remainder_eligibility(
 }
 
 impl ScenarioAccount {
+    fn execution_source(&self, candidate: &ExecutionCandidate) -> (Hash, source::Kind) {
+        if matches!(self.profile, ProfileContext::EventLimit(_)) {
+            (
+                hash_fields(&[
+                    Some("golden-event-c-source".into()),
+                    Some(candidate.event_id.clone()),
+                    Some(candidate.template.matching_effective_at.to_string()),
+                    Some(format!("{:02x?}", self.valuation_context_id)),
+                ]),
+                source::Kind::EventC,
+            )
+        } else {
+            (candidate.template.digest(), source::Kind::Execution)
+        }
+    }
     // The writer consumes this result and owns fatal gate publication. This seam
     // itself is read-only, including all business rejection and fault exits.
     fn prepare_execution(&self, candidate: &ExecutionCandidate) -> Result<Preparation<'_>, Fault> {
+        let stamp = source::stamp(
+            &candidate.event_id,
+            candidate.template.matching_effective_at,
+            30,
+        );
+        self.prepare_execution_stamped(candidate, &stamp)
+    }
+
+    fn prepare_execution_stamped(
+        &self,
+        candidate: &ExecutionCandidate,
+        stamp: &risk_transition::cancel::Stamp,
+    ) -> Result<Preparation<'_>, Fault> {
         let template = &candidate.template;
         let execution_id = template.key.canonical_id();
         let digest = template.digest();
@@ -182,8 +238,13 @@ impl ScenarioAccount {
                 Err("EXECUTION_ID_CONFLICT")
             };
         }
-        if self.gate != Gate::Running {
-            return Err("RUN_FAILED");
+        let (source_digest, source_kind) = self.execution_source(candidate);
+        if let Err(fault) = self.source_boundary(stamp, source_digest, source_kind) {
+            return if fault == "RUN_TERMINAL" {
+                Ok(Preparation::Rejected(fault))
+            } else {
+                Err(fault)
+            };
         }
         self.validate_context(template.matching_effective_at)?;
         let order = self.target_order(&template.order_id)?;

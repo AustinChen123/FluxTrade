@@ -102,6 +102,9 @@ fn receipt_fixture(owner: &ScenarioAccount, candidate: &ExecutionCandidate) -> C
     let template = &candidate.template;
     let snapshot = FinancialSnapshot::BtcEth(owner.reservation().unwrap());
     CommittedExecution {
+        risk_decision_after: None,
+        lifecycle_after: risk_transition::Lifecycle::RiskStable,
+        episode_after: None,
         account_key: owner.key.clone(),
         execution_id: template.key.canonical_id(),
         financial_payload_digest: template.digest(),

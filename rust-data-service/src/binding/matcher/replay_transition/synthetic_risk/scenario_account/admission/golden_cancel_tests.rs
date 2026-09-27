@@ -64,7 +64,7 @@ fn golden_cancel_admission_is_closed_and_uses_canonical_order_identity() {
     assert_eq!(
         owner.admit(&Envelope {
             event_id: "E2",
-            effective_at: 500,
+            effective_at: 501,
             intent: &second
         }),
         Err("INVALID_GOLDEN_CANCEL_INTENT")

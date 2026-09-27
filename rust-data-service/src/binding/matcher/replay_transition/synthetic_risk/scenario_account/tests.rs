@@ -105,13 +105,34 @@ fn risk_and_settlement_boundaries_remain_private_and_single_entry() {
     assert!(!owner.contains("pub mod risk_transition"));
     assert!(!owner.contains("fn execution_snapshot_after"));
     assert!(!commit.contains("fn execution_snapshot_after"));
-    assert!(commit.contains("self.execution_snapshot_after()?"));
+    assert!(commit.contains("self.execution_snapshot_after(stamp)?"));
     assert_eq!(risk.matches("fn execution_snapshot_after").count(), 1);
     assert!(risk.contains("impl ScenarioAccount"));
     assert!(!risk.contains("struct ScenarioAccount"));
     assert_eq!(settlement.matches("fn calculate").count(), 1);
     assert_eq!(settlement.matches("fn fee_amount(").count(), 1);
     assert!(!risk.contains("fee_amount("));
+    for source in [
+        risk,
+        include_str!("context.rs"),
+        include_str!("group.rs"),
+        include_str!("risk_transition/cancel.rs"),
+    ] {
+        for forbidden in [
+            "pyo3::",
+            "reqwest::",
+            "tokio::",
+            "std::fs",
+            "std::net",
+            "struct ScenarioAccount",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "private transition boundary: {forbidden}"
+            );
+        }
+    }
+    assert_eq!(risk.matches("fn classify_risk(").count(), 1);
 }
 
 #[test]

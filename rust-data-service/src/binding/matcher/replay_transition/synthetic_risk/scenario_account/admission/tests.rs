@@ -44,8 +44,8 @@ fn setup(program: capacity::Program) -> (ScenarioAccount, OrderIntent) {
 
 fn event(intent: &OrderIntent) -> Envelope<'_> {
     Envelope {
-        event_id: "E1",
-        effective_at: 500,
+        event_id: &intent.intent_id,
+        effective_at: if intent.intent_id == "I1" { 500 } else { 501 },
         intent,
     }
 }
@@ -82,7 +82,7 @@ fn capacity_trace_caches_both_outcomes_and_conflict_stops_run() {
         ),
         (None, Some(1))
     );
-    assert_eq!(accepted.result.created_at_event_id, "E1");
+    assert_eq!(accepted.result.created_at_event_id, "I1");
     assert_eq!(accepted.result.spec_version, "capacity-spec-v1");
     assert_eq!(accepted.result.rule_data_version, "capacity-data-v1");
     let order = owner
@@ -129,6 +129,12 @@ fn capacity_trace_caches_both_outcomes_and_conflict_stops_run() {
     expected
         .intent_results
         .insert(second.intent_id.clone(), rejected.result.clone());
+    expected.publish_source(
+        &source::stamp(event(&second).event_id, event(&second).effective_at, 60),
+        second.digest(),
+        source::Kind::Intent,
+        false,
+    );
     assert_eq!(owner, expected);
     let duplicate = owner
         .admit(&Envelope {
@@ -152,7 +158,10 @@ fn capacity_trace_caches_both_outcomes_and_conflict_stops_run() {
     );
     expected.gate = Gate::Failed("IDEMPOTENCY_KEY_CONFLICT");
     assert_eq!(owner, expected);
-    assert_eq!(owner.admit(&event(&first)), Err("RUN_FAILED"));
+    assert_eq!(
+        owner.admit(&event(&first)).unwrap().kind,
+        ReplyKind::Duplicate
+    );
 }
 
 #[test]
@@ -362,7 +371,7 @@ fn preparation_faults_panics_and_dropped_drafts_never_publish() {
     let mut conflicting = changed.clone();
     let existing = conflicting.orders.values().next().unwrap().clone();
     conflicting.orders.insert(next.order_id(), existing);
-    assert_fatal(conflicting, &next, 500, "ORDER_ID_CONFLICT");
+    assert_fatal(conflicting, &next, 501, "ORDER_ID_CONFLICT");
     let mut invalid_facts = changed.clone();
     invalid_facts
         .orders
@@ -371,7 +380,7 @@ fn preparation_faults_panics_and_dropped_drafts_never_publish() {
         .unwrap()
         .facts
         .product = ProfileProduct::BtcEth(Product::Btc);
-    assert_fatal(invalid_facts, &next, 500, "INVALID_CAPACITY_CANDIDATE");
+    assert_fatal(invalid_facts, &next, 501, "INVALID_CAPACITY_CANDIDATE");
     let mut invalid_event = owner.clone();
     assert_eq!(
         invalid_event.admit(&Envelope {

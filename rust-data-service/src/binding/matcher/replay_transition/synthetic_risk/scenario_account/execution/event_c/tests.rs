@@ -132,6 +132,12 @@ fn c09_v1_v2_exact_sequential_receipts_and_repeatability() {
                     if filled == 1 { "FILLED" } else { "OPEN" }
                 );
             }
+            assert_eq!(account.transition.events.len(), 1);
+            assert_eq!(account.transition.event_kinds["C"], source::Kind::EventC);
+            assert_eq!(
+                account.transition.accepted_stamp.as_ref(),
+                Some(&account.transition.events["C"].0)
+            );
             let before = account.clone();
             let repeated = account.run_event_c(&templates).unwrap();
             assert_eq!(repeated[0], Reply::Duplicate(first.clone()));
@@ -148,6 +154,7 @@ fn c09_v1_v2_exact_sequential_receipts_and_repeatability() {
                 let mut another_event = account.clone();
                 let mut candidate = another_event.event_c_candidate(&templates[1], 1).unwrap();
                 candidate.event_id = "D".into();
+                candidate.template.matching_effective_at += 1;
                 let mut expected = account.clone();
                 expected.gate = Gate::Failed("UNSUPPORTED_EXECUTION");
                 assert_eq!(
@@ -308,10 +315,7 @@ fn profile_context_and_event_identity_do_not_cross() {
     let first = account.event_c_candidate(&bad[0], 0).unwrap();
     let mut expected = account.clone();
     expected.execute(&first).unwrap();
-    expected.gate = Gate::Failed("UNSUPPORTED_CONTEXT_TRANSITION");
-    assert_eq!(
-        account.run_event_c(&bad),
-        Err("UNSUPPORTED_CONTEXT_TRANSITION")
-    );
+    expected.gate = Gate::Failed("EVENT_ID_CONFLICT");
+    assert_eq!(account.run_event_c(&bad), Err("EVENT_ID_CONFLICT"));
     assert_eq!(account, expected);
 }

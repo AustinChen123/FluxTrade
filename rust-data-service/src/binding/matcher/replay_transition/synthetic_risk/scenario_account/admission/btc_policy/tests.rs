@@ -1,6 +1,68 @@
 use super::super::super::tests::{d, fixture};
 use super::*;
 
+#[test]
+fn a04_causal_mark_admission_shortfall_request_effect_versions() {
+    use super::super::super::context::tests::{activation, mark_rows, stamp};
+    use super::super::super::risk_transition::{cancel, Lifecycle};
+    let (mut seed, config, mut marks) = seed("1000", "1", Side::Long);
+    seed.positions[0].product = Product::Eth;
+    seed.positions[0].lots[0].entry = d("2000");
+    marks[1].price = d("2000");
+    marks[1].valid_to = 600;
+    marks.extend([
+        Mark {
+            product: Product::Eth,
+            price: d("3000"),
+            valid_from: 600,
+            valid_to: 700,
+        },
+        Mark {
+            product: Product::Eth,
+            price: d("2000"),
+            valid_from: 700,
+            valid_to: 3000,
+        },
+    ]);
+    let mut owner = ScenarioAccount::from_seed(&seed, &config, &marks).unwrap();
+    owner
+        .activate_context(&activation(&owner, 600, mark_rows(&marks, 600)))
+        .unwrap();
+    let mut candidate = intent(&owner, "20", Side::Long);
+    candidate.requested_at = 600;
+    let reply = owner
+        .admit(&Envelope {
+            event_id: "admit",
+            effective_at: 600,
+            intent: &candidate,
+        })
+        .unwrap();
+    assert_eq!(reply.kind, ReplyKind::Accepted);
+    assert_eq!(owner.state_version, 2);
+    assert_eq!(owner.reservation().unwrap().available_margin, d("60"));
+    let mut lower = activation(&owner, 700, mark_rows(&marks, 700));
+    lower.stamp.event_id = "lower".into();
+    let receipt = owner.activate_context(&lower).unwrap();
+    assert_eq!(receipt.after.available_margin, d("-30"));
+    assert_eq!(owner.state_version, 4);
+    assert_eq!(
+        owner.transition.lifecycle,
+        Lifecycle::AwaitingCancelEffective
+    );
+    let order = reply.result.order_id.unwrap();
+    owner
+        .effect_cancel(&cancel::EffectInput {
+            stamp: stamp("effective", 700, 50),
+            effects: vec![("lower".into(), order.clone(), cancel::Reason::RiskShortfall)],
+        })
+        .unwrap();
+    assert_eq!(owner.state_version, 5);
+    assert_eq!(owner.orders[&order].version, 3);
+    assert_eq!(owner.reservation().unwrap().available_margin, d("980"));
+    assert_eq!(owner.fees, Decimal::ZERO);
+    assert_eq!(owner.cash, d("1000"));
+}
+
 fn seed(cash: &str, contracts: &str, side: Side) -> (CleanSeed, FrozenScenario, Vec<Mark>) {
     let (mut seed, config, mut marks) = fixture();
     seed.cash = d(cash);
@@ -39,8 +101,8 @@ fn submit(owner: &mut ScenarioAccount, intent: &OrderIntent) -> Reply {
     owner
         .admit(&Envelope {
             intent,
-            event_id: "BTC-E1",
-            effective_at: 500,
+            event_id: &format!("BTC-{}", intent.intent_id),
+            effective_at: 500 + owner.state_version as i64,
         })
         .unwrap()
 }
@@ -131,6 +193,16 @@ fn c03_atomic_reservation_and_both_receipts_survive_later_versions() {
     expected
         .intent_results
         .insert(second.intent_id.clone(), rejected.result.clone());
+    expected.publish_source(
+        &source::stamp(
+            &format!("BTC-{}", second.intent_id),
+            500 + expected.state_version as i64,
+            60,
+        ),
+        second.digest(),
+        source::Kind::Intent,
+        false,
+    );
     assert_eq!(owner, expected);
     let mut third = first.clone();
     third.intent_id = "third".into();
@@ -320,6 +392,16 @@ fn each_strict_stress_inequality_is_required() {
         expected
             .intent_results
             .insert(candidate.intent_id.clone(), reply.result);
+        expected.publish_source(
+            &source::stamp(
+                &format!("BTC-{}", candidate.intent_id),
+                500 + expected.state_version as i64,
+                60,
+            ),
+            candidate.digest(),
+            source::Kind::Intent,
+            false,
+        );
         assert_eq!(owner, expected);
     }
 }
@@ -349,6 +431,16 @@ fn current_breach_precedes_roles_and_candidate_arithmetic() {
         expected
             .intent_results
             .insert(candidate.intent_id.clone(), reply.result);
+        expected.publish_source(
+            &source::stamp(
+                &format!("BTC-{}", candidate.intent_id),
+                500 + expected.state_version as i64,
+                60,
+            ),
+            candidate.digest(),
+            source::Kind::Intent,
+            false,
+        );
         assert_eq!(owner, expected);
     }
 }
