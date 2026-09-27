@@ -106,7 +106,7 @@ describe("strategy management", () => {
 
   it("removes stale command controls after a failed read-only refresh", async () => {
     render(<StrategyManager />);
-    await screen.findByRole("button", { name: "停止" });
+    await screen.findByRole("button", { name: "停止策略" });
     api.loadStrategyStates.mockRejectedValue(new ApiError("unavailable", 503));
     fireEvent.click(screen.getByRole("button", { name: "重新整理狀態" }));
     await screen.findByRole("alert");
@@ -120,8 +120,8 @@ describe("strategy management", () => {
 
     expect(await screen.findByText("active-strategy")).toBeTruthy();
     expect(screen.getByText("feed disconnected")).toBeTruthy();
-    expect(screen.getByRole("button", { name: "停止" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: "恢復" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "停止策略" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "恢復策略" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "強制恢復" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "啟動" })).toBeTruthy();
     expect(screen.queryByRole("button", { name: "重新載入" })).toBeNull();
@@ -138,14 +138,14 @@ describe("strategy management", () => {
     render(<StrategyManager />);
 
     expect(await screen.findByText("active-strategy")).toBeTruthy();
-    expect(screen.queryByRole("button", { name: "停止" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "停止策略" })).toBeNull();
   });
 
   it("does not send a command when confirmation is declined", async () => {
     vi.mocked(window.confirm).mockReturnValue(false);
     render(<StrategyManager />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "停止" }));
+    fireEvent.click(await screen.findByRole("button", { name: "停止策略" }));
 
     expect(api.sendStrategyCommand).not.toHaveBeenCalled();
   });
@@ -154,7 +154,7 @@ describe("strategy management", () => {
     const request = deferred();
     api.sendStrategyCommand.mockReturnValue(request.promise);
     render(<StrategyManager />);
-    const stop = await screen.findByRole("button", { name: "停止" });
+    const stop = await screen.findByRole("button", { name: "停止策略" });
 
     fireEvent.click(stop);
     fireEvent.click(stop);
@@ -170,10 +170,10 @@ describe("strategy management", () => {
     api.sendStrategyCommand.mockReturnValue(request.promise);
     render(<StrategyManager />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "停止" }));
+    fireEvent.click(await screen.findByRole("button", { name: "停止策略" }));
 
     expect(window.confirm).toHaveBeenCalledWith(
-      "確定要對 active-strategy 執行「停止」？"
+      "確定要對 active-strategy 執行「停止策略」？"
     );
     expect(api.sendStrategyCommand).toHaveBeenCalledWith(
       "active-strategy",
@@ -187,13 +187,13 @@ describe("strategy management", () => {
         .disabled
     ).toBe(true);
     expect(
-      (screen.getByRole("button", { name: "恢復" }) as HTMLButtonElement)
+      (screen.getByRole("button", { name: "恢復策略" }) as HTMLButtonElement)
         .disabled
     ).toBe(true);
 
     request.resolve();
     expect(
-      await screen.findByText("已接受 active-strategy 的「停止」命令。")
+      await screen.findByText("已受理 active-strategy 的「停止策略」命令，等待狀態確認。")
     ).toBeTruthy();
     await waitFor(() => expect(api.loadStrategyStates).toHaveBeenCalledTimes(2));
     expect(
@@ -220,7 +220,7 @@ describe("strategy management", () => {
 
     await waitFor(() => expect(api.loadStrategyStates).toHaveBeenCalledTimes(4));
     expect(screen.queryByText("等待狀態更新")).toBeNull();
-    expect(screen.getAllByRole("button", { name: "恢復" })).toHaveLength(2);
+    expect(screen.getAllByRole("button", { name: "恢復策略" })).toHaveLength(2);
   });
 
   it("explains missing step-up access without discarding the snapshot", async () => {
@@ -249,7 +249,7 @@ describe("strategy management", () => {
     api.sendStrategyCommand.mockRejectedValue(new TypeError("Failed to fetch"));
     const firstRender = render(<StrategyManager />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "停止" }));
+    fireEvent.click(await screen.findByRole("button", { name: "停止策略" }));
 
     expect(await screen.findByText("策略命令結果不明")).toBeTruthy();
     expect(
@@ -282,7 +282,7 @@ describe("strategy management", () => {
     );
     render(<StrategyManager />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "停止" }));
+    fireEvent.click(await screen.findByRole("button", { name: "停止策略" }));
 
     expect(await screen.findByText("策略命令結果不明")).toBeTruthy();
     expect(screen.getByRole("button", { name: "等待狀態更新" })).toBeTruthy();
@@ -294,11 +294,11 @@ describe("strategy management", () => {
     );
     render(<StrategyManager />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "停止" }));
+    fireEvent.click(await screen.findByRole("button", { name: "停止策略" }));
 
     expect(await screen.findByText("策略命令未送出")).toBeTruthy();
     expect(
-      (screen.getByRole("button", { name: "停止" }) as HTMLButtonElement)
+      (screen.getByRole("button", { name: "停止策略" }) as HTMLButtonElement)
         .disabled
     ).toBe(false);
     expect(screen.queryByText("等待狀態更新")).toBeNull();
@@ -307,7 +307,7 @@ describe("strategy management", () => {
   it("keeps an uncertain lock when a snapshot temporarily omits the strategy", async () => {
     api.sendStrategyCommand.mockRejectedValue(new TypeError("Failed to fetch"));
     render(<StrategyManager />);
-    fireEvent.click(await screen.findByRole("button", { name: "停止" }));
+    fireEvent.click(await screen.findByRole("button", { name: "停止策略" }));
     await screen.findByText("策略命令結果不明");
 
     api.loadStrategyStates.mockResolvedValue([
@@ -332,10 +332,10 @@ describe("strategy management", () => {
       .mockRejectedValueOnce(new ApiError("strategy_state_query_unavailable", 503));
     render(<StrategyManager />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "停止" }));
+    fireEvent.click(await screen.findByRole("button", { name: "停止策略" }));
 
     expect(
-      await screen.findByText("已接受 active-strategy 的「停止」命令。")
+      await screen.findByText("已受理 active-strategy 的「停止策略」命令，等待狀態確認。")
     ).toBeTruthy();
     expect(screen.getByText("命令已接受，但狀態尚未更新")).toBeTruthy();
     expect(screen.queryByText("策略命令未送出")).toBeNull();
@@ -352,10 +352,10 @@ describe("strategy management", () => {
       .mockResolvedValueOnce([strategy("active-strategy", "ACTIVE"), strategy("other-strategy", "READY")])
       .mockRejectedValueOnce(failure);
     render(<StrategyManager />);
-    fireEvent.click(await screen.findByRole("button", { name: "停止" }));
+    fireEvent.click(await screen.findByRole("button", { name: "停止策略" }));
     await screen.findByText("命令已接受，但狀態尚未更新");
     expect(screen.getByText("other-strategy")).toBeTruthy();
-    expect(screen.getByText("已接受 active-strategy 的「停止」命令。")).toBeTruthy();
+    expect(screen.getByText("已受理 active-strategy 的「停止策略」命令，等待狀態確認。")).toBeTruthy();
     expect(document.querySelectorAll(".strategy-action button")).toHaveLength(0);
     expect(window.sessionStorage.getItem("fluxtrade.strategy.awaiting")).toContain("active-strategy");
     expect(api.sendStrategyCommand).toHaveBeenCalledTimes(1);
@@ -367,10 +367,10 @@ describe("strategy management", () => {
       .mockResolvedValueOnce([]);
     render(<StrategyManager />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "停止" }));
+    fireEvent.click(await screen.findByRole("button", { name: "停止策略" }));
 
     expect(
-      await screen.findByText("已接受 active-strategy 的「停止」命令。")
+      await screen.findByText("已受理 active-strategy 的「停止策略」命令，等待狀態確認。")
     ).toBeTruthy();
     await waitFor(() => expect(api.loadStrategyStates).toHaveBeenCalledTimes(2));
     expect(screen.queryByText("active-strategy")).toBeNull();
@@ -387,9 +387,9 @@ describe("strategy management", () => {
       ]);
     render(<StrategyManager />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "停止" }));
+    fireEvent.click(await screen.findByRole("button", { name: "停止策略" }));
 
-    expect(await screen.findByRole("button", { name: "恢復" })).toBeTruthy();
+    expect(await screen.findByRole("button", { name: "恢復策略" })).toBeTruthy();
     expect(screen.queryByText("等待狀態更新")).toBeNull();
   });
 

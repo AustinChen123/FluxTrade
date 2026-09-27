@@ -68,6 +68,13 @@ export const en = {
       "paginationUnavailable": "Additional trade pages are not connected."
     },
     "strategies": {
+      "awaitingExplanation": "Use Refresh state to check progress. This strategy remains locked until authoritative state changes.",
+      "stopExplanation": "Stopping a strategy does not cancel orders or close positions.",
+      "pendingExplanation": "A command is being sent. Strategy actions are temporarily unavailable.",
+      "lastKnownState": "Last-known strategy state. Refresh is required before using controls.",
+      "lockdownUnavailable": "LOCKDOWN status unavailable",
+      "recoveryUnavailable": "Recovery is not connected. Backend recovery is required; strategy state does not confirm LOCKDOWN status.",
+      "unlockLockdown": "Unlock LOCKDOWN",
       "readOnly": "Read-only session. Strategy commands require operator permission.",
       "kicker": "Runtime control",
       "title": "Strategy management",
@@ -94,19 +101,19 @@ export const en = {
       "pending": "Sending",
       "awaitingState": "Awaiting state update",
       "confirm": "Run “{{command}}” for {{strategyId}}?",
-      "accepted": "Accepted “{{command}}” for {{strategyId}}.",
+      "accepted": "Accepted “{{command}}” for {{strategyId}}. Awaiting state confirmation.",
       "status": {
         "DISCOVERED": "Discovered",
         "READY": "Ready",
         "WARNING": "Warning",
         "ACTIVE": "Active",
-        "STOPPED": "Stopped",
+        "STOPPED": "Strategy stopped",
         "ERROR": "Error"
       },
       "command": {
         "START": "Start",
-        "STOP": "Stop",
-        "RESUME": "Resume",
+        "STOP": "Stop strategy",
+        "RESUME": "Resume strategy",
         "FORCE_RECOVER": "Force recover"
       }
     },

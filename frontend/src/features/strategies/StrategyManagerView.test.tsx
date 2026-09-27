@@ -50,7 +50,7 @@ describe("StrategyManagerView", () => {
     expect(screen.getByText("active-strategy")).toBeTruthy();
     expect(screen.getAllByText("—")).toHaveLength(2);
     fireEvent.click(screen.getByRole("button", { name: "重新整理狀態" }));
-    fireEvent.click(screen.getByRole("button", { name: "停止" }));
+    fireEvent.click(screen.getByRole("button", { name: "停止策略" }));
     expect(refresh).toHaveBeenCalledTimes(1);
     expect(submit).toHaveBeenCalledWith(active, "STOP");
   });

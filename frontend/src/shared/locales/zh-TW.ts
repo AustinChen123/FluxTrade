@@ -68,6 +68,13 @@ export const zhTW = {
       "paginationUnavailable": "尚未連接後續交易頁面。"
     },
     "strategies": {
+      "awaitingExplanation": "可重新整理確認進度；權威狀態更新前，此策略維持操作鎖定。",
+      "stopExplanation": "停止策略不代表撤單或平倉。",
+      "pendingExplanation": "命令送出中，暫時無法操作策略。",
+      "lastKnownState": "目前顯示上次取得的策略狀態；重新整理成功後才能操作。",
+      "lockdownUnavailable": "LOCKDOWN 狀態未接通",
+      "recoveryUnavailable": "解除功能尚未接通，需由後端恢復流程處理；策略狀態不代表 LOCKDOWN 狀態。",
+      "unlockLockdown": "解除 LOCKDOWN",
       "readOnly": "目前為唯讀工作階段；策略命令需要 operator 權限。",
       "kicker": "運行控制",
       "title": "策略管理",
@@ -94,19 +101,19 @@ export const zhTW = {
       "pending": "送出中",
       "awaitingState": "等待狀態更新",
       "confirm": "確定要對 {{strategyId}} 執行「{{command}}」？",
-      "accepted": "已接受 {{strategyId}} 的「{{command}}」命令。",
+      "accepted": "已受理 {{strategyId}} 的「{{command}}」命令，等待狀態確認。",
       "status": {
         "DISCOVERED": "已發現",
         "READY": "準備就緒",
         "WARNING": "警告",
         "ACTIVE": "運行中",
-        "STOPPED": "已停止",
+        "STOPPED": "策略已停止",
         "ERROR": "錯誤"
       },
       "command": {
         "START": "啟動",
-        "STOP": "停止",
-        "RESUME": "恢復",
+        "STOP": "停止策略",
+        "RESUME": "恢復策略",
         "FORCE_RECOVER": "強制恢復"
       }
     },
