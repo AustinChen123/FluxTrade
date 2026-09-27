@@ -4,7 +4,7 @@ use context::tests::{activation, mark_rows};
 
 // Consume the existing complete source draft at its pre-continuation boundary.
 // Production still publishes that same draft and takes the 4C-2 sentinel.
-fn source_draft(owner: &ScenarioAccount, at: i64) -> ScenarioAccount {
+pub(super) fn source_draft(owner: &ScenarioAccount, at: i64) -> ScenarioAccount {
     let (_, marks) = owner.btc_context().unwrap();
     let mut input = activation(owner, at, mark_rows(marks, at));
     input.stamp.event_id = format!("mark-{at}");
@@ -16,7 +16,7 @@ fn source_draft(owner: &ScenarioAccount, at: i64) -> ScenarioAccount {
     draft
 }
 
-fn anchor(
+pub(super) fn anchor(
     side: Side,
     quantity: &str,
     entry: &str,
@@ -187,7 +187,10 @@ fn origin_spec_v1_survives_real_spec_v2_activation_and_preparation() {
     assert_eq!(owner, before);
 }
 
-fn two_product_seed(cash: &str, eth_quantity: &str) -> (CleanSeed, FrozenScenario, Vec<Mark>) {
+pub(super) fn two_product_seed(
+    cash: &str,
+    eth_quantity: &str,
+) -> (CleanSeed, FrozenScenario, Vec<Mark>) {
     let (mut seed, config, mut marks) = fixture();
     seed.effective_at = 499;
     seed.cash = d(cash);

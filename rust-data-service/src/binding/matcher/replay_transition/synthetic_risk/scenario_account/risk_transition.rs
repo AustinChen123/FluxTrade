@@ -39,6 +39,7 @@ pub(super) struct Facts {
     pub reverse_group: bool,
     pub batches: BTreeMap<Hash, AutomaticReceipt>,
     pub completed_episodes: Vec<Episode>,
+    liquidations: Vec<liquidation::Receipt>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

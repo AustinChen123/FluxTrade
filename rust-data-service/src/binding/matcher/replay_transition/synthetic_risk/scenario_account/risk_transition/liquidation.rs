@@ -2,6 +2,7 @@
 use super::*;
 use cancel::identity::{classify, Encoding, Stored};
 use hypothetical_settlement::FeePolicy;
+mod commit;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StepDecision {
@@ -12,6 +13,20 @@ enum StepDecision {
 }
 
 impl StepDecision {
+    fn from_valuation(value: &IncompleteValuation) -> Self {
+        if value.products.is_empty() {
+            if value.equity < Decimal::ZERO {
+                Self::LiquidatedInsolvent
+            } else {
+                Self::LiquidatedFlat
+            }
+        } else if value.risk == MaintenanceState::Safe {
+            Self::RiskStable
+        } else {
+            Self::ContinueLiquidation
+        }
+    }
+
     fn lifecycle(self) -> Option<Lifecycle> {
         match self {
             Self::ContinueLiquidation => None,
@@ -23,7 +38,7 @@ impl StepDecision {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Receipt {
+pub(super) struct Receipt {
     account_key: AccountKey,
     liquidation_id: Hash,
     canonical_payload_digest: Hash,
@@ -145,7 +160,7 @@ fn historical<'a>(
     .map(|value| value.copied())
 }
 
-fn prepare(owner: &ScenarioAccount, history: &[Receipt]) -> Result<Receipt, Fault> {
+fn prepare_step(owner: &ScenarioAccount, history: &[Receipt]) -> Result<commit::Prepared, Fault> {
     if owner.gate != Gate::Running {
         return Err("RUN_FAILED");
     }
@@ -252,17 +267,7 @@ fn prepare(owner: &ScenarioAccount, history: &[Receipt]) -> Result<Receipt, Faul
     }
     let valuation_after = scenario.evaluate(&draft.projection()?, marks)?;
     let reservation_after = draft.reservation()?;
-    let post_step_decision = if draft.positions.is_empty() {
-        if valuation_after.equity < Decimal::ZERO {
-            StepDecision::LiquidatedInsolvent
-        } else {
-            StepDecision::LiquidatedFlat
-        }
-    } else if valuation_after.risk == MaintenanceState::Safe {
-        StepDecision::RiskStable
-    } else {
-        StepDecision::ContinueLiquidation
-    };
+    let post_step_decision = StepDecision::from_valuation(&valuation_after);
     let mut receipt = Receipt {
         account_key: owner.key.clone(),
         liquidation_id: step_id(&owner.key, episode.id, step_index),
@@ -300,7 +305,19 @@ fn prepare(owner: &ScenarioAccount, history: &[Receipt]) -> Result<Receipt, Faul
         resulting_lifecycle: post_step_decision.lifecycle(),
     };
     receipt.canonical_payload_digest = receipt.digest()?;
-    Ok(receipt)
+    Ok(commit::Prepared {
+        receipt,
+        before: commit::Preconditions::capture(owner),
+        cash: draft.cash,
+        fees: draft.fees,
+        gross_realized: draft.gross_realized,
+        positions: draft.positions,
+    })
+}
+
+#[cfg(test)]
+fn prepare(owner: &ScenarioAccount, history: &[Receipt]) -> Result<Receipt, Fault> {
+    prepare_step(owner, history).map(|p| p.receipt)
 }
 
 #[cfg(test)]
