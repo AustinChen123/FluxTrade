@@ -11,8 +11,193 @@ fn opening(sequence: u64) -> OpeningIdentity {
 }
 
 #[test]
+fn closed_fee_policies_have_exact_rates_and_amounts() {
+    for (policy, rate, fee) in [
+        (FeePolicy::BtcEthTradingTaker, "0.001", "0.04"),
+        (FeePolicy::GoldenCancelTradingTaker, "0.01", "0.4"),
+        (FeePolicy::SyntheticLiquidation, "0.00602", "0.2408"),
+    ] {
+        assert_eq!(policy.rate(), d(rate));
+        assert_eq!(fee_amount(d("4"), d("10"), policy), Ok(d(fee)));
+    }
+}
+
+#[test]
+fn origin_spec_preserves_fractional_fifo_under_active_v2_for_both_fee_policies() {
+    let (_, config, _) = fixture();
+    let (v1, _) = config.resolve(Product::Btc, 1999).unwrap();
+    let (v2, _) = config.resolve(Product::Btc, 2000).unwrap();
+    for (side, opposing, pnl) in [
+        (Side::Long, Side::Short, "0.0135"),
+        (Side::Short, Side::Long, "-0.0135"),
+    ] {
+        for (policy, fee, cash) in [
+            (
+                FeePolicy::BtcEthTradingTaker,
+                "0.750015",
+                if side == Side::Long {
+                    "-0.736515"
+                } else {
+                    "-0.763515"
+                },
+            ),
+            (
+                FeePolicy::SyntheticLiquidation,
+                "4.5150903",
+                if side == Side::Long {
+                    "-4.5015903"
+                } else {
+                    "-4.5285903"
+                },
+            ),
+        ] {
+            let first = calculate(
+                None,
+                side,
+                d("1"),
+                d("50000.1"),
+                (&config, v1),
+                FeePolicy::BtcEthTradingTaker,
+                Some(&opening(0)),
+            )
+            .unwrap();
+            let opened = calculate(
+                first.position.as_ref(),
+                side,
+                d("2"),
+                d("50000.1"),
+                (&config, v1),
+                FeePolicy::BtcEthTradingTaker,
+                Some(&opening(1)),
+            )
+            .unwrap();
+            let before = opened.position.clone();
+            let closed = calculate(
+                opened.position.as_ref(),
+                opposing,
+                d("1.5"),
+                d("50001"),
+                (&config, v2),
+                policy,
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                (closed.gross_realized_delta, closed.fee, closed.cash_delta),
+                (d(pnl), d(fee), d(cash))
+            );
+            let remaining = closed.position.unwrap();
+            assert_eq!(
+                (remaining.contracts, remaining.entry_basis),
+                (d("1.5"), d("750.0015"))
+            );
+            assert_eq!(remaining.lots.len(), 1);
+            let lot = &remaining.lots[0];
+            assert_eq!(
+                (
+                    &lot.origin_spec_version,
+                    lot.execution_id,
+                    lot.source.seed_sequence
+                ),
+                (&"spec-v1".to_string(), opening(1).execution_id, 1)
+            );
+            assert_eq!(
+                (lot.source.entry, lot.source.contracts, lot.base_quantity),
+                (d("50000.1"), d("1.5"), d("0.015"))
+            );
+            assert_eq!(opened.position, before);
+            assert_eq!(
+                calculate(
+                    opened.position.as_ref(),
+                    opposing,
+                    d("1"),
+                    d("50000.1"),
+                    (&config, v2),
+                    policy,
+                    None
+                ),
+                Err("INVALID_HYPOTHETICAL_EXECUTION")
+            );
+            let v2_open = calculate(
+                Some(&remaining),
+                side,
+                d("1"),
+                d("50001"),
+                (&config, v2),
+                policy,
+                Some(&opening(2)),
+            )
+            .unwrap()
+            .position
+            .unwrap();
+            assert_eq!(v2_open.lots[0].origin_spec_version, "spec-v1");
+            assert_eq!(v2_open.lots[1].origin_spec_version, "spec-v2");
+        }
+    }
+    assert_eq!(FeePolicy::BtcEthTradingTaker.rate(), d("0.001"));
+    assert_eq!(FeePolicy::SyntheticLiquidation.rate(), d("0.00602"));
+}
+
+#[test]
+fn missing_unknown_and_corrupt_origin_fail_closed_without_mutation() {
+    let (mut seed, config, marks) = fixture();
+    seed.positions[0].lots[0].entry = d("50000.1");
+    let owner = ScenarioAccount::from_seed(&seed, &config, &marks).unwrap();
+    let original = &owner.positions.btc().unwrap()[&Product::Btc];
+    assert!(original
+        .lots
+        .iter()
+        .all(|lot| lot.origin_spec_version == "spec-v1"));
+    let (active, _) = config.resolve(Product::Btc, 2000).unwrap();
+    for (version, error) in [
+        ("", "INVALID_LOT_ORIGIN_SPEC"),
+        ("unknown", "INVALID_LOT_ORIGIN_SPEC"),
+        ("event-limit-neutral", "INVALID_LOT_ORIGIN_SPEC"),
+        ("spec-v2", "INVALID_FIFO_POSITION"),
+    ] {
+        let mut corrupted = original.clone();
+        corrupted.lots[0].origin_spec_version = version.into();
+        let before = corrupted.clone();
+        assert_eq!(
+            calculate(
+                Some(&corrupted),
+                Side::Short,
+                d("1"),
+                d("50001"),
+                (&config, active),
+                FeePolicy::SyntheticLiquidation,
+                None
+            ),
+            Err(error)
+        );
+        assert_eq!(corrupted, before);
+    }
+    for mutate in [
+        |lot: &mut EntryLot| lot.source.entry = d("50000.01"),
+        |lot: &mut EntryLot| lot.source.contracts = d("1.001"),
+        |lot: &mut EntryLot| lot.base_quantity = d("0.1"),
+    ] {
+        let mut corrupted = original.clone();
+        mutate(&mut corrupted.lots[0]);
+        assert_eq!(
+            calculate(
+                Some(&corrupted),
+                Side::Short,
+                d("1"),
+                d("50001"),
+                (&config, active),
+                FeePolicy::BtcEthTradingTaker,
+                None
+            ),
+            Err("INVALID_FIFO_POSITION")
+        );
+    }
+}
+
+#[test]
 fn long_and_short_fifo_golden_traces_are_pure_and_exact() {
     let spec = frozen_spec(Product::Btc, false);
+    let (_, config, _) = fixture();
     for (side, rows, ending_cash) in [
         (
             Side::Long,
@@ -53,8 +238,8 @@ fn long_and_short_fifo_golden_traces_are_pure_and_exact() {
                 direction,
                 d(quantity),
                 d(price),
-                &spec,
-                d("0.001"),
+                (&config, &spec),
+                FeePolicy::BtcEthTradingTaker,
                 (index < 2).then_some(&identity),
             )
             .unwrap();
@@ -108,8 +293,8 @@ fn reducing_stress_uses_actual_fee_and_preserves_input() {
             Side::Short,
             d("0.5"),
             d(price),
-            &frozen_spec(Product::Btc, false),
-            d("0.001"),
+            (&config, &frozen_spec(Product::Btc, false)),
+            FeePolicy::BtcEthTradingTaker,
             None,
         )
         .unwrap();
@@ -140,6 +325,7 @@ fn invalid_and_nonexact_hypotheticals_never_mutate_inputs() {
     let owner = ScenarioAccount::from_seed(&seed, &config, &marks).unwrap();
     let position = &owner.positions.btc().unwrap()[&Product::Btc];
     let spec = frozen_spec(Product::Btc, false);
+    let (_, config, _) = fixture();
     for (quantity, price) in [
         ("4", "50000"),
         ("0", "50000"),
@@ -154,8 +340,8 @@ fn invalid_and_nonexact_hypotheticals_never_mutate_inputs() {
             Side::Short,
             d(quantity),
             d(price),
-            &spec,
-            d("0.001"),
+            (&config, &spec),
+            FeePolicy::BtcEthTradingTaker,
             None
         )
         .is_err());
@@ -167,8 +353,8 @@ fn invalid_and_nonexact_hypotheticals_never_mutate_inputs() {
         Side::Short,
         d("1"),
         d("50000"),
-        &spec,
-        d("0.001"),
+        (&config, &spec),
+        FeePolicy::BtcEthTradingTaker,
         None
     )
     .is_err());
@@ -177,8 +363,8 @@ fn invalid_and_nonexact_hypotheticals_never_mutate_inputs() {
         Side::Long,
         d("1"),
         d("50000"),
-        &spec,
-        d("0.001"),
+        (&config, &spec),
+        FeePolicy::BtcEthTradingTaker,
         None
     )
     .is_err());
@@ -187,8 +373,8 @@ fn invalid_and_nonexact_hypotheticals_never_mutate_inputs() {
         Side::Long,
         d("1"),
         d("50000"),
-        &spec,
-        d("0.001"),
+        (&config, &spec),
+        FeePolicy::BtcEthTradingTaker,
         Some(&opening(0))
     )
     .is_err());
@@ -197,13 +383,17 @@ fn invalid_and_nonexact_hypotheticals_never_mutate_inputs() {
         Side::Long,
         d("200"),
         Decimal::MAX,
-        &spec,
-        d("0.001"),
+        (&config, &spec),
+        FeePolicy::BtcEthTradingTaker,
         Some(&opening(0))
     )
     .is_err());
     assert_eq!(
-        fee_amount(d("0.0000000000000000000000000001"), d("1"), d("0.001")),
+        fee_amount(
+            d("0.0000000000000000000000000001"),
+            d("1"),
+            FeePolicy::BtcEthTradingTaker
+        ),
         Err("DECIMAL_PRECISION_LOSS")
     );
     assert_eq!(
@@ -235,8 +425,8 @@ fn strict_stress_threshold_equalities_remain_visible_to_future_admission() {
             Side::Short,
             d("0.5"),
             d(price),
-            &frozen_spec(Product::Btc, false),
-            d("0.001"),
+            (&config, &frozen_spec(Product::Btc, false)),
+            FeePolicy::BtcEthTradingTaker,
             None,
         )
         .unwrap();

@@ -75,6 +75,45 @@ pub(super) fn fixture() -> (CleanSeed, FrozenScenario, Vec<Mark>) {
 }
 
 #[test]
+fn seed_origin_is_resolved_by_product_and_seed_effective_time() {
+    for product in [Product::Btc, Product::Eth] {
+        for (at, version) in [(1999, "spec-v1"), (2000, "spec-v2")] {
+            let (mut seed, config, marks) = fixture();
+            seed.effective_at = at;
+            seed.orders.clear();
+            seed.positions[0].product = product;
+            for lot in &mut seed.positions[0].lots {
+                lot.entry = d("2000");
+            }
+            let owner = ScenarioAccount::from_seed(&seed, &config, &marks).unwrap();
+            assert!(owner.positions.btc().unwrap()[&product]
+                .lots
+                .iter()
+                .all(|lot| lot.origin_spec_version == version));
+        }
+    }
+}
+
+#[test]
+fn risk_and_settlement_boundaries_remain_private_and_single_entry() {
+    let owner = include_str!("../scenario_account.rs");
+    let commit = include_str!("execution/commit.rs");
+    let risk = include_str!("risk_transition.rs");
+    let settlement = include_str!("hypothetical_settlement.rs");
+    assert!(owner.contains("mod risk_transition;"));
+    assert!(!owner.contains("pub mod risk_transition"));
+    assert!(!owner.contains("fn execution_snapshot_after"));
+    assert!(!commit.contains("fn execution_snapshot_after"));
+    assert!(commit.contains("self.execution_snapshot_after()?"));
+    assert_eq!(risk.matches("fn execution_snapshot_after").count(), 1);
+    assert!(risk.contains("impl ScenarioAccount"));
+    assert!(!risk.contains("struct ScenarioAccount"));
+    assert_eq!(settlement.matches("fn calculate(").count(), 1);
+    assert_eq!(settlement.matches("fn fee_amount(").count(), 1);
+    assert!(!risk.contains("fee_amount("));
+}
+
+#[test]
 fn seed_reservation_arithmetic_is_validated_before_publishing_owner() {
     let (mut seed, config, mut marks) = fixture();
     seed.positions.clear();

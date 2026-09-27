@@ -11,6 +11,7 @@ mod event_limit;
 mod execution;
 mod hypothetical_settlement;
 mod reservation;
+mod risk_transition;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ProfileContext {
@@ -112,6 +113,7 @@ struct CleanSeed {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct EntryLot {
     source: SeedLot,
+    origin_spec_version: String,
     execution_id: Hash,
     base_quantity: Decimal,
 }
@@ -330,6 +332,7 @@ impl ScenarioAccount {
                 seed_executions.insert(execution_id);
                 lots.push(EntryLot {
                     source: source.clone(),
+                    origin_spec_version: spec.version.clone(),
                     execution_id,
                     base_quantity,
                 });

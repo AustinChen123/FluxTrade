@@ -119,8 +119,8 @@ impl ScenarioAccount {
                     template.side,
                     template.quantity,
                     template.price,
-                    spec,
-                    Decimal::new(1, 3),
+                    (scenario, spec),
+                    hypothetical_settlement::FeePolicy::BtcEthTradingTaker,
                     opening.as_ref(),
                 )?;
                 (
@@ -197,41 +197,6 @@ impl ScenarioAccount {
             risk_state_after: risk,
             pending_action_ids: Vec::new(),
         })
-    }
-
-    fn execution_snapshot_after(&mut self) -> Result<(FinancialSnapshot, ProfileRisk), Fault> {
-        if matches!(self.profile, ProfileContext::EventLimit(_)) {
-            return Ok((
-                FinancialSnapshot::EventLimit(self.event_limit_projection()?),
-                ProfileRisk::CapacitySafe,
-            ));
-        }
-        let after_reservation = self.reservation()?;
-        let (scenario, marks) = self.btc_context()?;
-        let valuation = scenario.evaluate(&self.projection()?, marks)?;
-        let mut needs_order_action = false;
-        for order in self.orders.values() {
-            if order
-                .facts
-                .projects_remainder("INVALID_RESERVATION_ORDER")?
-                && remainder_eligibility(
-                    &order.facts,
-                    self.positions.btc()?.get(&order.facts.product.btc()?),
-                ) != Ok(RemainderRole::Reducing)
-            {
-                needs_order_action = true;
-            }
-        }
-        if valuation.risk == MaintenanceState::Breach
-            || (self.positions.is_empty() && valuation.equity < Decimal::ZERO)
-            || (after_reservation.available_margin < Decimal::ZERO && needs_order_action)
-        {
-            self.gate = Gate::Failed("UNSUPPORTED_RISK_TRANSITION");
-        }
-        Ok((
-            FinancialSnapshot::BtcEth(after_reservation),
-            ProfileRisk::BtcEth(valuation.risk),
-        ))
     }
 }
 

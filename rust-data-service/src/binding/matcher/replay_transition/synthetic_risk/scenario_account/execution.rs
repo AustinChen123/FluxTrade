@@ -97,7 +97,7 @@ struct ExecutionCandidate {
 
 // Closed BTC evidence for this checkpoint; neutral execution remains unsupported.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum FinancialSnapshot {
+pub(super) enum FinancialSnapshot {
     BtcEth(reservation::Snapshot),
     EventLimit(event_limit::Snapshot),
 }
@@ -140,12 +140,12 @@ enum Preparation<'a> {
 
 // The whole order remainder, not candidate quantity, owns execution eligibility.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RemainderRole {
+pub(super) enum RemainderRole {
     Reducing,
     Increasing,
 }
 
-fn remainder_eligibility(
+pub(super) fn remainder_eligibility(
     order: &SeedOrder,
     position: Option<&ProductPosition>,
 ) -> Result<RemainderRole, Fault> {

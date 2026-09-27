@@ -154,6 +154,7 @@ impl ScenarioAccount {
         position.contracts = add(position.contracts, Decimal::ONE)?;
         position.entry_basis = add(position.entry_basis, Decimal::TEN)?;
         position.lots.push(EntryLot {
+            origin_spec_version: "event-limit-neutral".into(),
             source: SeedLot {
                 seed_execution_id: candidate.template.key.external_id.clone(),
                 seed_sequence: self.commit_sequence,

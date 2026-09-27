@@ -90,8 +90,8 @@ pub(super) fn evaluate(
             intent.side,
             intent.quantity,
             price,
-            spec,
-            Decimal::new(1, 3),
+            (scenario, spec),
+            hypothetical_settlement::FeePolicy::BtcEthTradingTaker,
             None,
         )?;
         let mut stress_input = input;

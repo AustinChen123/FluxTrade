@@ -207,6 +207,7 @@ fn pure_authoritative_facts_produce_exact_c09_snapshots_not_executions() {
         let mut orders = seed.orders.clone();
         let lots = (0..filled)
             .map(|sequence| EntryLot {
+                origin_spec_version: "event-limit-neutral".into(),
                 source: SeedLot {
                     seed_execution_id: format!("X_{sequence}"),
                     seed_sequence: sequence,

@@ -17,20 +17,58 @@ pub(super) struct Draft {
     pub cash_delta: Decimal,
 }
 
-pub(super) fn fee_amount(base: Decimal, price: Decimal, rate: Decimal) -> Result<Decimal, Fault> {
-    if rate != Decimal::new(1, 3) || base <= Decimal::ZERO || price <= Decimal::ZERO {
-        return Err("UNSUPPORTED_FEE_INPUT");
-    }
-    mul(mul(base, price)?, rate)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FeePolicy {
+    BtcEthTradingTaker,
+    GoldenCancelTradingTaker,
+    SyntheticLiquidation,
 }
 
-fn validate_position(position: &ProductPosition, spec: &Spec) -> Result<(), Fault> {
+impl FeePolicy {
+    fn rate(self) -> Decimal {
+        match self {
+            Self::BtcEthTradingTaker => Decimal::new(1, 3),
+            Self::GoldenCancelTradingTaker => Decimal::new(1, 2),
+            Self::SyntheticLiquidation => Decimal::new(602, 5),
+        }
+    }
+}
+
+pub(super) fn fee_amount(
+    base: Decimal,
+    price: Decimal,
+    policy: FeePolicy,
+) -> Result<Decimal, Fault> {
+    if base <= Decimal::ZERO || price <= Decimal::ZERO {
+        return Err("UNSUPPORTED_FEE_INPUT");
+    }
+    mul(mul(base, price)?, policy.rate())
+}
+
+fn origin_spec<'a>(
+    scenario: &'a FrozenScenario,
+    product: Product,
+    version: &str,
+) -> Result<&'a Spec, Fault> {
+    scenario
+        .specs
+        .iter()
+        .find(|spec| spec.product == product && spec.version == version)
+        .ok_or("INVALID_LOT_ORIGIN_SPEC")
+}
+
+fn validate_position(
+    position: &ProductPosition,
+    product: Product,
+    scenario: &FrozenScenario,
+) -> Result<(), Fault> {
     let mut contracts = Decimal::ZERO;
     let mut basis = Decimal::ZERO;
     let mut ids = BTreeSet::new();
     let mut sources = BTreeSet::new();
     let mut previous = None;
     for lot in &position.lots {
+        let spec = origin_spec(scenario, product, &lot.origin_spec_version)?;
         let facts = &lot.source;
         if !identity(&facts.seed_execution_id)
             || !identity(&facts.strategy_id)
@@ -51,7 +89,7 @@ fn validate_position(position: &ProductPosition, spec: &Spec) -> Result<(), Faul
         basis = add(basis, mul(lot.base_quantity, facts.entry)?)?;
     }
     if contracts <= Decimal::ZERO
-        || contracts > spec_tier_maximum(spec.product)
+        || contracts > spec_tier_maximum(product)
         || contracts != position.contracts
         || basis != position.entry_basis
     {
@@ -65,10 +103,11 @@ pub(super) fn calculate(
     side: Side,
     quantity: Decimal,
     price: Decimal,
-    spec: &Spec,
-    fee_rate: Decimal,
+    context: (&FrozenScenario, &Spec),
+    fee_policy: FeePolicy,
     opening: Option<&OpeningIdentity>,
 ) -> Result<Draft, Fault> {
+    let (scenario, spec) = context;
     if *spec != frozen_spec(spec.product, spec.version == "spec-v2") {
         return Err("UNSUPPORTED_SPEC");
     }
@@ -80,10 +119,10 @@ pub(super) fn calculate(
         return Err("INVALID_HYPOTHETICAL_EXECUTION");
     }
     if let Some(position) = current {
-        validate_position(position, spec)?;
+        validate_position(position, spec.product, scenario)?;
     }
     let base = mul(mul(quantity, spec.contract_value)?, spec.multiplier)?;
-    let fee = fee_amount(base, price, fee_rate)?;
+    let fee = fee_amount(base, price, fee_policy)?;
     let mut position = current.cloned().unwrap_or(ProductPosition {
         side,
         contracts: Decimal::ZERO,
@@ -106,6 +145,7 @@ pub(super) fn calculate(
         position.contracts = add(position.contracts, quantity)?;
         position.entry_basis = add(position.entry_basis, mul(base, price)?)?;
         position.lots.push(EntryLot {
+            origin_spec_version: spec.version.clone(),
             source: SeedLot {
                 seed_execution_id: id.source_id.clone(),
                 seed_sequence: id.sequence,
@@ -122,8 +162,9 @@ pub(super) fn calculate(
         }
         let mut remaining = quantity;
         for lot in &mut position.lots {
+            let origin = origin_spec(scenario, spec.product, &lot.origin_spec_version)?;
             let closed = remaining.min(lot.source.contracts);
-            let closed_base = mul(mul(closed, spec.contract_value)?, spec.multiplier)?;
+            let closed_base = mul(mul(closed, origin.contract_value)?, origin.multiplier)?;
             let difference = match position.side {
                 Side::Long => add(price, -lot.source.entry)?,
                 Side::Short => add(lot.source.entry, -price)?,
