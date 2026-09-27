@@ -74,6 +74,7 @@ pub(in super::super) fn seed() -> CleanSeed {
             side: Side::Long,
             original: d("1"),
             filled: d("0"),
+            canceled: Decimal::ZERO,
             remaining: d("1"),
             price: d("10"),
             reduce_only: false,

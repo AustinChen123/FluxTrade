@@ -48,7 +48,9 @@ fn submit(owner: &mut ScenarioAccount, intent: &OrderIntent) -> Reply {
 fn evidence(reply: &Reply) -> &Evidence {
     match &reply.result.evaluation {
         Evaluation::BtcEth(value) => value,
-        Evaluation::GoldenCapacity(_) => panic!("BTC evidence required"),
+        Evaluation::GoldenCapacity(_) | Evaluation::GoldenCancel(_) => {
+            panic!("BTC evidence required")
+        }
     }
 }
 

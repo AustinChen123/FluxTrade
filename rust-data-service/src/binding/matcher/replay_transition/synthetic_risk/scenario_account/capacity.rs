@@ -212,6 +212,7 @@ impl ScenarioAccount {
             intent_results: BTreeMap::new(),
             execution_receipts: BTreeMap::new(),
             pending_actions: Vec::new(),
+            cancel_facts: Default::default(),
         })
     }
 

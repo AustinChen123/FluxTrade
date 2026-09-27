@@ -34,9 +34,14 @@ fn authoritative_projection_retains_terminal_order_without_reservation() {
         facts.status = status.into();
         facts.filled = d(filled);
         facts.remaining = d(remaining);
-        owner
-            .orders
-            .insert("O1".into(), RestingOrder { facts, version: 7 });
+        owner.orders.insert(
+            "O1".into(),
+            RestingOrder {
+                facts,
+                version: 7,
+                cancel: risk_transition::cancel::State::None,
+            },
+        );
         let before = owner.clone();
         let snapshot = owner.capacity_projection(&candidate("1"));
         match expected {

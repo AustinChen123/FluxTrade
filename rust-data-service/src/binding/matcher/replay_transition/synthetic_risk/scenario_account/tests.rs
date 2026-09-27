@@ -54,6 +54,7 @@ pub(super) fn fixture() -> (CleanSeed, FrozenScenario, Vec<Mark>) {
             reduce_only: true,
             original: d("2"),
             filled: d("1"),
+            canceled: Decimal::ZERO,
             remaining: d("1"),
             status: "PARTIALLY_FILLED".into(),
         }],
@@ -108,7 +109,7 @@ fn risk_and_settlement_boundaries_remain_private_and_single_entry() {
     assert_eq!(risk.matches("fn execution_snapshot_after").count(), 1);
     assert!(risk.contains("impl ScenarioAccount"));
     assert!(!risk.contains("struct ScenarioAccount"));
-    assert_eq!(settlement.matches("fn calculate(").count(), 1);
+    assert_eq!(settlement.matches("fn calculate").count(), 1);
     assert_eq!(settlement.matches("fn fee_amount(").count(), 1);
     assert!(!risk.contains("fee_amount("));
 }

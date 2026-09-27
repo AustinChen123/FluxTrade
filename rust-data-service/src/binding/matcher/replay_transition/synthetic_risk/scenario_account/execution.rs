@@ -1,5 +1,6 @@
 //! Private execution identity/preparation and the sole BTC/ETH commit boundary.
 use super::*;
+mod golden_cancel;
 
 mod commit;
 mod event_c;
@@ -98,6 +99,7 @@ struct ExecutionCandidate {
 // Closed BTC evidence for this checkpoint; neutral execution remains unsupported.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum FinancialSnapshot {
+    GoldenCancel(Decimal),
     BtcEth(reservation::Snapshot),
     EventLimit(event_limit::Snapshot),
 }
@@ -193,11 +195,19 @@ impl ScenarioAccount {
         if matches!(self.profile, ProfileContext::EventLimit(_)) {
             return self.prepare_event_c_candidate(candidate, order, execution_id, digest);
         }
+        if matches!(self.profile, ProfileContext::GoldenCancel(_)) {
+            return self.prepare_golden_cancel_candidate(candidate, order, execution_id, digest);
+        }
         let product = order
             .facts
             .product
             .btc()
             .map_err(|_| "UNSUPPORTED_EXECUTION")?;
+        // Terminal orders cannot become role-based business rejections after
+        // another accepted execution has flattened or changed the position.
+        if !order.facts.projects_remainder("UNSUPPORTED_EXECUTION")? {
+            return Err("UNSUPPORTED_EXECUTION");
+        }
         if let Err(reason) =
             remainder_eligibility(&order.facts, self.positions.btc()?.get(&product))
         {
@@ -213,7 +223,6 @@ impl ScenarioAccount {
             || !identity(&candidate.event_id)
             || template.key.product != facts.product
             || template.side != facts.side
-            || !facts.projects_remainder("UNSUPPORTED_EXECUTION")?
             || candidate.spec_version != spec.version
             || candidate.rule_data_version != tier.version
             || template.liquidity != LiquidityRole::SyntheticTaker

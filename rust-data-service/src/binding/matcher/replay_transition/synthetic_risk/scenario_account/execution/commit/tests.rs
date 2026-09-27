@@ -18,6 +18,7 @@ fn flat(cash: &str, mark: &str, orders: &[(Side, &str, &str)]) -> ScenarioAccoun
             original: d(qty),
             remaining: d(qty),
             filled: d("0"),
+            canceled: Decimal::ZERO,
             price: d(price),
             reduce_only: false,
             status: "OPEN".into(),

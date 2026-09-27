@@ -9,6 +9,7 @@ mod admission;
 mod capacity;
 mod event_limit;
 mod execution;
+mod golden_cancel;
 mod hypothetical_settlement;
 mod reservation;
 mod risk_transition;
@@ -21,6 +22,7 @@ enum ProfileContext {
     },
     GoldenCapacity(capacity::Config),
     EventLimit(event_limit::Config),
+    GoldenCancel(golden_cancel::Config),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,6 +76,7 @@ struct SeedOrder {
     reduce_only: bool,
     original: Decimal,
     filled: Decimal,
+    canceled: Decimal,
     remaining: Decimal,
     status: String,
 }
@@ -84,16 +87,32 @@ impl SeedOrder {
         if self.original <= Decimal::ZERO
             || self.filled < Decimal::ZERO
             || self.remaining < Decimal::ZERO
-            || add(self.filled, self.remaining)? != self.original
+            || self.canceled < Decimal::ZERO
+            || add(add(self.filled, self.canceled)?, self.remaining)? != self.original
         {
             return Err(invalid);
         }
         match self.status.as_str() {
-            "OPEN" if self.filled == Decimal::ZERO && self.remaining > Decimal::ZERO => Ok(true),
-            "PARTIALLY_FILLED" if self.filled > Decimal::ZERO && self.remaining > Decimal::ZERO => {
+            "OPEN"
+                if self.filled == Decimal::ZERO
+                    && self.canceled == Decimal::ZERO
+                    && self.remaining > Decimal::ZERO =>
+            {
                 Ok(true)
             }
-            "FILLED" if self.remaining == Decimal::ZERO => Ok(false),
+            "PARTIALLY_FILLED"
+                if self.filled > Decimal::ZERO
+                    && self.canceled == Decimal::ZERO
+                    && self.remaining > Decimal::ZERO =>
+            {
+                Ok(true)
+            }
+            "FILLED" if self.remaining == Decimal::ZERO && self.canceled == Decimal::ZERO => {
+                Ok(false)
+            }
+            "CANCELED" if self.remaining == Decimal::ZERO && self.canceled > Decimal::ZERO => {
+                Ok(false)
+            }
             _ => Err(invalid),
         }
     }
@@ -131,6 +150,7 @@ enum PositionState {
     BtcEth(BTreeMap<Product, ProductPosition>),
     CapacityFlat,
     EventLimit(Option<ProductPosition>),
+    GoldenCancel(Option<ProductPosition>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -158,7 +178,7 @@ impl PositionState {
         match self {
             Self::BtcEth(value) => value.len(),
             Self::CapacityFlat => 0,
-            Self::EventLimit(value) => usize::from(value.is_some()),
+            Self::EventLimit(value) | Self::GoldenCancel(value) => usize::from(value.is_some()),
         }
     }
 
@@ -171,6 +191,7 @@ impl PositionState {
 struct RestingOrder {
     facts: SeedOrder,
     version: u64,
+    cancel: risk_transition::cancel::State,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -195,6 +216,7 @@ struct ScenarioAccount {
     // Only the future execution writer may publish a receipt; seeds have none.
     execution_receipts: BTreeMap<Hash, execution::CommittedExecution>,
     pending_actions: Vec<Infallible>,
+    cancel_facts: risk_transition::cancel::Facts,
 }
 
 enum NewIdentity<'a> {
@@ -272,9 +294,9 @@ impl ScenarioAccount {
     fn btc_context(&self) -> Result<(&FrozenScenario, &[Mark]), Fault> {
         match &self.profile {
             ProfileContext::BtcEthScenario { scenario, marks } => Ok((scenario, marks)),
-            ProfileContext::GoldenCapacity(_) | ProfileContext::EventLimit(_) => {
-                Err("PROFILE_MISMATCH")
-            }
+            ProfileContext::GoldenCapacity(_)
+            | ProfileContext::EventLimit(_)
+            | ProfileContext::GoldenCancel(_) => Err("PROFILE_MISMATCH"),
         }
     }
 
@@ -381,6 +403,7 @@ impl ScenarioAccount {
                 || order.original < spec.minimum
                 || order.remaining < spec.minimum
                 || order.filled < Decimal::ZERO
+                || order.canceled != Decimal::ZERO
                 || [order.original, order.filled, order.remaining]
                     .iter()
                     .any(|q| !aligned(*q, spec.lot))
@@ -405,6 +428,7 @@ impl ScenarioAccount {
                     RestingOrder {
                         facts: order.clone(),
                         version: 0,
+                        cancel: risk_transition::cancel::State::None,
                     },
                 )
                 .is_some()
@@ -435,6 +459,7 @@ impl ScenarioAccount {
             intent_results: BTreeMap::new(),
             execution_receipts: BTreeMap::new(),
             pending_actions: Vec::new(),
+            cancel_facts: Default::default(),
         };
         let (scenario, marks) = owner.btc_context()?;
         if scenario.evaluate(&owner.projection()?, marks)?.risk != MaintenanceState::Safe {
@@ -480,6 +505,7 @@ impl ScenarioAccount {
             }
             ProfileContext::GoldenCapacity(config) => config.context_id(effective_at),
             ProfileContext::EventLimit(config) => config.context_id(effective_at),
+            ProfileContext::GoldenCancel(config) => config.context_id(effective_at),
         };
         if current.ok() != Some(self.valuation_context_id) {
             return Err("UNSUPPORTED_CONTEXT_TRANSITION");

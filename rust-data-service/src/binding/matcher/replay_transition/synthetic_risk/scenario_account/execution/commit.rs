@@ -99,6 +99,31 @@ impl ScenarioAccount {
                     position.clone(),
                     self.event_c_settlement(candidate, execution_id)?,
                 )
+            } else if let (
+                ProfileContext::GoldenCancel(config),
+                PositionState::GoldenCancel(position),
+            ) = (&self.profile, &self.positions)
+            {
+                let opening = hypothetical_settlement::OpeningIdentity {
+                    source_id: format!("runtime:{execution_id:02x?}"),
+                    strategy_id: order.facts.strategy_id.clone(),
+                    execution_id,
+                    sequence: self.commit_sequence,
+                };
+                (
+                    None,
+                    FinancialSnapshot::GoldenCancel(self.golden_cancel_reservation()?),
+                    position.clone(),
+                    hypothetical_settlement::calculate(
+                        position.as_ref(),
+                        template.side,
+                        template.quantity,
+                        template.price,
+                        hypothetical_settlement::Context::GoldenCancel(config),
+                        hypothetical_settlement::FeePolicy::GoldenCancelTradingTaker,
+                        Some(&opening),
+                    )?,
+                )
             } else {
                 let product = template.key.product.btc()?;
                 let before_reservation = self.reservation()?;
@@ -151,6 +176,7 @@ impl ScenarioAccount {
                 }
             },
             (PositionState::EventLimit(position), None) => *position = settled.position.clone(),
+            (PositionState::GoldenCancel(position), None) => *position = settled.position.clone(),
             _ => return Err("PROFILE_MISMATCH"),
         }
         let order = self
@@ -200,5 +226,7 @@ impl ScenarioAccount {
     }
 }
 
+#[cfg(test)]
+mod cancel_tests;
 #[cfg(test)]
 mod tests;

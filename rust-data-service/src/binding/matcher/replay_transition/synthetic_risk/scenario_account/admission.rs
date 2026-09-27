@@ -14,7 +14,11 @@ pub(super) fn admit_execution_fixture(
         client_order_id: "client".into(),
         account_key: owner.key.clone(),
         config_id: owner.config_id.clone(),
-        product: ProfileProduct::BtcEth(Product::Btc),
+        product: if matches!(owner.profile, ProfileContext::GoldenCancel(_)) {
+            ProfileProduct::Pa
+        } else {
+            ProfileProduct::BtcEth(Product::Btc)
+        },
         strategy_id: "strategy".into(),
         side,
         order_type: OrderType::Limit,
@@ -117,6 +121,7 @@ enum Outcome {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Evaluation {
+    GoldenCancel(Decimal),
     GoldenCapacity(capacity::CapacityProjection),
     BtcEth(btc_policy::Evidence),
 }
@@ -253,6 +258,19 @@ impl ScenarioAccount {
         }
         let price = intent.limit_price.ok_or("LIMIT_PRICE_REQUIRED")?;
         let (spec_version, rule_data_version) = match &self.profile {
+            ProfileContext::GoldenCancel(config) => {
+                config.validate(envelope.effective_at)?;
+                if intent.product != ProfileProduct::Pa
+                    || intent.side != Side::Long
+                    || intent.quantity != Decimal::TEN
+                    || price != Decimal::TEN
+                    || intent.reduce_only
+                    || !self.orders.is_empty()
+                {
+                    return Err("INVALID_GOLDEN_CANCEL_INTENT");
+                }
+                ("gt03-spec-v1".into(), "gt03-rule-v1".into())
+            }
             ProfileContext::EventLimit(_) => return Err("UNSUPPORTED_ADMISSION_PROFILE"),
             ProfileContext::GoldenCapacity(config) => {
                 if intent.product != ProfileProduct::Pa {
@@ -284,6 +302,7 @@ impl ScenarioAccount {
             order_id.clone(),
             RestingOrder {
                 version: 1,
+                cancel: risk_transition::cancel::State::None,
                 facts: SeedOrder {
                     intent_id: intent.intent_id.clone(),
                     order_id: order_id.clone(),
@@ -295,6 +314,7 @@ impl ScenarioAccount {
                     reduce_only: intent.reduce_only,
                     original: intent.quantity,
                     filled: Decimal::ZERO,
+                    canceled: Decimal::ZERO,
                     remaining: intent.quantity,
                     status: "OPEN".into(),
                 },
@@ -302,6 +322,10 @@ impl ScenarioAccount {
         );
         hook(PrepareStage::OrderDrafted)?;
         let (evaluation, reason_code) = match &self.profile {
+            ProfileContext::GoldenCancel(_) => (
+                Evaluation::GoldenCancel(draft.golden_cancel_reservation()?),
+                None,
+            ),
             ProfileContext::EventLimit(_) => return Err("UNSUPPORTED_ADMISSION_PROFILE"),
             ProfileContext::GoldenCapacity(_) => {
                 let projection = self.capacity_projection(&capacity::Candidate {
@@ -353,5 +377,7 @@ impl ScenarioAccount {
     }
 }
 
+#[cfg(test)]
+mod golden_cancel_tests;
 #[cfg(test)]
 mod tests;

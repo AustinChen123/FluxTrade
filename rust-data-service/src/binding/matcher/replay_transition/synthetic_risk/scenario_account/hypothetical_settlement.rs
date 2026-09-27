@@ -1,5 +1,7 @@
 //! Pure FIFO calculation shared by future admission stress and execution commit.
 use super::*;
+mod context;
+pub(super) use context::Context;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct OpeningIdentity {
@@ -45,22 +47,10 @@ pub(super) fn fee_amount(
     mul(mul(base, price)?, policy.rate())
 }
 
-fn origin_spec<'a>(
-    scenario: &'a FrozenScenario,
-    product: Product,
-    version: &str,
-) -> Result<&'a Spec, Fault> {
-    scenario
-        .specs
-        .iter()
-        .find(|spec| spec.product == product && spec.version == version)
-        .ok_or("INVALID_LOT_ORIGIN_SPEC")
-}
-
 fn validate_position(
     position: &ProductPosition,
-    product: Product,
-    scenario: &FrozenScenario,
+    context: Context<'_>,
+    maximum: Decimal,
 ) -> Result<(), Fault> {
     let mut contracts = Decimal::ZERO;
     let mut basis = Decimal::ZERO;
@@ -68,7 +58,7 @@ fn validate_position(
     let mut sources = BTreeSet::new();
     let mut previous = None;
     for lot in &position.lots {
-        let spec = origin_spec(scenario, product, &lot.origin_spec_version)?;
+        let spec = context.origin(&lot.origin_spec_version)?;
         let facts = &lot.source;
         if !identity(&facts.seed_execution_id)
             || !identity(&facts.strategy_id)
@@ -89,7 +79,7 @@ fn validate_position(
         basis = add(basis, mul(lot.base_quantity, facts.entry)?)?;
     }
     if contracts <= Decimal::ZERO
-        || contracts > spec_tier_maximum(product)
+        || contracts > maximum
         || contracts != position.contracts
         || basis != position.entry_basis
     {
@@ -98,19 +88,17 @@ fn validate_position(
     Ok(())
 }
 
-pub(super) fn calculate(
+pub(super) fn calculate<'a>(
     current: Option<&ProductPosition>,
     side: Side,
     quantity: Decimal,
     price: Decimal,
-    context: (&FrozenScenario, &Spec),
+    context: impl Into<Context<'a>>,
     fee_policy: FeePolicy,
     opening: Option<&OpeningIdentity>,
 ) -> Result<Draft, Fault> {
-    let (scenario, spec) = context;
-    if *spec != frozen_spec(spec.product, spec.version == "spec-v2") {
-        return Err("UNSUPPORTED_SPEC");
-    }
+    let context = context.into();
+    let spec = context.active(fee_policy)?;
     if quantity < spec.minimum
         || !aligned(quantity, spec.lot)
         || price <= Decimal::ZERO
@@ -119,7 +107,7 @@ pub(super) fn calculate(
         return Err("INVALID_HYPOTHETICAL_EXECUTION");
     }
     if let Some(position) = current {
-        validate_position(position, spec.product, scenario)?;
+        validate_position(position, context, spec.maximum)?;
     }
     let base = mul(mul(quantity, spec.contract_value)?, spec.multiplier)?;
     let fee = fee_amount(base, price, fee_policy)?;
@@ -145,7 +133,7 @@ pub(super) fn calculate(
         position.contracts = add(position.contracts, quantity)?;
         position.entry_basis = add(position.entry_basis, mul(base, price)?)?;
         position.lots.push(EntryLot {
-            origin_spec_version: spec.version.clone(),
+            origin_spec_version: spec.version.into(),
             source: SeedLot {
                 seed_execution_id: id.source_id.clone(),
                 seed_sequence: id.sequence,
@@ -162,7 +150,7 @@ pub(super) fn calculate(
         }
         let mut remaining = quantity;
         for lot in &mut position.lots {
-            let origin = origin_spec(scenario, spec.product, &lot.origin_spec_version)?;
+            let origin = context.origin(&lot.origin_spec_version)?;
             let closed = remaining.min(lot.source.contracts);
             let closed_base = mul(mul(closed, origin.contract_value)?, origin.multiplier)?;
             let difference = match position.side {
@@ -190,7 +178,7 @@ pub(super) fn calculate(
     } else {
         signed_sum(&realized)?
     };
-    if position.contracts > spec_tier_maximum(spec.product) {
+    if position.contracts > spec.maximum {
         return Err("UNSUPPORTED_POSITION_TIER");
     }
     Ok(Draft {
@@ -199,10 +187,6 @@ pub(super) fn calculate(
         fee,
         cash_delta: add(gross_realized_delta, -fee)?,
     })
-}
-
-fn spec_tier_maximum(product: Product) -> Decimal {
-    frozen_tiers(product, false).tiers[2].maximum
 }
 
 #[cfg(test)]

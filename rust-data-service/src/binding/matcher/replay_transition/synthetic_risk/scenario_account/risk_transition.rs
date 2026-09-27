@@ -1,11 +1,18 @@
 //! Post-settlement risk classification on the sole owner's unobservable draft.
 use super::execution::{remainder_eligibility, FinancialSnapshot, RemainderRole};
 use super::*;
+pub(super) mod cancel;
 
 impl ScenarioAccount {
     pub(super) fn execution_snapshot_after(
         &mut self,
     ) -> Result<(FinancialSnapshot, ProfileRisk), Fault> {
+        if matches!(self.profile, ProfileContext::GoldenCancel(_)) {
+            return Ok((
+                FinancialSnapshot::GoldenCancel(self.golden_cancel_reservation()?),
+                ProfileRisk::CapacitySafe,
+            ));
+        }
         if matches!(self.profile, ProfileContext::EventLimit(_)) {
             return Ok((
                 FinancialSnapshot::EventLimit(self.event_limit_projection()?),

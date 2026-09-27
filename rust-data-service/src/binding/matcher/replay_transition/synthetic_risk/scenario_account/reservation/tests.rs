@@ -13,6 +13,7 @@ fn order(id: &str, side: Side, remaining: &str) -> SeedOrder {
         reduce_only: false,
         original: d(remaining),
         filled: d("0"),
+        canceled: Decimal::ZERO,
         remaining: d(remaining),
         status: "OPEN".into(),
     }
