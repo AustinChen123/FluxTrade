@@ -75,6 +75,76 @@ pub(super) fn fixture() -> (CleanSeed, FrozenScenario, Vec<Mark>) {
 }
 
 #[test]
+fn seed_reservation_arithmetic_is_validated_before_publishing_owner() {
+    let (mut seed, config, mut marks) = fixture();
+    seed.positions.clear();
+    seed.cash = d("1000");
+    marks[0].price = d("50000");
+    let order = &mut seed.orders[0];
+    order.side = Side::Long;
+    order.price = d("50000");
+    order.reduce_only = false;
+    order.original = Decimal::ONE;
+    order.filled = Decimal::ZERO;
+    order.remaining = Decimal::ONE;
+    order.status = "OPEN".into();
+
+    let snapshot = ScenarioAccount::from_seed(&seed, &config, &marks)
+        .unwrap()
+        .reservation()
+        .unwrap();
+    assert_eq!(snapshot.equity, d("1000"));
+    assert_eq!(snapshot.maintenance_margin, Decimal::ZERO);
+    assert_eq!(snapshot.total_order_loss, Decimal::ZERO);
+    assert_eq!(snapshot.total_fee_hold, d("0.5"));
+    assert_eq!(snapshot.products[0].exposure_margin, d("50"));
+    assert_eq!(snapshot.used_margin, d("50.5"));
+    assert_eq!(snapshot.available_margin, d("949.5"));
+    let mut negative_available = seed.clone();
+    negative_available.cash = d("40");
+    let owner = ScenarioAccount::from_seed(&negative_available, &config, &marks).unwrap();
+    assert_eq!(owner.gate, Gate::Running);
+    assert_eq!(owner.reservation().unwrap().available_margin, d("-10.5"));
+
+    for (quantity, mark, count, fault) in [
+        (Decimal::MAX, d("50000"), 1, "DECIMAL_OVERFLOW"),
+        (
+            d("0.01"),
+            d("0.0000000000000000000000000001"),
+            1,
+            "DECIMAL_PRECISION_LOSS",
+        ),
+        (
+            d("80000000000000000000000000"),
+            d("50000"),
+            2,
+            "DECIMAL_OVERFLOW",
+        ),
+    ] {
+        let mut invalid = seed.clone();
+        let mut invalid_marks = marks.clone();
+        invalid_marks[0].price = mark;
+        invalid.orders[0].original = quantity;
+        invalid.orders[0].remaining = quantity;
+        if count == 2 {
+            // Each order is representable; only their shared aggregate overflows.
+            assert!(ScenarioAccount::from_seed(&invalid, &config, &invalid_marks).is_ok());
+            let mut second = invalid.orders[0].clone();
+            second.intent_id = "I2".into();
+            second.order_id = "O2".into();
+            second.client_id = "C2".into();
+            invalid.orders.push(second);
+        }
+        let unchanged = (invalid.clone(), invalid_marks.clone());
+        assert_eq!(
+            ScenarioAccount::from_seed(&invalid, &config, &invalid_marks),
+            Err(fault)
+        );
+        assert_eq!((invalid, invalid_marks), unchanged);
+    }
+}
+
+#[test]
 fn seed_lots_are_product_net_fifo_not_strategy_positions() {
     let (mut seed, config, marks) = fixture();
     seed.positions[0].lots.reverse();

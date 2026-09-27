@@ -437,6 +437,7 @@ impl ScenarioAccount {
         if scenario.evaluate(&owner.projection()?, marks)?.risk != MaintenanceState::Safe {
             return Err("SEED_MMR_BREACH");
         }
+        owner.reservation()?;
         Ok(owner)
     }
 
