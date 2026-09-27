@@ -1,6 +1,65 @@
 use super::super::tests::{d, fixture};
 use super::*;
 
+pub(in super::super) fn assert_snapshot(
+    snapshot: &Snapshot,
+    position: &str,
+    remaining: &str,
+    used: &str,
+    available: &str,
+) {
+    assert_eq!(snapshot.position_value, d(position));
+    assert_eq!(snapshot.long_remaining_value, d(remaining));
+    assert_eq!(snapshot.short_remaining_value, d("0"));
+    assert_eq!(
+        (
+            snapshot.exposure_margin,
+            snapshot.used_margin,
+            snapshot.available_margin
+        ),
+        (d(used), d(used), d(available))
+    );
+    assert_eq!(
+        (snapshot.equity, snapshot.eligible_collateral),
+        (d("1000"), d("1000"))
+    );
+    assert_eq!(
+        (
+            snapshot.initial_margin,
+            snapshot.maintenance_margin,
+            snapshot.total_order_loss,
+            snapshot.total_fee_hold
+        ),
+        (d("0"), d("0"), d("0"), d("0"))
+    );
+    assert_eq!(snapshot.risk, ProfileRisk::CapacitySafe);
+    let expected_orders = match remaining {
+        "20" => vec!["O_A", "O_B"],
+        "10" => vec!["O_B"],
+        "0" => vec![],
+        _ => panic!("closed C09 remainder required"),
+    };
+    assert_eq!(
+        snapshot
+            .orders
+            .iter()
+            .map(|row| row.order_id.as_str())
+            .collect::<Vec<_>>(),
+        expected_orders
+    );
+    for row in &snapshot.orders {
+        assert_eq!(
+            (
+                row.remaining_contracts,
+                row.remaining_base_exposure,
+                row.order_loss,
+                row.fee_hold
+            ),
+            (d("1"), d("1"), d("0"), d("0"))
+        );
+    }
+}
+
 pub(in super::super) fn seed() -> CleanSeed {
     let (mut seed, _, _) = fixture();
     seed.cash = d("1000");

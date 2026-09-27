@@ -2,7 +2,7 @@ use super::super::tests::{d, fixture};
 use super::*;
 
 #[test]
-fn event_limit_execution_remains_unimplemented_in_this_checkpoint() {
+fn event_limit_rejects_unmapped_execution_identity() {
     let mut owner = ScenarioAccount::from_event_limit_seed(
         &event_limit::tests::seed(),
         &event_limit::Config::frozen(event_limit::Program::V1),

@@ -13,7 +13,7 @@ pub(super) enum Reply {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Stage {
+pub(super) enum Stage {
     Preparing,
     Validated,
     Settled,
@@ -28,7 +28,7 @@ impl ScenarioAccount {
     }
 
     // The interruption hook receives no owner or draft reference.
-    fn execute_checked(
+    pub(super) fn execute_checked(
         &mut self,
         candidate: &ExecutionCandidate,
         mut hook: impl FnMut(Stage) -> Result<(), Fault>,
@@ -73,12 +73,7 @@ impl ScenarioAccount {
                 }
                 Ok(reply)
             }
-            Err(fault) => {
-                if self.gate == Gate::Running {
-                    self.gate = Gate::Failed(fault);
-                }
-                Err(fault)
-            }
+            Err(fault) => Err(self.fail_execution(fault)),
         }
     }
 
@@ -91,31 +86,50 @@ impl ScenarioAccount {
         hook: &mut impl FnMut(Stage) -> Result<(), Fault>,
     ) -> Result<CommittedExecution, Fault> {
         let template = &candidate.template;
-        let product = template.key.product.btc()?;
-        let before_reservation = self.reservation()?;
-        let position_before = self.positions.btc()?.get(&product).cloned();
         let order = self.target_order(&template.order_id)?;
         let order_version_before = order.version;
-        let opening = position_before
-            .as_ref()
-            .is_none_or(|p| p.side == template.side)
-            .then(|| hypothetical_settlement::OpeningIdentity {
-                source_id: format!("runtime:{execution_id:02x?}"),
-                strategy_id: order.facts.strategy_id.clone(),
-                execution_id,
-                sequence: self.commit_sequence,
-            });
-        let (scenario, _) = self.btc_context()?;
-        let (spec, _) = scenario.resolve(product, template.matching_effective_at)?;
-        let settled = hypothetical_settlement::calculate(
-            position_before.as_ref(),
-            template.side,
-            template.quantity,
-            template.price,
-            spec,
-            Decimal::new(1, 3),
-            opening.as_ref(),
-        )?;
+        let (product, before_reservation, position_before, settled) =
+            if matches!(self.profile, ProfileContext::EventLimit(_)) {
+                let PositionState::EventLimit(position) = &self.positions else {
+                    return Err("PROFILE_MISMATCH");
+                };
+                (
+                    None,
+                    FinancialSnapshot::EventLimit(self.event_limit_projection()?),
+                    position.clone(),
+                    self.event_c_settlement(candidate, execution_id)?,
+                )
+            } else {
+                let product = template.key.product.btc()?;
+                let before_reservation = self.reservation()?;
+                let position_before = self.positions.btc()?.get(&product).cloned();
+                let opening = position_before
+                    .as_ref()
+                    .is_none_or(|p| p.side == template.side)
+                    .then(|| hypothetical_settlement::OpeningIdentity {
+                        source_id: format!("runtime:{execution_id:02x?}"),
+                        strategy_id: order.facts.strategy_id.clone(),
+                        execution_id,
+                        sequence: self.commit_sequence,
+                    });
+                let (scenario, _) = self.btc_context()?;
+                let (spec, _) = scenario.resolve(product, template.matching_effective_at)?;
+                let settled = hypothetical_settlement::calculate(
+                    position_before.as_ref(),
+                    template.side,
+                    template.quantity,
+                    template.price,
+                    spec,
+                    Decimal::new(1, 3),
+                    opening.as_ref(),
+                )?;
+                (
+                    Some(product),
+                    FinancialSnapshot::BtcEth(before_reservation),
+                    position_before,
+                    settled,
+                )
+            };
         hook(Stage::Settled)?;
         let state_version_before = self.state_version;
         let sequence = self.commit_sequence;
@@ -127,13 +141,17 @@ impl ScenarioAccount {
         self.cash = add(self.cash, settled.cash_delta)?;
         self.gross_realized = add(self.gross_realized, settled.gross_realized_delta)?;
         self.fees = add(self.fees, settled.fee)?;
-        match &settled.position {
-            Some(position) => {
-                self.positions.btc_mut()?.insert(product, position.clone());
-            }
-            None => {
-                self.positions.btc_mut()?.remove(&product);
-            }
+        match (&mut self.positions, product) {
+            (PositionState::BtcEth(positions), Some(product)) => match &settled.position {
+                Some(position) => {
+                    positions.insert(product, position.clone());
+                }
+                None => {
+                    positions.remove(&product);
+                }
+            },
+            (PositionState::EventLimit(position), None) => *position = settled.position.clone(),
+            _ => return Err("PROFILE_MISMATCH"),
         }
         let order = self
             .orders
@@ -150,6 +168,44 @@ impl ScenarioAccount {
         .into();
         let order_version_after = order.version;
         hook(Stage::OrdersDrafted)?;
+        let (after_reservation, risk) = self.execution_snapshot_after()?;
+        hook(Stage::Valued)?;
+        Ok(CommittedExecution {
+            account_key: self.key.clone(),
+            execution_id,
+            financial_payload_digest: digest,
+            event_id: candidate.event_id.clone(),
+            commit_sequence: sequence,
+            state_version_before,
+            state_version_after: self.state_version,
+            order_version_before,
+            order_version_after,
+            product: template.key.product,
+            order_id: template.order_id.clone(),
+            quantity: template.quantity,
+            price: template.price,
+            fee_asset: "USDT".into(),
+            fee_amount: settled.fee,
+            realized_pnl_delta: settled.gross_realized_delta,
+            cash_deltas: vec![("USDT".into(), settled.cash_delta)],
+            position_before,
+            position_after: settled.position,
+            reservation_before: before_reservation,
+            reservation_after: after_reservation,
+            spec_version: candidate.spec_version.clone(),
+            rule_data_version: candidate.rule_data_version.clone(),
+            risk_state_after: risk,
+            pending_action_ids: Vec::new(),
+        })
+    }
+
+    fn execution_snapshot_after(&mut self) -> Result<(FinancialSnapshot, ProfileRisk), Fault> {
+        if matches!(self.profile, ProfileContext::EventLimit(_)) {
+            return Ok((
+                FinancialSnapshot::EventLimit(self.event_limit_projection()?),
+                ProfileRisk::CapacitySafe,
+            ));
+        }
         let after_reservation = self.reservation()?;
         let (scenario, marks) = self.btc_context()?;
         let valuation = scenario.evaluate(&self.projection()?, marks)?;
@@ -172,34 +228,10 @@ impl ScenarioAccount {
         {
             self.gate = Gate::Failed("UNSUPPORTED_RISK_TRANSITION");
         }
-        hook(Stage::Valued)?;
-        Ok(CommittedExecution {
-            account_key: self.key.clone(),
-            execution_id,
-            financial_payload_digest: digest,
-            event_id: candidate.event_id.clone(),
-            commit_sequence: sequence,
-            state_version_before,
-            state_version_after: self.state_version,
-            order_version_before,
-            order_version_after,
-            product: template.key.product,
-            order_id: template.order_id.clone(),
-            quantity: template.quantity,
-            price: template.price,
-            fee_asset: "USDT".into(),
-            fee_amount: settled.fee,
-            realized_pnl_delta: settled.gross_realized_delta,
-            cash_deltas: vec![("USDT".into(), settled.cash_delta)],
-            position_before,
-            position_after: settled.position,
-            reservation_before: FinancialSnapshot::BtcEth(before_reservation),
-            reservation_after: FinancialSnapshot::BtcEth(after_reservation),
-            spec_version: candidate.spec_version.clone(),
-            rule_data_version: candidate.rule_data_version.clone(),
-            risk_state_after: ProfileRisk::BtcEth(valuation.risk),
-            pending_action_ids: Vec::new(),
-        })
+        Ok((
+            FinancialSnapshot::BtcEth(after_reservation),
+            ProfileRisk::BtcEth(valuation.risk),
+        ))
     }
 }
 

@@ -2,6 +2,7 @@
 use super::*;
 
 mod commit;
+mod event_c;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LiquidityRole {
@@ -183,14 +184,14 @@ impl ScenarioAccount {
             return Err("RUN_FAILED");
         }
         self.validate_context(template.matching_effective_at)?;
-        if matches!(self.profile, ProfileContext::EventLimit(_)) {
-            return Err("UNSUPPORTED_EXECUTION");
-        }
         let order = self.target_order(&template.order_id)?;
         if candidate.expected_account_version != self.state_version
             || candidate.expected_order_version != order.version
         {
             return Err("STALE_VERSION");
+        }
+        if matches!(self.profile, ProfileContext::EventLimit(_)) {
+            return self.prepare_event_c_candidate(candidate, order, execution_id, digest);
         }
         let product = order
             .facts
@@ -234,6 +235,13 @@ impl ScenarioAccount {
             execution_id,
             digest,
         })
+    }
+
+    fn fail_execution(&mut self, fault: Fault) -> Fault {
+        if self.gate == Gate::Running {
+            self.gate = Gate::Failed(fault);
+        }
+        fault
     }
 }
 

@@ -1,4 +1,4 @@
-//! Closed Golden C09 seed/context and pure financial projection; no execution yet.
+//! Closed Golden C09 seed/context and pure financial projection.
 use super::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,6 +43,9 @@ pub(super) struct Config {
 }
 
 impl Config {
+    pub(super) fn execution_limit(&self, at: i64) -> Result<u64, Fault> {
+        Ok(self.validate(at)?.limit())
+    }
     pub(super) fn frozen(program: Program) -> Self {
         Self {
             program_id: program.id().into(),
@@ -283,7 +286,7 @@ impl ScenarioAccount {
         })
     }
 
-    fn event_limit_projection(&self) -> Result<Snapshot, Fault> {
+    pub(super) fn event_limit_projection(&self) -> Result<Snapshot, Fault> {
         let (ProfileContext::EventLimit(config), PositionState::EventLimit(position)) =
             (&self.profile, &self.positions)
         else {
