@@ -114,7 +114,7 @@ fn reducing_stress_uses_actual_fee_and_preserves_input() {
         )
         .unwrap();
         let position = draft.position.unwrap();
-        let mut projection = owner.projection();
+        let mut projection = owner.projection().unwrap();
         projection.cash = add(projection.cash, draft.cash_delta).unwrap();
         projection.positions[0].contracts = position.contracts;
         projection.positions[0].lots[0].contracts = position.contracts;
@@ -240,7 +240,7 @@ fn strict_stress_threshold_equalities_remain_visible_to_future_admission() {
             None,
         )
         .unwrap();
-        let mut projection = owner.projection();
+        let mut projection = owner.projection().unwrap();
         projection.cash = add(projection.cash, draft.cash_delta).unwrap();
         projection.positions[0].contracts = d("0.5");
         projection.positions[0].lots[0].contracts = d("0.5");

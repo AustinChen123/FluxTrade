@@ -95,7 +95,9 @@ fn seed_lots_are_product_net_fifo_not_strategy_positions() {
         (p.lots[0].base_quantity, p.lots[1].base_quantity),
         (d("0.01"), d("0.02"))
     );
-    let value = config.evaluate(&owner.projection(), &marks).unwrap();
+    let value = config
+        .evaluate(&owner.projection().unwrap(), &marks)
+        .unwrap();
     assert_eq!(
         (value.products[0].unrealized_pnl, value.equity),
         (d("0.028"), d("10000.028"))
@@ -107,7 +109,7 @@ fn seed_lots_are_product_net_fifo_not_strategy_positions() {
     seed.positions[0].lots[0].strategy_id = "strategy-a".into();
     seed.positions[0].lots[1].strategy_id = "strategy-b".into();
     let swapped = ScenarioAccount::from_seed(&seed, &config, &marks).unwrap();
-    assert_eq!(swapped.projection(), owner.projection());
+    assert_eq!(swapped.projection().unwrap(), owner.projection().unwrap());
     assert_eq!(
         (owner.state_version, owner.commit_sequence, &owner.gate),
         (0, 2, &Gate::Running)
@@ -141,7 +143,7 @@ fn two_products_short_lots_and_clone_projection_are_isolated() {
     }
     seed.positions.push(eth);
     let owner = ScenarioAccount::from_seed(&seed, &config, &marks).unwrap();
-    let mut projection = owner.projection();
+    let mut projection = owner.projection().unwrap();
     let value = config.evaluate(&projection, &marks).unwrap();
     assert_eq!(
         (
@@ -164,11 +166,16 @@ fn two_products_short_lots_and_clone_projection_are_isolated() {
         d("50000")
     );
     assert_eq!(owner.orders["O1"].facts.remaining, d("1"));
-    assert_eq!(config.evaluate(&owner.projection(), &marks).unwrap(), value);
+    assert_eq!(
+        config
+            .evaluate(&owner.projection().unwrap(), &marks)
+            .unwrap(),
+        value
+    );
     seed.key.account = "B".into();
     let other = ScenarioAccount::from_seed(&seed, &config, &marks).unwrap();
     assert_ne!(other.seed_executions, owner.seed_executions);
-    assert_eq!(other.projection(), owner.projection());
+    assert_eq!(other.projection().unwrap(), owner.projection().unwrap());
 }
 
 #[test]

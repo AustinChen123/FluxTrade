@@ -5,8 +5,18 @@ use std::convert::Infallible;
 use super::super::{hash_fields, identity, AccountKey, Gate, Hash};
 use super::*;
 
+mod capacity;
 mod hypothetical_settlement;
 mod reservation;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ProfileContext {
+    BtcEthScenario {
+        scenario: FrozenScenario,
+        marks: Vec<Mark>,
+    },
+    GoldenCapacity(capacity::Config),
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SeedLot {
@@ -77,8 +87,7 @@ struct RestingOrder {
 struct ScenarioAccount {
     key: AccountKey,
     config_id: String,
-    scenario: FrozenScenario,
-    marks: Vec<Mark>,
+    profile: ProfileContext,
     valuation_context_id: Hash,
     seed_effective_at: i64,
     state_version: u64,
@@ -170,12 +179,20 @@ fn aligned(value: Decimal, step: Decimal) -> bool {
 }
 
 impl ScenarioAccount {
+    fn btc_context(&self) -> Result<(&FrozenScenario, &[Mark]), Fault> {
+        match &self.profile {
+            ProfileContext::BtcEthScenario { scenario, marks } => Ok((scenario, marks)),
+            ProfileContext::GoldenCapacity(_) => Err("PROFILE_MISMATCH"),
+        }
+    }
+
     fn reservation(&self) -> Result<reservation::Snapshot, Fault> {
+        let (scenario, marks) = self.btc_context()?;
         reservation::calculate(
-            &self.projection(),
+            &self.projection()?,
             &self.orders.values().map(|o| &o.facts).collect::<Vec<_>>(),
-            &self.scenario,
-            &self.marks,
+            scenario,
+            marks,
         )
     }
 
@@ -304,8 +321,10 @@ impl ScenarioAccount {
         let owner = Self {
             key: seed.key.clone(),
             config_id: seed.config_id.clone(),
-            scenario,
-            marks: marks.to_vec(),
+            profile: ProfileContext::BtcEthScenario {
+                scenario,
+                marks: marks.to_vec(),
+            },
             valuation_context_id,
             seed_effective_at: seed.effective_at,
             state_version: 0,
@@ -323,19 +342,16 @@ impl ScenarioAccount {
             execution_receipts: BTreeMap::new(),
             pending_actions: Vec::new(),
         };
-        if owner
-            .scenario
-            .evaluate(&owner.projection(), &owner.marks)?
-            .risk
-            != MaintenanceState::Safe
-        {
+        let (scenario, marks) = owner.btc_context()?;
+        if scenario.evaluate(&owner.projection()?, marks)?.risk != MaintenanceState::Safe {
             return Err("SEED_MMR_BREACH");
         }
         Ok(owner)
     }
 
-    fn projection(&self) -> ValuationInput {
-        ValuationInput {
+    fn projection(&self) -> Result<ValuationInput, Fault> {
+        self.btc_context()?;
+        Ok(ValuationInput {
             account_version: self.state_version,
             effective_at: self.seed_effective_at,
             cash: self.cash,
@@ -356,15 +372,19 @@ impl ScenarioAccount {
                         .collect(),
                 })
                 .collect(),
-        }
+        })
     }
 
     // Only for nonduplicates, after canonical identity lookup in future consumers.
     // No mutation: a future transition must fail its gate on this fault.
     fn validate_context(&self, effective_at: i64) -> Result<(), Fault> {
-        if context_id(&self.scenario, &self.marks, effective_at).ok()
-            != Some(self.valuation_context_id)
-        {
+        let current = match &self.profile {
+            ProfileContext::BtcEthScenario { scenario, marks } => {
+                context_id(scenario, marks, effective_at)
+            }
+            ProfileContext::GoldenCapacity(config) => config.context_id(effective_at),
+        };
+        if current.ok() != Some(self.valuation_context_id) {
             return Err("UNSUPPORTED_CONTEXT_TRANSITION");
         }
         Ok(())

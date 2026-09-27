@@ -221,7 +221,7 @@ fn shared_equity_and_atomic_capacity_anchors_are_only_snapshots() {
 fn invalid_reservation_inputs_fail_without_modifying_authoritative_facts() {
     let (seed, config, marks) = fixture();
     let owner = ScenarioAccount::from_seed(&seed, &config, &marks).unwrap();
-    let projection = owner.projection();
+    let projection = owner.projection().unwrap();
     let mutations: &[fn(&mut SeedOrder)] = &[
         |o| o.remaining = d("0"),
         |o| o.remaining = d("0.001"),
@@ -262,5 +262,5 @@ fn invalid_reservation_inputs_fail_without_modifying_authoritative_facts() {
     let mut unsupported = config.clone();
     unsupported.leverage = d("5");
     assert!(calculate(&projection, &[], &unsupported, &marks).is_err());
-    assert_eq!(owner.projection(), projection);
+    assert_eq!(owner.projection().unwrap(), projection);
 }
