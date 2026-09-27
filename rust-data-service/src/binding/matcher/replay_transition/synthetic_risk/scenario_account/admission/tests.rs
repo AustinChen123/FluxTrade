@@ -104,7 +104,9 @@ fn capacity_trace_caches_both_outcomes_and_conflict_stops_run() {
         (None, None)
     );
     assert!(rejected.result.order_id.is_none() && rejected.result.reservation_after.is_none());
-    let Evaluation::GoldenCapacity(projection) = &rejected.result.evaluation;
+    let Evaluation::GoldenCapacity(projection) = &rejected.result.evaluation else {
+        panic!("capacity evidence required")
+    };
     assert_eq!(projection.required, d("1100"));
     let mut expected = before;
     expected
@@ -148,8 +150,12 @@ fn c02_same_inputs_only_program_changes_and_original_receipts_survive_versions()
     let accepted = v1.admit(&event(&intent)).unwrap();
     let rejected = tight.admit(&event(&same)).unwrap();
     assert_eq!(rejected.kind, ReplyKind::Rejected);
-    let Evaluation::GoldenCapacity(a) = &accepted.result.evaluation;
-    let Evaluation::GoldenCapacity(b) = &rejected.result.evaluation;
+    let Evaluation::GoldenCapacity(a) = &accepted.result.evaluation else {
+        panic!("capacity evidence required")
+    };
+    let Evaluation::GoldenCapacity(b) = &rejected.result.evaluation else {
+        panic!("capacity evidence required")
+    };
     assert_eq!((a.required, b.required), (d("600"), d("600")));
     assert_eq!((a.threshold, b.threshold), (d("1000"), d("500")));
     assert_ne!(a.program_hash, b.program_hash);
@@ -166,7 +172,9 @@ fn c02_same_inputs_only_program_changes_and_original_receipts_survive_versions()
     next.side = Side::Short;
     let next_result = v1.admit(&event(&next)).unwrap();
     assert_eq!(next_result.kind, ReplyKind::Accepted);
-    let Evaluation::GoldenCapacity(next_projection) = next_result.result.evaluation;
+    let Evaluation::GoldenCapacity(next_projection) = next_result.result.evaluation else {
+        panic!("capacity evidence required")
+    };
     assert_eq!(next_projection.required, d("700"));
     assert_eq!(v1.state_version, 2);
     assert_eq!(v1.orders.len(), 2); // Reused client ID is not an idempotency key.
@@ -285,8 +293,7 @@ fn invalid_input_context_and_seed_identity_precedence_are_atomic() {
     assert_fatal(btc, &collision, 500, "SEED_IDENTITY_CONFLICT");
     seed.orders.clear();
     let btc = ScenarioAccount::from_seed(&seed, &scenario, &marks).unwrap();
-    collision.product = ProfileProduct::BtcEth(Product::Btc);
-    assert_fatal(btc, &collision, 500, "UNSUPPORTED_ADMISSION_PROFILE");
+    assert_fatal(btc, &collision, 500, "PROFILE_MISMATCH");
 }
 
 #[test]

@@ -1,6 +1,8 @@
-//! Single private admission writer. BTC policy remains unsupported in this checkpoint.
+//! Single private admission writer with closed capacity and BTC/ETH policies.
 use super::*;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+
+mod btc_policy;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OrderType {
@@ -84,6 +86,7 @@ enum Outcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Evaluation {
     GoldenCapacity(capacity::CapacityProjection),
+    BtcEth(btc_policy::Evidence),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -213,25 +216,36 @@ impl ScenarioAccount {
             return Err("ORDER_ID_CONFLICT");
         }
         self.validate_context(envelope.effective_at)?;
-        let config = match &self.profile {
-            ProfileContext::GoldenCapacity(config) => config,
-            ProfileContext::BtcEthScenario { .. } => return Err("UNSUPPORTED_ADMISSION_PROFILE"),
-        };
-        if intent.product != ProfileProduct::Pa {
-            return Err("PROFILE_MISMATCH");
-        }
         if intent.order_type != OrderType::Limit {
             return Err("UNSUPPORTED_ORDER_TYPE");
         }
-        if intent.reduce_only {
-            return Err("UNSUPPORTED_ADMISSION_ROLE");
-        }
         let price = intent.limit_price.ok_or("LIMIT_PRICE_REQUIRED")?;
-        let projection = self.capacity_projection(&capacity::Candidate {
-            product: intent.product,
-            quantity: intent.quantity,
-            price,
-        })?;
+        let (spec_version, rule_data_version) = match &self.profile {
+            ProfileContext::GoldenCapacity(config) => {
+                if intent.product != ProfileProduct::Pa {
+                    return Err("PROFILE_MISMATCH");
+                }
+                if intent.reduce_only {
+                    return Err("UNSUPPORTED_ADMISSION_ROLE");
+                }
+                (
+                    config.spec_version.clone(),
+                    config.rule_data_version.clone(),
+                )
+            }
+            ProfileContext::BtcEthScenario { scenario, .. } => {
+                let (spec, tier) =
+                    scenario.resolve(intent.product.btc()?, envelope.effective_at)?;
+                if intent.quantity < spec.minimum
+                    || !aligned(intent.quantity, spec.lot)
+                    || price <= Decimal::ZERO
+                    || !aligned(price, spec.tick)
+                {
+                    return Err("INVALID_BTC_INTENT");
+                }
+                (spec.version.clone(), tier.version.clone())
+            }
+        };
         hook(PrepareStage::Validated)?;
         draft.orders.insert(
             order_id.clone(),
@@ -254,8 +268,23 @@ impl ScenarioAccount {
             },
         );
         hook(PrepareStage::OrderDrafted)?;
-        let accepted = projection.required <= projection.threshold;
-        let evaluation = Evaluation::GoldenCapacity(projection);
+        let (evaluation, reason_code) = match &self.profile {
+            ProfileContext::GoldenCapacity(_) => {
+                let projection = self.capacity_projection(&capacity::Candidate {
+                    product: intent.product,
+                    quantity: intent.quantity,
+                    price,
+                })?;
+                let reason =
+                    (projection.required > projection.threshold).then_some("CAPACITY_EXCEEDED");
+                (Evaluation::GoldenCapacity(projection), reason)
+            }
+            ProfileContext::BtcEthScenario { .. } => {
+                let (evidence, reason) = btc_policy::evaluate(self, &draft, intent, price)?;
+                (Evaluation::BtcEth(evidence), reason)
+            }
+        };
+        let accepted = reason_code.is_none();
         if accepted {
             draft.state_version = self
                 .state_version
@@ -270,18 +299,14 @@ impl ScenarioAccount {
             } else {
                 Outcome::Rejected
             },
-            reason_code: if accepted {
-                None
-            } else {
-                Some("CAPACITY_EXCEEDED")
-            },
+            reason_code,
             order_id: accepted.then_some(order_id),
             account_version_before: self.state_version,
             account_version_after: draft.state_version,
             order_version_before: None,
             order_version_after: accepted.then_some(1),
-            spec_version: config.spec_version.clone(),
-            rule_data_version: config.rule_data_version.clone(),
+            spec_version,
+            rule_data_version,
             reservation_after: accepted.then(|| evaluation.clone()),
             evaluation,
             created_at_event_id: envelope.event_id.into(),
