@@ -3,12 +3,12 @@ use super::*;
 use ring::digest::{digest, SHA256};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct Stored<T> {
+pub(in super::super) struct Stored<T> {
     pub digest: Hash,
     pub value: T,
 }
 
-pub(super) fn classify<T>(
+pub(in super::super) fn classify<T>(
     stored: Option<&Stored<T>>,
     incoming: Hash,
     conflict: Fault,

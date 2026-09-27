@@ -27,7 +27,7 @@ pub(super) enum FeePolicy {
 }
 
 impl FeePolicy {
-    fn rate(self) -> Decimal {
+    pub(super) fn rate(self) -> Decimal {
         match self {
             Self::BtcEthTradingTaker => Decimal::new(1, 3),
             Self::GoldenCancelTradingTaker => Decimal::new(1, 2),
