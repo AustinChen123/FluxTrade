@@ -1,7 +1,7 @@
 use super::super::tests::{d, fixture};
 use super::*;
 
-fn fixture_candidate() -> (ScenarioAccount, ExecutionCandidate) {
+pub(super) fn fixture_candidate() -> (ScenarioAccount, ExecutionCandidate) {
     let (seed, scenario, marks) = fixture();
     let (spec, tier) = scenario.resolve(Product::Btc, 500).unwrap();
     let candidate = ExecutionCandidate {
@@ -167,6 +167,11 @@ fn seed_collision_precedes_lookup_and_seed_target_is_legal() {
         owner.prepare_execution(&candidate),
         Err("SEED_IDENTITY_CONFLICT")
     );
+    let mut actual = owner.clone();
+    let mut expected = owner.clone();
+    expected.gate = Gate::Failed("SEED_IDENTITY_CONFLICT");
+    assert_eq!(actual.execute(&candidate), Err("SEED_IDENTITY_CONFLICT"));
+    assert_eq!(actual, expected);
     assert!(owner.execution_receipts.is_empty());
     candidate.template.key.namespace = "synthetic-v1".into();
     // Defensive canonical collision, even if a runtime record were inconsistent.
@@ -209,7 +214,11 @@ fn symmetric_full_remainder_matrix_precedes_malformed_candidate() {
                     } else if opposing && remaining == "4" {
                         Err("EXECUTION_INELIGIBLE_REMAINDER_EXCEEDS_POSITION")
                     } else {
-                        Ok(())
+                        Ok(if opposing {
+                            RemainderRole::Reducing
+                        } else {
+                            RemainderRole::Increasing
+                        })
                     };
                     assert_eq!(
                         remainder_eligibility(facts, owner.positions.get(&Product::Btc)),
@@ -224,10 +233,13 @@ fn symmetric_full_remainder_matrix_precedes_malformed_candidate() {
                         let result = owner.prepare_execution(&input);
                         match expected {
                             Err(reason) => assert_eq!(result, Ok(Preparation::Rejected(reason))),
-                            Ok(()) if qty == "0.5" => {
+                            Ok(_) if qty == "0.5" => {
                                 assert!(matches!(result, Ok(Preparation::Eligible { .. })))
                             }
-                            Ok(()) => assert_eq!(result, Err("UNSUPPORTED_EXECUTION")),
+                            Ok(_) => assert_eq!(result, Err("UNSUPPORTED_EXECUTION")),
+                        }
+                        if let Err(reason) = expected {
+                            assert_eq!(owner.execute(&input), Ok(commit::Reply::Rejected(reason)));
                         }
                         assert_eq!(owner, before);
                     }
@@ -268,6 +280,11 @@ fn fatal_validation_matrix_is_read_only_and_ordered() {
             owner.prepare_execution(&input),
             Err("UNSUPPORTED_EXECUTION")
         );
+        let mut actual = owner.clone();
+        let mut expected = owner.clone();
+        expected.gate = Gate::Failed("UNSUPPORTED_EXECUTION");
+        assert_eq!(actual.execute(&input), Err("UNSUPPORTED_EXECUTION"));
+        assert_eq!(actual, expected);
     }
     for time in [-1, 1000, 2000] {
         let mut input = candidate.clone();
@@ -277,6 +294,14 @@ fn fatal_validation_matrix_is_read_only_and_ordered() {
             owner.prepare_execution(&input),
             Err("UNSUPPORTED_CONTEXT_TRANSITION")
         );
+        let mut actual = owner.clone();
+        let mut expected = owner.clone();
+        expected.gate = Gate::Failed("UNSUPPORTED_CONTEXT_TRANSITION");
+        assert_eq!(
+            actual.execute(&input),
+            Err("UNSUPPORTED_CONTEXT_TRANSITION")
+        );
+        assert_eq!(actual, expected);
     }
     let mut input = candidate.clone();
     input.template.order_id = "missing".into();

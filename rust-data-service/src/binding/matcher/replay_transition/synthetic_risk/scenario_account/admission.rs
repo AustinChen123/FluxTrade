@@ -2,6 +2,38 @@
 use super::*;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
+#[cfg(test)]
+pub(super) fn admit_execution_fixture(
+    owner: &mut ScenarioAccount,
+    side: Side,
+    quantity: Decimal,
+    price: Decimal,
+) -> String {
+    let intent = OrderIntent {
+        intent_id: "execution-fixture".into(),
+        client_order_id: "client".into(),
+        account_key: owner.key.clone(),
+        config_id: owner.config_id.clone(),
+        product: ProfileProduct::BtcEth(Product::Btc),
+        strategy_id: "strategy".into(),
+        side,
+        order_type: OrderType::Limit,
+        quantity,
+        limit_price: Some(price),
+        reduce_only: false,
+        requested_at: 500,
+    };
+    let reply = owner
+        .admit(&Envelope {
+            event_id: "admission",
+            effective_at: 500,
+            intent: &intent,
+        })
+        .unwrap();
+    assert_eq!(reply.kind, ReplyKind::Accepted);
+    reply.result.order_id.unwrap()
+}
+
 mod btc_policy;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

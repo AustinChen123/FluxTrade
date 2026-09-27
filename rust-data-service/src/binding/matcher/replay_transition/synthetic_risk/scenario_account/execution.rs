@@ -1,5 +1,7 @@
-//! Pure execution preparation only. No settlement, publication, or gate mutation.
+//! Private execution identity/preparation and the sole BTC/ETH commit boundary.
 use super::*;
+
+mod commit;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LiquidityRole {
@@ -135,10 +137,16 @@ enum Preparation<'a> {
 }
 
 // The whole order remainder, not candidate quantity, owns execution eligibility.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemainderRole {
+    Reducing,
+    Increasing,
+}
+
 fn remainder_eligibility(
     order: &SeedOrder,
     position: Option<&ProductPosition>,
-) -> Result<(), Fault> {
+) -> Result<RemainderRole, Fault> {
     let reducing = position.is_some_and(|p| p.side != order.side && order.remaining <= p.contracts);
     if order.reduce_only && !reducing {
         return Err("REDUCE_ONLY_NOT_REDUCING");
@@ -146,11 +154,15 @@ fn remainder_eligibility(
     if position.is_some_and(|p| p.side != order.side && order.remaining > p.contracts) {
         return Err("EXECUTION_INELIGIBLE_REMAINDER_EXCEEDS_POSITION");
     }
-    Ok(())
+    Ok(if reducing {
+        RemainderRole::Reducing
+    } else {
+        RemainderRole::Increasing
+    })
 }
 
 impl ScenarioAccount {
-    // Future writer consumes this result and owns fatal gate publication. This seam
+    // The writer consumes this result and owns fatal gate publication. This seam
     // itself is read-only, including all business rejection and fault exits.
     fn prepare_execution(&self, candidate: &ExecutionCandidate) -> Result<Preparation<'_>, Fault> {
         let template = &candidate.template;
