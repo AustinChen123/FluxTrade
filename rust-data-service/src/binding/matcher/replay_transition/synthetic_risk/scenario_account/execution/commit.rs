@@ -93,7 +93,7 @@ impl ScenarioAccount {
         let template = &candidate.template;
         let product = template.key.product.btc()?;
         let before_reservation = self.reservation()?;
-        let position_before = self.positions.get(&product).cloned();
+        let position_before = self.positions.btc()?.get(&product).cloned();
         let order = self.target_order(&template.order_id)?;
         let order_version_before = order.version;
         let opening = position_before
@@ -129,10 +129,10 @@ impl ScenarioAccount {
         self.fees = add(self.fees, settled.fee)?;
         match &settled.position {
             Some(position) => {
-                self.positions.insert(product, position.clone());
+                self.positions.btc_mut()?.insert(product, position.clone());
             }
             None => {
-                self.positions.remove(&product);
+                self.positions.btc_mut()?.remove(&product);
             }
         }
         let order = self
@@ -160,7 +160,7 @@ impl ScenarioAccount {
                 .projects_remainder("INVALID_RESERVATION_ORDER")?
                 && remainder_eligibility(
                     &order.facts,
-                    self.positions.get(&order.facts.product.btc()?),
+                    self.positions.btc()?.get(&order.facts.product.btc()?),
                 ) != Ok(RemainderRole::Reducing)
             {
                 needs_order_action = true;
@@ -197,7 +197,7 @@ impl ScenarioAccount {
             reservation_after: FinancialSnapshot::BtcEth(after_reservation),
             spec_version: candidate.spec_version.clone(),
             rule_data_version: candidate.rule_data_version.clone(),
-            risk_state_after: valuation.risk,
+            risk_state_after: ProfileRisk::BtcEth(valuation.risk),
             pending_action_ids: Vec::new(),
         })
     }

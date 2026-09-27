@@ -53,7 +53,7 @@ pub(super) fn evaluate(
     let (scenario, marks) = current.btc_context()?;
     let input = current.projection()?;
     let value = scenario.evaluate(&input, marks)?;
-    let position = current.positions.get(&product);
+    let position = current.positions.btc()?.get(&product);
     let role = classify(
         position.map(|p| (p.side, p.contracts)),
         intent.side,

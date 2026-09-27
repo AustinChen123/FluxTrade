@@ -253,6 +253,7 @@ impl ScenarioAccount {
         }
         let price = intent.limit_price.ok_or("LIMIT_PRICE_REQUIRED")?;
         let (spec_version, rule_data_version) = match &self.profile {
+            ProfileContext::EventLimit(_) => return Err("UNSUPPORTED_ADMISSION_PROFILE"),
             ProfileContext::GoldenCapacity(config) => {
                 if intent.product != ProfileProduct::Pa {
                     return Err("PROFILE_MISMATCH");
@@ -301,6 +302,7 @@ impl ScenarioAccount {
         );
         hook(PrepareStage::OrderDrafted)?;
         let (evaluation, reason_code) = match &self.profile {
+            ProfileContext::EventLimit(_) => return Err("UNSUPPORTED_ADMISSION_PROFILE"),
             ProfileContext::GoldenCapacity(_) => {
                 let projection = self.capacity_projection(&capacity::Candidate {
                     product: intent.product,

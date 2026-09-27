@@ -1,6 +1,24 @@
 use super::super::tests::{d, fixture};
 use super::*;
 
+#[test]
+fn event_limit_execution_remains_unimplemented_in_this_checkpoint() {
+    let mut owner = ScenarioAccount::from_event_limit_seed(
+        &event_limit::tests::seed(),
+        &event_limit::Config::frozen(event_limit::Program::V1),
+    )
+    .unwrap();
+    let (_, mut candidate) = fixture_candidate();
+    candidate.template.key.product = ProfileProduct::Pa;
+    candidate.template.order_id = "O_A".into();
+    candidate.template.quantity = d("1");
+    candidate.template.price = d("10");
+    let mut expected = owner.clone();
+    expected.gate = Gate::Failed("UNSUPPORTED_EXECUTION");
+    assert_eq!(owner.execute(&candidate), Err("UNSUPPORTED_EXECUTION"));
+    assert_eq!(owner, expected);
+}
+
 pub(super) fn fixture_candidate() -> (ScenarioAccount, ExecutionCandidate) {
     let (seed, scenario, marks) = fixture();
     let (spec, tier) = scenario.resolve(Product::Btc, 500).unwrap();
@@ -101,13 +119,13 @@ fn receipt_fixture(owner: &ScenarioAccount, candidate: &ExecutionCandidate) -> C
         fee_amount: d("0.2500005"),
         realized_pnl_delta: d("0.0005"),
         cash_deltas: vec![("USDT".into(), d("-0.2495005"))],
-        position_before: owner.positions.get(&Product::Btc).cloned(),
-        position_after: owner.positions.get(&Product::Btc).cloned(),
+        position_before: owner.positions.btc().unwrap().get(&Product::Btc).cloned(),
+        position_after: owner.positions.btc().unwrap().get(&Product::Btc).cloned(),
         reservation_before: snapshot.clone(),
         reservation_after: snapshot,
         spec_version: candidate.spec_version.clone(),
         rule_data_version: candidate.rule_data_version.clone(),
-        risk_state_after: MaintenanceState::Safe,
+        risk_state_after: ProfileRisk::BtcEth(MaintenanceState::Safe),
         pending_action_ids: Vec::new(),
     }
 }
@@ -197,9 +215,15 @@ fn symmetric_full_remainder_matrix_precedes_malformed_candidate() {
                 for remaining in ["1", "3", "4"] {
                     let mut owner = baseline.clone();
                     if let Some(side) = position_side {
-                        owner.positions.get_mut(&Product::Btc).unwrap().side = side;
+                        owner
+                            .positions
+                            .btc_mut()
+                            .unwrap()
+                            .get_mut(&Product::Btc)
+                            .unwrap()
+                            .side = side;
                     } else {
-                        owner.positions.clear();
+                        owner.positions.btc_mut().unwrap().clear();
                     }
                     let facts = &mut owner.orders.get_mut("O1").unwrap().facts;
                     facts.side = order_side;
@@ -221,7 +245,10 @@ fn symmetric_full_remainder_matrix_precedes_malformed_candidate() {
                         })
                     };
                     assert_eq!(
-                        remainder_eligibility(facts, owner.positions.get(&Product::Btc)),
+                        remainder_eligibility(
+                            facts,
+                            owner.positions.btc().unwrap().get(&Product::Btc)
+                        ),
                         expected
                     );
                     let before = owner.clone();

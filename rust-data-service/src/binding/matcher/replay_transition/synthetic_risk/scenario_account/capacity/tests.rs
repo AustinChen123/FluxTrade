@@ -2,6 +2,18 @@ use super::super::tests::{d, fixture};
 use super::*;
 
 #[test]
+fn event_limit_program_cannot_masquerade_as_capacity_admission() {
+    for program in ["SYNTHETIC_EVENT_LIMIT_V1", "SYNTHETIC_EVENT_LIMIT_V2"] {
+        let mut config = Config::frozen(Program::CapacityV1);
+        config.program_id = program.into();
+        assert_eq!(
+            ScenarioAccount::from_capacity_seed(&seed(), &config),
+            Err("UNSUPPORTED_CAPACITY_PROGRAM")
+        );
+    }
+}
+
+#[test]
 fn authoritative_projection_retains_terminal_order_without_reservation() {
     let config = Config::frozen(Program::CapacityV1);
     for (status, filled, remaining, expected) in [

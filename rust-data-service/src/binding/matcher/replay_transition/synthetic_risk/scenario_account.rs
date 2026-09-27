@@ -1,4 +1,4 @@
-//! Private incomplete scenario account; no execution commit or public API.
+//! Private incomplete scenario account; no public API or 4C transitions.
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 
@@ -7,6 +7,7 @@ use super::*;
 
 mod admission;
 mod capacity;
+mod event_limit;
 mod execution;
 mod hypothetical_settlement;
 mod reservation;
@@ -18,6 +19,7 @@ enum ProfileContext {
         marks: Vec<Mark>,
     },
     GoldenCapacity(capacity::Config),
+    EventLimit(event_limit::Config),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,6 +125,47 @@ struct ProductPosition {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+enum PositionState {
+    BtcEth(BTreeMap<Product, ProductPosition>),
+    CapacityFlat,
+    EventLimit(Option<ProductPosition>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProfileRisk {
+    BtcEth(MaintenanceState),
+    CapacitySafe,
+}
+
+impl PositionState {
+    fn btc(&self) -> Result<&BTreeMap<Product, ProductPosition>, Fault> {
+        match self {
+            Self::BtcEth(value) => Ok(value),
+            _ => Err("PROFILE_MISMATCH"),
+        }
+    }
+
+    fn btc_mut(&mut self) -> Result<&mut BTreeMap<Product, ProductPosition>, Fault> {
+        match self {
+            Self::BtcEth(value) => Ok(value),
+            _ => Err("PROFILE_MISMATCH"),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::BtcEth(value) => value.len(),
+            Self::CapacityFlat => 0,
+            Self::EventLimit(value) => usize::from(value.is_some()),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct RestingOrder {
     facts: SeedOrder,
     version: u64,
@@ -140,7 +183,7 @@ struct ScenarioAccount {
     cash: Decimal,
     gross_realized: Decimal,
     fees: Decimal,
-    positions: BTreeMap<Product, ProductPosition>,
+    positions: PositionState,
     orders: BTreeMap<String, RestingOrder>,
     seed_intents: BTreeSet<String>,
     seed_orders: BTreeSet<String>,
@@ -227,7 +270,9 @@ impl ScenarioAccount {
     fn btc_context(&self) -> Result<(&FrozenScenario, &[Mark]), Fault> {
         match &self.profile {
             ProfileContext::BtcEthScenario { scenario, marks } => Ok((scenario, marks)),
-            ProfileContext::GoldenCapacity(_) => Err("PROFILE_MISMATCH"),
+            ProfileContext::GoldenCapacity(_) | ProfileContext::EventLimit(_) => {
+                Err("PROFILE_MISMATCH")
+            }
         }
     }
 
@@ -378,7 +423,7 @@ impl ScenarioAccount {
             cash: seed.cash,
             gross_realized: Decimal::ZERO,
             fees: Decimal::ZERO,
-            positions,
+            positions: PositionState::BtcEth(positions),
             seed_orders: orders.keys().cloned().collect(),
             orders,
             seed_intents,
@@ -403,6 +448,7 @@ impl ScenarioAccount {
             cash: self.cash,
             positions: self
                 .positions
+                .btc()?
                 .iter()
                 .map(|(product, position)| NetPosition {
                     product: *product,
@@ -429,6 +475,7 @@ impl ScenarioAccount {
                 context_id(scenario, marks, effective_at)
             }
             ProfileContext::GoldenCapacity(config) => config.context_id(effective_at),
+            ProfileContext::EventLimit(config) => config.context_id(effective_at),
         };
         if current.ok() != Some(self.valuation_context_id) {
             return Err("UNSUPPORTED_CONTEXT_TRANSITION");

@@ -122,7 +122,7 @@ fn long_and_short_golden_fifo_runs_use_actual_commits() {
             assert_eq!(owner.orders[&format!("O{index}")].facts.status, "FILLED");
             assert_eq!(
                 receipt.position_after.as_ref(),
-                owner.positions.get(&Product::Btc)
+                owner.positions.btc().unwrap().get(&Product::Btc)
             );
             assert_eq!(
                 receipt.reservation_after,
@@ -141,7 +141,7 @@ fn long_and_short_golden_fifo_runs_use_actual_commits() {
                 );
             }
             if index == 2 {
-                let lots = &owner.positions[&Product::Btc].lots;
+                let lots = &owner.positions.btc().unwrap()[&Product::Btc].lots;
                 if orders[0].0 == Side::Long {
                     assert_eq!(lots.len(), 1);
                     assert_eq!(lots[0].execution_id, receipts[1].execution_id);
@@ -233,8 +233,11 @@ fn runtime_opening_after_seed_retains_fifo_sequence_and_provenance() {
     let receipt = committed(&mut clone, &candidate);
     assert_eq!(owner, before);
     assert_eq!(committed(&mut owner, &candidate), receipt);
-    let lots = &owner.positions[&Product::Btc].lots;
-    assert_eq!(&lots[..2], before.positions[&Product::Btc].lots);
+    let lots = &owner.positions.btc().unwrap()[&Product::Btc].lots;
+    assert_eq!(
+        &lots[..2],
+        before.positions.btc().unwrap()[&Product::Btc].lots
+    );
     assert_eq!(lots[2].source.seed_sequence, 2);
     assert_eq!(lots[2].execution_id, receipt.execution_id);
     assert_eq!(lots[2].source.strategy_id, seed.orders[0].strategy_id);
@@ -355,7 +358,15 @@ fn every_prepublication_fault_and_panic_discards_the_draft() {
             1 => actual.orders.get_mut("O1").unwrap().version = u64::MAX,
             2 => actual.commit_sequence = u64::MAX,
             3 => actual.fees = Decimal::MAX,
-            _ => actual.positions.get_mut(&Product::Btc).unwrap().entry_basis = d("1"),
+            _ => {
+                actual
+                    .positions
+                    .btc_mut()
+                    .unwrap()
+                    .get_mut(&Product::Btc)
+                    .unwrap()
+                    .entry_basis = d("1")
+            }
         }
         let input = input(&actual, "O1", "failure", "0.5", "50000.1");
         let reason = match field {

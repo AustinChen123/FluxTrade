@@ -79,7 +79,7 @@ fn seed_lots_are_product_net_fifo_not_strategy_positions() {
     let (mut seed, config, marks) = fixture();
     seed.positions[0].lots.reverse();
     let owner = ScenarioAccount::from_seed(&seed, &config, &marks).unwrap();
-    let p = &owner.positions[&Product::Btc];
+    let p = &owner.positions.btc().unwrap()[&Product::Btc];
     assert_eq!(
         (owner.positions.len(), p.contracts, p.entry_basis),
         (1, d("3"), d("1500.002"))
@@ -156,13 +156,21 @@ fn two_products_short_lots_and_clone_projection_are_isolated() {
     projection.positions[0].lots[0].entry = d("1");
     let mut draft = owner.clone();
     draft.cash = d("1");
-    draft.positions.get_mut(&Product::Btc).unwrap().lots[0]
+    draft
+        .positions
+        .btc_mut()
+        .unwrap()
+        .get_mut(&Product::Btc)
+        .unwrap()
+        .lots[0]
         .source
         .entry = d("1");
     draft.orders.get_mut("O1").unwrap().facts.remaining = d("0.5");
     assert_eq!(owner.cash, d("10000"));
     assert_eq!(
-        owner.positions[&Product::Btc].lots[0].source.entry,
+        owner.positions.btc().unwrap()[&Product::Btc].lots[0]
+            .source
+            .entry,
         d("50000")
     );
     assert_eq!(owner.orders["O1"].facts.remaining, d("1"));

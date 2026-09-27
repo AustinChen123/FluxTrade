@@ -1,6 +1,23 @@
 use super::super::tests::{d, fixture};
 use super::*;
 
+#[test]
+fn event_limit_profile_never_admits_an_intent() {
+    let (_, intent) = setup(capacity::Program::CapacityV1);
+    let mut owner = ScenarioAccount::from_event_limit_seed(
+        &event_limit::tests::seed(),
+        &event_limit::Config::frozen(event_limit::Program::V1),
+    )
+    .unwrap();
+    let mut expected = owner.clone();
+    expected.gate = Gate::Failed("UNSUPPORTED_ADMISSION_PROFILE");
+    assert_eq!(
+        owner.admit(&event(&intent)),
+        Err("UNSUPPORTED_ADMISSION_PROFILE")
+    );
+    assert_eq!(owner, expected);
+}
+
 fn setup(program: capacity::Program) -> (ScenarioAccount, OrderIntent) {
     let (mut seed, _, _) = fixture();
     seed.positions.clear();

@@ -104,7 +104,7 @@ fn reducing_stress_uses_actual_fee_and_preserves_input() {
         ("42200", "0.789", "-0.211", false),
     ] {
         let draft = calculate(
-            owner.positions.get(&Product::Btc),
+            owner.positions.btc().unwrap().get(&Product::Btc),
             Side::Short,
             d("0.5"),
             d(price),
@@ -138,7 +138,7 @@ fn reducing_stress_uses_actual_fee_and_preserves_input() {
 fn invalid_and_nonexact_hypotheticals_never_mutate_inputs() {
     let (seed, config, marks) = fixture();
     let owner = ScenarioAccount::from_seed(&seed, &config, &marks).unwrap();
-    let position = &owner.positions[&Product::Btc];
+    let position = &owner.positions.btc().unwrap()[&Product::Btc];
     let spec = frozen_spec(Product::Btc, false);
     for (quantity, price) in [
         ("4", "50000"),
@@ -231,7 +231,7 @@ fn strict_stress_threshold_equalities_remain_visible_to_future_admission() {
             Ok(d(prior_excess))
         );
         let draft = calculate(
-            owner.positions.get(&Product::Btc),
+            owner.positions.btc().unwrap().get(&Product::Btc),
             Side::Short,
             d("0.5"),
             d(price),

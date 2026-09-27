@@ -98,6 +98,7 @@ struct ExecutionCandidate {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum FinancialSnapshot {
     BtcEth(reservation::Snapshot),
+    EventLimit(event_limit::Snapshot),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -125,7 +126,7 @@ pub(super) struct CommittedExecution {
     reservation_after: FinancialSnapshot,
     spec_version: String,
     rule_data_version: String,
-    risk_state_after: MaintenanceState,
+    risk_state_after: ProfileRisk,
     pending_action_ids: Vec<String>,
 }
 
@@ -182,6 +183,9 @@ impl ScenarioAccount {
             return Err("RUN_FAILED");
         }
         self.validate_context(template.matching_effective_at)?;
+        if matches!(self.profile, ProfileContext::EventLimit(_)) {
+            return Err("UNSUPPORTED_EXECUTION");
+        }
         let order = self.target_order(&template.order_id)?;
         if candidate.expected_account_version != self.state_version
             || candidate.expected_order_version != order.version
@@ -193,7 +197,9 @@ impl ScenarioAccount {
             .product
             .btc()
             .map_err(|_| "UNSUPPORTED_EXECUTION")?;
-        if let Err(reason) = remainder_eligibility(&order.facts, self.positions.get(&product)) {
+        if let Err(reason) =
+            remainder_eligibility(&order.facts, self.positions.btc()?.get(&product))
+        {
             return Ok(Preparation::Rejected(reason));
         }
         let (scenario, _) = self.btc_context().map_err(|_| "UNSUPPORTED_EXECUTION")?;

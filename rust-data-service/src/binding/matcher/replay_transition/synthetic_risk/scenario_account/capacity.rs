@@ -203,7 +203,7 @@ impl ScenarioAccount {
             cash: seed.cash,
             gross_realized: Decimal::ZERO,
             fees: Decimal::ZERO,
-            positions: BTreeMap::new(),
+            positions: PositionState::CapacityFlat,
             orders: BTreeMap::new(),
             seed_intents: BTreeSet::new(),
             seed_orders: BTreeSet::new(),
@@ -222,7 +222,7 @@ impl ScenarioAccount {
         let ProfileContext::GoldenCapacity(config) = &self.profile else {
             return Err("PROFILE_MISMATCH");
         };
-        if !self.positions.is_empty() {
+        if self.positions != PositionState::CapacityFlat {
             return Err("UNSUPPORTED_CAPACITY_SEED_STATE");
         }
         let orders = self

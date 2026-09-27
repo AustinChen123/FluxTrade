@@ -197,6 +197,8 @@ fn single_role_classifier_and_actual_path_cover_both_sides_without_clipping() {
                 classify(
                     owner
                         .positions
+                        .btc()
+                        .unwrap()
                         .get(&Product::Btc)
                         .map(|p| (p.side, p.contracts)),
                     order_side,
