@@ -20,6 +20,7 @@ function response(status: number, body: object): Response {
 const session: BrowserSession = {
   actor: "operator@example.com",
   capabilities: [],
+  permissions: { can_mutate: true, can_step_up: true },
   csrf_token: "csrf-token",
   expires_at: "2026-07-29T12:00:00Z",
   step_up_expires_at: null

@@ -42,6 +42,7 @@ export type GenerationSummary = {
 export type BrowserSession = {
   actor: string;
   capabilities: string[];
+  permissions: { can_mutate: boolean; can_step_up: boolean };
   csrf_token: string;
   expires_at: string;
   step_up_expires_at: string | null;

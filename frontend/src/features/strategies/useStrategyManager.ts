@@ -65,6 +65,15 @@ function saveAwaitingStrategies(strategies: AwaitingStrategies): void {
   }
 }
 
+function permittedCommands(strategy: StrategyState, session: BrowserSession | null) {
+  if (session?.permissions?.can_mutate !== true) return [];
+  return strategy.available_commands.filter((command) =>
+    command === "STOP" ||
+    (["START", "RESUME", "FORCE_RECOVER"].includes(command) &&
+      session.permissions.can_step_up === true)
+  );
+}
+
 function commandLabel(command: StrategyCommand, t: Translate): string {
   return t(`strategies.command.${command}`);
 }
@@ -91,11 +100,13 @@ export function useStrategyManager(t: Translate) {
 
   const refresh = useCallback(async () => {
     setLoading(true);
+    setSession(null);
     setError(null);
     try {
       const browserSession = await ensureBrowserSession();
+      const items = await loadStrategyStates();
+      applyStrategyStates(items);
       setSession(browserSession);
-      applyStrategyStates(await loadStrategyStates());
     } catch (reason) {
       setError(classifyError(reason, "load"));
     } finally {
@@ -113,6 +124,7 @@ export function useStrategyManager(t: Translate) {
 
   const submit = useCallback(
     async (strategy: StrategyState, command: StrategyCommand) => {
+      if (!permittedCommands(strategy, session).includes(command)) return;
       if (
         !window.confirm(
           t("strategies.confirm", {
@@ -158,6 +170,7 @@ export function useStrategyManager(t: Translate) {
           const updatedStrategies = await loadStrategyStates();
           applyStrategyStates(updatedStrategies);
         } catch (reason) {
+          setSession(null);
           setError(classifyError(reason, "refresh"));
         }
       } catch (reason) {
@@ -186,11 +199,16 @@ export function useStrategyManager(t: Translate) {
         setPendingStrategyId(null);
       }
     },
-    [applyStrategyStates, awaitingStrategies, session?.csrf_token, t]
+    [applyStrategyStates, awaitingStrategies, session, t]
   );
 
   return {
-    strategies,
+    strategies: strategies.map((strategy) => ({
+      ...strategy, available_commands: permittedCommands(strategy, session)
+    })),
+    readOnly: session?.permissions?.can_mutate !== true,
+    stepUpRequired: session?.permissions?.can_mutate === true &&
+      session?.permissions?.can_step_up !== true,
     loading,
     error,
     notice,

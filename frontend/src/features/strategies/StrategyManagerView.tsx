@@ -18,6 +18,8 @@ type Translate = ReturnType<typeof useTranslation>["t"];
 
 export interface StrategyManagerViewProps {
   strategies: StrategyRecord[];
+  readOnly?: boolean;
+  stepUpRequired?: boolean;
   loading: boolean;
   error: StrategyManagerError | null;
   notice: string;
@@ -53,6 +55,8 @@ function errorMessage(detail: StrategyErrorDetail, t: Translate): string {
 
 export function StrategyManagerView({
   strategies,
+  readOnly = false,
+  stepUpRequired = false,
   loading,
   error,
   notice,
@@ -108,6 +112,9 @@ export function StrategyManagerView({
             <p>{errorMessage(error.detail, t)}</p>
           </div>
         </div>
+      )}
+      {!loading && error === null && (readOnly || stepUpRequired) && (
+        <p role="status">{t(readOnly ? "strategies.readOnly" : "strategies.stepUpRequired")}</p>
       )}
       {notice && (
         <p className="strategy-notice" role="status">

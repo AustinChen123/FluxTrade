@@ -68,6 +68,7 @@ export const zhTW = {
       "paginationUnavailable": "尚未連接後續交易頁面。"
     },
     "strategies": {
+      "readOnly": "目前為唯讀工作階段；策略命令需要 operator 權限。",
       "kicker": "運行控制",
       "title": "策略管理",
       "body": "查看權威運行狀態，並對單一策略送出受控生命週期命令。",

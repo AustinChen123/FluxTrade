@@ -870,6 +870,7 @@ class ControlPlaneApp:
             {
                 "actor": principal.actor,
                 "capabilities": sorted(principal.capabilities),
+                "permissions": self._browser_permissions(principal),
                 "csrf_token": principal.csrf_token,
                 "expires_at": _utc_iso(principal.expires_at),
                 "step_up_expires_at": _utc_iso(principal.step_up_expires_at),
@@ -880,8 +881,15 @@ class ControlPlaneApp:
             ),
         )
 
-    @staticmethod
+    def _browser_permissions(self, principal: BrowserPrincipal) -> dict[str, bool]:
+        assert self.browser_auth is not None
+        return {
+            "can_mutate": principal.has_capability(self.browser_auth.operator_capability),
+            "can_step_up": self.browser_auth.has_step_up(principal),
+        }
+
     def _get_browser_session(
+        self,
         principal: BrowserPrincipal | None,
     ) -> HttpResponse:
         if principal is None:
@@ -891,6 +899,7 @@ class ControlPlaneApp:
             {
                 "actor": principal.actor,
                 "capabilities": sorted(principal.capabilities),
+                "permissions": self._browser_permissions(principal),
                 "csrf_token": principal.csrf_token,
                 "expires_at": _utc_iso(principal.expires_at),
                 "step_up_expires_at": _utc_iso(principal.step_up_expires_at),

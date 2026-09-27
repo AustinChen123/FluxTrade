@@ -140,6 +140,15 @@ schema. Browser kill-switch requests require a unique `Idempotency-Key` header
 in addition to confirmation. API-key authentication remains available for CLI
 and service clients; never place that key in browser code.
 
+### Browser validation
+
+Browser session create/get responses include `permissions.can_mutate` and
+`permissions.can_step_up`, computed by the server from current grants and the
+step-up deadline. Existing session fields remain unchanged. The console
+intersects these permissions with state-derived `available_commands`; absent
+permissions remain read-only. Backend authorization is authoritative on every
+mutation request.
+
 ### Manual Setup
 
 Requires: Python 3.12+, Rust stable, PostgreSQL 15, Redis

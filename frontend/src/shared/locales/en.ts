@@ -68,6 +68,7 @@ export const en = {
       "paginationUnavailable": "Additional trade pages are not connected."
     },
     "strategies": {
+      "readOnly": "Read-only session. Strategy commands require operator permission.",
       "kicker": "Runtime control",
       "title": "Strategy management",
       "body": "Inspect authoritative runtime state and send a controlled lifecycle command to one strategy.",
