@@ -7,6 +7,7 @@ use super::*;
 
 mod admission;
 mod capacity;
+mod execution;
 mod hypothetical_settlement;
 mod reservation;
 
@@ -74,6 +75,27 @@ struct SeedOrder {
     status: String,
 }
 
+impl SeedOrder {
+    // Terminal facts stay in the owner, but never become financial remainders.
+    fn projects_remainder(&self, invalid: Fault) -> Result<bool, Fault> {
+        if self.original <= Decimal::ZERO
+            || self.filled < Decimal::ZERO
+            || self.remaining < Decimal::ZERO
+            || add(self.filled, self.remaining)? != self.original
+        {
+            return Err(invalid);
+        }
+        match self.status.as_str() {
+            "OPEN" if self.filled == Decimal::ZERO && self.remaining > Decimal::ZERO => Ok(true),
+            "PARTIALLY_FILLED" if self.filled > Decimal::ZERO && self.remaining > Decimal::ZERO => {
+                Ok(true)
+            }
+            "FILLED" if self.remaining == Decimal::ZERO => Ok(false),
+            _ => Err(invalid),
+        }
+    }
+}
+
 // No derived equity, reservation, basis or margin can enter the seed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CleanSeed {
@@ -125,8 +147,8 @@ struct ScenarioAccount {
     seed_executions: BTreeSet<Hash>,
     commit_sequence: u64,
     intent_results: BTreeMap<String, admission::AdmissionResult>,
-    // Uninhabited values: later slices introduce real execution receipts/actions, not fakes.
-    execution_receipts: BTreeMap<Hash, Infallible>,
+    // Only the future execution writer may publish a receipt; seeds have none.
+    execution_receipts: BTreeMap<Hash, execution::CommittedExecution>,
     pending_actions: Vec<Infallible>,
 }
 

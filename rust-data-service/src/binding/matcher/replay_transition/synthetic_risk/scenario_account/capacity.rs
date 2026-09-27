@@ -228,22 +228,24 @@ impl ScenarioAccount {
         let orders = self
             .orders
             .values()
-            .map(|order| {
+            .filter_map(|order| {
                 let facts = &order.facts;
-                if !matches!(facts.status.as_str(), "OPEN" | "PARTIALLY_FILLED")
-                    || add(facts.filled, facts.remaining)? != facts.original
-                    || facts.filled < Decimal::ZERO
-                {
-                    return Err("INVALID_CAPACITY_ORDER");
+                if facts.product != ProfileProduct::Pa {
+                    return Some(Err("INVALID_CAPACITY_CANDIDATE"));
                 }
-                Ok(RemainingOrder {
+                match facts.projects_remainder("INVALID_CAPACITY_ORDER") {
+                    Ok(false) => return None,
+                    Err(fault) => return Some(Err(fault)),
+                    Ok(true) => {}
+                }
+                Some(Ok(RemainingOrder {
                     order_id: facts.order_id.clone(),
                     remainder: Candidate {
                         product: facts.product,
                         quantity: facts.remaining,
                         price: facts.price,
                     },
-                })
+                }))
             })
             .collect::<Result<Vec<_>, Fault>>()?;
         calculate(

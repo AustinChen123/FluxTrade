@@ -39,8 +39,16 @@ pub(super) fn calculate(
     scenario: &FrozenScenario,
     marks: &[Mark],
 ) -> Result<Snapshot, Fault> {
+    let mut ids = BTreeSet::new();
+    let mut resting = Vec::new();
     for order in orders {
         order.product.btc()?;
+        if !identity(&order.order_id) || !ids.insert(order.order_id.clone()) {
+            return Err("INVALID_RESERVATION_ORDER");
+        }
+        if order.projects_remainder("INVALID_RESERVATION_ORDER")? {
+            resting.push(*order);
+        }
     }
     FrozenScenario::new(
         scenario.leverage,
@@ -60,7 +68,6 @@ pub(super) fn calculate(
         used_margin: Decimal::ZERO,
         available_margin: Decimal::ZERO,
     };
-    let mut ids = BTreeSet::new();
     for product in [Product::Btc, Product::Eth] {
         let (spec, _) = scenario.resolve(product, input.effective_at)?;
         let mark = marks
@@ -78,25 +85,18 @@ pub(super) fn calculate(
             .map_or(Decimal::ZERO, |p| p.notional);
         let mut long = Decimal::ZERO;
         let mut short = Decimal::ZERO;
-        for order in orders
+        for order in resting
             .iter()
             .filter(|o| o.product == ProfileProduct::BtcEth(product))
         {
-            if !identity(&order.order_id)
-                || !ids.insert(order.order_id.clone())
-                || order.remaining < spec.minimum
+            if order.remaining < spec.minimum
                 || order.original < spec.minimum
                 || order.filled < Decimal::ZERO
                 || [order.remaining, order.original, order.filled]
                     .iter()
                     .any(|q| !aligned(*q, spec.lot))
-                || add(order.filled, order.remaining)? != order.original
                 || order.price <= Decimal::ZERO
                 || !aligned(order.price, spec.tick)
-                || !matches!(
-                    (order.status.as_str(), order.filled > Decimal::ZERO),
-                    ("OPEN", false) | ("PARTIALLY_FILLED", true)
-                )
             {
                 return Err("INVALID_RESERVATION_ORDER");
             }

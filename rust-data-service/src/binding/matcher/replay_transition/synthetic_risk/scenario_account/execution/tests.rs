@@ -1,0 +1,341 @@
+use super::super::tests::{d, fixture};
+use super::*;
+
+fn fixture_candidate() -> (ScenarioAccount, ExecutionCandidate) {
+    let (seed, scenario, marks) = fixture();
+    let (spec, tier) = scenario.resolve(Product::Btc, 500).unwrap();
+    let candidate = ExecutionCandidate {
+        template: ExecutionTemplate {
+            key: ExternalExecutionKey {
+                account: seed.key.clone(),
+                namespace: "synthetic-v1".into(),
+                product: ProfileProduct::BtcEth(Product::Btc),
+                external_id: "X3".into(),
+            },
+            order_id: "O1".into(),
+            side: Side::Short,
+            price: d("50000.1"),
+            quantity: d("0.5"),
+            liquidity: LiquidityRole::SyntheticTaker,
+            fee_asset: None,
+            fee_amount: None,
+            matching_effective_at: 500,
+        },
+        candidate_id: "candidate-1".into(),
+        event_id: "event-1".into(),
+        source_id: "transport-A".into(),
+        visible_at: 510,
+        expected_account_version: 0,
+        expected_order_version: 0,
+        spec_version: spec.version.clone(),
+        rule_data_version: tier.version.clone(),
+    };
+    (
+        ScenarioAccount::from_seed(&seed, &scenario, &marks).unwrap(),
+        candidate,
+    )
+}
+
+#[test]
+fn every_identity_axis_and_financial_field_is_canonical() {
+    let (_, candidate) = fixture_candidate();
+    let template = &candidate.template;
+    let key_changes: &[fn(&mut ExternalExecutionKey)] = &[
+        |k| k.account.venue.push('x'),
+        |k| k.account.environment.push('x'),
+        |k| k.account.account.push('x'),
+        |k| k.account.subaccount = Some("sub".into()),
+        |k| k.namespace.push('x'),
+        |k| k.product = ProfileProduct::BtcEth(Product::Eth),
+        |k| k.product = ProfileProduct::Pa,
+        |k| k.external_id.push('x'),
+    ];
+    for change in key_changes {
+        let mut other = template.clone();
+        change(&mut other.key);
+        assert_ne!(other.key.canonical_id(), template.key.canonical_id());
+        assert_ne!(other.digest(), template.digest());
+    }
+    let financial_changes: &[fn(&mut ExecutionTemplate)] = &[
+        |t| t.order_id.push('x'),
+        |t| t.side = Side::Long,
+        |t| t.price += d("0.1"),
+        |t| t.quantity += d("0.1"),
+        |t| t.liquidity = LiquidityRole::Unsupported,
+        |t| t.fee_asset = Some("USDT".into()),
+        |t| t.fee_amount = Some(d("0")),
+        |t| t.matching_effective_at += 1,
+    ];
+    for change in financial_changes {
+        let mut other = template.clone();
+        change(&mut other);
+        assert_eq!(other.key.canonical_id(), template.key.canonical_id());
+        assert_ne!(other.digest(), template.digest());
+    }
+    let mut canonical = template.clone();
+    canonical.quantity = d("0.50000");
+    canonical.price = d("50000.10000");
+    assert_eq!(canonical.digest(), template.digest());
+}
+
+// Synthetic runtime receipt DTO fixture only; never a historical seed receipt or
+// evidence of a real commit. Production has no receipt insertion in this slice.
+fn receipt_fixture(owner: &ScenarioAccount, candidate: &ExecutionCandidate) -> CommittedExecution {
+    let template = &candidate.template;
+    let snapshot = FinancialSnapshot::BtcEth(owner.reservation().unwrap());
+    CommittedExecution {
+        account_key: owner.key.clone(),
+        execution_id: template.key.canonical_id(),
+        financial_payload_digest: template.digest(),
+        event_id: candidate.event_id.clone(),
+        commit_sequence: 2,
+        state_version_before: 0,
+        state_version_after: 1,
+        order_version_before: 0,
+        order_version_after: 1,
+        product: template.key.product,
+        order_id: template.order_id.clone(),
+        quantity: template.quantity,
+        price: template.price,
+        fee_asset: "USDT".into(),
+        fee_amount: d("0.2500005"),
+        realized_pnl_delta: d("0.0005"),
+        cash_deltas: vec![("USDT".into(), d("-0.2495005"))],
+        position_before: owner.positions.get(&Product::Btc).cloned(),
+        position_after: owner.positions.get(&Product::Btc).cloned(),
+        reservation_before: snapshot.clone(),
+        reservation_after: snapshot,
+        spec_version: candidate.spec_version.clone(),
+        rule_data_version: candidate.rule_data_version.clone(),
+        risk_state_after: MaintenanceState::Safe,
+        pending_action_ids: Vec::new(),
+    }
+}
+
+#[test]
+fn runtime_lookup_precedes_gate_context_versions_and_delivery_metadata() {
+    let (mut owner, candidate) = fixture_candidate();
+    assert!(owner.execution_receipts.is_empty());
+    let receipt = receipt_fixture(&owner, &candidate);
+    owner
+        .execution_receipts
+        .insert(receipt.execution_id, receipt.clone());
+    owner.gate = Gate::Failed("UNSUPPORTED_RISK_TRANSITION");
+    owner.state_version = 99;
+    let before = owner.clone();
+    let mut redelivery = candidate.clone();
+    redelivery.source_id = "transport-B".into();
+    redelivery.visible_at = 3000;
+    redelivery.event_id = "redelivery".into();
+    redelivery.candidate_id = "another-candidate".into();
+    redelivery.expected_account_version = 42;
+    redelivery.expected_order_version = 42;
+    redelivery.spec_version = "stale".into();
+    redelivery.rule_data_version = "stale".into();
+    assert_eq!(
+        owner.prepare_execution(&redelivery),
+        Ok(Preparation::Duplicate(&receipt))
+    );
+    redelivery.template.quantity = d("0.4");
+    assert_eq!(
+        owner.prepare_execution(&redelivery),
+        Err("EXECUTION_ID_CONFLICT")
+    );
+    redelivery.template = candidate.template.clone();
+    redelivery.template.matching_effective_at = 1000;
+    assert_eq!(
+        owner.prepare_execution(&redelivery),
+        Err("EXECUTION_ID_CONFLICT")
+    );
+    redelivery.template.key.external_id = "new".into();
+    assert_eq!(owner.prepare_execution(&redelivery), Err("RUN_FAILED"));
+    assert_eq!(owner, before);
+}
+
+#[test]
+fn seed_collision_precedes_lookup_and_seed_target_is_legal() {
+    let (mut owner, mut candidate) = fixture_candidate();
+    let before = owner.clone();
+    assert!(matches!(
+        owner.prepare_execution(&candidate),
+        Ok(Preparation::Eligible { .. })
+    ));
+    assert_eq!(owner, before);
+    candidate.template.key.namespace = "seed".into();
+    candidate.template.quantity = d("0");
+    assert_eq!(
+        owner.prepare_execution(&candidate),
+        Err("SEED_IDENTITY_CONFLICT")
+    );
+    assert!(owner.execution_receipts.is_empty());
+    candidate.template.key.namespace = "synthetic-v1".into();
+    // Defensive canonical collision, even if a runtime record were inconsistent.
+    let receipt = receipt_fixture(&owner, &candidate);
+    owner.seed_executions.insert(receipt.execution_id);
+    owner
+        .execution_receipts
+        .insert(receipt.execution_id, receipt);
+    let before = owner.clone();
+    assert_eq!(
+        owner.prepare_execution(&candidate),
+        Err("SEED_IDENTITY_CONFLICT")
+    );
+    assert_eq!(owner, before);
+}
+
+#[test]
+fn symmetric_full_remainder_matrix_precedes_malformed_candidate() {
+    let (baseline, candidate) = fixture_candidate();
+    for position_side in [None, Some(Side::Long), Some(Side::Short)] {
+        for order_side in [Side::Long, Side::Short] {
+            for reduce_only in [false, true] {
+                for remaining in ["1", "3", "4"] {
+                    let mut owner = baseline.clone();
+                    if let Some(side) = position_side {
+                        owner.positions.get_mut(&Product::Btc).unwrap().side = side;
+                    } else {
+                        owner.positions.clear();
+                    }
+                    let facts = &mut owner.orders.get_mut("O1").unwrap().facts;
+                    facts.side = order_side;
+                    facts.reduce_only = reduce_only;
+                    facts.original = d(remaining);
+                    facts.filled = d("0");
+                    facts.remaining = d(remaining);
+                    facts.status = "OPEN".into();
+                    let opposing = position_side.is_some_and(|side| side != order_side);
+                    let expected = if reduce_only && (!opposing || remaining == "4") {
+                        Err("REDUCE_ONLY_NOT_REDUCING")
+                    } else if opposing && remaining == "4" {
+                        Err("EXECUTION_INELIGIBLE_REMAINDER_EXCEEDS_POSITION")
+                    } else {
+                        Ok(())
+                    };
+                    assert_eq!(
+                        remainder_eligibility(facts, owner.positions.get(&Product::Btc)),
+                        expected
+                    );
+                    let before = owner.clone();
+                    for (qty, price) in [("0", "0"), ("0.5", "50000.1"), ("100", "1")] {
+                        let mut input = candidate.clone();
+                        input.template.side = order_side;
+                        input.template.quantity = d(qty);
+                        input.template.price = d(price);
+                        let result = owner.prepare_execution(&input);
+                        match expected {
+                            Err(reason) => assert_eq!(result, Ok(Preparation::Rejected(reason))),
+                            Ok(()) if qty == "0.5" => {
+                                assert!(matches!(result, Ok(Preparation::Eligible { .. })))
+                            }
+                            Ok(()) => assert_eq!(result, Err("UNSUPPORTED_EXECUTION")),
+                        }
+                        assert_eq!(owner, before);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn fatal_validation_matrix_is_read_only_and_ordered() {
+    let (owner, candidate) = fixture_candidate();
+    let mutations: &[fn(&mut ExecutionCandidate)] = &[
+        |c| c.template.key.account.account.push('x'),
+        |c| c.template.key.product = ProfileProduct::Pa,
+        |c| c.template.key.namespace.clear(),
+        |c| c.template.key.external_id.clear(),
+        |c| c.template.side = Side::Long,
+        |c| c.template.quantity = d("0"),
+        |c| c.template.quantity = d("-1"),
+        |c| c.template.quantity = d("2"),
+        |c| c.template.quantity = d("0.001"),
+        |c| c.template.price = d("0"),
+        |c| c.template.price = d("50000.01"),
+        |c| c.template.price = d("50000"),
+        |c| c.template.liquidity = LiquidityRole::Unsupported,
+        |c| c.template.fee_asset = Some("USDT".into()),
+        |c| c.template.fee_amount = Some(d("0")),
+        |c| c.spec_version.clear(),
+        |c| c.rule_data_version.clear(),
+        |c| c.event_id.clear(),
+        |c| c.candidate_id.clear(),
+    ];
+    for change in mutations {
+        let mut input = candidate.clone();
+        change(&mut input);
+        assert_eq!(
+            owner.prepare_execution(&input),
+            Err("UNSUPPORTED_EXECUTION")
+        );
+    }
+    for time in [-1, 1000, 2000] {
+        let mut input = candidate.clone();
+        input.template.matching_effective_at = time;
+        input.template.order_id = "missing".into();
+        assert_eq!(
+            owner.prepare_execution(&input),
+            Err("UNSUPPORTED_CONTEXT_TRANSITION")
+        );
+    }
+    let mut input = candidate.clone();
+    input.template.order_id = "missing".into();
+    assert_eq!(owner.prepare_execution(&input), Err("UNKNOWN_ORDER"));
+    for account_version in [false, true] {
+        let mut input = candidate.clone();
+        if account_version {
+            input.expected_account_version = 1;
+        } else {
+            input.expected_order_version = 1;
+        }
+        input.template.quantity = d("0");
+        assert_eq!(owner.prepare_execution(&input), Err("STALE_VERSION"));
+    }
+    let (original, _) = fixture_candidate();
+    assert_eq!(owner, original);
+}
+
+#[test]
+fn terminal_projection_matrix_keeps_owner_facts_and_excludes_remainders() {
+    let (baseline, candidate) = fixture_candidate();
+    for (status, filled, remaining, valid) in [
+        ("OPEN", "0", "2", true),
+        ("PARTIALLY_FILLED", "1", "1", true),
+        ("FILLED", "2", "0", true),
+        ("FILLED", "1", "1", false),
+        ("OPEN", "2", "0", false),
+        ("PARTIALLY_FILLED", "2", "0", false),
+        ("OPEN", "1", "1", false),
+        ("PARTIALLY_FILLED", "0", "2", false),
+        ("CANCELED", "2", "0", false),
+        ("UNKNOWN", "0", "2", false),
+        ("FILLED", "1", "0", false),
+        ("OPEN", "-1", "3", false),
+    ] {
+        let mut owner = baseline.clone();
+        let facts = &mut owner.orders.get_mut("O1").unwrap().facts;
+        facts.status = status.into();
+        facts.filled = d(filled);
+        facts.remaining = d(remaining);
+        facts.reduce_only = false;
+        let before = owner.clone();
+        let snapshot = owner.reservation();
+        assert_eq!(snapshot.is_ok(), valid, "{status}/{filled}/{remaining}");
+        if valid {
+            assert_eq!(
+                snapshot.unwrap().orders.len(),
+                usize::from(remaining != "0")
+            );
+        }
+        if status == "FILLED" && valid {
+            assert_eq!(
+                owner.prepare_execution(&candidate),
+                Err("UNSUPPORTED_EXECUTION")
+            );
+            let mut without = owner.clone();
+            without.orders.clear();
+            assert_eq!(owner.reservation(), without.reservation());
+        }
+        assert_eq!(owner, before);
+    }
+}

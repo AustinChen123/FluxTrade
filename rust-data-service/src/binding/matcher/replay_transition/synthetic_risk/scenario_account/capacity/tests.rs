@@ -1,6 +1,41 @@
 use super::super::tests::{d, fixture};
 use super::*;
 
+#[test]
+fn authoritative_projection_retains_terminal_order_without_reservation() {
+    let config = Config::frozen(Program::CapacityV1);
+    for (status, filled, remaining, expected) in [
+        ("OPEN", "0", "2", Some("200")),
+        ("PARTIALLY_FILLED", "1", "1", Some("100")),
+        ("FILLED", "2", "0", Some("0")),
+        ("FILLED", "1", "1", None),
+        ("OPEN", "2", "0", None),
+        ("PARTIALLY_FILLED", "2", "0", None),
+        ("CANCELED", "2", "0", None),
+        ("UNKNOWN", "0", "2", None),
+        ("FILLED", "1", "0", None),
+    ] {
+        let mut owner = ScenarioAccount::from_capacity_seed(&seed(), &config).unwrap();
+        let mut facts = fixture().0.orders.remove(0);
+        facts.product = ProfileProduct::Pa;
+        facts.price = d("100");
+        facts.status = status.into();
+        facts.filled = d(filled);
+        facts.remaining = d(remaining);
+        owner
+            .orders
+            .insert("O1".into(), RestingOrder { facts, version: 7 });
+        let before = owner.clone();
+        let snapshot = owner.capacity_projection(&candidate("1"));
+        match expected {
+            Some(value) => assert_eq!(snapshot.unwrap().current, d(value)),
+            None => assert_eq!(snapshot, Err("INVALID_CAPACITY_ORDER")),
+        }
+        assert_eq!(owner, before);
+        assert_eq!(owner.orders["O1"].version, 7);
+    }
+}
+
 fn seed() -> CleanSeed {
     let (mut seed, _, _) = fixture();
     seed.cash = d("1000");
