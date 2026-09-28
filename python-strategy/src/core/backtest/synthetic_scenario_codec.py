@@ -392,3 +392,10 @@ class ScenarioCodec:
 
     def inspect_state(self) -> Inspection:
         return cast(Inspection, _decode(self._session.inspect_state()))
+
+
+def _native_failure(exc: Exception) -> dict[str, str] | None:
+    kinds = {_native.ScenarioReplayInputError: "INPUT", _native.ScenarioReplayLookupError: "LOOKUP",
+             _native.ScenarioReplayConflictError: "CONFLICT", _native.ScenarioReplayInvariantError: "INVARIANT"}
+    kind = kinds.get(type(exc))
+    return None if kind is None else {"kind": kind, "reason": str(exc.args[0])}

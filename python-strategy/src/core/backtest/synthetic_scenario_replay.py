@@ -1,6 +1,7 @@
 """Internal closed-policy composition; no scheduling or financial submission."""
 
 from copy import deepcopy
+import heapq
 from dataclasses import dataclass
 from decimal import Decimal as D, localcontext
 from typing import Any, Callable, cast
@@ -177,16 +178,249 @@ def _poll_check(condition: bool) -> None:
         raise ValueError("INVALID_SCHEMA")
 
 
+class _ScheduleError(Exception):
+    pass
+
+
 class _ReplayComposition:
     """One native owner and one source cache, deliberately without a run API."""
 
-    def __init__(self, profile: wire.Profile, account: wire.Account) -> None:
+    def __init__(self, profile: wire.Profile, account: wire.Account, callback_plans=None) -> None:
         self._codec = wire.ScenarioCodec(profile, account)
         self._policy = _closed_policy(profile)
         self._account = deepcopy(account)
         self._polls: dict[str, _PollRecord] = {}
         self._continuations: dict[str, str] = {}
         self._last_poll_at: int | None = None
+        self._callback_plans = deepcopy(callback_plans if callback_plans is not None else {})
+        self._queue: list[tuple] = []
+        self._records: dict[tuple, dict[str, Any]] = {}
+        self._current_time, self._last_popped = 500, None
+        self._terminal: dict[str, Any] | None = None
+        self._audit: dict[str, list] = {}
+
+    def _scheduler_observation(self):
+        result: dict[str, Any] = deepcopy(dict(current_time=self._current_time, last_popped=self._last_popped,
+            gate="FAILED" if self._terminal else "RUNNING", terminal=self._terminal,
+            pending=sorted(self._queue), records=self._records, callbacks=self._audit))
+        for events in result["callbacks"].values():
+            for event in events:
+                if "actions" in event:
+                    count = sum(a["status"] == "SUBMITTED" for a in event["actions"])
+                    event["disposition"] = "NONE" if not count else "ALL" if count == len(event["actions"]) else "PARTIAL"
+        return result
+
+    def _stop_scheduler(self, exc, kind, stable_id=None, prefix=None, group=None):
+        native = wire._native_failure(exc)
+        if native is None and type(exc) is not _ScheduleError:
+            raise exc
+        result = dict(kind=kind, stable_id=stable_id, classification="TERMINAL",
+                      reason=native["reason"] if native else exc.args[0], events=deepcopy(prefix if prefix is not None else self._audit.get(stable_id or "", [])))
+        if native is not None:
+            result["native_failure"] = native
+        if group is not None:
+            result["group_result"] = deepcopy(group)
+        result["callbacks"] = self._scheduler_observation()["callbacks"]
+        self._terminal = deepcopy(result)
+        return deepcopy(result)
+
+    def _queue_record(self, item, plan=None):
+        try:
+            kind = item.get("kind") if isinstance(item, dict) else None
+            if kind == "SOURCE_GROUP":
+                row = cast(dict[str, Any], policy_protocol._event_object(item, "kind schedule_sequence group"))
+                group = row["group"]
+                content = policy_protocol._plan_sequence(row["schedule_sequence"]) + policy_protocol._plan_group(group)
+                account, at, sequence, stable, cls = group["account_key"], group["group_effective_at"], row["schedule_sequence"], group["group_id"], 0
+            elif kind == "SNAPSHOT_CAPTURE":
+                row = cast(dict[str, Any], policy_protocol._event_object(item, "kind capture_sequence request delivery_projection"))
+                request, projection = row["request"], row["delivery_projection"]
+                content = policy_protocol._plan_sequence(row["capture_sequence"]) + policy_protocol._plan_snapshot(request) + policy_protocol._plan_projection(projection)
+                account, at, sequence, stable, cls = request["account_key"], request["captured_at"], row["capture_sequence"], request["snapshot_id"], 1
+            elif kind == "DELIVERY":
+                row = cast(dict[str, Any], policy_protocol._event_object(item, "kind delivery"))
+                d = policy_protocol._event_object(row["delivery"], "account_key delivery_id source_fact_id source_namespace payload_kind occurrence_index schedule_sequence immutable_payload payload_digest visible_at", "snapshot_version snapshot_as_of continuation_id")
+                projection = dict(schema_version="delivery_projection_v1", reference=dict(namespace=d["source_namespace"], fact_id=d["source_fact_id"]),
+                    **{k: d[k] for k in ("payload_kind", "occurrence_index", "schedule_sequence", "visible_at")}, continuation_id=d.get("continuation_id"))
+                policy_protocol._plan_projection(projection)
+                policy_protocol._event_id(d["delivery_id"])
+                content = (policy_protocol._plan_hash(d["payload_digest"]), policy_protocol._emission_plan_digest(plan))
+                account, at, sequence, stable, cls = d["account_key"], d["visible_at"], d["schedule_sequence"], d["delivery_id"], 2
+            else:
+                raise _ScheduleError("INVALID_SCHEMA")
+            if policy_protocol._plan_account(account) != policy_protocol._plan_account(self._account):
+                raise _ScheduleError("INVALID_SCHEMA")
+            return dict(key=(at, cls, sequence, stable), content=content, item=deepcopy(item), plan=deepcopy(plan),
+                        result=dict(kind=kind, stable_id=stable, classification="PENDING"))
+        except (ValueError, UnicodeError, OverflowError) as exc:
+            if isinstance(exc, (UnicodeError, OverflowError)) or exc.args == ("POLICY_EMISSION_MISMATCH",):
+                raise _ScheduleError("INVALID_SCHEMA") from exc
+            raise
+
+    def _admit_set(self, items, commit=True):
+        prospective, added, results = dict(self._records), [], []
+        for item, plan in items:
+            record = self._queue_record(item, plan)
+            at, cls, sequence, stable = key = record["key"]
+            identity = (cls, stable)
+            old = prospective.get(identity)
+            if old is not None:
+                if old["content"] != record["content"]:
+                    raise _ScheduleError("DELIVERY_ID_CONFLICT" if cls == 2 else "INVALID_SCHEMA")
+                results.append(old["result"])
+                continue
+            if at < self._current_time or (self._last_popped is not None and key <= self._last_popped):
+                raise _ScheduleError("INVALID_SCHEMA")
+            for other in prospective.values():
+                other_key = other["key"]
+                if key[:3] == other_key[:3] or (cls == other_key[1] == 0 and at == other_key[0]):
+                    raise _ScheduleError("INVALID_SCHEMA")
+            if cls == 1:
+                request, projection = item["request"], item["delivery_projection"]
+                if projection["visible_at"] < at or projection["reference"] != dict(namespace="SNAPSHOT", fact_id=request["snapshot_id"]):
+                    raise _ScheduleError("INVALID_SCHEMA")
+            if cls == 2 and plan["delivery_id"] != stable:
+                raise _ScheduleError("INVALID_SCHEMA")
+            prospective[identity] = record
+            added.append(record)
+            results.append(record["result"])
+        if commit:
+            for record in added:
+                key = record["key"]
+                self._records[(key[1], key[3])] = record
+                heapq.heappush(self._queue, key)
+        return deepcopy(results)
+
+    def _enqueue(self, item, plan=None):
+        if self._terminal is not None:
+            return deepcopy(self._terminal)
+        try:
+            return self._admit_set([(item, plan)])[0]
+        except Exception as exc:
+            kind = item.get("kind") if isinstance(item, dict) else "QUEUE"
+            kind = kind if isinstance(kind, str) and kind in ("SOURCE_GROUP", "SNAPSHOT_CAPTURE", "DELIVERY") else "QUEUE"
+            field, identity = {"SOURCE_GROUP": ("group", "group_id"), "SNAPSHOT_CAPTURE": ("request", "snapshot_id"), "DELIVERY": ("delivery", "delivery_id")}.get(kind or "", ("", ""))
+            value = item.get(field) if isinstance(item, dict) else None
+            return self._stop_scheduler(exc, kind, value.get(identity) if isinstance(value, dict) else None)
+
+    @staticmethod
+    def _capture_item(stage):
+        return dict(kind="SNAPSHOT_CAPTURE", capture_sequence=stage["capture_sequence"],
+                    request=stage["snapshot_request"], delivery_projection=stage["delivery_projection"])
+
+    def _begin_poll(self, plan):
+        if self._terminal is not None:
+            return deepcopy(self._terminal)
+        def preflight(issued, stage):
+            if issued < self._current_time or any(key[0] < issued for key in self._queue):
+                raise _ScheduleError("INVALID_SCHEMA")
+            self._admit_set([(self._capture_item(stage), None)], commit=False)
+        prefix = []
+        try:
+            try:
+                result = self._start_poll(plan, preflight)
+            except ValueError as exc:
+                if exc.args != ("INVALID_SCHEMA",):
+                    raise
+                raise _ScheduleError("INVALID_SCHEMA") from exc
+            if result.observation.status == "CALLBACK_FAILED":
+                prefix = list(result.observation.prefix.events)
+                raise _ScheduleError("CALLBACK_FAILED")
+            if result.clock_advance is not None:
+                self._current_time = result.clock_advance
+                self._admit_set([(self._capture_item(result.next_stage), None)])
+            return dict(kind="POLL", stable_id=plan["poll_id"], classification="SUCCESS", status=result.observation.status,
+                        events=deepcopy(result.observation.prefix.events))
+        except Exception as exc:
+            return self._stop_scheduler(exc, "POLL", plan.get("poll_id") if isinstance(plan, dict) else None, prefix=prefix)
+
+    def _deliver_queued(self, record):
+        delivery, plan = record["item"]["delivery"], record["plan"]
+        next_stage = None
+        if delivery.get("continuation_id") is not None:
+            try:
+                result = self._resume_poll(delivery)
+            except ValueError as exc:
+                if exc.args != ("INVALID_SCHEMA",):
+                    raise
+                raise _ScheduleError("INVALID_SCHEMA") from exc
+            prefix, next_stage = result.observation.prefix, result.next_stage
+        else:
+            prefix = self._capture_callback(delivery)
+        events: list[dict[str, Any]] = [dict(event=deepcopy(e), **({"actions": [dict(group_id=None, status="UNSUBMITTED") for _ in cast(list, e["orders"])]}
+                  if e["kind"] in ("send", "cancel") else {})) for e in prefix.events]
+        self._audit[delivery["delivery_id"]] = events
+        if prefix.exception is not None:
+            raise _ScheduleError("CALLBACK_FAILED")
+        try:
+            validated = _validate_emission_plan(self._account, delivery, prefix.events, plan)
+        except ValueError as exc:
+            if exc.args not in (("POLICY_EMISSION_MISMATCH",), ("MISSING_NEXT_EVENT_STAMP",)):
+                raise
+            raise _ScheduleError(exc.args[0]) from exc
+        financial = iter(plan["financial_items"])
+        for event in events:
+            for action in event.get("actions", []):
+                action["group_id"] = next(financial)["expected_group"]["group_id"]
+        derived = [(dict(kind="SOURCE_GROUP", schedule_sequence=v["schedule_sequence"], group=v["expected_group"]), None)
+                   if "expected_group" in v else (self._capture_item(dict(capture_sequence=v["capture_sequence"],
+                       snapshot_request=v["snapshot_request"], delivery_projection=v["delivery_projection"])), None) for v in validated]
+        if next_stage is not None:
+            derived.append((self._capture_item(next_stage), None))
+        self._admit_set(derived)
+        return deepcopy(events)
+
+    def _dispatch_due(self, until):
+        if self._terminal is not None:
+            return deepcopy(self._terminal)
+        record = None
+        try:
+            if type(until) is not int or not 0 <= until < 2**63 or until < self._current_time:
+                raise _ScheduleError("INVALID_SCHEMA")
+            while self._queue and self._queue[0][0] <= until:
+                key = heapq.heappop(self._queue)
+                self._current_time, self._last_popped = key[0], key
+                record = self._records[(key[1], key[3])]
+                item, kind = record["item"], record["item"]["kind"]
+                result = dict(kind=kind, stable_id=key[3], classification="SUCCESS")
+                if kind == "SOURCE_GROUP":
+                    actions = [a for events in self._audit.values() for e in events for a in e.get("actions", []) if a["group_id"] == key[3]]
+                    for action in actions:
+                        action["status"] = "SUBMITTED"
+                    try:
+                        group = self._codec.apply_group(item["group"])
+                    except Exception as exc:
+                        native = wire._native_failure(exc)
+                        if native is not None:
+                            for action in actions:
+                                action["native_failure"] = native
+                        raise
+                    result["group_result"] = group
+                    for action in actions:
+                        action["group_result"] = deepcopy(group)
+                    record["result"] = deepcopy(result)
+                    if group["classification"] == "FAULT":
+                        record["result"] = self._stop_scheduler(_ScheduleError(cast(str, group.get("failure"))), kind, key[3], group=group)
+                        return deepcopy(record["result"])
+                elif kind == "SNAPSHOT_CAPTURE":
+                    fact = self._codec.capture_snapshot(item["request"])
+                    projection = deepcopy(item["delivery_projection"])
+                    projection["reference"] = fact["reference"]
+                    delivery = self._codec.build_delivery(projection)
+                    plan = self._callback_plans.get(delivery["delivery_id"])
+                    if plan is None:
+                        raise _ScheduleError("INVALID_SCHEMA")
+                    self._admit_set([(dict(kind="DELIVERY", delivery=delivery), plan)])
+                else:
+                    result["events"] = self._deliver_queued(record)
+                record["result"] = deepcopy(result)
+            self._current_time = until
+            return dict(kind="DISPATCH", stable_id=None, classification="SUCCESS")
+        except Exception as exc:
+            result = self._stop_scheduler(exc, record["item"]["kind"] if record else "DISPATCH", record["key"][3] if record else None)
+            if record is not None:
+                record["result"] = deepcopy(result)
+            return result
 
     def _start_poll(self, plan, preflight: Callable[[int, dict[str, Any]], None]) -> _PollResult:
         try:
