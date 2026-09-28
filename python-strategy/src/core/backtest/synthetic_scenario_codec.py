@@ -1,10 +1,24 @@
 """Typed, stateless wire conversion for the closed synthetic native session."""
 import json
+from importlib.machinery import EXTENSION_SUFFIXES
 from collections.abc import Mapping
 from decimal import Decimal
 from typing import Literal, NotRequired, TypeAlias, TypedDict, cast
 
 import fluxtrade_core as _native
+
+
+def loaded_native_artifact_path() -> str:
+    """Return only the already-loaded extension path, never a wrapper or probe."""
+    path = _native.__file__ if hasattr(_native, "__file__") else None
+    if type(path) is str and path.endswith(tuple(EXTENSION_SUFFIXES)):
+        return path
+    if type(path) is not str or not path.endswith("/__init__.py"):
+        raise ValueError("UNSUPPORTED_CONFIGURATION")
+    path = getattr(getattr(_native, "fluxtrade_core", None), "__file__", None)
+    if type(path) is str and path.endswith(tuple(EXTENSION_SUFFIXES)):
+        return path
+    raise ValueError("UNSUPPORTED_CONFIGURATION")
 
 Product = Literal["BTC-USDT-SWAP", "ETH-USDT-SWAP", "P_A"]
 Profile = Literal["SYNTHETIC_BTC_ETH_V1", "SYNTHETIC_GOLDEN_CANCEL_V1", "SYNTHETIC_MIN_CASH_V1", "SYNTHETIC_P1_LIQUIDATION_V1", "SYNTHETIC_P1_O03_V1"]

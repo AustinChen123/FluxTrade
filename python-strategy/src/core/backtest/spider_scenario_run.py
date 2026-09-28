@@ -1,0 +1,224 @@
+"""Bounded single-run orchestration over the existing durability and runtime owners."""
+
+from copy import deepcopy as _copy
+from hashlib import sha256 as _sha256
+from pathlib import Path as _Path
+from typing import Any as _Any, cast as _cast
+
+from src.core.backtest import spider_policy_protocol as _protocol, spider_scenario_plans as _plans, synthetic_scenario_codec as _wire
+from src.core.backtest.spider_run_artifacts import _HASHES, _HASH_NAMES, _IDENTITIES, _object, _require, _text, canonical_bytes as _bytes, decode_canonical as _decode, validate_artifact as _validate
+from src.core.backtest.spider_run_envelope_schema import endpoint as _endpoint, journal as _journal
+from src.core.backtest.spider_run_evidence import ReconciliationProjectionError as _ProjectionError, build_endpoint_artifacts as _build
+from src.core.backtest.spider_run_admission import admit_spider_run as _admit
+from src.core.backtest.spider_run_store import SpiderRunStore as _Store, SpiderRunStoreError as _StoreError
+from src.core.backtest.synthetic_scenario_replay import _ReplayComposition, ReplayPersistenceError as _PersistenceError
+
+_ROOT = _Path(__file__).resolve().parents[4]
+_PROGRAM = tuple("python-strategy/src/core/backtest/" + name + ".py" for name in (
+    "synthetic_scenario_codec", "synthetic_scenario_replay", "spider_policy", "spider_policy_protocol", "spider_run_admission",
+    "spider_run_artifacts", "spider_run_completion_schema", "spider_run_envelope_schema", "spider_run_evidence",
+    "spider_run_native_schema", "spider_run_reconciliation_schema", "spider_run_store", "spider_scenario_plan_liquidation",
+    "spider_scenario_plan_o03", "spider_scenario_plan_scheduled", "spider_scenario_plans", "spider_scenario_run"))
+_POLICY = "eb6ab34d8685fb59e286f5ffda8af24cbecf3e5ab2c729c585ccdca797cac336"
+
+
+def _normalized(value):
+    return _cast(_Any, _decode(_bytes(value)))
+
+
+def _empty(delivery):
+    return dict(delivery_id=delivery["delivery_id"], expected_policy_events=[], financial_items=[], market_requests=[])
+
+
+def _configuration(selector, run_id, select):
+    bundle = _cast(dict[str, _Any], select(selector))
+    _object(bundle, "plan plan_sha256 journal endpoint report", "native_identity_vectors" if selector == _plans.PLAN_IDS[2] else "")
+    plan = bundle["plan"]
+    _object(plan, "schema_version scenario_plan_id native_profile account_key initial_cutoff final_cutoff terminal_policy source_groups deliveries planned_coverage")
+    _require(plan["schema_version"] == "spider_scenario_plan_v1" and plan["scenario_plan_id"] == selector)
+    _require(_sha256(_bytes(plan)).hexdigest() == bundle["plan_sha256"])
+    rows = bundle["journal"]
+    for row in [*rows, bundle["endpoint"]]:
+        row["run_id"] = run_id
+    _journal(rows)
+    _endpoint(bundle["endpoint"])
+    sources = [row for row in rows if row["record_kind"] == "SOURCE_GROUP_RESULT"]
+    expected_kinds = ["SOURCE_GROUP_RESULT"] * len(sources) + (["DELIVERY_ATTEMPT", "CALLBACK_RESULT"] if selector == _plans.CLI_PLAN_IDS[0] else [])
+    _require([row["record_kind"] for row in rows] == expected_kinds and bool(sources))
+    _require(plan["planned_coverage"] == [dict(ordinal=row["journal_seq"], barrier_id=row["barrier_id"], record_kind=row["record_kind"]) for row in rows])
+    _require(plan["source_groups"] == [dict(schedule_sequence=row["scheduler_key"]["schedule_sequence"], group_id=row["payload"]["request"]["group_id"],
+                                         group_sha256=row["payload"]["result"]["group_digest"]) for row in sources])
+    deliveries = [row["payload"]["delivery"] for row in rows if row["record_kind"] == "DELIVERY_ATTEMPT"]
+    _require(plan["deliveries"] == [dict(schedule_sequence=d["schedule_sequence"], delivery_id=d["delivery_id"],
+                                       emission_plan_sha256=_protocol._emission_plan_digest(_empty(d))) for d in deliveries])
+    _require(plan["initial_cutoff"] == bundle["endpoint"]["initial_owner_evidence"]["cutoff"]
+             and plan["final_cutoff"] == bundle["endpoint"]["final_owner_evidence"]["cutoff"])
+    program = _sha256()
+    for name in sorted(_PROGRAM):
+        raw = name.encode()
+        program.update(len(raw).to_bytes(8, "big") + raw + _sha256((_ROOT / name).read_bytes()).digest())
+    native = _sha256(_Path(_wire.loaded_native_artifact_path()).read_bytes()).hexdigest()
+    policy = _sha256((_ROOT / "docs/internal/spider_source_replica_v1/source_manifest.json").read_bytes()).hexdigest()
+    _require(policy == _POLICY)
+    return bundle, [bundle["plan_sha256"], program.hexdigest(), native, policy]
+
+
+def _attempt(run_id, selector, bundle=None, hashes=()):
+    row = dict(schema_version="spider_attempt_v1", run_id=run_id, run_contract_id="SPIDER_SYNTHETIC_P1_RUN_V1",
+               registration_state="REJECTED", requested_scenario_selector=selector, registration_failure="UNSUPPORTED_CONFIGURATION",
+               input_contract_hashes=[], planned_coverage=[], **dict.fromkeys(_IDENTITIES))
+    if bundle is not None:
+        plan = bundle["plan"]
+        row.update(registration_state="VALIDATED", registration_failure=None, profile_id=plan["native_profile"], account_key=plan["account_key"],
+                   scenario_plan_id=selector, ordering_contract_id="S_order_v1", cost_contract_id="SPIDER_SYNTHETIC_COSTS_V1",
+                   funding_exclusion="SYNTHETIC_P1_NO_FUNDING_INPUT_OR_CLAIM", terminal_policy=plan["terminal_policy"],
+                   planned_coverage=plan["planned_coverage"], artifact_encoding="artifact_encoding_v1", **dict(zip(_HASHES, hashes, strict=True)))
+        row["input_contract_hashes"] = [dict(name=name, sha256=value) for name, value in zip(_HASH_NAMES, hashes, strict=True)]
+    _validate(row)
+    return row
+
+
+def _primary(kind, payload):
+    if kind == "SOURCE_GROUP_RESULT" and payload["result"]["classification"] == "FAULT":
+        return dict(kind="NATIVE", reason=payload["result"]["failure"])
+    failure = payload.get("failure") if kind == "CALLBACK_RESULT" else None
+    return dict(kind="SCHEDULER" if failure["kind"] == "PLAN" else failure["kind"], reason=failure["reason"]) if failure else None
+
+
+def _terminal(result, closed):
+    if closed:
+        return "PERSISTENCE_FAILED", None
+    if "native_failure" in result or result.get("group_result", {}).get("classification") == "FAULT":
+        return "NATIVE_FAULT", dict(kind="NATIVE", reason=result["reason"])
+    callback = result["reason"] == "CALLBACK_FAILED"
+    return ("CALLBACK_FAILED" if callback else "SCHEDULER_FAILED"), dict(kind="CALLBACK" if callback else "SCHEDULER", reason=result["reason"])
+
+
+def _execute(store, bundle, attempt):
+    rows, plan = bundle["journal"], bundle["plan"]
+    journal, previous, closed = [], None, False
+    def capture(template):
+        return owner.capture_owner_evidence(template["cutoff"], *[template[kind + "_request"] for kind in ("trading", "positions", "open_orders")])
+    def barrier(kind, key, payload):
+        nonlocal previous, closed
+        template = rows[len(journal)]
+        if kind != template["record_kind"] or key != template["scheduler_key"]:
+            raise RuntimeError("UNEXPECTED_BARRIER")
+        upstream = _primary(kind, payload)
+        store.mark_processed(dict(ordinal=template["journal_seq"], journal_seq=template["journal_seq"], barrier_id=template["barrier_id"]))
+        after = previous
+        try:
+            if kind == "SOURCE_GROUP_RESULT":
+                after = capture(template["payload"]["owner_evidence_after"])["owner_evidence"]
+                payload = dict(payload, owner_evidence_before=previous, owner_evidence_after=after)
+        except Exception as error:
+            if _wire._native_failure(error) is None:
+                raise
+            store.publish_failure("PERSISTENCE_FAILED", upstream or dict(kind="PERSISTENCE", reason="EVIDENCE_CAPTURE_FAILED"))
+            closed = True
+            raise _PersistenceError() from error
+        row = _normalized(dict(template, payload=payload))
+        try:
+            store.append_journal(row)
+        except _StoreError as error:
+            store.publish_failure("PERSISTENCE_FAILED", upstream or error.primary_failure)
+            closed = True
+            raise _PersistenceError() from error
+        journal.append(row)
+        previous = after
+    owner = _ReplayComposition(plan["native_profile"], plan["account_key"], evidence_callback=barrier)
+    initial = capture(bundle["endpoint"]["initial_owner_evidence"])["owner_evidence"]
+    previous = initial
+    while len(journal) < len(rows):
+        row = rows[len(journal)]
+        if row["record_kind"] == "SOURCE_GROUP_RESULT":
+            group = _wire._decode(_bytes(row["payload"]["request"]).decode())
+            result = owner._enqueue(dict(kind="SOURCE_GROUP", group=group, schedule_sequence=row["scheduler_key"]["schedule_sequence"]))
+        else:
+            frozen = row["payload"]["delivery"]
+            delivery = owner._codec.build_delivery(_cast(_wire.Projection, dict(schema_version="delivery_projection_v1",
+                reference=dict(namespace=frozen["source_namespace"], fact_id=frozen["source_fact_id"]),
+                **{key: frozen[key] for key in ("payload_kind", "occurrence_index", "schedule_sequence", "visible_at")})))
+            result = owner._enqueue(dict(kind="DELIVERY", delivery=delivery), _empty(delivery))
+        if result["classification"] != "TERMINAL":
+            result = owner._dispatch_due(row["visible_at"])
+        if result["classification"] == "TERMINAL":
+            reason, primary = _terminal(result, closed)
+            if not closed:
+                store.publish_failure(reason, primary)
+            return reason
+        if len(journal) < row["journal_seq"]:
+            raise RuntimeError("UNOBSERVED_BARRIER")
+    _require(len(journal) == len(plan["planned_coverage"]))
+    result = owner._dispatch_due(plan["final_cutoff"])
+    if result["classification"] == "TERMINAL":
+        reason, primary = _terminal(result, closed)
+        store.publish_failure(reason, primary)
+        return reason
+    final = _normalized(capture(bundle["endpoint"]["final_owner_evidence"]))
+    last = plan["planned_coverage"][-1]
+    boundary = dict(ordinal=last["ordinal"], journal_seq=last["ordinal"], barrier_id=last["barrier_id"])
+    status = dict(schema_version="spider_status_v1", run_id=attempt["run_id"], state="RUNNING", processed_boundary=boundary,
+                  persisted_boundary=_copy(boundary), failure_reason=None, primary_failure=None)
+    artifacts = _build(attempt["run_id"], attempt, status, journal, _normalized(initial), final["owner_evidence"], final["scheduler_observation"])
+    if store.finalize(**artifacts) != "COMPLETE_PUBLISHED":
+        raise RuntimeError("INVALID_STORE_ACKNOWLEDGEMENT")
+    admitted = _admit(store._path)
+    return None if admitted["decision"] == "ACCEPT" else admitted["reason"]
+
+
+def _invoke(output_root, run_id, selector, select):
+    try:
+        _text(output_root)
+        _text(run_id, r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
+        _text(selector, r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
+        _require("\0" not in output_root)
+        output_root.encode("utf-8")
+    except (ValueError, UnicodeError):
+        raise ValueError("INVALID_INVOCATION") from None
+    store = None
+    def failed(error):
+        if store is not None and store._state == "RUNNING" and error.requested_failure_reason is None:
+            try:
+                store.publish_failure(error.reason, error.primary_failure)
+            except _StoreError as newer:
+                error = newer
+        return dict(run_id=run_id, outcome="DURABILITY_UNKNOWN" if error.reason == "PUBLICATION_DURABILITY_UNKNOWN" else "FAILED", reason=error.reason)
+    try:
+        store = _Store.create(output_root, run_id)
+        try:
+            bundle, hashes = _configuration(selector, run_id, select)
+            attempt = _attempt(run_id, selector, bundle, hashes)
+        except (OSError, ValueError) as error:
+            if isinstance(error, ValueError) and error.args not in (("INVALID_ARTIFACT",), ("UNSUPPORTED_CONFIGURATION",), ("POLICY_EMISSION_MISMATCH",)):
+                raise
+            store.register(_attempt(run_id, selector))
+            return dict(run_id=run_id, outcome="REJECTED", reason="UNSUPPORTED_CONFIGURATION")
+        if store.register(attempt) != "NATIVE_CONSTRUCTION_ALLOWED":
+            raise RuntimeError("INVALID_STORE_ACKNOWLEDGEMENT")
+        reason = _execute(store, bundle, attempt)
+        return dict(run_id=run_id, outcome="ADMITTED" if reason is None else "FAILED", reason=reason)
+    except _StoreError as error:
+        return failed(error)
+    except Exception as error:
+        native = _wire._native_failure(error)
+        reason = "NATIVE_FAULT" if native else "ENDPOINT_RECONCILIATION_FAILED" if isinstance(error, _ProjectionError) else "UNEXPECTED_EXCEPTION"
+        if store is not None and store._state == "RUNNING":
+            try:
+                store.publish_failure(reason, dict(kind="NATIVE", reason=native["reason"]) if native else None)
+            except _StoreError as newer:
+                return failed(newer)
+        if native or isinstance(error, _ProjectionError):
+            return dict(run_id=run_id, outcome="FAILED", reason=reason)
+        raise
+
+
+def run_spider_scenario(output_root: str, run_id: str, scenario_selector: str) -> dict[str, _Any]:
+    """Run only a CLI-approved fixed recipe and admit its exact persisted output."""
+    return _invoke(output_root, run_id, scenario_selector, _plans.cli_plan_bundle)
+
+
+def _run_o03(output_root: str, run_id: str, scenario_selector: str) -> dict[str, _Any]:
+    if type(scenario_selector) is not str or scenario_selector != _plans.PLAN_IDS[2]:
+        raise ValueError("UNSUPPORTED_CONFIGURATION")
+    return _invoke(output_root, run_id, scenario_selector, _plans.plan_bundle)
