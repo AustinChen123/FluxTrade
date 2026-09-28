@@ -14,6 +14,7 @@ mod execution;
 mod golden_cancel;
 mod group;
 mod hypothetical_settlement;
+mod inspection;
 mod min_cash;
 mod reservation;
 mod risk_transition;
