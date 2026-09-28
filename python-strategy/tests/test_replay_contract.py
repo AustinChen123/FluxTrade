@@ -2,6 +2,7 @@
 
 from dataclasses import FrozenInstanceError, replace
 from decimal import Decimal as D
+from typing import Callable, cast
 
 import pytest
 
@@ -115,7 +116,7 @@ def test_rule_pool_identity_must_be_normalized(pool_id):
 def test_rule_pool_identity_is_required_and_cannot_mix():
     first = rule_version()
     with pytest.raises(TypeError, match="pool_id"):
-        RuleDataVersion(
+        cast(Callable[..., RuleDataVersion], RuleDataVersion)(
             first.product_id, first.version_id, first.effective, first.tiers
         )
     second = replace(rule_version(second=True), pool_id="another-pool")
@@ -150,7 +151,7 @@ def test_account_identity_is_scoped_and_immutable():
     with pytest.raises(ValueError):
         replace(account, subaccount_id=" ")
     with pytest.raises(FrozenInstanceError):
-        account.account_id = "B01"
+        setattr(account, "account_id", "B01")
 
 
 @pytest.mark.parametrize(
@@ -309,4 +310,4 @@ def test_unbounded_tail_and_frozen_inputs():
             setattr(obj, field, value)
     spec = spec_version().spec
     with pytest.raises(FrozenInstanceError):
-        spec.price_tick = D("2")
+        setattr(spec, "price_tick", D("2"))

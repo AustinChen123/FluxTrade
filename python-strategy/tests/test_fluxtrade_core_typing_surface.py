@@ -9,6 +9,11 @@ import fluxtrade_core
 
 STUB_PATH = Path(__file__).parents[1] / "typings/fluxtrade_core/__init__.pyi"
 COMMON_EXPORTS = (
+    "_SyntheticScenarioReplaySession",
+    "ScenarioReplayInputError",
+    "ScenarioReplayLookupError",
+    "ScenarioReplayConflictError",
+    "ScenarioReplayInvariantError",
     "CandleAggregator",
     "Candlestick",
     "FillEvent",
