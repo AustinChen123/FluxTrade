@@ -7,9 +7,9 @@ pub(super) struct Reference {
     pub fact_id: String,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct Projection {
+pub(in super::super) struct Projection {
     pub schema_version: String,
-    pub reference: Reference,
+    pub(super) reference: Reference,
     pub kind: &'static str,
     pub occurrence: i64,
     pub sequence: i64,
