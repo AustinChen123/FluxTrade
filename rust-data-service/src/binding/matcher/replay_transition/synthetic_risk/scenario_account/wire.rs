@@ -224,3 +224,38 @@ fn quote(s: &str) -> String {
     out.push('"');
     out
 }
+
+pub(super) fn fields(rows: Vec<(&str, Json)>) -> Json {
+    Json::Object(rows.into_iter().map(|(k, v)| (k.into(), v)).collect())
+}
+pub(super) fn string(value: &str) -> Json {
+    Json::Text(value.into())
+}
+pub(super) fn decimal(value: Decimal) -> Json {
+    string(&value.normalize().to_string())
+}
+pub(super) fn number(value: impl TryInto<i64>) -> Result<Json, Fault> {
+    Ok(Json::Number(
+        value
+            .try_into()
+            .map_err(|_| "NATIVE_INVARIANT")?
+            .to_string(),
+    ))
+}
+pub(super) fn hash(value: Hash) -> Json {
+    string(&value.iter().fold(String::with_capacity(64), |mut s, b| {
+        write!(s, "{b:02x}").expect("String write");
+        s
+    }))
+}
+pub(super) fn account(value: &AccountKey) -> Json {
+    let mut rows = vec![
+        ("venue", string(&value.venue)),
+        ("environment", string(&value.environment)),
+        ("account", string(&value.account)),
+    ];
+    if let Some(s) = &value.subaccount {
+        rows.push(("subaccount", string(s)));
+    }
+    fields(rows)
+}

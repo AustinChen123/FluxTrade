@@ -1,6 +1,7 @@
 //! Bounded current economic evidence, not a restart state or a second ledger.
 use super::*;
 use risk_transition::{cancel, cancel::identity::Encoding, Lifecycle};
+mod wire;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CurrentBasis {

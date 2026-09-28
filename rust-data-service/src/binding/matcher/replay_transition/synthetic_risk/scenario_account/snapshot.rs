@@ -2,6 +2,7 @@
 use super::*;
 use risk_transition::cancel::identity::{classify, Encoding, Stored};
 mod payload;
+pub(super) mod wire;
 use payload::Payload;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,7 +39,7 @@ enum Mode {
     FrozenPollFixture,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Request {
+pub(super) struct Request {
     schema_version: String,
     account_key: AccountKey,
     snapshot_id: String,
