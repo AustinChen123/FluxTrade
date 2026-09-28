@@ -2,6 +2,64 @@
 use super::super::wire::{optional, Json};
 use super::*;
 
+#[cfg(test)]
+mod output_tests {
+    use super::*;
+    #[test]
+    fn golden_saved_alias_and_checked_version() {
+        let (seed, _, _) = super::super::super::tests::fixture();
+        let mut owner =
+            super::super::super::wire::profiles::construct("SYNTHETIC_GOLDEN_CANCEL_V1", seed.key)
+                .unwrap();
+        admission::inspection_tests::golden_admit(&mut owner);
+        let id = owner.orders.keys().next().unwrap().clone();
+        owner
+            .execute(&commit::tests::input(&owner, &id, "G", "4", "10"))
+            .unwrap();
+        let before = owner.clone();
+        let r = owner.execution_receipts.values().next().unwrap();
+        assert_eq!(owner, before);
+        let mut bad = r.clone();
+        bad.state_version_after = i64::MAX as u64 + 1;
+        assert_eq!(bad.delivery_json("0000015000"), Err("NATIVE_INVARIANT"));
+        bad.state_version_after = 2;
+        bad.order_after.status = "OPEN".into();
+        assert_eq!(bad.delivery_json("0000015000"), Err("NATIVE_INVARIANT"));
+    }
+}
+
+impl CommittedExecution {
+    pub(in super::super) fn delivery_json(&self, client: &str) -> Result<Json, Fault> {
+        use super::super::wire::{decimal, fields, number, string};
+        let o = &self.order_after;
+        let state = match o.status.as_str() {
+            "PARTIALLY_FILLED" => "partially_filled",
+            "FILLED" => "filled",
+            _ => return Err("NATIVE_INVARIANT"),
+        };
+        Ok(fields(vec![
+            ("order_id", string(&o.order_id)),
+            ("owner_client_order_id", string(&o.client_id)),
+            ("policy_client_order_id", string(client)),
+            ("product_id", string(o.product.canonical_id())),
+            ("state", string(state)),
+            ("side", string(delivery::side(o.side))),
+            ("limit_price", decimal(o.price)),
+            ("fill_price", decimal(self.price)),
+            ("original_size_contracts", decimal(o.original)),
+            ("cumulative_filled_size_contracts", decimal(o.filled)),
+            ("contract_value", decimal(self.contract_value)),
+            (
+                "execution_effective_at",
+                number(self.execution_effective_at)?,
+            ),
+            ("commit_account_version", number(self.state_version_after)?),
+            ("spec_version", string(&self.spec_version)),
+            ("rule_data_version", string(&self.rule_data_version)),
+        ]))
+    }
+}
+
 pub(in super::super) fn decode(
     value: &Json,
     account: &AccountKey,

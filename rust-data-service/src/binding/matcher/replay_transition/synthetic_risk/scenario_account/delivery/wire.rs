@@ -1,6 +1,7 @@
 //! Representation and existing pre-identity validation, never fact resolution.
 use super::super::wire::{decode, optional, Json};
 use super::*;
+mod output;
 use identity::{Projection, Reference};
 #[cfg(test)]
 mod tests;

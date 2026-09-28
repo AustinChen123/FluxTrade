@@ -3,6 +3,15 @@ use super::*;
 use execution::commit::tests::{at, input};
 mod projections;
 mod vectors;
+pub(in super::super) fn frozen_fixture(owner: &ScenarioAccount) -> Fact {
+    let mut r = request(owner, Kind::Earn);
+    r.snapshot_id = "F".into();
+    r.mode = Mode::FrozenPollFixture;
+    r.fixture_key = Some("POLL_EARN_ZERO".into());
+    r.captured_at = 504;
+    Store::new(owner.key.clone()).capture(owner, &r).unwrap()
+}
+
 pub(in super::super) fn poison(fact: &mut Fact) {
     fact.payload = Payload::Trading(d("-999"), d("-888"));
 }
