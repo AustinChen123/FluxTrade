@@ -1,6 +1,48 @@
 //! Frozen P1 scenario configuration construction and exact validation.
 use super::*;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ConfiguredProduct {
+    pub product: Product,
+    pub instrument_code: i64,
+    pub taker_fee: Decimal,
+    pub liquidation_fee: Decimal,
+    pub spec: Spec,
+    pub tier: TierVersion,
+    pub mark: Mark,
+}
+
+impl ConfiguredProduct {
+    fn valid(&self) -> bool {
+        let s = &self.spec;
+        let t = &self.tier;
+        super::super::identity(&self.product.0)
+            && self.instrument_code > 0
+            && self.taker_fee == Decimal::new(1, 3)
+            && self.liquidation_fee == Decimal::new(1, 3)
+            && s.product == self.product
+            && t.product == self.product
+            && self.mark.product == self.product
+            && s.version == "scale-spec-v1"
+            && t.version == "scale-tier-v1"
+            && s.interval == (Interval { from: 0, to: None })
+            && t.interval == s.interval
+            && [s.contract_value, s.multiplier, s.tick] == [Decimal::ONE; 3]
+            && [s.lot, s.minimum] == [Decimal::new(5, 1); 2]
+            && t.tiers
+                == vec![Tier {
+                    minimum: Decimal::ZERO,
+                    maximum: Decimal::from(100000),
+                    mmr: Decimal::new(5, 3),
+                    imr: Decimal::new(1, 1),
+                    max_leverage: Decimal::TEN,
+                }]
+            && self.mark.price == Decimal::from(100)
+            && self.mark.valid_from == 0
+            && self.mark.valid_to == 3000
+    }
+}
+
 pub(super) fn interval(second: bool, boundary: i64) -> Interval {
     if second {
         Interval {
@@ -83,6 +125,7 @@ impl FrozenScenario {
         tiers: Vec<TierVersion>,
     ) -> Result<Self, Fault> {
         let scenario = Self {
+            configured: None,
             leverage,
             specs,
             tiers,
@@ -91,11 +134,30 @@ impl FrozenScenario {
         Ok(scenario)
     }
 
-    pub(super) fn products(&self) -> [Product; 2] {
-        [Product::Btc, Product::Eth]
+    pub(super) fn products(&self) -> Vec<Product> {
+        self.configured.as_ref().map_or_else(
+            || vec![Product::Btc, Product::Eth],
+            |rows| rows.iter().map(|r| r.product.clone()).collect(),
+        )
     }
 
     pub(super) fn validate(&self) -> Result<(), Fault> {
+        if let Some(rows) = &self.configured {
+            let mut ids = std::collections::BTreeSet::new();
+            let mut codes = std::collections::BTreeSet::new();
+            return if self.leverage == Decimal::TEN
+                && !rows.is_empty()
+                && rows
+                    .iter()
+                    .all(|r| r.valid() && ids.insert(&r.product) && codes.insert(r.instrument_code))
+                && self.specs == rows.iter().map(|r| r.spec.clone()).collect::<Vec<_>>()
+                && self.tiers == rows.iter().map(|r| r.tier.clone()).collect::<Vec<_>>()
+            {
+                Ok(())
+            } else {
+                Err("INVALID_SCHEMA")
+            };
+        }
         if self.leverage <= Decimal::ZERO
             || self
                 .tiers

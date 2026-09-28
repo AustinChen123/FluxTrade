@@ -236,7 +236,10 @@ impl ScenarioAccount {
         Ok(e.finish())
     }
     fn inspection_basis(&self) -> Result<CurrentBasis, Fault> {
-        let profile = match self.profile {
+        let profile = match &self.profile {
+            ProfileContext::BtcEthScenario { scenario, .. } if scenario.configured.is_some() => {
+                "SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1"
+            }
             ProfileContext::BtcEthScenario {
                 p1_liquidation_profile: true,
                 ..

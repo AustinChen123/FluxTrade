@@ -7,6 +7,8 @@ use super::*;
 
 mod admission;
 mod capacity;
+#[cfg(test)]
+mod configured_tests;
 mod context;
 mod delivery;
 mod event_limit;
@@ -307,6 +309,31 @@ fn aligned(value: Decimal, step: Decimal) -> bool {
 }
 
 impl ScenarioAccount {
+    fn from_configured_empty(
+        seed: &CleanSeed,
+        leverage: Decimal,
+        products: Vec<ConfiguredProduct>,
+    ) -> Result<Self, Fault> {
+        seed.key.validate().map_err(|_| "INVALID_SCHEMA")?;
+        if !identity(&seed.config_id)
+            || seed.effective_at != 500
+            || seed.cash != Decimal::new(1212, 1)
+            || !seed.positions.is_empty()
+            || !seed.orders.is_empty()
+        {
+            return Err("INVALID_SCHEMA");
+        }
+        let scenario = FrozenScenario {
+            leverage,
+            specs: products.iter().map(|p| p.spec.clone()).collect(),
+            tiers: products.iter().map(|p| p.tier.clone()).collect(),
+            configured: Some(products.clone()),
+        };
+        scenario.validate()?;
+        let marks: Vec<_> = products.into_iter().map(|p| p.mark).collect();
+        Self::from_validated_configuration(seed, scenario, &marks)
+    }
+
     fn btc_context(&self) -> Result<(&FrozenScenario, &[Mark]), Fault> {
         match &self.profile {
             ProfileContext::BtcEthScenario {

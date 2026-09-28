@@ -8,7 +8,7 @@ use rust_decimal::Decimal;
 use super::Fault;
 
 mod configuration;
-use configuration::{frozen_spec, frozen_tiers, interval};
+use configuration::{frozen_spec, frozen_tiers, interval, ConfiguredProduct};
 mod scenario_account;
 pub(crate) use scenario_account::register_python;
 
@@ -64,6 +64,7 @@ struct TierVersion {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct FrozenScenario {
+    configured: Option<Vec<ConfiguredProduct>>,
     leverage: Decimal,
     specs: Vec<Spec>,
     tiers: Vec<TierVersion>,
