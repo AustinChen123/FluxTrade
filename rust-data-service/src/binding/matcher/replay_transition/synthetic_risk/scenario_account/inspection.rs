@@ -23,6 +23,14 @@ struct Inspection {
     basis: CurrentBasis,
     owner_state_digest: Hash,
 }
+pub(super) fn lifecycle(value: Lifecycle) -> &'static str {
+    match value {
+        Lifecycle::RiskStable => "RISK_STABLE",
+        Lifecycle::AwaitingCancelEffective => "AWAITING_CANCEL_EFFECTIVE",
+        Lifecycle::LiquidatedFlat => "LIQUIDATED_FLAT",
+        Lifecycle::LiquidatedInsolvent => "LIQUIDATED_INSOLVENT",
+    }
+}
 pub(super) fn number(e: &mut Encoding, n: impl TryInto<i64>) -> Result<(), Fault> {
     e.integer(n.try_into().map_err(|_| "NATIVE_INVARIANT")?);
     Ok(())
@@ -66,6 +74,34 @@ fn cancel_request(e: &mut Encoding, r: &cancel::CanonicalRequest) {
     e.hash(r.delivery_action_id);
 }
 impl ScenarioAccount {
+    fn encode_inspection_sources(&self, e: &mut Encoding) -> Result<(), Fault> {
+        number(e, self.transition.event_kinds.len())?;
+        for (id, kind) in &self.transition.event_kinds {
+            e.text(id);
+            e.text(match kind {
+                source::Kind::Context => "CONTEXT",
+                source::Kind::Execution => "EXECUTION",
+                source::Kind::Intent => "INTENT",
+                source::Kind::CancelRequest => "CANCEL_REQUEST",
+                source::Kind::CancelEffect => "CANCEL_EFFECT",
+                source::Kind::EventC => return Err("NATIVE_INVARIANT"),
+            });
+        }
+        Ok(())
+    }
+    fn inspect_state(&self) -> Result<Inspection, Fault> {
+        let (basis, mut e) = self.current_evidence()?;
+        self.encode_inspection_intents(&mut e)?;
+        self.encode_inspection_executions(&mut e)?;
+        self.cancel_facts.encode_inspection_receipts(&mut e)?;
+        self.cancel_facts.encode_inspection_actions(&mut e)?;
+        self.encode_inspection_liquidations(&mut e)?;
+        self.encode_inspection_sources(&mut e)?;
+        Ok(Inspection {
+            basis,
+            owner_state_digest: e.finish(),
+        })
+    }
     fn encode_positions(&self, e: &mut Encoding) -> Result<(), Fault> {
         let mut rows: Vec<_> = match &self.positions {
             PositionState::BtcEth(p) => p.iter().map(|(p, v)| (product_id(*p), v)).collect(),
@@ -251,6 +287,8 @@ impl ScenarioAccount {
         Ok((b, e))
     }
 }
+#[cfg(test)]
+mod completion_tests;
 #[cfg(test)]
 pub(super) mod receipt_vectors;
 #[cfg(test)]

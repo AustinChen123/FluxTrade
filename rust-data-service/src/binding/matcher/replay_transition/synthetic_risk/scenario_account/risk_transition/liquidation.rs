@@ -3,8 +3,58 @@ use super::*;
 use cancel::identity::{classify, Encoding, Stored};
 use hypothetical_settlement::FeePolicy;
 mod commit;
+#[cfg(test)]
+mod inspection_tests;
 
 impl ScenarioAccount {
+    pub(in super::super) fn encode_inspection_liquidations(
+        &self,
+        e: &mut Encoding,
+    ) -> Result<(), Fault> {
+        use inspection::{decimals, number};
+        number(e, self.transition.liquidations.len())?;
+        for r in &self.transition.liquidations {
+            if r.fee_policy != FeePolicy::SyntheticLiquidation {
+                return Err("NATIVE_INVARIANT");
+            }
+            e.account(&r.account_key);
+            e.hash(r.liquidation_id);
+            e.hash(r.canonical_payload_digest);
+            e.text(&r.trigger_event_id);
+            e.integer(r.step_index);
+            e.text(product_id(r.product));
+            e.text(side_name(r.position_side_before));
+            e.text(side_name(r.execution_side));
+            decimals(e, &[r.contracts, r.base_quantity, r.mark]);
+            e.text("SyntheticLiquidation");
+            decimals(
+                e,
+                &[r.fee_rate, r.fee, r.gross_realized_delta, r.cash_delta],
+            );
+            for n in [
+                r.account_version_before,
+                r.account_version_after,
+                r.commit_sequence_before,
+                r.commit_sequence,
+            ] {
+                number(e, n)?;
+            }
+            e.text(&r.spec_version);
+            e.text(&r.rule_data_version);
+            e.hash(r.risk_action_episode_id);
+            e.optional_text(r.escalation_event_id.as_deref());
+            e.optional_text(r.release_event_id.as_deref());
+            e.hash(r.active_context_id);
+            e.text(match r.post_step_decision {
+                StepDecision::ContinueLiquidation => "CONTINUE_LIQUIDATION",
+                StepDecision::RiskStable => "RISK_STABLE",
+                StepDecision::LiquidatedFlat => "LIQUIDATED_FLAT",
+                StepDecision::LiquidatedInsolvent => "LIQUIDATED_INSOLVENT",
+            });
+            e.optional_text(r.resulting_lifecycle.map(inspection::lifecycle));
+        }
+        Ok(())
+    }
     pub(in super::super) fn liquidation_ids(&self) -> impl Iterator<Item = Hash> + '_ {
         self.transition
             .liquidations
