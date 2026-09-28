@@ -3,6 +3,7 @@ use super::*;
 mod golden_cancel;
 #[cfg(test)]
 mod inspection_tests;
+pub(super) mod wire;
 
 pub(super) mod commit;
 mod event_c;

@@ -5,6 +5,7 @@ use serde::Deserialize;
 use serde_json::value::RawValue;
 use std::fmt::{self, Write};
 
+pub(super) mod group;
 pub(super) mod profiles;
 #[cfg(test)]
 mod tests;
@@ -47,6 +48,33 @@ pub(super) fn decode(input: &str) -> Result<Json, Fault> {
 }
 
 impl Json {
+    pub(super) fn array(&self) -> Result<&[Self], Fault> {
+        match self {
+            Self::Array(rows) => Ok(rows),
+            _ => Err("INVALID_SCHEMA"),
+        }
+    }
+    pub(super) fn boolean(&self) -> Result<bool, Fault> {
+        match self {
+            Self::Bool(value) => Ok(*value),
+            _ => Err("INVALID_SCHEMA"),
+        }
+    }
+    pub(super) fn product(&self) -> Result<ProfileProduct, Fault> {
+        match self.text()? {
+            "BTC-USDT-SWAP" => Ok(ProfileProduct::BtcEth(Product::Btc)),
+            "ETH-USDT-SWAP" => Ok(ProfileProduct::BtcEth(Product::Eth)),
+            "P_A" => Ok(ProfileProduct::Pa),
+            _ => Err("INVALID_SCHEMA"),
+        }
+    }
+    pub(super) fn side(&self) -> Result<Side, Fault> {
+        match self.text()? {
+            "LONG" => Ok(Side::Long),
+            "SHORT" => Ok(Side::Short),
+            _ => Err("INVALID_SCHEMA"),
+        }
+    }
     fn from_raw(raw: &RawValue, parent_depth: usize) -> Result<Self, Fault> {
         let s = raw.get();
         let depth = parent_depth + usize::from(matches!(s.as_bytes()[0], b'{' | b'['));

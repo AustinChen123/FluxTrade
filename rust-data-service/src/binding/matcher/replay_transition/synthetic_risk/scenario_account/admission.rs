@@ -52,6 +52,7 @@ pub(super) fn fixture_intent(
 mod btc_policy;
 #[cfg(test)]
 pub(super) mod inspection_tests;
+pub(super) mod wire;
 
 #[cfg(test)]
 pub(super) fn fixture_admit(
