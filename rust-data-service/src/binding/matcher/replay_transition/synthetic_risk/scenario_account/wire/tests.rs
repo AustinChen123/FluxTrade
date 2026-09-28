@@ -208,3 +208,67 @@ fn closed_constructors_equal_existing_owners_and_literal_anchors() {
         Err("INVALID_SCHEMA")
     );
 }
+
+#[test]
+fn p1_liquidation_profile_reuses_frozen_owner_transition() {
+    let (mut seed, config, mut marks) = super::super::tests::fixture();
+    seed.effective_at = 1500;
+    seed.cash = Decimal::from(3);
+    seed.orders.clear();
+    seed.positions[0].side = Side::Short;
+    seed.positions[0].contracts = Decimal::ONE;
+    seed.positions[0].lots.truncate(1);
+    marks[0].price = Decimal::from(50000);
+    marks[0].valid_to = 1501;
+    marks.push(Mark {
+        product: Product::Btc,
+        price: Decimal::from(50100),
+        valid_from: 1501,
+        valid_to: 3000,
+    });
+    let mut expected = ScenarioAccount::from_seed(&seed, &config, &marks).unwrap();
+    let ProfileContext::BtcEthScenario {
+        p1_liquidation_profile,
+        ..
+    } = &mut expected.profile
+    else {
+        unreachable!()
+    };
+    *p1_liquidation_profile = true;
+    let mut owner = construct("SYNTHETIC_P1_LIQUIDATION_V1", seed.key).unwrap();
+    assert_eq!(owner, expected);
+    // Independent raw-byte SHA256: entry basis 500; lot entry 50000; base 0.01.
+    let hex = |hash: Hash| hash.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    assert_eq!(
+        hex(owner.owner_evidence_digest().unwrap()),
+        "134b24a87d3490abca366cadb5e081d698562474c3285e7b4e1393300c4da94d"
+    );
+    let mut input =
+        context::tests::activation(&owner, 1501, context::tests::mark_rows(&marks, 1501));
+    input.stamp.event_id = "S6-L-MARK-1501".into();
+    owner.activate_context(&input).unwrap();
+    assert_eq!(
+        (owner.cash, owner.gross_realized, owner.fees),
+        (
+            Decimal::new(-101602, 5),
+            -Decimal::ONE,
+            Decimal::new(301602, 5)
+        )
+    );
+    assert_eq!(owner.state_version, 2);
+    assert_eq!(owner.gate, Gate::Running);
+    assert_eq!(
+        owner.transition.lifecycle,
+        risk_transition::Lifecycle::LiquidatedInsolvent
+    );
+    assert!(owner.positions.is_empty() && owner.orders.is_empty());
+    assert_eq!(owner.liquidation_ids().count(), 1);
+    assert_eq!(
+        hex(owner.owner_evidence_digest().unwrap()),
+        "542cb313c7e688a6107f408aa24414041cd4321bd7e1c75d26b1d2d7e9277fb4"
+    );
+    assert_eq!(
+        hex(owner.liquidation_ids().next().unwrap()),
+        "7fb9f5bec4fe944a93de3c08e44d149a42279d93ff24c37b7712c0a5037db810"
+    );
+}

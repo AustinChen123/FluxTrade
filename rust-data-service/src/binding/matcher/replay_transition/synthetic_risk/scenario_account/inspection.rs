@@ -229,6 +229,10 @@ impl ScenarioAccount {
     fn inspection_basis(&self) -> Result<CurrentBasis, Fault> {
         let profile = match self.profile {
             ProfileContext::BtcEthScenario {
+                p1_liquidation_profile: true,
+                ..
+            } => "SYNTHETIC_P1_LIQUIDATION_V1",
+            ProfileContext::BtcEthScenario {
                 min_cash_profile: false,
                 ..
             } => "SYNTHETIC_BTC_ETH_V1",

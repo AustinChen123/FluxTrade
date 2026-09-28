@@ -20,7 +20,8 @@ pub(in super::super) fn construct(
         return ScenarioAccount::from_golden_cancel_seed(&seed, &golden_cancel::Config::frozen())
             .map_err(|_| "NATIVE_INVARIANT");
     }
-    if profile != "SYNTHETIC_BTC_ETH_V1" {
+    let liquidation = profile == "SYNTHETIC_P1_LIQUIDATION_V1";
+    if profile != "SYNTHETIC_BTC_ETH_V1" && !liquidation {
         return Err("INVALID_SCHEMA");
     }
     seed.cash = Decimal::from(10000);
@@ -67,7 +68,7 @@ pub(in super::super) fn construct(
     }
     let scenario =
         FrozenScenario::new(Decimal::TEN, specs, tiers).map_err(|_| "NATIVE_INVARIANT")?;
-    let marks = [(Product::Btc, 50001), (Product::Eth, 1900)]
+    let mut marks = [(Product::Btc, 50001), (Product::Eth, 1900)]
         .into_iter()
         .map(|(product, price)| Mark {
             product,
@@ -76,5 +77,31 @@ pub(in super::super) fn construct(
             valid_to: 3000,
         })
         .collect::<Vec<_>>();
-    ScenarioAccount::from_seed(&seed, &scenario, &marks).map_err(|_| "NATIVE_INVARIANT")
+    if liquidation {
+        seed.effective_at = 1500;
+        seed.cash = Decimal::from(3);
+        seed.orders.clear();
+        let position = &mut seed.positions[0];
+        position.side = Side::Short;
+        position.contracts = Decimal::ONE;
+        position.lots.truncate(1);
+        marks[0].price = Decimal::from(50000);
+        marks[0].valid_to = 1501;
+        marks.push(Mark {
+            product: Product::Btc,
+            price: Decimal::from(50100),
+            valid_from: 1501,
+            valid_to: 3000,
+        });
+    }
+    let mut owner =
+        ScenarioAccount::from_seed(&seed, &scenario, &marks).map_err(|_| "NATIVE_INVARIANT")?;
+    if let ProfileContext::BtcEthScenario {
+        p1_liquidation_profile,
+        ..
+    } = &mut owner.profile
+    {
+        *p1_liquidation_profile = liquidation;
+    }
+    Ok(owner)
 }

@@ -30,6 +30,7 @@ enum ProfileContext {
         scenario: FrozenScenario,
         marks: Vec<Mark>,
         min_cash_profile: bool,
+        p1_liquidation_profile: bool,
     },
     GoldenCapacity(capacity::Config),
     EventLimit(event_limit::Config),
@@ -457,6 +458,7 @@ impl ScenarioAccount {
             config_id: seed.config_id.clone(),
             profile: ProfileContext::BtcEthScenario {
                 min_cash_profile: false,
+                p1_liquidation_profile: false,
                 scenario,
                 marks: marks.to_vec(),
             },

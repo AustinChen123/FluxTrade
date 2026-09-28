@@ -7,7 +7,7 @@ from typing import Literal, NotRequired, TypeAlias, TypedDict, cast
 import fluxtrade_core as _native
 
 Product = Literal["BTC-USDT-SWAP", "ETH-USDT-SWAP", "P_A"]
-Profile = Literal["SYNTHETIC_BTC_ETH_V1", "SYNTHETIC_GOLDEN_CANCEL_V1", "SYNTHETIC_MIN_CASH_V1"]
+Profile = Literal["SYNTHETIC_BTC_ETH_V1", "SYNTHETIC_GOLDEN_CANCEL_V1", "SYNTHETIC_MIN_CASH_V1", "SYNTHETIC_P1_LIQUIDATION_V1"]
 Side = Literal["LONG", "SHORT"]
 ObservedSide = Literal["buy", "sell"]
 Ordering = Literal["S_order_v1", "S_order_v1_reverse_execution_cancel_effective"]
