@@ -3,7 +3,7 @@
 import hashlib
 import re
 from decimal import Decimal
-from typing import Callable, Literal, TypedDict, cast
+from typing import Callable, Literal, NotRequired, TypedDict, cast
 
 
 def _event_integer(value: object) -> bytes:
@@ -428,3 +428,50 @@ def _emission_plan_bytes(plan: object) -> bytes:
 
 def _emission_plan_digest(plan: object) -> str:
     return hashlib.sha256(_emission_plan_bytes(plan)).hexdigest()
+
+
+class _PollStagePlan(TypedDict):
+    capture_sequence: int
+    snapshot_request: dict[str, object]
+    delivery_projection: dict[str, object]
+
+
+class _PollOccurrencePlan(TypedDict):
+    account_key: dict[str, object]
+    poll_id: str
+    issued_at: int
+    continuation_id: str
+    earn: NotRequired[_PollStagePlan | None]
+    trading: _PollStagePlan
+    positions: _PollStagePlan
+    open_orders: _PollStagePlan
+
+
+def _poll_stage_bytes(value: object) -> bytes:
+    row = _event_object(value, "capture_sequence snapshot_request delivery_projection")
+    return (
+        _plan_sequence(row["capture_sequence"])
+        + _plan_snapshot(row["snapshot_request"])
+        + _plan_projection(row["delivery_projection"])
+    )
+
+
+def _poll_occurrence_plan_bytes(plan: object) -> bytes:
+    """Encode representation only; poll timing and stage matching belong to composition."""
+    try:
+        row = _event_object(plan, "account_key poll_id issued_at continuation_id trading positions open_orders", "earn")
+        return (
+            _event_text("SPIDER_POLL_OCCURRENCE_PLAN_V1")
+            + _plan_account(row["account_key"])
+            + _event_id(row["poll_id"])
+            + _event_integer(row["issued_at"])
+            + _event_id(row["continuation_id"])
+            + _plan_optional(row.get("earn"), _poll_stage_bytes)
+            + b"".join(_poll_stage_bytes(row[k]) for k in ("trading", "positions", "open_orders"))
+        )
+    except (UnicodeError, OverflowError) as exc:
+        raise ValueError("POLICY_EMISSION_MISMATCH") from exc
+
+
+def _poll_occurrence_plan_digest(plan: object) -> str:
+    return hashlib.sha256(_poll_occurrence_plan_bytes(plan)).hexdigest()

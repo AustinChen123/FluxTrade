@@ -8,6 +8,7 @@ from src.core.backtest import spider_policy_protocol, synthetic_scenario_replay
 
 ROOT = Path(__file__).parents[1] / "src/core/backtest"
 ENTRY_POINTS = {"_policy_event_bytes", "_policy_event_digest", "_emission_plan_bytes", "_emission_plan_digest"}
+ENTRY_POINTS |= {"_poll_occurrence_plan_bytes", "_poll_occurrence_plan_digest"}
 
 
 def allowed(source, composition=False):
