@@ -50,6 +50,8 @@ pub(super) fn fixture_intent(
 }
 
 mod btc_policy;
+#[cfg(test)]
+pub(super) mod inspection_tests;
 
 #[cfg(test)]
 pub(super) fn fixture_admit(
@@ -209,6 +211,43 @@ enum ReplyKind {
 struct Reply {
     kind: ReplyKind,
     result: AdmissionResult,
+}
+
+impl ScenarioAccount {
+    pub(super) fn encode_inspection_intents(
+        &self,
+        e: &mut risk_transition::cancel::identity::Encoding,
+    ) -> Result<(), Fault> {
+        use inspection::{number, order_facts};
+        number(e, self.intent_results.len())?;
+        for (key, r) in &self.intent_results {
+            e.text(key);
+            e.text(&r.intent_id);
+            e.hash(r.canonical_payload_digest);
+            e.text(match r.outcome {
+                Outcome::Accepted => "ACCEPTED",
+                Outcome::Rejected => "REJECTED",
+            });
+            e.optional_text(r.reason_code);
+            e.optional_text(r.order_id.as_deref());
+            number(e, r.account_version_before)?;
+            number(e, r.account_version_after)?;
+            for version in [r.order_version_before, r.order_version_after] {
+                e.presence(version.is_some());
+                if let Some(v) = version {
+                    number(e, v)?;
+                }
+            }
+            e.text(&r.spec_version);
+            e.text(&r.rule_data_version);
+            e.text(&r.created_at_event_id);
+            e.presence(r.accepted_order.is_some());
+            if let Some(order) = &r.accepted_order {
+                order_facts(e, order)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

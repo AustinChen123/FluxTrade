@@ -23,11 +23,11 @@ struct Inspection {
     basis: CurrentBasis,
     owner_state_digest: Hash,
 }
-fn number(e: &mut Encoding, n: impl TryInto<i64>) -> Result<(), Fault> {
+pub(super) fn number(e: &mut Encoding, n: impl TryInto<i64>) -> Result<(), Fault> {
     e.integer(n.try_into().map_err(|_| "NATIVE_INVARIANT")?);
     Ok(())
 }
-fn decimals(e: &mut Encoding, values: &[Decimal]) {
+pub(super) fn decimals(e: &mut Encoding, values: &[Decimal]) {
     for v in values {
         e.text(&v.normalize().to_string());
     }
@@ -35,7 +35,7 @@ fn decimals(e: &mut Encoding, values: &[Decimal]) {
 fn side(e: &mut Encoding, s: Side) {
     e.text(if s == Side::Long { "LONG" } else { "SHORT" });
 }
-fn order_facts(e: &mut Encoding, o: &SeedOrder) -> Result<(), Fault> {
+pub(super) fn order_facts(e: &mut Encoding, o: &SeedOrder) -> Result<(), Fault> {
     for s in [
         &o.intent_id,
         &o.order_id,
@@ -251,5 +251,7 @@ impl ScenarioAccount {
         Ok((b, e))
     }
 }
+#[cfg(test)]
+pub(super) mod receipt_vectors;
 #[cfg(test)]
 mod tests;

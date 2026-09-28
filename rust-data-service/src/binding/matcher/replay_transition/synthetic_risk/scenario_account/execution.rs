@@ -1,6 +1,8 @@
 //! Private execution identity/preparation and the sole BTC/ETH commit boundary.
 use super::*;
 mod golden_cancel;
+#[cfg(test)]
+mod inspection_tests;
 
 pub(super) mod commit;
 mod event_c;
@@ -220,6 +222,63 @@ impl CommittedExecution {
         e.integer(i64::try_from(self.state_version_after).map_err(|_| "NATIVE_INVARIANT")?);
         e.text(&self.spec_version);
         e.text(&self.rule_data_version);
+        Ok(())
+    }
+}
+
+impl ScenarioAccount {
+    pub(super) fn encode_inspection_executions(
+        &self,
+        e: &mut risk_transition::cancel::identity::Encoding,
+    ) -> Result<(), Fault> {
+        use inspection::{decimals, number, order_facts};
+        number(e, self.execution_receipts.len())?;
+        for (key, r) in &self.execution_receipts {
+            e.hash(*key);
+            e.account(&r.account_key);
+            e.hash(r.execution_id);
+            e.hash(r.financial_payload_digest);
+            e.text(&r.event_id);
+            for n in [
+                r.commit_sequence,
+                r.state_version_before,
+                r.state_version_after,
+                r.order_version_before,
+                r.order_version_after,
+            ] {
+                number(e, n)?;
+            }
+            e.text(r.product.canonical_id());
+            e.text(&r.order_id);
+            decimals(e, &[r.quantity, r.price]);
+            e.text(&r.fee_asset);
+            decimals(e, &[r.fee_amount, r.realized_pnl_delta]);
+            number(e, r.cash_deltas.len())?;
+            for (asset, value) in &r.cash_deltas {
+                e.text(asset);
+                decimals(e, &[*value]);
+            }
+            order_facts(e, &r.order_after)?;
+            e.integer(r.order_created_at);
+            e.integer(r.execution_effective_at);
+            decimals(e, &[r.contract_value]);
+            e.text(&r.spec_version);
+            e.text(&r.rule_data_version);
+            e.text(match r.lifecycle_after {
+                risk_transition::Lifecycle::RiskStable => "RISK_STABLE",
+                risk_transition::Lifecycle::AwaitingCancelEffective => "AWAITING_CANCEL_EFFECTIVE",
+                risk_transition::Lifecycle::LiquidatedFlat => "LIQUIDATED_FLAT",
+                risk_transition::Lifecycle::LiquidatedInsolvent => "LIQUIDATED_INSOLVENT",
+            });
+            number(e, r.pending_action_ids.len())?;
+            for id in &r.pending_action_ids {
+                e.text(id);
+            }
+            let client =
+                r.policy_client(matches!(self.profile, ProfileContext::GoldenCancel(_)))?;
+            e.text("EXECUTION_FACT");
+            r.encode_delivery(e, &client)?;
+        }
         Ok(())
     }
 }
