@@ -2,6 +2,7 @@
 use super::*;
 use risk_transition::cancel::identity::Encoding;
 mod identity;
+mod store;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Transport {

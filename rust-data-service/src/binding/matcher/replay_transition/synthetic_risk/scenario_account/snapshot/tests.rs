@@ -4,6 +4,17 @@ use execution::commit::tests::{at, input};
 mod projections;
 mod vectors;
 
+pub(in super::super) fn delivery_fixture(
+    owner: &ScenarioAccount,
+    capture: bool,
+) -> (Store, Option<Fact>) {
+    let mut store = Store::new(owner.key.clone());
+    let mut r = request(owner, Kind::Trading);
+    r.continuation_id = Some("Q".into());
+    let fact = capture.then(|| store.capture(owner, &r).unwrap());
+    (store, fact)
+}
+
 fn request(owner: &ScenarioAccount, kind: Kind) -> Request {
     Request {
         schema_version: "snapshot_request_v1".into(),

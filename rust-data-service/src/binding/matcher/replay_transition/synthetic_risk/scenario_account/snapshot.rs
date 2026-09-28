@@ -77,6 +77,16 @@ pub(super) struct Fact {
     payload_digest: Hash,
 }
 impl Fact {
+    pub(super) fn delivery_metadata(
+        &self,
+        kind: &str,
+        continuation: Option<&str>,
+    ) -> Result<(Option<i64>, i64), Fault> {
+        if kind != self.kind.payload_name() || continuation != self.continuation_id.as_deref() {
+            return Err("INVALID_SCHEMA");
+        }
+        Ok((self.captured_account_version, self.snapshot_as_of))
+    }
     pub(super) fn encode_payload(&self, e: &mut Encoding) -> Result<(), Fault> {
         self.payload.encode(e)
     }
@@ -94,11 +104,20 @@ impl Fact {
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Store {
+pub(super) struct Store {
     account_key: AccountKey,
     snapshots: BTreeMap<String, Stored<Fact>>,
 }
 impl Store {
+    pub(super) fn lookup(&self, account: &AccountKey, id: &str) -> Result<Fact, Fault> {
+        if account != &self.account_key {
+            return Err("ACCOUNT_KEY_MISMATCH");
+        }
+        self.snapshots
+            .get(id)
+            .map(|s| s.value.clone())
+            .ok_or("UNKNOWN_RECEIPT_REFERENCE")
+    }
     fn new(account_key: AccountKey) -> Self {
         Self {
             account_key,
