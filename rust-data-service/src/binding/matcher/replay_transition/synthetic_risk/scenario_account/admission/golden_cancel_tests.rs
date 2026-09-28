@@ -58,6 +58,18 @@ fn golden_cancel_admission_is_closed_and_uses_canonical_order_identity() {
     let before = owner.clone();
     assert_eq!(owner.admit(&envelope).unwrap().kind, ReplyKind::Duplicate);
     assert_eq!(owner, before);
+    let id = intent.order_id();
+    let fill = execution::commit::tests::input(&owner, &id, "golden", "10", "10");
+    owner.execute(&fill).unwrap();
+    let saved = owner.clone();
+    let delivery::Payload::Execution(_, client) =
+        delivery::source(&owner, "event-golden", "EXECUTION_FACT", None).unwrap()
+    else {
+        panic!("execution");
+    };
+    assert_eq!(client, "0000015000");
+    assert_eq!(owner, saved);
+    owner = before.clone();
     let mut second = intent.clone();
     second.intent_id = "second".into();
     second.client_order_id = "second-client".into();

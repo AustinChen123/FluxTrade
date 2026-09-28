@@ -172,6 +172,58 @@ enum Preparation<'a> {
     Eligible { execution_id: Hash, digest: Hash },
 }
 
+impl CommittedExecution {
+    pub(super) fn source_event(&self) -> &str {
+        &self.event_id
+    }
+    pub(super) fn policy_client(&self, golden: bool) -> Result<String, Fault> {
+        if golden {
+            if self.order_after.client_id != "C" {
+                return Err("NATIVE_INVARIANT");
+            }
+            Ok("0000015000".into())
+        } else {
+            Ok(self.order_after.client_id.clone())
+        }
+    }
+    pub(super) fn encode_delivery(
+        &self,
+        e: &mut risk_transition::cancel::identity::Encoding,
+        policy_client: &str,
+    ) -> Result<(), Fault> {
+        let o = &self.order_after;
+        let state = match o.status.as_str() {
+            "PARTIALLY_FILLED" => "partially_filled",
+            "FILLED" => "filled",
+            _ => return Err("NATIVE_INVARIANT"),
+        };
+        for s in [
+            o.order_id.as_str(),
+            &o.client_id,
+            policy_client,
+            o.product.canonical_id(),
+            state,
+            delivery::side(o.side),
+        ] {
+            e.text(s);
+        }
+        for v in [
+            o.price,
+            self.price,
+            o.original,
+            o.filled,
+            self.contract_value,
+        ] {
+            e.text(&v.normalize().to_string());
+        }
+        e.integer(self.execution_effective_at);
+        e.integer(i64::try_from(self.state_version_after).map_err(|_| "NATIVE_INVARIANT")?);
+        e.text(&self.spec_version);
+        e.text(&self.rule_data_version);
+        Ok(())
+    }
+}
+
 // The whole order remainder, not candidate quantity, owns execution eligibility.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RemainderRole {

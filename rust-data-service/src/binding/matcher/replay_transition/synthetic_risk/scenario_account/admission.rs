@@ -181,6 +181,7 @@ enum Evaluation {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct AdmissionResult {
+    accepted_order: Option<SeedOrder>,
     intent_id: String,
     canonical_payload_digest: Hash,
     outcome: Outcome,
@@ -451,6 +452,7 @@ impl ScenarioAccount {
                 .ok_or("VERSION_OVERFLOW")?;
         }
         let result = AdmissionResult {
+            accepted_order: accepted.then(|| draft.orders[&order_id].facts.clone()),
             intent_id: intent.intent_id.clone(),
             canonical_payload_digest: intent.digest(),
             outcome: if accepted {
@@ -475,6 +477,14 @@ impl ScenarioAccount {
             .insert(intent.intent_id.clone(), result.clone());
         hook(PrepareStage::ResultDrafted)?;
         Ok(Prepared { draft, result })
+    }
+}
+
+impl AdmissionResult {
+    pub(super) fn delivery_order(&self, event: &str) -> Option<&SeedOrder> {
+        (self.created_at_event_id == event)
+            .then_some(self.accepted_order.as_ref())
+            .flatten()
     }
 }
 

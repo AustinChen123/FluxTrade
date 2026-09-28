@@ -83,6 +83,34 @@ fn closed_min_cash_controls_preserve_standard_rejection_and_identity_precedence(
     expected.intent_results = owner.intent_results.clone();
     expected.transition = owner.transition.clone();
     assert_eq!(owner, expected);
+    assert!(rejected.accepted_order.is_none());
+    let t = delivery::Transport {
+        route: "WS",
+        operation: "ORDER",
+        client: "MIN-NEGATIVE-C".into(),
+        order: None,
+        code: "0".into(),
+        message: None,
+        product: None,
+        side: None,
+        price: None,
+        size: None,
+    };
+    let mut cancel = t.clone();
+    cancel.operation = "CANCEL";
+    for (kind, transport) in [
+        ("EXECUTION_FACT", None),
+        ("EXECUTION_FACT", Some(&t)),
+        ("TRANSPORT_ACK", None),
+        ("TRANSPORT_ACK", Some(&t)),
+        ("TRANSPORT_ACK", Some(&cancel)),
+    ] {
+        assert_eq!(
+            delivery::source(&owner, "negative", kind, transport),
+            Err("INVALID_SCHEMA")
+        );
+        assert_eq!(owner, expected);
+    }
     assert_eq!(
         fixture_admit(&mut owner, "negative", 502, &negative)
             .unwrap()

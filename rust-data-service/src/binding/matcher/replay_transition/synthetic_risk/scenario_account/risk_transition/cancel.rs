@@ -175,6 +175,53 @@ pub(in super::super) struct Facts {
     pub actions: BTreeMap<Hash, Action>,
 }
 
+impl Facts {
+    #[cfg(test)]
+    pub(in super::super) fn assert_ambiguous_delivery_rejected(
+        &self,
+        event: &str,
+        transport: &super::super::delivery::Transport,
+    ) {
+        let mut ambiguous = self.clone();
+        let receipt = self.effects.values().next().unwrap().clone();
+        ambiguous.effects.insert([255; 32], receipt);
+        assert!(!ambiguous.delivery_match(event, transport));
+        let mut wrong = transport.clone();
+        wrong.client = "unknown".into();
+        assert!(!self.delivery_match(event, &wrong));
+    }
+    pub(in super::super) fn delivery_match(
+        &self,
+        event: &str,
+        transport: &super::super::delivery::Transport,
+    ) -> bool {
+        let mut matching = self
+            .effects
+            .values()
+            .map(|s| &s.value)
+            .filter(|r| r.event_id == event && transport.matches(&r.after));
+        let Some(receipt) = matching.next() else {
+            return false;
+        };
+        if matching.next().is_some() {
+            return false;
+        }
+        self.requests.values().map(|s| &s.value).any(|r| {
+            r.detecting_event_id == receipt.detecting_event_id
+                && r.target_order_id == receipt.target_order_id
+                && r.action_ids.contains(&receipt.action_id)
+                && r.action_ids.iter().any(|id| {
+                    self.actions.get(id).is_some_and(|a| {
+                        a.phase == 2
+                            && a.outcome.is_none()
+                            && a.detecting_event_id == receipt.detecting_event_id
+                            && a.target_order_id == receipt.target_order_id
+                    })
+                })
+        })
+    }
+}
+
 pub(in super::super) use super::Stage;
 
 impl ScenarioAccount {

@@ -152,6 +152,10 @@ pub(in super::super::super) fn input(
     result.template.price = d(price);
     result.expected_account_version = owner.state_version;
     result.expected_order_version = order.version;
+    if order.facts.product == ProfileProduct::Pa {
+        result.spec_version = "gt03-spec-v1".into();
+        result.rule_data_version = "gt03-rule-v1".into();
+    }
     result
 }
 

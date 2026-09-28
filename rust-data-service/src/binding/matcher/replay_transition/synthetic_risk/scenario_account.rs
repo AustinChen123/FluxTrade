@@ -8,6 +8,7 @@ use super::*;
 mod admission;
 mod capacity;
 mod context;
+mod delivery;
 mod event_limit;
 mod execution;
 mod golden_cancel;

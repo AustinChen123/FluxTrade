@@ -42,6 +42,17 @@ fn terminal_unknown_effect_matches_direct_rejection_but_history_conflict_wins() 
     let mut owner = anchor(Side::Long, "1001", "50000", "3000", 500, "49900");
     let source = mark(&owner, 501, "terminal-mark");
     owner.activate_context(&source).unwrap();
+    let saved = owner.clone();
+    for (id, error) in [
+        (owner.liquidation_ids().next().unwrap(), "INVALID_SCHEMA"),
+        ([0; 32], "UNKNOWN_RECEIPT_REFERENCE"),
+    ] {
+        assert_eq!(
+            delivery::resolve(&owner, &Reference::Liquidation(id), "EXECUTION_FACT", None),
+            Err(error)
+        );
+        assert_eq!(owner, saved);
+    }
     let input = cancel::EffectInput {
         stamp: stamp("fresh", 502, 50),
         effects: vec![(
