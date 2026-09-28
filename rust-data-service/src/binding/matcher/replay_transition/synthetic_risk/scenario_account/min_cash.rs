@@ -40,8 +40,8 @@ impl ScenarioAccount {
         let mut tiers = Vec::new();
         for product in [Product::Btc, Product::Eth] {
             for second in [false, true] {
-                specs.push(frozen_spec(product, second));
-                tiers.push(frozen_tiers(product, second));
+                specs.push(frozen_spec(&product, second));
+                tiers.push(frozen_tiers(&product, second));
             }
         }
         let scenario = FrozenScenario::new(Decimal::TEN, specs, tiers)?;

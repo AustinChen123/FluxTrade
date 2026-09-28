@@ -35,7 +35,7 @@ impl Input {
             Rows::Marks(rows) => {
                 e.integer(rows.len() as i64);
                 for (product, from, to, mark) in rows {
-                    e.text(product_id(*product));
+                    e.text(product_id(product));
                     e.integer(*from);
                     e.integer(*to);
                     e.text(&mark.normalize().to_string());
@@ -44,7 +44,7 @@ impl Input {
             Rows::Specs(rows) | Rows::Tiers(rows) => {
                 e.integer(rows.len() as i64);
                 for (product, from, to, boundary) in rows {
-                    e.text(product_id(*product));
+                    e.text(product_id(product));
                     e.text(from);
                     e.text(to);
                     e.integer(*boundary);
@@ -189,8 +189,8 @@ impl ScenarioAccount {
         let mut rows_before = Vec::new();
         let mut rows_after = Vec::new();
         for (index, product) in [Product::Btc, Product::Eth].into_iter().enumerate() {
-            let (old_spec, old_tier) = scenario.resolve(product, old_at)?;
-            let (spec, tier) = scenario.resolve(product, at)?;
+            let (old_spec, old_tier) = scenario.resolve(&product, old_at)?;
+            let (spec, tier) = scenario.resolve(&product, at)?;
             if let Some(position) = self.positions.btc()?.get(&product) {
                 hypothetical_settlement::validate_existing(
                     position,
@@ -237,7 +237,7 @@ impl ScenarioAccount {
                             return Err("UNSUPPORTED_SPEC_MIGRATION");
                         }
                         for order in self.orders.values() {
-                            if order.facts.product == ProfileProduct::BtcEth(product)
+                            if matches!(&order.facts.product, ProfileProduct::BtcEth(p) if p == &product)
                                 && order
                                     .facts
                                     .projects_remainder("INVALID_RESERVATION_ORDER")?

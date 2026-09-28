@@ -108,7 +108,7 @@ impl ScenarioAccount {
     }
     fn encode_positions(&self, e: &mut Encoding) -> Result<(), Fault> {
         let mut rows: Vec<_> = match &self.positions {
-            PositionState::BtcEth(p) => p.iter().map(|(p, v)| (product_id(*p), v)).collect(),
+            PositionState::BtcEth(p) => p.iter().map(|(p, v)| (product_id(p), v)).collect(),
             PositionState::GoldenCancel(p) => p.iter().map(|p| ("P_A", p)).collect(),
             _ => return Err("NATIVE_INVARIANT"),
         };
@@ -190,10 +190,11 @@ impl ScenarioAccount {
                     r.available_margin,
                 ],
             );
-            r.products.sort_by_key(|p| product_id(p.product));
+            r.products
+                .sort_by(|a, b| product_id(&a.product).cmp(product_id(&b.product)));
             number(e, r.products.len())?;
             for p in r.products {
-                e.text(product_id(p.product));
+                e.text(product_id(&p.product));
                 decimals(
                     e,
                     &[
@@ -204,11 +205,12 @@ impl ScenarioAccount {
                     ],
                 );
             }
-            r.orders
-                .sort_by_key(|o| (product_id(o.product), o.order_id.clone()));
+            r.orders.sort_by(|a, b| {
+                (product_id(&a.product), &a.order_id).cmp(&(product_id(&b.product), &b.order_id))
+            });
             number(e, r.orders.len())?;
             for o in r.orders {
-                e.text(product_id(o.product));
+                e.text(product_id(&o.product));
                 e.text(&o.order_id);
                 side(e, o.side);
                 decimals(

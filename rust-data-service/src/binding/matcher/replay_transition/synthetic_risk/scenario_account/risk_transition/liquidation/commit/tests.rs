@@ -255,7 +255,7 @@ fn frozen_tier_one_breach_cannot_liquidate_to_solvent_flat() {
     // even the largest admitted tier-one MMR at the exact breach boundary.
     for product in [Product::Btc, Product::Eth] {
         for second in [false, true] {
-            let rate = frozen_tiers(product, second).tiers[0].mmr;
+            let rate = frozen_tiers(&product, second).tiers[0].mmr;
             assert!(rate <= d("0.0045"));
             assert!(rate < FeePolicy::SyntheticLiquidation.rate());
         }
@@ -276,7 +276,10 @@ fn frozen_loop_bound_includes_both_products_and_rejects_non_decreasing_tier() {
     let mut owner = source_draft(&initial, 500);
     let receipts = owner.liquidation_loop(|_| Ok(())).unwrap();
     assert_eq!(
-        receipts.iter().map(|r| r.product).collect::<Vec<_>>(),
+        receipts
+            .iter()
+            .map(|r| r.product.clone())
+            .collect::<Vec<_>>(),
         vec![Product::Btc, Product::Eth]
     );
     assert_eq!(

@@ -40,7 +40,7 @@ fn group_mixed_account_children_fail_before_valid_prior_member() {
             expected_after: context_id(&config, &marks, 500).unwrap(),
             rows: context::Rows::Marks(
                 next.iter()
-                    .map(|m| (m.product, m.valid_from, m.valid_to, m.price))
+                    .map(|m| (m.product.clone(), m.valid_from, m.valid_to, m.price))
                     .collect(),
             ),
         };

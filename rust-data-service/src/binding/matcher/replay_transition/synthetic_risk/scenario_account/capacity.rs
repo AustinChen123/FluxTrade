@@ -262,7 +262,7 @@ impl ScenarioAccount {
                 Some(Ok(RemainingOrder {
                     order_id: facts.order_id.clone(),
                     remainder: Candidate {
-                        product: facts.product,
+                        product: facts.product.clone(),
                         quantity: facts.remaining,
                         price: facts.price,
                     },

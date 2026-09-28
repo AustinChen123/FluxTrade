@@ -38,21 +38,21 @@ enum ProfileContext {
     P1O03,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum ProfileProduct {
     BtcEth(Product),
     Pa,
 }
 
 impl ProfileProduct {
-    fn canonical_id(self) -> &'static str {
+    fn canonical_id(&self) -> &str {
         match self {
             Self::BtcEth(product) => product_id(product),
             Self::Pa => "P_A",
         }
     }
 
-    fn btc(self) -> Result<Product, Fault> {
+    fn btc(&self) -> Result<&Product, Fault> {
         match self {
             Self::BtcEth(product) => Ok(product),
             Self::Pa => Err("PROFILE_MISMATCH"),
@@ -259,7 +259,7 @@ fn seed_profile_execution_key(key: &AccountKey, product: ProfileProduct, id: &st
     ])
 }
 
-fn product_id(product: Product) -> &'static str {
+fn product_id(product: &Product) -> &str {
     match product {
         Product::Btc => "BTC-USDT-SWAP",
         Product::Eth => "ETH-USDT-SWAP",
@@ -269,13 +269,13 @@ fn product_id(product: Product) -> &'static str {
 fn context_id(scenario: &FrozenScenario, marks: &[Mark], at: i64) -> Result<Hash, Fault> {
     let mut fields = Vec::new();
     for product in [Product::Btc, Product::Eth] {
-        let (spec, tier) = scenario.resolve(product, at)?;
+        let (spec, tier) = scenario.resolve(&product, at)?;
         let mark = marks
             .iter()
             .find(|m| m.product == product && m.valid_from <= at && at < m.valid_to)
             .ok_or("MARK_COVERAGE_MISSING")?;
         fields.extend([
-            Some(product_id(product).into()),
+            Some(product_id(&product).into()),
             Some(spec.version.clone()),
             Some(spec.interval.from.to_string()),
             spec.interval.to.map(|v| v.to_string()),
@@ -353,7 +353,7 @@ impl ScenarioAccount {
         let mut seed_ids = BTreeSet::new();
         let mut seed_executions = BTreeSet::new();
         for position in &seed.positions {
-            let (spec, _) = scenario.resolve(position.product, seed.effective_at)?;
+            let (spec, _) = scenario.resolve(&position.product, seed.effective_at)?;
             let mut lots = Vec::new();
             let mut basis = Decimal::ZERO;
             for source in &position.lots {
@@ -371,8 +371,11 @@ impl ScenarioAccount {
                 let base_quantity =
                     mul(mul(source.contracts, spec.contract_value)?, spec.multiplier)?;
                 basis = add(basis, mul(base_quantity, source.entry)?)?;
-                let execution_id =
-                    seed_execution_key(&seed.key, position.product, &source.seed_execution_id);
+                let execution_id = seed_execution_key(
+                    &seed.key,
+                    position.product.clone(),
+                    &source.seed_execution_id,
+                );
                 seed_executions.insert(execution_id);
                 lots.push(EntryLot {
                     source: source.clone(),
@@ -387,7 +390,7 @@ impl ScenarioAccount {
             });
             if positions
                 .insert(
-                    position.product,
+                    position.product.clone(),
                     ProductPosition {
                         side: position.side,
                         contracts: position.contracts,
@@ -439,7 +442,7 @@ impl ScenarioAccount {
             }
             if order.reduce_only
                 && !positions
-                    .get(&product)
+                    .get(product)
                     .is_some_and(|p| p.side != order.side && order.remaining <= p.contracts)
             {
                 return Err("REDUCE_ONLY_NOT_REDUCING");
@@ -506,7 +509,7 @@ impl ScenarioAccount {
                 .btc()?
                 .iter()
                 .map(|(product, position)| NetPosition {
-                    product: *product,
+                    product: product.clone(),
                     side: position.side,
                     contracts: position.contracts,
                     lots: position

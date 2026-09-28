@@ -69,7 +69,7 @@ pub(super) fn calculate(
         available_margin: Decimal::ZERO,
     };
     for product in [Product::Btc, Product::Eth] {
-        let (spec, _) = scenario.resolve(product, input.effective_at)?;
+        let (spec, _) = scenario.resolve(&product, input.effective_at)?;
         let mark = marks
             .iter()
             .find(|m| {
@@ -87,7 +87,7 @@ pub(super) fn calculate(
         let mut short = Decimal::ZERO;
         for order in resting
             .iter()
-            .filter(|o| o.product == ProfileProduct::BtcEth(product))
+            .filter(|o| matches!(&o.product, ProfileProduct::BtcEth(p) if p == &product))
         {
             if order.remaining < spec.minimum
                 || order.original < spec.minimum
@@ -122,7 +122,7 @@ pub(super) fn calculate(
             snapshot.total_fee_hold = add(snapshot.total_fee_hold, fee)?;
             snapshot.orders.push(OrderReservation {
                 order_id: order.order_id.clone(),
-                product,
+                product: product.clone(),
                 side: order.side,
                 remaining_contracts: order.remaining,
                 remaining_base_exposure: base,

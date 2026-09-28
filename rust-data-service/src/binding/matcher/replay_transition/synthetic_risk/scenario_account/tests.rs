@@ -1,6 +1,28 @@
 use super::*;
 use std::str::FromStr;
 
+#[test]
+fn borrowed_product_identity_preserves_tokens_order_and_profile_errors() {
+    let mut products = [Product::Eth, Product::Btc];
+    products.sort();
+    assert_eq!(
+        products.map(|p| product_id(&p).to_owned()),
+        ["BTC-USDT-SWAP", "ETH-USDT-SWAP"]
+    );
+    for (product, token) in [
+        (Product::Btc, "BTC-USDT-SWAP"),
+        (Product::Eth, "ETH-USDT-SWAP"),
+    ] {
+        let profile = ProfileProduct::BtcEth(product.clone());
+        assert_eq!(profile.canonical_id(), token);
+        assert_eq!(profile.btc(), Ok(&product));
+        assert_eq!(profile.clone(), profile);
+        assert_eq!(product.clone(), product);
+    }
+    assert_eq!(ProfileProduct::Pa.canonical_id(), "P_A");
+    assert_eq!(ProfileProduct::Pa.btc(), Err("PROFILE_MISMATCH"));
+}
+
 pub(super) fn d(value: &str) -> Decimal {
     Decimal::from_str(value).unwrap()
 }
@@ -10,8 +32,8 @@ pub(super) fn fixture() -> (CleanSeed, FrozenScenario, Vec<Mark>) {
     let mut tiers = Vec::new();
     for product in [Product::Btc, Product::Eth] {
         for second in [false, true] {
-            specs.push(frozen_spec(product, second));
-            tiers.push(frozen_tiers(product, second));
+            specs.push(frozen_spec(&product, second));
+            tiers.push(frozen_tiers(&product, second));
         }
     }
     let positions = vec![SeedPosition {
@@ -82,7 +104,7 @@ fn seed_origin_is_resolved_by_product_and_seed_effective_time() {
             let (mut seed, config, marks) = fixture();
             seed.effective_at = at;
             seed.orders.clear();
-            seed.positions[0].product = product;
+            seed.positions[0].product = product.clone();
             for lot in &mut seed.positions[0].lots {
                 lot.entry = d("2000");
             }

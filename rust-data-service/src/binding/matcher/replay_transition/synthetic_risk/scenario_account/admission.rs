@@ -457,7 +457,7 @@ impl ScenarioAccount {
                         order_id: order_id.clone(),
                         client_id: intent.client_order_id.clone(),
                         strategy_id: intent.strategy_id.clone(),
-                        product: intent.product,
+                        product: intent.product.clone(),
                         side: intent.side,
                         price,
                         reduce_only: intent.reduce_only,
@@ -482,7 +482,7 @@ impl ScenarioAccount {
                 ProfileContext::EventLimit(_) => return Err("UNSUPPORTED_ADMISSION_PROFILE"),
                 ProfileContext::GoldenCapacity(_) | ProfileContext::P1O03 => {
                     let projection = self.capacity_projection(&capacity::Candidate {
-                        product: intent.product,
+                        product: intent.product.clone(),
                         quantity: intent.quantity,
                         price,
                     })?;

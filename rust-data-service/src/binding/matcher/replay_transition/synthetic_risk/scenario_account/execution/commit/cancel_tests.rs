@@ -14,7 +14,7 @@ fn activated_tick_context_executes_aligned_price_against_fractional_origin_lot()
     ] {
         let (mut seed, config, mut marks) = fixture();
         seed.effective_at = 1999;
-        seed.positions[0].product = product;
+        seed.positions[0].product = product.clone();
         seed.positions[0].contracts = d("1");
         seed.positions[0].lots.truncate(1);
         seed.positions[0].lots[0].entry = d(entry);
@@ -24,7 +24,7 @@ fn activated_tick_context_executes_aligned_price_against_fractional_origin_lot()
             .unwrap()
             .price = d(price);
         let order = &mut seed.orders[0];
-        order.product = ProfileProduct::BtcEth(product);
+        order.product = ProfileProduct::BtcEth(product.clone());
         order.price = d(price);
         order.original = d("0.5");
         order.filled = Decimal::ZERO;
@@ -206,7 +206,7 @@ fn candidate(
     let (_, mut c) = super::super::tests::fixture_candidate();
     let order = &owner.orders[id];
     c.template.key.account = owner.key.clone();
-    c.template.key.product = order.facts.product;
+    c.template.key.product = order.facts.product.clone();
     c.template.key.external_id = external.into();
     c.event_id = format!("event-{external}");
     c.template.matching_effective_at = owner

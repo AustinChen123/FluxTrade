@@ -25,8 +25,8 @@ fn closed_fee_policies_have_exact_rates_and_amounts() {
 #[test]
 fn origin_spec_preserves_fractional_fifo_under_active_v2_for_both_fee_policies() {
     let (_, config, _) = fixture();
-    let (v1, _) = config.resolve(Product::Btc, 1999).unwrap();
-    let (v2, _) = config.resolve(Product::Btc, 2000).unwrap();
+    let (v1, _) = config.resolve(&Product::Btc, 1999).unwrap();
+    let (v2, _) = config.resolve(&Product::Btc, 2000).unwrap();
     for (side, opposing, pnl) in [
         (Side::Long, Side::Short, "0.0135"),
         (Side::Short, Side::Long, "-0.0135"),
@@ -148,7 +148,7 @@ fn missing_unknown_and_corrupt_origin_fail_closed_without_mutation() {
         .lots
         .iter()
         .all(|lot| lot.origin_spec_version == "spec-v1"));
-    let (active, _) = config.resolve(Product::Btc, 2000).unwrap();
+    let (active, _) = config.resolve(&Product::Btc, 2000).unwrap();
     for (version, error) in [
         ("", "INVALID_LOT_ORIGIN_SPEC"),
         ("unknown", "INVALID_LOT_ORIGIN_SPEC"),
@@ -196,7 +196,7 @@ fn missing_unknown_and_corrupt_origin_fail_closed_without_mutation() {
 
 #[test]
 fn long_and_short_fifo_golden_traces_are_pure_and_exact() {
-    let spec = frozen_spec(Product::Btc, false);
+    let spec = frozen_spec(&Product::Btc, false);
     let (_, config, _) = fixture();
     for (side, rows, ending_cash) in [
         (
@@ -293,7 +293,7 @@ fn reducing_stress_uses_actual_fee_and_preserves_input() {
             Side::Short,
             d("0.5"),
             d(price),
-            (&config, &frozen_spec(Product::Btc, false)),
+            (&config, &frozen_spec(&Product::Btc, false)),
             FeePolicy::BtcEthTradingTaker,
             None,
         )
@@ -324,7 +324,7 @@ fn invalid_and_nonexact_hypotheticals_never_mutate_inputs() {
     let (seed, config, marks) = fixture();
     let owner = ScenarioAccount::from_seed(&seed, &config, &marks).unwrap();
     let position = &owner.positions.btc().unwrap()[&Product::Btc];
-    let spec = frozen_spec(Product::Btc, false);
+    let spec = frozen_spec(&Product::Btc, false);
     let (_, config, _) = fixture();
     for (quantity, price) in [
         ("4", "50000"),
@@ -425,7 +425,7 @@ fn strict_stress_threshold_equalities_remain_visible_to_future_admission() {
             Side::Short,
             d("0.5"),
             d(price),
-            (&config, &frozen_spec(Product::Btc, false)),
+            (&config, &frozen_spec(&Product::Btc, false)),
             FeePolicy::BtcEthTradingTaker,
             None,
         )

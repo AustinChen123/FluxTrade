@@ -52,7 +52,7 @@ fn o03_zero_fee_cannot_enter_other_settlement_contexts() {
     use super::super::hypothetical_settlement::{self as settlement, Context, FeePolicy};
     let config = super::super::golden_cancel::Config::frozen();
     let (seed, scenario, _) = fixture();
-    let (spec, _) = scenario.resolve(Product::Btc, seed.effective_at).unwrap();
+    let (spec, _) = scenario.resolve(&Product::Btc, seed.effective_at).unwrap();
     for (context, expected) in [
         (Context::GoldenCancel(&config), "UNSUPPORTED_FEE_INPUT"),
         (Context::BtcEth(&scenario, spec), "UNSUPPORTED_SPEC"),

@@ -138,7 +138,7 @@ pub(in super::super::super) fn input(
     let (_, mut result) = fixture_candidate();
     let order = &owner.orders[order_id];
     result.template.key.account = owner.key.clone();
-    result.template.key.product = order.facts.product;
+    result.template.key.product = order.facts.product.clone();
     result.template.key.external_id = execution.into();
     result.event_id = format!("event-{execution}");
     result.template.matching_effective_at = owner

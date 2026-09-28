@@ -288,7 +288,7 @@ fn greater_eth_mmr_precedes_canonical_first_btc_without_mutation() {
         r.valuation_before
             .products
             .iter()
-            .map(|p| (p.product, p.maintenance_margin))
+            .map(|p| (p.product.clone(), p.maintenance_margin))
             .collect::<Vec<_>>(),
         vec![(Product::Btc, d("2")), (Product::Eth, d("2.4"))]
     );

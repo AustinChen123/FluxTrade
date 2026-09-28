@@ -176,7 +176,7 @@ impl ScenarioAccount {
             } else {
                 let product = template.key.product.btc()?;
                 let before_reservation = self.reservation()?;
-                let position_before = self.positions.btc()?.get(&product).cloned();
+                let position_before = self.positions.btc()?.get(product).cloned();
                 let opening = position_before
                     .as_ref()
                     .is_none_or(|p| p.side == template.side)
@@ -218,10 +218,10 @@ impl ScenarioAccount {
         match (&mut self.positions, product) {
             (PositionState::BtcEth(positions), Some(product)) => match &settled.position {
                 Some(position) => {
-                    positions.insert(product, position.clone());
+                    positions.insert(product.clone(), position.clone());
                 }
                 None => {
-                    positions.remove(&product);
+                    positions.remove(product);
                 }
             },
             (PositionState::EventLimit(position), None) => *position = settled.position.clone(),
@@ -244,7 +244,7 @@ impl ScenarioAccount {
         let order_version_after = order.version;
         let order_after = order.facts.clone();
         let order_created_at = order.created_at;
-        let contract_value = match template.key.product {
+        let contract_value = match &template.key.product {
             ProfileProduct::BtcEth(product) => {
                 self.btc_context()?
                     .0
@@ -278,7 +278,7 @@ impl ScenarioAccount {
             state_version_after: self.state_version,
             order_version_before,
             order_version_after,
-            product: template.key.product,
+            product: template.key.product.clone(),
             order_id: template.order_id.clone(),
             quantity: template.quantity,
             price: template.price,

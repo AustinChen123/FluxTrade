@@ -22,7 +22,7 @@ impl ScenarioAccount {
             e.hash(r.canonical_payload_digest);
             e.text(&r.trigger_event_id);
             e.integer(r.step_index);
-            e.text(product_id(r.product));
+            e.text(product_id(&r.product));
             e.text(side_name(r.position_side_before));
             e.text(side_name(r.execution_side));
             decimals(e, &[r.contracts, r.base_quantity, r.mark]);
@@ -156,7 +156,7 @@ impl Receipt {
         e.hash(self.liquidation_id);
         e.text(&self.trigger_event_id);
         e.integer(self.step_index);
-        e.text(product_id(self.product));
+        e.text(product_id(&self.product));
         e.text(side_name(self.position_side_before));
         e.text(side_name(self.execution_side));
         for value in [self.contracts, self.base_quantity, self.mark] {
@@ -248,7 +248,7 @@ fn prepare_step(owner: &ScenarioAccount, history: &[Receipt]) -> Result<commit::
     }
     let valuation_before = scenario.evaluate(&before, marks)?;
     for (product, position) in owner.positions.btc()? {
-        let (spec, _) = scenario.resolve(*product, before.effective_at)?;
+        let (spec, _) = scenario.resolve(product, before.effective_at)?;
         hypothetical_settlement::validate_existing(
             position,
             (scenario, spec).into(),
@@ -261,12 +261,12 @@ fn prepare_step(owner: &ScenarioAccount, history: &[Receipt]) -> Result<commit::
         .min_by(|a, b| {
             b.maintenance_margin
                 .cmp(&a.maintenance_margin)
-                .then_with(|| product_id(a.product).cmp(product_id(b.product)))
+                .then_with(|| product_id(&a.product).cmp(product_id(&b.product)))
         })
         .ok_or("INVALID_RISK_EPISODE")?;
-    let product = selected.product;
+    let product = selected.product.clone();
     let position_before = owner.positions.btc()?[&product].clone();
-    let (spec, tiers) = scenario.resolve(product, before.effective_at)?;
+    let (spec, tiers) = scenario.resolve(&product, before.effective_at)?;
     let target = if selected.tier == 1 {
         Decimal::ZERO
     } else {
@@ -318,7 +318,10 @@ fn prepare_step(owner: &ScenarioAccount, history: &[Receipt]) -> Result<commit::
         .ok_or("SEQUENCE_OVERFLOW")?;
     match &settlement.position {
         Some(position) => {
-            draft.positions.btc_mut()?.insert(product, position.clone());
+            draft
+                .positions
+                .btc_mut()?
+                .insert(product.clone(), position.clone());
         }
         None => {
             draft.positions.btc_mut()?.remove(&product);

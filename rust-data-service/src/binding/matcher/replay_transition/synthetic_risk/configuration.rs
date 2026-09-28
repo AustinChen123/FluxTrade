@@ -16,12 +16,12 @@ pub(super) fn interval(second: bool, boundary: i64) -> Interval {
 }
 
 // These are the frozen Scenario §§3/7 inputs, never provider defaults.
-pub(super) fn frozen_spec(product: Product, second: bool) -> Spec {
+pub(super) fn frozen_spec(product: &Product, second: bool) -> Spec {
     Spec {
-        product,
+        product: product.clone(),
         version: if second { "spec-v2" } else { "spec-v1" }.into(),
         interval: interval(second, 2000),
-        contract_value: Decimal::new(1, if product == Product::Btc { 2 } else { 1 }),
+        contract_value: Decimal::new(1, if *product == Product::Btc { 2 } else { 1 }),
         multiplier: Decimal::ONE,
         tick: Decimal::new(
             1,
@@ -36,7 +36,7 @@ pub(super) fn frozen_spec(product: Product, second: bool) -> Spec {
     }
 }
 
-pub(super) fn frozen_tiers(product: Product, second: bool) -> TierVersion {
+pub(super) fn frozen_tiers(product: &Product, second: bool) -> TierVersion {
     let maximums = match product {
         Product::Btc => [1000, 5000, 20000],
         Product::Eth => [5000, 10000, 25000],
@@ -49,7 +49,7 @@ pub(super) fn frozen_tiers(product: Product, second: bool) -> TierVersion {
         [10000, 6666, 5000]
     };
     TierVersion {
-        product,
+        product: product.clone(),
         version: if second { "tier-v2" } else { "tier-v1" }.into(),
         interval: interval(second, 1000),
         tiers: std::array::from_fn(|i| Tier {
@@ -87,8 +87,8 @@ impl FrozenScenario {
         // unsupported migrations, including future versions, before any output.
         for product in [Product::Btc, Product::Eth] {
             for second in [false, true] {
-                let spec = frozen_spec(product, second);
-                let tier = frozen_tiers(product, second);
+                let spec = frozen_spec(&product, second);
+                let tier = frozen_tiers(&product, second);
                 if specs.iter().filter(|v| **v == spec).count() != 1
                     || tiers.iter().filter(|v| **v == tier).count() != 1
                 {

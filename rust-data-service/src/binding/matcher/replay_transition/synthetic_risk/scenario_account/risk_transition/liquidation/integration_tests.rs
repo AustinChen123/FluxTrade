@@ -113,7 +113,10 @@ fn tied_products_complete_identically_across_seed_insertion_orders() {
         assert_eq!(owner.transition.accepted_stamp.as_ref(), Some(&input.stamp));
         let receipts = &owner.transition.liquidations;
         assert_eq!(
-            receipts.iter().map(|r| r.product).collect::<Vec<_>>(),
+            receipts
+                .iter()
+                .map(|r| r.product.clone())
+                .collect::<Vec<_>>(),
             vec![Product::Btc, Product::Eth]
         );
         assert_eq!(

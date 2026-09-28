@@ -172,7 +172,7 @@ fn tick_migration_cancels_only_misaligned_and_reuses_pending_phase_one() {
             seed.effective_at = 1999;
             seed.positions[0].contracts = d("1");
             seed.positions[0].lots.truncate(1);
-            seed.positions[0].product = product;
+            seed.positions[0].product = product.clone();
             seed.positions[0].lots[0].entry = d(entry);
             marks
                 .iter_mut()
@@ -180,7 +180,7 @@ fn tick_migration_cancels_only_misaligned_and_reuses_pending_phase_one() {
                 .unwrap()
                 .price = d(mark);
             let order = &mut seed.orders[0];
-            order.product = ProfileProduct::BtcEth(product);
+            order.product = ProfileProduct::BtcEth(product.clone());
             order.price = d(entry);
             order.original = d("0.5");
             order.filled = Decimal::ZERO;

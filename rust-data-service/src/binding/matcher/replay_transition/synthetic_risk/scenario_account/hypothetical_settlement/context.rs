@@ -33,14 +33,14 @@ impl<'a> Context<'a> {
             tick: spec.tick,
             lot: spec.lot,
             minimum: spec.minimum,
-            maximum: frozen_tiers(spec.product, false).tiers[2].maximum,
+            maximum: frozen_tiers(&spec.product, false).tiers[2].maximum,
         }
     }
 
     pub(super) fn active(self, fee: FeePolicy) -> Result<Scaling<'a>, Fault> {
         match self {
             Self::BtcEth(_, spec) => {
-                if *spec != frozen_spec(spec.product, spec.version == "spec-v2")
+                if *spec != frozen_spec(&spec.product, spec.version == "spec-v2")
                     || matches!(
                         fee,
                         FeePolicy::GoldenCancelTradingTaker | FeePolicy::P1O03Zero

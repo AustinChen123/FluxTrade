@@ -21,7 +21,7 @@ fn event_limit_rejects_unmapped_execution_identity() {
 
 pub(super) fn fixture_candidate() -> (ScenarioAccount, ExecutionCandidate) {
     let (seed, scenario, marks) = fixture();
-    let (spec, tier) = scenario.resolve(Product::Btc, 500).unwrap();
+    let (spec, tier) = scenario.resolve(&Product::Btc, 500).unwrap();
     let candidate = ExecutionCandidate {
         template: ExecutionTemplate {
             key: ExternalExecutionKey {
@@ -118,7 +118,7 @@ fn receipt_fixture(owner: &ScenarioAccount, candidate: &ExecutionCandidate) -> C
         state_version_after: 1,
         order_version_before: 0,
         order_version_after: 1,
-        product: template.key.product,
+        product: template.key.product.clone(),
         order_id: template.order_id.clone(),
         quantity: template.quantity,
         price: template.price,

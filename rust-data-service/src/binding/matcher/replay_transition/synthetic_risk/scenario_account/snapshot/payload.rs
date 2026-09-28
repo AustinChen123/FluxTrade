@@ -167,7 +167,7 @@ pub(super) fn current(owner: &ScenarioAccount, kind: Kind) -> Result<Payload, Fa
                             })
                             .ok_or("NATIVE_INVARIANT")?;
                         rows.push(PositionRow {
-                            product: product_id(v.product).into(),
+                            product: product_id(&v.product).into(),
                             contracts: if p.side == Side::Long {
                                 p.contracts
                             } else {

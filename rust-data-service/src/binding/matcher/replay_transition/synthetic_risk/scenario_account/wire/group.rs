@@ -105,6 +105,7 @@ fn member(value: &Json, account: &AccountKey) -> Result<Member, Fault> {
                         r["product_id"]
                             .product()?
                             .btc()
+                            .cloned()
                             .map_err(|_| "INVALID_SCHEMA")?,
                         r["valid_from"].integer(false)?,
                         r["valid_to"].integer(false)?,

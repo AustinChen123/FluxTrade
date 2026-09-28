@@ -12,7 +12,7 @@ use configuration::{frozen_spec, frozen_tiers, interval};
 mod scenario_account;
 pub(crate) use scenario_account::register_python;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Product {
     Btc,
     Eth,
@@ -67,15 +67,15 @@ struct FrozenScenario {
 }
 
 impl FrozenScenario {
-    fn resolve(&self, product: Product, at: i64) -> Result<(&Spec, &TierVersion), Fault> {
+    fn resolve(&self, product: &Product, at: i64) -> Result<(&Spec, &TierVersion), Fault> {
         let spec = self
             .specs
             .iter()
-            .find(|v| v.product == product && v.interval.contains(at));
+            .find(|v| &v.product == product && v.interval.contains(at));
         let tier = self
             .tiers
             .iter()
-            .find(|v| v.product == product && v.interval.contains(at));
+            .find(|v| &v.product == product && v.interval.contains(at));
         match (spec, tier) {
             (Some(s), Some(t)) => Ok((s, t)),
             _ => Err("VERSION_COVERAGE_MISSING"),
@@ -102,7 +102,7 @@ impl FrozenScenario {
             {
                 return Err("DUPLICATE_NET_POSITION");
             }
-            let (spec, tier_version) = self.resolve(position.product, input.effective_at)?;
+            let (spec, tier_version) = self.resolve(&position.product, input.effective_at)?;
             if position.contracts <= Decimal::ZERO
                 || position.lots.is_empty()
                 || position.contracts < spec.minimum
@@ -154,7 +154,7 @@ impl FrozenScenario {
             mmr = add(mmr, contribution)?;
             exposure = add(exposure, margin)?;
             products.push(ProductValuation {
-                product: position.product,
+                product: position.product.clone(),
                 spec_version: spec.version.clone(),
                 tier_version: tier_version.version.clone(),
                 tier: tier_index + 1,
@@ -165,7 +165,7 @@ impl FrozenScenario {
                 exposure_margin: margin,
             });
         }
-        products.sort_by_key(|v| v.product);
+        products.sort_by(|a, b| a.product.cmp(&b.product));
         let equity = signed_sum(&equity_terms)?;
         Ok(IncompleteValuation {
             account_version: input.account_version,
@@ -340,8 +340,8 @@ mod tests {
         let mut tiers = Vec::new();
         for product in [Product::Btc, Product::Eth] {
             for second in [false, true] {
-                specs.push(frozen_spec(product, second));
-                tiers.push(frozen_tiers(product, second));
+                specs.push(frozen_spec(&product, second));
+                tiers.push(frozen_tiers(&product, second));
             }
         }
         FrozenScenario::new(d("10"), specs, tiers).unwrap()
@@ -390,7 +390,7 @@ mod tests {
                 (2000, "spec-v2", "tier-v2", "1", "0.1"),
                 (2001, "spec-v2", "tier-v2", "1", "0.1"),
             ] {
-                let (spec, tier) = config.resolve(product, at).unwrap();
+                let (spec, tier) = config.resolve(&product, at).unwrap();
                 assert_eq!((&*spec.version, &*tier.version), (spec_id, tier_id));
                 assert_eq!(
                     spec.tick,
@@ -401,7 +401,10 @@ mod tests {
                     })
                 );
             }
-            assert_eq!(config.resolve(product, -1), Err("VERSION_COVERAGE_MISSING"));
+            assert_eq!(
+                config.resolve(&product, -1),
+                Err("VERSION_COVERAGE_MISSING")
+            );
         }
     }
 
@@ -602,7 +605,7 @@ mod tests {
             (Product::Eth, "10000.01", 3, "375000.375"),
             (Product::Eth, "25000", 3, "937500"),
         ] {
-            let state = input("1000", vec![position(product, quantity, "50000")]);
+            let state = input("1000", vec![position(product.clone(), quantity, "50000")]);
             let value = config
                 .evaluate(&state, &[mark(product, "50000", 0, 3000)])
                 .unwrap();

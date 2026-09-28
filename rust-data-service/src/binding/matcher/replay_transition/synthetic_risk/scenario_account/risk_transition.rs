@@ -132,7 +132,7 @@ impl ScenarioAccount {
                 || (reason == Some(cancel::Reason::RiskShortfall)
                     && remainder_eligibility(
                         &order.facts,
-                        self.positions.btc()?.get(&order.facts.product.btc()?),
+                        self.positions.btc()?.get(order.facts.product.btc()?),
                     ) != Ok(RemainderRole::Reducing)))
                 && matches!(order.cancel, cancel::State::None)
             {

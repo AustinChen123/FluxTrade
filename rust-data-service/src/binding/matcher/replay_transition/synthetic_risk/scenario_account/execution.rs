@@ -388,8 +388,7 @@ impl ScenarioAccount {
         if !order.facts.projects_remainder("UNSUPPORTED_EXECUTION")? {
             return Err("UNSUPPORTED_EXECUTION");
         }
-        if let Err(reason) =
-            remainder_eligibility(&order.facts, self.positions.btc()?.get(&product))
+        if let Err(reason) = remainder_eligibility(&order.facts, self.positions.btc()?.get(product))
         {
             return Ok(Preparation::Rejected(reason));
         }

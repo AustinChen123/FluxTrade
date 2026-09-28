@@ -53,7 +53,7 @@ pub(super) fn evaluate(
     let (scenario, marks) = current.btc_context()?;
     let input = current.projection()?;
     let value = scenario.evaluate(&input, marks)?;
-    let position = current.positions.btc()?.get(&product);
+    let position = current.positions.btc()?.get(product);
     let role = classify(
         position.map(|p| (p.side, p.contracts)),
         intent.side,
@@ -96,10 +96,10 @@ pub(super) fn evaluate(
         )?;
         let mut stress_input = input;
         stress_input.cash = add(stress_input.cash, settlement.cash_delta)?;
-        stress_input.positions.retain(|p| p.product != product);
+        stress_input.positions.retain(|p| &p.product != product);
         if let Some(position) = settlement.position {
             stress_input.positions.push(NetPosition {
-                product,
+                product: product.clone(),
                 side: position.side,
                 contracts: position.contracts,
                 lots: position
