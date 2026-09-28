@@ -74,6 +74,9 @@ fn cancel_request(e: &mut Encoding, r: &cancel::CanonicalRequest) {
     e.hash(r.delivery_action_id);
 }
 impl ScenarioAccount {
+    pub(super) fn owner_evidence_digest(&self) -> Result<Hash, Fault> {
+        Ok(self.inspect_state()?.owner_state_digest)
+    }
     fn encode_inspection_sources(&self, e: &mut Encoding) -> Result<(), Fault> {
         number(e, self.transition.event_kinds.len())?;
         for (id, kind) in &self.transition.event_kinds {

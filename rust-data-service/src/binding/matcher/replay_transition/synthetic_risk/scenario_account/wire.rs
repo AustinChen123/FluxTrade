@@ -7,6 +7,7 @@ use std::fmt::{self, Write};
 
 pub(super) mod group;
 pub(super) mod profiles;
+pub(super) mod result;
 #[cfg(test)]
 mod tests;
 
