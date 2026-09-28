@@ -1,6 +1,7 @@
 //! Pure committed-fact projection; no delivery store, clock, or financial writer.
 use super::*;
 use risk_transition::cancel::identity::Encoding;
+mod identity;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Transport {

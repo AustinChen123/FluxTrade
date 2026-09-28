@@ -22,6 +22,9 @@ pub(in super::super::super) fn classify<T>(
 
 pub(in super::super::super) struct Encoding(Vec<u8>);
 impl Encoding {
+    pub(in super::super::super) fn presence(&mut self, present: bool) {
+        self.0.push(u8::from(present));
+    }
     pub(in super::super::super) fn optional_integer(&mut self, value: Option<i64>) {
         match value {
             Some(v) => {

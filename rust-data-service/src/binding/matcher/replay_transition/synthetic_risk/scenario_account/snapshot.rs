@@ -66,7 +66,7 @@ impl Request {
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Fact {
+pub(super) struct Fact {
     snapshot_id: String,
     request_digest: Hash,
     kind: Kind,
@@ -77,6 +77,9 @@ struct Fact {
     payload_digest: Hash,
 }
 impl Fact {
+    pub(super) fn encode_payload(&self, e: &mut Encoding) -> Result<(), Fault> {
+        self.payload.encode(e)
+    }
     fn digest(&self) -> Result<Hash, Fault> {
         let mut e = Encoding::new("SCENARIO_SNAPSHOT_PAYLOAD_V1");
         e.text("SNAPSHOT");
