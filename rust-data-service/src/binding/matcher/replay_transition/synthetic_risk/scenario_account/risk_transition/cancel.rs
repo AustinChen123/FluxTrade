@@ -5,6 +5,79 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 pub(in super::super) mod identity;
 use identity::{classify, PreparedAction, Stored};
+#[cfg(test)]
+mod inspection_tests;
+
+fn inspection_outcome(outcome: Outcome) -> &'static str {
+    match outcome {
+        Outcome::Requested => "REQUESTED",
+        Outcome::EffectiveCanceled => "EFFECTIVE_CANCELED",
+        Outcome::EffectiveTooLate => "EFFECTIVE_TOO_LATE",
+    }
+}
+impl Facts {
+    pub(in super::super) fn encode_inspection_receipts(
+        &self,
+        e: &mut identity::Encoding,
+    ) -> Result<(), Fault> {
+        use inspection::{number, order_facts};
+        for receipts in [&self.requests, &self.effects] {
+            number(e, receipts.len())?;
+            for (key, stored) in receipts {
+                let r = &stored.value;
+                e.hash(*key);
+                e.hash(stored.digest);
+                e.account(&r.account_key);
+                e.hash(r.action_id);
+                e.hash(r.payload_digest);
+                for s in [&r.event_id, &r.detecting_event_id, &r.target_order_id] {
+                    e.text(s);
+                }
+                e.text(r.reason.name());
+                e.integer(r.phase);
+                e.text(inspection_outcome(r.outcome));
+                e.integer(r.effective_at);
+                for n in [
+                    r.account_version_before,
+                    r.account_version_after,
+                    r.order_version_before,
+                    r.order_version_after,
+                ] {
+                    number(e, n)?;
+                }
+                order_facts(e, &r.before)?;
+                order_facts(e, &r.after)?;
+                e.text(match r.lifecycle_after {
+                    super::Lifecycle::RiskStable => "RISK_STABLE",
+                    super::Lifecycle::AwaitingCancelEffective => "AWAITING_CANCEL_EFFECTIVE",
+                    super::Lifecycle::LiquidatedFlat => "LIQUIDATED_FLAT",
+                    super::Lifecycle::LiquidatedInsolvent => "LIQUIDATED_INSOLVENT",
+                });
+                e.text(&r.spec_version);
+                e.text(&r.rule_data_version);
+                number(e, r.action_ids.len())?;
+                for id in &r.action_ids {
+                    e.hash(*id);
+                }
+            }
+        }
+        Ok(())
+    }
+    pub(in super::super) fn encode_inspection_actions(
+        &self,
+        e: &mut identity::Encoding,
+    ) -> Result<(), Fault> {
+        inspection::number(e, self.actions.len())?;
+        for (id, action) in &self.actions {
+            e.hash(*id);
+            e.text(&action.detecting_event_id);
+            e.text(&action.target_order_id);
+            e.integer(action.phase);
+            e.optional_text(action.outcome.map(inspection_outcome));
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in super::super) enum Reason {
