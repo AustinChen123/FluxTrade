@@ -7,7 +7,7 @@ import pytest
 from src.core.backtest import spider_policy_protocol, synthetic_scenario_replay
 
 ROOT = Path(__file__).parents[1] / "src/core/backtest"
-ENTRY_POINTS = {"_policy_event_bytes", "_policy_event_digest"}
+ENTRY_POINTS = {"_policy_event_bytes", "_policy_event_digest", "_emission_plan_bytes", "_emission_plan_digest"}
 
 
 def allowed(source, composition=False):
@@ -25,7 +25,7 @@ def allowed(source, composition=False):
         elif not composition and isinstance(node, ast.Name) and node.id == "__import__" and isinstance(node.ctx, ast.Load):
             return False
     if not composition:
-        return imports == {"hashlib", "re", "typing"}
+        return imports == {"hashlib", "re", "typing", "decimal"}
     for node in ast.walk(tree):
         if isinstance(node, (ast.Assign, ast.AnnAssign)) and isinstance(node.value, ast.Attribute):
             if ast.unparse(node.value.value) in aliases and node.value.attr in ENTRY_POINTS:
