@@ -312,6 +312,71 @@ fn context_id(scenario: &FrozenScenario, marks: &[Mark], at: i64) -> Result<Hash
                 fields.push(Some(value.normalize().to_string()));
             }
         }
+        if let Some(configured) = &scenario.configured {
+            let row = configured
+                .iter()
+                .find(|row| row.product == product)
+                .ok_or("INVALID_SCHEMA")?;
+            if row.specs.len() > 1 || row.tiers.len() > 1 || row.marks.len() > 1 {
+                fields.extend([
+                    Some("configured-timelines-v1".into()),
+                    Some("spec-count".into()),
+                    Some(row.specs.len().to_string()),
+                ]);
+                for spec in &row.specs {
+                    fields.extend([
+                        Some("spec".into()),
+                        Some(product_id(&spec.product).into()),
+                        Some(spec.version.clone()),
+                        Some(spec.interval.from.to_string()),
+                        spec.interval.to.map(|value| value.to_string()),
+                    ]);
+                    for value in [
+                        spec.contract_value,
+                        spec.multiplier,
+                        spec.tick,
+                        spec.lot,
+                        spec.minimum,
+                    ] {
+                        fields.push(Some(value.normalize().to_string()));
+                    }
+                }
+                fields.extend([Some("tier-count".into()), Some(row.tiers.len().to_string())]);
+                for version in &row.tiers {
+                    fields.extend([
+                        Some("tier-version".into()),
+                        Some(product_id(&version.product).into()),
+                        Some(version.version.clone()),
+                        Some(version.interval.from.to_string()),
+                        version.interval.to.map(|value| value.to_string()),
+                        Some("tier-row-count".into()),
+                        Some(version.tiers.len().to_string()),
+                    ]);
+                    for tier_row in &version.tiers {
+                        fields.push(Some("tier-row".into()));
+                        for value in [
+                            tier_row.minimum,
+                            tier_row.maximum,
+                            tier_row.mmr,
+                            tier_row.imr,
+                            tier_row.max_leverage,
+                        ] {
+                            fields.push(Some(value.normalize().to_string()));
+                        }
+                    }
+                }
+                fields.extend([Some("mark-count".into()), Some(row.marks.len().to_string())]);
+                for mark_row in &row.marks {
+                    fields.extend([
+                        Some("mark".into()),
+                        Some(product_id(&mark_row.product).into()),
+                        Some(mark_row.valid_from.to_string()),
+                        Some(mark_row.valid_to.to_string()),
+                        Some(mark_row.price.normalize().to_string()),
+                    ]);
+                }
+            }
+        }
     }
     Ok(hash_fields(&fields))
 }

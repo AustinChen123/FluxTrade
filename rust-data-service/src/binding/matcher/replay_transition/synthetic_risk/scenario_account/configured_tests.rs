@@ -1,6 +1,12 @@
 use super::*;
 use tests::{d, fixture};
 
+// Oracle from the committed c7c57dd singleton configured encoding.
+const PARENT_SINGLETON_CONTEXT: [u8; 32] = [
+    0x95, 0x37, 0xb1, 0x11, 0x6d, 0xa6, 0x12, 0x8f, 0x4d, 0xfa, 0xd8, 0x01, 0x7a, 0xbd, 0x02, 0xa5,
+    0x11, 0xb4, 0xf5, 0xc3, 0xe5, 0x9f, 0x32, 0x57, 0x06, 0xa1, 0xa9, 0x9e, 0x40, 0x57, 0xca, 0xfe,
+];
+
 fn input(count: usize) -> (CleanSeed, Vec<ConfiguredProduct>) {
     let mut seed = fixture().0;
     seed.config_id = "SYNTHETIC_P2_SCALE_12_V1".into();
@@ -63,26 +69,61 @@ fn multi_version_input() -> (CleanSeed, ConfiguredProduct) {
     let (mut seed, mut products) = input(1);
     seed.effective_at = 50;
     let product = &mut products[0];
-    let mut spec_v2 = product.specs[0].clone();
-    spec_v2.version = "spec-v2".into();
-    spec_v2.interval = interval(true, 100);
-    spec_v2.contract_value = d("2");
-    product.specs[0].interval = interval(false, 100);
-    product.specs.push(spec_v2);
-
-    let mut tier_v2 = product.tiers[0].clone();
-    tier_v2.version = "tier-v2".into();
-    tier_v2.interval = interval(true, 100);
-    tier_v2.tiers[0].mmr = d("0.01");
-    product.tiers[0].interval = interval(false, 100);
-    product.tiers.push(tier_v2);
-
-    let mut mark_v2 = product.marks[0].clone();
-    mark_v2.valid_from = 40;
-    mark_v2.valid_to = 80;
-    mark_v2.price = d("101");
-    product.marks[0].valid_to = 30;
-    product.marks.push(mark_v2);
+    let mut spec1 = product.specs[0].clone();
+    spec1.interval = Interval {
+        from: 0,
+        to: Some(40),
+    };
+    let spec2 = Spec {
+        version: "spec-v2".into(),
+        interval: Interval {
+            from: 40,
+            to: Some(100),
+        },
+        contract_value: d("2"),
+        ..spec1.clone()
+    };
+    let spec3 = Spec {
+        version: "spec-v3".into(),
+        interval: interval(true, 100),
+        ..spec2.clone()
+    };
+    product.specs = vec![spec1, spec2, spec3];
+    let mut tier1 = product.tiers[0].clone();
+    tier1.interval = Interval {
+        from: 0,
+        to: Some(40),
+    };
+    let mut tier2 = TierVersion {
+        version: "tier-v2".into(),
+        interval: Interval {
+            from: 40,
+            to: Some(100),
+        },
+        ..tier1.clone()
+    };
+    tier2.tiers[0].mmr = d("0.01");
+    let tier3 = TierVersion {
+        version: "tier-v3".into(),
+        interval: interval(true, 100),
+        ..tier2.clone()
+    };
+    product.tiers = vec![tier1, tier2, tier3];
+    let mut mark1 = product.marks[0].clone();
+    mark1.valid_to = 30;
+    let mark2 = Mark {
+        valid_from: 40,
+        valid_to: 80,
+        price: d("101"),
+        ..mark1.clone()
+    };
+    let mark3 = Mark {
+        valid_from: 90,
+        valid_to: 200,
+        price: d("102"),
+        ..mark1.clone()
+    };
+    product.marks = vec![mark1, mark2, mark3];
     (seed, products.remove(0))
 }
 fn assert_invalid_timeline(change: impl FnOnce(&mut ConfiguredProduct)) {
@@ -140,6 +181,58 @@ fn configured_scenario(leverage: Decimal, products: &[ConfiguredProduct]) -> Fro
     }
 }
 
+fn timeline_hash(seed: &CleanSeed, product: &ConfiguredProduct) -> Hash {
+    let rows = [product.clone()];
+    context_hash(&configured_scenario(d("10"), &rows), seed, &rows)
+}
+
+fn active_projection(seed: &CleanSeed, product: &ConfiguredProduct) -> (String, String, Decimal) {
+    let rows = [product.clone()];
+    let scenario = configured_scenario(d("10"), &rows);
+    let (spec, tier) = scenario
+        .resolve(&product.product, seed.effective_at)
+        .unwrap();
+    let mark = product
+        .marks
+        .iter()
+        .find(|m| m.valid_from <= seed.effective_at && seed.effective_at < m.valid_to)
+        .unwrap();
+    (spec.version.clone(), tier.version.clone(), mark.price)
+}
+
+fn assert_timeline_changes(
+    seed: &CleanSeed,
+    base: &ConfiguredProduct,
+    cases: &[fn(&mut ConfiguredProduct)],
+) {
+    // Mutations use the private hash seam; some intentionally make inactive rows invalid.
+    let original = timeline_hash(seed, base);
+    let active = active_projection(seed, base);
+    for change in cases {
+        let mut changed = base.clone();
+        change(&mut changed);
+        assert_eq!(active_projection(seed, &changed), active);
+        assert_ne!(timeline_hash(seed, &changed), original);
+    }
+}
+
+fn assert_timeline_scale_equivalent(
+    seed: &CleanSeed,
+    base: &ConfiguredProduct,
+    cases: &[fn(&mut ConfiguredProduct)],
+) {
+    let original = timeline_hash(seed, base);
+    for change in cases {
+        let mut scaled = base.clone();
+        change(&mut scaled);
+        assert_eq!(
+            active_projection(seed, &scaled),
+            active_projection(seed, base)
+        );
+        assert_eq!(timeline_hash(seed, &scaled), original);
+    }
+}
+
 #[test]
 fn configured_empty_owners_preserve_order_and_shared_cash() {
     for count in [1, 2, 12] {
@@ -164,6 +257,9 @@ fn configured_empty_owners_preserve_order_and_shared_cash() {
             products.iter().map(|p| &p.product).collect::<Vec<_>>()
         );
         assert!(owner.positions.is_empty() && owner.orders.is_empty());
+        if count == 1 {
+            assert_eq!(owner.valuation_context_id, PARENT_SINGLETON_CONTEXT);
+        }
         let wire::Json::Object(facts) = owner.inspect_state().unwrap().wire_json().unwrap() else {
             panic!()
         };
@@ -324,13 +420,81 @@ fn configured_multi_version_timelines_resolve_boundaries_and_mark_gaps() {
     let (scenario, marks) = owner.btc_context().unwrap();
     let products = scenario.products();
     for (at, expected) in [
-        (99, ("scale-spec-v1", "scale-tier-v1")),
-        (100, ("spec-v2", "tier-v2")),
+        (39, ("scale-spec-v1", "scale-tier-v1")),
+        (40, ("spec-v2", "tier-v2")),
+        (99, ("spec-v2", "tier-v2")),
+        (100, ("spec-v3", "tier-v3")),
     ] {
         let (spec, tier) = scenario.resolve(&products[0], at).unwrap();
         assert_eq!((spec.version.as_str(), tier.version.as_str()), expected);
     }
     assert_eq!(marks[1].price, d("101"));
+}
+
+#[test]
+fn configured_multi_version_identity_covers_inactive_timelines_causally() {
+    let (seed, product) = multi_version_input();
+    let changes: &[fn(&mut ConfiguredProduct)] = &[
+        |p| p.specs[0].product = Product("changed".into()),
+        |p| p.specs[0].version.push('x'),
+        |p| p.specs[0].interval.from = 1,
+        |p| p.specs[0].interval.to = Some(39),
+        |p| p.specs[0].contract_value += d("1"),
+        |p| p.specs[0].multiplier += d("1"),
+        |p| p.specs[0].tick += d("1"),
+        |p| p.specs[0].lot += d("0.1"),
+        |p| p.specs[0].minimum += d("0.1"),
+        |p| {
+            p.specs.remove(0);
+        },
+        |p| p.specs.push(p.specs[2].clone()),
+        |p| p.tiers[0].product = Product("changed".into()),
+        |p| p.tiers[0].version.push('x'),
+        |p| p.tiers[0].interval.from = 1,
+        |p| p.tiers[0].interval.to = Some(39),
+        |p| p.tiers[0].tiers[0].minimum += d("1"),
+        |p| p.tiers[0].tiers[0].maximum += d("1"),
+        |p| p.tiers[0].tiers[0].mmr += d("0.001"),
+        |p| p.tiers[0].tiers[0].imr += d("0.01"),
+        |p| p.tiers[0].tiers[0].max_leverage += d("1"),
+        |p| {
+            p.tiers.remove(0);
+        },
+        |p| p.tiers.push(p.tiers[2].clone()),
+        |p| {
+            let row = p.tiers[0].tiers[0].clone();
+            p.tiers[0].tiers.push(row);
+        },
+        |p| {
+            p.tiers[0].tiers.remove(0);
+        },
+        |p| p.marks[0].product = Product("changed".into()),
+        |p| p.marks[0].valid_from = 1,
+        |p| p.marks[0].valid_to = 29,
+        |p| p.marks[0].price += d("1"),
+        |p| {
+            p.marks.remove(0);
+        },
+        |p| p.marks.push(p.marks[0].clone()),
+        |p| p.specs.reverse(),
+        |p| p.tiers.reverse(),
+        |p| p.marks.reverse(),
+    ];
+    assert_timeline_changes(&seed, &product, changes);
+    let scales: &[fn(&mut ConfiguredProduct)] = &[
+        |p| p.specs[0].contract_value = d("1.0"),
+        |p| p.specs[0].multiplier = d("1.0"),
+        |p| p.specs[0].tick = d("1.0"),
+        |p| p.specs[0].lot = d("0.50"),
+        |p| p.specs[0].minimum = d("0.50"),
+        |p| p.tiers[0].tiers[0].minimum = d("0.00"),
+        |p| p.tiers[0].tiers[0].maximum = d("100000.0"),
+        |p| p.tiers[0].tiers[0].mmr = d("0.0050"),
+        |p| p.tiers[0].tiers[0].imr = d("0.100"),
+        |p| p.tiers[0].tiers[0].max_leverage = d("10.0"),
+        |p| p.marks[0].price = d("100.0"),
+    ];
+    assert_timeline_scale_equivalent(&seed, &product, scales);
 }
 #[test]
 fn configured_multi_version_rejects_invalid_timeline_shapes_before_owner() {
