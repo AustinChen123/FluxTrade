@@ -160,7 +160,9 @@ impl Store {
                     Kind::Trading | Kind::Positions | Kind::OpenOrders
                 ) || !matches!(
                     owner.profile,
-                    ProfileContext::BtcEthScenario { .. } | ProfileContext::GoldenCancel(_)
+                    ProfileContext::BtcEthScenario { .. }
+                        | ProfileContext::GoldenCancel(_)
+                        | ProfileContext::P1O03
                 ) || request.fixture_key.is_some()
                     || request.captured_at < owner.seed_effective_at
                     || owner

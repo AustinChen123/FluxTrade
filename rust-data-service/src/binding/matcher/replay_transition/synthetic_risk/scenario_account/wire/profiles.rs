@@ -16,6 +16,65 @@ pub(in super::super) fn construct(
         positions: Vec::new(),
         orders: Vec::new(),
     };
+    if profile == "SYNTHETIC_P1_O03_V1" {
+        seed.effective_at = 600;
+        let mut owner =
+            ScenarioAccount::from_golden_cancel_seed(&seed, &golden_cancel::Config::frozen())?;
+        owner.profile = ProfileContext::P1O03;
+        owner.valuation_context_id =
+            capacity::Config::frozen(capacity::Program::P1O03).context_id(600)?;
+        let execution_id =
+            seed_profile_execution_key(&seed.key, ProfileProduct::Pa, "O03-SEED-POS");
+        owner.positions = PositionState::GoldenCancel(Some(ProductPosition {
+            side: Side::Long,
+            contracts: Decimal::from(5),
+            entry_basis: Decimal::from(50),
+            lots: vec![EntryLot {
+                source: SeedLot {
+                    seed_execution_id: "O03-SEED-POS".into(),
+                    seed_sequence: 0,
+                    strategy_id: "o03-seed".into(),
+                    contracts: Decimal::from(5),
+                    entry: Decimal::TEN,
+                },
+                origin_spec_version: "gt03-spec-v1".into(),
+                execution_id,
+                base_quantity: Decimal::from(5),
+            }],
+        }));
+        owner.seed_executions.insert(execution_id);
+        owner.commit_sequence = 1;
+        for (suffix, quantity) in [("OLD1", 2), ("OLD2", 3)] {
+            let order_id = format!("O_{suffix}");
+            let intent_id = format!("I_{suffix}");
+            owner.seed_orders.insert(order_id.clone());
+            owner.seed_intents.insert(intent_id.clone());
+            owner.orders.insert(
+                order_id.clone(),
+                RestingOrder {
+                    created_at: 600,
+                    version: 0,
+                    cancel: risk_transition::cancel::State::None,
+                    facts: SeedOrder {
+                        intent_id,
+                        order_id,
+                        client_id: format!("C_{suffix}"),
+                        strategy_id: "o03-seed".into(),
+                        product: ProfileProduct::Pa,
+                        side: Side::Long,
+                        price: Decimal::TEN,
+                        reduce_only: false,
+                        original: Decimal::from(quantity),
+                        filled: Decimal::ZERO,
+                        canceled: Decimal::ZERO,
+                        remaining: Decimal::from(quantity),
+                        status: "OPEN".into(),
+                    },
+                },
+            );
+        }
+        return Ok(owner);
+    }
     if profile == "SYNTHETIC_GOLDEN_CANCEL_V1" {
         return ScenarioAccount::from_golden_cancel_seed(&seed, &golden_cancel::Config::frozen())
             .map_err(|_| "NATIVE_INVARIANT");

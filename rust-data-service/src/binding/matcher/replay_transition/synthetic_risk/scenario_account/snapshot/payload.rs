@@ -128,13 +128,18 @@ pub(super) fn fixture(key: &str) -> Result<(Payload, i64), Fault> {
 pub(super) fn current(owner: &ScenarioAccount, kind: Kind) -> Result<Payload, Fault> {
     if !matches!(
         owner.profile,
-        ProfileContext::BtcEthScenario { .. } | ProfileContext::GoldenCancel(_)
+        ProfileContext::BtcEthScenario { .. }
+            | ProfileContext::GoldenCancel(_)
+            | ProfileContext::P1O03
     ) {
         return Err("INVALID_SCHEMA");
     }
     Ok(match kind {
         Kind::Trading => {
-            if matches!(owner.profile, ProfileContext::GoldenCancel(_)) {
+            if matches!(
+                owner.profile,
+                ProfileContext::GoldenCancel(_) | ProfileContext::P1O03
+            ) {
                 Payload::Trading(
                     owner.cash,
                     add(owner.cash, -owner.golden_cancel_reservation()?)?,

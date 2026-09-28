@@ -73,7 +73,10 @@ impl ScenarioAccount {
         &mut self,
         stamp: &cancel::Stamp,
     ) -> Result<(FinancialSnapshot, ProfileRisk), Fault> {
-        if matches!(self.profile, ProfileContext::GoldenCancel(_)) {
+        if matches!(
+            self.profile,
+            ProfileContext::GoldenCancel(_) | ProfileContext::P1O03
+        ) {
             return Ok((
                 FinancialSnapshot::GoldenCancel(self.golden_cancel_reservation()?),
                 ProfileRisk::CapacitySafe,

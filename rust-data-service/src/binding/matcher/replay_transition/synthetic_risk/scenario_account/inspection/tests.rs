@@ -1,6 +1,37 @@
 use super::super::tests::{d, fixture};
 use super::*;
 use execution::commit::tests::{at, input};
+
+#[test]
+fn o03_migration_inspection_is_profile_closed_and_binds_action_hash() {
+    let mut owner =
+        super::super::wire::profiles::construct("SYNTHETIC_P1_O03_V1", fixture().0.key).unwrap();
+    owner.orders.get_mut("O_OLD1").unwrap().cancel = cancel::State::MigrationEffective([1; 32]);
+    let first = owner
+        .component(
+            "SCENARIO_ORDERS_EVIDENCE_V1",
+            ScenarioAccount::encode_orders,
+        )
+        .unwrap();
+    owner.orders.get_mut("O_OLD1").unwrap().cancel = cancel::State::MigrationEffective([2; 32]);
+    assert_ne!(
+        first,
+        owner
+            .component(
+                "SCENARIO_ORDERS_EVIDENCE_V1",
+                ScenarioAccount::encode_orders
+            )
+            .unwrap()
+    );
+    owner.profile = ProfileContext::GoldenCancel(golden_cancel::Config::frozen());
+    assert_eq!(
+        owner.component(
+            "SCENARIO_ORDERS_EVIDENCE_V1",
+            ScenarioAccount::encode_orders
+        ),
+        Err("NATIVE_INVARIANT")
+    );
+}
 fn owners() -> Vec<ScenarioAccount> {
     let (mut seed, config, marks) = fixture();
     let btc = ScenarioAccount::from_seed(&seed, &config, &marks).unwrap();

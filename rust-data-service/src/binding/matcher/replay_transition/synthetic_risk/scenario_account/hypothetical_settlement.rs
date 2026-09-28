@@ -23,6 +23,7 @@ pub(super) struct Draft {
 pub(super) enum FeePolicy {
     BtcEthTradingTaker,
     GoldenCancelTradingTaker,
+    P1O03Zero,
     SyntheticLiquidation,
 }
 
@@ -31,6 +32,7 @@ impl FeePolicy {
         match self {
             Self::BtcEthTradingTaker => Decimal::new(1, 3),
             Self::GoldenCancelTradingTaker => Decimal::new(1, 2),
+            Self::P1O03Zero => Decimal::ZERO,
             Self::SyntheticLiquidation => Decimal::new(602, 5),
         }
     }

@@ -139,7 +139,7 @@ impl ScenarioAccount {
                     self.event_c_settlement(candidate, execution_id)?,
                 )
             } else if let (
-                ProfileContext::GoldenCancel(config),
+                ProfileContext::GoldenCancel(_) | ProfileContext::P1O03,
                 PositionState::GoldenCancel(position),
             ) = (&self.profile, &self.positions)
             {
@@ -148,6 +148,16 @@ impl ScenarioAccount {
                     strategy_id: order.facts.strategy_id.clone(),
                     execution_id,
                     sequence: self.commit_sequence,
+                };
+                let (context, fee) = match &self.profile {
+                    ProfileContext::GoldenCancel(config) => (
+                        hypothetical_settlement::Context::GoldenCancel(config),
+                        hypothetical_settlement::FeePolicy::GoldenCancelTradingTaker,
+                    ),
+                    _ => (
+                        hypothetical_settlement::Context::P1O03,
+                        hypothetical_settlement::FeePolicy::P1O03Zero,
+                    ),
                 };
                 (
                     None,
@@ -158,8 +168,8 @@ impl ScenarioAccount {
                         template.side,
                         template.quantity,
                         template.price,
-                        hypothetical_settlement::Context::GoldenCancel(config),
-                        hypothetical_settlement::FeePolicy::GoldenCancelTradingTaker,
+                        context,
+                        fee,
                         Some(&opening),
                     )?,
                 )

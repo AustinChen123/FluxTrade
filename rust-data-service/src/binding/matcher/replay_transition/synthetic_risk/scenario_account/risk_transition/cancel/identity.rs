@@ -254,7 +254,8 @@ pub(super) fn validate(
         || actions.iter().any(|a| {
             !identity(&a.detecting)
                 || !identity(&a.target)
-                || matches!(a.reason, Reason::Unsupported | Reason::SpecMigration)
+                || a.reason == Reason::Unsupported
+                || (a.reason == Reason::SpecMigration && !owner.o03_direct_effect(stamp, actions))
                 || !ids.insert(a.id)
                 || !targets.insert(&a.target)
         })

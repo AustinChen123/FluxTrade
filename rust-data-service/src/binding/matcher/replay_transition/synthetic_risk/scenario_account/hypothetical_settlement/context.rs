@@ -5,6 +5,7 @@ use super::*;
 pub(in super::super) enum Context<'a> {
     BtcEth(&'a FrozenScenario, &'a Spec),
     GoldenCancel(&'a golden_cancel::Config),
+    P1O03,
 }
 
 impl<'a> From<(&'a FrozenScenario, &'a Spec)> for Context<'a> {
@@ -40,15 +41,24 @@ impl<'a> Context<'a> {
         match self {
             Self::BtcEth(_, spec) => {
                 if *spec != frozen_spec(spec.product, spec.version == "spec-v2")
-                    || fee == FeePolicy::GoldenCancelTradingTaker
+                    || matches!(
+                        fee,
+                        FeePolicy::GoldenCancelTradingTaker | FeePolicy::P1O03Zero
+                    )
                 {
                     return Err("UNSUPPORTED_SPEC");
                 }
                 Ok(Self::btc(spec))
             }
-            Self::GoldenCancel(config) => {
-                config.validate(0)?;
-                if fee != FeePolicy::GoldenCancelTradingTaker {
+            Self::GoldenCancel(_) | Self::P1O03 => {
+                let expected = match self {
+                    Self::GoldenCancel(config) => {
+                        config.validate(0)?;
+                        FeePolicy::GoldenCancelTradingTaker
+                    }
+                    _ => FeePolicy::P1O03Zero,
+                };
+                if fee != expected {
                     return Err("UNSUPPORTED_FEE_INPUT");
                 }
                 Ok(Scaling {
@@ -75,6 +85,7 @@ impl<'a> Context<'a> {
             Self::GoldenCancel(_) if version == "gt03-spec-v1" => {
                 self.active(FeePolicy::GoldenCancelTradingTaker)
             }
+            Self::P1O03 if version == "gt03-spec-v1" => self.active(FeePolicy::P1O03Zero),
             _ => Err("INVALID_LOT_ORIGIN_SPEC"),
         }
     }

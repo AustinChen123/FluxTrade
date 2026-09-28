@@ -372,7 +372,10 @@ impl ScenarioAccount {
         if matches!(self.profile, ProfileContext::EventLimit(_)) {
             return self.prepare_event_c_candidate(candidate, order, execution_id, digest);
         }
-        if matches!(self.profile, ProfileContext::GoldenCancel(_)) {
+        if matches!(
+            self.profile,
+            ProfileContext::GoldenCancel(_) | ProfileContext::P1O03
+        ) {
             return self.prepare_golden_cancel_candidate(candidate, order, execution_id, digest);
         }
         let product = order

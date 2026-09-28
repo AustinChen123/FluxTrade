@@ -298,6 +298,19 @@ impl Facts {
 pub(in super::super) use super::Stage;
 
 impl ScenarioAccount {
+    fn o03_direct_effect(&self, stamp: &Stamp, actions: &[PreparedAction]) -> bool {
+        self.profile == ProfileContext::P1O03
+            && actions.len() == 1
+            && actions.iter().all(|a| {
+                a.id == a.request.effect_action_id
+                    && a.reason == Reason::SpecMigration
+                    && a.detecting == stamp.event_id
+                    && self.orders.get(&a.target).is_some_and(|o| {
+                        matches!(o.cancel, State::None)
+                            && o.facts.projects_remainder("INVALID_CANCEL_ORDER") == Ok(true)
+                    })
+            })
+    }
     pub(in super::super) fn automatic_cancel(&mut self, input: &RequestInput) -> Result<(), Fault> {
         self.automatic_cancel_checked(input, |_| Ok(()))
     }
@@ -509,9 +522,9 @@ impl ScenarioAccount {
             ProfileContext::BtcEthScenario { .. } => {
                 Ok(FinancialSnapshot::BtcEth(self.reservation()?))
             }
-            ProfileContext::GoldenCancel(_) => Ok(FinancialSnapshot::GoldenCancel(
-                self.golden_cancel_reservation()?,
-            )),
+            ProfileContext::GoldenCancel(_) | ProfileContext::P1O03 => Ok(
+                FinancialSnapshot::GoldenCancel(self.golden_cancel_reservation()?),
+            ),
             _ => Err("UNSUPPORTED_CANCEL_PROFILE"),
         }
     }
@@ -522,7 +535,9 @@ impl ScenarioAccount {
                 let (s, t) = scenario.resolve(order.product.btc()?, at)?;
                 Ok((s.version.clone(), t.version.clone()))
             }
-            ProfileContext::GoldenCancel(_) => Ok(("gt03-spec-v1".into(), "gt03-rule-v1".into())),
+            ProfileContext::GoldenCancel(_) | ProfileContext::P1O03 => {
+                Ok(("gt03-spec-v1".into(), "gt03-rule-v1".into()))
+            }
             _ => Err("UNSUPPORTED_CANCEL_PROFILE"),
         }
     }
@@ -686,6 +701,7 @@ impl ScenarioAccount {
                     .cancel
                     .request()
                     .is_none()
+                    && !self.o03_direct_effect(&input.stamp, &actions)
                 {
                     return Err("CANCEL_EFFECT_BEFORE_REQUEST");
                 }

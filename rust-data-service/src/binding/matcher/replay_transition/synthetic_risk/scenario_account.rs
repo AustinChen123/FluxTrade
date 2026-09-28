@@ -35,6 +35,7 @@ enum ProfileContext {
     GoldenCapacity(capacity::Config),
     EventLimit(event_limit::Config),
     GoldenCancel(golden_cancel::Config),
+    P1O03,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -243,13 +244,17 @@ enum NewIdentity<'a> {
 }
 
 fn seed_execution_key(key: &AccountKey, product: Product, id: &str) -> Hash {
+    seed_profile_execution_key(key, ProfileProduct::BtcEth(product), id)
+}
+
+fn seed_profile_execution_key(key: &AccountKey, product: ProfileProduct, id: &str) -> Hash {
     hash_fields(&[
         Some(key.venue.clone()),
         Some(key.environment.clone()),
         Some(key.account.clone()),
         key.subaccount.clone(),
         Some("seed".into()),
-        Some(product_id(product).into()),
+        Some(product.canonical_id().into()),
         Some(id.into()),
     ])
 }
@@ -312,7 +317,8 @@ impl ScenarioAccount {
             } => Ok((scenario, marks)),
             ProfileContext::GoldenCapacity(_)
             | ProfileContext::EventLimit(_)
-            | ProfileContext::GoldenCancel(_) => Err("PROFILE_MISMATCH"),
+            | ProfileContext::GoldenCancel(_)
+            | ProfileContext::P1O03 => Err("PROFILE_MISMATCH"),
         }
     }
 
@@ -526,6 +532,9 @@ impl ScenarioAccount {
             ProfileContext::GoldenCapacity(config) => config.context_id(effective_at),
             ProfileContext::EventLimit(config) => config.context_id(effective_at),
             ProfileContext::GoldenCancel(config) => config.context_id(effective_at),
+            ProfileContext::P1O03 => {
+                capacity::Config::frozen(capacity::Program::P1O03).context_id(effective_at)
+            }
         };
         if current.ok() != Some(self.valuation_context_id) {
             return Err("UNSUPPORTED_CONTEXT_TRANSITION");

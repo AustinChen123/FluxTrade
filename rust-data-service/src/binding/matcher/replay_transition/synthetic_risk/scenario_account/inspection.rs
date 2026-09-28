@@ -155,13 +155,20 @@ impl ScenarioAccount {
                     cancel_request(e, &f.request);
                     e.hash(f.action_id);
                 }
+                cancel::State::MigrationEffective(id) if self.profile == ProfileContext::P1O03 => {
+                    e.text("MIGRATION_EFFECTIVE");
+                    e.hash(*id);
+                }
                 cancel::State::MigrationEffective(_) => return Err("NATIVE_INVARIANT"),
             }
         }
         Ok(())
     }
     fn encode_reservations(&self, e: &mut Encoding) -> Result<(), Fault> {
-        if matches!(self.profile, ProfileContext::GoldenCancel(_)) {
+        if matches!(
+            self.profile,
+            ProfileContext::GoldenCancel(_) | ProfileContext::P1O03
+        ) {
             e.text("GOLDEN_CANCEL");
             decimals(
                 e,
@@ -241,6 +248,7 @@ impl ScenarioAccount {
                 ..
             } => "SYNTHETIC_MIN_CASH_V1",
             ProfileContext::GoldenCancel(_) => "SYNTHETIC_GOLDEN_CANCEL_V1",
+            ProfileContext::P1O03 => "SYNTHETIC_P1_O03_V1",
             _ => return Err("NATIVE_INVARIANT"),
         };
         Ok(CurrentBasis {

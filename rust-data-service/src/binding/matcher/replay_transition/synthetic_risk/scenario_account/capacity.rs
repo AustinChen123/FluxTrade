@@ -5,6 +5,7 @@ use super::*;
 pub(super) enum Program {
     CapacityV1,
     CapacityTightV1,
+    P1O03,
 }
 
 impl Program {
@@ -12,12 +13,13 @@ impl Program {
         match self {
             Self::CapacityV1 => "SYNTHETIC_CAPACITY_V1",
             Self::CapacityTightV1 => "SYNTHETIC_CAPACITY_TIGHT_V1",
+            Self::P1O03 => "SYNTHETIC_P1_O03_V1",
         }
     }
 
     fn threshold(self) -> Decimal {
         Decimal::from(match self {
-            Self::CapacityV1 => 1000,
+            Self::CapacityV1 | Self::P1O03 => 1000,
             Self::CapacityTightV1 => 500,
         })
     }
@@ -51,7 +53,7 @@ pub(super) struct Config {
 
 impl Config {
     pub(super) fn frozen(program: Program) -> Self {
-        Self {
+        let mut config = Self {
             product: ProfileProduct::Pa,
             program_id: program.id().into(),
             program_hash: program.hash(),
@@ -65,13 +67,22 @@ impl Config {
             spec_interval: interval(false, 1000),
             mark: Decimal::from(100),
             mark_interval: interval(false, 1000),
+        };
+        if program == Program::P1O03 {
+            config.rule_data_version = "gt03-rule-v1".into();
+            config.spec_version = "gt03-spec-v1".into();
+            config.mark = Decimal::TEN;
+            config.spec_interval = interval(false, 3000);
+            config.mark_interval = interval(false, 3000);
         }
+        config
     }
 
     fn validate(&self, at: i64) -> Result<Program, Fault> {
         let program = match self.program_id.as_str() {
             "SYNTHETIC_CAPACITY_V1" => Program::CapacityV1,
             "SYNTHETIC_CAPACITY_TIGHT_V1" => Program::CapacityTightV1,
+            "SYNTHETIC_P1_O03_V1" => Program::P1O03,
             _ => return Err("UNSUPPORTED_CAPACITY_PROGRAM"),
         };
         if self != &Self::frozen(program) {
@@ -221,12 +232,20 @@ impl ScenarioAccount {
         &self,
         candidate: &Candidate,
     ) -> Result<CapacityProjection, Fault> {
-        let ProfileContext::GoldenCapacity(config) = &self.profile else {
-            return Err("PROFILE_MISMATCH");
+        let o03 = Config::frozen(Program::P1O03);
+        let (config, occupied) = match (&self.profile, &self.positions) {
+            (ProfileContext::GoldenCapacity(config), PositionState::CapacityFlat) => {
+                (config, Decimal::ZERO)
+            }
+            (ProfileContext::P1O03, PositionState::GoldenCancel(position)) => (
+                &o03,
+                position.as_ref().map_or(Decimal::ZERO, |p| p.contracts),
+            ),
+            (ProfileContext::GoldenCapacity(_), _) => {
+                return Err("UNSUPPORTED_CAPACITY_SEED_STATE")
+            }
+            _ => return Err("PROFILE_MISMATCH"),
         };
-        if self.positions != PositionState::CapacityFlat {
-            return Err("UNSUPPORTED_CAPACITY_SEED_STATE");
-        }
         let orders = self
             .orders
             .values()
@@ -250,13 +269,7 @@ impl ScenarioAccount {
                 }))
             })
             .collect::<Result<Vec<_>, Fault>>()?;
-        calculate(
-            config,
-            self.seed_effective_at,
-            Decimal::ZERO,
-            &orders,
-            candidate,
-        )
+        calculate(config, self.seed_effective_at, occupied, &orders, candidate)
     }
 }
 

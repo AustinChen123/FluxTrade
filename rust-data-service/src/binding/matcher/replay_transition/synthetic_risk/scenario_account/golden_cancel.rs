@@ -73,10 +73,13 @@ impl ScenarioAccount {
     }
 
     pub(super) fn golden_cancel_reservation(&self) -> Result<Decimal, Fault> {
-        let ProfileContext::GoldenCancel(config) = &self.profile else {
-            return Err("PROFILE_MISMATCH");
-        };
-        config.validate(self.seed_effective_at)?;
+        match &self.profile {
+            ProfileContext::GoldenCancel(config) => config.validate(self.seed_effective_at)?,
+            ProfileContext::P1O03 => {
+                self.validate_context(self.seed_effective_at)?;
+            }
+            _ => return Err("PROFILE_MISMATCH"),
+        }
         self.orders.values().try_fold(Decimal::ZERO, |sum, order| {
             order
                 .facts

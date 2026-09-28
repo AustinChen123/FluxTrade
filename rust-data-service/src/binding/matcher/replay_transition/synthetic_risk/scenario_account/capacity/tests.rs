@@ -2,6 +2,92 @@ use super::super::tests::{d, fixture};
 use super::*;
 
 #[test]
+fn o03_capacity_counts_occupied_and_resting_without_mutation() {
+    let mut owner =
+        super::super::wire::profiles::construct("SYNTHETIC_P1_O03_V1", seed().key).unwrap();
+    let PositionState::GoldenCancel(Some(position)) = &mut owner.positions else {
+        panic!("position")
+    };
+    position.contracts = d("6");
+    let old = &mut owner.orders.get_mut("O_OLD1").unwrap().facts;
+    old.status = "CANCELED".into();
+    old.filled = d("1");
+    old.canceled = d("1");
+    old.remaining = Decimal::ZERO;
+    let input = Candidate {
+        product: ProfileProduct::Pa,
+        quantity: d("100"),
+        price: d("10"),
+    };
+    let before = owner.clone();
+    let projection = owner.capacity_projection(&input).unwrap();
+    assert_eq!(
+        (
+            projection.current,
+            projection.new,
+            projection.required,
+            projection.threshold,
+            projection.available
+        ),
+        (d("90"), d("1000"), d("1090"), d("1000"), d("-90"))
+    );
+    assert_eq!(owner.golden_cancel_reservation().unwrap(), d("30"));
+    assert_eq!(owner, before);
+    if let PositionState::GoldenCancel(Some(position)) = &mut owner.positions {
+        position.contracts = Decimal::ZERO;
+    }
+    assert_eq!(
+        owner.capacity_projection(&input).unwrap().required,
+        d("1030")
+    );
+    owner.orders.remove("O_OLD2");
+    assert_eq!(
+        owner.capacity_projection(&input).unwrap().required,
+        d("1000")
+    );
+}
+
+#[test]
+fn o03_zero_fee_cannot_enter_other_settlement_contexts() {
+    use super::super::hypothetical_settlement::{self as settlement, Context, FeePolicy};
+    let config = super::super::golden_cancel::Config::frozen();
+    let (seed, scenario, _) = fixture();
+    let (spec, _) = scenario.resolve(Product::Btc, seed.effective_at).unwrap();
+    for (context, expected) in [
+        (Context::GoldenCancel(&config), "UNSUPPORTED_FEE_INPUT"),
+        (Context::BtcEth(&scenario, spec), "UNSUPPORTED_SPEC"),
+    ] {
+        assert_eq!(
+            settlement::calculate(
+                None,
+                Side::Long,
+                d("1"),
+                d("10"),
+                context,
+                FeePolicy::P1O03Zero,
+                None
+            ),
+            Err(expected)
+        );
+    }
+    let owner = super::super::wire::profiles::construct("SYNTHETIC_P1_O03_V1", seed.key).unwrap();
+    let PositionState::GoldenCancel(Some(position)) = &owner.positions else {
+        panic!("position")
+    };
+    assert!(settlement::validate_existing(position, Context::P1O03, FeePolicy::P1O03Zero).is_ok());
+    for fee in [
+        FeePolicy::GoldenCancelTradingTaker,
+        FeePolicy::BtcEthTradingTaker,
+        FeePolicy::SyntheticLiquidation,
+    ] {
+        assert_eq!(
+            settlement::validate_existing(position, Context::P1O03, fee),
+            Err("UNSUPPORTED_FEE_INPUT")
+        );
+    }
+}
+
+#[test]
 fn event_limit_program_cannot_masquerade_as_capacity_admission() {
     for program in ["SYNTHETIC_EVENT_LIMIT_V1", "SYNTHETIC_EVENT_LIMIT_V2"] {
         let mut config = Config::frozen(Program::CapacityV1);

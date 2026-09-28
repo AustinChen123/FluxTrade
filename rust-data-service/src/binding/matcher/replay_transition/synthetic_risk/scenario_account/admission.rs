@@ -386,6 +386,18 @@ impl ScenarioAccount {
         }
         let price = intent.limit_price.ok_or("LIMIT_PRICE_REQUIRED")?;
         let (spec_version, rule_data_version) = match &self.profile {
+            ProfileContext::P1O03 => {
+                if intent.product != ProfileProduct::Pa
+                    || intent.reduce_only
+                    || intent.quantity <= Decimal::ZERO
+                    || price <= Decimal::ZERO
+                    || !aligned(intent.quantity, Decimal::ONE)
+                    || !aligned(price, Decimal::ONE)
+                {
+                    return Err("INVALID_CAPACITY_CANDIDATE");
+                }
+                ("gt03-spec-v1".into(), "gt03-rule-v1".into())
+            }
             ProfileContext::GoldenCancel(config) => {
                 config.validate(envelope.effective_at)?;
                 if intent.product != ProfileProduct::Pa
@@ -468,7 +480,7 @@ impl ScenarioAccount {
                     None,
                 ),
                 ProfileContext::EventLimit(_) => return Err("UNSUPPORTED_ADMISSION_PROFILE"),
-                ProfileContext::GoldenCapacity(_) => {
+                ProfileContext::GoldenCapacity(_) | ProfileContext::P1O03 => {
                     let projection = self.capacity_projection(&capacity::Candidate {
                         product: intent.product,
                         quantity: intent.quantity,
