@@ -2,6 +2,7 @@ use self::identity::Reference;
 use super::super::super::tests::{d, fixture};
 use super::*;
 use execution::commit::tests::{at, input};
+mod closure;
 fn projection(namespace: &'static str, id: &str, kind: &'static str) -> Projection {
     Projection {
         schema_version: "delivery_projection_v1".into(),
@@ -26,6 +27,7 @@ fn build(
     let saved = owner.clone();
     let before = store.clone();
     let result = store.build(owner, snapshots, p);
+    inspection::completion_tests::assert_inspection(owner);
     assert_eq!(owner, &saved);
     if result.is_err() {
         assert_eq!(store, &before);

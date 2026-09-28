@@ -288,7 +288,7 @@ impl ScenarioAccount {
     }
 }
 #[cfg(test)]
-mod completion_tests;
+pub(super) mod completion_tests;
 #[cfg(test)]
 pub(super) mod receipt_vectors;
 #[cfg(test)]

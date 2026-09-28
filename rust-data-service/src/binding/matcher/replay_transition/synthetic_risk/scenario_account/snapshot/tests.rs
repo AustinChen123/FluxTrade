@@ -3,6 +3,9 @@ use super::*;
 use execution::commit::tests::{at, input};
 mod projections;
 mod vectors;
+pub(in super::super) fn poison(fact: &mut Fact) {
+    fact.payload = Payload::Trading(d("-999"), d("-888"));
+}
 
 pub(in super::super) fn delivery_fixture(
     owner: &ScenarioAccount,

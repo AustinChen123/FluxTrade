@@ -2,7 +2,7 @@ use super::super::tests::{d, fixture};
 use super::*;
 use cancel::{EffectInput, Reason, RequestInput};
 use execution::commit::tests::{at, input};
-fn mixed_owner() -> ScenarioAccount {
+pub(in super::super) fn mixed_owner() -> ScenarioAccount {
     let (mut seed, config, mut marks) = fixture();
     seed.cash = d("200");
     marks[0].valid_to = 600;
@@ -44,6 +44,11 @@ fn mixed_owner() -> ScenarioAccount {
     assert_eq!(a.liquidation_ids().count(), 1);
     assert_eq!(a.transition.event_kinds.len(), 6);
     a
+}
+pub(in super::super) fn assert_inspection(a: &ScenarioAccount) {
+    let before = a.clone();
+    assert_eq!(a.inspect_state().unwrap(), a.inspect_state().unwrap());
+    assert_eq!(a, &before);
 }
 #[test]
 fn complete_literal_owner_vector() {

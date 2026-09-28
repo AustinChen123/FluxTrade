@@ -1,6 +1,22 @@
 use super::super::tests::{d, fixture};
 use super::*;
 use risk_transition::cancel::identity::Encoding;
+pub(in super::super) fn reject_min_cash(owner: &mut ScenarioAccount) {
+    let mut intent = fixture_intent(owner, "MIN-NEGATIVE-I", Side::Long, d("1"), d("50000"));
+    intent.client_order_id = "MIN-NEGATIVE-C".into();
+    intent.strategy_id = "min-cash-policy".into();
+    intent.requested_at = 502;
+    let before = owner.clone();
+    let (_, result) = fixture_admit(owner, "negative", 502, &intent).unwrap();
+    assert_eq!(
+        (result.outcome, result.reason_code),
+        (Outcome::Rejected, Some("MIN_CASH"))
+    );
+    let mut expected = before;
+    expected.intent_results = owner.intent_results.clone();
+    expected.transition = owner.transition.clone();
+    assert_eq!(*owner, expected);
+}
 pub(in super::super) fn golden_admit(owner: &mut ScenarioAccount) {
     let mut intent = fixture_intent(owner, "I", Side::Long, d("10"), d("10"));
     intent.client_order_id = "C".into();
