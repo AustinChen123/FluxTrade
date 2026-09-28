@@ -18,28 +18,30 @@ impl ConfiguredProduct {
         let t = &self.tier;
         super::super::identity(&self.product.0)
             && self.instrument_code > 0
-            && self.taker_fee == Decimal::new(1, 3)
-            && self.liquidation_fee == Decimal::new(1, 3)
+            && self.taker_fee >= Decimal::ZERO
+            && self.liquidation_fee >= Decimal::ZERO
             && s.product == self.product
             && t.product == self.product
             && self.mark.product == self.product
-            && s.version == "scale-spec-v1"
-            && t.version == "scale-tier-v1"
+            && super::super::identity(&s.version)
+            && super::super::identity(&t.version)
             && s.interval == (Interval { from: 0, to: None })
             && t.interval == s.interval
-            && [s.contract_value, s.multiplier, s.tick] == [Decimal::ONE; 3]
-            && [s.lot, s.minimum] == [Decimal::new(5, 1); 2]
-            && t.tiers
-                == vec![Tier {
-                    minimum: Decimal::ZERO,
-                    maximum: Decimal::from(100000),
-                    mmr: Decimal::new(5, 3),
-                    imr: Decimal::new(1, 1),
-                    max_leverage: Decimal::TEN,
-                }]
-            && self.mark.price == Decimal::from(100)
-            && self.mark.valid_from == 0
-            && self.mark.valid_to == 3000
+            && [s.contract_value, s.multiplier, s.tick, s.lot, s.minimum]
+                .iter()
+                .all(|value| *value > Decimal::ZERO)
+            && !t.tiers.is_empty()
+            && t.tiers.iter().enumerate().all(|(index, row)| {
+                row.minimum >= Decimal::ZERO
+                    && row.maximum >= row.minimum
+                    && row.mmr >= Decimal::ZERO
+                    && row.imr >= Decimal::ZERO
+                    && row.max_leverage > Decimal::ZERO
+                    && (index == 0 || t.tiers[index - 1].maximum < row.minimum)
+            })
+            && self.mark.price > Decimal::ZERO
+            && self.mark.valid_from >= 0
+            && self.mark.valid_to > self.mark.valid_from
     }
 }
 
@@ -145,7 +147,7 @@ impl FrozenScenario {
         if let Some(rows) = &self.configured {
             let mut ids = std::collections::BTreeSet::new();
             let mut codes = std::collections::BTreeSet::new();
-            return if self.leverage == Decimal::TEN
+            return if self.leverage > Decimal::ZERO
                 && !rows.is_empty()
                 && rows
                     .iter()

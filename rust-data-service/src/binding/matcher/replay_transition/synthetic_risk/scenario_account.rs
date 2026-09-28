@@ -284,6 +284,18 @@ fn context_id(scenario: &FrozenScenario, marks: &[Mark], at: i64) -> Result<Hash
             Some(mark.valid_from.to_string()),
             Some(mark.valid_to.to_string()),
         ]);
+        if let Some(configured) = &scenario.configured {
+            let row = configured
+                .iter()
+                .find(|row| row.product == product)
+                .ok_or("INVALID_SCHEMA")?;
+            fields.extend([
+                Some(at.to_string()),
+                Some(row.instrument_code.to_string()),
+                Some(row.taker_fee.normalize().to_string()),
+                Some(row.liquidation_fee.normalize().to_string()),
+            ]);
+        }
         for value in [
             spec.contract_value,
             spec.multiplier,
@@ -316,8 +328,7 @@ impl ScenarioAccount {
     ) -> Result<Self, Fault> {
         seed.key.validate().map_err(|_| "INVALID_SCHEMA")?;
         if !identity(&seed.config_id)
-            || seed.effective_at != 500
-            || seed.cash != Decimal::new(1212, 1)
+            || seed.effective_at < 0
             || !seed.positions.is_empty()
             || !seed.orders.is_empty()
         {
@@ -331,6 +342,21 @@ impl ScenarioAccount {
         };
         scenario.validate()?;
         let marks: Vec<_> = products.into_iter().map(|p| p.mark).collect();
+        if marks.len() != scenario.products().len()
+            || scenario.products().iter().any(|product| {
+                marks
+                    .iter()
+                    .filter(|mark| {
+                        mark.product == *product
+                            && mark.valid_from <= seed.effective_at
+                            && seed.effective_at < mark.valid_to
+                    })
+                    .count()
+                    != 1
+            })
+        {
+            return Err("INVALID_SCHEMA");
+        }
         Self::from_validated_configuration(seed, scenario, &marks)
     }
 
@@ -379,7 +405,15 @@ impl ScenarioAccount {
         scenario: FrozenScenario,
         marks: &[Mark],
     ) -> Result<Self, Fault> {
-        let valuation_context_id = context_id(&scenario, marks, seed.effective_at)?;
+        let context = context_id(&scenario, marks, seed.effective_at)?;
+        let valuation_context_id = if scenario.configured.is_some() {
+            hash_fields(&[
+                Some(format!("{:02x?}", context)),
+                Some(seed.config_id.clone()),
+            ])
+        } else {
+            context
+        };
         let mut positions = BTreeMap::new();
         let mut sequences = BTreeSet::new();
         let mut seed_ids = BTreeSet::new();
