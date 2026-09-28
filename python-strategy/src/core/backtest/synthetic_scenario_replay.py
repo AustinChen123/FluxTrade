@@ -3,7 +3,7 @@
 from copy import deepcopy
 from dataclasses import dataclass
 from decimal import Decimal as D, localcontext
-from typing import cast
+from typing import Any, Callable, cast
 
 from src.core.backtest import synthetic_scenario_codec as wire
 from src.core.backtest import spider_policy_protocol as policy_protocol
@@ -150,12 +150,132 @@ class _CallbackPrefix:
     exception: Exception | None
 
 
+@dataclass(frozen=True)
+class _PollObservation:
+    status: str
+    awaiting: dict[str, Any] | None
+    prefix: _CallbackPrefix
+
+
+@dataclass(frozen=True)
+class _PollResult:
+    observation: _PollObservation
+    clock_advance: int | None = None
+    next_stage: dict[str, Any] | None = None
+
+
+@dataclass
+class _PollRecord:
+    digest: str
+    stages: list[dict[str, Any]]
+    index: int
+    observation: _PollObservation
+
+
+def _poll_check(condition: bool) -> None:
+    if not condition:
+        raise ValueError("INVALID_SCHEMA")
+
+
 class _ReplayComposition:
     """One native owner and one source cache, deliberately without a run API."""
 
     def __init__(self, profile: wire.Profile, account: wire.Account) -> None:
         self._codec = wire.ScenarioCodec(profile, account)
         self._policy = _closed_policy(profile)
+        self._account = deepcopy(account)
+        self._polls: dict[str, _PollRecord] = {}
+        self._continuations: dict[str, str] = {}
+        self._last_poll_at: int | None = None
+
+    def _start_poll(self, plan, preflight: Callable[[int, dict[str, Any]], None]) -> _PollResult:
+        try:
+            digest = policy_protocol._poll_occurrence_plan_digest(plan)
+            account = policy_protocol._plan_account(plan["account_key"])
+        except ValueError as exc:
+            if exc.args != ("POLICY_EMISSION_MISMATCH",):
+                raise
+            raise ValueError("INVALID_SCHEMA") from exc
+        _poll_check(account == policy_protocol._plan_account(self._account))
+        poll_id, continuation = plan["poll_id"], plan["continuation_id"]
+        if poll_id in self._polls:
+            record = self._polls[poll_id]
+            _poll_check(record.digest == digest)
+            return _PollResult(deepcopy(record.observation))
+        _poll_check(continuation not in self._continuations)
+        policy, issued = self._policy, plan["issued_at"]
+        if policy.paused:
+            observation = _PollObservation("PAUSED", None, _CallbackPrefix((), None))
+            self._polls[poll_id] = _PollRecord(digest, [], 0, observation)
+            self._continuations[continuation] = poll_id
+            return _PollResult(deepcopy(observation))
+        _poll_check(self._last_poll_at is None or issued >= self._last_poll_at)
+        due = issued - policy.last_earn_ms > 60000
+        _poll_check((plan.get("earn") is not None) == due)
+        kinds = [("earn", "EARN", "EARN_SNAPSHOT")] if due else []
+        kinds += [("trading", "TRADING", "TRADING_SNAPSHOT"), ("positions", "POSITIONS", "POSITION_SNAPSHOT"),
+                  ("open_orders", "OPEN_ORDERS", "OPEN_ORDER_SNAPSHOT")]
+        stages = []
+        previous = None
+        for key, kind, payload_kind in kinds:
+            stage = plan[key]
+            request, projection = stage["snapshot_request"], stage["delivery_projection"]
+            _poll_check(policy_protocol._plan_account(request["account_key"]) == account)
+            _poll_check(request.get("continuation_id") == projection.get("continuation_id") == continuation)
+            _poll_check(request["snapshot_kind"] == kind and projection["payload_kind"] == payload_kind)
+            _poll_check(projection["reference"] == dict(namespace="SNAPSHOT", fact_id=request["snapshot_id"]))
+            _poll_check(projection.get("transport") is None)
+            captured, visible = request["captured_at"], projection["visible_at"]
+            _poll_check(captured >= issued if previous is None else captured > previous)
+            _poll_check(visible >= captured)
+            stages.append(deepcopy(stage))
+            previous = visible
+        preflight(issued, deepcopy(stages[0]))
+        self._last_poll_at = issued
+        self._continuations[continuation] = poll_id
+        start = len(policy.events)
+        policy.now_ms = issued
+        error = None
+        try:
+            if due:
+                policy.last_earn_ms = issued
+                policy.emit("request_earn")
+        except Exception as exc:
+            error = exc
+        prefix = _CallbackPrefix(tuple(deepcopy(policy.events[start:])), error)
+        observation = _PollObservation("CALLBACK_FAILED" if error else "IN_PROGRESS", None if error else stages[0], prefix)
+        self._polls[poll_id] = _PollRecord(digest, stages, 0, observation)
+        return _PollResult(deepcopy(observation), None if error else issued, None if error else deepcopy(stages[0]))
+
+    def _resume_poll(self, delivery: wire.Delivery) -> _PollResult:
+        continuation = delivery.get("continuation_id")
+        _poll_check(continuation in self._continuations)
+        record = self._polls[self._continuations[cast(str, continuation)]]
+        _poll_check(record.observation.status == "IN_PROGRESS")
+        stage = record.stages[record.index]
+        request, projection = stage["snapshot_request"], stage["delivery_projection"]
+        _poll_check(policy_protocol._plan_account(delivery["account_key"]) == policy_protocol._plan_account(self._account))
+        _poll_check(delivery["source_namespace"] == projection["reference"]["namespace"] == "SNAPSHOT")
+        _poll_check(delivery["source_fact_id"] == projection["reference"]["fact_id"] == request["snapshot_id"])
+        for key in ("payload_kind", "occurrence_index", "schedule_sequence", "visible_at", "continuation_id"):
+            _poll_check(delivery.get(key) == projection.get(key))
+        policy, start = self._policy, len(self._policy.events)
+        error = None
+        try:
+            self._apply_payload(delivery)
+            if record.index == len(record.stages) - 1:
+                policy.raise_leverage()
+                if policy.running and not policy.ws_open:
+                    policy.emit("check_websocket")
+                policy.check_risk()
+        except Exception as exc:
+            error = exc
+        record.index += 1
+        next_stage = None if error or record.index == len(record.stages) else record.stages[record.index]
+        prefix = _CallbackPrefix(tuple(deepcopy(policy.events[start:])), error)
+        status = "CALLBACK_FAILED" if error else "COMPLETED" if next_stage is None else "IN_PROGRESS"
+        record.observation = _PollObservation(status, next_stage, prefix)
+        return _PollResult(deepcopy(record.observation), next_stage=deepcopy(next_stage))
 
     def _capture_callback(self, delivery: wire.Delivery) -> _CallbackPrefix:
         start = len(self._policy.events)
