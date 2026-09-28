@@ -3,6 +3,12 @@ use super::super::super::tests::{d, fixture};
 use super::*;
 
 pub(in super::super::super) fn run(fault: bool) -> (ScenarioAccount, Completion) {
+    run_with_panic(fault, false)
+}
+pub(in super::super::super) fn run_with_panic(
+    fault: bool,
+    panic: bool,
+) -> (ScenarioAccount, Completion) {
     let (mut seed, config, mut marks) = fixture();
     seed.cash = d("3000");
     seed.orders.clear();
@@ -45,6 +51,7 @@ pub(in super::super::super) fn run(fault: bool) -> (ScenarioAccount, Completion)
     let completion = owner
         .apply_group_checked(&group, |stage| {
             if fault && stage == risk_transition::Stage::LiquidationBeforeSwap(2) {
+                assert!(!panic, "private owner panic injection");
                 Err("INJECTED")
             } else {
                 Ok(())
