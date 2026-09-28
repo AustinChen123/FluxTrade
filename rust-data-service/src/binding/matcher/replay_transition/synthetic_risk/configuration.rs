@@ -7,22 +7,26 @@ pub(super) struct ConfiguredProduct {
     pub instrument_code: i64,
     pub taker_fee: Decimal,
     pub liquidation_fee: Decimal,
-    pub spec: Spec,
-    pub tier: TierVersion,
-    pub mark: Mark,
+    pub specs: Vec<Spec>,
+    pub tiers: Vec<TierVersion>,
+    pub marks: Vec<Mark>,
 }
 
 impl ConfiguredProduct {
     fn valid(&self) -> bool {
-        let s = &self.spec;
-        let t = &self.tier;
+        if self.specs.len() != 1 || self.tiers.len() != 1 || self.marks.len() != 1 {
+            return false;
+        }
+        let s = &self.specs[0];
+        let t = &self.tiers[0];
+        let mark = &self.marks[0];
         super::super::identity(&self.product.0)
             && self.instrument_code > 0
             && self.taker_fee >= Decimal::ZERO
             && self.liquidation_fee >= Decimal::ZERO
             && s.product == self.product
             && t.product == self.product
-            && self.mark.product == self.product
+            && mark.product == self.product
             && super::super::identity(&s.version)
             && super::super::identity(&t.version)
             && s.interval == (Interval { from: 0, to: None })
@@ -39,9 +43,9 @@ impl ConfiguredProduct {
                     && row.max_leverage > Decimal::ZERO
                     && (index == 0 || t.tiers[index - 1].maximum < row.minimum)
             })
-            && self.mark.price > Decimal::ZERO
-            && self.mark.valid_from >= 0
-            && self.mark.valid_to > self.mark.valid_from
+            && mark.price > Decimal::ZERO
+            && mark.valid_from >= 0
+            && mark.valid_to > mark.valid_from
     }
 }
 
@@ -152,8 +156,16 @@ impl FrozenScenario {
                 && rows
                     .iter()
                     .all(|r| r.valid() && ids.insert(&r.product) && codes.insert(r.instrument_code))
-                && self.specs == rows.iter().map(|r| r.spec.clone()).collect::<Vec<_>>()
-                && self.tiers == rows.iter().map(|r| r.tier.clone()).collect::<Vec<_>>()
+                && self.specs
+                    == rows
+                        .iter()
+                        .flat_map(|r| r.specs.iter().cloned())
+                        .collect::<Vec<_>>()
+                && self.tiers
+                    == rows
+                        .iter()
+                        .flat_map(|r| r.tiers.iter().cloned())
+                        .collect::<Vec<_>>()
             {
                 Ok(())
             } else {

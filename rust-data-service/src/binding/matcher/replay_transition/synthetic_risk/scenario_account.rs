@@ -336,12 +336,21 @@ impl ScenarioAccount {
         }
         let scenario = FrozenScenario {
             leverage,
-            specs: products.iter().map(|p| p.spec.clone()).collect(),
-            tiers: products.iter().map(|p| p.tier.clone()).collect(),
+            specs: products
+                .iter()
+                .flat_map(|p| p.specs.iter().cloned())
+                .collect(),
+            tiers: products
+                .iter()
+                .flat_map(|p| p.tiers.iter().cloned())
+                .collect(),
             configured: Some(products.clone()),
         };
         scenario.validate()?;
-        let marks: Vec<_> = products.into_iter().map(|p| p.mark).collect();
+        let marks: Vec<_> = products
+            .iter()
+            .flat_map(|p| p.marks.iter().cloned())
+            .collect();
         if marks.len() != scenario.products().len()
             || scenario.products().iter().any(|product| {
                 marks

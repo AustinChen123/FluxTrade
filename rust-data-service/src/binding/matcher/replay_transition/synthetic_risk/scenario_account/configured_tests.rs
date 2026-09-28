@@ -25,7 +25,7 @@ fn input(count: usize) -> (CleanSeed, Vec<ConfiguredProduct>) {
                 instrument_code: i as i64 + 1,
                 taker_fee: d("0.001"),
                 liquidation_fee: d("0.001"),
-                spec: Spec {
+                specs: vec![Spec {
                     product: product.clone(),
                     version: "scale-spec-v1".into(),
                     interval: Interval { from: 0, to: None },
@@ -34,8 +34,8 @@ fn input(count: usize) -> (CleanSeed, Vec<ConfiguredProduct>) {
                     tick: d("1"),
                     lot: d("0.5"),
                     minimum: d("0.5"),
-                },
-                tier: TierVersion {
+                }],
+                tiers: vec![TierVersion {
                     product: product.clone(),
                     version: "scale-tier-v1".into(),
                     interval: Interval { from: 0, to: None },
@@ -46,13 +46,13 @@ fn input(count: usize) -> (CleanSeed, Vec<ConfiguredProduct>) {
                         imr: d("0.1"),
                         max_leverage: d("10"),
                     }],
-                },
-                mark: Mark {
+                }],
+                marks: vec![Mark {
                     product,
                     price: d("100"),
                     valid_from: 0,
                     valid_to: 3000,
-                },
+                }],
             }
         })
         .collect();
@@ -88,7 +88,7 @@ fn context_hash(
 ) -> Hash {
     let marks = products
         .iter()
-        .map(|row| row.mark.clone())
+        .flat_map(|row| row.marks.iter().cloned())
         .collect::<Vec<_>>();
     context_id(scenario, &marks, seed.effective_at).unwrap()
 }
@@ -97,8 +97,14 @@ fn configured_scenario(leverage: Decimal, products: &[ConfiguredProduct]) -> Fro
     FrozenScenario {
         configured: Some(products.to_vec()),
         leverage,
-        specs: products.iter().map(|row| row.spec.clone()).collect(),
-        tiers: products.iter().map(|row| row.tier.clone()).collect(),
+        specs: products
+            .iter()
+            .flat_map(|row| row.specs.iter().cloned())
+            .collect(),
+        tiers: products
+            .iter()
+            .flat_map(|row| row.tiers.iter().cloned())
+            .collect(),
     }
 }
 
@@ -152,31 +158,40 @@ fn configured_shape_deviations_never_expose_owner() {
         |p| p.instrument_code = 0,
         |p| p.taker_fee = d("-0.001"),
         |p| p.liquidation_fee = d("-0.001"),
-        |p| p.spec.product = Product("other".into()),
-        |p| p.spec.version.clear(),
-        |p| p.spec.interval.from = 1,
-        |p| p.spec.interval.to = Some(3000),
-        |p| p.spec.contract_value = d("0"),
-        |p| p.spec.multiplier = d("0"),
-        |p| p.spec.tick = d("0"),
-        |p| p.spec.lot = d("0"),
-        |p| p.spec.minimum = d("0"),
-        |p| p.tier.product = Product("other".into()),
-        |p| p.tier.version.clear(),
-        |p| p.tier.interval.from = 1,
-        |p| p.tier.interval.to = Some(3000),
-        |p| p.tier.tiers.clear(),
-        |p| p.tier.tiers.push(p.tier.tiers[0].clone()),
-        |p| p.tier.tiers[0].minimum = d("-1"),
-        |p| p.tier.tiers[0].maximum = d("-1"),
-        |p| p.tier.tiers[0].mmr = d("-0.1"),
-        |p| p.tier.tiers[0].imr = d("-0.1"),
-        |p| p.tier.tiers[0].max_leverage = d("0"),
-        |p| p.mark.product = Product("other".into()),
-        |p| p.mark.price = d("0"),
-        |p| p.mark.valid_from = -1,
-        |p| p.mark.valid_from = 501,
-        |p| p.mark.valid_to = 0,
+        |p| p.specs.clear(),
+        |p| p.specs.push(p.specs[0].clone()),
+        |p| p.tiers.clear(),
+        |p| p.tiers.push(p.tiers[0].clone()),
+        |p| p.marks.clear(),
+        |p| p.marks.push(p.marks[0].clone()),
+        |p| p.specs[0].product = Product("other".into()),
+        |p| p.specs[0].version.clear(),
+        |p| p.specs[0].interval.from = 1,
+        |p| p.specs[0].interval.to = Some(3000),
+        |p| p.specs[0].contract_value = d("0"),
+        |p| p.specs[0].multiplier = d("0"),
+        |p| p.specs[0].tick = d("0"),
+        |p| p.specs[0].lot = d("0"),
+        |p| p.specs[0].minimum = d("0"),
+        |p| p.tiers[0].product = Product("other".into()),
+        |p| p.tiers[0].version.clear(),
+        |p| p.tiers[0].interval.from = 1,
+        |p| p.tiers[0].interval.to = Some(3000),
+        |p| p.tiers[0].tiers.clear(),
+        |p| {
+            let duplicate = p.tiers[0].tiers[0].clone();
+            p.tiers[0].tiers.push(duplicate);
+        },
+        |p| p.tiers[0].tiers[0].minimum = d("-1"),
+        |p| p.tiers[0].tiers[0].maximum = d("-1"),
+        |p| p.tiers[0].tiers[0].mmr = d("-0.1"),
+        |p| p.tiers[0].tiers[0].imr = d("-0.1"),
+        |p| p.tiers[0].tiers[0].max_leverage = d("0"),
+        |p| p.marks[0].product = Product("other".into()),
+        |p| p.marks[0].price = d("0"),
+        |p| p.marks[0].valid_from = -1,
+        |p| p.marks[0].valid_from = 501,
+        |p| p.marks[0].valid_to = 0,
     ];
     for change in mutations {
         let mut rows = products.clone();
@@ -229,14 +244,14 @@ fn configured_empty_accepts_non_scale_values_and_multiple_tiers() {
     for (index, product) in products.iter_mut().enumerate() {
         product.taker_fee = d("0");
         product.liquidation_fee = d("0.02");
-        product.spec.version = format!("custom-spec-{index}");
-        product.spec.contract_value = d("3.25");
-        product.spec.multiplier = d("2");
-        product.spec.tick = d("0.25");
-        product.spec.lot = d("0.1");
-        product.spec.minimum = d("0.2");
-        product.tier.version = format!("custom-tier-{index}");
-        product.tier.tiers = vec![
+        product.specs[0].version = format!("custom-spec-{index}");
+        product.specs[0].contract_value = d("3.25");
+        product.specs[0].multiplier = d("2");
+        product.specs[0].tick = d("0.25");
+        product.specs[0].lot = d("0.1");
+        product.specs[0].minimum = d("0.2");
+        product.tiers[0].version = format!("custom-tier-{index}");
+        product.tiers[0].tiers = vec![
             Tier {
                 minimum: d("0"),
                 maximum: d("10"),
@@ -252,9 +267,9 @@ fn configured_empty_accepts_non_scale_values_and_multiple_tiers() {
                 max_leverage: d("40"),
             },
         ];
-        product.mark.price = d("12.75");
-        product.mark.valid_from = 50;
-        product.mark.valid_to = 100;
+        product.marks[0].price = d("12.75");
+        product.marks[0].valid_from = 50;
+        product.marks[0].valid_to = 100;
     }
     let owner = ScenarioAccount::from_configured_empty(&seed, d("25"), products.clone()).unwrap();
     assert!(owner.positions.is_empty() && owner.orders.is_empty());
@@ -293,30 +308,32 @@ fn configured_context_identity_covers_every_configured_semantic_field() {
     }
     change_each_product!(|_, row: &mut ConfiguredProduct| {
         row.product = Product(format!("{}-changed", row.product.0).into());
-        row.spec.product = row.product.clone();
-        row.tier.product = row.product.clone();
-        row.mark.product = row.product.clone();
+        row.specs[0].product = row.product.clone();
+        row.tiers[0].product = row.product.clone();
+        row.marks[0].product = row.product.clone();
     });
     change_each_product!(
         |index, row: &mut ConfiguredProduct| row.instrument_code += 10 + index as i64
     );
     change_each_product!(|_, row: &mut ConfiguredProduct| row.taker_fee += d("0.001"));
     change_each_product!(|_, row: &mut ConfiguredProduct| row.liquidation_fee += d("0.001"));
-    change_each_product!(|_, row: &mut ConfiguredProduct| row.spec.version.push('x'));
-    change_each_product!(|_, row: &mut ConfiguredProduct| row.spec.contract_value += d("1"));
-    change_each_product!(|_, row: &mut ConfiguredProduct| row.spec.multiplier += d("1"));
-    change_each_product!(|_, row: &mut ConfiguredProduct| row.spec.tick += d("1"));
-    change_each_product!(|_, row: &mut ConfiguredProduct| row.spec.lot += d("0.1"));
-    change_each_product!(|_, row: &mut ConfiguredProduct| row.spec.minimum += d("0.1"));
-    change_each_product!(|_, row: &mut ConfiguredProduct| row.tier.version.push('x'));
-    change_each_product!(|_, row: &mut ConfiguredProduct| row.tier.tiers[0].minimum = d("0.1"));
-    change_each_product!(|_, row: &mut ConfiguredProduct| row.tier.tiers[0].maximum += d("1"));
-    change_each_product!(|_, row: &mut ConfiguredProduct| row.tier.tiers[0].mmr += d("0.001"));
-    change_each_product!(|_, row: &mut ConfiguredProduct| row.tier.tiers[0].imr += d("0.01"));
-    change_each_product!(|_, row: &mut ConfiguredProduct| row.tier.tiers[0].max_leverage += d("1"));
-    change_each_product!(|_, row: &mut ConfiguredProduct| row.mark.price += d("1"));
-    change_each_product!(|_, row: &mut ConfiguredProduct| row.mark.valid_from += 1);
-    change_each_product!(|_, row: &mut ConfiguredProduct| row.mark.valid_to += 1);
+    change_each_product!(|_, row: &mut ConfiguredProduct| row.specs[0].version.push('x'));
+    change_each_product!(|_, row: &mut ConfiguredProduct| row.specs[0].contract_value += d("1"));
+    change_each_product!(|_, row: &mut ConfiguredProduct| row.specs[0].multiplier += d("1"));
+    change_each_product!(|_, row: &mut ConfiguredProduct| row.specs[0].tick += d("1"));
+    change_each_product!(|_, row: &mut ConfiguredProduct| row.specs[0].lot += d("0.1"));
+    change_each_product!(|_, row: &mut ConfiguredProduct| row.specs[0].minimum += d("0.1"));
+    change_each_product!(|_, row: &mut ConfiguredProduct| row.tiers[0].version.push('x'));
+    change_each_product!(|_, row: &mut ConfiguredProduct| row.tiers[0].tiers[0].minimum = d("0.1"));
+    change_each_product!(|_, row: &mut ConfiguredProduct| row.tiers[0].tiers[0].maximum += d("1"));
+    change_each_product!(|_, row: &mut ConfiguredProduct| row.tiers[0].tiers[0].mmr += d("0.001"));
+    change_each_product!(|_, row: &mut ConfiguredProduct| row.tiers[0].tiers[0].imr += d("0.01"));
+    change_each_product!(
+        |_, row: &mut ConfiguredProduct| row.tiers[0].tiers[0].max_leverage += d("1")
+    );
+    change_each_product!(|_, row: &mut ConfiguredProduct| row.marks[0].price += d("1"));
+    change_each_product!(|_, row: &mut ConfiguredProduct| row.marks[0].valid_from += 1);
+    change_each_product!(|_, row: &mut ConfiguredProduct| row.marks[0].valid_to += 1);
 
     // Spec and tier intervals are fixed by schema, so exercise their encoded
     // fields directly through the private hash function rather than construct
@@ -331,9 +348,9 @@ fn configured_context_identity_covers_every_configured_semantic_field() {
         for is_spec in [true, false] {
             let mut changed = products.clone();
             if is_spec {
-                changed[0].spec.interval = interval;
+                changed[0].specs[0].interval = interval;
             } else {
-                changed[0].tier.interval = interval;
+                changed[0].tiers[0].interval = interval;
             }
             let before = context_hash(&configured_scenario(leverage, &products), &seed, &products);
             let after = context_hash(&configured_scenario(leverage, &changed), &seed, &changed);
@@ -344,9 +361,9 @@ fn configured_context_identity_covers_every_configured_semantic_field() {
     let mut equivalent = products.clone();
     equivalent[0].taker_fee = d("0.0010");
     equivalent[0].liquidation_fee = d("0.0010");
-    equivalent[0].spec.contract_value = d("1.0");
-    equivalent[0].tier.tiers[0].mmr = d("0.0050");
-    equivalent[0].mark.price = d("100.0");
+    equivalent[0].specs[0].contract_value = d("1.0");
+    equivalent[0].tiers[0].tiers[0].mmr = d("0.0050");
+    equivalent[0].marks[0].price = d("100.0");
     let original = ScenarioAccount::from_configured_empty(&seed, leverage, products).unwrap();
     let same = ScenarioAccount::from_configured_empty(&seed, leverage, equivalent).unwrap();
     assert_eq!(original.valuation_context_id, same.valuation_context_id);
