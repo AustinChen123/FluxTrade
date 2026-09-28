@@ -209,6 +209,41 @@ class _ReplayComposition:
         self._audit: dict[str, list] = {}
         self._evidence_callback = evidence_callback
 
+    def capture_owner_evidence(self, cutoff, trading_request, positions_request, open_orders_request):
+        """Observe the owner and scheduler without dispatching or emitting a barrier."""
+        _poll_check(type(cutoff) is int and 0 <= cutoff < 2**63)
+        requests = deepcopy((trading_request, positions_request, open_orders_request))
+        for kind, request in zip(("TRADING", "POSITIONS", "OPEN_ORDERS"), requests, strict=True):
+            policy_protocol._plan_snapshot(request)
+            _poll_check(request["capture_mode"] == "OWNER_CURRENT" and request["snapshot_kind"] == kind
+                        and request["captured_at"] == cutoff and request["account_key"] == self._account)
+        owner: dict[str, Any] = dict(cutoff=cutoff, inspection=self._codec.inspect_state())
+        for kind, request in zip(("trading", "positions", "open_orders"), requests, strict=True):
+            owner[kind + "_request"] = request
+            owner[kind + "_fact"] = self._codec.capture_snapshot(deepcopy(request))
+        def key(value):
+            return dict(visible_at=value[0], queue_class=("SOURCE_GROUP", "SNAPSHOT_CAPTURE", "DELIVERY")[value[1]],
+                        schedule_sequence=value[2], stable_id=value[3])
+        polls = []
+        for continuation, poll_id in self._continuations.items():
+            observation = self._polls[poll_id].observation
+            awaiting = observation.awaiting
+            stage = awaiting["snapshot_request"]["snapshot_kind"] if awaiting is not None else None
+            polls.append(dict(poll_id=poll_id, continuation_id=continuation, status=observation.status,
+                              awaiting="EARN_IF_DUE" if stage == "EARN" else stage))
+        actions = [dict(delivery_id=delivery_id, event_index=i, action_index=j, group_id=action["group_id"],
+                        status=action["status"], group_result=action.get("group_result"), native_failure=action.get("native_failure"))
+                   for delivery_id, events in sorted(self._audit.items()) for i, event in enumerate(events)
+                   for j, action in enumerate(event.get("actions", []))]
+        observation = dict(current_time=self._current_time, last_popped=key(self._last_popped) if self._last_popped is not None else None,
+                           gate="FAILED" if self._terminal is not None else "RUNNING",
+                           terminal={name: self._terminal[name] for name in ("kind", "stable_id", "classification", "reason")} if self._terminal is not None else None,
+                           pending_keys=[key(value) for value in sorted(self._queue)],
+                           records=[dict(key=key(record["key"]), **{name: record["result"][name] for name in ("kind", "stable_id", "classification")})
+                                    for _, record in sorted(self._records.items())],
+                           polls=sorted(polls, key=lambda row: (row["poll_id"], row["continuation_id"])), callback_actions=actions)
+        return deepcopy(dict(owner_evidence=owner, scheduler_observation=observation))
+
     def _evidence(self, kind, key, evidence):
         if self._evidence_callback is None:
             return

@@ -7,6 +7,7 @@ from typing import cast as _cast
 
 from src.core.backtest.spider_run_artifacts import canonical_bytes as _bytes
 from src.core.backtest.spider_run_completion_schema import report as _validate_report
+from src.core.backtest.spider_run_envelope_schema import endpoint as _validate_endpoint
 from src.core.backtest.spider_run_reconciliation_schema import _CHECKS, reconciliation as _validate
 from src.core.backtest.spider_scenario_plans import plan_bundle as _plan_bundle
 
@@ -81,6 +82,49 @@ def _terminal(policy: str, endpoint: dict[str, _Any]) -> dict[str, _Any]:
 
 def _report(rows: list[dict[str, _Any]]) -> dict[str, _Any]:
     return dict(report_rows=rows, report_sha256=_sha256(_bytes(rows)).hexdigest())
+
+
+def build_endpoint_artifacts(run_id: str, attempt: dict[str, _Any], status: dict[str, _Any],
+                             journal: list[dict[str, _Any]], initial_owner_evidence: dict[str, _Any],
+                             final_owner_evidence: dict[str, _Any], scheduler_observation: dict[str, _Any]) -> dict[str, _Any]:
+    """Project actual endpoint evidence and reuse the sole reconciliation predicates."""
+    if type(run_id) is not str or any(row.get("run_id") != run_id for row in [attempt, status, *journal]):
+        raise ReconciliationProjectionError()
+    try:
+        frozen = _cast(dict[str, _Any], _plan_bundle(attempt.get("scenario_plan_id")))
+    except ValueError as error:
+        if error.args == ("UNSUPPORTED_CONFIGURATION",):
+            raise ReconciliationProjectionError() from error
+        raise
+    persisted = _required(status, "persisted_boundary")
+    terminal = _required(attempt, "terminal_policy")
+    endpoint = _copy(dict(schema_version="spider_endpoint_v1", run_id=run_id, terminal_reason=terminal,
+                          cutoff=dict(scheduler_time=_required(scheduler_observation, "current_time"), persisted_boundary=persisted),
+                          initial_owner_evidence=initial_owner_evidence, final_owner_evidence=final_owner_evidence,
+                          scheduler_observation=scheduler_observation,
+                          remaining_planned_barriers=attempt["planned_coverage"][persisted["ordinal"]:]))
+    final = final_owner_evidence
+    inspection = final["inspection"]
+    trading = final["trading_fact"]["immutable_payload"]
+    positions = _required(final["positions_fact"]["immutable_payload"], "rows")
+    orders = _required(final["open_orders_fact"]["immutable_payload"], "rows")
+    report = []
+    for template in frozen["report"]:
+        product = template["product_id"]
+        position = next((row for row in positions if row["product_id"] == product), None)
+        report.append(dict(schema_version="spider_product_report_v1", run_id=run_id, product_id=product, terminal_reason=terminal,
+                           position_contracts=_required(position, "position_contracts") if position is not None else "0",
+                           mark_price=_required(position, "last_price") if position is not None else None,
+                           notional_usd=_required(position, "notional_usd") if position is not None else "0",
+                           open_orders=[row for row in orders if row["product_id"] == product],
+                           committed_execution_refs=template["committed_execution_refs"], source_evidence_refs=template["source_evidence_refs"],
+                           account_cash=_required(inspection, "cash"), account_equity=_required(trading, "equity"),
+                           account_available_equity=_required(trading, "available_equity"), account_gross_realized=_required(inspection, "gross_realized"),
+                           account_total_fees=_required(inspection, "total_fees")))
+    _validate_endpoint(endpoint)
+    _validate_report(report)
+    return _copy(dict(endpoint=endpoint, report=report,
+                      reconciliation=build_reconciliation(run_id, attempt, status, journal, endpoint, report)))
 
 
 def build_reconciliation(run_id: str, attempt: dict[str, _Any], status: dict[str, _Any],

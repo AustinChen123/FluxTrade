@@ -304,12 +304,12 @@ def test_unrelated_programming_value_error_propagates(monkeypatch):
 
 
 def test_no_reconciliation_authority_and_public_import_boundary():
-    assert {name for name in vars(evidence) if not name.startswith("_")} == {"ReconciliationProjectionError", "build_reconciliation"}
+    assert {name for name in vars(evidence) if not name.startswith("_")} == {"ReconciliationProjectionError", "build_reconciliation", "build_endpoint_artifacts"}
     with pytest.raises(TypeError):
         cast(Any, evidence.build_reconciliation)(RUN, *fixture(), reconciliation={"result": "OK"})
     tree = ast.parse(Path(evidence.__file__).read_text())
     assert not any(isinstance(node, ast.Import) for node in ast.walk(tree))
     assert {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)} <= {
         "copy", "hashlib", "typing", "src.core.backtest.spider_run_artifacts", "src.core.backtest.spider_run_completion_schema",
-        "src.core.backtest.spider_run_reconciliation_schema", "src.core.backtest.spider_scenario_plans"}
+        "src.core.backtest.spider_run_reconciliation_schema", "src.core.backtest.spider_scenario_plans", "src.core.backtest.spider_run_envelope_schema"}
     assert not any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in {"open", "eval", "exec", "__import__"} for node in ast.walk(tree))
