@@ -265,7 +265,7 @@ fn product_id(product: &Product) -> &str {
 
 fn context_id(scenario: &FrozenScenario, marks: &[Mark], at: i64) -> Result<Hash, Fault> {
     let mut fields = Vec::new();
-    for product in [Product::Btc, Product::Eth] {
+    for product in scenario.products() {
         let (spec, tier) = scenario.resolve(&product, at)?;
         let mark = marks
             .iter()
@@ -344,6 +344,14 @@ impl ScenarioAccount {
             scenario.tiers.clone(),
         )?;
         validate_marks(marks)?;
+        Self::from_validated_configuration(seed, scenario, marks)
+    }
+
+    fn from_validated_configuration(
+        seed: &CleanSeed,
+        scenario: FrozenScenario,
+        marks: &[Mark],
+    ) -> Result<Self, Fault> {
         let valuation_context_id = context_id(&scenario, marks, seed.effective_at)?;
         let mut positions = BTreeMap::new();
         let mut sequences = BTreeSet::new();

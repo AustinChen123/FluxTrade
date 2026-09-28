@@ -50,11 +50,7 @@ pub(super) fn calculate(
             resting.push(*order);
         }
     }
-    FrozenScenario::new(
-        scenario.leverage,
-        scenario.specs.clone(),
-        scenario.tiers.clone(),
-    )?;
+    scenario.validate()?;
     validate_marks(marks)?;
     context_id(scenario, marks, input.effective_at)?;
     let valuation = scenario.evaluate(input, marks)?;
@@ -68,7 +64,7 @@ pub(super) fn calculate(
         used_margin: Decimal::ZERO,
         available_margin: Decimal::ZERO,
     };
-    for product in [Product::Btc, Product::Eth] {
+    for product in scenario.products() {
         let (spec, _) = scenario.resolve(&product, input.effective_at)?;
         let mark = marks
             .iter()

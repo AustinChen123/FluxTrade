@@ -188,7 +188,7 @@ impl ScenarioAccount {
         let mut migrations = Vec::new();
         let mut rows_before = Vec::new();
         let mut rows_after = Vec::new();
-        for (index, product) in [Product::Btc, Product::Eth].into_iter().enumerate() {
+        for (index, product) in scenario.products().into_iter().enumerate() {
             let (old_spec, old_tier) = scenario.resolve(&product, old_at)?;
             let (spec, tier) = scenario.resolve(&product, at)?;
             if let Some(position) = self.positions.btc()?.get(&product) {

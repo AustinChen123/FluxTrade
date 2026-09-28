@@ -54,17 +54,19 @@ pub(super) fn frozen_tiers(product: &Product, second: bool) -> TierVersion {
         product: product.clone(),
         version: if second { "tier-v2" } else { "tier-v1" }.into(),
         interval: interval(second, 1000),
-        tiers: std::array::from_fn(|i| Tier {
-            minimum: if i == 0 {
-                Decimal::ZERO
-            } else {
-                Decimal::new(maximums[i - 1] * 100 + 1, 2)
-            },
-            maximum: Decimal::from(maximums[i]),
-            mmr: Decimal::new(mmr[i], 4),
-            imr: Decimal::new(imr[i], 3),
-            max_leverage: Decimal::new(leverage[i], 2),
-        }),
+        tiers: (0..3)
+            .map(|i| Tier {
+                minimum: if i == 0 {
+                    Decimal::ZERO
+                } else {
+                    Decimal::new(maximums[i - 1] * 100 + 1, 2)
+                },
+                maximum: Decimal::from(maximums[i]),
+                mmr: Decimal::new(mmr[i], 4),
+                imr: Decimal::new(imr[i], 3),
+                max_leverage: Decimal::new(leverage[i], 2),
+            })
+            .collect(),
     }
 }
 
@@ -80,34 +82,45 @@ impl FrozenScenario {
         specs: Vec<Spec>,
         tiers: Vec<TierVersion>,
     ) -> Result<Self, Fault> {
-        if leverage <= Decimal::ZERO
-            || tiers
+        let scenario = Self {
+            leverage,
+            specs,
+            tiers,
+        };
+        scenario.validate()?;
+        Ok(scenario)
+    }
+
+    pub(super) fn products(&self) -> [Product; 2] {
+        [Product::Btc, Product::Eth]
+    }
+
+    pub(super) fn validate(&self) -> Result<(), Fault> {
+        if self.leverage <= Decimal::ZERO
+            || self
+                .tiers
                 .iter()
                 .flat_map(|v| &v.tiers)
-                .any(|t| leverage > t.max_leverage)
+                .any(|t| self.leverage > t.max_leverage)
         {
             return Err("LEVERAGE_TIER_CONFLICT");
         }
-        if leverage != Decimal::TEN || specs.len() != 4 || tiers.len() != 4 {
+        if self.leverage != Decimal::TEN || self.specs.len() != 4 || self.tiers.len() != 4 {
             return Err("UNSUPPORTED_SCENARIO_CONFIG");
         }
         // Exact whole-table validation rejects gaps/overlaps/third versions and
         // unsupported migrations, including future versions, before any output.
-        for product in [Product::Btc, Product::Eth] {
+        for product in self.products() {
             for second in [false, true] {
                 let spec = frozen_spec(&product, second);
                 let tier = frozen_tiers(&product, second);
-                if specs.iter().filter(|v| **v == spec).count() != 1
-                    || tiers.iter().filter(|v| **v == tier).count() != 1
+                if self.specs.iter().filter(|v| **v == spec).count() != 1
+                    || self.tiers.iter().filter(|v| **v == tier).count() != 1
                 {
                     return Err("INVALID_FROZEN_TIMELINE");
                 }
             }
         }
-        Ok(Self {
-            leverage,
-            specs,
-            tiers,
-        })
+        Ok(())
     }
 }

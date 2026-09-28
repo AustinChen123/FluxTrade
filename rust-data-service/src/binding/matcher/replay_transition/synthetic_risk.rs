@@ -59,7 +59,7 @@ struct TierVersion {
     product: Product,
     version: String,
     interval: Interval,
-    tiers: [Tier; 3],
+    tiers: Vec<Tier>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

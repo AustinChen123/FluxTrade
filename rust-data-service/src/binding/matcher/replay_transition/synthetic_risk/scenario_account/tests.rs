@@ -28,6 +28,49 @@ pub(super) fn d(value: &str) -> Decimal {
 }
 
 #[test]
+fn shared_constructor_foundation_preserves_p1_order_and_validation_precedence() {
+    let (seed, config, marks) = fixture();
+    assert_eq!(config.products(), [Product::Btc, Product::Eth]);
+    assert!(config.tiers.iter().all(|v| v.tiers.len() == 3));
+    let owner = ScenarioAccount::from_seed(&seed, &config, &marks).unwrap();
+    assert_eq!(
+        ScenarioAccount::from_validated_configuration(&seed, config.clone(), &marks),
+        Ok(owner.clone())
+    );
+    assert_eq!(
+        owner
+            .reservation()
+            .unwrap()
+            .products
+            .iter()
+            .map(|p| &p.product)
+            .collect::<Vec<_>>(),
+        vec![&Product::Btc, &Product::Eth]
+    );
+    for (leverage, reason) in [
+        (Decimal::ZERO, "LEVERAGE_TIER_CONFLICT"),
+        (Decimal::TEN, "INVALID_FROZEN_TIMELINE"),
+    ] {
+        let mut invalid = config.clone();
+        invalid.leverage = leverage;
+        invalid.tiers[0].tiers.pop();
+        assert_eq!(invalid.validate(), Err(reason));
+        assert_eq!(
+            FrozenScenario::new(leverage, invalid.specs.clone(), invalid.tiers.clone()),
+            Err(reason)
+        );
+        assert_eq!(
+            ScenarioAccount::from_seed(&seed, &invalid, &[]),
+            Err(reason)
+        );
+        assert_eq!(
+            reservation::calculate(&owner.projection().unwrap(), &[], &invalid, &[]),
+            Err(reason)
+        );
+    }
+}
+
+#[test]
 fn owned_identity_is_value_based_but_does_not_admit_new_p1_products() {
     use std::borrow::Cow;
     let owned_btc = Product(Cow::Owned(String::from("BTC-USDT-SWAP")));
