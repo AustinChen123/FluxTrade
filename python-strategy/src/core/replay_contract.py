@@ -6,7 +6,7 @@ are half-open; lookup never uses delivery time, arrival order or a fallback.
 
 from dataclasses import dataclass, fields, replace
 from decimal import Decimal
-from typing import Generic, TypeVar
+from typing import Generic, TypeVar, cast
 
 from src.core.product_registry import CapitalModel, FeeModel, InstrumentSpec, MarketType
 
@@ -174,7 +174,7 @@ class EffectiveTimeline(Generic[Version]):
             if version.product_id != self.product_id:
                 raise ValueError("wrong timeline product key")
             if isinstance(version, RuleDataVersion) and (
-                version.pool_id != self.versions[0].pool_id
+                version.pool_id != cast(RuleDataVersion, self.versions[0]).pool_id
             ):
                 raise ValueError("mixed timeline pool identity")
             if version.version_id in seen:
