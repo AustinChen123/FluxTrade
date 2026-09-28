@@ -1,0 +1,281 @@
+"""Causal filesystem durability gates using independent detached fixtures."""
+
+import ast
+import os
+from copy import deepcopy
+from hashlib import sha256
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from src.core.backtest import spider_run_store as module
+from src.core.backtest.spider_run_admission import admit_spider_run
+from src.core.backtest.spider_run_artifacts import decode_jsonl
+from test_spider_run_artifacts import rejected
+from test_spider_run_evidence import RUN, expected_checks, fixture
+
+
+def prepared(tmp_path, index=0):
+    values = fixture(index)
+    values[0]["policy_source_sha256"] = "eb6ab34d8685fb59e286f5ffda8af24cbecf3e5ab2c729c585ccdca797cac336"
+    values[0]["input_contract_hashes"][3]["sha256"] = values[0]["policy_source_sha256"]
+    recon: dict[str, Any] = dict(schema_version="spider_reconciliation_v1", run_id=RUN, result="OK", checks=expected_checks(values))
+    return module.SpiderRunStore.create(str(tmp_path), RUN), values, recon
+
+
+def boundary(row):
+    return dict(ordinal=row["journal_seq"], journal_seq=row["journal_seq"], barrier_id=row["barrier_id"])
+
+
+def ready(store, values):
+    assert store.register(values[0]) == "NATIVE_CONSTRUCTION_ALLOWED"
+    for row in values[2]:
+        store.mark_processed(boundary(row))
+        store.append_journal(row)
+        status = decode_jsonl((store._path / "status.json").read_bytes())[0]
+        assert status["state"] == "RUNNING"
+        assert status["processed_boundary"] == status["persisted_boundary"] == boundary(row)
+
+
+@pytest.mark.parametrize("index", range(3))
+def test_full_publication_and_actual_complete_status_metadata(tmp_path, index):
+    store, values, recon = prepared(tmp_path, index)
+    before = deepcopy(values)
+    ready(store, values)
+    root = tmp_path / RUN
+    running = (root / "status.json").read_bytes()
+    assert store.finalize(values[3], recon, values[4]) == "COMPLETE_PUBLISHED"
+    result = admit_spider_run(root)
+    assert result["decision"] == "ACCEPT"
+    complete = (root / "status.json").read_bytes()
+    metadata = result["artifacts"]["completion.json"]["artifacts"][1]
+    assert metadata["sha256"] == sha256(complete).hexdigest() != sha256(running).hexdigest()
+    assert metadata["byte_count"] == len(complete) and metadata["row_count"] == 1
+    assert values == before and store._state == "FROZEN"
+    with pytest.raises(RuntimeError):
+        store.publish_failure("PERSISTENCE_FAILED", None)
+
+
+def test_registration_order_and_empty_journal_durability(tmp_path, monkeypatch):
+    events = []
+    original_sync, original_write, original_replace, original_link = module._sync, module._write, os.replace, os.link
+    def sync(path):
+        events.append(("dir", Path(path).name))
+        original_sync(path)
+    def write(path, raw, append=False):
+        original_write(path, raw, append)
+        events.append(("file", Path(path).name))
+    def link(src, dst):
+        original_link(src, dst)
+        events.append(("link", Path(dst).name))
+    def replace(src, dst):
+        original_replace(src, dst)
+        events.append(("replace", Path(dst).name))
+    monkeypatch.setattr(module, "_sync", sync)
+    monkeypatch.setattr(module, "_write", write)
+    monkeypatch.setattr(module.os, "link", link)
+    monkeypatch.setattr(module.os, "replace", replace)
+    store, values, _ = prepared(tmp_path)
+    assert store.register(values[0]) == "NATIVE_CONSTRUCTION_ALLOWED"
+    assert events == [("dir", tmp_path.name), ("file", ".attempt.json.tmp"), ("link", "attempt.json"), ("dir", RUN),
+                      ("file", ".status.json.tmp"), ("replace", "status.json"), ("dir", RUN), ("file", "journal.jsonl"), ("dir", RUN)]
+    assert (tmp_path / RUN / "journal.jsonl").read_bytes() == b""
+
+
+def test_rejected_registration_and_invalid_orders(tmp_path):
+    store, values, _ = prepared(tmp_path)
+    with pytest.raises(RuntimeError):
+        store.publish_failure("PERSISTENCE_FAILED", None)
+    with pytest.raises(RuntimeError):
+        store.mark_processed(boundary(values[2][0]))
+    attempt = rejected()
+    attempt["run_id"] = RUN
+    assert store.register(attempt) == "REGISTRATION_REJECTED"
+    assert store._state == "FAILED" and not (tmp_path / RUN / "journal.jsonl").exists()
+    assert decode_jsonl((tmp_path / RUN / "status.json").read_bytes())[0]["failure_reason"] == "UNSUPPORTED_CONFIGURATION"
+    with pytest.raises(RuntimeError):
+        store.register(attempt)
+
+
+def test_mark_before_after_capture_failure_is_memory_only(tmp_path):
+    store, values, _ = prepared(tmp_path)
+    store.register(values[0])
+    root = tmp_path / RUN
+    before = (root / "status.json").read_bytes()
+    store.mark_processed(boundary(values[2][0]))
+    assert (root / "status.json").read_bytes() == before and (root / "journal.jsonl").read_bytes() == b""
+    with pytest.raises(RuntimeError):
+        store.mark_processed(boundary(values[2][1]))
+    store.publish_failure("PERSISTENCE_FAILED", None)
+    status = decode_jsonl((root / "status.json").read_bytes())[0]
+    assert status["processed_boundary"] == boundary(values[2][0]) and status["persisted_boundary"] is None
+    assert admit_spider_run(root)["reason"] == "INCOMPLETE_PERSISTENCE"
+
+
+@pytest.mark.parametrize("stage", ["write", "short", "flush", "fsync", "publish", "directory"])
+def test_one_failure_per_publication_primitive(tmp_path, monkeypatch, stage):
+    store, values, _ = prepared(tmp_path)
+    original = module._open
+    class Stream:
+        def __init__(self, *args, **kwargs):
+            self.inner = original(*args, **kwargs)
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            self.inner.close()
+        def fileno(self):
+            return self.inner.fileno()
+        def write(self, raw):
+            if stage == "write":
+                raise OSError("injected")
+            return len(raw) - 1 if stage == "short" else self.inner.write(raw)
+        def flush(self):
+            if stage == "flush":
+                raise OSError("injected")
+            self.inner.flush()
+    def fail(*args):
+        raise OSError("injected")
+    def directory_failure(_):
+        raise module.SpiderRunStoreError("PUBLICATION_DURABILITY_UNKNOWN")
+    monkeypatch.setattr(module, "_open", Stream)
+    if stage == "fsync":
+        monkeypatch.setattr(module.os, "fsync", fail)
+    elif stage == "publish":
+        monkeypatch.setattr(module.os, "link", fail)
+    elif stage == "directory":
+        monkeypatch.setattr(module, "_sync", directory_failure)
+    reason = "PUBLICATION_FAILED" if stage == "publish" else "PUBLICATION_DURABILITY_UNKNOWN" if stage == "directory" else "ARTIFACT_WRITE_FAILED"
+    with pytest.raises(module.SpiderRunStoreError) as error:
+        store.register(values[0])
+    assert error.value.reason == reason
+    assert not (tmp_path / RUN / "journal.jsonl").exists() and not (tmp_path / RUN / "completion.json").exists()
+
+
+@pytest.mark.parametrize("status_fails", [False, True])
+def test_empty_journal_directory_failure_no_token_and_failure_seam(tmp_path, monkeypatch, status_fails):
+    store, values, _ = prepared(tmp_path)
+    original_sync, original_publish = module._sync, store._publish
+    def sync(path):
+        if (Path(path) / "journal.jsonl").exists():
+            raise module.SpiderRunStoreError("PUBLICATION_DURABILITY_UNKNOWN")
+        original_sync(path)
+    def publish(name, raw):
+        if name == "status.json" and b'"FAILED"' in raw:
+            if status_fails:
+                raise module.SpiderRunStoreError("PUBLICATION_FAILED")
+            monkeypatch.setattr(module, "_sync", original_sync)
+        original_publish(name, raw)
+    monkeypatch.setattr(module, "_sync", sync)
+    monkeypatch.setattr(store, "_publish", publish)
+    with pytest.raises(module.SpiderRunStoreError) as error:
+        store.register(values[0])
+    assert error.value.reason == ("PUBLICATION_FAILED" if status_fails else "PERSISTENCE_FAILED")
+    assert error.value.requested_failure_reason == "PERSISTENCE_FAILED"
+    assert error.value.primary_failure == dict(kind="PERSISTENCE", reason="PUBLICATION_DURABILITY_UNKNOWN")
+
+
+def test_append_status_failure_stops_next_barrier_and_preserves_primary(tmp_path, monkeypatch):
+    store, values, _ = prepared(tmp_path)
+    store.register(values[0])
+    store.mark_processed(boundary(values[2][0]))
+    def fail(*args):
+        raise module.SpiderRunStoreError("PUBLICATION_FAILED")
+    monkeypatch.setattr(store, "_publish", fail)
+    with pytest.raises(module.SpiderRunStoreError) as error:
+        store.append_journal(values[2][0])
+    assert error.value.reason == error.value.requested_failure_reason == "PERSISTENCE_FAILED"
+    assert error.value.primary_failure == dict(kind="PERSISTENCE", reason="PUBLICATION_FAILED")
+    with pytest.raises(RuntimeError):
+        store.mark_processed(boundary(values[2][1]))
+    primary = dict(kind="CALLBACK", reason="POLICY_FAILED")
+    with pytest.raises(module.SpiderRunStoreError) as failure:
+        store.publish_failure("CALLBACK_FAILED", primary)
+    assert failure.value.reason == "PUBLICATION_FAILED" and failure.value.requested_failure_reason == "CALLBACK_FAILED"
+    assert failure.value.primary_failure == primary
+
+
+def test_first_append_failure_retains_zero_persisted_frontier(tmp_path, monkeypatch):
+    store, values, _ = prepared(tmp_path)
+    store.register(values[0])
+    store.mark_processed(boundary(values[2][0]))
+    original = module._write
+    def fail(path, raw, append=False):
+        if append:
+            raise module.SpiderRunStoreError("ARTIFACT_WRITE_FAILED")
+        original(path, raw, append)
+    monkeypatch.setattr(module, "_write", fail)
+    with pytest.raises(module.SpiderRunStoreError) as error:
+        store.append_journal(values[2][0])
+    assert error.value.primary_failure == dict(kind="PERSISTENCE", reason="ARTIFACT_WRITE_FAILED")
+    store.publish_failure(error.value.reason, error.value.primary_failure)
+    assert store._persisted is None
+    assert admit_spider_run(tmp_path / RUN)["reason"] == "INCOMPLETE_PERSISTENCE"
+
+
+def test_root_directory_fsync_failure_has_no_artifact_authority(tmp_path, monkeypatch):
+    def fail(_):
+        raise OSError("injected")
+    monkeypatch.setattr(module.os, "fsync", fail)
+    with pytest.raises(module.SpiderRunStoreError) as error:
+        module.SpiderRunStore.create(str(tmp_path), RUN)
+    assert error.value.reason == "PUBLICATION_DURABILITY_UNKNOWN"
+    assert list((tmp_path / RUN).iterdir()) == []
+
+
+@pytest.mark.parametrize("collision", ["attempt.json", ".attempt.json.tmp"])
+def test_collision_and_stale_temp_never_clobbered(tmp_path, collision):
+    store, values, _ = prepared(tmp_path)
+    target = tmp_path / RUN / collision
+    target.write_bytes(b"preserved")
+    with pytest.raises(module.SpiderRunStoreError):
+        store.register(values[0])
+    assert target.read_bytes() == b"preserved"
+    with pytest.raises(module.SpiderRunStoreError):
+        module.SpiderRunStore.create(str(tmp_path), RUN)
+
+
+@pytest.mark.parametrize("fault", ["io", "decode", "evidence", "complete-status", "completion-dir"])
+def test_finalize_rereads_and_completion_visibility_freezes(tmp_path, monkeypatch, fault):
+    store, values, recon = prepared(tmp_path)
+    ready(store, values)
+    original_read, original_sync = Path.read_bytes, module._sync
+    def read(path):
+        if path.name == "attempt.json" and fault == "io":
+            raise OSError("injected")
+        if path.name == "attempt.json" and fault == "decode":
+            return b"not-json\n"
+        raw = original_read(path)
+        if path.name == "status.json" and fault == "complete-status" and b'"COMPLETE"' in raw:
+            return b"{}\n"
+        return raw
+    def sync(path):
+        if fault == "completion-dir" and (Path(path) / "completion.json").exists():
+            raise module.SpiderRunStoreError("PUBLICATION_DURABILITY_UNKNOWN")
+        original_sync(path)
+    if fault == "evidence":
+        recon["checks"][10]["observed"]["report_sha256"] = "f" * 64
+    monkeypatch.setattr(Path, "read_bytes", read)
+    monkeypatch.setattr(module, "_sync", sync)
+    with pytest.raises(module.SpiderRunStoreError) as error:
+        store.finalize(values[3], recon, values[4])
+    expected = "PUBLICATION_FAILED" if fault == "io" else "PUBLICATION_DURABILITY_UNKNOWN" if fault == "completion-dir" else "ENDPOINT_RECONCILIATION_FAILED"
+    assert error.value.reason == expected
+    assert (tmp_path / RUN / "completion.json").exists() == (fault == "completion-dir")
+    if fault == "completion-dir":
+        assert store._state == "FROZEN"
+        with pytest.raises(RuntimeError):
+            store.publish_failure("PUBLICATION_FAILED", None)
+
+
+def test_programming_error_and_import_boundary(tmp_path, monkeypatch):
+    store, values, recon = prepared(tmp_path)
+    ready(store, values)
+    def broken(*args):
+        raise RuntimeError("programming")
+    monkeypatch.setattr(module, "build_reconciliation", broken)
+    with pytest.raises(RuntimeError, match="programming"):
+        store.finalize(values[3], recon, values[4])
+    tree = ast.parse(Path(module.__file__).read_text())
+    imports = {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)}
+    assert not any(any(word in (name or "") for word in ("plans", "codec", "scheduler", "policy", "admission")) for name in imports)
