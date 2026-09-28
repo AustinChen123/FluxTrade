@@ -91,12 +91,12 @@ pub(super) enum Body {
     Snapshot(Box<snapshot::Fact>),
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct Delivery {
+pub(in super::super) struct Delivery {
     pub account: AccountKey,
     pub projection: Projection,
     pub delivery_id: Hash,
     pub payload_digest: Hash,
-    pub body: Body,
+    pub(super) body: Body,
     pub snapshot_version: Option<i64>,
     pub snapshot_as_of: Option<i64>,
 }

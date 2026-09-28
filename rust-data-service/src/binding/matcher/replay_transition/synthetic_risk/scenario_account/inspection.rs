@@ -20,7 +20,7 @@ struct CurrentBasis {
     reservations: Hash,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Inspection {
+pub(super) struct Inspection {
     basis: CurrentBasis,
     owner_state_digest: Hash,
 }
@@ -93,7 +93,7 @@ impl ScenarioAccount {
         }
         Ok(())
     }
-    fn inspect_state(&self) -> Result<Inspection, Fault> {
+    pub(super) fn inspect_state(&self) -> Result<Inspection, Fault> {
         let (basis, mut e) = self.current_evidence()?;
         self.encode_inspection_intents(&mut e)?;
         self.encode_inspection_executions(&mut e)?;

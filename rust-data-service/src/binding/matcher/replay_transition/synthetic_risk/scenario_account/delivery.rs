@@ -2,7 +2,7 @@
 use super::*;
 use risk_transition::cancel::identity::Encoding;
 mod identity;
-mod store;
+pub(super) mod store;
 pub(super) mod wire;
 
 #[derive(Clone, Debug, PartialEq, Eq)]

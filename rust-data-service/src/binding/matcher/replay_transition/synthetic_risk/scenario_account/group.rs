@@ -46,6 +46,11 @@ pub(super) struct Completion {
     pub failure: Option<Fault>,
 }
 
+pub(super) enum Applied {
+    Fresh(Completion),
+    Duplicate(Completion),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Admission {
     pub digest: Hash,
@@ -175,15 +180,26 @@ impl ScenarioAccount {
     pub(super) fn apply_group_checked(
         &mut self,
         group: &Group,
-        mut hook: impl FnMut(risk_transition::Stage) -> Result<(), Fault>,
+        hook: impl FnMut(risk_transition::Stage) -> Result<(), Fault>,
     ) -> Result<Completion, Fault> {
+        self.apply_group_observed(group, hook)
+            .map(|outcome| match outcome {
+                Applied::Fresh(c) | Applied::Duplicate(c) => c,
+            })
+    }
+
+    pub(super) fn apply_group_observed(
+        &mut self,
+        group: &Group,
+        mut hook: impl FnMut(risk_transition::Stage) -> Result<(), Fault>,
+    ) -> Result<Applied, Fault> {
         let result = self.prepare_group(group);
         let (digest, members, duplicate) = match result {
             Ok(prepared) => prepared,
             Err(f) => return Err(self.source_failure(f)),
         };
         if let Some(original) = duplicate {
-            return Ok(original);
+            return Ok(Applied::Duplicate(original));
         }
         let mut completion = Completion {
             group: group.clone(),
@@ -282,7 +298,7 @@ impl ScenarioAccount {
             (group.ordering_contract_id.clone(), group.group_id.clone()),
             completion.clone(),
         );
-        Ok(completion)
+        Ok(Applied::Fresh(completion))
     }
 
     fn prepare_group<'a>(&self, group: &'a Group) -> Result<PreparedGroup<'a>, Fault> {

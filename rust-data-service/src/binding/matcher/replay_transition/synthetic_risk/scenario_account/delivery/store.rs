@@ -4,18 +4,18 @@ use super::*;
 use risk_transition::cancel::identity::{classify, Stored};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct Store {
+pub(in super::super) struct Store {
     account: AccountKey,
     deliveries: BTreeMap<Hash, Stored<Delivery>>,
 }
 impl Store {
-    pub(super) fn new(account: AccountKey) -> Self {
+    pub(in super::super) fn new(account: AccountKey) -> Self {
         Self {
             account,
             deliveries: BTreeMap::new(),
         }
     }
-    pub(super) fn build(
+    pub(in super::super) fn build(
         &mut self,
         owner: &ScenarioAccount,
         snapshots: &snapshot::Store,

@@ -2,7 +2,7 @@ use super::super::super::group::{Group, Input, Member};
 use super::super::super::tests::{d, fixture};
 use super::*;
 
-fn run(fault: bool) -> (ScenarioAccount, Completion) {
+pub(in super::super::super) fn run(fault: bool) -> (ScenarioAccount, Completion) {
     let (mut seed, config, mut marks) = fixture();
     seed.cash = d("3000");
     seed.orders.clear();

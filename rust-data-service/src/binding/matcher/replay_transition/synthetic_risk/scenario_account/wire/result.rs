@@ -3,7 +3,7 @@ use super::super::group::{Completion, Reference};
 use super::*;
 use risk_transition::{cancel::identity::Encoding, Lifecycle};
 #[cfg(test)]
-mod tests;
+pub(in super::super) mod tests;
 #[cfg(test)]
 mod vectors;
 

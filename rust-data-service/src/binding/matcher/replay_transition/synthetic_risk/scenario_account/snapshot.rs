@@ -119,13 +119,17 @@ impl Store {
             .map(|s| s.value.clone())
             .ok_or("UNKNOWN_RECEIPT_REFERENCE")
     }
-    fn new(account_key: AccountKey) -> Self {
+    pub(super) fn new(account_key: AccountKey) -> Self {
         Self {
             account_key,
             snapshots: BTreeMap::new(),
         }
     }
-    fn capture(&mut self, owner: &ScenarioAccount, request: &Request) -> Result<Fact, Fault> {
+    pub(super) fn capture(
+        &mut self,
+        owner: &ScenarioAccount,
+        request: &Request,
+    ) -> Result<Fact, Fault> {
         if request.schema_version != "snapshot_request_v1"
             || request.account_key.validate().is_err()
             || !identity(&request.snapshot_id)

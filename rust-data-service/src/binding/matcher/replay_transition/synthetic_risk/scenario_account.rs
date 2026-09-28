@@ -18,6 +18,7 @@ mod inspection;
 mod min_cash;
 mod reservation;
 mod risk_transition;
+mod session;
 mod snapshot;
 mod source;
 mod wire;
