@@ -182,10 +182,19 @@ class _ScheduleError(Exception):
     pass
 
 
+class ReplayPersistenceError(Exception):
+    """A synchronous evidence barrier failed after an observed result."""
+
+
+class _EvidenceCallbackError(Exception):
+    def __init__(self, original: Exception):
+        self.original = original
+
+
 class _ReplayComposition:
     """One native owner and one source cache, deliberately without a run API."""
 
-    def __init__(self, profile: wire.Profile, account: wire.Account, callback_plans=None) -> None:
+    def __init__(self, profile: wire.Profile, account: wire.Account, callback_plans=None, evidence_callback=None) -> None:
         self._codec = wire.ScenarioCodec(profile, account)
         self._policy = _closed_policy(profile)
         self._account = deepcopy(account)
@@ -198,6 +207,26 @@ class _ReplayComposition:
         self._current_time, self._last_popped = 500, None
         self._terminal: dict[str, Any] | None = None
         self._audit: dict[str, list] = {}
+        self._evidence_callback = evidence_callback
+
+    def _evidence(self, kind, key, evidence):
+        if self._evidence_callback is None:
+            return
+        scheduler_key = dict(visible_at=key[0], queue_class=("SOURCE_GROUP", "SNAPSHOT_CAPTURE", "DELIVERY")[key[1]],
+                             schedule_sequence=key[2], stable_id=key[3])
+        try:
+            self._evidence_callback(kind, deepcopy(scheduler_key), deepcopy(evidence))
+        except Exception as exc:
+            if type(exc) is ReplayPersistenceError:
+                raise _ScheduleError("PERSISTENCE_FAILED") from exc
+            raise _EvidenceCallbackError(exc) from exc
+
+    def _callback_evidence(self, record, prefix, events, outcome="SUCCESS", failure=None):
+        actions = [dict(event_index=i, action_index=j, group_id=action["group_id"], status=action["status"],
+                        group_result=action.get("group_result"), native_failure=action.get("native_failure"))
+                   for i, event in enumerate(events) for j, action in enumerate(event.get("actions", []))]
+        self._evidence("CALLBACK_RESULT", record["key"], dict(delivery_id=record["item"]["delivery"]["delivery_id"],
+                       outcome=outcome, policy_events=list(prefix.events), actions=actions, failure=failure))
 
     def _scheduler_observation(self):
         result: dict[str, Any] = deepcopy(dict(current_time=self._current_time, last_popped=self._last_popped,
@@ -336,6 +365,8 @@ class _ReplayComposition:
 
     def _deliver_queued(self, record):
         delivery, plan = record["item"]["delivery"], record["plan"]
+        self._evidence("DELIVERY_ATTEMPT", record["key"], dict(delivery=delivery,
+                       emission_plan_digest=policy_protocol._emission_plan_digest(plan) if plan is not None else None))
         next_stage = None
         if delivery.get("continuation_id") is not None:
             try:
@@ -351,17 +382,20 @@ class _ReplayComposition:
                   if e["kind"] in ("send", "cancel") else {})) for e in prefix.events]
         self._audit[delivery["delivery_id"]] = events
         if prefix.exception is not None:
+            self._callback_evidence(record, prefix, events, "CALLBACK_FAILED", dict(kind="CALLBACK", reason="CALLBACK_FAILED"))
             raise _ScheduleError("CALLBACK_FAILED")
         try:
             validated = _validate_emission_plan(self._account, delivery, prefix.events, plan)
         except ValueError as exc:
             if exc.args not in (("POLICY_EMISSION_MISMATCH",), ("MISSING_NEXT_EVENT_STAMP",)):
                 raise
+            self._callback_evidence(record, prefix, events, "PLAN_FAILED", dict(kind="PLAN", reason=exc.args[0]))
             raise _ScheduleError(exc.args[0]) from exc
         financial = iter(plan["financial_items"])
         for event in events:
             for action in event.get("actions", []):
                 action["group_id"] = next(financial)["expected_group"]["group_id"]
+        self._callback_evidence(record, prefix, events)
         derived = [(dict(kind="SOURCE_GROUP", schedule_sequence=v["schedule_sequence"], group=v["expected_group"]), None)
                    if "expected_group" in v else (self._capture_item(dict(capture_sequence=v["capture_sequence"],
                        snapshot_request=v["snapshot_request"], delivery_projection=v["delivery_projection"])), None) for v in validated]
@@ -399,11 +433,13 @@ class _ReplayComposition:
                     for action in actions:
                         action["group_result"] = deepcopy(group)
                     record["result"] = deepcopy(result)
+                    self._evidence("SOURCE_GROUP_RESULT", key, dict(request=item["group"], result=group))
                     if group["classification"] == "FAULT":
                         record["result"] = self._stop_scheduler(_ScheduleError(cast(str, group.get("failure"))), kind, key[3], group=group)
                         return deepcopy(record["result"])
                 elif kind == "SNAPSHOT_CAPTURE":
                     fact = self._codec.capture_snapshot(item["request"])
+                    self._evidence("SNAPSHOT_FACT", key, dict(purpose="POLL", request=item["request"], fact=fact))
                     projection = deepcopy(item["delivery_projection"])
                     projection["reference"] = fact["reference"]
                     delivery = self._codec.build_delivery(projection)
@@ -416,6 +452,8 @@ class _ReplayComposition:
                 record["result"] = deepcopy(result)
             self._current_time = until
             return dict(kind="DISPATCH", stable_id=None, classification="SUCCESS")
+        except _EvidenceCallbackError as exc:
+            raise exc.original
         except Exception as exc:
             result = self._stop_scheduler(exc, record["item"]["kind"] if record else "DISPATCH", record["key"][3] if record else None)
             if record is not None:

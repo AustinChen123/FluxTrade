@@ -6,7 +6,7 @@ import pytest
 
 from src.core.backtest import synthetic_scenario_codec as wire
 from src.core.backtest import spider_policy_protocol as protocol
-from src.core.backtest.synthetic_scenario_replay import _ReplayComposition
+from src.core.backtest.synthetic_scenario_replay import ReplayPersistenceError, _ReplayComposition
 from test_spider_emission_pairing import fixture as emission_fixture
 from test_spider_poll_continuations import plan as poll_plan
 
@@ -320,3 +320,189 @@ def test_complete_poll_due_dispatch_and_delivery_duplicate_do_not_repeat_local_a
     d = materialize(stages[-1])
     assert enqueue_delivery(o, d)["classification"] == "SUCCESS" and o._begin_poll(p)["status"] == "COMPLETED"
     assert vars(o._policy) == before and not o._queue
+
+
+def test_evidence_four_shapes_order_and_detachment(monkeypatch):
+    s, calls, evidence = stage(), [], []
+    d = materialize(s)
+    def barrier(kind, key, payload):
+        calls.append(kind)
+        evidence.append((kind, deepcopy(key), deepcopy(payload)))
+        if kind == "SOURCE_GROUP_RESULT":
+            payload["request"]["members"].clear()
+        elif kind == "SNAPSHOT_FACT":
+            payload["fact"]["reference"]["fact_id"] = "poison"
+        elif kind == "DELIVERY_ATTEMPT":
+            payload["delivery"]["immutable_payload"].clear()
+        key.clear()
+        payload.clear()
+    o = _ReplayComposition("SYNTHETIC_BTC_ETH_V1", ACCOUNT, {d["delivery_id"]: empty(d)}, evidence_callback=barrier)
+    apply, snapshot, build = wire.ScenarioCodec.apply_group, wire.ScenarioCodec.capture_snapshot, wire.ScenarioCodec.build_delivery
+    monkeypatch.setattr(wire.ScenarioCodec, "apply_group", lambda self, x: (calls.append("apply"), apply(self, x))[1])
+    monkeypatch.setattr(wire.ScenarioCodec, "capture_snapshot", lambda self, x: (calls.append("snapshot"), snapshot(self, x))[1])
+    monkeypatch.setattr(wire.ScenarioCodec, "build_delivery", lambda self, x: (calls.append("build"), build(self, x))[1])
+    monkeypatch.setattr(o, "_apply_payload", lambda _: calls.append("policy"))
+    o._enqueue(source())
+    o._enqueue(capture(s))
+    assert o._dispatch_due(500)["classification"] == "SUCCESS"
+    assert calls == ["apply", "SOURCE_GROUP_RESULT", "snapshot", "SNAPSHOT_FACT", "build", "DELIVERY_ATTEMPT", "policy", "CALLBACK_RESULT"]
+    assert evidence[0][1] == dict(visible_at=500, queue_class="SOURCE_GROUP", schedule_sequence=0, stable_id="G")
+    assert evidence[0][2] == dict(request=source()["group"], result=o._records[(0, "G")]["result"]["group_result"])
+    assert o._records[(0, "G")]["item"]["group"] == source()["group"]
+    assert evidence[1][2] == dict(purpose="POLL", request=s["request"], fact=o._codec.capture_snapshot(s["request"]))
+    assert evidence[2][2] == dict(delivery=d, emission_plan_digest=protocol._emission_plan_digest(empty(d)))
+    assert evidence[3][2] == dict(delivery_id=d["delivery_id"], outcome="SUCCESS", policy_events=[], actions=[], failure=None)
+    count = len(evidence)
+    o._enqueue(source())
+    o._enqueue(capture(s))
+    enqueue_delivery(o, d)
+    o._dispatch_due(500)
+    assert len(evidence) == count
+
+
+@pytest.mark.parametrize("fail_at", ["SOURCE_GROUP_RESULT", "SNAPSHOT_FACT", "DELIVERY_ATTEMPT", "CALLBACK_RESULT"])
+def test_evidence_failure_stops_exact_barrier_and_every_later_work(monkeypatch, fail_at):
+    s, seen = stage(), []
+    d = materialize(s)
+    def barrier(kind, key, payload):
+        seen.append(kind)
+        if kind == fail_at:
+            raise ReplayPersistenceError()
+    o = _ReplayComposition("SYNTHETIC_BTC_ETH_V1", ACCOUNT, {d["delivery_id"]: empty(d)}, evidence_callback=barrier)
+    policy_calls = []
+    monkeypatch.setattr(o, "_apply_payload", lambda _: policy_calls.append("policy"))
+    o._enqueue(source())
+    o._enqueue(capture(s))
+    o._enqueue(source("later", 700))
+    result = o._dispatch_due(900)
+    kinds = ["SOURCE_GROUP_RESULT", "SNAPSHOT_FACT", "DELIVERY_ATTEMPT", "CALLBACK_RESULT"]
+    assert seen == kinds[:kinds.index(fail_at) + 1]
+    assert result["reason"] == "PERSISTENCE_FAILED" and o._current_time == 500
+    assert policy_calls == (["policy"] if fail_at == "CALLBACK_RESULT" else [])
+    assert o._records[(0, "later")]["result"]["classification"] == "PENDING"
+    if fail_at in ("SOURCE_GROUP_RESULT", "SNAPSHOT_FACT"):
+        assert (2, d["delivery_id"]) not in o._records
+    before = deepcopy(seen)
+    assert o._dispatch_due(900) == o._enqueue(source("never", 900)) == result
+    assert seen == before
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_source_evidence_retained_before_fault_handling_and_caller_after_capture(fail):
+    observed = []
+    def barrier(kind, key, payload):
+        assert kind == "SOURCE_GROUP_RESULT" and o._terminal is None
+        assert o._records[(0, key["stable_id"])]["result"]["group_result"] == payload["result"]
+        observed.append((deepcopy(payload), o._codec.inspect_state()))
+        if fail:
+            raise ReplayPersistenceError()
+    o = _ReplayComposition("SYNTHETIC_BTC_ETH_V1", ACCOUNT, evidence_callback=barrier)
+    item = source("fault")
+    item["group"]["members"][0]["payload"]["order_type"] = "MARKET"
+    del item["group"]["members"][0]["payload"]["limit_price"]
+    o._enqueue(item)
+    result = o._dispatch_due(500)
+    assert observed[0][0]["result"]["classification"] == "FAULT"
+    assert result["reason"] == ("PERSISTENCE_FAILED" if fail else observed[0][0]["result"]["failure"])
+
+
+@pytest.mark.parametrize("outcome", ["SUCCESS", "CALLBACK_FAILED", "PLAN_FAILED"])
+@pytest.mark.parametrize("persist_fails", [False, True])
+def test_callback_complete_prefix_precedes_derived_admission_or_failure(monkeypatch, outcome, persist_fails):
+    o, seen = owner(), []
+    d, _ = batch(o, monkeypatch)
+    if outcome == "CALLBACK_FAILED":
+        def broken(_):
+            o._policy.emit("alert", reason="total_limit")
+            raise RuntimeError("recognized source callback failure")
+        monkeypatch.setattr(o, "_apply_payload", broken)
+    elif outcome == "PLAN_FAILED":
+        o._records[(2, d["delivery_id"])]["plan"]["financial_items"][2]["expected_group"]["members"][0]["payload"]["client_order_id"] = "wrong"
+    def barrier(kind, key, payload):
+        if kind == "CALLBACK_RESULT":
+            assert all((0, f"G{i}") not in o._records for i in range(3))
+            seen.append(deepcopy(payload))
+            if persist_fails:
+                raise ReplayPersistenceError()
+    o._evidence_callback = barrier
+    result = o._dispatch_due(500)
+    assert len(seen) == 1 and seen[0]["outcome"] == outcome
+    assert seen[0]["policy_events"] == o._policy.events
+    failure = None if outcome == "SUCCESS" else dict(kind="CALLBACK" if outcome == "CALLBACK_FAILED" else "PLAN",
+                                                    reason="CALLBACK_FAILED" if outcome == "CALLBACK_FAILED" else "POLICY_EMISSION_MISMATCH")
+    assert seen[0]["failure"] == failure
+    if outcome != "CALLBACK_FAILED":
+        assert seen[0]["actions"] == [dict(event_index=0, action_index=i, group_id=f"G{i}" if outcome == "SUCCESS" else None,
+                                          status="UNSUBMITTED", group_result=None, native_failure=None) for i in range(3)]
+    if persist_fails or outcome != "SUCCESS":
+        assert result["reason"] == ("PERSISTENCE_FAILED" if persist_fails else cast(dict, failure)["reason"])
+        assert all((0, f"G{i}") not in o._records for i in range(3))
+    else:
+        assert result["classification"] == "SUCCESS" and all((0, f"G{i}") in o._records for i in range(3))
+
+
+def test_delivery_barrier_precedes_poll_resume():
+    p = poll_plan()
+    stages = [dict(capture_sequence=p[k]["capture_sequence"], request=p[k]["snapshot_request"], delivery_projection=p[k]["delivery_projection"])
+              for k in ("trading", "positions", "open_orders")]
+    o = owner(stages)
+    def barrier(kind, key, payload):
+        if kind == "DELIVERY_ATTEMPT":
+            raise ReplayPersistenceError()
+    o._evidence_callback = barrier
+    o._begin_poll(p)
+    before = deepcopy(vars(o._policy))
+    assert o._dispatch_due(100000)["reason"] == "PERSISTENCE_FAILED"
+    assert o._polls["Q1"].index == 0 and vars(o._policy) == before
+
+
+def test_callback_action_indexes_include_nonfinancial_events_and_reset(monkeypatch):
+    o, d = owner(), materialize(stage())
+    original, plan = emission_fixture()
+    events = [dict(at_ms=500, kind="alert", reason="total_limit"), original[0], original[2]]
+    plan.update(delivery_id=d["delivery_id"], market_requests=[],
+                expected_policy_events=[dict(kind=e["kind"], event_digest=protocol._policy_event_digest(e)) for e in events])
+    monkeypatch.setattr(o, "_apply_payload", lambda _: o._policy.events.extend(deepcopy(events)))
+    seen = []
+    def barrier(kind, key, payload):
+        if kind == "CALLBACK_RESULT":
+            seen.append(deepcopy(payload))
+            payload["actions"][0]["group_id"] = "poison"
+            payload["policy_events"][1]["orders"].clear()
+    o._evidence_callback = barrier
+    enqueue_delivery(o, d, plan)
+    assert o._dispatch_due(500)["classification"] == "SUCCESS"
+    assert [(a["event_index"], a["action_index"]) for a in seen[0]["actions"]] == [(1, 0), (1, 1), (2, 0)]
+    assert seen[0]["policy_events"] == events == o._policy.events
+    assert o._audit[d["delivery_id"]][1]["actions"][0]["group_id"] == "G0"
+
+
+@pytest.mark.parametrize("exception", [ValueError("unknown"), RuntimeError("unknown"), type("Child", (ReplayPersistenceError,), {})("unknown")])
+def test_evidence_unknown_errors_propagate_without_reclassification(exception):
+    def barrier(*args):
+        raise exception
+    o = _ReplayComposition("SYNTHETIC_BTC_ETH_V1", ACCOUNT, evidence_callback=barrier)
+    o._enqueue(source())
+    with pytest.raises(type(exception), match="unknown") as error:
+        o._dispatch_due(500)
+    assert error.value is exception and o._terminal is None
+
+
+def test_evidence_native_shaped_error_keeps_original_instance_and_stops_work():
+    codec = wire.ScenarioCodec("SYNTHETIC_BTC_ETH_V1", ACCOUNT)
+    projection = cast(wire.Projection, dict(stage()["delivery_projection"], reference=dict(namespace="SOURCE", fact_id="missing")))
+    with pytest.raises(Exception) as lookup:
+        codec.build_delivery(projection)
+    assert wire._native_failure(lookup.value) == dict(kind="LOOKUP", reason="UNKNOWN_RECEIPT_REFERENCE")
+    seen = []
+    def barrier(kind, key, payload):
+        seen.append(key["stable_id"])
+        raise lookup.value
+    o = _ReplayComposition("SYNTHETIC_BTC_ETH_V1", ACCOUNT, evidence_callback=barrier)
+    o._enqueue(source())
+    o._enqueue(source("later", 501))
+    with pytest.raises(type(lookup.value)) as propagated:
+        o._dispatch_due(900)
+    assert propagated.value is lookup.value and o._terminal is None
+    assert seen == ["G"] and o._current_time == 500
+    assert o._records[(0, "later")]["result"]["classification"] == "PENDING"
