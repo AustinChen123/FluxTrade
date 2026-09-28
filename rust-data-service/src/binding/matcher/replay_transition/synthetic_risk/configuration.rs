@@ -14,38 +14,76 @@ pub(super) struct ConfiguredProduct {
 
 impl ConfiguredProduct {
     fn valid(&self) -> bool {
-        if self.specs.len() != 1 || self.tiers.len() != 1 || self.marks.len() != 1 {
-            return false;
-        }
-        let s = &self.specs[0];
-        let t = &self.tiers[0];
-        let mark = &self.marks[0];
         super::super::identity(&self.product.0)
             && self.instrument_code > 0
             && self.taker_fee >= Decimal::ZERO
             && self.liquidation_fee >= Decimal::ZERO
-            && s.product == self.product
-            && t.product == self.product
-            && mark.product == self.product
-            && super::super::identity(&s.version)
-            && super::super::identity(&t.version)
-            && s.interval == (Interval { from: 0, to: None })
-            && t.interval == s.interval
-            && [s.contract_value, s.multiplier, s.tick, s.lot, s.minimum]
-                .iter()
-                .all(|value| *value > Decimal::ZERO)
-            && !t.tiers.is_empty()
-            && t.tiers.iter().enumerate().all(|(index, row)| {
-                row.minimum >= Decimal::ZERO
-                    && row.maximum >= row.minimum
-                    && row.mmr >= Decimal::ZERO
-                    && row.imr >= Decimal::ZERO
-                    && row.max_leverage > Decimal::ZERO
-                    && (index == 0 || t.tiers[index - 1].maximum < row.minimum)
+            && !self.specs.is_empty()
+            && self.specs.iter().enumerate().all(|(index, spec)| {
+                spec.product == self.product
+                    && super::super::identity(&spec.version)
+                    && self.specs[..index]
+                        .iter()
+                        .all(|previous| previous.version != spec.version)
+                    && spec.interval.from >= 0
+                    && spec.interval.to.is_none_or(|to| to > spec.interval.from)
+                    && (if index == 0 {
+                        spec.interval.from == 0
+                    } else {
+                        self.specs[index - 1].interval.to == Some(spec.interval.from)
+                    })
+                    && (index + 1 == self.specs.len() || spec.interval.to.is_some())
+                    && [
+                        spec.contract_value,
+                        spec.multiplier,
+                        spec.tick,
+                        spec.lot,
+                        spec.minimum,
+                    ]
+                    .iter()
+                    .all(|value| *value > Decimal::ZERO)
             })
-            && mark.price > Decimal::ZERO
-            && mark.valid_from >= 0
-            && mark.valid_to > mark.valid_from
+            && self
+                .specs
+                .last()
+                .is_some_and(|spec| spec.interval.to.is_none())
+            && !self.tiers.is_empty()
+            && self.tiers.iter().enumerate().all(|(index, tier)| {
+                tier.product == self.product
+                    && super::super::identity(&tier.version)
+                    && self.tiers[..index]
+                        .iter()
+                        .all(|previous| previous.version != tier.version)
+                    && tier.interval.from >= 0
+                    && tier.interval.to.is_none_or(|to| to > tier.interval.from)
+                    && (if index == 0 {
+                        tier.interval.from == 0
+                    } else {
+                        self.tiers[index - 1].interval.to == Some(tier.interval.from)
+                    })
+                    && (index + 1 == self.tiers.len() || tier.interval.to.is_some())
+                    && !tier.tiers.is_empty()
+                    && tier.tiers.iter().enumerate().all(|(row_index, row)| {
+                        row.minimum >= Decimal::ZERO
+                            && row.maximum >= row.minimum
+                            && row.mmr >= Decimal::ZERO
+                            && row.imr >= Decimal::ZERO
+                            && row.max_leverage > Decimal::ZERO
+                            && (row_index == 0 || tier.tiers[row_index - 1].maximum < row.minimum)
+                    })
+            })
+            && self
+                .tiers
+                .last()
+                .is_some_and(|tier| tier.interval.to.is_none())
+            && !self.marks.is_empty()
+            && self.marks.iter().enumerate().all(|(index, mark)| {
+                mark.product == self.product
+                    && mark.price > Decimal::ZERO
+                    && mark.valid_from >= 0
+                    && mark.valid_to > mark.valid_from
+                    && (index == 0 || self.marks[index - 1].valid_to <= mark.valid_from)
+            })
     }
 }
 

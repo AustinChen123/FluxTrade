@@ -351,19 +351,17 @@ impl ScenarioAccount {
             .iter()
             .flat_map(|p| p.marks.iter().cloned())
             .collect();
-        if marks.len() != scenario.products().len()
-            || scenario.products().iter().any(|product| {
-                marks
-                    .iter()
-                    .filter(|mark| {
-                        mark.product == *product
-                            && mark.valid_from <= seed.effective_at
-                            && seed.effective_at < mark.valid_to
-                    })
-                    .count()
-                    != 1
-            })
-        {
+        if scenario.products().iter().any(|product| {
+            marks
+                .iter()
+                .filter(|mark| {
+                    mark.product == *product
+                        && mark.valid_from <= seed.effective_at
+                        && seed.effective_at < mark.valid_to
+                })
+                .count()
+                != 1
+        }) {
             return Err("INVALID_SCHEMA");
         }
         Self::from_validated_configuration(seed, scenario, &marks)

@@ -59,6 +59,38 @@ fn input(count: usize) -> (CleanSeed, Vec<ConfiguredProduct>) {
     (seed, products)
 }
 
+fn multi_version_input() -> (CleanSeed, ConfiguredProduct) {
+    let (mut seed, mut products) = input(1);
+    seed.effective_at = 50;
+    let product = &mut products[0];
+    let mut spec_v2 = product.specs[0].clone();
+    spec_v2.version = "spec-v2".into();
+    spec_v2.interval = interval(true, 100);
+    spec_v2.contract_value = d("2");
+    product.specs[0].interval = interval(false, 100);
+    product.specs.push(spec_v2);
+
+    let mut tier_v2 = product.tiers[0].clone();
+    tier_v2.version = "tier-v2".into();
+    tier_v2.interval = interval(true, 100);
+    tier_v2.tiers[0].mmr = d("0.01");
+    product.tiers[0].interval = interval(false, 100);
+    product.tiers.push(tier_v2);
+
+    let mut mark_v2 = product.marks[0].clone();
+    mark_v2.valid_from = 40;
+    mark_v2.valid_to = 80;
+    mark_v2.price = d("101");
+    product.marks[0].valid_to = 30;
+    product.marks.push(mark_v2);
+    (seed, products.remove(0))
+}
+fn assert_invalid_timeline(change: impl FnOnce(&mut ConfiguredProduct)) {
+    let (seed, mut product) = multi_version_input();
+    change(&mut product);
+    let result = ScenarioAccount::from_configured_empty(&seed, d("10"), vec![product]);
+    assert_eq!(result, Err("INVALID_SCHEMA"));
+}
 fn assert_context_changes(
     seed: &CleanSeed,
     leverage: Decimal,
@@ -283,6 +315,51 @@ fn configured_empty_accepts_non_scale_values_and_multiple_tiers() {
     changed_seed.config_id = "another-config".into();
     let other = ScenarioAccount::from_configured_empty(&changed_seed, d("25"), products).unwrap();
     assert_ne!(owner.valuation_context_id, other.valuation_context_id);
+}
+
+#[test]
+fn configured_multi_version_timelines_resolve_boundaries_and_mark_gaps() {
+    let (seed, product) = multi_version_input();
+    let owner = ScenarioAccount::from_configured_empty(&seed, d("10"), vec![product]).unwrap();
+    let (scenario, marks) = owner.btc_context().unwrap();
+    let products = scenario.products();
+    for (at, expected) in [
+        (99, ("scale-spec-v1", "scale-tier-v1")),
+        (100, ("spec-v2", "tier-v2")),
+    ] {
+        let (spec, tier) = scenario.resolve(&products[0], at).unwrap();
+        assert_eq!((spec.version.as_str(), tier.version.as_str()), expected);
+    }
+    assert_eq!(marks[1].price, d("101"));
+}
+#[test]
+fn configured_multi_version_rejects_invalid_timeline_shapes_before_owner() {
+    let mutations: &[fn(&mut ConfiguredProduct)] = &[
+        |p| p.specs.clear(),
+        |p| p.specs[0].interval.from = 1,
+        |p| p.specs[0].interval.to = Some(0),
+        |p| p.specs[0].interval.to = Some(90),
+        |p| p.specs[1].interval.to = Some(200),
+        |p| p.specs.swap(0, 1),
+        |p| p.specs[1].version = p.specs[0].version.clone(),
+        |p| p.specs[1].product = Product("other".into()),
+        |p| p.tiers.clear(),
+        |p| p.tiers[0].interval.to = Some(90),
+        |p| p.tiers.swap(0, 1),
+        |p| p.tiers[1].interval.to = Some(200),
+        |p| p.tiers[1].version = p.tiers[0].version.clone(),
+        |p| p.tiers[1].version.clear(),
+        |p| p.tiers[1].product = Product("other".into()),
+        |p| p.tiers[1].tiers.clear(),
+        |p| p.tiers[0].interval.to = Some(110),
+        |p| p.marks.clear(),
+        |p| p.marks[0].valid_to = 45,
+        |p| p.marks.swap(0, 1),
+        |p| p.marks[1].valid_from = 51,
+    ];
+    for change in mutations {
+        assert_invalid_timeline(change);
+    }
 }
 
 #[test]
