@@ -20,6 +20,7 @@ mod reservation;
 mod risk_transition;
 mod snapshot;
 mod source;
+mod wire;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ProfileContext {
