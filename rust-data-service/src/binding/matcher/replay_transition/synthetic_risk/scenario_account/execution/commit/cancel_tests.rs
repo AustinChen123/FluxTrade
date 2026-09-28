@@ -351,6 +351,12 @@ fn gt03_partial_and_full_fill_cancel_traces_are_exact_and_repeatable() {
                 "0",
             );
             let receipt = &effective.receipts[0];
+            assert_eq!(x1.order_after.filled, d("4"));
+            assert_eq!(x1.order_after.remaining, d("6"));
+            assert_eq!(x1.order_after.status, "PARTIALLY_FILLED");
+            assert_eq!(x1.order_created_at, 500);
+            assert_eq!(x1.contract_value, Decimal::ONE);
+            assert_eq!(owner.orders[&id].created_at, 500);
             assert_eq!(
                 receipt.lifecycle_after,
                 risk_transition::Lifecycle::RiskStable

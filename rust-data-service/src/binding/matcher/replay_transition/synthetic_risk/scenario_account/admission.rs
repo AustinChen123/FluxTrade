@@ -173,6 +173,7 @@ enum Outcome {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Evaluation {
+    MinCash(Decimal),
     GoldenCancel(Decimal),
     GoldenCapacity(capacity::CapacityProjection),
     BtcEth(btc_policy::Evidence),
@@ -384,48 +385,62 @@ impl ScenarioAccount {
             }
         };
         hook(PrepareStage::Validated)?;
-        draft.orders.insert(
-            order_id.clone(),
-            RestingOrder {
-                version: 1,
-                cancel: risk_transition::cancel::State::None,
-                facts: SeedOrder {
-                    intent_id: intent.intent_id.clone(),
-                    order_id: order_id.clone(),
-                    client_id: intent.client_order_id.clone(),
-                    strategy_id: intent.strategy_id.clone(),
-                    product: intent.product,
-                    side: intent.side,
-                    price,
-                    reduce_only: intent.reduce_only,
-                    original: intent.quantity,
-                    filled: Decimal::ZERO,
-                    canceled: Decimal::ZERO,
-                    remaining: intent.quantity,
-                    status: "OPEN".into(),
-                },
-            },
-        );
-        hook(PrepareStage::OrderDrafted)?;
-        let (evaluation, reason_code) = match &self.profile {
-            ProfileContext::GoldenCancel(_) => (
-                Evaluation::GoldenCancel(draft.golden_cancel_reservation()?),
-                None,
-            ),
-            ProfileContext::EventLimit(_) => return Err("UNSUPPORTED_ADMISSION_PROFILE"),
-            ProfileContext::GoldenCapacity(_) => {
-                let projection = self.capacity_projection(&capacity::Candidate {
-                    product: intent.product,
-                    quantity: intent.quantity,
-                    price,
-                })?;
-                let reason =
-                    (projection.required > projection.threshold).then_some("CAPACITY_EXCEEDED");
-                (Evaluation::GoldenCapacity(projection), reason)
+        let below_floor = matches!(
+            self.profile,
+            ProfileContext::BtcEthScenario {
+                min_cash_profile: true,
+                ..
             }
-            ProfileContext::BtcEthScenario { .. } => {
-                let (evidence, reason) = btc_policy::evaluate(self, &draft, intent, price)?;
-                (Evaluation::BtcEth(evidence), reason)
+        ) && self.cash < Decimal::from(995);
+        if !below_floor {
+            draft.orders.insert(
+                order_id.clone(),
+                RestingOrder {
+                    created_at: envelope.effective_at,
+                    version: 1,
+                    cancel: risk_transition::cancel::State::None,
+                    facts: SeedOrder {
+                        intent_id: intent.intent_id.clone(),
+                        order_id: order_id.clone(),
+                        client_id: intent.client_order_id.clone(),
+                        strategy_id: intent.strategy_id.clone(),
+                        product: intent.product,
+                        side: intent.side,
+                        price,
+                        reduce_only: intent.reduce_only,
+                        original: intent.quantity,
+                        filled: Decimal::ZERO,
+                        canceled: Decimal::ZERO,
+                        remaining: intent.quantity,
+                        status: "OPEN".into(),
+                    },
+                },
+            );
+        }
+        hook(PrepareStage::OrderDrafted)?;
+        let (evaluation, reason_code) = if below_floor {
+            (Evaluation::MinCash(self.cash), Some("MIN_CASH"))
+        } else {
+            match &self.profile {
+                ProfileContext::GoldenCancel(_) => (
+                    Evaluation::GoldenCancel(draft.golden_cancel_reservation()?),
+                    None,
+                ),
+                ProfileContext::EventLimit(_) => return Err("UNSUPPORTED_ADMISSION_PROFILE"),
+                ProfileContext::GoldenCapacity(_) => {
+                    let projection = self.capacity_projection(&capacity::Candidate {
+                        product: intent.product,
+                        quantity: intent.quantity,
+                        price,
+                    })?;
+                    let reason =
+                        (projection.required > projection.threshold).then_some("CAPACITY_EXCEEDED");
+                    (Evaluation::GoldenCapacity(projection), reason)
+                }
+                ProfileContext::BtcEthScenario { .. } => {
+                    let (evidence, reason) = btc_policy::evaluate(self, &draft, intent, price)?;
+                    (Evaluation::BtcEth(evidence), reason)
+                }
             }
         };
         let accepted = reason_code.is_none();
@@ -465,5 +480,7 @@ impl ScenarioAccount {
 
 #[cfg(test)]
 mod golden_cancel_tests;
+#[cfg(test)]
+mod min_cash_tests;
 #[cfg(test)]
 mod tests;

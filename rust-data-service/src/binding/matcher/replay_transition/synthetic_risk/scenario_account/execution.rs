@@ -131,6 +131,10 @@ pub(super) enum FinancialSnapshot {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct CommittedExecution {
+    order_after: SeedOrder,
+    order_created_at: i64,
+    execution_effective_at: i64,
+    contract_value: Decimal,
     risk_decision_after: Option<risk_transition::Decision>,
     lifecycle_after: risk_transition::Lifecycle,
     episode_after: Option<risk_transition::Episode>,

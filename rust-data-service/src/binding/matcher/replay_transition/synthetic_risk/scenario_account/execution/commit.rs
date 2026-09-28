@@ -232,10 +232,26 @@ impl ScenarioAccount {
         }
         .into();
         let order_version_after = order.version;
+        let order_after = order.facts.clone();
+        let order_created_at = order.created_at;
+        let contract_value = match template.key.product {
+            ProfileProduct::BtcEth(product) => {
+                self.btc_context()?
+                    .0
+                    .resolve(product, template.matching_effective_at)?
+                    .0
+                    .contract_value
+            }
+            ProfileProduct::Pa => Decimal::ONE,
+        };
         hook(Stage::OrdersDrafted)?;
         let (after_reservation, risk) = self.execution_snapshot_after(stamp)?;
         hook(Stage::Valued)?;
         Ok(CommittedExecution {
+            order_after,
+            order_created_at,
+            execution_effective_at: template.matching_effective_at,
+            contract_value,
             risk_decision_after: if let FinancialSnapshot::BtcEth(snapshot) = &after_reservation {
                 Some(self.classify_risk(snapshot)?)
             } else {

@@ -467,7 +467,10 @@ fn pending_cancel_and_invalid_preparation_inputs_fail_without_a_step() {
                 "INVALID_POSITION"
             }
             _ => {
-                let ProfileContext::BtcEthScenario { scenario, marks } = &mut bad.profile else {
+                let ProfileContext::BtcEthScenario {
+                    scenario, marks, ..
+                } = &mut bad.profile
+                else {
                     unreachable!()
                 };
                 match field {

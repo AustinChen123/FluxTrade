@@ -102,6 +102,10 @@ fn receipt_fixture(owner: &ScenarioAccount, candidate: &ExecutionCandidate) -> C
     let template = &candidate.template;
     let snapshot = FinancialSnapshot::BtcEth(owner.reservation().unwrap());
     CommittedExecution {
+        order_after: owner.orders[&template.order_id].facts.clone(),
+        order_created_at: owner.orders[&template.order_id].created_at,
+        execution_effective_at: template.matching_effective_at,
+        contract_value: d("0.01"),
         risk_decision_after: None,
         lifecycle_after: risk_transition::Lifecycle::RiskStable,
         episode_after: None,

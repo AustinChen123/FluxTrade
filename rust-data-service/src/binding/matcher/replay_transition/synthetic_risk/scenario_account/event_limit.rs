@@ -271,6 +271,7 @@ impl ScenarioAccount {
                         facts.order_id.clone(),
                         RestingOrder {
                             facts: facts.clone(),
+                            created_at: seed.effective_at,
                             version: 0,
                             cancel: risk_transition::cancel::State::None,
                         },

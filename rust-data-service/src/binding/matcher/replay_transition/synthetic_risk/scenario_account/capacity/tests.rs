@@ -37,6 +37,7 @@ fn authoritative_projection_retains_terminal_order_without_reservation() {
         owner.orders.insert(
             "O1".into(),
             RestingOrder {
+                created_at: 500,
                 facts,
                 version: 7,
                 cancel: risk_transition::cancel::State::None,

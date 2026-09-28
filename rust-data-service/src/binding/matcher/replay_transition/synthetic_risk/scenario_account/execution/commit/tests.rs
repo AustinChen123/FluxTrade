@@ -2,6 +2,61 @@ use super::super::super::tests::{d, fixture};
 use super::super::tests::fixture_candidate;
 use super::*;
 
+pub(in super::super::super) fn at(mut input: ExecutionCandidate, at: i64) -> ExecutionCandidate {
+    input.template.matching_effective_at = at;
+    input
+}
+
+#[test]
+fn min_cash_execution_metadata_is_frozen_across_context_and_duplicates() {
+    let (seed, _, _) = fixture();
+    let mut owner = ScenarioAccount::synthetic_min_cash(seed.key).unwrap();
+    let candidate = at(input(&owner, "MIN-O1", "MIN-X1", "20", "50000"), 501);
+    let receipt = committed(&mut owner, &candidate);
+    assert_eq!(
+        (
+            owner.cash,
+            owner.fees,
+            owner.gross_realized,
+            owner.state_version
+        ),
+        (d("990"), d("10"), d("0"), 1)
+    );
+    assert_eq!(
+        receipt.financial_payload_digest,
+        candidate.template.digest()
+    );
+    assert_eq!(
+        (
+            receipt.order_created_at,
+            receipt.execution_effective_at,
+            receipt.contract_value
+        ),
+        (500, 501, d("0.01"))
+    );
+    assert_eq!(receipt.order_after, owner.orders["MIN-O1"].facts);
+    assert_eq!(receipt.order_after.status, "FILLED");
+    assert_eq!(
+        (receipt.order_after.original, receipt.order_after.filled),
+        (d("20"), d("20"))
+    );
+    use super::super::super::context::tests::{activation, mark_rows};
+    let (_, marks) = owner.btc_context().unwrap();
+    let change = activation(&owner, 503, mark_rows(marks, 503));
+    owner.activate_context(&change).unwrap();
+    let before = owner.clone();
+    assert_eq!(
+        owner.execute(&candidate),
+        Ok(Reply::Duplicate(receipt.clone()))
+    );
+    assert_eq!(owner, before);
+    assert_eq!(owner.execution_receipts[&receipt.execution_id], receipt);
+    assert_eq!(
+        (owner.state_version, owner.orders["MIN-O1"].created_at),
+        (2, 500)
+    );
+}
+
 #[test]
 fn liquidation_fault_after_execution_retains_immutable_source_commit() {
     for panic in [false, true] {

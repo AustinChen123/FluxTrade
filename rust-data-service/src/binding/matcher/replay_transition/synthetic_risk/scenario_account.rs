@@ -13,6 +13,7 @@ mod execution;
 mod golden_cancel;
 mod group;
 mod hypothetical_settlement;
+mod min_cash;
 mod reservation;
 mod risk_transition;
 mod source;
@@ -22,6 +23,7 @@ enum ProfileContext {
     BtcEthScenario {
         scenario: FrozenScenario,
         marks: Vec<Mark>,
+        min_cash_profile: bool,
     },
     GoldenCapacity(capacity::Config),
     EventLimit(event_limit::Config),
@@ -193,6 +195,7 @@ impl PositionState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RestingOrder {
     facts: SeedOrder,
+    created_at: i64,
     version: u64,
     cancel: risk_transition::cancel::State,
 }
@@ -297,7 +300,9 @@ fn aligned(value: Decimal, step: Decimal) -> bool {
 impl ScenarioAccount {
     fn btc_context(&self) -> Result<(&FrozenScenario, &[Mark]), Fault> {
         match &self.profile {
-            ProfileContext::BtcEthScenario { scenario, marks } => Ok((scenario, marks)),
+            ProfileContext::BtcEthScenario {
+                scenario, marks, ..
+            } => Ok((scenario, marks)),
             ProfileContext::GoldenCapacity(_)
             | ProfileContext::EventLimit(_)
             | ProfileContext::GoldenCancel(_) => Err("PROFILE_MISMATCH"),
@@ -431,6 +436,7 @@ impl ScenarioAccount {
                     order.order_id.clone(),
                     RestingOrder {
                         facts: order.clone(),
+                        created_at: seed.effective_at,
                         version: 0,
                         cancel: risk_transition::cancel::State::None,
                     },
@@ -444,6 +450,7 @@ impl ScenarioAccount {
             key: seed.key.clone(),
             config_id: seed.config_id.clone(),
             profile: ProfileContext::BtcEthScenario {
+                min_cash_profile: false,
                 scenario,
                 marks: marks.to_vec(),
             },
@@ -505,9 +512,9 @@ impl ScenarioAccount {
     // No mutation: a future transition must fail its gate on this fault.
     fn validate_context(&self, effective_at: i64) -> Result<(), Fault> {
         let current = match &self.profile {
-            ProfileContext::BtcEthScenario { scenario, marks } => {
-                context_id(scenario, marks, effective_at)
-            }
+            ProfileContext::BtcEthScenario {
+                scenario, marks, ..
+            } => context_id(scenario, marks, effective_at),
             ProfileContext::GoldenCapacity(config) => config.context_id(effective_at),
             ProfileContext::EventLimit(config) => config.context_id(effective_at),
             ProfileContext::GoldenCancel(config) => config.context_id(effective_at),
