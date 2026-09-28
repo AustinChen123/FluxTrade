@@ -9,6 +9,7 @@ mod account_state;
 // Private GT-02 kernel; intentionally not connected to the legacy/Python facade.
 #[allow(dead_code)]
 mod replay_transition;
+pub(crate) use replay_transition::register_python as register_synthetic_scenario;
 mod settlement;
 
 use account_state::AccountState;

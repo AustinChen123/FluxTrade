@@ -19,6 +19,7 @@ mod min_cash;
 mod reservation;
 mod risk_transition;
 mod session;
+pub(crate) use session::register_python;
 mod snapshot;
 mod source;
 mod wire;

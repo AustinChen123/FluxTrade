@@ -51,6 +51,7 @@ fn fluxtrade_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Core Engine
     m.add_class::<binding::matcher::PyMatchingEngine>()?;
+    binding::matcher::register_synthetic_scenario(m)?;
 
     Ok(())
 }

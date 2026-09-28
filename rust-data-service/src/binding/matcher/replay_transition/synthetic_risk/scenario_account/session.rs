@@ -1,5 +1,7 @@
 //! Private session containment; no registration, recovery, or financial alias.
 use super::*;
+mod python;
+pub(crate) use python::register as register_python;
 #[cfg(test)]
 mod tests;
 

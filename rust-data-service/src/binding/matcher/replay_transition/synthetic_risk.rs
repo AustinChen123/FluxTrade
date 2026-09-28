@@ -8,6 +8,7 @@ use rust_decimal::Decimal;
 use super::Fault;
 
 mod scenario_account;
+pub(crate) use scenario_account::register_python;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Product {

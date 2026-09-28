@@ -11,6 +11,7 @@ use rust_decimal::Decimal;
 use super::{settlement, FeeModel, Order, PyMatchingEngine, SettlementModel};
 
 mod synthetic_risk;
+pub(crate) use synthetic_risk::register_python;
 
 type Fault = &'static str;
 type Hash = [u8; 32];
