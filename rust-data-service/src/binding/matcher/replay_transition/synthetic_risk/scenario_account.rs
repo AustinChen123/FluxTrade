@@ -16,6 +16,7 @@ mod hypothetical_settlement;
 mod min_cash;
 mod reservation;
 mod risk_transition;
+mod snapshot;
 mod source;
 
 #[derive(Clone, Debug, PartialEq, Eq)]

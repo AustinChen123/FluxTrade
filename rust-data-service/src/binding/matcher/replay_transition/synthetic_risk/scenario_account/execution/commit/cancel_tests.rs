@@ -300,9 +300,11 @@ fn gt03_partial_and_full_fill_cancel_traces_are_exact_and_repeatable() {
         let run = || {
             let (mut owner, id) = golden();
             assert_golden(&owner, &id, 1, "0", "0", "10", "1000", "0", "100");
+            snapshot::tests::assert_golden(&owner, "1000", "900", "0", true);
             let x1 = fill(&mut owner, &id, "X1", "4");
             assert_eq!(x1.fee_amount, d("0.4"));
             assert_golden(&owner, &id, 2, "4", "0", "6", "999.6", "0.4", "60");
+            snapshot::tests::assert_golden(&owner, "999.6", "939.6", "4", true);
             let request_input = request("C1", &[&id]);
             let c1 = owner.request_cancel(&request_input).unwrap();
             assert_golden(&owner, &id, 3, "4", "0", "6", "999.6", "0.4", "60");
@@ -338,6 +340,13 @@ fn gt03_partial_and_full_fill_cancel_traces_are_exact_and_repeatable() {
                 if full { "0" } else { "30" },
             );
             let effect_input = effect("C1-effective", "C1", &[&id]);
+            snapshot::tests::assert_golden(
+                &owner,
+                if full { "999" } else { "999.3" },
+                if full { "999" } else { "969.3" },
+                if full { "10" } else { "7" },
+                !full,
+            );
             let effective = owner.effect_cancel(&effect_input).unwrap();
             assert_golden(
                 &owner,
@@ -351,6 +360,13 @@ fn gt03_partial_and_full_fill_cancel_traces_are_exact_and_repeatable() {
                 "0",
             );
             let receipt = &effective.receipts[0];
+            snapshot::tests::assert_golden(
+                &owner,
+                if full { "999" } else { "999.3" },
+                if full { "999" } else { "999.3" },
+                if full { "10" } else { "7" },
+                false,
+            );
             assert_eq!(x1.order_after.filled, d("4"));
             assert_eq!(x1.order_after.remaining, d("6"));
             assert_eq!(x1.order_after.status, "PARTIALLY_FILLED");
