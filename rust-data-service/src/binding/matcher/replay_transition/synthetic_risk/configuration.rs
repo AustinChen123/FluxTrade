@@ -17,18 +17,19 @@ pub(super) fn interval(second: bool, boundary: i64) -> Interval {
 
 // These are the frozen Scenario §§3/7 inputs, never provider defaults.
 pub(super) fn frozen_spec(product: &Product, second: bool) -> Spec {
+    let btc = p1_btc(product);
     Spec {
         product: product.clone(),
         version: if second { "spec-v2" } else { "spec-v1" }.into(),
         interval: interval(second, 2000),
-        contract_value: Decimal::new(1, if *product == Product::Btc { 2 } else { 1 }),
+        contract_value: Decimal::new(1, if btc { 2 } else { 1 }),
         multiplier: Decimal::ONE,
         tick: Decimal::new(
             1,
-            match (product, second) {
-                (Product::Btc, true) => 0,
-                (Product::Btc, false) | (Product::Eth, true) => 1,
-                (Product::Eth, false) => 2,
+            match (btc, second) {
+                (true, true) => 0,
+                (true, false) | (false, true) => 1,
+                (false, false) => 2,
             },
         ),
         lot: Decimal::new(1, 2),
@@ -37,9 +38,10 @@ pub(super) fn frozen_spec(product: &Product, second: bool) -> Spec {
 }
 
 pub(super) fn frozen_tiers(product: &Product, second: bool) -> TierVersion {
-    let maximums = match product {
-        Product::Btc => [1000, 5000, 20000],
-        Product::Eth => [5000, 10000, 25000],
+    let maximums = if p1_btc(product) {
+        [1000, 5000, 20000]
+    } else {
+        [5000, 10000, 25000]
     };
     let mmr = if second { [45, 55, 80] } else { [40, 50, 75] };
     let imr = if second { [11, 16, 21] } else { [10, 15, 20] };
@@ -64,6 +66,12 @@ pub(super) fn frozen_tiers(product: &Product, second: bool) -> TierVersion {
             max_leverage: Decimal::new(leverage[i], 2),
         }),
     }
+}
+
+// These helpers describe only frozen P1 products, not product admission.
+fn p1_btc(product: &Product) -> bool {
+    assert!(*product == Product::Btc || *product == Product::Eth);
+    *product == Product::Btc
 }
 
 impl FrozenScenario {

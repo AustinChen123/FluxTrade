@@ -27,6 +27,48 @@ pub(super) fn d(value: &str) -> Decimal {
     Decimal::from_str(value).unwrap()
 }
 
+#[test]
+fn owned_identity_is_value_based_but_does_not_admit_new_p1_products() {
+    use std::borrow::Cow;
+    let owned_btc = Product(Cow::Owned(String::from("BTC-USDT-SWAP")));
+    assert_eq!(owned_btc, Product::Btc);
+    assert_eq!(owned_btc.cmp(&Product::Eth), std::cmp::Ordering::Less);
+    let (mut seed, mut config, marks) = fixture();
+    let fixed_owner = ScenarioAccount::from_seed(&seed, &config, &marks).unwrap();
+    assert_eq!(
+        seed_execution_key(&seed.key, owned_btc.clone(), "same"),
+        seed_execution_key(&seed.key, Product::Btc, "same")
+    );
+    seed.positions[0].product = owned_btc;
+    assert_eq!(
+        ScenarioAccount::from_seed(&seed, &config, &marks),
+        Ok(fixed_owner)
+    );
+    let names = [String::from("Z-private"), String::from("A-private")];
+    let products = names.clone().map(|name| Product(Cow::Owned(name)));
+    assert_eq!(
+        products.each_ref().map(product_id),
+        ["Z-private", "A-private"]
+    );
+    for product in &products {
+        assert_eq!(product.clone(), *product);
+        assert_eq!(
+            wire::Json::Text(product_id(product).into()).product(),
+            Err("INVALID_SCHEMA")
+        );
+        seed.positions[0].product = product.clone();
+        assert_eq!(
+            ScenarioAccount::from_seed(&seed, &config, &marks),
+            Err("VERSION_COVERAGE_MISSING")
+        );
+    }
+    config.specs[0].product = products[0].clone();
+    assert_eq!(
+        FrozenScenario::new(config.leverage, config.specs, config.tiers),
+        Err("INVALID_FROZEN_TIMELINE")
+    );
+}
+
 pub(super) fn fixture() -> (CleanSeed, FrozenScenario, Vec<Mark>) {
     let mut specs = Vec::new();
     let mut tiers = Vec::new();

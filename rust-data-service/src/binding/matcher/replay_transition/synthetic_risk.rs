@@ -13,9 +13,12 @@ mod scenario_account;
 pub(crate) use scenario_account::register_python;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum Product {
-    Btc,
-    Eth,
+struct Product(std::borrow::Cow<'static, str>);
+
+#[allow(non_upper_case_globals)]
+impl Product {
+    const Btc: Self = Self(std::borrow::Cow::Borrowed("BTC-USDT-SWAP"));
+    const Eth: Self = Self(std::borrow::Cow::Borrowed("ETH-USDT-SWAP"));
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

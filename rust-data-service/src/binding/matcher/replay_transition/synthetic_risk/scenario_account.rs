@@ -260,10 +260,7 @@ fn seed_profile_execution_key(key: &AccountKey, product: ProfileProduct, id: &st
 }
 
 fn product_id(product: &Product) -> &str {
-    match product {
-        Product::Btc => "BTC-USDT-SWAP",
-        Product::Eth => "ETH-USDT-SWAP",
-    }
+    product.0.as_ref()
 }
 
 fn context_id(scenario: &FrozenScenario, marks: &[Mark], at: i64) -> Result<Hash, Fault> {
