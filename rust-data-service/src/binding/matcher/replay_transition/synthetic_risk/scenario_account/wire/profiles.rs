@@ -1,5 +1,7 @@
 use super::*;
 
+mod configured;
+
 pub(in super::super) fn construct(
     profile: &str,
     key: AccountKey,
