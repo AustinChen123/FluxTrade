@@ -246,6 +246,22 @@ def test_scheduler_has_no_production_inbound_imports():
     assert not [p for p in production if scheduler_imports(p.read_text(), _module_name(p), modules, packages)]
 
 
+def test_cli_and_store_composition_have_one_way_ownership():
+    paths, modules, packages = scheduler_sources()
+    paired = []
+    for path in paths:
+        tree = ast.parse(path.read_text())
+        imports = _static_imports(_module_name(path), tree, modules, packages) | _dynamic_imports(tree)
+        if {"src.core.backtest.synthetic_scenario_replay", "src.core.backtest.spider_run_store"} <= imports:
+            paired.append(path.name)
+    assert paired == ["spider_scenario_run.py"]
+    path = ROOT / "python-strategy/examples/run_spider_scenario_replay.py"
+    tree = ast.parse(path.read_text())
+    imports = _static_imports("examples.run_spider_scenario_replay", tree, modules, packages) | _dynamic_imports(tree)
+    assert imports == {"argparse", "json", "pathlib", "sys", "src.core.backtest.spider_scenario_run"}
+    assert not any(isinstance(node, ast.Attribute) and node.attr.startswith("_") for node in ast.walk(tree))
+
+
 @pytest.mark.parametrize("snippet", [
     "from src.core.backtest.synthetic_scenario_replay import _ReplayComposition",
     "from src.core.backtest.synthetic_scenario_replay import _ReplayComposition as R",
