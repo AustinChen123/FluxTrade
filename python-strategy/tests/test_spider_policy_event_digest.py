@@ -5,7 +5,7 @@ from struct import pack
 
 import pytest
 
-from src.core.backtest.synthetic_scenario_replay import _policy_event_bytes, _policy_event_digest
+from src.core.backtest.spider_policy_protocol import _policy_event_bytes, _policy_event_digest
 
 
 def text(value):
