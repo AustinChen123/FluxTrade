@@ -2,7 +2,7 @@ import ast
 from copy import deepcopy
 from itertools import product
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 import pytest
 
@@ -498,7 +498,9 @@ def test_configured_nested_context_is_required_through_group_delivery_and_snapsh
         "rows": [{**P, "product_id": "CFG-MIDDLE"}],
     }
     n.snapshot_fact(snapshot, context=context)
-    snapshot["immutable_payload"]["rows"][0]["product_id"] = "CFG-OTHER"
+    positions = cast(dict[str, object], snapshot["immutable_payload"])
+    rows = cast(list[dict[str, object]], positions["rows"])
+    rows[0]["product_id"] = "CFG-OTHER"
     with pytest.raises(ValueError):
         n.snapshot_fact(snapshot, context=context)
 

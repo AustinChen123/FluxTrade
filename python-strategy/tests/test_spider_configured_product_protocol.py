@@ -1,9 +1,11 @@
 from copy import deepcopy
 from decimal import Decimal as D
+from typing import Literal, Protocol, TypedDict, cast
 
 import pytest
 
 from src.core.backtest import spider_policy_protocol as protocol
+from src.core.backtest import synthetic_scenario_codec as wire
 from src.core.backtest.synthetic_scenario_replay import (
     _ReplayComposition,
 )
@@ -13,6 +15,44 @@ from test_spider_emission_pairing import fixture as _paired_fixture
 
 
 PRODUCTS = ("PRODUCT-01", "PRODUCT-02", "PRODUCT-03")
+
+
+class _PartialExecutionFact(TypedDict):
+    order_id: str
+    policy_client_order_id: str
+    product_id: str
+    state: Literal["filled"]
+    side: Literal["buy"]
+    limit_price: D
+    fill_price: D
+    original_size_contracts: D
+    cumulative_filled_size_contracts: D
+    contract_value: D
+    execution_effective_at: int
+    commit_account_version: int
+    spec_version: str
+    rule_data_version: str
+
+
+class _PartialDelivery(TypedDict):
+    account_key: wire.Account
+    delivery_id: str
+    source_fact_id: str
+    source_namespace: Literal["SOURCE"]
+    payload_kind: Literal["EXECUTION_FACT"]
+    occurrence_index: int
+    schedule_sequence: int
+    immutable_payload: _PartialExecutionFact
+    payload_digest: str
+    visible_at: int
+
+
+class _CapturedEvents(Protocol):
+    events: tuple[dict[str, object], ...]
+
+
+class _CapturePartialDelivery(Protocol):
+    def __call__(self, delivery: _PartialDelivery) -> _CapturedEvents: ...
 
 
 def group(product_ids=PRODUCTS):
@@ -131,17 +171,31 @@ def _seed_policy_for_product_fill(composition):
     policy.replies["old"] = dict(instId=product, side="sell", px="11", sz="1", clOrdId="client-0002", state="live")
 
 
-def _product_fill_delivery():
-    payload = dict(order_id="fill-order", policy_client_order_id="client-0001", product_id=PRODUCTS[1],
-        state="filled", side="buy", limit_price=D(10), fill_price=D(10), original_size_contracts=D(1),
-        cumulative_filled_size_contracts=D(1), contract_value=D(1), execution_effective_at=500,
-        commit_account_version=1, spec_version="spec-v1", rule_data_version="tier-v1")
-    return dict(account_key=ACCOUNT, delivery_id="C3-DELIVERY", source_fact_id="fill-order",
+def _product_fill_delivery() -> _PartialDelivery:
+    payload: _PartialExecutionFact = {
+        "order_id": "fill-order",
+        "policy_client_order_id": "client-0001",
+        "product_id": PRODUCTS[1],
+        "state": "filled",
+        "side": "buy",
+        "limit_price": D(10),
+        "fill_price": D(10),
+        "original_size_contracts": D(1),
+        "cumulative_filled_size_contracts": D(1),
+        "contract_value": D(1),
+        "execution_effective_at": 500,
+        "commit_account_version": 1,
+        "spec_version": "spec-v1",
+        "rule_data_version": "tier-v1",
+    }
+    return _PartialDelivery(account_key=ACCOUNT, delivery_id="C3-DELIVERY", source_fact_id="fill-order",
         source_namespace="SOURCE", payload_kind="EXECUTION_FACT", occurrence_index=0, schedule_sequence=0,
         immutable_payload=payload, payload_digest="00" * 32, visible_at=500)
 
 
-def _emission_plan_for_policy_events(delivery, events):
+def _emission_plan_for_policy_events(
+    delivery: _PartialDelivery, events
+) -> protocol._EmissionPlan:
     expected = [dict(kind=e["kind"], event_digest=protocol._policy_event_digest(e)) for e in events]
     financial = []
     previous = delivery["visible_at"]
@@ -168,15 +222,16 @@ def _emission_plan_for_policy_events(delivery, events):
                 declared_member_count=1, members=[member])
             financial.append(dict(event_digest=digest, action_kind="ORDER_INTENT" if is_send else "CANCEL_REQUEST",
                                   schedule_sequence=ordinal, expected_group=group))
-    return dict(delivery_id=delivery["delivery_id"], expected_policy_events=expected,
-                financial_items=financial, market_requests=[])
+    return cast(protocol._EmissionPlan, dict(delivery_id=delivery["delivery_id"], expected_policy_events=expected,
+                financial_items=financial, market_requests=[]))
 
 
 def test_configured_delivery_dispatch_validates_and_queues_policy_groups_with_context():
     preview = _ReplayComposition("SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1", ACCOUNT, configuration=configured(3))
     _seed_policy_for_product_fill(preview)
     delivery = _product_fill_delivery()
-    events = list(preview._capture_callback(delivery).events)
+    capture_partial = cast(_CapturePartialDelivery, preview._capture_callback)
+    events = list(capture_partial(delivery).events)
     assert {event["kind"] for event in events} >= {"send", "cancel"}
     plan = _emission_plan_for_policy_events(delivery, events)
 

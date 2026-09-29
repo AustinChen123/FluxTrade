@@ -1,6 +1,8 @@
 from copy import deepcopy
 from decimal import Decimal as D
+from collections.abc import Mapping
 from types import MappingProxyType
+from typing import cast
 
 import pytest
 
@@ -45,7 +47,7 @@ def configured(count: int = 1, *, decimals: bool = True) -> dict[str, object]:
             "products": products, "positions": [], "orders": []}
 
 
-def read_only(value):
+def read_only(value: object) -> object:
     if isinstance(value, dict):
         return MappingProxyType({key: read_only(item) for key, item in value.items()})
     if isinstance(value, list):
@@ -60,10 +62,10 @@ def test_configured_markets_follow_product_order_and_active_seed_rows(count):
         "SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1", ACCOUNT, configuration=config
     )
     markets = composition._policy.markets
-    products = config["products"]
+    products = cast(list[dict[str, object]], config["products"])
     assert list(markets) == [product["product_id"] for product in products]
     for index, product in enumerate(products, start=1):
-        market = markets[product["product_id"]]
+        market = markets[cast(str, product["product_id"])]
         assert market == {
             "price": D(index + 10), "ctVal": D(index + 1), "lotSz": D(index + 3),
             "minSz": D(index + 4), "increment": D(index + 2), "ratioHL": "0.1",
@@ -79,16 +81,20 @@ def test_configuration_snapshot_is_detached_and_not_retained():
     )
     original_markets = deepcopy(composition._policy.markets)
     config["config_id"] = "mutated"
-    config["products"][0]["specs"][1]["contract_value"] = D("999")
+    products = cast(list[dict[str, object]], config["products"])
+    specs = cast(list[dict[str, object]], products[0]["specs"])
+    specs[1]["contract_value"] = D("999")
     assert composition._policy.markets == original_markets
     assert not any(value is config for value in vars(composition).values())
     assert not any(value == config for value in vars(composition).values())
 
 
 def test_top_level_and_nested_read_only_mappings_are_supported():
-    config = read_only(configured(3))
+    config = cast(Mapping[str, object], read_only(configured(3)))
     composition = _ReplayComposition(
-        "SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1", ACCOUNT, configuration=config
+        "SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1",
+        ACCOUNT,
+        configuration=config,
     )
     assert list(composition._policy.markets) == [
         "PRODUCT-01", "PRODUCT-02", "PRODUCT-03"
@@ -114,17 +120,21 @@ def test_invalid_or_missing_config_keeps_native_invalid_schema_precedence(monkey
     with pytest.raises(ValueError, match="^INVALID_SCHEMA$"):
         _ReplayComposition("SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1", ACCOUNT)
     invalid = configured()
-    del invalid["products"][0]["specs"][1]["multiplier"]
+    products = cast(list[dict[str, object]], invalid["products"])
+    specs = cast(list[dict[str, object]], products[0]["specs"])
+    del specs[1]["multiplier"]
     with pytest.raises(ValueError, match="^INVALID_SCHEMA$"):
         _ReplayComposition(
             "SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1", ACCOUNT,
-            configuration=read_only(invalid),
+            configuration=cast(Mapping[str, object], read_only(invalid)),
         )
 
 
 def test_native_valid_non_unit_multiplier_rejects_before_policy_or_callbacks(monkeypatch):
     config = configured()
-    config["products"][0]["specs"][1]["multiplier"] = D("2")
+    products = cast(list[dict[str, object]], config["products"])
+    specs = cast(list[dict[str, object]], products[0]["specs"])
+    specs[1]["multiplier"] = D("2")
     calls = []
 
     def policy_must_not_be_built(_profile):

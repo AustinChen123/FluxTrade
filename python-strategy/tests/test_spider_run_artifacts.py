@@ -1,9 +1,14 @@
 from copy import deepcopy
 from decimal import Decimal, localcontext
+from typing import Protocol, cast
 
 import pytest
 
 from src.core.backtest import spider_run_artifacts as a
+
+
+class _WritableConfigId(Protocol):
+    config_id: str
 
 
 def attempt() -> dict[str, object]:
@@ -318,7 +323,7 @@ def test_configuration_context_is_exact_detached_and_immutable():
     assert context.configuration_sha256 == "a" * 64
     assert context.products == ("CFG-FIRST", "CFG-MIDDLE", "CFG-LAST")
     with pytest.raises(AttributeError):
-        context.config_id = "changed"
+        cast(_WritableConfigId, context).config_id = "changed"
 
 
 @pytest.mark.parametrize(
@@ -390,7 +395,8 @@ def test_configured_context_is_serialized_as_detached_ordered_list_data():
     }
     assert b'"products":["CFG-LAST","CFG-MIDDLE","CFG-FIRST"]' in encoded
     source["products"][0] = "MUTATED"
-    assert decoded["configuration_context"]["products"] == [
+    decoded_context = cast(dict[str, object], decoded["configuration_context"])
+    assert decoded_context["products"] == [
         "CFG-LAST", "CFG-MIDDLE", "CFG-FIRST"
     ]
 

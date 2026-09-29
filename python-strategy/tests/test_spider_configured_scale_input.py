@@ -652,7 +652,7 @@ def test_configured_tail_execution_callback_and_overlapping_polls_are_causal():
         assert stamp["causal_parent_ids"] == (
             [] if step["at"] == 518 else ["event-518"]
         )
-        payload = group["members"][0]["payload"]
+        payload = cast(dict[str, object], group["members"][0]["payload"])
         assert payload["order_id"] == _DOGE_ORDER_ID
         assert payload["external_execution_id"] == f"fill-{step['at']}"
         assert payload["candidate_id"] == f"candidate-{step['at']}"
@@ -722,7 +722,7 @@ def test_configured_tail_execution_callback_and_overlapping_polls_are_causal():
     }
     delayed = replay._codec.build_delivery(cast(codec.Projection, delayed_projection))
     assert delayed["delivery_id"] == expected_callback_ids[1]
-    immutable_fact = delayed["immutable_payload"]
+    immutable_fact = cast(dict[str, object], delayed["immutable_payload"])
     assert (
         immutable_fact["state"],
         immutable_fact["cumulative_filled_size_contracts"],

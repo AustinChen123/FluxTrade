@@ -5,13 +5,17 @@ import os
 from copy import deepcopy
 from hashlib import sha256
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol, cast
 
 import pytest
 
 from src.core.backtest import spider_run_store as module
 from src.core.backtest.spider_run_admission import admit_spider_run
-from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_jsonl, validate_artifact
+from src.core.backtest.spider_run_artifacts import (
+    canonical_bytes,
+    decode_jsonl,
+    validate_artifact,
+)
 from src.core.backtest.spider_run_completion_schema import report as validate_report
 from src.core.backtest.spider_run_envelope_schema import endpoint as validate_endpoint, journal as validate_journal
 from src.core.backtest.spider_run_reconciliation_schema import reconciliation as validate_reconciliation
@@ -20,6 +24,10 @@ from test_spider_run_completion_schema import configured_report_rows
 from test_spider_run_envelope_schema import configured_endpoint, configured_group_record
 from test_spider_run_reconciliation_schema import configured_fixture as configured_reconciliation_fixture
 from test_spider_run_evidence import RUN, expected_checks, fixture
+
+
+class _ReportValidationBoundary(Protocol):
+    def __call__(self, value: object, *, context: object | None = None) -> None: ...
 
 
 def prepared(tmp_path, index=0):
@@ -69,7 +77,9 @@ def configured_ready(tmp_path):
     validate_journal([row])
     validate_endpoint(endpoint)
     validate_reconciliation(reconciliation_value)
-    validate_report(report, context=attempt["configuration_context"])
+    cast(_ReportValidationBoundary, validate_report)(
+        report, context=attempt["configuration_context"]
+    )
     return store, attempt, status, [row], endpoint, reconciliation_value, report
 
 
@@ -300,11 +310,11 @@ def test_configured_report_validation_uses_candidate_context_for_reread(tmp_path
 @pytest.mark.parametrize("mutation", ["hash", "order"])
 def test_finalize_valid_candidate_report_mismatch_reaches_context_chain(tmp_path, monkeypatch, mutation):
     store, attempt, _, _, endpoint, recon, _ = configured_ready(tmp_path)
-    candidate = deepcopy(attempt["configuration_context"])
+    candidate = cast(dict[str, object], deepcopy(attempt["configuration_context"]))
     if mutation == "hash":
         candidate["configuration_sha256"] = "b" * 64
     else:
-        candidate["products"].reverse()
+        cast(list[str], candidate["products"]).reverse()
     report = configured_report_rows(candidate)
     for row in report:
         row["run_id"] = "r-1"
