@@ -4,6 +4,25 @@ use super::*;
 mod configured_fee;
 mod configured_fee_scale;
 
+pub(in super::super::super) fn configured_input(
+    owner: &ScenarioAccount,
+    order_id: &str,
+    execution_id: &str,
+    quantity: &str,
+    price: &str,
+    effective_at: i64,
+) -> ExecutionCandidate {
+    let mut candidate = input(owner, order_id, execution_id, quantity, price);
+    candidate.template.matching_effective_at = effective_at;
+    let (scenario, _) = owner.btc_context().unwrap();
+    assert!(scenario.configured.is_some());
+    let product = candidate.template.key.product.btc().unwrap();
+    let (spec, tier) = scenario.resolve(product, effective_at).unwrap();
+    candidate.spec_version = spec.version.clone();
+    candidate.rule_data_version = tier.version.clone();
+    candidate
+}
+
 pub(in super::super::super) fn at(mut input: ExecutionCandidate, at: i64) -> ExecutionCandidate {
     input.template.matching_effective_at = at;
     input
