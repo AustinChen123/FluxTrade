@@ -89,6 +89,20 @@ fn completed_bytes_survive_mutation_and_identity_is_owned_by_four_c() {
     );
     assert_eq!(reverse.apply_group(&g.to_string()), Ok(bytes));
 }
+
+#[test]
+fn malformed_product_session_input_leaves_owner_unchanged() {
+    let mut s = session();
+    let mut invalid = group("bad-product", 500);
+    invalid["members"][0]["payload"]["product_id"] = json!(7);
+    let before = s.owner.clone();
+    assert_eq!(
+        s.apply_group(&invalid.to_string()),
+        Err(BoundaryError::Input("INVALID_SCHEMA"))
+    );
+    assert_eq!(s.owner, before);
+    assert!(s.completed.is_empty());
+}
 #[test]
 fn actual_prefix_and_terminal_preflight_are_retained_without_fabrication() {
     for fault in [false, true] {

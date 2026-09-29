@@ -43,9 +43,148 @@ fn request(kind: &str) -> Value {
 }
 fn parse(value: &Value, owner: &ScenarioAccount) -> Result<Group, Fault> {
     let before = owner.clone();
-    let result = decode_group(&value.to_string(), &owner.key);
+    let result = decode_group(&value.to_string(), owner);
     assert_eq!(*owner, before);
     result
+}
+
+fn configured_owner(count: usize) -> ScenarioAccount {
+    let (seed, products) = super::super::super::configured_tests::input(count);
+    ScenarioAccount::from_configured(&seed, super::super::super::tests::d("10"), products).unwrap()
+}
+
+fn set_product(value: &mut Value, kind: &str, product: Value) {
+    let path = if kind == "CONTEXT_MARKS" {
+        "/members/0/payload/rows/0/product_id"
+    } else {
+        "/members/0/payload/product_id"
+    };
+    *value.pointer_mut(path).unwrap() = product;
+}
+
+#[test]
+fn configured_group_products_are_exactly_configuration_owned_for_all_decoders() {
+    let owner = configured_owner(12);
+    for kind in ["INTENT", "EXECUTION", "CONTEXT_MARKS"] {
+        let mut accepted = request(kind);
+        set_product(&mut accepted, kind, json!("ETH-USDT-SWAP"));
+        let decoded = parse(&accepted, &owner).unwrap();
+        let product = match &decoded.members[0].input {
+            Input::Intent(value) => value.wire_product().clone(),
+            Input::Execution(value) => value.wire_product().clone(),
+            Input::Context(value) => match &value.rows {
+                context::Rows::Marks(rows) => ProfileProduct::BtcEth(rows[0].0.clone()),
+                _ => panic!("expected marks"),
+            },
+            _ => panic!("unexpected member type"),
+        };
+        assert_eq!(
+            product,
+            ProfileProduct::BtcEth(Product("ETH-USDT-SWAP".into()))
+        );
+
+        for rejected in [json!("UNCONFIGURED-SWAP"), json!(7), json!("P_A")] {
+            let mut invalid = request(kind);
+            set_product(&mut invalid, kind, rejected);
+            assert_eq!(parse(&invalid, &owner), Err("INVALID_SCHEMA"), "{kind}");
+        }
+    }
+
+    let (seed, mut products) = super::super::super::configured_tests::input(1);
+    let only_eth = Product("ETH-USDT-SWAP".into());
+    products[0].product = only_eth.clone();
+    products[0].specs[0].product = only_eth.clone();
+    products[0].tiers[0].product = only_eth.clone();
+    products[0].marks[0].product = only_eth;
+    let eth_owner =
+        ScenarioAccount::from_configured(&seed, super::super::super::tests::d("10"), products)
+            .unwrap();
+    for kind in ["INTENT", "EXECUTION", "CONTEXT_MARKS"] {
+        let mut legacy_known = request(kind);
+        set_product(&mut legacy_known, kind, json!("BTC-USDT-SWAP"));
+        assert_eq!(
+            parse(&legacy_known, &eth_owner),
+            Err("INVALID_SCHEMA"),
+            "{kind}"
+        );
+    }
+}
+
+#[test]
+fn configured_pa_requires_explicit_membership_and_is_never_the_p1_pa_variant() {
+    let (seed, mut products) = super::super::super::configured_tests::input(1);
+    let product = Product("P_A".into());
+    products[0].product = product.clone();
+    products[0].specs[0].product = product.clone();
+    products[0].tiers[0].product = product.clone();
+    products[0].marks[0].product = product;
+    let owner =
+        ScenarioAccount::from_configured(&seed, super::super::super::tests::d("10"), products)
+            .unwrap();
+    for kind in ["INTENT", "EXECUTION", "CONTEXT_MARKS"] {
+        let mut value = request(kind);
+        set_product(&mut value, kind, json!("P_A"));
+        let decoded = parse(&value, &owner).unwrap();
+        let product = match &decoded.members[0].input {
+            Input::Intent(value) => value.wire_product().clone(),
+            Input::Execution(value) => value.wire_product().clone(),
+            Input::Context(value) => match &value.rows {
+                context::Rows::Marks(rows) => ProfileProduct::BtcEth(rows[0].0.clone()),
+                _ => panic!("expected marks"),
+            },
+            _ => panic!("unexpected member type"),
+        };
+        assert_eq!(product, ProfileProduct::BtcEth(Product("P_A".into())));
+    }
+}
+
+#[test]
+fn configured_product_type_and_account_error_precedence_are_preserved() {
+    let owner = configured_owner(12);
+    let mut invalid = request("INTENT");
+    set_product(&mut invalid, "INTENT", json!(false));
+    invalid["account_key"]["account"] = json!("OTHER");
+    assert_eq!(parse(&invalid, &owner), Err("INVALID_SCHEMA"));
+    let mut valid = request("INTENT");
+    valid["account_key"]["account"] = json!("OTHER");
+    assert_eq!(parse(&valid, &owner), Err("ACCOUNT_KEY_MISMATCH"));
+}
+
+#[test]
+fn legacy_wire_product_matrix_keeps_p1_tokens_and_context_rejection() {
+    let owner = owner();
+    for token in ["BTC-USDT-SWAP", "ETH-USDT-SWAP"] {
+        for kind in ["INTENT", "EXECUTION", "CONTEXT_MARKS"] {
+            let mut value = request(kind);
+            set_product(&mut value, kind, json!(token));
+            let decoded = parse(&value, &owner).unwrap();
+            let product = match &decoded.members[0].input {
+                Input::Intent(value) => value.wire_product().clone(),
+                Input::Execution(value) => value.wire_product().clone(),
+                Input::Context(value) => match &value.rows {
+                    context::Rows::Marks(rows) => ProfileProduct::BtcEth(rows[0].0.clone()),
+                    _ => panic!("expected marks"),
+                },
+                _ => panic!("unexpected member type"),
+            };
+            assert_eq!(product.canonical_id(), token);
+            assert!(matches!(product, ProfileProduct::BtcEth(_)));
+        }
+    }
+    for kind in ["INTENT", "EXECUTION"] {
+        let mut value = request(kind);
+        set_product(&mut value, kind, json!("P_A"));
+        let decoded = parse(&value, &owner).unwrap();
+        let product = match &decoded.members[0].input {
+            Input::Intent(value) => value.wire_product(),
+            Input::Execution(value) => value.wire_product(),
+            _ => panic!("unexpected member type"),
+        };
+        assert_eq!(product, &ProfileProduct::Pa);
+    }
+    let mut context = request("CONTEXT_MARKS");
+    set_product(&mut context, "CONTEXT_MARKS", json!("P_A"));
+    assert_eq!(parse(&context, &owner), Err("INVALID_SCHEMA"));
 }
 
 #[test]
@@ -108,7 +247,7 @@ fn every_nested_required_unknown_duplicate_and_forbidden_field_is_rejected() {
             assert_eq!(
                 decode_group(
                     &value.to_string().replacen(&original, &duplicate, 1),
-                    &owner.key
+                    &owner
                 ),
                 Err("INVALID_SCHEMA")
             );

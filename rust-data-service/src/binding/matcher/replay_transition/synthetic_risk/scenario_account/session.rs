@@ -71,7 +71,7 @@ impl Session {
         result
     }
     fn apply_group_inner(&mut self, request: &str) -> Reply {
-        let group = wire::group::decode_group(request, &self.owner.key).map_err(boundary)?;
+        let group = wire::group::decode_group(request, &self.owner).map_err(boundary)?;
         let before = self.owner.state_version;
         let outcome = self.owner.apply_group_observed(&group, |_| Ok(()));
         self.group_result(&group, before, outcome)

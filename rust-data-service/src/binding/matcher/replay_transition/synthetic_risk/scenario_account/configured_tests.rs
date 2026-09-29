@@ -7,7 +7,7 @@ const PARENT_SINGLETON_CONTEXT: [u8; 32] = [
     0x11, 0xb4, 0xf5, 0xc3, 0xe5, 0x9f, 0x32, 0x57, 0x06, 0xa1, 0xa9, 0x9e, 0x40, 0x57, 0xca, 0xfe,
 ];
 
-fn input(count: usize) -> (CleanSeed, Vec<ConfiguredProduct>) {
+pub(super) fn input(count: usize) -> (CleanSeed, Vec<ConfiguredProduct>) {
     let mut seed = fixture().0;
     seed.config_id = "SYNTHETIC_P2_SCALE_12_V1".into();
     seed.effective_at = 500;

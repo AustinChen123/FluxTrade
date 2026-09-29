@@ -386,6 +386,20 @@ fn aligned(value: Decimal, step: Decimal) -> bool {
 }
 
 impl ScenarioAccount {
+    fn resolve_wire_product(&self, value: &wire::Json) -> Result<ProfileProduct, Fault> {
+        if let ProfileContext::BtcEthScenario { scenario, .. } = &self.profile {
+            if let Some(products) = &scenario.configured {
+                let id = value.text()?;
+                return products
+                    .iter()
+                    .find(|row| row.product.0 == id)
+                    .map(|row| ProfileProduct::BtcEth(row.product.clone()))
+                    .ok_or("INVALID_SCHEMA");
+            }
+        }
+        value.product()
+    }
+
     fn from_configured(
         seed: &CleanSeed,
         leverage: Decimal,

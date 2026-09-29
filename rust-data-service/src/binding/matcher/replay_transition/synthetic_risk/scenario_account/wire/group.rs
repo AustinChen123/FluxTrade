@@ -5,7 +5,7 @@ use risk_transition::cancel::{EffectInput, Reason, RequestInput, Stamp};
 #[cfg(test)]
 mod tests;
 
-pub(in super::super) fn decode_group(input: &str, account: &AccountKey) -> Result<Group, Fault> {
+pub(in super::super) fn decode_group(input: &str, owner: &ScenarioAccount) -> Result<Group, Fault> {
     let value = decode(input)?;
     let rows = value.object(
         &[
@@ -35,10 +35,10 @@ pub(in super::super) fn decode_group(input: &str, account: &AccountKey) -> Resul
         members: rows["members"]
             .array()?
             .iter()
-            .map(|v| member(v, account))
+            .map(|v| member(v, owner))
             .collect::<Result<_, _>>()?,
     };
-    if group.account_key != *account {
+    if group.account_key != owner.key {
         return Err("ACCOUNT_KEY_MISMATCH");
     }
     Ok(group)
@@ -85,15 +85,13 @@ fn reason(value: &Json) -> Result<Reason, Fault> {
         _ => return Err("INVALID_SCHEMA"),
     })
 }
-fn member(value: &Json, account: &AccountKey) -> Result<Member, Fault> {
+fn member(value: &Json, owner: &ScenarioAccount) -> Result<Member, Fault> {
     let rows = value.object(&["stamp", "kind", "payload"], &[])?;
     let stamp = stamp(&rows["stamp"])?;
     let payload = &rows["payload"];
     let input = match rows["kind"].text()? {
-        "INTENT" => Input::Intent(admission::wire::decode(payload, account)?),
-        "EXECUTION" => {
-            Input::Execution(execution::wire::decode(payload, account, &stamp.event_id)?)
-        }
+        "INTENT" => Input::Intent(admission::wire::decode(payload, owner)?),
+        "EXECUTION" => Input::Execution(execution::wire::decode(payload, owner, &stamp.event_id)?),
         "CONTEXT_MARKS" => {
             let p = payload.object(&["expected_before", "expected_after", "rows"], &[])?;
             let marks = p["rows"]
@@ -102,8 +100,8 @@ fn member(value: &Json, account: &AccountKey) -> Result<Member, Fault> {
                 .map(|value| {
                     let r = value.object(&["product_id", "valid_from", "valid_to", "mark"], &[])?;
                     Ok((
-                        r["product_id"]
-                            .product()?
+                        owner
+                            .resolve_wire_product(&r["product_id"])?
                             .btc()
                             .cloned()
                             .map_err(|_| "INVALID_SCHEMA")?,
@@ -114,7 +112,7 @@ fn member(value: &Json, account: &AccountKey) -> Result<Member, Fault> {
                 })
                 .collect::<Result<_, Fault>>()?;
             Input::Context(context::Input {
-                account_key: account.clone(),
+                account_key: owner.key.clone(),
                 stamp: stamp.clone(),
                 expected_before: p["expected_before"].hash()?,
                 expected_after: p["expected_after"].hash()?,

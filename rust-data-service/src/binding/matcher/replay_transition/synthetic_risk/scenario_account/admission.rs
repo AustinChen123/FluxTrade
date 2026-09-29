@@ -103,6 +103,9 @@ pub(super) struct OrderIntent {
 }
 
 impl OrderIntent {
+    pub(super) fn wire_product(&self) -> &ProfileProduct {
+        &self.product
+    }
     pub(super) fn account_key(&self) -> &AccountKey {
         &self.account_key
     }

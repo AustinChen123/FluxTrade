@@ -65,7 +65,7 @@ impl CommittedExecution {
 
 pub(in super::super) fn decode(
     value: &Json,
-    account: &AccountKey,
+    owner: &ScenarioAccount,
     event_id: &str,
 ) -> Result<ExecutionCandidate, Fault> {
     let rows = value.object(
@@ -95,9 +95,9 @@ pub(in super::super) fn decode(
     Ok(ExecutionCandidate {
         template: ExecutionTemplate {
             key: ExternalExecutionKey {
-                account: account.clone(),
+                account: owner.key.clone(),
                 namespace: rows["namespace"].id()?,
-                product: rows["product_id"].product()?,
+                product: owner.resolve_wire_product(&rows["product_id"])?,
                 external_id: rows["external_execution_id"].id()?,
             },
             order_id: rows["order_id"].id()?,

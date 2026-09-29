@@ -59,7 +59,7 @@ fn cache_missing_mismatch_and_encoding_failures_poison_without_rollback() {
         blocked(&mut s);
     }
     let mut s = session();
-    let g = wire::group::decode_group(&group("G", 500).to_string(), &s.owner.key).unwrap();
+    let g = wire::group::decode_group(&group("G", 500).to_string(), &s.owner).unwrap();
     let outcome = s.owner.apply_group_observed(&g, |_| Ok(()));
     s.owner.state_version = u64::MAX;
     let before = s.owner.clone();

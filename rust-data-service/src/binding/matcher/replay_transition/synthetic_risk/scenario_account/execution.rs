@@ -100,6 +100,9 @@ pub(super) struct ExecutionCandidate {
 }
 
 impl ExecutionCandidate {
+    pub(super) fn wire_product(&self) -> &ProfileProduct {
+        &self.template.key.product
+    }
     pub(super) fn account_key(&self) -> &AccountKey {
         &self.template.key.account
     }

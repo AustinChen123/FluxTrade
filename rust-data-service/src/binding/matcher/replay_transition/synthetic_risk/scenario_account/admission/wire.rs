@@ -2,7 +2,10 @@
 use super::super::wire::{optional, Json};
 use super::*;
 
-pub(in super::super) fn decode(value: &Json, account: &AccountKey) -> Result<OrderIntent, Fault> {
+pub(in super::super) fn decode(
+    value: &Json,
+    owner: &ScenarioAccount,
+) -> Result<OrderIntent, Fault> {
     let rows = value.object(
         &[
             "intent_id",
@@ -29,9 +32,9 @@ pub(in super::super) fn decode(value: &Json, account: &AccountKey) -> Result<Ord
     Ok(OrderIntent {
         intent_id: rows["intent_id"].id()?,
         client_order_id: rows["client_order_id"].id()?,
-        account_key: account.clone(),
+        account_key: owner.key.clone(),
         config_id: rows["config_id"].id()?,
-        product: rows["product_id"].product()?,
+        product: owner.resolve_wire_product(&rows["product_id"])?,
         strategy_id: rows["strategy_id"].id()?,
         side: rows["side"].side()?,
         order_type,
