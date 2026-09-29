@@ -3,6 +3,8 @@ use super::super::group::{Group, Input, Member};
 use super::*;
 use risk_transition::cancel::{EffectInput, Reason, RequestInput, Stamp};
 #[cfg(test)]
+mod section6_scale_tests;
+#[cfg(test)]
 mod tests;
 
 pub(in super::super) fn decode_group(input: &str, owner: &ScenarioAccount) -> Result<Group, Fault> {
