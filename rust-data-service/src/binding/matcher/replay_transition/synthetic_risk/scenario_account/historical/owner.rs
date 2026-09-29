@@ -165,6 +165,7 @@ impl ScenarioAccount {
                 encoding.integer(i64::from(input.step_index));
                 for step in &steps {
                     encoding.hash(step.source_row_hash);
+                    encoding.hash(step.mark_source_row_hash);
                 }
                 let hash = encoding.finish();
                 format!("P3-MARK-{:02x?}", hash)

@@ -77,6 +77,12 @@ impl PySession {
             .build_delivery(&self.request(request)?)
             .map_err(error)
     }
+    #[pyo3(signature = (request))]
+    fn historical_market_step(&mut self, request: &Bound<'_, PyAny>) -> PyResult<String> {
+        self.inner
+            .historical_market_step(&self.request(request)?)
+            .map_err(error)
+    }
     fn inspect_state(&mut self) -> PyResult<String> {
         self.inner.inspect_state().map_err(error)
     }

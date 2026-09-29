@@ -354,10 +354,89 @@ class Inspection(TypedDict):
     owner_state_digest: str
 
 
+HistoricalModel = Literal[
+    "OHLC4_OPEN_HIGH_LOW_CLOSE_V1",
+    "OHLC4_OPEN_LOW_HIGH_CLOSE_V1",
+]
+
+
+class HistoricalBarValues(TypedDict):
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
+
+
+class HistoricalTradeBar(HistoricalBarValues):
+    volume_contracts: Decimal
+    confirmed: Literal[True]
+    source_row_hash: str
+
+
+class HistoricalMarkBar(HistoricalBarValues):
+    confirmed: Literal[True]
+    source_row_hash: str
+
+
+class HistoricalProductBars(TypedDict):
+    product_id: str
+    trade: HistoricalTradeBar
+    mark: HistoricalMarkBar
+
+
+class HistoricalWorkingOrder(TypedDict):
+    order_id: str
+    product_id: str
+    order_version: int
+    status: str
+    remaining_quantity_contracts: Decimal
+    accepted_at: int
+    accepted_source_sequence: int
+    order_kind: Literal["LIMIT", "MARKET"]
+    side: Side
+    limit_price: Decimal | None
+    risk_cancel_pending: bool
+
+
+class HistoricalNode(TypedDict):
+    schema_version: Literal["historical_node_v1"]
+    model_id: HistoricalModel
+    model_version: Literal["1"]
+    run_contract_hash: str
+    bar_open_ms: int
+    bar_duration_ms: Literal[60000]
+    step_index: int
+    market_slippage_bps: Decimal
+    bars: list[HistoricalProductBars]
+    working_orders: list[HistoricalWorkingOrder]
+
+
+class HistoricalFill(TypedDict):
+    order_id: str
+    quantity_contracts: Decimal
+    price: Decimal
+    execution_id: str
+
+
+class HistoricalProductResult(TypedDict):
+    product_id: str
+    capacity: Decimal
+    discarded_volume: Decimal
+    fills: list[HistoricalFill]
+
+
+class HistoricalNodeResult(TypedDict):
+    schema_version: Literal["historical_node_result_v1"]
+    raw_time_ms: int
+    effective_at: int
+    products: list[HistoricalProductResult]
+    owner_evidence: Inspection
+
+
 _Json: TypeAlias = str | int | bool | None | list["_Json"] | dict[str, "_Json"]
-_MONEY = frozenset("mark price quantity_contracts reported_fee limit_price size_contracts fill_price original_size_contracts cumulative_filled_size_contracts contract_value lot_size minimum_size price_increment high_low_ratio earn equity available_equity position_contracts last_price notional_usd cash gross_realized total_fees".split())
+_MONEY = frozenset("mark price open high low close quantity_contracts remaining_quantity_contracts volume_contracts capacity discarded_volume market_slippage_bps reported_fee limit_price size_contracts fill_price original_size_contracts cumulative_filled_size_contracts contract_value lot_size minimum_size price_increment high_low_ratio earn equity available_equity position_contracts last_price notional_usd cash gross_realized total_fees".split())
 _OPTIONAL = frozenset("subaccount source_sequence fee_asset reported_fee limit_price fixture_key continuation_id transport order_id message product_id side size_contracts".split())
-_INTEGER = frozenset("source_sequence effective_at scenario_ordinal valid_from valid_to matching_effective_at visible_at expected_account_version expected_order_version requested_at group_effective_at declared_member_count occurrence_index schedule_sequence captured_at captured_account_version snapshot_as_of snapshot_version execution_effective_at commit_account_version instrument_code created_at account_version account_version_before account_version_after".split())
+_INTEGER = frozenset("source_sequence effective_at scenario_ordinal valid_from valid_to matching_effective_at visible_at expected_account_version expected_order_version requested_at group_effective_at declared_member_count occurrence_index schedule_sequence captured_at captured_account_version snapshot_as_of snapshot_version execution_effective_at commit_account_version instrument_code created_at account_version account_version_before account_version_after bar_open_ms bar_duration_ms step_index order_version accepted_at accepted_source_sequence".split())
 
 
 def _decimal(value: Decimal) -> str:
@@ -369,12 +448,12 @@ def _decimal(value: Decimal) -> str:
     return text.rstrip("0").rstrip(".") if "." in text else text
 
 
-def _convert(value: object, *, reading: bool, field: str = "") -> object:
+def _convert(value: object, *, reading: bool, field: str = "", preserve_null: bool = False) -> object:
     if isinstance(value, Mapping):
-        return {key: _convert(item, reading=reading, field=key) for key, item in value.items()
-                if not (item is None and key in _OPTIONAL and not reading)}
+        return {key: _convert(item, reading=reading, field=key, preserve_null=preserve_null) for key, item in value.items()
+                if not (item is None and key in _OPTIONAL and not reading and not preserve_null)}
     if isinstance(value, list):
-        return [_convert(item, reading=reading) for item in value]
+        return [_convert(item, reading=reading, preserve_null=preserve_null) for item in value]
     if field in _MONEY and value is not None:
         if reading and isinstance(value, str):
             return Decimal(value)
@@ -388,8 +467,8 @@ def _convert(value: object, *, reading: bool, field: str = "") -> object:
     raise _native.ScenarioReplayInputError("INVALID_SCHEMA")
 
 
-def _encode(value: object) -> str:
-    return json.dumps(_convert(value, reading=False), ensure_ascii=False, separators=(",", ":"))
+def _encode(value: object, *, preserve_null: bool = False) -> str:
+    return json.dumps(_convert(value, reading=False, preserve_null=preserve_null), ensure_ascii=False, separators=(",", ":"))
 
 
 def _encode_configuration(value: Mapping[str, object]) -> str:
@@ -444,6 +523,9 @@ class ScenarioCodec:
 
     def build_delivery(self, request: Projection) -> Delivery:
         return cast(Delivery, _decode(self._session.build_delivery(_encode(request))))
+
+    def historical_market_step(self, request: HistoricalNode) -> HistoricalNodeResult:
+        return cast(HistoricalNodeResult, _decode(self._session.historical_market_step(_encode(request, preserve_null=True))))
 
     def inspect_state(self) -> Inspection:
         return cast(Inspection, _decode(self._session.inspect_state()))

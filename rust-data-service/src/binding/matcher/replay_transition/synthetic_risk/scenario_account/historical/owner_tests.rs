@@ -95,7 +95,8 @@ fn node_input(
                     Decimal::ZERO
                 },
                 confirmed: true,
-                source_row_hash: [50 + index as u8 + node.step_index; 32],
+                trade_source_row_hash: [50 + index as u8 + node.step_index; 32],
+                mark_source_row_hash: [80 + index as u8 + node.step_index; 32],
             })
             .collect(),
         working_orders: historical_orders(owner, orders),
@@ -125,7 +126,8 @@ fn historical_step_commits_through_the_existing_execution_owner() {
                 mark_ohlc: [d("50000"), d("50001"), d("49999"), d("50000")],
                 volume_contracts: d("4"),
                 confirmed: true,
-                source_row_hash: [5; 32],
+                trade_source_row_hash: [5; 32],
+                mark_source_row_hash: [6; 32],
             })
             .collect(),
         working_orders: vec![historical::WorkingOrderMeta {

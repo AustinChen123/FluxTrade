@@ -10,7 +10,8 @@ from src.core.backtest import synthetic_scenario_codec as c
 KEY: c.Account = {"venue": "okx-scenario", "environment": "test", "account": "A"}
 # Independent protocol field inventory: never derive coverage from codec dispatch.
 MONEY_FIELDS = (
-    "mark price quantity_contracts reported_fee limit_price size_contracts fill_price "
+    "mark price open high low close quantity_contracts remaining_quantity_contracts "
+    "volume_contracts capacity discarded_volume market_slippage_bps reported_fee limit_price size_contracts fill_price "
     "original_size_contracts cumulative_filled_size_contracts contract_value lot_size "
     "minimum_size price_increment high_low_ratio earn equity available_equity "
     "position_contracts last_price notional_usd cash gross_realized total_fees"
@@ -20,7 +21,8 @@ INTEGER_FIELDS = (
     "visible_at expected_account_version expected_order_version requested_at group_effective_at "
     "declared_member_count occurrence_index schedule_sequence captured_at captured_account_version "
     "snapshot_as_of snapshot_version execution_effective_at commit_account_version instrument_code "
-    "created_at account_version account_version_before account_version_after"
+    "created_at account_version account_version_before account_version_after bar_open_ms "
+    "bar_duration_ms step_index order_version accepted_at accepted_source_sequence"
 ).split()
 OPTIONAL_FIELDS = (
     "subaccount source_sequence fee_asset reported_fee limit_price fixture_key continuation_id "
@@ -196,6 +198,182 @@ def test_configured_transport_preserves_mapping_and_list_order_and_nested_nulls(
     encoded = c._encode_configuration(value)
     assert encoded == '{"second":["1.25",null],"first":{"enabled":true}}'
     assert value == {"second": [Decimal("1.2500"), None], "first": {"enabled": True}}
+
+
+def _historical_node(
+    configuration: dict[str, object],
+    *,
+    step_index: int = 0,
+    bar_open_ms: int = 3,
+    working_orders: list[c.HistoricalWorkingOrder] | None = None,
+    volume: Decimal = Decimal("0"),
+) -> c.HistoricalNode:
+    products = cast(list[dict[str, object]], configuration["products"])
+    bars: list[c.HistoricalProductBars] = []
+    for index, configured in enumerate(products):
+        product_id = cast(str, configured["product_id"])
+        bars.append({
+            "product_id": product_id,
+            "trade": {"open": Decimal("1"), "high": Decimal("1"), "low": Decimal("1"),
+                "close": Decimal("1"), "volume_contracts": volume, "confirmed": True,
+                "source_row_hash": ("a" if index == 0 else "b") * 64},
+            "mark": {"open": Decimal("1"), "high": Decimal("1"), "low": Decimal("1"),
+                "close": Decimal("1"), "confirmed": True,
+                "source_row_hash": ("c" if index == 0 else "d") * 64},
+        })
+    return {
+        "schema_version": "historical_node_v1",
+        "model_id": "OHLC4_OPEN_HIGH_LOW_CLOSE_V1",
+        "model_version": "1",
+        "run_contract_hash": "e" * 64,
+        "bar_open_ms": bar_open_ms,
+        "bar_duration_ms": 60000,
+        "step_index": step_index,
+        "market_slippage_bps": Decimal("0"),
+        "bars": bars,
+        "working_orders": working_orders or [],
+    }
+
+
+def _seeded_working_order(product_id: str = "WIRE-Z") -> dict[str, object]:
+    return {
+        "intent_id": "hist-intent",
+        "order_id": "hist-order",
+        "client_order_id": "hist-client",
+        "strategy_id": "hist-strategy",
+        "product_id": product_id,
+        "side": "SHORT",
+        "limit_price": Decimal("1"),
+        "reduce_only": False,
+        "original_quantity_contracts": Decimal("1"),
+        "filled_quantity_contracts": Decimal("0"),
+        "canceled_quantity_contracts": Decimal("0"),
+        "remaining_quantity_contracts": Decimal("1"),
+        "status": "OPEN",
+    }
+
+
+def test_historical_codec_round_trips_no_fill_node_with_owner_evidence():
+    configuration = _configured_input(2)
+    codec = c.ScenarioCodec("SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1", KEY, configuration)
+    node = _historical_node(configuration)
+    encoded = c._encode(node, preserve_null=True)
+    assert json.loads(encoded)["bars"][0]["trade"]["source_row_hash"] == "a" * 64
+    result = codec.historical_market_step(node)
+    assert result["schema_version"] == "historical_node_result_v1"
+    assert (result["raw_time_ms"], result["effective_at"]) == (3, 55)
+    assert [row["product_id"] for row in result["products"]] == ["WIRE-Z", "WIRE-A"]
+    assert all(not row["fills"] for row in result["products"])
+    assert all(row["capacity"] == Decimal("0") and row["discarded_volume"] == Decimal("0")
+        for row in result["products"])
+    assert result["owner_evidence"]["schema_version"] == "inspect_state_v1"
+    assert codec.inspect_state()["owner_state_digest"] == result["owner_evidence"]["owner_state_digest"]
+
+
+def test_historical_codec_h04_partial_steps_use_native_receipts_and_exact_ids():
+    configuration = _configured_input(2)
+    configuration["orders"] = [_seeded_working_order()]
+    codec = c.ScenarioCodec("SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1", KEY, configuration)
+    node0 = _historical_node(configuration, volume=Decimal("1"), working_orders=[{
+        "order_id": "hist-order", "product_id": "WIRE-Z", "order_version": 0,
+        "status": "OPEN", "remaining_quantity_contracts": Decimal("1"), "accepted_at": 50,
+        "accepted_source_sequence": 1, "order_kind": "LIMIT", "side": "SHORT",
+        "limit_price": Decimal("1"), "risk_cancel_pending": False,
+    }])
+    first = codec.historical_market_step(node0)
+    assert len(first["products"][0]["fills"]) == 1
+    assert first["products"][0]["fills"][0]["order_id"] == "hist-order"
+    assert first["products"][0]["fills"][0]["quantity_contracts"] == Decimal("0.5")
+    assert first["products"][0]["fills"][0]["price"] == Decimal("1")
+    first_id = first["products"][0]["fills"][0]["execution_id"]
+    node1 = _historical_node(configuration, step_index=1, volume=Decimal("1"), working_orders=[{
+        "order_id": "hist-order", "product_id": "WIRE-Z", "order_version": 1,
+        "status": "PARTIALLY_FILLED", "remaining_quantity_contracts": Decimal("0.5"), "accepted_at": 50,
+        "accepted_source_sequence": 1, "order_kind": "LIMIT", "side": "SHORT",
+        "limit_price": Decimal("1"), "risk_cancel_pending": False,
+    }])
+    second = codec.historical_market_step(node1)
+    assert second["products"][0]["fills"][0]["quantity_contracts"] == Decimal("0.5")
+    assert second["products"][0]["fills"][0]["execution_id"] != first_id
+    assert second["owner_evidence"]["total_fees"] == Decimal("0.001")
+
+
+def test_historical_codec_preserves_configured_ab_order_and_close_open_phase():
+    configuration = _configured_input(2)
+    for product in cast(list[dict[str, object]], configuration["products"]):
+        marks = cast(list[dict[str, object]], product["marks"])
+        marks[0]["valid_to"] = 2**63 - 1
+    codec = c.ScenarioCodec("SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1", KEY, configuration)
+    close_node = _historical_node(configuration, step_index=3, bar_open_ms=3)
+    close_node["bars"][0]["mark"].update({"open": Decimal("105"), "high": Decimal("105"),
+        "low": Decimal("105"), "close": Decimal("105")})
+    close = codec.historical_market_step(close_node)
+    open_node = _historical_node(configuration, step_index=0, bar_open_ms=60_003)
+    open_node["bars"][0]["mark"].update({"open": Decimal("100"), "high": Decimal("100"),
+        "low": Decimal("100"), "close": Decimal("100")})
+    opened = codec.historical_market_step(open_node)
+    assert close["raw_time_ms"] == opened["raw_time_ms"] == 60_003
+    assert close["effective_at"] == 60_003 * 16 + 4
+    assert opened["effective_at"] == 60_003 * 16 + 7
+    assert opened["effective_at"] > close["effective_at"]
+
+
+def test_historical_codec_commits_a_then_b_fills_in_configured_order():
+    configuration = _configured_input(2)
+    configuration["orders"] = [_seeded_working_order("WIRE-Z"), _seeded_working_order("WIRE-A")]
+    orders = [
+        {"order_id": "hist-order", "product_id": product, "order_version": 0,
+            "status": "OPEN", "remaining_quantity_contracts": Decimal("1"), "accepted_at": 50,
+            "accepted_source_sequence": sequence, "order_kind": "LIMIT", "side": "SHORT",
+            "limit_price": Decimal("1"), "risk_cancel_pending": False}
+        for product, sequence in [("WIRE-Z", 1), ("WIRE-A", 2)]
+    ]
+    orders[1]["order_id"] = "hist-order"
+    # IDs are owner-scoped, so make the second seed and snapshot distinct.
+    cast(dict[str, object], configuration["orders"][1])["order_id"] = "hist-order-b"
+    cast(dict[str, object], configuration["orders"][1])["intent_id"] = "hist-intent-b"
+    cast(dict[str, object], configuration["orders"][1])["client_order_id"] = "hist-client-b"
+    orders[1]["order_id"] = "hist-order-b"
+    codec = c.ScenarioCodec("SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1", KEY, configuration)
+    node = _historical_node(configuration, volume=Decimal("1"), working_orders=cast(list[c.HistoricalWorkingOrder], orders))
+    result = codec.historical_market_step(node)
+    assert [row["product_id"] for row in result["products"]] == ["WIRE-Z", "WIRE-A"]
+    assert [row["fills"][0]["order_id"] for row in result["products"]] == ["hist-order", "hist-order-b"]
+    assert len({row["fills"][0]["execution_id"] for row in result["products"]}) == 2
+    assert result["owner_evidence"]["total_fees"] == Decimal("0.001")
+
+
+def test_historical_codec_bad_product_time_snapshot_and_market_reject_without_mutation():
+    configuration = _configured_input(2)
+    configuration["orders"] = [_seeded_working_order()]
+    codec = c.ScenarioCodec("SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1", KEY, configuration)
+    market = _historical_node(configuration, volume=Decimal("1"), working_orders=[{
+        "order_id": "hist-order", "product_id": "WIRE-Z", "order_version": 0,
+        "status": "OPEN", "remaining_quantity_contracts": Decimal("1"), "accepted_at": 50,
+        "accepted_source_sequence": 1, "order_kind": "MARKET", "side": "SHORT",
+        "limit_price": None, "risk_cancel_pending": False,
+    }])
+    before = codec.inspect_state()
+    encoded_market = json.loads(c._encode(market, preserve_null=True))
+    assert encoded_market["working_orders"][0]["limit_price"] is None
+    unknown_product = deepcopy(market)
+    unknown_product["bars"][0]["product_id"] = "NOT-CONFIGURED"
+    with pytest.raises(ValueError, match="^INVALID_SCHEMA$"):
+        codec.historical_market_step(unknown_product)
+    stale_snapshot = deepcopy(market)
+    stale_snapshot["working_orders"][0]["order_kind"] = "LIMIT"
+    stale_snapshot["working_orders"][0]["limit_price"] = Decimal("1")
+    stale_snapshot["working_orders"][0]["order_version"] = 1
+    with pytest.raises(ValueError, match="^INVALID_HISTORICAL_ORDER_SNAPSHOT$"):
+        codec.historical_market_step(stale_snapshot)
+    with pytest.raises(ValueError, match="^HISTORICAL_MARKET_OWNER_UNSUPPORTED$"):
+        codec.historical_market_step(market)
+    assert codec.inspect_state() == before
+    invalid = _historical_node(configuration)
+    invalid["bar_open_ms"] = 1 << 59
+    with pytest.raises(ValueError, match="^INVALID_HISTORICAL_TIME$"):
+        codec.historical_market_step(invalid)
+    assert codec.inspect_state() == before
 
 
 @pytest.mark.parametrize("fixture,kind", [

@@ -1,5 +1,6 @@
 //! Private session containment; no registration, recovery, or financial alias.
 use super::*;
+mod historical;
 mod python;
 pub(crate) use python::register as register_python;
 #[cfg(test)]
@@ -14,7 +15,15 @@ enum BoundaryError {
 }
 fn boundary(reason: Fault) -> BoundaryError {
     match reason {
-        "INVALID_JSON" | "INVALID_SCHEMA" | "ACCOUNT_KEY_MISMATCH" => BoundaryError::Input(reason),
+        "INVALID_JSON"
+        | "INVALID_SCHEMA"
+        | "ACCOUNT_KEY_MISMATCH"
+        | "UNSUPPORTED_HISTORICAL_MODEL"
+        | "INVALID_HISTORICAL_INPUT"
+        | "INVALID_HISTORICAL_BAR"
+        | "INVALID_HISTORICAL_TIME"
+        | "INVALID_HISTORICAL_ORDER_SNAPSHOT"
+        | "HISTORICAL_MARKET_OWNER_UNSUPPORTED" => BoundaryError::Input(reason),
         "UNKNOWN_RECEIPT_REFERENCE" => BoundaryError::Lookup(reason),
         "SNAPSHOT_ID_CONFLICT" | "DELIVERY_ID_CONFLICT" => BoundaryError::Conflict(reason),
         _ => BoundaryError::Invariant,

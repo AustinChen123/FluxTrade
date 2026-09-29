@@ -14,7 +14,8 @@ fn bar() -> BarPair {
         mark_ohlc: [d("101"), d("121"), d("81"), d("111")],
         volume_contracts: d("10.5"),
         confirmed: true,
-        source_row_hash: [7; 32],
+        trade_source_row_hash: [7; 32],
+        mark_source_row_hash: [8; 32],
     }
 }
 

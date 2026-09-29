@@ -87,7 +87,8 @@ pub(super) struct BarPair {
     pub mark_ohlc: [Decimal; 4],
     pub volume_contracts: Decimal,
     pub confirmed: bool,
-    pub source_row_hash: Hash,
+    pub trade_source_row_hash: Hash,
+    pub mark_source_row_hash: Hash,
 }
 
 /// Metadata paired with an owner working-order snapshot by the P3 caller.
@@ -138,6 +139,7 @@ struct ProductStep {
     capacity: Decimal,
     discarded_volume: Decimal,
     source_row_hash: Hash,
+    mark_source_row_hash: Hash,
     price_tick: Decimal,
     quantity_step: Decimal,
     minimum_quantity: Decimal,
@@ -283,7 +285,8 @@ fn product_steps(
             .map(|index| trade[usize::from(index)]),
         capacity: capacities[usize::from(step_index)],
         discarded_volume,
-        source_row_hash: bar.source_row_hash,
+        source_row_hash: bar.trade_source_row_hash,
+        mark_source_row_hash: bar.mark_source_row_hash,
         price_tick,
         quantity_step,
         minimum_quantity,
