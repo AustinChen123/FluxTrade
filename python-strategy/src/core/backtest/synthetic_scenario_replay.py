@@ -1,7 +1,9 @@
 """Internal closed-policy composition; no scheduling or financial submission."""
 
 from copy import deepcopy
+from collections.abc import Mapping
 import heapq
+import json
 from dataclasses import dataclass
 from decimal import Decimal as D, localcontext
 from typing import Any, Callable, cast
@@ -194,9 +196,49 @@ class _EvidenceCallbackError(Exception):
 class _ReplayComposition:
     """One native owner and one source cache, deliberately without a run API."""
 
-    def __init__(self, profile: wire.Profile, account: wire.Account, callback_plans=None, evidence_callback=None) -> None:
-        self._codec = wire.ScenarioCodec(profile, account)
-        self._policy = _closed_policy(profile)
+    def __init__(self, profile: wire.Profile, account: wire.Account, callback_plans=None, evidence_callback=None, *, configuration: Mapping[str, object] | None = None) -> None:
+        configuration_snapshot = (
+            json.loads(wire._encode_configuration(configuration))
+            if configuration is not None
+            else None
+        )
+        if configuration_snapshot is None:
+            self._codec = wire.ScenarioCodec(profile, account)
+        else:
+            self._codec = wire.ScenarioCodec(profile, account, configuration_snapshot)
+        if profile == "SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1":
+            configured = cast(dict[str, Any], configuration_snapshot)
+            seed_at = configured["seed_effective_at"]
+            markets = {}
+            for product in configured["products"]:
+                active_specs = [
+                    row for row in product["specs"]
+                    if row["valid_from"] <= seed_at
+                    and (row["valid_to"] is None or seed_at < row["valid_to"])
+                ]
+                active_marks = [
+                    row for row in product["marks"]
+                    if row["valid_from"] <= seed_at
+                    and (row["valid_to"] is None or seed_at < row["valid_to"])
+                ]
+                spec, mark = active_specs[0], active_marks[0]
+                if D(str(spec["multiplier"])) != D(1):
+                    raise ValueError("UNSUPPORTED_CONFIGURATION")
+                product_id = product["product_id"]
+                markets[product_id] = dict(
+                    price=D(str(mark["mark"])),
+                    ctVal=D(str(spec["contract_value"])),
+                    lotSz=D(str(spec["quantity_step"])),
+                    minSz=D(str(spec["minimum_quantity"])),
+                    increment=D(str(spec["price_tick"])),
+                    ratioHL="0.1",
+                    state="live",
+                    instIdCode=product["instrument_code"],
+                )
+            self._policy = _closed_policy(profile)
+            self._policy.markets = deepcopy(markets)
+        else:
+            self._policy = _closed_policy(profile)
         self._account = deepcopy(account)
         self._polls: dict[str, _PollRecord] = {}
         self._continuations: dict[str, str] = {}
