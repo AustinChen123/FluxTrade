@@ -479,3 +479,128 @@ fn configured_middle_product_fee_cancel_remainder_and_delayed_ack() {
     );
     assert_eq!((owner, store), saved);
 }
+
+#[test]
+fn configured_last_product_fee_cancel_remainder_and_delayed_ack() {
+    let target = 2;
+    let (mut owner, product) = owner_with_three_products(target);
+    assert_state(
+        &owner,
+        &product,
+        "0",
+        "2",
+        "0",
+        "OPEN",
+        "1000",
+        "0",
+        "1.2",
+        "61.2",
+        "938.8",
+        Some("0.6"),
+    );
+    let first = configured_input(&owner, IDS[target], "CANCEL-LAST-FILL-1", "0.5", "100", 501);
+    let receipt1 = committed(&mut owner, &first);
+    assert_state(
+        &owner,
+        &product,
+        "0.5",
+        "1.5",
+        "0",
+        "PARTIALLY_FILLED",
+        "999.85",
+        "0.15",
+        "1.05",
+        "61.05",
+        "938.8",
+        Some("0.45"),
+    );
+
+    let request = RequestInput {
+        stamp: source::stamp("CANCEL-LAST-REQUEST", 502, 40),
+        targets: vec![(IDS[target].into(), Reason::ExplicitScenario)],
+    };
+    let requested = owner.request_cancel(&request).unwrap();
+    assert_state(
+        &owner,
+        &product,
+        "0.5",
+        "1.5",
+        "0",
+        "PARTIALLY_FILLED",
+        "999.85",
+        "0.15",
+        "1.05",
+        "61.05",
+        "938.8",
+        Some("0.45"),
+    );
+    let saved = owner.clone();
+    assert_eq!(owner.request_cancel(&request), Ok(requested));
+    assert_eq!(owner, saved);
+
+    let second = configured_input(&owner, IDS[target], "CANCEL-LAST-FILL-2", "0.5", "100", 503);
+    let receipt2 = committed(&mut owner, &second);
+    assert_state(
+        &owner,
+        &product,
+        "1",
+        "1",
+        "0",
+        "PARTIALLY_FILLED",
+        "999.7",
+        "0.3",
+        "0.9",
+        "60.9",
+        "938.8",
+        Some("0.3"),
+    );
+
+    let effect = EffectInput {
+        stamp: source::stamp("CANCEL-LAST-EFFECT", 504, 50),
+        effects: vec![(
+            request.stamp.event_id.clone(),
+            IDS[target].into(),
+            Reason::ExplicitScenario,
+        )],
+    };
+    let effected = owner.effect_cancel(&effect).unwrap();
+    assert_state(
+        &owner, &product, "1", "0", "1", "CANCELED", "999.7", "0.3", "0.6", "50.6", "949.1", None,
+    );
+    let saved = owner.clone();
+    assert_eq!(owner.effect_cancel(&effect), Ok(effected));
+    assert_eq!(owner, saved);
+    assert_eq!(owner.execute(&first), Ok(Reply::Duplicate(receipt1)));
+    assert_eq!(owner, saved);
+    assert_eq!(owner.execute(&second), Ok(Reply::Duplicate(receipt2)));
+    assert_eq!(owner, saved);
+
+    let (snapshots, _) = snapshot::tests::delivery_fixture(&owner, false);
+    let mut store = Store::new(owner.key.clone());
+    let mut ack = projection("SOURCE", "CANCEL-LAST-EFFECT", "TRANSPORT_ACK");
+    ack.visible_at = 510;
+    ack.transport = Some(Transport {
+        route: "WS",
+        operation: "CANCEL",
+        client: owner.orders[IDS[target]].facts.client_id.clone(),
+        order: Some(IDS[target].into()),
+        code: "0".into(),
+        message: None,
+        product: None,
+        side: None,
+        price: None,
+        size: None,
+    });
+    let delivered = build(&mut store, &owner, &snapshots, &ack).unwrap();
+    assert_eq!(delivered.projection, ack);
+    assert_eq!(
+        delivered.body,
+        Body::Source(Payload::Transport(ack.transport.clone().unwrap()))
+    );
+    let saved = (owner.clone(), store.clone());
+    assert_eq!(
+        build(&mut store, &owner, &snapshots, &ack),
+        Ok(delivered.clone())
+    );
+    assert_eq!((owner, store), saved);
+}
