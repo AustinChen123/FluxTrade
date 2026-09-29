@@ -1,4 +1,4 @@
-"""Internal closed-policy composition; no scheduling or financial submission."""
+"""Internal closed-policy scheduler composition; no financial submission."""
 
 from copy import deepcopy
 from collections.abc import Mapping
@@ -181,6 +181,76 @@ def _poll_check(condition: bool) -> None:
         raise ValueError("INVALID_SCHEMA")
 
 
+def _historical_node_clock(value: object, configured_product_ids: tuple[str, ...] | None) -> tuple[int, int, bytes]:
+    """Validate the scheduler-owned envelope and derive the frozen T clock."""
+    row = policy_protocol._event_object(
+        value,
+        "schema_version model_id model_version run_contract_hash bar_open_ms bar_duration_ms "
+        "step_index market_slippage_bps bars working_orders",
+    )
+    if configured_product_ids is None or row["schema_version"] != "historical_node_v1":
+        raise ValueError("INVALID_SCHEMA")
+    if row["model_id"] not in ("OHLC4_OPEN_HIGH_LOW_CLOSE_V1", "OHLC4_OPEN_LOW_HIGH_CLOSE_V1"):
+        raise ValueError("INVALID_SCHEMA")
+    if row["model_version"] != "1":
+        raise ValueError("INVALID_SCHEMA")
+    policy_protocol._plan_hash(row["run_contract_hash"])
+    raw_open = row["bar_open_ms"]
+    duration = row["bar_duration_ms"]
+    step = row["step_index"]
+    if type(raw_open) is not int or not 0 <= raw_open < 2**59 or type(duration) is not int or duration != 60_000:
+        raise ValueError("INVALID_SCHEMA")
+    if type(step) is not int or step not in (0, 1, 2, 3):
+        raise ValueError("INVALID_SCHEMA")
+    raw = raw_open + (0, 20_000, 40_000, 60_000)[step]
+    if raw >= 2**59:
+        raise ValueError("INVALID_SCHEMA")
+    effective = raw * 16 + (7, 8, 8, 4)[step]
+    bars = row["bars"]
+    if not isinstance(bars, list) or len(bars) != len(configured_product_ids):
+        raise ValueError("INVALID_SCHEMA")
+    for product_id, bar_value in zip(configured_product_ids, bars, strict=True):
+        pair = policy_protocol._event_object(bar_value, "product_id trade mark")
+        if pair["product_id"] != product_id:
+            raise ValueError("INVALID_SCHEMA")
+        trade = policy_protocol._event_object(
+            pair["trade"], "open high low close volume_contracts confirmed source_row_hash"
+        )
+        mark = policy_protocol._event_object(
+            pair["mark"], "open high low close confirmed source_row_hash"
+        )
+        if trade["confirmed"] is not True or mark["confirmed"] is not True:
+            raise ValueError("INVALID_SCHEMA")
+        policy_protocol._plan_hash(trade["source_row_hash"])
+        policy_protocol._plan_hash(mark["source_row_hash"])
+        for values in (trade, mark):
+            for field in ("open", "high", "low", "close"):
+                price = values[field]
+                if type(price) is not D or not price.is_finite() or price <= 0:
+                    raise ValueError("INVALID_SCHEMA")
+        volume = trade["volume_contracts"]
+        if type(volume) is not D or not volume.is_finite() or volume < 0:
+            raise ValueError("INVALID_SCHEMA")
+    if not isinstance(row["working_orders"], list):
+        raise ValueError("INVALID_SCHEMA")
+    for order in row["working_orders"]:
+        order_row = policy_protocol._event_object(
+            order,
+            "order_id product_id order_version status remaining_quantity_contracts accepted_at "
+            "accepted_source_sequence order_kind side limit_price risk_cancel_pending",
+        )
+        if (not isinstance(order_row["order_id"], str) or not order_row["order_id"]
+                or order_row["product_id"] not in configured_product_ids
+                or type(order_row["order_version"]) is not int or order_row["order_version"] < 0
+                or order_row["status"] not in ("OPEN", "PARTIALLY_FILLED")
+                or order_row["order_kind"] not in ("LIMIT", "MARKET")
+                or order_row["side"] not in ("LONG", "SHORT")
+                or type(order_row["risk_cancel_pending"]) is not bool):
+            raise ValueError("INVALID_SCHEMA")
+    node_bytes = wire._encode(value, preserve_null=True).encode("utf-8")
+    return raw, effective, node_bytes
+
+
 class _ScheduleError(Exception):
     pass
 
@@ -267,7 +337,7 @@ class _ReplayComposition:
             owner[kind + "_request"] = request
             owner[kind + "_fact"] = self._codec.capture_snapshot(deepcopy(request))
         def key(value):
-            return dict(visible_at=value[0], queue_class=("SOURCE_GROUP", "SNAPSHOT_CAPTURE", "DELIVERY")[value[1]],
+            return dict(visible_at=value[0], queue_class=self._queue_label(value[1]),
                         schedule_sequence=value[2], stable_id=value[3])
         polls = []
         for continuation, poll_id in self._continuations.items():
@@ -289,10 +359,14 @@ class _ReplayComposition:
                            polls=sorted(polls, key=lambda row: (row["poll_id"], row["continuation_id"])), callback_actions=actions)
         return deepcopy(dict(owner_evidence=owner, scheduler_observation=observation))
 
+    @staticmethod
+    def _queue_label(queue_class: int) -> str:
+        return ("SOURCE_GROUP", "SNAPSHOT_CAPTURE", "DELIVERY", "HISTORICAL_MARKET_STEP")[queue_class]
+
     def _evidence(self, kind, key, evidence):
         if self._evidence_callback is None:
             return
-        scheduler_key = dict(visible_at=key[0], queue_class=("SOURCE_GROUP", "SNAPSHOT_CAPTURE", "DELIVERY")[key[1]],
+        scheduler_key = dict(visible_at=key[0], queue_class=self._queue_label(key[1]),
                              schedule_sequence=key[2], stable_id=key[3])
         try:
             self._evidence_callback(kind, deepcopy(scheduler_key), deepcopy(evidence))
@@ -336,6 +410,7 @@ class _ReplayComposition:
     def _queue_record(self, item, plan=None):
         try:
             kind = item.get("kind") if isinstance(item, dict) else None
+            raw = 0
             if kind == "SOURCE_GROUP":
                 row = cast(dict[str, Any], policy_protocol._event_object(item, "kind schedule_sequence group"))
                 group = row["group"]
@@ -357,10 +432,28 @@ class _ReplayComposition:
                 content = (policy_protocol._plan_hash(d["payload_digest"]),
                            policy_protocol._emission_plan_digest(plan, self._configured_product_ids))
                 account, at, sequence, stable, cls = d["account_key"], d["visible_at"], d["schedule_sequence"], d["delivery_id"], 2
+            elif kind == "HISTORICAL_MARKET_STEP":
+                row = cast(dict[str, Any], policy_protocol._event_object(
+                    item, "kind schedule_sequence stable_id node"
+                ))
+                sequence = row["schedule_sequence"]
+                stable = row["stable_id"]
+                sequence_bytes = policy_protocol._plan_sequence(sequence)
+                stable_bytes = policy_protocol._event_id(stable)
+                try:
+                    raw, at, node_bytes = _historical_node_clock(row["node"], self._configured_product_ids)
+                except (ValueError, UnicodeError, OverflowError) as exc:
+                    raise _ScheduleError("INVALID_SCHEMA") from exc
+                content = sequence_bytes + stable_bytes + node_bytes
+                account, cls = self._account, 3
             else:
                 raise _ScheduleError("INVALID_SCHEMA")
             if policy_protocol._plan_account(account) != policy_protocol._plan_account(self._account):
                 raise _ScheduleError("INVALID_SCHEMA")
+            if kind == "HISTORICAL_MARKET_STEP":
+                return dict(key=(at, cls, sequence, stable), content=content, item=deepcopy(item), plan=None,
+                            raw_time_ms=raw,
+                            result=dict(kind=kind, stable_id=stable, classification="PENDING"))
             return dict(key=(at, cls, sequence, stable), content=content, item=deepcopy(item), plan=deepcopy(plan),
                         result=dict(kind=kind, stable_id=stable, classification="PENDING"))
         except (ValueError, UnicodeError, OverflowError) as exc:
@@ -409,9 +502,11 @@ class _ReplayComposition:
             return self._admit_set([(item, plan)])[0]
         except Exception as exc:
             kind = item.get("kind") if isinstance(item, dict) else "QUEUE"
-            kind = kind if isinstance(kind, str) and kind in ("SOURCE_GROUP", "SNAPSHOT_CAPTURE", "DELIVERY") else "QUEUE"
-            field, identity = {"SOURCE_GROUP": ("group", "group_id"), "SNAPSHOT_CAPTURE": ("request", "snapshot_id"), "DELIVERY": ("delivery", "delivery_id")}.get(kind or "", ("", ""))
+            kind = kind if isinstance(kind, str) and kind in ("SOURCE_GROUP", "SNAPSHOT_CAPTURE", "DELIVERY", "HISTORICAL_MARKET_STEP") else "QUEUE"
+            field, identity = {"SOURCE_GROUP": ("group", "group_id"), "SNAPSHOT_CAPTURE": ("request", "snapshot_id"), "DELIVERY": ("delivery", "delivery_id"), "HISTORICAL_MARKET_STEP": ("", "stable_id")}.get(kind or "", ("", ""))
             value = item.get(field) if isinstance(item, dict) else None
+            if kind == "HISTORICAL_MARKET_STEP":
+                value = item
             return self._stop_scheduler(exc, kind, value.get(identity) if isinstance(value, dict) else None)
 
     @staticmethod
@@ -531,8 +626,16 @@ class _ReplayComposition:
                     if plan is None:
                         raise _ScheduleError("INVALID_SCHEMA")
                     self._admit_set([(dict(kind="DELIVERY", delivery=delivery), plan)])
-                else:
+                elif kind == "DELIVERY":
                     result["events"] = self._deliver_queued(record)
+                else:
+                    historical_result = self._codec.historical_market_step(item["node"])
+                    if (type(historical_result.get("raw_time_ms")) is not int
+                            or historical_result["raw_time_ms"] != record["raw_time_ms"]
+                            or type(historical_result.get("effective_at")) is not int
+                            or historical_result["effective_at"] != key[0]):
+                        raise _ScheduleError("INVALID_SCHEMA")
+                    result["historical_result"] = deepcopy(historical_result)
                 record["result"] = deepcopy(result)
             self._current_time = until
             return dict(kind="DISPATCH", stable_id=None, classification="SUCCESS")
