@@ -8,6 +8,244 @@ use super::*;
 use context::tests::{activation, mark_rows, stamp};
 use group::{Group, Input, Member, Reference};
 
+fn configured_isolation_owner(account: &str) -> (ScenarioAccount, Product, Product) {
+    let (mut seed, mut products) = configured_tests::input(2);
+    seed.key.account = account.into();
+    seed.cash = d("3.1");
+    let lower = products[0].product.clone();
+    let higher = products[1].product.clone();
+    products[0].taker_fee = d("0.02");
+    products[0].tiers[0].tiers[0].mmr = d("0.01");
+    products[1].liquidation_fee = d("0.00602");
+    products[1].tiers[0].tiers[0].mmr = d("0.04");
+    for (index, product) in [&lower, &higher].into_iter().enumerate() {
+        seed.positions.push(SeedPosition {
+            product: product.clone(),
+            side: Side::Long,
+            contracts: d("0.5"),
+            lots: vec![SeedLot {
+                seed_execution_id: format!("C01-SEED-{index}"),
+                seed_sequence: index as u64,
+                strategy_id: "strategy".into(),
+                contracts: d("0.5"),
+                entry: d("100"),
+            }],
+        });
+    }
+    let prototype = fixture().0.orders[0].clone();
+    let order = |id: &str, product: &Product| SeedOrder {
+        order_id: id.into(),
+        intent_id: format!("I-{id}"),
+        client_id: format!("C-{id}"),
+        product: ProfileProduct::BtcEth(product.clone()),
+        side: Side::Long,
+        price: d("100"),
+        reduce_only: false,
+        original: d("0.5"),
+        filled: Decimal::ZERO,
+        canceled: Decimal::ZERO,
+        remaining: d("0.5"),
+        status: "OPEN".into(),
+        ..prototype.clone()
+    };
+    seed.orders = vec![order("FILL", &lower), order("CANCEL", &higher)];
+    (
+        ScenarioAccount::from_configured(&seed, d("10"), products).unwrap(),
+        lower,
+        higher,
+    )
+}
+
+#[test]
+fn configured_liquidation_receipts_are_account_scoped_for_identical_inputs() {
+    let (mut a, lower_a, higher_a) = configured_isolation_owner("ACCOUNT-A");
+    let (mut b, lower_b, higher_b) = configured_isolation_owner("ACCOUNT-B");
+    assert_ne!(a.key, b.key);
+    assert_eq!(a.config_id, b.config_id);
+    assert_eq!((&lower_a, &higher_a), (&lower_b, &higher_b));
+    let initial_a = a.reservation().unwrap();
+    let initial_b = b.reservation().unwrap();
+    assert_eq!(initial_a, initial_b);
+    assert!(initial_a.equity > initial_a.maintenance_margin);
+    assert!(initial_b.equity > initial_b.maintenance_margin);
+    assert_eq!((a.cash, a.fees), (d("3.1"), Decimal::ZERO));
+    assert_eq!((b.cash, b.fees), (d("3.1"), Decimal::ZERO));
+    assert_eq!(a.liquidation_ids().count(), 0);
+    assert_eq!(b.liquidation_ids().count(), 0);
+
+    let candidate_a = configured_input(&a, "FILL", "C01-SAME-EXECUTION", "0.5", "100", 501);
+    let candidate_b = configured_input(&b, "FILL", "C01-SAME-EXECUTION", "0.5", "100", 501);
+    let b_before_a = b.clone();
+    let Reply::Committed {
+        receipt: execution_a,
+        ..
+    } = a.execute(&candidate_a).unwrap()
+    else {
+        panic!("ordinary execution must commit")
+    };
+    let fee_a = d("0.5") * d("100") * d("0.02");
+    assert_eq!(fee_a, d("1"));
+    let after_fill_a = a.reservation().unwrap();
+    assert_eq!((a.cash, a.fees), (d("2.1"), fee_a));
+    assert_eq!(
+        (after_fill_a.equity, after_fill_a.maintenance_margin),
+        (d("2.1"), d("3"))
+    );
+    assert_eq!(after_fill_a.equity + fee_a, d("3.1"));
+    assert!(after_fill_a.equity + fee_a > after_fill_a.maintenance_margin);
+    assert!(after_fill_a.equity <= after_fill_a.maintenance_margin);
+    assert_eq!(a.liquidation_ids().count(), 0);
+    assert!(matches!(a.orders["CANCEL"].cancel, State::Requested(_)));
+    assert_eq!(b, b_before_a);
+
+    let effect = EffectInput {
+        stamp: stamp("C01-SAME-CANCEL-EFFECT", 502, 50),
+        effects: vec![(
+            "event-C01-SAME-EXECUTION".into(),
+            "CANCEL".into(),
+            Reason::MmrBreach,
+        )],
+    };
+    let effect_a = a.effect_cancel(&effect).unwrap();
+    assert_eq!(a.liquidation_ids().count(), 1);
+    assert_eq!(b, b_before_a);
+    let a_after = a.clone();
+
+    let Reply::Committed {
+        receipt: execution_b,
+        ..
+    } = b.execute(&candidate_b).unwrap()
+    else {
+        panic!("ordinary execution must commit")
+    };
+    assert_eq!(a, a_after);
+    let after_fill_b = b.reservation().unwrap();
+    assert_eq!((b.cash, b.fees), (d("2.1"), fee_a));
+    assert_eq!(
+        (after_fill_b.equity, after_fill_b.maintenance_margin),
+        (d("2.1"), d("3"))
+    );
+    assert_eq!(after_fill_b.equity + fee_a, d("3.1"));
+    assert!(after_fill_b.equity + fee_a > after_fill_b.maintenance_margin);
+    assert!(after_fill_b.equity <= after_fill_b.maintenance_margin);
+    assert_eq!(b.liquidation_ids().count(), 0);
+    assert!(matches!(b.orders["CANCEL"].cancel, State::Requested(_)));
+    let effect_b = b.effect_cancel(&effect).unwrap();
+    assert_eq!(b.liquidation_ids().count(), 1);
+    assert_eq!(a, a_after);
+
+    let liquidation_a = &a.transition.liquidations[0];
+    let liquidation_b = &b.transition.liquidations[0];
+    assert_eq!(liquidation_a.account_key, a.key);
+    assert_eq!(liquidation_b.account_key, b.key);
+    assert_eq!(liquidation_a.step_index, 1);
+    assert_eq!(liquidation_b.step_index, 1);
+    assert_eq!(
+        liquidation_a.liquidation_id,
+        step_id(
+            &a.key,
+            liquidation_a.risk_action_episode_id,
+            liquidation_a.step_index
+        )
+    );
+    assert_eq!(
+        liquidation_b.liquidation_id,
+        step_id(
+            &b.key,
+            liquidation_b.risk_action_episode_id,
+            liquidation_b.step_index
+        )
+    );
+    assert_eq!(
+        liquidation_a.canonical_payload_digest,
+        liquidation_a.digest().unwrap()
+    );
+    assert_eq!(
+        liquidation_b.canonical_payload_digest,
+        liquidation_b.digest().unwrap()
+    );
+    assert_ne!(liquidation_a.liquidation_id, liquidation_b.liquidation_id);
+    assert_ne!(
+        liquidation_a.canonical_payload_digest,
+        liquidation_b.canonical_payload_digest
+    );
+    let ids_a: Vec<_> = a.liquidation_ids().collect();
+    let ids_b: Vec<_> = b.liquidation_ids().collect();
+    assert_eq!(ids_a, vec![liquidation_a.liquidation_id]);
+    assert_eq!(ids_b, vec![liquidation_b.liquidation_id]);
+    assert!(ids_a.iter().all(|id| !ids_b.contains(id)));
+    assert_eq!(
+        (
+            a.cash,
+            a.fees,
+            a.gross_realized,
+            a.positions.btc().unwrap()[&lower_a].contracts,
+            a.positions.btc().unwrap().contains_key(&higher_a),
+            a.transition.lifecycle,
+        ),
+        (
+            b.cash,
+            b.fees,
+            b.gross_realized,
+            b.positions.btc().unwrap()[&lower_b].contracts,
+            b.positions.btc().unwrap().contains_key(&higher_b),
+            b.transition.lifecycle,
+        )
+    );
+    assert_eq!(
+        (a.cash, a.fees, a.gross_realized),
+        (d("1.799"), d("1.301"), Decimal::ZERO)
+    );
+    assert_eq!(a.positions.btc().unwrap()[&lower_a].contracts, d("1"));
+    assert!(!a.positions.btc().unwrap().contains_key(&higher_a));
+    assert_eq!(a.transition.lifecycle, Lifecycle::RiskStable);
+    assert_eq!(liquidation_a.product, higher_a);
+    assert_eq!(liquidation_b.product, higher_b);
+    assert_eq!(
+        (liquidation_a.fee_rate, liquidation_a.fee),
+        (d("0.00602"), d("0.301"))
+    );
+    assert_eq!(
+        (liquidation_b.fee_rate, liquidation_b.fee),
+        (d("0.00602"), d("0.301"))
+    );
+
+    let a_saved = a.clone();
+    let b_saved = b.clone();
+    for (owner, own, peer) in [
+        (
+            &a,
+            liquidation_a.liquidation_id,
+            liquidation_b.liquidation_id,
+        ),
+        (
+            &b,
+            liquidation_b.liquidation_id,
+            liquidation_a.liquidation_id,
+        ),
+    ] {
+        assert_eq!(
+            delivery::resolve(owner, &Reference::Liquidation(own), "EXECUTION_FACT", None),
+            Err("INVALID_SCHEMA")
+        );
+        assert_eq!(
+            delivery::resolve(owner, &Reference::Liquidation(peer), "EXECUTION_FACT", None),
+            Err("UNKNOWN_RECEIPT_REFERENCE")
+        );
+    }
+    assert_eq!(a, a_saved);
+    assert_eq!(b, b_saved);
+
+    assert_eq!(a.execute(&candidate_a), Ok(Reply::Duplicate(execution_a)));
+    assert_eq!(a, a_saved);
+    assert_eq!(b.execute(&candidate_b), Ok(Reply::Duplicate(execution_b)));
+    assert_eq!(b, b_saved);
+    assert_eq!(a.effect_cancel(&effect), Ok(effect_a));
+    assert_eq!(a, a_saved);
+    assert_eq!(b.effect_cancel(&effect), Ok(effect_b));
+    assert_eq!(b, b_saved);
+}
+
 #[test]
 fn duplicate_intent_group_references_original_source_without_republication() {
     let (seed, config, marks) = fixture();
