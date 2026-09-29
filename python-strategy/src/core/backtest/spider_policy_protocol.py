@@ -208,10 +208,14 @@ def _plan_stamp(value: object) -> bytes:
     )
 
 
-def _plan_mark(value: object) -> bytes:
+def _plan_product(value: object, configured_product_ids: tuple[str, ...] | None, p1_products: tuple[str, ...]) -> bytes:
+    return _event_token(value, p1_products if configured_product_ids is None else configured_product_ids)
+
+
+def _plan_mark(value: object, configured_product_ids: tuple[str, ...] | None = None) -> bytes:
     row = _event_object(value, "product_id valid_from valid_to mark")
     return (
-        _event_token(row["product_id"], ("BTC-USDT-SWAP", "ETH-USDT-SWAP"))
+        _plan_product(row["product_id"], configured_product_ids, ("BTC-USDT-SWAP", "ETH-USDT-SWAP"))
         + _event_integer(row["valid_from"])
         + _event_integer(row["valid_to"])
         + _plan_decimal(row["mark"])
@@ -229,7 +233,7 @@ def _plan_target(value: object, effect: bool = False) -> bytes:
     )
 
 
-def _plan_member(value: object) -> bytes:
+def _plan_member(value: object, configured_product_ids: tuple[str, ...] | None = None) -> bytes:
     row = _event_object(value, "stamp kind payload")
     kind, payload = row["kind"], row["payload"]
     data = _plan_stamp(row["stamp"]) + _event_text(kind)
@@ -239,7 +243,7 @@ def _plan_member(value: object) -> bytes:
             data
             + _plan_hash(p["expected_before"])
             + _plan_hash(p["expected_after"])
-            + _plan_list(p["rows"], _plan_mark)
+            + _plan_list(p["rows"], lambda item: _plan_mark(item, configured_product_ids))
         )
     if kind == "EXECUTION":
         p = _event_object(
@@ -247,7 +251,8 @@ def _plan_member(value: object) -> bytes:
             "namespace product_id external_execution_id order_id side price quantity_contracts liquidity matching_effective_at candidate_id source_id visible_at expected_account_version expected_order_version spec_version rule_data_version",
             "fee_asset reported_fee",
         )
-        data += _event_id(p["namespace"]) + _event_token(p["product_id"], ("BTC-USDT-SWAP", "ETH-USDT-SWAP", "P_A"))
+        data += _event_id(p["namespace"]) + _plan_product(p["product_id"], configured_product_ids,
+                                                            ("BTC-USDT-SWAP", "ETH-USDT-SWAP", "P_A"))
         data += (
             _event_id(p["external_execution_id"])
             + _event_id(p["order_id"])
@@ -275,7 +280,8 @@ def _plan_member(value: object) -> bytes:
             "limit_price",
         )
         data += b"".join(_event_id(p[k]) for k in ("intent_id", "client_order_id", "config_id"))
-        data += _event_token(p["product_id"], ("BTC-USDT-SWAP", "ETH-USDT-SWAP", "P_A")) + _event_id(p["strategy_id"])
+        data += _plan_product(p["product_id"], configured_product_ids,
+                              ("BTC-USDT-SWAP", "ETH-USDT-SWAP", "P_A")) + _event_id(p["strategy_id"])
         data += (
             _event_token(p["side"], ("LONG", "SHORT"))
             + _event_token(p["order_type"], ("LIMIT", "MARKET"))
@@ -294,7 +300,7 @@ def _plan_member(value: object) -> bytes:
     raise ValueError("POLICY_EMISSION_MISMATCH")
 
 
-def _plan_group(value: object) -> bytes:
+def _plan_group(value: object, configured_product_ids: tuple[str, ...] | None = None) -> bytes:
     row = _event_object(
         value,
         "schema_version group_id account_key ordering_contract_id group_effective_at declared_member_count members",
@@ -306,7 +312,7 @@ def _plan_group(value: object) -> bytes:
         + _event_token(row["ordering_contract_id"], ("S_order_v1", "S_order_v1_reverse_execution_cancel_effective"))
         + _event_integer(row["group_effective_at"])
         + _event_integer(row["declared_member_count"])
-        + _plan_list(row["members"], _plan_member)
+        + _plan_list(row["members"], lambda item: _plan_member(item, configured_product_ids))
     )
 
 
@@ -377,7 +383,7 @@ def _plan_projection(value: object) -> bytes:
     )
 
 
-def _emission_plan_bytes(plan: object) -> bytes:
+def _emission_plan_bytes(plan: object, configured_product_ids: tuple[str, ...] | None = None) -> bytes:
     row = _event_object(plan, "delivery_id expected_policy_events financial_items market_requests")
 
     def expected(value: object) -> bytes:
@@ -402,7 +408,7 @@ def _emission_plan_bytes(plan: object) -> bytes:
             _plan_hash(p["event_digest"])
             + _event_token(p["action_kind"], ("ORDER_INTENT", "CANCEL_REQUEST"))
             + _plan_sequence(p["schedule_sequence"])
-            + _plan_group(p["expected_group"])
+            + _plan_group(p["expected_group"], configured_product_ids)
         )
 
     def market(value: object) -> bytes:
@@ -426,8 +432,8 @@ def _emission_plan_bytes(plan: object) -> bytes:
         raise ValueError("POLICY_EMISSION_MISMATCH") from exc
 
 
-def _emission_plan_digest(plan: object) -> str:
-    return hashlib.sha256(_emission_plan_bytes(plan)).hexdigest()
+def _emission_plan_digest(plan: object, configured_product_ids: tuple[str, ...] | None = None) -> str:
+    return hashlib.sha256(_emission_plan_bytes(plan, configured_product_ids)).hexdigest()
 
 
 class _PollStagePlan(TypedDict):

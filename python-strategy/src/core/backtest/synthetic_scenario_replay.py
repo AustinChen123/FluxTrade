@@ -18,11 +18,11 @@ def _pairing_check(condition: bool) -> None:
         raise ValueError("POLICY_EMISSION_MISMATCH")
 
 
-def _pair_financial(item, digest, operation, order, account, previous):
+def _pair_financial(item, digest, operation, order, account, previous, configured_product_ids=None):
     row = policy_protocol._event_object(item, "event_digest action_kind schedule_sequence expected_group")
     policy_protocol._plan_hash(row["event_digest"])
     policy_protocol._plan_sequence(row["schedule_sequence"])
-    policy_protocol._plan_group(row["expected_group"])
+    policy_protocol._plan_group(row["expected_group"], configured_product_ids)
     group = cast(wire.Group, row["expected_group"])
     _pairing_check(row["event_digest"] == digest)
     _pairing_check(row["action_kind"] == ("ORDER_INTENT" if operation == "send" else "CANCEL_REQUEST"))
@@ -66,7 +66,7 @@ def _pair_market(item, digest, account, visible_at):
     _pairing_check(request["captured_at"] > visible_at and projection["visible_at"] >= request["captured_at"])
 
 
-def _validate_emission_plan(account, delivery, events, plan):
+def _validate_emission_plan(account, delivery, events, plan, configured_product_ids=None):
     """Validate atomically as evidence; return detached items, never dispatch."""
     try:
         row = policy_protocol._event_object(plan, "delivery_id expected_policy_events financial_items market_requests")
@@ -90,7 +90,8 @@ def _validate_emission_plan(account, delivery, events, plan):
                 for order in event["orders"]:
                     if fi == len(financial):
                         raise ValueError("MISSING_NEXT_EVENT_STAMP")
-                    previous = _pair_financial(financial[fi], digest, event["kind"], order, account, previous)
+                    previous = _pair_financial(financial[fi], digest, event["kind"], order, account, previous,
+                                               configured_product_ids)
                     validated.append(financial[fi])
                     fi += 1
             elif event["kind"] == "request_market":
@@ -101,7 +102,7 @@ def _validate_emission_plan(account, delivery, events, plan):
                 mi += 1
         _pairing_check(fi == len(financial))
         _pairing_check(mi == len(markets))
-        policy_protocol._emission_plan_bytes(plan)
+        policy_protocol._emission_plan_bytes(plan, configured_product_ids)
         return tuple(deepcopy(validated))
     except (UnicodeError, OverflowError) as exc:
         raise ValueError("POLICY_EMISSION_MISMATCH") from exc
@@ -206,6 +207,8 @@ class _ReplayComposition:
             self._codec = wire.ScenarioCodec(profile, account)
         else:
             self._codec = wire.ScenarioCodec(profile, account, configuration_snapshot)
+        self._configured_product_ids = (tuple(product["product_id"] for product in configuration_snapshot["products"])
+                                        if configuration_snapshot is not None else None)
         if profile == "SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1":
             configured = cast(dict[str, Any], configuration_snapshot)
             seed_at = configured["seed_effective_at"]
@@ -336,7 +339,8 @@ class _ReplayComposition:
             if kind == "SOURCE_GROUP":
                 row = cast(dict[str, Any], policy_protocol._event_object(item, "kind schedule_sequence group"))
                 group = row["group"]
-                content = policy_protocol._plan_sequence(row["schedule_sequence"]) + policy_protocol._plan_group(group)
+                content = policy_protocol._plan_sequence(row["schedule_sequence"]) + policy_protocol._plan_group(
+                    group, self._configured_product_ids)
                 account, at, sequence, stable, cls = group["account_key"], group["group_effective_at"], row["schedule_sequence"], group["group_id"], 0
             elif kind == "SNAPSHOT_CAPTURE":
                 row = cast(dict[str, Any], policy_protocol._event_object(item, "kind capture_sequence request delivery_projection"))
@@ -350,7 +354,8 @@ class _ReplayComposition:
                     **{k: d[k] for k in ("payload_kind", "occurrence_index", "schedule_sequence", "visible_at")}, continuation_id=d.get("continuation_id"))
                 policy_protocol._plan_projection(projection)
                 policy_protocol._event_id(d["delivery_id"])
-                content = (policy_protocol._plan_hash(d["payload_digest"]), policy_protocol._emission_plan_digest(plan))
+                content = (policy_protocol._plan_hash(d["payload_digest"]),
+                           policy_protocol._emission_plan_digest(plan, self._configured_product_ids))
                 account, at, sequence, stable, cls = d["account_key"], d["visible_at"], d["schedule_sequence"], d["delivery_id"], 2
             else:
                 raise _ScheduleError("INVALID_SCHEMA")
@@ -443,7 +448,8 @@ class _ReplayComposition:
     def _deliver_queued(self, record):
         delivery, plan = record["item"]["delivery"], record["plan"]
         self._evidence("DELIVERY_ATTEMPT", record["key"], dict(delivery=delivery,
-                       emission_plan_digest=policy_protocol._emission_plan_digest(plan) if plan is not None else None))
+                       emission_plan_digest=policy_protocol._emission_plan_digest(
+                           plan, self._configured_product_ids) if plan is not None else None))
         next_stage = None
         if delivery.get("continuation_id") is not None:
             try:
@@ -462,7 +468,8 @@ class _ReplayComposition:
             self._callback_evidence(record, prefix, events, "CALLBACK_FAILED", dict(kind="CALLBACK", reason="CALLBACK_FAILED"))
             raise _ScheduleError("CALLBACK_FAILED")
         try:
-            validated = _validate_emission_plan(self._account, delivery, prefix.events, plan)
+            validated = _validate_emission_plan(self._account, delivery, prefix.events, plan,
+                                                self._configured_product_ids)
         except ValueError as exc:
             if exc.args not in (("POLICY_EMISSION_MISMATCH",), ("MISSING_NEXT_EVENT_STAMP",)):
                 raise
