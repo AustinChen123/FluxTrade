@@ -2,6 +2,7 @@
 
 import ast
 from copy import deepcopy
+from decimal import Decimal
 from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,6 +11,7 @@ from typing import Any, cast
 import pytest
 
 from src.core.backtest import spider_scenario_run as run, synthetic_scenario_codec as wire
+from src.core.backtest import spider_configured_scale_input as scale
 from src.core.backtest import spider_run_store as storage
 from src.core.backtest.spider_run_artifacts import decode_jsonl
 from src.core.backtest.spider_run_admission import admit_spider_run
@@ -307,3 +309,229 @@ def test_projection_failure_is_bounded_but_missing_callback_is_not_retried(tmp_p
     with pytest.raises(RuntimeError, match="^UNOBSERVED_BARRIER$"):
         invoke(tmp_path, name="r2")
     assert read(tmp_path, "r2", "status.json")[0]["failure_reason"] == "UNEXPECTED_EXCEPTION"
+
+
+def _invoke_configured(root, run_id="p2", select=None):
+    return run._invoke(str(root), run_id, "SPIDER_P2_CONFIGURED_SCALE_V1", select or run._plans.plan_bundle)
+
+
+def test_configured_runner_persists_exact_forty_barriers_then_stops_at_projection_gate(tmp_path, monkeypatch):
+    owners, captures = [], []
+    policy_calls = dict(orders=0, order_filled=0, raise_leverage=0, check_risk=0)
+    original = run._ReplayComposition
+    def observe(*args, **kwargs):
+        attempt = read(tmp_path, "p2", "attempt.json")[0]
+        assert read(tmp_path, "p2", "status.json")[0]["state"] == "RUNNING"
+        assert (tmp_path / "p2/journal.jsonl").read_bytes() == b""
+        assert attempt["registration_state"] == "VALIDATED"
+        assert attempt["configuration_context"]["configuration_sha256"] == "807054044bdd182274509535ecf8bbc4598f00b6a92b598c6228129a6ff11b70"
+        assert args[2] == {row["delivery_id"]: row for row in scale._configured_scale_plan_input()["callback_plans"]}
+        assert kwargs["configuration"] == scale._configured_scale_plan_input()["configuration"]
+        owner = original(*args, **kwargs)
+        for name in policy_calls:
+            method = getattr(owner._policy, name)
+            def counted(*call_args, _method=method, _name=name, **call_kwargs):
+                policy_calls[_name] += 1
+                return _method(*call_args, **call_kwargs)
+            setattr(owner._policy, name, counted)
+        capture = owner.capture_owner_evidence
+        def capture_and_record(cutoff, trading_request, positions_request, open_orders_request):
+            requests = (trading_request, positions_request, open_orders_request)
+            result = capture(cutoff, *requests)
+            captures.append((cutoff, deepcopy(requests), run._normalized(result)))
+            return result
+        owner.capture_owner_evidence = capture_and_record
+        owners.append(owner)
+        return owner
+    monkeypatch.setattr(run, "_ReplayComposition", observe)
+    result = _invoke_configured(tmp_path)
+    assert result == dict(run_id="p2", outcome="FAILED", reason="ENDPOINT_RECONCILIATION_FAILED")
+    plan = scale._configured_scale_plan_input()
+    attempt = read(tmp_path, "p2", "attempt.json")[0]
+    status = read(tmp_path, "p2", "status.json")[0]
+    rows = read(tmp_path, "p2", "journal.jsonl")
+    assert attempt["run_contract_id"] == "SPIDER_SYNTHETIC_P2_CONFIGURED_RUN_V1"
+    assert attempt["scenario_plan_sha256"] == "8235c952a5d199825a2a77842b03f49e213ef707c0f30b24d8bf623fde53c2b3"
+    assert attempt["configuration_context"] == dict(schema_version="spider_configuration_context_v1",
+        config_id=plan["configuration"]["config_id"], configuration_sha256=plan["configuration_sha256"], products=plan["products"])
+    assert attempt["planned_coverage"] == [dict(ordinal=row["ordinal"], barrier_id=row["barrier_id"], record_kind=row["record_kind"]) for row in plan["planned_barriers"]]
+    assert len(rows) == 40 and [row["journal_seq"] for row in rows] == list(range(1, 41))
+    assert [(row["barrier_id"], row["record_kind"], row["scheduler_key"], row["causal_parent_ids"]) for row in rows] == [
+        (row["barrier_id"], row["record_kind"], row["scheduler_key"], row["causal_parent_ids"]) for row in plan["planned_barriers"]]
+    assert all(row["configuration_context"] == attempt["configuration_context"] for row in rows)
+    source_ordinals = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 19, 20]
+    source_cutoffs = [501, 502, 503, 504, 505, 506, 507, 508, 509, 510, 511, 512, 513, 514, 515, 516, 518, 519]
+    kinds = [("TRADING", "TRADING"), ("POSITIONS", "POSITIONS"), ("OPEN_ORDERS", "OPEN-ORDERS")]
+    expected_captures = [(500, [f"SPIDER-P2-INITIAL-{suffix}" for _, suffix in kinds])]
+    expected_captures.extend((cutoff, [f"SPIDER-P2-SOURCE-{ordinal}-{suffix}" for _, suffix in kinds])
+                             for ordinal, cutoff in zip(source_ordinals, source_cutoffs, strict=True))
+    expected_captures.append((100024, [f"SPIDER-P2-FINAL-{suffix}" for _, suffix in kinds]))
+    assert [(cutoff, [request["snapshot_id"] for request in requests]) for cutoff, requests, _ in captures] == expected_captures
+    assert all([request["snapshot_kind"] for request in requests] == [kind for kind, _ in kinds] for _, requests, _ in captures)
+    all_capture_ids = [request["snapshot_id"] for _, requests, _ in captures for request in requests]
+    assert len(all_capture_ids) == len(set(all_capture_ids)) == 60
+    source_rows = [row for row in rows if row["record_kind"] == "SOURCE_GROUP_RESULT"]
+    assert len(source_rows) == 18
+    for index, row in enumerate(source_rows):
+        evidence = row["payload"]
+        assert evidence["owner_evidence_before"] == captures[index][2]["owner_evidence"]
+        assert evidence["owner_evidence_after"] == captures[index + 1][2]["owner_evidence"]
+    rejected = rows[12]["payload"]["result"]
+    assert (rejected["classification"], rejected["rejections"], rejected["account_version_before"], rejected["account_version_after"]) == (
+        "REJECTED", [{"event_id": "event-513", "reason": "INSUFFICIENT_SHARED_EQUITY"}], 12, 12)
+    assert [(rows[index]["payload"]["result"]["account_version_before"],
+             rows[index]["payload"]["result"]["account_version_after"]) for index in (13, 14, 15, 18, 19)] == [
+        (12, 13), (13, 14), (14, 15), (15, 16), (16, 17)]
+    assert [row["effective_at"] for row in rows[20:29:3]] == [100010, 100012, 100014]
+    assert [row["effective_at"] for row in rows[31:40:3]] == [100020, 100022, 100024]
+    assert (status["processed_boundary"]["ordinal"], status["persisted_boundary"]["ordinal"], status["failure_reason"]) == (40, 40, "ENDPOINT_RECONCILIATION_FAILED")
+    assert not any((tmp_path / "p2" / name).exists() for name in ("endpoint.json", "reconciliation.json", "report.jsonl", "completion.json"))
+    assert len(owners) == 1
+    assert len(run._PROGRAM) == 17
+    records = [(name.encode(), sha256((run._ROOT / name).read_bytes()).digest())
+               for name in sorted((*run._PROGRAM, "python-strategy/src/core/backtest/spider_configured_scale_input.py"))]
+    expected_program = sha256(b"".join(len(name).to_bytes(8, "big") + name + digest for name, digest in records)).hexdigest()
+    assert attempt["program_sha256"] == expected_program
+    native = owners[0]._codec.inspect_state()
+    assert (native["account_version"], native["cash"], native["total_fees"], native["gross_realized"], native["lifecycle"]) == (17, Decimal("121.05"), Decimal("0.15"), Decimal("0"), "RISK_STABLE")
+    assert owners[0]._polls["Q1"].observation.status == owners[0]._polls["Q2"].observation.status == "COMPLETED"
+    assert policy_calls == dict(orders=1, order_filled=0, raise_leverage=2, check_risk=2)
+    account = cast(wire.Account, plan["account_key"])
+    trading = owners[0]._codec.capture_snapshot(cast(wire.SnapshotRequest, dict(
+        schema_version="snapshot_request_v1", account_key=account, snapshot_id="P2-FINAL-READONLY-TRADING",
+        snapshot_kind="TRADING", capture_mode="OWNER_CURRENT", captured_at=519)))
+    positions = owners[0]._codec.capture_snapshot(cast(wire.SnapshotRequest, dict(
+        schema_version="snapshot_request_v1", account_key=account, snapshot_id="P2-FINAL-READONLY-POSITIONS",
+        snapshot_kind="POSITIONS", capture_mode="OWNER_CURRENT", captured_at=519)))
+    assert trading["immutable_payload"]["equity"] == Decimal("121.05")
+    assert trading["immutable_payload"]["available_equity"] == Decimal("5.05")
+    assert [(row["product_id"], row["position_contracts"], row["notional_usd"])
+            for row in positions["immutable_payload"]["rows"]] == [
+        ("BTC-USDT-SWAP", Decimal("0.5"), Decimal("50")),
+        ("DOGE-USDT-SWAP", Decimal("1"), Decimal("100"))]
+
+
+def test_configured_journal_is_run_id_independent_and_rejected_input_never_constructs(tmp_path, monkeypatch):
+    first = _invoke_configured(tmp_path, "p2a")
+    second = _invoke_configured(tmp_path, "p2b")
+    assert first["reason"] == second["reason"] == "ENDPOINT_RECONCILIATION_FAILED"
+    left, right = read(tmp_path, "p2a", "journal.jsonl"), read(tmp_path, "p2b", "journal.jsonl")
+    for rows in (left, right):
+        for row in rows:
+            row.pop("run_id")
+    assert left == right
+    original = run._plans.plan_bundle
+    def changed(selector):
+        plan = cast(dict[str, Any], original(selector))
+        plan["configuration"]["products"][0]["product_id"] = "CFG-OTHER"
+        plan["configuration_sha256"] = sha256(run._bytes(plan["configuration"])).hexdigest()
+        return plan
+    monkeypatch.setattr(run, "_ReplayComposition", lambda *a, **k: pytest.fail("owner must not construct"))
+    assert _invoke_configured(tmp_path, "bad", changed)["reason"] == "UNSUPPORTED_CONFIGURATION"
+    rejected = read(tmp_path, "bad", "attempt.json")[0]
+    assert rejected["run_contract_id"] == "SPIDER_SYNTHETIC_P2_CONFIGURED_RUN_V1"
+    assert rejected["registration_state"] == "REJECTED" and "configuration_context" not in rejected
+
+
+def test_configured_recipe_kind_and_configuration_mutations_reject_before_owner(tmp_path, monkeypatch):
+    original = run._plans.plan_bundle
+    for mutation in ("recipe", "configuration"):
+        root = tmp_path / mutation
+        root.mkdir()
+        def changed(selector, mutation=mutation):
+            plan = cast(dict[str, Any], original(selector))
+            if mutation == "recipe":
+                plan["recipe"][0]["kind"] = "DELIVERY"
+            else:
+                plan["configuration"]["products"][0]["product_id"] = "CFG-OTHER"
+                plan["configuration_sha256"] = sha256(run._bytes(plan["configuration"])).hexdigest()
+            return plan
+        monkeypatch.setattr(run, "_ReplayComposition", lambda *a, **k: pytest.fail("owner must not construct"))
+        assert _invoke_configured(root, mutation, changed)["reason"] == "UNSUPPORTED_CONFIGURATION"
+        attempt = read(root, mutation, "attempt.json")[0]
+        assert attempt["run_contract_id"] == "SPIDER_SYNTHETIC_P2_CONFIGURED_RUN_V1"
+        assert attempt["registration_state"] == "REJECTED" and "configuration_context" not in attempt
+
+
+def test_configured_barrier_mismatch_stops_before_processing_or_append(tmp_path, monkeypatch):
+    original = run._ReplayComposition
+    def mismatch(*args, **kwargs):
+        callback = kwargs["evidence_callback"]
+        def altered(kind, key, payload):
+            if kind == "SOURCE_GROUP_RESULT":
+                key["visible_at"] += 1
+            return callback(kind, key, payload)
+        kwargs["evidence_callback"] = altered
+        return original(*args, **kwargs)
+    monkeypatch.setattr(run, "_ReplayComposition", mismatch)
+    with pytest.raises(RuntimeError, match="^UNEXPECTED_BARRIER$"):
+        _invoke_configured(tmp_path)
+    status = read(tmp_path, "p2", "status.json")[0]
+    assert status["failure_reason"] == "UNEXPECTED_EXCEPTION"
+    assert status["processed_boundary"] is status["persisted_boundary"] is None
+    assert read(tmp_path, "p2", "journal.jsonl") == []
+
+
+def test_configured_context_drop_and_journal_write_failure_stop_at_exact_frontier(tmp_path, monkeypatch):
+    append = storage.SpiderRunStore.append_journal
+    def drop_context(store, row):
+        row = deepcopy(row)
+        row.pop("configuration_context")
+        return append(store, row)
+    monkeypatch.setattr(storage.SpiderRunStore, "append_journal", drop_context)
+    with pytest.raises(ValueError, match="^INVALID_ARTIFACT$"):
+        _invoke_configured(tmp_path, "context")
+    status = read(tmp_path, "context", "status.json")[0]
+    assert status["failure_reason"] == "UNEXPECTED_EXCEPTION"
+    assert status["processed_boundary"]["ordinal"] == 1 and status["persisted_boundary"] is None
+    assert read(tmp_path, "context", "journal.jsonl") == []
+    monkeypatch.setattr(storage.SpiderRunStore, "append_journal", append)
+    def fail_at_twenty(store, row):
+        if row["journal_seq"] == 20:
+            raise storage.SpiderRunStoreError("PERSISTENCE_FAILED", "PERSISTENCE_FAILED", dict(kind="PERSISTENCE", reason="ARTIFACT_WRITE_FAILED"))
+        append(store, row)
+    monkeypatch.setattr(storage.SpiderRunStore, "append_journal", fail_at_twenty)
+    assert _invoke_configured(tmp_path, "persist")["reason"] == "PERSISTENCE_FAILED"
+    failed = read(tmp_path, "persist", "status.json")[0]
+    assert (failed["processed_boundary"]["ordinal"], failed["persisted_boundary"]["ordinal"]) == (20, 19)
+    assert len(read(tmp_path, "persist", "journal.jsonl")) == 19
+
+
+def test_configured_native_terminal_preserves_existing_failure_mapping(tmp_path, monkeypatch):
+    codec = wire.ScenarioCodec("SYNTHETIC_MIN_CASH_V1", cast(wire.Account, dict(venue="okx-scenario", environment="test", account="A")))
+    with pytest.raises(ValueError) as rejected:
+        codec.capture_snapshot(cast(wire.SnapshotRequest, {}))
+    native = rejected.value
+    def fail(*args, **kwargs):
+        raise native
+    monkeypatch.setattr(wire.ScenarioCodec, "apply_group", fail)
+    assert _invoke_configured(tmp_path, "native")["reason"] == "NATIVE_FAULT"
+    status = read(tmp_path, "native", "status.json")[0]
+    assert status["primary_failure"] == dict(kind="NATIVE", reason="INVALID_SCHEMA")
+    assert status["processed_boundary"] is status["persisted_boundary"] is None
+    assert read(tmp_path, "native", "journal.jsonl") == []
+
+
+@pytest.mark.parametrize("ordinal", [21, 22, 23, 40])
+def test_configured_final_dispatch_persistence_fault_publishes_once_without_retry(tmp_path, monkeypatch, ordinal):
+    append, publish = storage.SpiderRunStore.append_journal, storage.SpiderRunStore.publish_failure
+    attempts, failures = [], []
+    def fail_at_barrier(store, row):
+        attempts.append(row["journal_seq"])
+        if row["journal_seq"] == ordinal:
+            raise storage.SpiderRunStoreError("PERSISTENCE_FAILED", "PERSISTENCE_FAILED",
+                                               dict(kind="PERSISTENCE", reason="ARTIFACT_WRITE_FAILED"))
+        append(store, row)
+    def record_failure(store, reason, primary):
+        failures.append((reason, primary))
+        return publish(store, reason, primary)
+    monkeypatch.setattr(storage.SpiderRunStore, "append_journal", fail_at_barrier)
+    monkeypatch.setattr(storage.SpiderRunStore, "publish_failure", record_failure)
+    assert _invoke_configured(tmp_path, f"fault-{ordinal}") == dict(
+        run_id=f"fault-{ordinal}", outcome="FAILED", reason="PERSISTENCE_FAILED")
+    status = read(tmp_path, f"fault-{ordinal}", "status.json")[0]
+    journal = read(tmp_path, f"fault-{ordinal}", "journal.jsonl")
+    assert (status["processed_boundary"]["ordinal"], status["persisted_boundary"]["ordinal"]) == (ordinal, ordinal - 1)
+    assert len(journal) == ordinal - 1 and len(attempts) == ordinal
+    assert attempts.count(ordinal) == 1
+    assert failures == [("PERSISTENCE_FAILED", dict(kind="PERSISTENCE", reason="ARTIFACT_WRITE_FAILED"))]
