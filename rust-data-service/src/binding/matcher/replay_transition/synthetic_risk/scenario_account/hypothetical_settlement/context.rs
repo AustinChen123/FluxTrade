@@ -71,6 +71,12 @@ impl<'a> Context<'a> {
                         .is_none_or(|rows| rows.iter().any(|row| row.taker_fee < Decimal::ZERO))
                     || !matches!(fee, FeePolicy::BtcEthTradingTaker)
                         && fee != FeePolicy::ConfiguredTaker(configured_fee)
+                        && !scenario.configured.as_ref().is_some_and(|rows| {
+                            rows.iter().any(|row| {
+                                row.product == *product
+                                    && fee == FeePolicy::ConfiguredLiquidation(row.liquidation_fee)
+                            })
+                        })
                     || !scenario.configured.as_ref().is_some_and(|rows| {
                         rows.iter().any(|row| {
                             row.product == *product

@@ -125,3 +125,23 @@ fn two_step_oracle_fields_commit_order_faults_and_exclusions() {
     r.reservation_after.equity = d("11");
     assert_eq!(digest(&b).unwrap(), expected);
 }
+
+#[test]
+fn configured_fee_policy_has_distinct_discriminator_at_same_rate() {
+    let mut owner = tests::source_draft(
+        &tests::anchor(Side::Long, "1001", "50000", "3000", 500, "49900"),
+        501,
+    );
+    owner.liquidation_loop(|_| Ok(())).unwrap();
+    let original = owner.transition.liquidations[0].clone();
+    assert_eq!(original.fee_rate, Decimal::new(602, 5));
+    let original_digest = original.digest().unwrap();
+    let original_inspection = digest(&owner).unwrap();
+
+    let mut configured = original;
+    configured.fee_policy = FeePolicy::ConfiguredLiquidation(Decimal::new(602, 5));
+    assert_eq!(configured.fee_rate, Decimal::new(602, 5));
+    assert_ne!(configured.digest().unwrap(), original_digest);
+    owner.transition.liquidations[0] = configured;
+    assert_ne!(digest(&owner).unwrap(), original_inspection);
+}

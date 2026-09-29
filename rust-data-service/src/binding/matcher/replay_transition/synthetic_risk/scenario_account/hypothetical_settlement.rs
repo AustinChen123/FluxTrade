@@ -26,6 +26,7 @@ pub(super) enum FeePolicy {
     GoldenCancelTradingTaker,
     P1O03Zero,
     SyntheticLiquidation,
+    ConfiguredLiquidation(Decimal),
 }
 
 impl FeePolicy {
@@ -36,6 +37,15 @@ impl FeePolicy {
             Self::GoldenCancelTradingTaker => Decimal::new(1, 2),
             Self::P1O03Zero => Decimal::ZERO,
             Self::SyntheticLiquidation => Decimal::new(602, 5),
+            Self::ConfiguredLiquidation(rate) => rate,
+        }
+    }
+
+    pub(super) fn liquidation_name(self) -> &'static str {
+        match self {
+            Self::SyntheticLiquidation => "SyntheticLiquidation",
+            Self::ConfiguredLiquidation(_) => "ConfiguredLiquidation",
+            _ => "",
         }
     }
 }

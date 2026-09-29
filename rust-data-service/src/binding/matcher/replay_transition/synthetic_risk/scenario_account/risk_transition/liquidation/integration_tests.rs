@@ -1,3 +1,7 @@
+use super::super::super::configured_tests;
+use super::super::super::execution::commit::tests::configured_input;
+use super::super::super::execution::commit::Reply;
+use super::super::super::risk_transition::cancel::{EffectInput, Reason, State};
 use super::super::super::tests::{d, fixture};
 use super::tests::anchor;
 use super::*;
@@ -151,6 +155,203 @@ fn tied_products_complete_identically_across_seed_insertion_orders() {
         runs.push((source, owner));
     }
     assert_eq!(runs[0], runs[1]);
+}
+
+#[test]
+fn configured_fee_breach_waits_for_cancel_effect_then_liquidates_shared_mmr_winner() {
+    let (mut seed, mut products) = configured_tests::input(2);
+    seed.cash = d("3.1");
+    let lower = products[0].product.clone();
+    let higher = products[1].product.clone();
+    products[0].taker_fee = d("0.02");
+    products[0].tiers[0].tiers[0].mmr = d("0.01");
+    products[1].liquidation_fee = d("0.00602");
+    products[1].tiers[0].tiers[0].mmr = d("0.04");
+    products.reverse();
+    for (index, product) in [&lower, &higher].into_iter().enumerate() {
+        seed.positions.push(SeedPosition {
+            product: product.clone(),
+            side: Side::Long,
+            contracts: d("0.5"),
+            lots: vec![SeedLot {
+                seed_execution_id: format!("SEED-{index}"),
+                seed_sequence: index as u64,
+                strategy_id: "strategy".into(),
+                contracts: d("0.5"),
+                entry: d("100"),
+            }],
+        });
+    }
+    let prototype = fixture().0.orders[0].clone();
+    let order = |id: &str, product: &Product| SeedOrder {
+        order_id: id.into(),
+        intent_id: format!("I-{id}"),
+        client_id: format!("C-{id}"),
+        product: ProfileProduct::BtcEth(product.clone()),
+        side: Side::Long,
+        price: d("100"),
+        reduce_only: false,
+        original: d("0.5"),
+        filled: Decimal::ZERO,
+        canceled: Decimal::ZERO,
+        remaining: d("0.5"),
+        status: "OPEN".into(),
+        ..prototype.clone()
+    };
+    seed.orders = vec![order("FILL", &lower), order("CANCEL", &higher)];
+    let mut owner = ScenarioAccount::from_configured(&seed, d("10"), products).unwrap();
+    let initial = owner.reservation().unwrap();
+    assert!(initial.equity > initial.maintenance_margin);
+    assert_eq!(owner.liquidation_ids().count(), 0);
+
+    let candidate = configured_input(&owner, "FILL", "CFG-FEE-TRIGGER", "0.5", "100", 501);
+    assert!(matches!(
+        owner.execute(&candidate),
+        Ok(Reply::Committed { .. })
+    ));
+    let ordinary_fee = d("0.5") * d("100") * d("0.02");
+    assert_eq!(owner.fees, ordinary_fee);
+    let after_fill = owner.reservation().unwrap();
+    let before_fee_equity = after_fill.equity + ordinary_fee;
+    assert_eq!(before_fee_equity, d("3.1"));
+    assert!(before_fee_equity > after_fill.maintenance_margin);
+    assert_eq!(
+        (after_fill.equity, after_fill.maintenance_margin),
+        (d("2.1"), d("3"))
+    );
+    assert!(after_fill.equity <= after_fill.maintenance_margin);
+    assert!(matches!(owner.orders["CANCEL"].cancel, State::Requested(_)));
+    assert_eq!(owner.liquidation_ids().count(), 0);
+    let breached = owner.reservation().unwrap();
+    assert!(breached.equity <= breached.maintenance_margin);
+
+    owner
+        .effect_cancel(&EffectInput {
+            stamp: source::stamp("CFG-CANCEL-EFFECT", 502, 50),
+            effects: vec![(
+                "event-CFG-FEE-TRIGGER".into(),
+                "CANCEL".into(),
+                Reason::MmrBreach,
+            )],
+        })
+        .unwrap();
+    assert_eq!(owner.liquidation_ids().count(), 1);
+    assert!(!owner.positions.btc().unwrap().contains_key(&higher));
+    assert_eq!(owner.positions.btc().unwrap()[&lower].contracts, d("1"));
+    let receipt = &owner.transition.liquidations[0];
+    assert_eq!(receipt.product, higher);
+    assert_eq!(
+        receipt.fee_policy,
+        FeePolicy::ConfiguredLiquidation(d("0.00602"))
+    );
+    assert_eq!(receipt.fee, d("0.301"));
+    assert_eq!(receipt.step_index, 1);
+    assert_eq!(receipt.valuation_after.maintenance_margin, d("1"));
+    assert_eq!(receipt.post_step_decision, StepDecision::RiskStable);
+}
+
+#[test]
+fn configured_aligned_tier_three_step_revalues_into_safe_tier_two() {
+    let (mut seed, mut products) = configured_tests::input(1);
+    seed.cash = d("12.6");
+    let product = products[0].product.clone();
+    products[0].taker_fee = d("0.02");
+    products[0].liquidation_fee = d("0.00602");
+    products[0].tiers[0].tiers = vec![
+        Tier {
+            minimum: d("0"),
+            maximum: d("0.5"),
+            mmr: d("0.005"),
+            imr: d("0.1"),
+            max_leverage: d("10"),
+        },
+        Tier {
+            minimum: d("1"),
+            maximum: d("1.5"),
+            mmr: d("0.01"),
+            imr: d("0.1"),
+            max_leverage: d("10"),
+        },
+        Tier {
+            minimum: d("2"),
+            maximum: d("100"),
+            mmr: d("0.05"),
+            imr: d("0.1"),
+            max_leverage: d("10"),
+        },
+    ];
+    seed.positions.push(SeedPosition {
+        product: product.clone(),
+        side: Side::Long,
+        contracts: d("2"),
+        lots: vec![SeedLot {
+            seed_execution_id: "SEED-TIER3".into(),
+            seed_sequence: 0,
+            strategy_id: "strategy".into(),
+            contracts: d("2"),
+            entry: d("100"),
+        }],
+    });
+    let prototype = fixture().0.orders[0].clone();
+    let fill_order = SeedOrder {
+        order_id: "FILL".into(),
+        intent_id: "I-FILL".into(),
+        client_id: "C-FILL".into(),
+        product: ProfileProduct::BtcEth(product.clone()),
+        side: Side::Long,
+        price: d("100"),
+        reduce_only: false,
+        original: d("0.5"),
+        filled: Decimal::ZERO,
+        canceled: Decimal::ZERO,
+        remaining: d("0.5"),
+        status: "OPEN".into(),
+        ..prototype.clone()
+    };
+    let cancel_order = SeedOrder {
+        order_id: "CANCEL".into(),
+        intent_id: "I-CANCEL".into(),
+        client_id: "C-CANCEL".into(),
+        ..fill_order.clone()
+    };
+    seed.orders = vec![fill_order, cancel_order];
+    let mut owner = ScenarioAccount::from_configured(&seed, d("10"), products).unwrap();
+    let initial = owner.reservation().unwrap();
+    assert!(initial.equity > initial.maintenance_margin);
+    let candidate = configured_input(&owner, "FILL", "CFG-TIER3-TRIGGER", "0.5", "100", 501);
+    assert!(matches!(
+        owner.execute(&candidate),
+        Ok(Reply::Committed { .. })
+    ));
+    let ordinary_fee = d("0.5") * d("100") * d("0.02");
+    assert_eq!(owner.fees, ordinary_fee);
+    assert_eq!(owner.liquidation_ids().count(), 0);
+    assert!(matches!(owner.orders["CANCEL"].cancel, State::Requested(_)));
+    let after_fill = owner.reservation().unwrap();
+    let before_fee_equity = after_fill.equity + ordinary_fee;
+    assert_eq!(before_fee_equity, d("12.6"));
+    assert_eq!(after_fill.maintenance_margin, d("12.5"));
+    assert!(before_fee_equity > after_fill.maintenance_margin);
+    assert_eq!(after_fill.equity, d("11.6"));
+    assert!(after_fill.equity <= after_fill.maintenance_margin);
+    owner
+        .effect_cancel(&EffectInput {
+            stamp: source::stamp("CFG-TIER3-CANCEL-EFFECT", 502, 50),
+            effects: vec![(
+                "event-CFG-TIER3-TRIGGER".into(),
+                "CANCEL".into(),
+                Reason::MmrBreach,
+            )],
+        })
+        .unwrap();
+    assert_eq!(owner.liquidation_ids().count(), 1);
+    let receipt = &owner.transition.liquidations[0];
+    assert_eq!((receipt.contracts, receipt.fee), (d("1"), d("0.602")));
+    assert_eq!(receipt.valuation_before.products[0].tier, 3);
+    assert_eq!(receipt.valuation_after.products[0].tier, 2);
+    assert_eq!(receipt.post_step_decision, StepDecision::RiskStable);
+    assert_eq!(owner.positions.btc().unwrap()[&product].contracts, d("1.5"));
+    assert_eq!(owner.transition.lifecycle, Lifecycle::RiskStable);
 }
 
 fn mark_group(owner: &ScenarioAccount) -> Group {

@@ -14,7 +14,10 @@ impl ScenarioAccount {
         use inspection::{decimals, number};
         number(e, self.transition.liquidations.len())?;
         for r in &self.transition.liquidations {
-            if r.fee_policy != FeePolicy::SyntheticLiquidation {
+            if !matches!(
+                r.fee_policy,
+                FeePolicy::SyntheticLiquidation | FeePolicy::ConfiguredLiquidation(_)
+            ) {
                 return Err("NATIVE_INVARIANT");
             }
             e.account(&r.account_key);
@@ -26,7 +29,7 @@ impl ScenarioAccount {
             e.text(side_name(r.position_side_before));
             e.text(side_name(r.execution_side));
             decimals(e, &[r.contracts, r.base_quantity, r.mark]);
-            e.text("SyntheticLiquidation");
+            e.text(r.fee_policy.liquidation_name());
             decimals(
                 e,
                 &[r.fee_rate, r.fee, r.gross_realized_delta, r.cash_delta],
@@ -162,7 +165,7 @@ impl Receipt {
         for value in [self.contracts, self.base_quantity, self.mark] {
             e.text(&value.normalize().to_string());
         }
-        e.text("SyntheticLiquidation");
+        e.text(self.fee_policy.liquidation_name());
         e.text(&self.fee_rate.normalize().to_string());
         e.text(&self.spec_version);
         e.text(&self.rule_data_version);
@@ -240,9 +243,6 @@ fn prepare_step(owner: &ScenarioAccount, history: &[Receipt]) -> Result<commit::
     let step_index = next_index(&owner.key, episode.id, history)?;
     let before = owner.projection()?;
     let (scenario, marks) = owner.btc_context()?;
-    if scenario.configured.is_some() {
-        return Err("UNSUPPORTED_CONFIGURED_LIQUIDATION");
-    }
     owner.validate_context(before.effective_at)?;
     let reservation_before = owner.reservation()?;
     let risk = owner.classify_risk(&reservation_before)?;
@@ -252,11 +252,30 @@ fn prepare_step(owner: &ScenarioAccount, history: &[Receipt]) -> Result<commit::
     let valuation_before = scenario.evaluate(&before, marks)?;
     for (product, position) in owner.positions.btc()? {
         let (spec, _) = scenario.resolve(product, before.effective_at)?;
-        hypothetical_settlement::validate_existing(
-            position,
-            (scenario, spec).into(),
-            FeePolicy::SyntheticLiquidation,
-        )?;
+        let policy = if scenario.configured.is_some() {
+            let row = scenario
+                .configured
+                .as_ref()
+                .and_then(|rows| rows.iter().find(|row| row.product == *product))
+                .ok_or("UNSUPPORTED_CONFIGURED_LIQUIDATION")?;
+            FeePolicy::ConfiguredLiquidation(row.liquidation_fee)
+        } else {
+            FeePolicy::SyntheticLiquidation
+        };
+        let settlement_context = match &scenario.configured {
+            Some(_) => {
+                let (_, tiers) = scenario.resolve(product, before.effective_at)?;
+                hypothetical_settlement::Context::Configured(
+                    scenario,
+                    product,
+                    spec,
+                    tiers,
+                    before.effective_at,
+                )
+            }
+            None => (scenario, spec).into(),
+        };
+        hypothetical_settlement::validate_existing(position, settlement_context, policy)?;
     }
     let selected = valuation_before
         .products
@@ -268,6 +287,16 @@ fn prepare_step(owner: &ScenarioAccount, history: &[Receipt]) -> Result<commit::
         })
         .ok_or("INVALID_RISK_EPISODE")?;
     let product = selected.product.clone();
+    let fee_policy = if let Some(rows) = &scenario.configured {
+        FeePolicy::ConfiguredLiquidation(
+            rows.iter()
+                .find(|row| row.product == product)
+                .ok_or("UNSUPPORTED_CONFIGURED_LIQUIDATION")?
+                .liquidation_fee,
+        )
+    } else {
+        FeePolicy::SyntheticLiquidation
+    };
     let position_before = owner.positions.btc()?[&product].clone();
     let (spec, tiers) = scenario.resolve(&product, before.effective_at)?;
     let target = if selected.tier == 1 {
@@ -285,6 +314,18 @@ fn prepare_step(owner: &ScenarioAccount, history: &[Receipt]) -> Result<commit::
     if contracts <= Decimal::ZERO || contracts > position_before.contracts {
         return Err("INVALID_HYPOTHETICAL_EXECUTION");
     }
+    let resulting_contracts = add(position_before.contracts, -contracts)?;
+    if scenario.configured.is_some() && selected.tier > 1 {
+        let previous = &tiers.tiers[selected.tier - 2];
+        if resulting_contracts < previous.minimum || resulting_contracts > previous.maximum {
+            return Err("UNSUPPORTED_CONFIGURED_LIQUIDATION");
+        }
+    } else if scenario.configured.is_some()
+        && selected.tier == 1
+        && resulting_contracts != Decimal::ZERO
+    {
+        return Err("UNSUPPORTED_CONFIGURED_LIQUIDATION");
+    }
     let mark = marks
         .iter()
         .find(|m| {
@@ -298,13 +339,24 @@ fn prepare_step(owner: &ScenarioAccount, history: &[Receipt]) -> Result<commit::
         Side::Long => Side::Short,
         Side::Short => Side::Long,
     };
+    let settlement_context = if scenario.configured.is_some() {
+        hypothetical_settlement::Context::Configured(
+            scenario,
+            &product,
+            spec,
+            tiers,
+            before.effective_at,
+        )
+    } else {
+        (scenario, spec).into()
+    };
     let settlement = hypothetical_settlement::calculate(
         Some(&position_before),
         execution_side,
         contracts,
         mark,
-        (scenario, spec),
-        FeePolicy::SyntheticLiquidation,
+        settlement_context,
+        fee_policy,
         None,
     )?;
     let mut draft = owner.clone();
@@ -345,8 +397,8 @@ fn prepare_step(owner: &ScenarioAccount, history: &[Receipt]) -> Result<commit::
         contracts,
         base_quantity: mul(mul(contracts, spec.contract_value)?, spec.multiplier)?,
         mark,
-        fee_policy: FeePolicy::SyntheticLiquidation,
-        fee_rate: FeePolicy::SyntheticLiquidation.rate(),
+        fee_policy,
+        fee_rate: fee_policy.rate(),
         fee: settlement.fee,
         gross_realized_delta: settlement.gross_realized_delta,
         cash_delta: settlement.cash_delta,

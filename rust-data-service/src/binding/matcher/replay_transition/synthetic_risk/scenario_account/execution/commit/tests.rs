@@ -446,7 +446,7 @@ fn configured_settlement_invalid_origin_and_tier_leverage_publish_no_financial_s
 }
 
 #[test]
-fn configured_liquidation_fails_after_committed_fill_without_liquidation_publication() {
+fn configured_liquidation_uses_configured_fee_after_committed_fill() {
     for liquidation_fee in [d("0.02"), d("0.00602")] {
         let (mut seed, mut products) = super::super::super::configured_tests::input(2);
         products[0].liquidation_fee = liquidation_fee;
@@ -462,29 +462,85 @@ fn configured_liquidation_fails_after_committed_fill_without_liquidation_publica
             "0.5",
         )];
         let mut owner = ScenarioAccount::from_configured(&seed, d("10"), products).unwrap();
-        let mut candidate = input(&owner, "L", "CFG-LIQ", "0.5", "100");
-        candidate.spec_version = "scale-spec-v1".into();
-        candidate.rule_data_version = "scale-tier-v1".into();
+        let mut candidate = configured_input(&owner, "L", "CFG-LIQ", "0.5", "100", 500);
         candidate.expected_account_version = owner.state_version;
         candidate.expected_order_version = owner.orders["L"].version;
-        assert_eq!(
+        assert!(matches!(
             owner.execute(&candidate),
-            Err("UNSUPPORTED_CONFIGURED_LIQUIDATION")
-        );
-        assert_eq!((owner.cash, owner.fees), (d("-0.01"), d("0.05")));
-        assert_eq!(owner.positions.btc().unwrap()[&product].contracts, d("0.5"));
+            Ok(Reply::Committed { .. })
+        ));
+        assert_eq!(owner.cash, d("-0.01") - d("50") * liquidation_fee);
+        assert_eq!(owner.fees, d("0.05") + d("50") * liquidation_fee);
+        assert!(!owner.positions.btc().unwrap().contains_key(&product));
         assert_eq!(owner.orders["L"].facts.status, "FILLED");
         assert_eq!(owner.execution_receipts.len(), 1);
-        assert_eq!(owner.liquidation_ids().count(), 0);
+        assert_eq!(owner.liquidation_ids().count(), 1);
+        assert_eq!(owner.gate, Gate::Running);
         assert_eq!(
-            owner.gate,
-            Gate::Failed("UNSUPPORTED_CONFIGURED_LIQUIDATION")
+            owner.transition.lifecycle,
+            risk_transition::Lifecycle::LiquidatedInsolvent
         );
         let after = owner.clone();
         let receipt = owner.execution_receipts.values().next().unwrap().clone();
         assert_eq!(owner.execute(&candidate), Ok(Reply::Duplicate(receipt)));
         assert_eq!(owner, after);
     }
+}
+
+#[test]
+fn configured_non_aligned_tier_liquidation_fails_without_publishing_a_step() {
+    let (mut seed, mut products) = super::super::super::configured_tests::input(1);
+    seed.cash = d("0.04");
+    let product = products[0].product.clone();
+    products[0].specs[0].lot = d("2");
+    products[0].specs[0].minimum = d("2");
+    products[0].tiers[0].tiers = vec![
+        Tier {
+            minimum: d("0"),
+            maximum: d("0.5"),
+            mmr: d("0.01"),
+            imr: d("0.1"),
+            max_leverage: d("10"),
+        },
+        Tier {
+            minimum: d("1"),
+            maximum: d("1.5"),
+            mmr: d("0.02"),
+            imr: d("0.1"),
+            max_leverage: d("10"),
+        },
+        Tier {
+            minimum: d("1.6"),
+            maximum: d("100000"),
+            mmr: d("0.03"),
+            imr: d("0.1"),
+            max_leverage: d("10"),
+        },
+    ];
+    let template = fixture().0.orders[0].clone();
+    seed.orders = vec![configured_order(
+        &template,
+        "L",
+        &product,
+        Side::Long,
+        "100",
+        "2",
+    )];
+    let mut owner = ScenarioAccount::from_configured(&seed, d("10"), products).unwrap();
+    let candidate = configured_input(&owner, "L", "CFG-NONALIGNED", "2", "100", 500);
+    assert_eq!(
+        owner.execute(&candidate),
+        Err("UNSUPPORTED_CONFIGURED_LIQUIDATION")
+    );
+    assert_eq!(
+        owner.gate,
+        Gate::Failed("UNSUPPORTED_CONFIGURED_LIQUIDATION")
+    );
+    assert_eq!(owner.state_version, 1);
+    assert_eq!(owner.commit_sequence, 1);
+    assert_eq!(owner.execution_receipts.len(), 1);
+    assert_eq!(owner.positions.btc().unwrap()[&product].contracts, d("2"));
+    assert_eq!(owner.liquidation_ids().count(), 0);
 }
 
 #[test]
