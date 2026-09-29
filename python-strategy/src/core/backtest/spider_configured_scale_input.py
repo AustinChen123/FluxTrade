@@ -410,21 +410,165 @@ def _callback_plans() -> list[dict[str, Any]]:
     ]
 
 
+def _planned_barriers(
+    recipe: list[dict[str, Any]], callback_plans: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    barriers: list[dict[str, Any]] = []
+
+    def append(
+        record_kind: str,
+        barrier_id: str,
+        visible_at: int,
+        queue_class: str,
+        schedule_sequence: int,
+        stable_id: str,
+        causal_parent_ids: list[str],
+    ) -> None:
+        barriers.append(
+            {
+                "ordinal": len(barriers) + 1,
+                "barrier_id": barrier_id,
+                "record_kind": record_kind,
+                "scheduler_key": {
+                    "visible_at": visible_at,
+                    "queue_class": queue_class,
+                    "schedule_sequence": schedule_sequence,
+                    "stable_id": stable_id,
+                },
+                "causal_parent_ids": causal_parent_ids,
+            }
+        )
+
+    def append_delivery_pair(projection: dict[str, Any], delivery_id: str) -> None:
+        reference = projection["reference"]
+        key = (
+            projection["visible_at"],
+            "DELIVERY",
+            projection["schedule_sequence"],
+            delivery_id,
+        )
+        append(
+            "DELIVERY_ATTEMPT",
+            f"DELIVERY_ATTEMPT:{delivery_id}",
+            *key[:3],
+            key[3],
+            [f"{reference['namespace']}:{reference['fact_id']}"],
+        )
+        append(
+            "CALLBACK_RESULT",
+            f"CALLBACK_RESULT:{delivery_id}",
+            *key[:3],
+            key[3],
+            [f"DELIVERY_ATTEMPT:{delivery_id}"],
+        )
+
+    for step in recipe:
+        if step["kind"] != "SOURCE_GROUP" or step["at"] > 516:
+            continue
+        stable_id = step["group"]["group_id"]
+        append(
+            "SOURCE_GROUP_RESULT",
+            f"SOURCE_GROUP:{stable_id}",
+            step["at"],
+            "SOURCE_GROUP",
+            step["schedule_sequence"],
+            stable_id,
+            [],
+        )
+
+    source_delivery_ids = {
+        step["projection"]["reference"]["fact_id"]: callback_plans[index]["delivery_id"]
+        for index, step in enumerate(
+            step for step in recipe if step["kind"] == "DELIVERY"
+        )
+        if step["projection"]["reference"]["namespace"] == "SOURCE"
+    }
+    poll_delivery_ids: dict[str, str] = {}
+    poll_callback_index = 2
+    poll_steps = [step for step in recipe if step["kind"] == "POLL_BEGIN"]
+    for step in poll_steps:
+        for stage_name in ("trading", "positions", "open_orders"):
+            snapshot_id = step["plan"][stage_name]["snapshot_request"]["snapshot_id"]
+            poll_delivery_ids[snapshot_id] = callback_plans[poll_callback_index][
+                "delivery_id"
+            ]
+            poll_callback_index += 1
+
+    for step in recipe:
+        if step["kind"] != "DELIVERY" or step["at"] != 517:
+            continue
+        projection = step["projection"]
+        delivery_id = source_delivery_ids[projection["reference"]["fact_id"]]
+        append_delivery_pair(projection, delivery_id)
+
+    for step in recipe:
+        if step["kind"] != "SOURCE_GROUP" or step["at"] < 518:
+            continue
+        group_id = step["group"]["group_id"]
+        append(
+            "SOURCE_GROUP_RESULT",
+            f"SOURCE_GROUP:{group_id}",
+            step["at"],
+            "SOURCE_GROUP",
+            step["schedule_sequence"],
+            group_id,
+            [],
+        )
+
+    timeline: list[tuple[int, str, dict[str, Any]]] = []
+    delayed_delivery = next(
+        step for step in recipe if step["kind"] == "DELIVERY" and step["at"] > 517
+    )
+    for step in poll_steps:
+        for stage_name in ("trading", "positions", "open_orders"):
+            stage = step["plan"][stage_name]
+            timeline.append(
+                (stage["snapshot_request"]["captured_at"], "SNAPSHOT", stage)
+            )
+    timeline.append((delayed_delivery["at"], "DELIVERY", delayed_delivery))
+    for _, item_kind, item in sorted(timeline, key=lambda row: row[0]):
+        if item_kind == "SNAPSHOT":
+            request = item["snapshot_request"]
+            projection = item["delivery_projection"]
+            snapshot_id = request["snapshot_id"]
+            append(
+                "SNAPSHOT_FACT",
+                f"SNAPSHOT_FACT:{snapshot_id}",
+                request["captured_at"],
+                "SNAPSHOT_CAPTURE",
+                item["capture_sequence"],
+                snapshot_id,
+                [f"POLL:{request['continuation_id']}"],
+            )
+            delivery_id = poll_delivery_ids[snapshot_id]
+            append_delivery_pair(projection, delivery_id)
+        else:
+            projection = item["projection"]
+            delivery_id = source_delivery_ids[projection["reference"]["fact_id"]]
+            append_delivery_pair(projection, delivery_id)
+    return barriers
+
+
 def _payload() -> dict[str, Any]:
     configuration = _configuration()
+    recipe = _recipe()
+    callback_plans = _callback_plans()
     return {
-        "schema_version": "spider_configured_plan_input_v1",
+        "schema_version": "spider_scenario_plan_v2",
         "scenario_plan_id": "SPIDER_P2_CONFIGURED_SCALE_V1",
         "native_profile": "SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1",
         "account_key": dict(_ACCOUNT),
         "terminal_policy": "SCHEDULED_MTM",
+        "initial_cutoff": 500,
+        "final_cutoff": 100024,
         "configuration": configuration,
         "configuration_sha256": hashlib.sha256(
             canonical_bytes(configuration)
         ).hexdigest(),
         "products": list(_PRODUCTS),
-        "recipe": _recipe(),
-        "callback_plans": _callback_plans(),
+        "recipe": recipe,
+        "callback_plans": callback_plans,
+        "planned_barriers": _planned_barriers(recipe, callback_plans),
     }
 
 

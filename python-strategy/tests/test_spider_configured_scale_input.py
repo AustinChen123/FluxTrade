@@ -6,6 +6,7 @@ from decimal import Decimal
 from typing import Any, cast
 from unittest.mock import patch
 
+import pytest
 from src.core.backtest import spider_configured_scale_input as scale
 from src.core.backtest import spider_scenario_plans
 from src.core.backtest import synthetic_scenario_codec as codec
@@ -31,12 +32,157 @@ _ORDER_ID = "scenario-order-v1:[17, 9a, 5a, ba, 18, 13, 08, a2, cd, 67, 71, 3c, 
 _CONFIGURATION_SHA256 = (
     "807054044bdd182274509535ecf8bbc4598f00b6a92b598c6228129a6ff11b70"
 )
-_PLAN_INPUT_SHA256 = "bf83787295303b933007849c5bf323649a19806db4c30f5dc6bc3e0eff324396"
+_PLAN_INPUT_SHA256 = "8235c952a5d199825a2a77842b03f49e213ef707c0f30b24d8bf623fde53c2b3"
 _DOGE_ORDER_ID = "scenario-order-v1:[e8, dd, fc, 11, a7, a3, d8, 1e, 93, 5c, 69, dc, 3e, f8, 71, 12, 83, 76, 45, 7d, 9f, 76, 54, db, a0, c0, 3b, ff, ae, 79, a7, d5]"
 
 
 def _input() -> dict[str, Any]:
     return scale._configured_scale_plan_input()
+
+
+def _append_barrier(
+    barriers: list[dict[str, Any]],
+    kind: str,
+    identity: str,
+    key: dict[str, Any],
+    parents: list[str],
+) -> None:
+    prefix = {
+        "SOURCE_GROUP_RESULT": "SOURCE_GROUP",
+        "SNAPSHOT_FACT": "SNAPSHOT_FACT",
+    }.get(kind, kind)
+    barriers.append(
+        {
+            "ordinal": len(barriers) + 1,
+            "barrier_id": f"{prefix}:{identity}",
+            "record_kind": kind,
+            "scheduler_key": key,
+            "causal_parent_ids": parents,
+        }
+    )
+
+
+def _expected_barriers_from_recipe(plan: dict[str, Any]) -> list[dict[str, Any]]:
+    """Reconstruct planned observable barriers from recipe inputs, not plan output."""
+    barriers: list[dict[str, Any]] = []
+    recipe = plan["recipe"]
+    account = cast(codec.Account, plan["account_key"])
+
+    def source(step: dict[str, Any]) -> None:
+        group_id = step["group"]["group_id"]
+        _append_barrier(
+            barriers,
+            "SOURCE_GROUP_RESULT",
+            group_id,
+            {
+                "visible_at": step["at"],
+                "queue_class": "SOURCE_GROUP",
+                "schedule_sequence": step["schedule_sequence"],
+                "stable_id": group_id,
+            },
+            [],
+        )
+
+    def delivery(projection: dict[str, Any]) -> None:
+        reference = projection["reference"]
+        identity = delivery_id(
+            reference["fact_id"],
+            projection["payload_kind"],
+            reference["namespace"],
+            projection["occurrence_index"],
+            account,
+        )
+        key = {
+            "visible_at": projection["visible_at"],
+            "queue_class": "DELIVERY",
+            "schedule_sequence": projection["schedule_sequence"],
+            "stable_id": identity,
+        }
+        _append_barrier(
+            barriers,
+            "DELIVERY_ATTEMPT",
+            identity,
+            key,
+            [f"{reference['namespace']}:{reference['fact_id']}"],
+        )
+        _append_barrier(
+            barriers,
+            "CALLBACK_RESULT",
+            identity,
+            key,
+            [f"DELIVERY_ATTEMPT:{identity}"],
+        )
+
+    for step in recipe:
+        if step["kind"] == "SOURCE_GROUP" and step["at"] <= 516:
+            source(step)
+    delivery(
+        next(
+            step["projection"]
+            for step in recipe
+            if step["kind"] == "DELIVERY" and step["at"] == 517
+        )
+    )
+    for step in recipe:
+        if step["kind"] == "SOURCE_GROUP" and step["at"] >= 518:
+            source(step)
+
+    polls = [step["plan"] for step in recipe if step["kind"] == "POLL_BEGIN"]
+    timeline: list[tuple[int, str, dict[str, Any]]] = []
+    for poll in polls:
+        for stage_name in ("trading", "positions", "open_orders"):
+            stage = poll[stage_name]
+            timeline.append(
+                (stage["snapshot_request"]["captured_at"], "SNAPSHOT", stage)
+            )
+    delayed = next(
+        step["projection"]
+        for step in recipe
+        if step["kind"] == "DELIVERY" and step["at"] > 517
+    )
+    timeline.append((delayed["visible_at"], "DELIVERY", delayed))
+    for _, item_kind, item in sorted(timeline, key=lambda row: row[0]):
+        if item_kind == "DELIVERY":
+            delivery(item)
+            continue
+        request = item["snapshot_request"]
+        snapshot_id = request["snapshot_id"]
+        _append_barrier(
+            barriers,
+            "SNAPSHOT_FACT",
+            snapshot_id,
+            {
+                "visible_at": request["captured_at"],
+                "queue_class": "SNAPSHOT_CAPTURE",
+                "schedule_sequence": item["capture_sequence"],
+                "stable_id": snapshot_id,
+            },
+            [f"POLL:{request['continuation_id']}"],
+        )
+        delivery(item["delivery_projection"])
+    return barriers
+
+
+def _observed_barriers(
+    evidence: list[tuple[str, dict[str, Any], dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    barriers: list[dict[str, Any]] = []
+    for record_kind, key, payload in evidence:
+        if record_kind == "SOURCE_GROUP_RESULT":
+            identity = payload["request"]["group_id"]
+            parents: list[str] = []
+        elif record_kind == "SNAPSHOT_FACT":
+            identity = payload["request"]["snapshot_id"]
+            parents = [f"POLL:{payload['request']['continuation_id']}"]
+        elif record_kind == "DELIVERY_ATTEMPT":
+            delivery = payload["delivery"]
+            identity = delivery["delivery_id"]
+            parents = [f"{delivery['source_namespace']}:{delivery['source_fact_id']}"]
+        else:
+            identity = payload["delivery_id"]
+            parents = [f"DELIVERY_ATTEMPT:{identity}"]
+        _append_barrier(barriers, record_kind, identity, key, parents)
+    return barriers
 
 
 def _wire_group(value: object) -> codec.Group:
@@ -117,17 +263,22 @@ def test_plan_input_schema_hash_detachment_and_p1_vectors_are_frozen():
         "native_profile",
         "account_key",
         "terminal_policy",
+        "initial_cutoff",
+        "final_cutoff",
         "configuration",
         "configuration_sha256",
         "products",
         "recipe",
         "callback_plans",
+        "planned_barriers",
     }
     assert set(first) == expected_keys
-    assert first["schema_version"] == "spider_configured_plan_input_v1"
+    assert first["schema_version"] == "spider_scenario_plan_v2"
     assert first["scenario_plan_id"] == "SPIDER_P2_CONFIGURED_SCALE_V1"
     assert first["native_profile"] == "SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1"
     assert first["terminal_policy"] == "SCHEDULED_MTM"
+    assert first["initial_cutoff"] == 500
+    assert first["final_cutoff"] == 100024
     assert first["products"] == _PRODUCTS
     configuration = first["configuration"]
     assert (
@@ -143,6 +294,30 @@ def test_plan_input_schema_hash_detachment_and_p1_vectors_are_frozen():
         scale._PLAN_INPUT_SHA256 == hashlib.sha256(canonical_bytes(first)).hexdigest()
     )
     assert scale._PLAN_INPUT_SHA256 == _PLAN_INPUT_SHA256
+    assert first["planned_barriers"] == _expected_barriers_from_recipe(first)
+    assert len(first["planned_barriers"]) == 40
+    assert [row["ordinal"] for row in first["planned_barriers"]] == list(range(1, 41))
+    assert all(
+        set(row)
+        == {
+            "ordinal",
+            "barrier_id",
+            "record_kind",
+            "scheduler_key",
+            "causal_parent_ids",
+        }
+        and set(row["scheduler_key"])
+        == {"visible_at", "queue_class", "schedule_sequence", "stable_id"}
+        for row in first["planned_barriers"]
+    )
+    assert [
+        row["scheduler_key"]["visible_at"] for row in first["planned_barriers"][20:29:3]
+    ] == [100010, 100012, 100014]
+    assert [
+        row["causal_parent_ids"]
+        for row in first["planned_barriers"]
+        if row["record_kind"] == "SNAPSHOT_FACT"
+    ] == [["POLL:Q2"], ["POLL:Q2"], ["POLL:Q2"], ["POLL:Q1"], ["POLL:Q1"], ["POLL:Q1"]]
     assert len(first["recipe"]) == 22
     assert [step["at"] for step in first["recipe"][:17]] == list(range(501, 518))
     assert [step["group"]["group_id"] for step in first["recipe"][:16]] == [
@@ -169,8 +344,8 @@ def test_plan_input_schema_hash_detachment_and_p1_vectors_are_frozen():
     first["configuration"]["products"][0]["specs"][0]["contract_value"] = "9"
     first["recipe"][0]["group"]["members"][0]["payload"]["product_id"] = "changed"
     first["callback_plans"][0]["expected_policy_events"].append("changed")
+    first["planned_barriers"][0]["scheduler_key"]["visible_at"] = -1
     assert canonical_bytes(_input()) == before
-
     assert spider_scenario_plans.PLAN_IDS == (
         "SPIDER_P1_SCHEDULED_MTM_V1",
         "SPIDER_P1_LEGAL_LIQUIDATION_V1",
@@ -187,6 +362,21 @@ def test_plan_input_schema_hash_detachment_and_p1_vectors_are_frozen():
         )
         raw = canonical_bytes(bundle["plan"])
         assert (len(raw), hashlib.sha256(raw).hexdigest()) == (length, digest)
+
+
+@pytest.mark.parametrize("mutation", ["remove", "reorder", "duplicate", "causal"])
+def test_planned_barriers_reject_incomplete_or_reordered_coverage(mutation):
+    plan = _input()
+    planned = plan["planned_barriers"]
+    if mutation == "remove":
+        del planned[20]
+    elif mutation == "reorder":
+        planned[20], planned[21] = planned[21], planned[20]
+    elif mutation == "duplicate":
+        planned.insert(20, planned[19])
+    else:
+        planned[20]["causal_parent_ids"] = ["Q2"]
+    assert planned != _expected_barriers_from_recipe(plan)
 
 
 def test_literal_section6_configuration_and_recipe_drive_real_native_codec():
@@ -400,10 +590,14 @@ def test_configured_tail_execution_callback_and_overlapping_polls_are_causal():
         for plan in callback_plans
     )
     emissions = {plan["delivery_id"]: plan for plan in callback_plans}
+    observed: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
     replay = _ReplayComposition(
         plan_input["native_profile"],
         account,
         emissions,
+        evidence_callback=lambda kind, key, payload: observed.append(
+            (kind, key, payload)
+        ),
         configuration=cast(dict[str, object], plan_input["configuration"]),
     )
     recipe = cast(list[dict[str, Any]], plan_input["recipe"])
@@ -651,3 +845,6 @@ def test_configured_tail_execution_callback_and_overlapping_polls_are_causal():
     ]
     assert replay._policy.events == []
     assert replay._policy.replies == {}
+    expected_barriers = _expected_barriers_from_recipe(plan_input)
+    assert plan_input["planned_barriers"] == expected_barriers
+    assert _observed_barriers(observed) == expected_barriers
