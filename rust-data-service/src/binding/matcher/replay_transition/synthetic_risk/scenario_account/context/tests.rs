@@ -1,3 +1,5 @@
+use super::super::configured_tests;
+use super::super::execution::commit::tests::configured_input;
 use super::super::tests::{d, fixture};
 use super::*;
 use risk_transition::{cancel, Lifecycle};
@@ -52,6 +54,349 @@ pub(in super::super) fn mark_rows(marks: &[Mark], at: i64) -> Rows {
             })
             .collect(),
     )
+}
+
+fn configured_mark_rows(owner: &ScenarioAccount, at: i64) -> Rows {
+    let (scenario, marks) = owner.btc_context().unwrap();
+    Rows::Marks(
+        scenario
+            .products()
+            .into_iter()
+            .map(|product| {
+                let row = marks
+                    .iter()
+                    .find(|m| m.product == product && m.valid_from <= at && at < m.valid_to)
+                    .unwrap();
+                (product, row.valid_from, row.valid_to, row.price)
+            })
+            .collect(),
+    )
+}
+
+fn configured_mark_fixture(count: usize, cash: &str) -> (CleanSeed, Vec<ConfiguredProduct>) {
+    let (mut seed, mut products) = configured_tests::input(count);
+    seed.cash = d(cash);
+    for row in &mut products {
+        let mut old = row.marks[0].clone();
+        old.valid_to = 600;
+        let next = Mark {
+            price: d("101"),
+            valid_from: 600,
+            valid_to: 3000,
+            ..old.clone()
+        };
+        row.marks = vec![old, next];
+    }
+    (seed, products)
+}
+
+fn assert_context_fault_has_no_draft(owner: &ScenarioAccount, original: &ScenarioAccount) {
+    let mut expected = original.clone();
+    expected.gate = Gate::Failed("UNSUPPORTED_CONTEXT_TRANSITION");
+    assert_eq!(owner, &expected);
+    assert_eq!(owner.state_version, original.state_version);
+    assert_eq!(owner.valuation_context_id, original.valuation_context_id);
+    assert_eq!(owner.transition.context_at, original.transition.context_at);
+    assert_eq!(owner.transition.contexts, original.transition.contexts);
+    assert_eq!(owner.transition.events, original.transition.events);
+    assert_eq!(
+        owner.transition.event_kinds,
+        original.transition.event_kinds
+    );
+    assert_eq!(owner.cash, original.cash);
+    assert_eq!(owner.fees, original.fees);
+    assert_eq!(owner.positions, original.positions);
+    assert_eq!(owner.orders, original.orders);
+}
+
+#[test]
+fn configured_mark_activation_accepts_one_and_three_products_in_config_order() {
+    for count in [1, 3] {
+        let (seed, products) = configured_mark_fixture(count, "1000");
+        let expected_products = products
+            .iter()
+            .map(|row| row.product.clone())
+            .collect::<Vec<_>>();
+        let mut owner = ScenarioAccount::from_configured(&seed, d("10"), products).unwrap();
+        let input = activation(&owner, 600, configured_mark_rows(&owner, 600));
+        assert_ne!(input.expected_before, input.expected_after);
+        let receipt = owner.activate_context(&input).unwrap();
+        assert_eq!(owner.valuation_context_id, input.expected_after);
+        assert_eq!(
+            receipt
+                .rows_after
+                .iter()
+                .map(|(_, _, mark)| mark.product.clone())
+                .collect::<Vec<_>>(),
+            expected_products
+        );
+        assert_eq!(owner.state_version, 1);
+        assert_eq!(owner.transition.context_at, Some(600));
+        assert_eq!(owner.transition.events.len(), 1);
+    }
+}
+
+#[test]
+fn configured_mark_vector_invalid_shapes_fail_without_publishing_context() {
+    for variant in [
+        "missing",
+        "extra",
+        "duplicate",
+        "reordered",
+        "stale",
+        "wrong-mark",
+    ] {
+        let (seed, products) = configured_mark_fixture(3, "1000");
+        let mut owner = ScenarioAccount::from_configured(&seed, d("10"), products).unwrap();
+        let mut input = activation(&owner, 600, configured_mark_rows(&owner, 600));
+        let Rows::Marks(rows) = &mut input.rows else {
+            unreachable!()
+        };
+        match variant {
+            "missing" => {
+                rows.pop();
+            }
+            "extra" => rows.push(rows[0].clone()),
+            "duplicate" => rows[2] = rows[1].clone(),
+            "reordered" => rows.swap(0, 1),
+            "stale" => {
+                let (scenario, marks) = owner.btc_context().unwrap();
+                let product = &scenario.products()[0];
+                let old = marks
+                    .iter()
+                    .find(|m| m.product == *product && m.valid_from < 600)
+                    .unwrap();
+                rows[0] = (product.clone(), old.valid_from, old.valid_to, old.price);
+            }
+            _ => rows[1].3 += Decimal::ONE,
+        }
+        input.stamp.event_id = format!("invalid-{variant}");
+        let original = owner.clone();
+        assert_eq!(
+            owner.activate_context(&input),
+            Err("UNSUPPORTED_CONTEXT_TRANSITION"),
+            "{variant}"
+        );
+        assert_context_fault_has_no_draft(&owner, &original);
+    }
+}
+
+#[test]
+fn configured_mark_activation_rejects_unchanged_identity_and_spec_tier_boundaries() {
+    let (mut seed, products) = configured_tests::input(1);
+    seed.cash = d("1000");
+    let mut owner = ScenarioAccount::from_configured(&seed, d("10"), products.clone()).unwrap();
+    let input = activation(&owner, 600, configured_mark_rows(&owner, 600));
+    assert_eq!(input.expected_before, input.expected_after);
+    let original = owner.clone();
+    assert_eq!(
+        owner.activate_context(&input),
+        Err("UNSUPPORTED_CONTEXT_TRANSITION")
+    );
+    assert_context_fault_has_no_draft(&owner, &original);
+
+    for boundary in ["spec", "tier"] {
+        let (seed, mut products) = configured_mark_fixture(1, "1000");
+        if boundary == "spec" {
+            let mut old = products[0].specs[0].clone();
+            old.interval.to = Some(600);
+            let new = Spec {
+                version: "spec-v2".into(),
+                interval: Interval {
+                    from: 600,
+                    to: None,
+                },
+                ..old.clone()
+            };
+            products[0].specs = vec![old, new];
+        } else {
+            let mut old = products[0].tiers[0].clone();
+            old.interval.to = Some(600);
+            let new = TierVersion {
+                version: "tier-v2".into(),
+                interval: Interval {
+                    from: 600,
+                    to: None,
+                },
+                ..old.clone()
+            };
+            products[0].tiers = vec![old, new];
+        }
+        let mut owner = ScenarioAccount::from_configured(&seed, d("10"), products).unwrap();
+        let input = activation(&owner, 600, configured_mark_rows(&owner, 600));
+        let original = owner.clone();
+        assert_eq!(
+            owner.activate_context(&input),
+            Err("UNSUPPORTED_CONTEXT_TRANSITION"),
+            "{boundary}"
+        );
+        assert_context_fault_has_no_draft(&owner, &original);
+    }
+}
+
+#[test]
+fn configured_mark_shortfall_commits_source_then_waits_for_cancel_effect_before_liquidation() {
+    let (mut seed, mut products) = configured_mark_fixture(3, "25.2");
+    let product = products[0].product.clone();
+    let shared_product = products[1].product.clone();
+    products[0].taker_fee = d("0.001");
+    products[0].liquidation_fee = d("0.001");
+    products[1].tiers[0].tiers[0].mmr = d("0.00001");
+    products[0].marks[1].price = d("1");
+    for row in &mut products[1..] {
+        row.marks[1].price = d("100");
+    }
+    let prototype = fixture().0.orders[0].clone();
+    seed.positions.push(SeedPosition {
+        product: shared_product.clone(),
+        side: Side::Long,
+        contracts: d("0.5"),
+        lots: vec![SeedLot {
+            seed_execution_id: "SHARED-ETH-POSITION".into(),
+            seed_sequence: 0,
+            strategy_id: "strategy".into(),
+            contracts: d("0.5"),
+            entry: d("100"),
+        }],
+    });
+    seed.orders = vec![SeedOrder {
+        order_id: "PARTIAL".into(),
+        intent_id: "I-PARTIAL".into(),
+        client_id: "C-PARTIAL".into(),
+        product: ProfileProduct::BtcEth(product.clone()),
+        side: Side::Long,
+        price: d("100"),
+        reduce_only: false,
+        original: d("2"),
+        filled: Decimal::ZERO,
+        canceled: Decimal::ZERO,
+        remaining: d("2"),
+        status: "OPEN".into(),
+        ..prototype
+    }];
+    let mut owner = ScenarioAccount::from_configured(&seed, d("10"), products).unwrap();
+    let seed_snapshot = owner.reservation().unwrap();
+    assert!(seed_snapshot.equity > seed_snapshot.maintenance_margin);
+    assert!(seed_snapshot.available_margin >= Decimal::ZERO);
+    assert!(owner.transition.episode.is_none());
+
+    let candidate = configured_input(&owner, "PARTIAL", "MARK-PARTIAL-FILL", "1", "100", 501);
+    assert!(matches!(
+        owner.execute(&candidate),
+        Ok(execution::commit::Reply::Committed { .. })
+    ));
+    assert_eq!((owner.cash, owner.fees), (d("25.1"), d("0.1")));
+    assert_eq!(owner.positions.btc().unwrap()[&product].contracts, d("1"));
+    assert_eq!(
+        (
+            owner.orders["PARTIAL"].facts.filled,
+            owner.orders["PARTIAL"].facts.remaining
+        ),
+        (d("1"), d("1"))
+    );
+    let after_fill = owner.reservation().unwrap();
+    assert_eq!(
+        (
+            after_fill.equity,
+            after_fill.maintenance_margin,
+            after_fill.available_margin
+        ),
+        (d("25.1"), d("0.5005"), d("0"))
+    );
+    let no_fee_equity = after_fill.equity + owner.fees;
+    assert_eq!(no_fee_equity, d("25.2"));
+    assert!(no_fee_equity > after_fill.maintenance_margin);
+    assert!(after_fill.equity > after_fill.maintenance_margin);
+    assert!(after_fill.available_margin >= Decimal::ZERO);
+    assert!(owner.transition.episode.is_none());
+
+    let (scenario, marks) = owner.btc_context().unwrap();
+    let mut projection = owner.projection().unwrap();
+    projection.effective_at = 600;
+    let orders = owner
+        .orders
+        .values()
+        .map(|order| &order.facts)
+        .collect::<Vec<_>>();
+    let old_marks = scenario
+        .products()
+        .into_iter()
+        .map(|p| {
+            let mark = marks
+                .iter()
+                .find(|m| m.product == p && m.valid_from < 600)
+                .unwrap();
+            Mark {
+                valid_from: 600,
+                valid_to: 3000,
+                ..mark.clone()
+            }
+        })
+        .collect::<Vec<_>>();
+    let old_counterfactual =
+        reservation::calculate(&projection, &orders, scenario, &old_marks).unwrap();
+    let new_counterfactual = reservation::calculate(&projection, &orders, scenario, marks).unwrap();
+    assert_eq!(
+        (
+            old_counterfactual.equity,
+            old_counterfactual.maintenance_margin
+        ),
+        (d("25.1"), d("0.5005"))
+    );
+    let old_without_fee = old_counterfactual.equity + owner.fees;
+    assert_eq!(old_without_fee, d("25.2"));
+    assert!(old_without_fee > old_counterfactual.maintenance_margin);
+    assert!(old_counterfactual.equity > old_counterfactual.maintenance_margin);
+    assert_eq!(new_counterfactual.equity, d("-73.9"));
+    assert_eq!(new_counterfactual.maintenance_margin, d("0.0055"));
+    assert!(new_counterfactual.equity <= new_counterfactual.maintenance_margin);
+
+    let mut mark_input = activation(&owner, 600, configured_mark_rows(&owner, 600));
+    mark_input.stamp.event_id = "mark-drop".into();
+    let mark_receipt = owner.activate_context(&mark_input).unwrap();
+    assert_eq!(mark_receipt.after.equity, d("-73.9"));
+    assert_eq!(mark_receipt.after.maintenance_margin, d("0.0055"));
+    assert_eq!(owner.valuation_context_id, mark_input.expected_after);
+    assert_eq!(owner.state_version, 3);
+    assert_eq!(owner.transition.contexts.len(), 1);
+    assert_eq!(owner.transition.events.len(), 2);
+    assert!(matches!(
+        owner.orders["PARTIAL"].cancel,
+        cancel::State::Requested(_)
+    ));
+    assert_eq!(owner.liquidation_ids().count(), 0);
+    assert_eq!(owner.orders["PARTIAL"].facts.filled, d("1"));
+    assert_eq!(owner.positions.btc().unwrap()[&product].contracts, d("1"));
+    assert_eq!(owner.fees, d("0.1"));
+
+    let effect = cancel::EffectInput {
+        stamp: stamp("MARK-CANCEL-EFFECT", 601, 50),
+        effects: vec![(
+            "mark-drop".into(),
+            "PARTIAL".into(),
+            cancel::Reason::MmrBreach,
+        )],
+    };
+    owner.effect_cancel(&effect).unwrap();
+    assert_eq!(owner.liquidation_ids().count(), 2);
+    assert_eq!(owner.orders["PARTIAL"].facts.status, "CANCELED");
+    assert_eq!(
+        (
+            owner.orders["PARTIAL"].facts.filled,
+            owner.orders["PARTIAL"].facts.canceled
+        ),
+        (d("1"), d("1"))
+    );
+    assert!(owner.positions.is_empty());
+    assert_eq!(owner.cash, d("-73.951"));
+    assert_eq!(owner.fees, d("0.151"));
+    assert_eq!(owner.gross_realized, d("-99"));
+    assert_eq!(owner.transition.lifecycle, Lifecycle::LiquidatedInsolvent);
+    assert_eq!(owner.execution_receipts.len(), 1);
+    assert_eq!(owner.transition.contexts.len(), 1);
+    let terminal = owner.clone();
+    owner.effect_cancel(&effect).unwrap();
+    assert_eq!(owner, terminal);
 }
 
 #[test]

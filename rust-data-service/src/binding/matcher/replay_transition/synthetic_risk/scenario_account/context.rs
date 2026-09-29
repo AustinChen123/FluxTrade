@@ -187,6 +187,12 @@ impl ScenarioAccount {
         if input.expected_after != after_id {
             return Err("UNSUPPORTED_CONTEXT_TRANSITION");
         }
+        if scenario.configured.is_some()
+            && matches!(input.rows, Rows::Marks(_))
+            && input.expected_before == input.expected_after
+        {
+            return Err("UNSUPPORTED_CONTEXT_TRANSITION");
+        }
         let mut migrations = Vec::new();
         let mut rows_before = Vec::new();
         let mut rows_after = Vec::new();
@@ -194,10 +200,24 @@ impl ScenarioAccount {
             let (old_spec, old_tier) = scenario.resolve(&product, old_at)?;
             let (spec, tier) = scenario.resolve(&product, at)?;
             if let Some(position) = self.positions.btc()?.get(&product) {
+                let (settlement_context, fee_policy) =
+                    if scenario.configured.is_some() && matches!(input.rows, Rows::Marks(_)) {
+                        (
+                            hypothetical_settlement::Context::Configured(
+                                scenario, &product, spec, tier, at,
+                            ),
+                            hypothetical_settlement::configured_fee_policy(scenario, &product)?,
+                        )
+                    } else {
+                        (
+                            (scenario, spec).into(),
+                            hypothetical_settlement::FeePolicy::BtcEthTradingTaker,
+                        )
+                    };
                 hypothetical_settlement::validate_existing(
                     position,
-                    (scenario, spec).into(),
-                    hypothetical_settlement::FeePolicy::BtcEthTradingTaker,
+                    settlement_context,
+                    fee_policy,
                 )?;
             }
             let old_mark = marks
@@ -212,7 +232,12 @@ impl ScenarioAccount {
             rows_after.push((spec.clone(), tier.clone(), mark.clone()));
             match &input.rows {
                 Rows::Marks(rows) => {
-                    if rows.len() != 2
+                    let expected_len = if scenario.configured.is_some() {
+                        scenario.products().len()
+                    } else {
+                        2
+                    };
+                    if rows.len() != expected_len
                         || rows.get(index)
                             != Some(&(product, mark.valid_from, mark.valid_to, mark.price))
                         || old_spec != spec
