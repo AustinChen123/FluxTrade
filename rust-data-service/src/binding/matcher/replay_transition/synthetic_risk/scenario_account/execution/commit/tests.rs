@@ -2,6 +2,7 @@ use super::super::super::tests::{d, fixture};
 use super::super::tests::fixture_candidate;
 use super::*;
 mod configured_fee;
+mod configured_fee_fifo;
 mod configured_fee_scale;
 
 pub(in super::super::super) fn configured_input(
