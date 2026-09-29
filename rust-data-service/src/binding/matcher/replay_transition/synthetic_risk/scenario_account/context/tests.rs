@@ -90,9 +90,81 @@ fn configured_mark_fixture(count: usize, cash: &str) -> (CleanSeed, Vec<Configur
     (seed, products)
 }
 
+fn configured_order(product: &Product, id: &str, price: &str) -> SeedOrder {
+    let prototype = fixture().0.orders[0].clone();
+    SeedOrder {
+        order_id: id.into(),
+        intent_id: format!("I-{id}"),
+        client_id: format!("C-{id}"),
+        product: ProfileProduct::BtcEth(product.clone()),
+        side: Side::Long,
+        price: d(price),
+        reduce_only: false,
+        original: d("0.5"),
+        filled: Decimal::ZERO,
+        canceled: Decimal::ZERO,
+        remaining: d("0.5"),
+        status: "OPEN".into(),
+        ..prototype
+    }
+}
+
+fn configured_position(product: &Product, id: &str, quantity: &str, sequence: u64) -> SeedPosition {
+    SeedPosition {
+        product: product.clone(),
+        side: Side::Long,
+        contracts: d(quantity),
+        lots: vec![SeedLot {
+            seed_execution_id: id.into(),
+            seed_sequence: sequence,
+            strategy_id: "strategy".into(),
+            contracts: d(quantity),
+            entry: d("100"),
+        }],
+    }
+}
+
+fn configured_activation(owner: &ScenarioAccount, at: i64, rows: Rows) -> Input {
+    let mut input = activation(owner, at, rows);
+    input.stamp.event_id = format!("configured-{}", input.stamp.event_id);
+    input
+}
+
+fn configure_spec_change(row: &mut ConfiguredProduct, at: i64, tick: &str) {
+    let mut old = row.specs[0].clone();
+    old.interval.to = Some(at);
+    row.specs = vec![
+        old.clone(),
+        Spec {
+            version: "spec-v2".into(),
+            interval: Interval { from: at, to: None },
+            tick: d(tick),
+            ..old
+        },
+    ];
+}
+
+fn configure_tier_change(row: &mut ConfiguredProduct, at: i64, mmr: &str) {
+    let mut old = row.tiers[0].clone();
+    old.interval.to = Some(at);
+    let mut new = old.clone();
+    new.version = "tier-v2".into();
+    new.interval = Interval { from: at, to: None };
+    new.tiers[0].mmr = d(mmr);
+    row.tiers = vec![old, new];
+}
+
 fn assert_context_fault_has_no_draft(owner: &ScenarioAccount, original: &ScenarioAccount) {
+    assert_context_fault_has_no_draft_with(owner, original, "UNSUPPORTED_CONTEXT_TRANSITION");
+}
+
+fn assert_context_fault_has_no_draft_with(
+    owner: &ScenarioAccount,
+    original: &ScenarioAccount,
+    fault: Fault,
+) {
     let mut expected = original.clone();
-    expected.gate = Gate::Failed("UNSUPPORTED_CONTEXT_TRANSITION");
+    expected.gate = Gate::Failed(fault);
     assert_eq!(owner, &expected);
     assert_eq!(owner.state_version, original.state_version);
     assert_eq!(owner.valuation_context_id, original.valuation_context_id);
@@ -826,4 +898,405 @@ fn context_and_group_invalid_shape_and_fault_retention_are_atomic() {
     );
     assert_eq!(expired.state_version, 0);
     assert!(expired.transition.admissions.is_empty());
+}
+
+#[test]
+fn configured_spec_subset_migrates_only_changed_product_and_reuses_pending_request() {
+    let (mut seed, mut products) = configured_tests::input(3);
+    seed.cash = d("1000");
+    seed.orders.clear();
+    let first = products[0].product.clone();
+    let middle = products[1].product.clone();
+    let last = products[2].product.clone();
+    configure_spec_change(&mut products[1], 600, "2");
+    seed.orders = vec![
+        configured_order(&first, "FIRST-ALIGNED", "101"),
+        configured_order(&middle, "MID-MISALIGNED", "101"),
+        configured_order(&middle, "MID-ALIGNED", "100"),
+        configured_order(&middle, "MID-PENDING", "103"),
+        configured_order(&last, "LAST-ALIGNED", "101"),
+    ];
+    let mut owner = ScenarioAccount::from_configured(&seed, d("10"), products).unwrap();
+    let old_tick = owner
+        .btc_context()
+        .unwrap()
+        .0
+        .resolve(&middle, 599)
+        .unwrap()
+        .0
+        .tick;
+    assert_eq!(old_tick, d("1"));
+    assert_eq!(owner.reservation().unwrap().orders.len(), 5);
+    let reservations_before = owner.reservation().unwrap().orders;
+
+    owner
+        .request_cancel(&cancel::RequestInput {
+            stamp: stamp("pending-migration-request", 550, 40),
+            targets: vec![("MID-PENDING".into(), cancel::Reason::ExplicitScenario)],
+        })
+        .unwrap();
+    let cancel::State::Requested(pending_request) = owner.orders["MID-PENDING"].cancel.clone()
+    else {
+        panic!("pending cancellation request must exist before spec activation")
+    };
+    assert_eq!(
+        pending_request.detecting_event_id,
+        "pending-migration-request"
+    );
+    assert_eq!(pending_request.reason, cancel::Reason::ExplicitScenario);
+    let input = configured_activation(
+        &owner,
+        600,
+        Rows::Specs(vec![(
+            middle.clone(),
+            "scale-spec-v1".into(),
+            "spec-v2".into(),
+            600,
+        )]),
+    );
+    let receipt = owner.activate_context(&input).unwrap();
+    assert_eq!(
+        owner.transition.contexts["configured-activate"].rows_before[1]
+            .0
+            .tick,
+        old_tick
+    );
+    let (active, _) = owner.btc_context().unwrap();
+    assert_eq!(active.resolve(&middle, 600).unwrap().0.tick, d("2"));
+    assert_eq!(receipt.rows_before[1].0.version, "scale-spec-v1");
+    assert_eq!(receipt.rows_after[1].0.version, "spec-v2");
+    assert_eq!(receipt.input.rows, input.rows);
+    assert_eq!(receipt.migration_effects.len(), 2);
+    assert_eq!(receipt.after_version, receipt.before_version + 1);
+    assert_eq!(owner.transition.context_at, Some(600));
+    assert_eq!(owner.valuation_context_id, input.expected_after);
+    assert_eq!(owner.transition.contexts["configured-activate"], receipt);
+
+    for id in ["MID-MISALIGNED", "MID-PENDING"] {
+        assert_eq!(owner.orders[id].facts.status, "CANCELED");
+        assert_eq!(owner.orders[id].facts.remaining, Decimal::ZERO);
+    }
+    let cancel::State::EffectiveCanceled(effect) = &owner.orders["MID-PENDING"].cancel else {
+        panic!("pending migration must retain its original effective cancellation")
+    };
+    assert_eq!(effect.action_id, pending_request.effect_action_id);
+    assert_eq!(
+        effect.request.detecting_event_id,
+        "pending-migration-request"
+    );
+    assert_eq!(effect.request.reason, cancel::Reason::ExplicitScenario);
+    let cancel::State::MigrationEffective(direct_migration) =
+        &owner.orders["MID-MISALIGNED"].cancel
+    else {
+        panic!("unaligned order must record the context migration effect")
+    };
+    assert_eq!(
+        receipt.migration_effects,
+        vec![*direct_migration, pending_request.effect_action_id]
+    );
+    for id in ["FIRST-ALIGNED", "MID-ALIGNED", "LAST-ALIGNED"] {
+        assert_eq!(owner.orders[id].facts.status, "OPEN");
+        assert_eq!(owner.orders[id].facts.remaining, d("0.5"));
+        assert_eq!(owner.orders[id].version, 0);
+    }
+    let effect_actions = owner
+        .cancel_facts
+        .actions
+        .iter()
+        .filter(|(id, _)| receipt.migration_effects.contains(id))
+        .map(|(_, action)| {
+            (
+                action.target_order_id.as_str(),
+                action.detecting_event_id.as_str(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        effect_actions,
+        BTreeSet::from([("MID-PENDING", "pending-migration-request")])
+    );
+    let reservations_after = owner.reservation().unwrap().orders;
+    let unchanged = ["FIRST-ALIGNED", "MID-ALIGNED", "LAST-ALIGNED"];
+    assert_eq!(
+        reservations_before
+            .iter()
+            .filter(|row| unchanged.contains(&row.order_id.as_str()))
+            .collect::<Vec<_>>(),
+        reservations_after.iter().collect::<Vec<_>>()
+    );
+    assert_eq!(reservations_after.len(), 3);
+    let before_duplicate = owner.clone();
+    assert_eq!(owner.activate_context(&input).unwrap(), receipt);
+    assert_eq!(owner, before_duplicate);
+}
+
+#[test]
+fn configured_spec_activation_accepts_ordered_changed_subset_of_multiple_products() {
+    let (mut seed, mut products) = configured_tests::input(3);
+    seed.cash = d("1000");
+    configure_spec_change(&mut products[0], 600, "2");
+    configure_spec_change(&mut products[2], 600, "5");
+    let p0 = products[0].product.clone();
+    let p2 = products[2].product.clone();
+    let mut owner = ScenarioAccount::from_configured(&seed, d("10"), products).unwrap();
+    let input = configured_activation(
+        &owner,
+        600,
+        Rows::Specs(vec![
+            (p0.clone(), "scale-spec-v1".into(), "spec-v2".into(), 600),
+            (p2.clone(), "scale-spec-v1".into(), "spec-v2".into(), 600),
+        ]),
+    );
+    let receipt = owner.activate_context(&input).unwrap();
+    assert_eq!(receipt.rows_after[0].0.tick, d("2"));
+    assert_eq!(receipt.rows_after[1].0.tick, d("1"));
+    assert_eq!(receipt.rows_after[2].0.tick, d("5"));
+    assert_eq!(owner.transition.contexts["configured-activate"], receipt);
+
+    let (mut seed, mut products) = configured_tests::input(3);
+    seed.cash = d("1000");
+    configure_spec_change(&mut products[0], 600, "2");
+    configure_spec_change(&mut products[2], 600, "5");
+    let p0 = products[0].product.clone();
+    let p2 = products[2].product.clone();
+    let mut owner = ScenarioAccount::from_configured(&seed, d("10"), products).unwrap();
+    let input = configured_activation(
+        &owner,
+        600,
+        Rows::Specs(vec![
+            (p2, "scale-spec-v1".into(), "spec-v2".into(), 600),
+            (p0, "scale-spec-v1".into(), "spec-v2".into(), 600),
+        ]),
+    );
+    let original = owner.clone();
+    assert_eq!(
+        owner.activate_context(&input),
+        Err("UNSUPPORTED_CONTEXT_TRANSITION")
+    );
+    assert_context_fault_has_no_draft(&owner, &original);
+}
+
+#[test]
+fn configured_tier_subset_revalues_shared_risk_then_waits_for_cancel_effect() {
+    let (mut seed, mut products) = configured_tests::input(3);
+    seed.cash = d("16");
+    seed.orders.clear();
+    let first = products[0].product.clone();
+    let middle = products[1].product.clone();
+    let last = products[2].product.clone();
+    configure_tier_change(&mut products[1], 600, "0.4");
+    seed.positions = vec![
+        configured_position(&first, "POSITION-FIRST", "0.5", 0),
+        configured_position(&middle, "POSITION-MIDDLE", "0.5", 1),
+    ];
+    seed.orders = vec![configured_order(&last, "LAST-OPEN", "100")];
+    let mut owner = ScenarioAccount::from_configured(&seed, d("10"), products).unwrap();
+    let before = owner.reservation().unwrap();
+    assert_eq!(before.equity, d("16"));
+    assert_eq!(before.maintenance_margin, d("0.5"));
+    assert!(before.available_margin >= Decimal::ZERO);
+
+    let input = configured_activation(
+        &owner,
+        600,
+        Rows::Tiers(vec![(
+            middle.clone(),
+            "scale-tier-v1".into(),
+            "tier-v2".into(),
+            600,
+        )]),
+    );
+    let receipt = owner.activate_context(&input).unwrap();
+    assert_eq!(receipt.after.equity, d("16"));
+    assert_eq!(receipt.after.maintenance_margin, d("20.25"));
+    assert_eq!(receipt.after.used_margin, before.used_margin);
+    assert_eq!(receipt.rows_before[1].1.version, "scale-tier-v1");
+    assert_eq!(receipt.rows_after[1].1.version, "tier-v2");
+    assert!(matches!(
+        owner.orders["LAST-OPEN"].cancel,
+        cancel::State::Requested(_)
+    ));
+    assert_eq!(owner.liquidation_ids().count(), 0);
+    assert_eq!(owner.positions.btc().unwrap()[&middle].contracts, d("0.5"));
+    assert_eq!(owner.positions.btc().unwrap()[&first].contracts, d("0.5"));
+    assert_eq!(owner.transition.context_at, Some(600));
+
+    let cancel::State::Requested(request) = owner.orders["LAST-OPEN"].cancel.clone() else {
+        panic!("tier revaluation must wait for its cancel effect")
+    };
+    owner
+        .effect_cancel(&cancel::EffectInput {
+            stamp: stamp("tier-cancel-effect", 601, 50),
+            effects: vec![(
+                request.detecting_event_id,
+                "LAST-OPEN".into(),
+                request.reason,
+            )],
+        })
+        .unwrap();
+    assert_eq!(owner.orders["LAST-OPEN"].facts.status, "CANCELED");
+    assert_eq!(owner.liquidation_ids().count(), 1);
+    assert!(!owner.positions.btc().unwrap().contains_key(&middle));
+    assert_eq!(owner.positions.btc().unwrap()[&first].contracts, d("0.5"));
+    assert_eq!(owner.transition.lifecycle, Lifecycle::RiskStable);
+    assert_eq!(owner.commit_sequence, 3);
+    assert_eq!(owner.fees, d("0.05"));
+}
+
+#[test]
+fn configured_activation_changed_subset_and_boundary_faults_are_atomic() {
+    for case in [
+        "missing",
+        "extra",
+        "duplicate",
+        "reordered",
+        "unchanged",
+        "wrong-version",
+        "wrong-boundary",
+        "mark-axis",
+        "tier-axis",
+        "missing-coverage",
+        "unsupported-scaling",
+    ] {
+        let (mut seed, mut products) = configured_tests::input(3);
+        seed.cash = d("1000");
+        configure_spec_change(&mut products[1], 600, "2");
+        if case == "unsupported-scaling" {
+            products[1].specs[1].contract_value = d("2");
+        }
+        if case == "tier-axis" {
+            configure_tier_change(&mut products[0], 600, "0.01");
+        }
+        if case == "mark-axis" || case == "missing-coverage" {
+            let mut old = products[0].marks[0].clone();
+            old.valid_to = if case == "missing-coverage" { 550 } else { 600 };
+            let new = Mark {
+                price: d("101"),
+                valid_from: if case == "missing-coverage" { 650 } else { 600 },
+                valid_to: 3000,
+                ..old.clone()
+            };
+            products[0].marks = vec![old, new];
+        }
+        let p0 = products[0].product.clone();
+        let p1 = products[1].product.clone();
+        let p2 = products[2].product.clone();
+        if case == "reordered" {
+            configure_spec_change(&mut products[0], 600, "4");
+            configure_spec_change(&mut products[2], 600, "3");
+        }
+        let tuple = |product: Product, old: &str, new: &str, boundary| {
+            (product, old.into(), new.into(), boundary)
+        };
+        let middle_change = tuple(
+            p1.clone(),
+            "scale-spec-v1",
+            "spec-v2",
+            if case == "wrong-boundary" { 599 } else { 600 },
+        );
+        let rows = match case {
+            "missing" | "missing-coverage" => vec![],
+            "extra" => vec![
+                middle_change,
+                tuple(p0.clone(), "scale-spec-v1", "spec-v2", 600),
+            ],
+            "duplicate" => vec![middle_change.clone(), middle_change],
+            "reordered" => vec![
+                tuple(p2.clone(), "scale-spec-v1", "spec-v2", 600),
+                tuple(p0.clone(), "scale-spec-v1", "spec-v2", 600),
+            ],
+            "unchanged" => vec![tuple(p0.clone(), "scale-spec-v1", "spec-v2", 600)],
+            "wrong-version" => vec![tuple(p1.clone(), "wrong-version", "spec-v2", 600)],
+            _ => vec![middle_change],
+        };
+        let mut owner = ScenarioAccount::from_configured(&seed, d("10"), products).unwrap();
+        let input = if case == "missing-coverage" {
+            Input {
+                account_key: owner.key.clone(),
+                stamp: stamp("configured-missing-coverage", 600, 10),
+                expected_before: owner.valuation_context_id,
+                expected_after: [0; 32],
+                rows: Rows::Specs(rows),
+            }
+        } else {
+            configured_activation(&owner, 600, Rows::Specs(rows))
+        };
+        let original = owner.clone();
+        let expected_fault = if case == "unsupported-scaling" {
+            "UNSUPPORTED_SPEC_MIGRATION"
+        } else {
+            "UNSUPPORTED_CONTEXT_TRANSITION"
+        };
+        assert_eq!(
+            owner.activate_context(&input),
+            Err(expected_fault),
+            "{case}"
+        );
+        assert_context_fault_has_no_draft_with(&owner, &original, expected_fault);
+    }
+}
+
+#[test]
+fn configured_tier_activation_rejects_concurrent_spec_or_mark_change() {
+    for other_axis in ["spec", "mark"] {
+        let (mut seed, mut products) = configured_tests::input(3);
+        seed.cash = d("1000");
+        configure_tier_change(&mut products[1], 600, "0.01");
+        if other_axis == "spec" {
+            configure_spec_change(&mut products[0], 600, "2");
+        } else {
+            let mut old = products[0].marks[0].clone();
+            old.valid_to = 600;
+            let new = Mark {
+                price: d("101"),
+                valid_from: 600,
+                valid_to: 3000,
+                ..old.clone()
+            };
+            products[0].marks = vec![old, new];
+        }
+        let middle = products[1].product.clone();
+        let mut owner = ScenarioAccount::from_configured(&seed, d("10"), products).unwrap();
+        let input = configured_activation(
+            &owner,
+            600,
+            Rows::Tiers(vec![(
+                middle,
+                "scale-tier-v1".into(),
+                "tier-v2".into(),
+                600,
+            )]),
+        );
+        let original = owner.clone();
+        assert_eq!(
+            owner.activate_context(&input),
+            Err("UNSUPPORTED_CONTEXT_TRANSITION"),
+            "{other_axis}"
+        );
+        assert_context_fault_has_no_draft(&owner, &original);
+    }
+}
+
+#[test]
+fn configured_tier_position_invalid_at_incoming_boundary_fails_before_swap() {
+    let (mut seed, mut products) = configured_tests::input(1);
+    seed.cash = d("1000");
+    let product = products[0].product.clone();
+    seed.positions = vec![configured_position(&product, "POSITION", "0.5", 0)];
+    configure_tier_change(&mut products[0], 600, "0.01");
+    products[0].tiers[1].tiers[0].maximum = d("0.25");
+    let mut owner = ScenarioAccount::from_configured(&seed, d("10"), products).unwrap();
+    let input = configured_activation(
+        &owner,
+        600,
+        Rows::Tiers(vec![(
+            product,
+            "scale-tier-v1".into(),
+            "tier-v2".into(),
+            600,
+        )]),
+    );
+    let original = owner.clone();
+    assert_eq!(owner.activate_context(&input), Err("INVALID_FIFO_POSITION"));
+    assert_context_fault_has_no_draft_with(&owner, &original, "INVALID_FIFO_POSITION");
 }

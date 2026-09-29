@@ -194,26 +194,26 @@ impl ScenarioAccount {
             return Err("UNSUPPORTED_CONTEXT_TRANSITION");
         }
         let mut migrations = Vec::new();
+        let mut configured_changes = Vec::new();
         let mut rows_before = Vec::new();
         let mut rows_after = Vec::new();
         for (index, product) in scenario.products().into_iter().enumerate() {
             let (old_spec, old_tier) = scenario.resolve(&product, old_at)?;
             let (spec, tier) = scenario.resolve(&product, at)?;
             if let Some(position) = self.positions.btc()?.get(&product) {
-                let (settlement_context, fee_policy) =
-                    if scenario.configured.is_some() && matches!(input.rows, Rows::Marks(_)) {
-                        (
-                            hypothetical_settlement::Context::Configured(
-                                scenario, &product, spec, tier, at,
-                            ),
-                            hypothetical_settlement::configured_fee_policy(scenario, &product)?,
-                        )
-                    } else {
-                        (
-                            (scenario, spec).into(),
-                            hypothetical_settlement::FeePolicy::BtcEthTradingTaker,
-                        )
-                    };
+                let (settlement_context, fee_policy) = if scenario.configured.is_some() {
+                    (
+                        hypothetical_settlement::Context::Configured(
+                            scenario, &product, spec, tier, at,
+                        ),
+                        hypothetical_settlement::configured_fee_policy(scenario, &product)?,
+                    )
+                } else {
+                    (
+                        (scenario, spec).into(),
+                        hypothetical_settlement::FeePolicy::BtcEthTradingTaker,
+                    )
+                };
                 hypothetical_settlement::validate_existing(
                     position,
                     settlement_context,
@@ -247,11 +247,18 @@ impl ScenarioAccount {
                     }
                 }
                 Rows::Specs(rows) | Rows::Tiers(rows) => {
-                    if rows.len() != 2 || old_mark != mark {
+                    let configured = scenario.configured.is_some();
+                    if (!configured && rows.len() != 2) || old_mark != mark {
                         return Err("UNSUPPORTED_CONTEXT_TRANSITION");
                     }
                     let expected = if matches!(input.rows, Rows::Specs(_)) {
-                        if old_tier != tier || old_spec == spec {
+                        if old_tier != tier {
+                            return Err("UNSUPPORTED_CONTEXT_TRANSITION");
+                        }
+                        if old_spec == spec {
+                            if configured {
+                                continue;
+                            }
                             return Err("UNSUPPORTED_CONTEXT_TRANSITION");
                         }
                         if (
@@ -280,7 +287,13 @@ impl ScenarioAccount {
                             spec.interval.from,
                         )
                     } else {
-                        if old_spec != spec || old_tier == tier {
+                        if old_spec != spec {
+                            return Err("UNSUPPORTED_CONTEXT_TRANSITION");
+                        }
+                        if old_tier == tier {
+                            if configured {
+                                continue;
+                            }
                             return Err("UNSUPPORTED_CONTEXT_TRANSITION");
                         }
                         (
@@ -290,11 +303,24 @@ impl ScenarioAccount {
                             tier.interval.from,
                         )
                     };
-                    if rows.get(index) != Some(&expected) || expected.3 != at {
+                    if expected.3 != at || (!configured && rows.get(index) != Some(&expected)) {
                         return Err("UNSUPPORTED_CONTEXT_TRANSITION");
+                    }
+                    if configured {
+                        configured_changes.push(expected);
                     }
                 }
             }
+        }
+        if scenario.configured.is_some()
+            && match &input.rows {
+                Rows::Specs(rows) | Rows::Tiers(rows) => {
+                    configured_changes.is_empty() || rows != &configured_changes
+                }
+                Rows::Marks(_) => false,
+            }
+        {
+            return Err("UNSUPPORTED_CONTEXT_TRANSITION");
         }
         let before = self.reservation()?;
         let mut draft = self.clone();
