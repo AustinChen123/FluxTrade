@@ -1,6 +1,7 @@
 use super::super::super::tests::{d, fixture};
 use super::super::tests::fixture_candidate;
 use super::*;
+mod configured_fee;
 
 pub(in super::super::super) fn at(mut input: ExecutionCandidate, at: i64) -> ExecutionCandidate {
     input.template.matching_effective_at = at;
@@ -364,7 +365,7 @@ fn configured_execution_uses_product_owned_specs_for_fifo_and_duplicates() {
 }
 
 #[test]
-fn configured_settlement_mismatches_and_invalid_domains_publish_no_financial_state() {
+fn configured_settlement_invalid_origin_leverage_and_tiers_publish_no_financial_state() {
     let (mut seed, mut products) = super::super::super::configured_tests::input(2);
     let product = products[0].product.clone();
     let prototype = fixture().0.orders[0].clone();
@@ -376,13 +377,10 @@ fn configured_settlement_mismatches_and_invalid_domains_publish_no_financial_sta
         "100",
         "1",
     )];
-    products[1].taker_fee = d("0.001");
     products[1].specs[0].version = "foreign-spec".into();
     let expected = [
         "INVALID_LOT_ORIGIN_SPEC",
         "INVALID_LOT_ORIGIN_SPEC",
-        "UNSUPPORTED_CONFIGURED_SETTLEMENT",
-        "UNSUPPORTED_CONFIGURED_SETTLEMENT",
         "UNSUPPORTED_CONFIGURED_SETTLEMENT",
         "UNSUPPORTED_POSITION_TIER",
         "UNSUPPORTED_POSITION_TIER",
@@ -392,10 +390,8 @@ fn configured_settlement_mismatches_and_invalid_domains_publish_no_financial_sta
         let mut leverage = d("10");
         match index {
             2 => leverage = d("5"),
-            3 => rows[0].taker_fee = d("0.002"),
-            4 => rows[1].taker_fee = d("0.002"),
-            5 => rows[0].tiers[0].tiers[0].maximum = d("0.75"),
-            6 => {
+            3 => rows[0].tiers[0].tiers[0].maximum = d("0.75"),
+            4 => {
                 rows[0].tiers[0].interval.to = Some(501);
                 rows[0].tiers[0].tiers[0].maximum = d("0.75");
                 let mut future = rows[0].tiers[0].clone();
@@ -410,23 +406,12 @@ fn configured_settlement_mismatches_and_invalid_domains_publish_no_financial_sta
             }
             _ => {}
         }
-        let mut case_seed = seed.clone();
-        if index == 4 {
-            let other = configured_order(
-                &fixture().0.orders[0],
-                "OTHER",
-                &products[1].product,
-                Side::Long,
-                "100",
-                "0.5",
-            );
-            case_seed.orders.push(other);
-        }
+        let case_seed = seed.clone();
         let mut owner = ScenarioAccount::from_configured(&case_seed, leverage, rows).unwrap();
         match index {
             0 => configured_position(&mut owner, &product, "unknown-spec"),
             1 => configured_position(&mut owner, &product, "foreign-spec"),
-            5 | 6 => configured_position(&mut owner, &product, "scale-spec-v1"),
+            3 | 4 => configured_position(&mut owner, &product, "scale-spec-v1"),
             _ => {}
         }
         let mut candidate = input(&owner, "L", &format!("BAD-{index}"), "0.5", "100");

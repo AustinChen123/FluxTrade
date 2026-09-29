@@ -109,11 +109,8 @@ pub(super) fn calculate(
                 }
             };
             let loss = mul(base, difference.max(Decimal::ZERO))?;
-            let fee = hypothetical_settlement::fee_amount(
-                base,
-                order.price,
-                hypothetical_settlement::FeePolicy::BtcEthTradingTaker,
-            )?;
+            let fee_policy = hypothetical_settlement::configured_fee_policy(scenario, &product)?;
+            let fee = hypothetical_settlement::fee_amount(base, order.price, fee_policy)?;
             snapshot.total_order_loss = add(snapshot.total_order_loss, loss)?;
             snapshot.total_fee_hold = add(snapshot.total_fee_hold, fee)?;
             snapshot.orders.push(OrderReservation {

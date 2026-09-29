@@ -22,6 +22,7 @@ pub(super) struct Draft {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum FeePolicy {
     BtcEthTradingTaker,
+    ConfiguredTaker(Decimal),
     GoldenCancelTradingTaker,
     P1O03Zero,
     SyntheticLiquidation,
@@ -31,10 +32,25 @@ impl FeePolicy {
     pub(super) fn rate(self) -> Decimal {
         match self {
             Self::BtcEthTradingTaker => Decimal::new(1, 3),
+            Self::ConfiguredTaker(rate) => rate,
             Self::GoldenCancelTradingTaker => Decimal::new(1, 2),
             Self::P1O03Zero => Decimal::ZERO,
             Self::SyntheticLiquidation => Decimal::new(602, 5),
         }
+    }
+}
+
+pub(super) fn configured_fee_policy(
+    scenario: &FrozenScenario,
+    product: &Product,
+) -> Result<FeePolicy, Fault> {
+    match &scenario.configured {
+        None => Ok(FeePolicy::BtcEthTradingTaker),
+        Some(rows) => rows
+            .iter()
+            .find(|row| row.product == *product)
+            .map(|row| FeePolicy::ConfiguredTaker(row.taker_fee))
+            .ok_or("UNSUPPORTED_CONFIGURED_SETTLEMENT"),
     }
 }
 

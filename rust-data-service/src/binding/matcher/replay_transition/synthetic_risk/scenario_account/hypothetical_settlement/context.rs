@@ -52,12 +52,24 @@ impl<'a> Context<'a> {
                 Ok(Self::btc(spec))
             }
             Self::Configured(scenario, product, spec, tier) => {
+                let configured_fee = scenario
+                    .configured
+                    .as_ref()
+                    .and_then(|rows| rows.iter().find(|row| row.product == *product))
+                    .map(|row| row.taker_fee)
+                    .ok_or("UNSUPPORTED_CONFIGURED_SETTLEMENT")?;
                 if scenario.leverage != Decimal::TEN
-                    || scenario.configured.as_ref().is_none_or(|rows| {
+                    || scenario
+                        .configured
+                        .as_ref()
+                        .is_none_or(|rows| rows.iter().any(|row| row.taker_fee < Decimal::ZERO))
+                    || !matches!(fee, FeePolicy::BtcEthTradingTaker)
+                        && fee != FeePolicy::ConfiguredTaker(configured_fee)
+                    || !scenario.configured.as_ref().is_some_and(|rows| {
                         rows.iter().any(|row| {
-                            row.taker_fee != Decimal::new(1, 3)
-                                || (row.product == *product
-                                    && (!row.specs.contains(spec) || !row.tiers.contains(tier)))
+                            row.product == *product
+                                && row.specs.contains(spec)
+                                && row.tiers.contains(tier)
                         })
                     })
                 {

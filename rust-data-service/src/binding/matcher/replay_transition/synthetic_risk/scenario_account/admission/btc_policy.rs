@@ -84,14 +84,20 @@ pub(super) fn evaluate(
         return Ok((evidence, None));
     }
     if role == Role::RiskReducing {
-        let (spec, _) = scenario.resolve(product, input.effective_at)?;
+        let (spec, tier) = scenario.resolve(product, input.effective_at)?;
+        let context = if scenario.configured.is_some() {
+            hypothetical_settlement::Context::Configured(scenario, product, spec, tier)
+        } else {
+            hypothetical_settlement::Context::BtcEth(scenario, spec)
+        };
+        let fee_policy = hypothetical_settlement::configured_fee_policy(scenario, product)?;
         let settlement = hypothetical_settlement::calculate(
             position,
             intent.side,
             intent.quantity,
             price,
-            (scenario, spec),
-            hypothetical_settlement::FeePolicy::BtcEthTradingTaker,
+            context,
+            fee_policy,
             None,
         )?;
         let mut stress_input = input;

@@ -193,13 +193,14 @@ impl ScenarioAccount {
                 } else {
                     hypothetical_settlement::Context::BtcEth(scenario, spec)
                 };
+                let fee_policy = hypothetical_settlement::configured_fee_policy(scenario, product)?;
                 let settled = hypothetical_settlement::calculate(
                     position_before.as_ref(),
                     template.side,
                     template.quantity,
                     template.price,
                     context,
-                    hypothetical_settlement::FeePolicy::BtcEthTradingTaker,
+                    fee_policy,
                     opening.as_ref(),
                 )?;
                 (

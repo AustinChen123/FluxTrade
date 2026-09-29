@@ -1,5 +1,6 @@
 use super::super::super::tests::{d, fixture};
 use super::*;
+mod configured_fee;
 
 #[test]
 fn a04_causal_mark_admission_shortfall_request_effect_versions() {
