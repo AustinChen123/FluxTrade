@@ -315,10 +315,24 @@ def _invoke_configured(root, run_id="p2", select=None):
     return run._invoke(str(root), run_id, "SPIDER_P2_CONFIGURED_SCALE_V1", select or run._plans.plan_bundle)
 
 
-def test_configured_runner_persists_exact_forty_barriers_then_stops_at_projection_gate(tmp_path, monkeypatch):
+def test_configured_runner_projects_finalizes_and_admits_exact_forty_barriers(tmp_path, monkeypatch):
     owners, captures = [], []
+    finalizes, admissions = [], []
     policy_calls = dict(orders=0, order_filled=0, raise_leverage=0, check_risk=0)
     original = run._ReplayComposition
+    original_finalize = storage.SpiderRunStore.finalize
+    original_admit = run._admit
+    def finalize(store, **artifacts):
+        finalizes.append(deepcopy(artifacts))
+        return original_finalize(store, **artifacts)
+    def admit(path):
+        before = {item.name: item.read_bytes() for item in path.iterdir() if item.is_file()}
+        result = original_admit(path)
+        after = {item.name: item.read_bytes() for item in path.iterdir() if item.is_file()}
+        admissions.append((result, before, after))
+        return result
+    monkeypatch.setattr(storage.SpiderRunStore, "finalize", finalize)
+    monkeypatch.setattr(run, "_admit", admit)
     def observe(*args, **kwargs):
         attempt = read(tmp_path, "p2", "attempt.json")[0]
         assert read(tmp_path, "p2", "status.json")[0]["state"] == "RUNNING"
@@ -345,7 +359,7 @@ def test_configured_runner_persists_exact_forty_barriers_then_stops_at_projectio
         return owner
     monkeypatch.setattr(run, "_ReplayComposition", observe)
     result = _invoke_configured(tmp_path)
-    assert result == dict(run_id="p2", outcome="FAILED", reason="ENDPOINT_RECONCILIATION_FAILED")
+    assert result == dict(run_id="p2", outcome="ADMITTED", reason=None)
     plan = scale._configured_scale_plan_input()
     attempt = read(tmp_path, "p2", "attempt.json")[0]
     status = read(tmp_path, "p2", "status.json")[0]
@@ -384,8 +398,70 @@ def test_configured_runner_persists_exact_forty_barriers_then_stops_at_projectio
         (12, 13), (13, 14), (14, 15), (15, 16), (16, 17)]
     assert [row["effective_at"] for row in rows[20:29:3]] == [100010, 100012, 100014]
     assert [row["effective_at"] for row in rows[31:40:3]] == [100020, 100022, 100024]
-    assert (status["processed_boundary"]["ordinal"], status["persisted_boundary"]["ordinal"], status["failure_reason"]) == (40, 40, "ENDPOINT_RECONCILIATION_FAILED")
-    assert not any((tmp_path / "p2" / name).exists() for name in ("endpoint.json", "reconciliation.json", "report.jsonl", "completion.json"))
+    assert (status["state"], status["processed_boundary"]["ordinal"], status["persisted_boundary"]["ordinal"], status["failure_reason"]) == ("COMPLETE", 40, 40, None)
+    assert all((tmp_path / "p2" / name).exists() for name in ("endpoint.json", "reconciliation.json", "report.jsonl", "completion.json"))
+    endpoint = read(tmp_path, "p2", "endpoint.json")[0]
+    reconciliation = read(tmp_path, "p2", "reconciliation.json")[0]
+    report = read(tmp_path, "p2", "report.jsonl")
+    completion = read(tmp_path, "p2", "completion.json")[0]
+    assert endpoint["cutoff"] == dict(scheduler_time=100024, persisted_boundary=status["persisted_boundary"])
+    assert endpoint["remaining_planned_barriers"] == []
+    assert endpoint["scheduler_observation"]["gate"] == "RUNNING"
+    assert endpoint["scheduler_observation"]["terminal"] is None
+    assert endpoint["scheduler_observation"]["pending_keys"] == []
+    assert endpoint["scheduler_observation"]["callback_actions"] == []
+    assert endpoint["scheduler_observation"]["last_popped"] == plan["planned_barriers"][-1]["scheduler_key"]
+    assert [(poll["poll_id"], poll["status"]) for poll in endpoint["scheduler_observation"]["polls"]] == [("Q1", "COMPLETED"), ("Q2", "COMPLETED")]
+    oracle = scale._configured_scale_projection_oracle()
+    assert scale._PROJECTION_ORACLE_SHA256 == "7154053ff5f233362ecf0bf6f64bf9757bdc76807b748f6e0b063280031641a3"
+    fills = [(Decimal("0.5"), Decimal("100"))] * 3
+    fees = sum((quantity * price * Decimal("0.001") for quantity, price in fills), Decimal("0"))
+    cash = Decimal("121.2") - fees
+    unrealized = Decimal("0.5") * (Decimal("100") - Decimal("100")) + Decimal("1") * (Decimal("100") - Decimal("100"))
+    assert (fees, cash, cash + unrealized, Decimal(oracle["gross_realized"])) == (
+        Decimal(oracle["total_fees"]), Decimal(oracle["cash"]), Decimal(oracle["equity"]), Decimal("0"))
+    positions = [row for row in report if Decimal(row["position_contracts"]) != 0]
+    live_orders = [order for row in report for order in row["open_orders"]]
+    position_margin = sum((Decimal(row["notional_usd"]) / Decimal("10") for row in positions), Decimal("0"))
+    order_margin = sum((Decimal(order["limit_price"]) * Decimal(order["original_size_contracts"]) / Decimal("10")
+                        for order in live_orders), Decimal("0"))
+    order_fee_holds = sum((Decimal(order["limit_price"]) * Decimal(order["original_size_contracts"]) * Decimal("0.001")
+                           for order in live_orders), Decimal("0"))
+    independently_available = cash + unrealized - position_margin - order_margin - order_fee_holds
+    assert (len(positions), len(live_orders), position_margin, order_margin, order_fee_holds, independently_available) == (
+        2, 10, Decimal("15"), Decimal("100"), Decimal("1"), Decimal("5.05"))
+    assert independently_available == Decimal(report[0]["account_available_equity"])
+    assert [row["product_id"] for row in report] == plan["products"]
+    assert all(row["configuration_context"] == attempt["configuration_context"] for row in report)
+    assert all((row["account_cash"], row["account_equity"], row["account_available_equity"],
+                row["account_gross_realized"], row["account_total_fees"]) ==
+               (oracle["cash"], oracle["equity"], oracle["available_equity"], oracle["gross_realized"], oracle["total_fees"])
+               for row in report)
+    assert [(row["product_id"], row["position_contracts"], row["mark_price"], row["notional_usd"], row["committed_execution_refs"])
+            for row in report] == [(row["product_id"], row["position_contracts"], row["mark_price"], row["notional_usd"], row["committed_execution_refs"])
+                                   for row in oracle["products"]]
+    source_by_event = {member["stamp"]["event_id"]: row["payload"]["result"]["committed_references"]
+                       for row in rows if row["record_kind"] == "SOURCE_GROUP_RESULT"
+                       for member in row["payload"]["request"]["members"]}
+    assert all({"namespace": "SOURCE", "fact_id": reference.removeprefix("SOURCE:")} in
+               source_by_event.get(reference.removeprefix("SOURCE:"), [])
+               for item in oracle["products"] for reference in item["committed_execution_refs"])
+    assert all(row["source_evidence_refs"] == [*[f"journal:{ordinal}" for ordinal in oracle_row["evidence_ordinals"]],
+                                                "artifact:endpoint.json#/final_owner_evidence"]
+               for row, oracle_row in zip(report, oracle["products"], strict=True))
+    for row, oracle_row in zip(report, oracle["products"], strict=True):
+        assert len(row["open_orders"]) == (0 if oracle_row["client_order_id"] is None else 1)
+        if oracle_row["client_order_id"] is not None:
+            order = row["open_orders"][0]
+            assert (order["client_order_id"], order["product_id"], order["side"], order["state"], order["limit_price"],
+                    order["original_size_contracts"], order["cumulative_filled_size_contracts"]) == (
+                oracle_row["client_order_id"], oracle_row["product_id"], "buy", "live", "100", "1", "0")
+    assert reconciliation["result"] == "OK" and all(check["result"] == "OK" for check in reconciliation["checks"])
+    assert len(reconciliation["checks"]) == 11
+    assert completion["state"] == "COMPLETE" and completion["configuration_context"] == attempt["configuration_context"]
+    assert len(finalizes) == len(admissions) == 1
+    assert finalizes[0]["reconciliation"]["result"] == "OK"
+    assert admissions[0][0]["decision"] == "ACCEPT" and admissions[0][1] == admissions[0][2]
     assert len(owners) == 1
     assert len(run._PROGRAM) == 17
     records = [(name.encode(), sha256((run._ROOT / name).read_bytes()).digest())
@@ -414,12 +490,20 @@ def test_configured_runner_persists_exact_forty_barriers_then_stops_at_projectio
 def test_configured_journal_is_run_id_independent_and_rejected_input_never_constructs(tmp_path, monkeypatch):
     first = _invoke_configured(tmp_path, "p2a")
     second = _invoke_configured(tmp_path, "p2b")
-    assert first["reason"] == second["reason"] == "ENDPOINT_RECONCILIATION_FAILED"
-    left, right = read(tmp_path, "p2a", "journal.jsonl"), read(tmp_path, "p2b", "journal.jsonl")
-    for rows in (left, right):
-        for row in rows:
-            row.pop("run_id")
-    assert left == right
+    assert first == dict(run_id="p2a", outcome="ADMITTED", reason=None)
+    assert second == dict(run_id="p2b", outcome="ADMITTED", reason=None)
+    def normalized(value, path=()):
+        if isinstance(value, dict):
+            return {key: normalized(item, (*path, key)) for key, item in value.items()
+                    if key not in {"run_id", "report_sha256", "endpoint_state_digest", "reconciliation_digest"}
+                    and not (key == "sha256" and "artifacts" in path)}
+        if isinstance(value, list):
+            return [normalized(item, path) for item in value]
+        return value
+    for artifact in ("journal.jsonl", "endpoint.json", "reconciliation.json", "report.jsonl", "completion.json"):
+        left = read(tmp_path, "p2a", artifact)
+        right = read(tmp_path, "p2b", artifact)
+        assert normalized(left) == normalized(right)
     original = run._plans.plan_bundle
     def changed(selector):
         plan = cast(dict[str, Any], original(selector))
@@ -431,6 +515,27 @@ def test_configured_journal_is_run_id_independent_and_rejected_input_never_const
     rejected = read(tmp_path, "bad", "attempt.json")[0]
     assert rejected["run_contract_id"] == "SPIDER_SYNTHETIC_P2_CONFIGURED_RUN_V1"
     assert rejected["registration_state"] == "REJECTED" and "configuration_context" not in rejected
+
+
+def test_configured_failed_projection_never_finalizes_or_admits(tmp_path, monkeypatch):
+    finalize_calls, admission_calls = [], []
+    original_build = run._build
+    def failed_projection(*args, **kwargs):
+        projected = original_build(*args, **kwargs)
+        projected["reconciliation"]["checks"][0]["result"] = "FAILED"
+        projected["reconciliation"]["result"] = "FAILED"
+        return projected
+    monkeypatch.setattr(run, "_build", failed_projection)
+    monkeypatch.setattr(storage.SpiderRunStore, "finalize", lambda *args, **kwargs: finalize_calls.append(args))
+    monkeypatch.setattr(run, "_admit", lambda *_: admission_calls.append(True))
+    assert _invoke_configured(tmp_path) == dict(
+        run_id="p2", outcome="FAILED", reason="ENDPOINT_RECONCILIATION_FAILED")
+    status = read(tmp_path, "p2", "status.json")[0]
+    assert status["state"] == "FAILED" and status["failure_reason"] == "ENDPOINT_RECONCILIATION_FAILED"
+    assert status["processed_boundary"]["ordinal"] == status["persisted_boundary"]["ordinal"] == 40
+    assert finalize_calls == admission_calls == []
+    assert not any((tmp_path / "p2" / name).exists() for name in (
+        "endpoint.json", "reconciliation.json", "report.jsonl", "completion.json"))
 
 
 def test_configured_recipe_kind_and_configuration_mutations_reject_before_owner(tmp_path, monkeypatch):

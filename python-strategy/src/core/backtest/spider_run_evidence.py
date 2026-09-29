@@ -14,12 +14,15 @@ from src.core.backtest.spider_run_artifacts import (
 from src.core.backtest.spider_run_completion_schema import report as _validate_report
 from src.core.backtest.spider_run_envelope_schema import endpoint as _validate_endpoint
 from src.core.backtest.spider_run_reconciliation_schema import _CHECKS, reconciliation as _validate
+from src.core.backtest.spider_configured_scale_input import _configured_scale_projection_oracle
 from src.core.backtest.spider_scenario_plans import plan_bundle as _plan_bundle
 
 _INITIAL = "artifact:endpoint.json#/initial_owner_evidence"
 _FINAL = "artifact:endpoint.json#/final_owner_evidence"
 _P1_RUN_CONTRACT = "SPIDER_SYNTHETIC_P1_RUN_V1"
 _P2_RUN_CONTRACT = "SPIDER_SYNTHETIC_P2_CONFIGURED_RUN_V1"
+_P2_SELECTOR = "SPIDER_P2_CONFIGURED_SCALE_V1"
+_P2_PLAN_SHA256 = "8235c952a5d199825a2a77842b03f49e213ef707c0f30b24d8bf623fde53c2b3"
 
 
 class ReconciliationProjectionError(ValueError):
@@ -114,6 +117,301 @@ def _report(rows: list[dict[str, _Any]]) -> dict[str, _Any]:
     return dict(report_rows=rows, report_sha256=_sha256(_bytes(rows)).hexdigest())
 
 
+def _configured_order_matches(orders: list[dict[str, _Any]], oracle_rows: list[dict[str, _Any]]) -> bool:
+    expected = [row for row in oracle_rows if row["client_order_id"] is not None]
+    if len(orders) != len(expected):
+        return False
+    by_client = {row["client_order_id"]: row for row in orders}
+    if len(by_client) != len(orders):
+        return False
+    return all(
+        (actual := by_client.get(item["client_order_id"])) is not None
+        and actual["product_id"] == item["product_id"]
+        and actual["side"] == "buy"
+        and actual["state"] == "live"
+        and actual["created_at"] == item["created_at"]
+        and actual["limit_price"] == "100"
+        and actual["original_size_contracts"] == "1"
+        and actual["cumulative_filled_size_contracts"] == "0"
+        and type(actual["order_id"]) is str
+        and bool(actual["order_id"])
+        for item in expected
+    )
+
+
+def _configured_report(run_id: str, terminal: str, context: _ConfigurationContext,
+                       final: dict[str, _Any], oracle: dict[str, _Any], *, expected: bool = False) -> list[dict[str, _Any]]:
+    inspection = final["inspection"]
+    trading = final["trading_fact"]["immutable_payload"]
+    positions = _required(final["positions_fact"]["immutable_payload"], "rows")
+    orders = _required(final["open_orders_fact"]["immutable_payload"], "rows")
+    rows = []
+    for template in oracle["products"]:
+        product = template["product_id"]
+        position = next((row for row in positions if row["product_id"] == product), None)
+        refs = [f"journal:{ordinal}" for ordinal in template["evidence_ordinals"]]
+        refs.append(_FINAL)
+        rows.append(dict(
+            schema_version="spider_product_report_v1", run_id=run_id, product_id=product,
+            terminal_reason=terminal,
+            position_contracts=template["position_contracts"] if expected else _required(position, "position_contracts") if position is not None else "0",
+            mark_price=template["mark_price"] if expected else _required(position, "last_price") if position is not None else None,
+            notional_usd=template["notional_usd"] if expected else _required(position, "notional_usd") if position is not None else "0",
+            open_orders=[row for row in orders if row["product_id"] == product],
+            committed_execution_refs=template["committed_execution_refs"],
+            source_evidence_refs=refs,
+            account_cash=oracle["cash"] if expected else _required(inspection, "cash"),
+            account_equity=oracle["equity"] if expected else _required(trading, "equity"),
+            account_available_equity=oracle["available_equity"] if expected else _required(trading, "available_equity"),
+            account_gross_realized=oracle["gross_realized"] if expected else _required(inspection, "gross_realized"),
+            account_total_fees=oracle["total_fees"] if expected else _required(inspection, "total_fees"),
+            configuration_context=_configuration_context(context),
+        ))
+    return rows
+
+
+def _configured_digest_vectors(journal: list[dict[str, _Any]], endpoint: dict[str, _Any]) -> tuple[list[dict[str, _Any]], list[dict[str, _Any]]]:
+    initial = endpoint["initial_owner_evidence"]
+    expected, observed = [], []
+    previous = initial["inspection"]["owner_state_digest"]
+    expected.append(dict(barrier_id="INITIAL", expected_owner_sha256=previous, observed_owner_sha256=previous))
+    observed.append(dict(barrier_id="INITIAL", expected_owner_sha256=previous, observed_owner_sha256=previous))
+    for row in journal:
+        if row["record_kind"] != "SOURCE_GROUP_RESULT":
+            continue
+        payload = row["payload"]
+        before = payload["owner_evidence_before"]["inspection"]["owner_state_digest"]
+        after = payload["owner_evidence_after"]["inspection"]["owner_state_digest"]
+        result_digest = payload["result"]["owner_state_digest"]
+        for phase, wanted, actual in (("BEFORE", previous, before), ("AFTER", result_digest, after)):
+            stage = row["barrier_id"] + ":" + phase
+            expected.append(dict(barrier_id=stage, expected_owner_sha256=wanted, observed_owner_sha256=wanted))
+            observed.append(dict(barrier_id=stage, expected_owner_sha256=wanted, observed_owner_sha256=actual))
+        previous = after
+    final = endpoint["final_owner_evidence"]["inspection"]["owner_state_digest"]
+    expected.append(dict(barrier_id="FINAL", expected_owner_sha256=previous, observed_owner_sha256=previous))
+    observed.append(dict(barrier_id="FINAL", expected_owner_sha256=previous, observed_owner_sha256=final))
+    return expected, observed
+
+
+def _configured_reconciliation(run_id: str, attempt: dict[str, _Any], status: dict[str, _Any],
+                               journal: list[dict[str, _Any]], endpoint: dict[str, _Any],
+                               report: list[dict[str, _Any]], frozen: dict[str, _Any],
+                               context: _ConfigurationContext) -> dict[str, _Any]:
+    plan = frozen
+    oracle = _configured_scale_projection_oracle()
+    barriers = plan["planned_barriers"]
+    if len(journal) != len(barriers) or len(report) != len(plan["products"]):
+        raise ReconciliationProjectionError()
+    coverage = [dict(ordinal=row["ordinal"], barrier_id=row["barrier_id"], record_kind=row["record_kind"]) for row in barriers]
+    observed_coverage = _coverage(journal)
+    last = barriers[-1]
+    boundary = dict(ordinal=last["ordinal"], barrier_id=last["barrier_id"], journal_seq=last["ordinal"])
+    processed = _required(status, "processed_boundary")
+    persisted = _required(status, "persisted_boundary")
+    observed_barriers = [dict(ordinal=row["journal_seq"], barrier_id=row["barrier_id"],
+                              record_kind=row["record_kind"], journal_seq=row["journal_seq"]) for row in journal]
+    expected_barriers = [dict(ordinal=row["ordinal"], barrier_id=row["barrier_id"],
+                              record_kind=row["record_kind"], journal_seq=row["ordinal"]) for row in barriers]
+    barrier_metadata_matches = all(
+        row["journal_seq"] == expected["ordinal"]
+        and row["barrier_id"] == expected["barrier_id"]
+        and row["record_kind"] == expected["record_kind"]
+        and row["scheduler_key"] == expected["scheduler_key"]
+        and row["causal_parent_ids"] == expected["causal_parent_ids"]
+        for row, expected in zip(journal, barriers, strict=True)
+    )
+    initial = endpoint["initial_owner_evidence"]
+    final = endpoint["final_owner_evidence"]
+    sites = [("INITIAL", _INITIAL, initial)]
+    for index, row in enumerate(journal):
+        if row["record_kind"] == "SOURCE_GROUP_RESULT":
+            payload = row["payload"]
+            sites.extend((
+                (row["barrier_id"] + ":BEFORE", f"artifact:journal.jsonl#/{index}/payload/owner_evidence_before", payload["owner_evidence_before"]),
+                (row["barrier_id"] + ":AFTER", f"artifact:journal.jsonl#/{index}/payload/owner_evidence_after", payload["owner_evidence_after"]),
+            ))
+    sites.append(("FINAL", _FINAL, final))
+    observed_identity = [dict(evidence_ref=ref, **{key: owner["inspection"][key] for key in ("account_key", "profile_id", "config_id")})
+                         for _, ref, owner in sites]
+    expected_identity = [dict(evidence_ref=ref, account_key=plan["account_key"], profile_id=plan["native_profile"], config_id=context.config_id)
+                         for _, ref, _ in sites]
+    expected_digests, observed_digests = _configured_digest_vectors(journal, endpoint)
+    observation = endpoint["scheduler_observation"]
+    source_rows = [row for row in journal if row["record_kind"] == "SOURCE_GROUP_RESULT"]
+    expected_records = []
+    for step in plan["recipe"]:
+        if step["kind"] == "SOURCE_GROUP":
+            group = step["group"]
+            expected_records.append(dict(kind="SOURCE_GROUP", stable_id=group["group_id"], classification="SUCCESS",
+                key=dict(visible_at=step["at"], queue_class="SOURCE_GROUP", schedule_sequence=step["schedule_sequence"], stable_id=group["group_id"])))
+    delivery_ids = [row["delivery_id"] for row in plan["callback_plans"]]
+    delivery_count = sum(step["kind"] == "DELIVERY" for step in plan["recipe"])
+    expected_delivery_ids = delivery_ids[:delivery_count]
+    delivery_index = 0
+    for step in plan["recipe"]:
+        if step["kind"] == "DELIVERY":
+            delivery_id = expected_delivery_ids[delivery_index]
+            delivery_index += 1
+            expected_records.append(dict(kind="DELIVERY", stable_id=delivery_id, classification="SUCCESS",
+                key=dict(visible_at=step["projection"]["visible_at"], queue_class="DELIVERY",
+                         schedule_sequence=step["projection"]["schedule_sequence"], stable_id=delivery_id)))
+    snapshot_sequence = 0
+    for step in plan["recipe"]:
+        if step["kind"] != "POLL_BEGIN":
+            continue
+        for name in ("trading", "positions", "open_orders"):
+            request = step["plan"][name]["snapshot_request"]
+            expected_records.append(dict(kind="SNAPSHOT_CAPTURE", stable_id=request["snapshot_id"], classification="SUCCESS",
+                key=dict(visible_at=request["captured_at"], queue_class="SNAPSHOT_CAPTURE", schedule_sequence=snapshot_sequence,
+                         stable_id=request["snapshot_id"])))
+            delivery_id = delivery_ids[delivery_count + snapshot_sequence]
+            expected_records.append(dict(kind="DELIVERY", stable_id=delivery_id, classification="SUCCESS",
+                key=dict(visible_at=request["captured_at"], queue_class="DELIVERY", schedule_sequence=snapshot_sequence,
+                         stable_id=delivery_id)))
+            snapshot_sequence += 1
+    queue_order = {"SOURCE_GROUP": 0, "SNAPSHOT_CAPTURE": 1, "DELIVERY": 2}
+    expected_records.sort(key=lambda row: (queue_order[row["key"]["queue_class"]], row["key"]["stable_id"]))
+    observed_records = observation["records"]
+    records_match = len(observed_records) == len(expected_records) and _equal(expected_records, observed_records)
+    source_exec_expected = []
+    for step in plan["recipe"]:
+        if step["kind"] != "SOURCE_GROUP":
+            continue
+        group = step["group"]
+        for member in group["members"]:
+            if member["kind"] == "EXECUTION":
+                event_id = member["stamp"]["event_id"]
+                source_exec_expected.append(dict(group_id=group["group_id"], event_id=event_id, kind="EXECUTION",
+                    product_id=member["payload"]["product_id"], committed_references=[dict(namespace="SOURCE", fact_id=event_id)]))
+    source_exec_observed = []
+    for row in source_rows:
+        request, result = row["payload"]["request"], row["payload"]["result"]
+        for member in request["members"]:
+            if member["kind"] == "EXECUTION":
+                source_exec_observed.append(dict(group_id=request["group_id"], event_id=member["stamp"]["event_id"],
+                    kind=member["kind"], product_id=member["payload"].get("product_id"),
+                    committed_references=result["committed_references"]))
+    execution_sources_match = _equal(source_exec_expected, source_exec_observed)
+    snapshots_match = attempt["account_key"] == plan["account_key"]
+    for _, _, owner in sites:
+        snapshots_match = snapshots_match and owner["inspection"]["account_key"] == plan["account_key"]
+        for kind in ("trading", "positions", "open_orders"):
+            request, fact = owner[kind + "_request"], owner[kind + "_fact"]
+            snapshots_match = snapshots_match and request["account_key"] == plan["account_key"]
+            snapshots_match = snapshots_match and fact["reference"] == dict(namespace="SNAPSHOT", fact_id=request["snapshot_id"])
+            snapshots_match = snapshots_match and fact["snapshot_kind"] == request["snapshot_kind"]
+            snapshots_match = snapshots_match and fact["snapshot_as_of"] == request["captured_at"]
+    previous_version = initial["inspection"]["account_version"]
+    source_versions_match = True
+    for row in source_rows:
+        payload = row["payload"]
+        result = payload["result"]
+        before = row["account_version_before"]
+        after = row["account_version_after"]
+        owner_before = payload["owner_evidence_before"]["inspection"]["account_version"]
+        owner_after = payload["owner_evidence_after"]["inspection"]["account_version"]
+        source_versions_match = source_versions_match and before == previous_version
+        source_versions_match = source_versions_match and result["account_version_before"] == before
+        source_versions_match = source_versions_match and result["account_version_after"] == after
+        source_versions_match = source_versions_match and owner_before == before and owner_after == after
+        previous_version = after
+    source_versions_match = source_versions_match and previous_version == final["inspection"]["account_version"]
+    cutoff = plan["final_cutoff"]
+    expected_versions = dict(inspection_account_version=oracle["account_version"], endpoint_cutoff=cutoff,
+                             **{kind: dict(captured_account_version=oracle["account_version"], snapshot_as_of=cutoff)
+                                for kind in ("trading", "positions", "open_orders")})
+    observed_versions = dict(inspection_account_version=final["inspection"]["account_version"],
+                             endpoint_cutoff=endpoint["cutoff"]["scheduler_time"],
+                             **{kind: dict(captured_account_version=final[kind + "_fact"]["captured_account_version"],
+                                           snapshot_as_of=final[kind + "_fact"]["snapshot_as_of"])
+                                for kind in ("trading", "positions", "open_orders")})
+    poll_ids = [step["plan"]["trading"]["snapshot_request"]["continuation_id"]
+                for step in plan["recipe"] if step["kind"] == "POLL_BEGIN"]
+    expected_polls = [dict(poll_id=poll_id, continuation_id=poll_id, status="COMPLETED", awaiting=None) for poll_id in poll_ids]
+    expected_queue = dict(pending_keys=[], remaining_planned_barriers=[])
+    observed_queue = dict(pending_keys=observation["pending_keys"], remaining_planned_barriers=endpoint["remaining_planned_barriers"])
+    expected_terminal = dict(terminal_policy=plan["terminal_policy"], terminal_reason=plan["terminal_policy"],
+                             scheduler_gate="RUNNING", scheduler_terminal=None, owner_gate="RUNNING",
+                             owner_lifecycle="RISK_STABLE", remaining_planned_barriers=[])
+    observed_terminal = _terminal(attempt["terminal_policy"], endpoint)
+    expected_report = _configured_report(run_id, plan["terminal_policy"], context, final, oracle, expected=True)
+    committed_by_event = {
+        member["stamp"]["event_id"]: row["payload"]["result"]["committed_references"]
+        for row in source_rows for member in row["payload"]["request"]["members"]
+    }
+    committed_exist = all(
+        {"namespace": "SOURCE", "fact_id": ref.removeprefix("SOURCE:")} in committed_by_event.get(ref.removeprefix("SOURCE:"), [])
+        for item in oracle["products"] for ref in item["committed_execution_refs"]
+    )
+    expected_position_rows = [dict(product_id=item["product_id"], position_contracts=item["position_contracts"],
+                                   last_price=item["mark_price"], notional_usd=item["notional_usd"])
+                              for item in oracle["products"] if item["mark_price"] is not None]
+    actual_positions = final["positions_fact"]["immutable_payload"]["rows"]
+    projected_positions = [{key: row[key] for key in ("product_id", "position_contracts", "last_price", "notional_usd")}
+                           for row in actual_positions]
+    order_rows = final["open_orders_fact"]["immutable_payload"]["rows"]
+    expected = [coverage, dict(processed_boundary=boundary, persisted_boundary=boundary, last_planned=coverage[-1]),
+                expected_barriers, expected_identity, expected_digests, expected_versions, expected_queue, expected_polls, [],
+                expected_terminal, _report(expected_report)]
+    observed = [observed_coverage, dict(processed_boundary=processed, persisted_boundary=persisted,
+                                        last_planned=attempt["planned_coverage"][-1]),
+                observed_barriers, observed_identity, observed_digests, observed_versions, observed_queue, observation["polls"],
+                _actions(journal, observation["callback_actions"]), observed_terminal, _report(report)]
+    final_inspection = final["inspection"]
+    actual_trading = final["trading_fact"]["immutable_payload"]
+    oracle_matches = (
+        final_inspection["account_version"] == oracle["account_version"]
+        and final_inspection["cash"] == oracle["cash"]
+        and final_inspection["gross_realized"] == oracle["gross_realized"]
+        and final_inspection["total_fees"] == oracle["total_fees"]
+        and actual_trading["equity"] == oracle["equity"]
+        and actual_trading["available_equity"] == oracle["available_equity"]
+        and projected_positions == expected_position_rows
+        and _configured_order_matches(order_rows, oracle["products"])
+        and committed_exist
+    )
+    extras = [
+        _equal(observed_coverage, attempt["planned_coverage"]) and _equal(observed_coverage, coverage),
+        endpoint["cutoff"]["persisted_boundary"] == boundary,
+        barrier_metadata_matches,
+        all(owner["inspection"]["account_key"] == plan["account_key"]
+            and owner["inspection"]["profile_id"] == plan["native_profile"]
+            and owner["inspection"]["config_id"] == context.config_id for _, _, owner in sites) and snapshots_match,
+        _equal(expected_digests, observed_digests),
+        source_versions_match,
+        True,
+        records_match,
+        True,
+        (initial["cutoff"] == plan["initial_cutoff"]
+         and final["cutoff"] == cutoff
+         and observation["current_time"] == cutoff
+         and observation["last_popped"] == barriers[-1]["scheduler_key"]),
+        oracle_matches and execution_sources_match and _equal(expected_report, report),
+    ]
+    journal_refs = [f"journal:{row['journal_seq']}" for row in journal]
+    source_refs = [ref for ref, row in zip(journal_refs, journal, strict=True) if row["record_kind"] == "SOURCE_GROUP_RESULT"]
+    delivery_refs = [ref for ref, row in zip(journal_refs, journal, strict=True)
+                     if row["record_kind"] in ("DELIVERY_ATTEMPT", "CALLBACK_RESULT")]
+    refs = [["artifact:attempt.json#/planned_coverage", *journal_refs],
+            ["artifact:status.json#/processed_boundary", "artifact:status.json#/persisted_boundary", "artifact:attempt.json#/planned_coverage"],
+            journal_refs, [_INITIAL, *source_refs, _FINAL], [_INITIAL, *source_refs, _FINAL], [_FINAL],
+            ["artifact:endpoint.json#/scheduler_observation/pending_keys", "artifact:endpoint.json#/remaining_planned_barriers"],
+            ["artifact:endpoint.json#/scheduler_observation/polls"],
+            ["artifact:endpoint.json#/scheduler_observation/callback_actions", *delivery_refs],
+            ["artifact:attempt.json#/terminal_policy", "artifact:endpoint.json#/terminal_reason", "artifact:endpoint.json#/cutoff",
+             "artifact:endpoint.json#/scheduler_observation", _FINAL],
+            [_FINAL, *[f"artifact:report.jsonl#/{index}" for index in range(len(report))]]]
+    checks = [dict(name=name, expected=wanted, observed=actual, evidence_refs=references,
+                   result="OK" if additional and _equal(wanted, actual) else "FAILED")
+              for name, wanted, actual, references, additional in zip(_CHECKS, expected, observed, refs, extras, strict=True)]
+    result = _copy(dict(schema_version="spider_reconciliation_v1", run_id=run_id,
+                        result="OK" if all(row["result"] == "OK" for row in checks) else "FAILED", checks=checks,
+                        configuration_context=_configuration_context(context)))
+    _validate(result)
+    return result
+
+
 def build_endpoint_artifacts(run_id: str, attempt: dict[str, _Any], status: dict[str, _Any],
                              journal: list[dict[str, _Any]], initial_owner_evidence: dict[str, _Any],
                              final_owner_evidence: dict[str, _Any], scheduler_observation: dict[str, _Any]) -> dict[str, _Any]:
@@ -126,9 +424,19 @@ def build_endpoint_artifacts(run_id: str, attempt: dict[str, _Any], status: dict
         if error.args == ("UNSUPPORTED_CONFIGURATION",):
             raise ReconciliationProjectionError() from error
         raise
-    if frozen.get("schema_version") == "spider_scenario_plan_v2":
+    configured = frozen.get("schema_version") == "spider_scenario_plan_v2"
+    if configured and (attempt.get("scenario_plan_id") != _P2_SELECTOR
+                       or _sha256(_bytes(frozen)).hexdigest() != _P2_PLAN_SHA256):
         raise ReconciliationProjectionError()
     context = _context_chain(attempt, status, journal)
+    if configured != (context is not None):
+        raise ReconciliationProjectionError()
+    if configured and (_cast(_ConfigurationContext, context).config_id != frozen["configuration"]["config_id"]
+                       or _cast(_ConfigurationContext, context).configuration_sha256 != frozen["configuration_sha256"]
+                       or list(_cast(_ConfigurationContext, context).products) != frozen["products"]
+                       or attempt.get("scenario_plan_sha256") != _P2_PLAN_SHA256
+                       or attempt.get("run_contract_id") != _P2_RUN_CONTRACT):
+        raise ReconciliationProjectionError()
     persisted = _required(status, "persisted_boundary")
     terminal = _required(attempt, "terminal_policy")
     endpoint = _copy(dict(schema_version="spider_endpoint_v1", run_id=run_id, terminal_reason=terminal,
@@ -143,22 +451,26 @@ def build_endpoint_artifacts(run_id: str, attempt: dict[str, _Any], status: dict
     trading = final["trading_fact"]["immutable_payload"]
     positions = _required(final["positions_fact"]["immutable_payload"], "rows")
     orders = _required(final["open_orders_fact"]["immutable_payload"], "rows")
-    report = []
-    for template in frozen["report"]:
-        product = template["product_id"]
-        position = next((row for row in positions if row["product_id"] == product), None)
-        row = dict(schema_version="spider_product_report_v1", run_id=run_id, product_id=product, terminal_reason=terminal,
-                           position_contracts=_required(position, "position_contracts") if position is not None else "0",
-                           mark_price=_required(position, "last_price") if position is not None else None,
-                           notional_usd=_required(position, "notional_usd") if position is not None else "0",
-                           open_orders=[row for row in orders if row["product_id"] == product],
-                           committed_execution_refs=template["committed_execution_refs"], source_evidence_refs=template["source_evidence_refs"],
-                           account_cash=_required(inspection, "cash"), account_equity=_required(trading, "equity"),
-                           account_available_equity=_required(trading, "available_equity"), account_gross_realized=_required(inspection, "gross_realized"),
-                           account_total_fees=_required(inspection, "total_fees"))
-        if context is not None:
-            row["configuration_context"] = _configuration_context(context)
-        report.append(row)
+    if configured:
+        oracle = _configured_scale_projection_oracle()
+        report = _configured_report(run_id, terminal, _cast(_ConfigurationContext, context), final, oracle)
+    else:
+        report = []
+        for template in frozen["report"]:
+            product = template["product_id"]
+            position = next((row for row in positions if row["product_id"] == product), None)
+            row = dict(schema_version="spider_product_report_v1", run_id=run_id, product_id=product, terminal_reason=terminal,
+                               position_contracts=_required(position, "position_contracts") if position is not None else "0",
+                               mark_price=_required(position, "last_price") if position is not None else None,
+                               notional_usd=_required(position, "notional_usd") if position is not None else "0",
+                               open_orders=[row for row in orders if row["product_id"] == product],
+                               committed_execution_refs=template["committed_execution_refs"], source_evidence_refs=template["source_evidence_refs"],
+                               account_cash=_required(inspection, "cash"), account_equity=_required(trading, "equity"),
+                               account_available_equity=_required(trading, "available_equity"), account_gross_realized=_required(inspection, "gross_realized"),
+                               account_total_fees=_required(inspection, "total_fees"))
+            if context is not None:
+                row["configuration_context"] = _configuration_context(context)
+            report.append(row)
     _validate_endpoint(endpoint)
     _validate_report(report, context=context)
     return _copy(dict(endpoint=endpoint, report=report,
@@ -177,7 +489,19 @@ def build_reconciliation(run_id: str, attempt: dict[str, _Any], status: dict[str
             raise ReconciliationProjectionError() from error
         raise
     if frozen.get("schema_version") == "spider_scenario_plan_v2":
-        raise ReconciliationProjectionError()
+        if (attempt.get("scenario_plan_id") != _P2_SELECTOR
+                or _sha256(_bytes(frozen)).hexdigest() != _P2_PLAN_SHA256):
+            raise ReconciliationProjectionError()
+        context = _context_chain(attempt, status, journal, endpoint, report)
+        if context is None:
+            raise ReconciliationProjectionError()
+        if (context.config_id != frozen["configuration"]["config_id"]
+                or context.configuration_sha256 != frozen["configuration_sha256"]
+                or list(context.products) != frozen["products"]
+                or attempt.get("scenario_plan_sha256") != _P2_PLAN_SHA256
+                or attempt.get("run_contract_id") != _P2_RUN_CONTRACT):
+            raise ReconciliationProjectionError()
+        return _configured_reconciliation(run_id, attempt, status, journal, endpoint, report, frozen, context)
     context = _context_chain(attempt, status, journal, endpoint, report)
     plan, frozen_journal, frozen_endpoint = frozen["plan"], frozen["journal"], frozen["endpoint"]
     if not journal or not attempt["planned_coverage"]:

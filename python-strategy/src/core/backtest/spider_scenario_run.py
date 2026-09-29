@@ -239,8 +239,13 @@ def _execute_configured(store, bundle, attempt):
     status = dict(schema_version="spider_status_v1", run_id=attempt["run_id"], state="RUNNING",
                   processed_boundary=boundary, persisted_boundary=_copy(boundary), failure_reason=None, primary_failure=None,
                   configuration_context=context)
-    _build(attempt["run_id"], attempt, status, journal, initial, final["owner_evidence"], final["scheduler_observation"])
-    raise RuntimeError("UNREACHABLE_CONFIGURED_PROJECTION")
+    artifacts = _build(attempt["run_id"], attempt, status, journal, initial, final["owner_evidence"], final["scheduler_observation"])
+    if artifacts["reconciliation"]["result"] != "OK":
+        raise _ProjectionError()
+    if store.finalize(**artifacts) != "COMPLETE_PUBLISHED":
+        raise RuntimeError("INVALID_STORE_ACKNOWLEDGEMENT")
+    admitted = _admit(store._path)
+    return None if admitted["decision"] == "ACCEPT" else admitted["reason"]
 
 
 def _execute(store, bundle, attempt):

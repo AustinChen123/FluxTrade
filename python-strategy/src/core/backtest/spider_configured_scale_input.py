@@ -575,7 +575,50 @@ def _payload() -> dict[str, Any]:
 _PLAN_INPUT_BYTES = canonical_bytes(_payload())
 _PLAN_INPUT_SHA256 = hashlib.sha256(_PLAN_INPUT_BYTES).hexdigest()
 
+_PROJECTION_ORACLE = {
+    "scenario_plan_id": "SPIDER_P2_CONFIGURED_SCALE_V1",
+    "account_version": 17,
+    "cash": "121.05",
+    "equity": "121.05",
+    "available_equity": "5.05",
+    "gross_realized": "0",
+    "total_fees": "0.15",
+    "products": [
+        {"product_id": "BTC-USDT-SWAP", "intent_ordinal": 1, "created_at": 501, "position_contracts": "0.5", "mark_price": "100", "notional_usd": "50",
+         "client_order_id": None, "committed_execution_refs": ["SOURCE:event-514"], "evidence_ordinals": [1, 13, 14, 15, 16, 17, 18]},
+        {"product_id": "ETH-USDT-SWAP", "intent_ordinal": 2, "created_at": 502, "position_contracts": "0", "mark_price": None, "notional_usd": "0",
+         "client_order_id": "C-502", "committed_execution_refs": [], "evidence_ordinals": [2]},
+        {"product_id": "SOL-USDT-SWAP", "intent_ordinal": 3, "created_at": 503, "position_contracts": "0", "mark_price": None, "notional_usd": "0",
+         "client_order_id": "C-503", "committed_execution_refs": [], "evidence_ordinals": [3]},
+        {"product_id": "BNB-USDT-SWAP", "intent_ordinal": 4, "created_at": 504, "position_contracts": "0", "mark_price": None, "notional_usd": "0",
+         "client_order_id": "C-504", "committed_execution_refs": [], "evidence_ordinals": [4]},
+        {"product_id": "XRP-USDT-SWAP", "intent_ordinal": 5, "created_at": 505, "position_contracts": "0", "mark_price": None, "notional_usd": "0",
+         "client_order_id": "C-505", "committed_execution_refs": [], "evidence_ordinals": [5]},
+        {"product_id": "DOGE-USDT-SWAP", "intent_ordinal": 6, "created_at": 506, "position_contracts": "1", "mark_price": "100", "notional_usd": "100",
+         "client_order_id": None, "committed_execution_refs": ["SOURCE:event-518", "SOURCE:event-519"], "evidence_ordinals": [6, 19, 20, 30, 31]},
+        {"product_id": "ARB-USDT-SWAP", "intent_ordinal": 7, "created_at": 507, "position_contracts": "0", "mark_price": None, "notional_usd": "0",
+         "client_order_id": "C-507", "committed_execution_refs": [], "evidence_ordinals": [7]},
+        {"product_id": "OP-USDT-SWAP", "intent_ordinal": 8, "created_at": 508, "position_contracts": "0", "mark_price": None, "notional_usd": "0",
+         "client_order_id": "C-508", "committed_execution_refs": [], "evidence_ordinals": [8]},
+        {"product_id": "NEAR-USDT-SWAP", "intent_ordinal": 9, "created_at": 509, "position_contracts": "0", "mark_price": None, "notional_usd": "0",
+         "client_order_id": "C-509", "committed_execution_refs": [], "evidence_ordinals": [9]},
+        {"product_id": "APT-USDT-SWAP", "intent_ordinal": 10, "created_at": 510, "position_contracts": "0", "mark_price": None, "notional_usd": "0",
+         "client_order_id": "C-510", "committed_execution_refs": [], "evidence_ordinals": [10]},
+        {"product_id": "SUI-USDT-SWAP", "intent_ordinal": 11, "created_at": 511, "position_contracts": "0", "mark_price": None, "notional_usd": "0",
+         "client_order_id": "C-511", "committed_execution_refs": [], "evidence_ordinals": [11]},
+        {"product_id": "ADA-USDT-SWAP", "intent_ordinal": 12, "created_at": 512, "position_contracts": "0", "mark_price": None, "notional_usd": "0",
+         "client_order_id": "C-512", "committed_execution_refs": [], "evidence_ordinals": [12]},
+    ],
+}
+_PROJECTION_ORACLE_BYTES = canonical_bytes(_PROJECTION_ORACLE)
+_PROJECTION_ORACLE_SHA256 = hashlib.sha256(_PROJECTION_ORACLE_BYTES).hexdigest()
+
 
 def _configured_scale_plan_input() -> dict[str, Any]:
     """Return a detached copy of the frozen input payload."""
     return cast(dict[str, Any], decode_canonical(_PLAN_INPUT_BYTES))
+
+
+def _configured_scale_projection_oracle() -> dict[str, Any]:
+    """Return the compact detached financial and provenance oracle for this plan."""
+    return cast(dict[str, Any], decode_canonical(_PROJECTION_ORACLE_BYTES))

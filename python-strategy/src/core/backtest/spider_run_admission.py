@@ -6,6 +6,7 @@ import stat as _stat
 from hashlib import sha256 as _sha256
 from json import JSONDecodeError as _JSONDecodeError
 from typing import Any as _Any
+from typing import cast as _cast
 
 from src.core.backtest.spider_run_artifacts import canonical_bytes as _bytes, configuration_context as _validate_context, decode_jsonl as _decode_jsonl, validate_artifact as _artifact
 from src.core.backtest.spider_run_completion_schema import _ARTIFACTS, completion as _completion, report as _report
@@ -18,6 +19,8 @@ _NAMES = tuple(name for name, _ in _ARTIFACTS)
 _ALL = (*_NAMES, "completion.json")
 _LIMIT = 16_777_216
 _POLICY = "eb6ab34d8685fb59e286f5ffda8af24cbecf3e5ab2c729c585ccdca797cac336"
+_P2_SELECTOR = "SPIDER_P2_CONFIGURED_SCALE_V1"
+_P2_RUN_CONTRACT = "SPIDER_SYNTHETIC_P2_CONFIGURED_RUN_V1"
 _DIAGNOSTIC = ("completion.json", "status.json", "journal.jsonl")
 _FRONTIER = ("attempt.json", "status.json", "journal.jsonl", "completion.json")
 
@@ -213,12 +216,24 @@ def _admit(directory: int) -> dict[str, _Any]:
         if error.args != ("UNSUPPORTED_CONFIGURATION",):
             raise
         return _reject("ENDPOINT_RECONCILIATION_FAILED", _ALL)
-    if selected.get("schema_version") == "spider_scenario_plan_v2":
+    configured = selected.get("schema_version") == "spider_scenario_plan_v2"
+    if configured:
+        if (attempt["scenario_plan_id"] != _P2_SELECTOR or attempt["run_contract_id"] != _P2_RUN_CONTRACT
+                or _sha256(_bytes(selected)).hexdigest() != attempt["scenario_plan_sha256"]):
+            return _reject("ENDPOINT_RECONCILIATION_FAILED", _ALL)
+        configuration = _cast(dict[str, _Any], selected["configuration"])
+        context = _cast(dict[str, _Any], attempt["configuration_context"])
+        if (context["config_id"] != configuration["config_id"]
+                or context["configuration_sha256"] != selected["configuration_sha256"]
+                or context["products"] != selected["products"]):
+            return _reject("ENDPOINT_RECONCILIATION_FAILED", _ALL)
+    elif attempt["run_contract_id"] == _P2_RUN_CONTRACT:
         return _reject("ENDPOINT_RECONCILIATION_FAILED", _ALL)
     hash_fields = ("scenario_plan_sha256", "program_sha256", "native_artifact_sha256", "policy_source_sha256")
+    selected_plan_sha256 = _sha256(_bytes(selected)).hexdigest() if configured else selected["plan_sha256"]
     if (attempt["requested_scenario_selector"] != attempt["scenario_plan_id"]
             or any(entry["sha256"] != attempt[key] for entry, key in zip(attempt["input_contract_hashes"], hash_fields, strict=True))
-            or attempt["policy_source_sha256"] != _POLICY or attempt["scenario_plan_sha256"] != selected["plan_sha256"]
+            or attempt["policy_source_sha256"] != _POLICY or attempt["scenario_plan_sha256"] != selected_plan_sha256
             or manifest["input_contract_hashes"] != attempt["input_contract_hashes"] or manifest["terminal_reason"] != endpoint["terminal_reason"]):
         return _reject("ENDPOINT_RECONCILIATION_FAILED", _ALL)
     try:
