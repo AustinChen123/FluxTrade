@@ -182,6 +182,32 @@ fn whole_product_nonadditive_reservation_matches_golden_facts() {
 }
 
 #[test]
+fn legacy_reservation_does_not_add_large_contract_quantities() {
+    let (mut seed, config, mut marks) = fixture();
+    seed.cash = d("100000000000000000000000000");
+    seed.positions.clear();
+    seed.orders = vec![
+        order("large-a", Side::Long, "40000000000000000000000000000"),
+        order("large-b", Side::Long, "40000000000000000000000000000"),
+    ];
+    for order in &mut seed.orders {
+        order.price = d("0.1");
+    }
+    marks[0].price = d("0.1");
+
+    let owner = ScenarioAccount::from_seed(&seed, &config, &marks).unwrap();
+    let snapshot = owner.reservation().unwrap();
+    assert_eq!(
+        snapshot.products[0].long_remaining_value,
+        d("80000000000000000000000000")
+    );
+    assert_eq!(
+        snapshot.products[0].exposure_margin,
+        d("8000000000000000000000000")
+    );
+}
+
+#[test]
 fn shared_equity_and_atomic_capacity_anchors_are_only_snapshots() {
     let (mut seed, config, mut marks) = fixture();
     seed.cash = d("1000");

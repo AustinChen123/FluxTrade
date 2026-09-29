@@ -86,7 +86,13 @@ pub(super) fn evaluate(
     if role == Role::RiskReducing {
         let (spec, tier) = scenario.resolve(product, input.effective_at)?;
         let context = if scenario.configured.is_some() {
-            hypothetical_settlement::Context::Configured(scenario, product, spec, tier)
+            hypothetical_settlement::Context::Configured(
+                scenario,
+                product,
+                spec,
+                tier,
+                input.effective_at,
+            )
         } else {
             hypothetical_settlement::Context::BtcEth(scenario, spec)
         };

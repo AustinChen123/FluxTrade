@@ -81,6 +81,8 @@ pub(super) fn calculate(
             .map_or(Decimal::ZERO, |p| p.notional);
         let mut long = Decimal::ZERO;
         let mut short = Decimal::ZERO;
+        let mut long_contracts = Decimal::ZERO;
+        let mut short_contracts = Decimal::ZERO;
         for order in resting
             .iter()
             .filter(|o| matches!(&o.product, ProfileProduct::BtcEth(p) if p == &product))
@@ -101,10 +103,16 @@ pub(super) fn calculate(
             let difference = match order.side {
                 Side::Long => {
                     long = add(long, marked)?;
+                    if scenario.configured.is_some() {
+                        long_contracts = add(long_contracts, order.remaining)?;
+                    }
                     add(order.price, -mark.price)?
                 }
                 Side::Short => {
                     short = add(short, marked)?;
+                    if scenario.configured.is_some() {
+                        short_contracts = add(short_contracts, order.remaining)?;
+                    }
                     add(mark.price, -order.price)?
                 }
             };
@@ -123,17 +131,33 @@ pub(super) fn calculate(
                 fee_hold: fee,
             });
         }
-        let worst = match input
-            .positions
-            .iter()
-            .find(|p| p.product == product)
-            .map(|p| p.side)
-        {
+        let position = input.positions.iter().find(|p| p.product == product);
+        let worst = match position.map(|p| p.side) {
             None => long.max(short),
             Some(Side::Long) => add(value, long)?.max(add(short, -value)?),
             Some(Side::Short) => add(long, -value)?.max(add(value, short)?),
         };
-        let exposure = exact(worst.mantissa(), worst.scale() + 1)?;
+        let exposure = if scenario.configured.is_some() {
+            let position_contracts = position.map_or(Decimal::ZERO, |p| p.contracts);
+            let absolute = |v: Decimal| if v < Decimal::ZERO { -v } else { v };
+            let worst_contracts = match position.map(|p| p.side) {
+                None => long_contracts.max(short_contracts),
+                Some(Side::Long) => add(position_contracts, long_contracts)?
+                    .max(absolute(add(position_contracts, -short_contracts)?)),
+                Some(Side::Short) => absolute(add(position_contracts, -long_contracts)?)
+                    .max(add(position_contracts, short_contracts)?),
+            };
+            super::super::configured_tier(
+                scenario,
+                &product,
+                input.effective_at,
+                position_contracts,
+            )?;
+            super::super::configured_tier(scenario, &product, input.effective_at, worst_contracts)?;
+            exact_div(worst, scenario.leverage)?
+        } else {
+            exact(worst.mantissa(), worst.scale() + 1)?
+        };
         snapshot.used_margin = add(snapshot.used_margin, exposure)?;
         snapshot.products.push(ProductReservation {
             product,

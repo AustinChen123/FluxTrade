@@ -134,6 +134,9 @@ pub(super) fn calculate<'a>(
     }
     if let Some(position) = current {
         validate_position(position, context, spec.maximum)?;
+        if let Context::Configured(scenario, product, _, _, at) = context {
+            super::super::configured_tier(scenario, product, at, position.contracts)?;
+        }
     }
     let base = mul(mul(quantity, spec.contract_value)?, spec.multiplier)?;
     let fee = fee_amount(base, price, fee_policy)?;

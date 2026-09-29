@@ -4,7 +4,13 @@ use super::*;
 #[derive(Clone, Copy)]
 pub(in super::super) enum Context<'a> {
     BtcEth(&'a FrozenScenario, &'a Spec),
-    Configured(&'a FrozenScenario, &'a Product, &'a Spec, &'a TierVersion),
+    Configured(
+        &'a FrozenScenario,
+        &'a Product,
+        &'a Spec,
+        &'a TierVersion,
+        i64,
+    ),
     GoldenCancel(&'a golden_cancel::Config),
     P1O03,
 }
@@ -51,14 +57,14 @@ impl<'a> Context<'a> {
                 }
                 Ok(Self::btc(spec))
             }
-            Self::Configured(scenario, product, spec, tier) => {
+            Self::Configured(scenario, product, spec, tier, _) => {
                 let configured_fee = scenario
                     .configured
                     .as_ref()
                     .and_then(|rows| rows.iter().find(|row| row.product == *product))
                     .map(|row| row.taker_fee)
                     .ok_or("UNSUPPORTED_CONFIGURED_SETTLEMENT")?;
-                if scenario.leverage != Decimal::TEN
+                if scenario.leverage <= Decimal::ZERO
                     || scenario
                         .configured
                         .as_ref()
@@ -121,7 +127,7 @@ impl<'a> Context<'a> {
                 .find(|s| s.product == active.product && s.version == version)
                 .map(Self::btc)
                 .ok_or("INVALID_LOT_ORIGIN_SPEC"),
-            Self::Configured(scenario, product, _, _) => scenario
+            Self::Configured(scenario, product, _, _, _) => scenario
                 .configured
                 .as_ref()
                 .and_then(|rows| rows.iter().find(|row| row.product == *product))
@@ -152,12 +158,11 @@ impl<'a> Context<'a> {
 
     pub(super) fn tier_ceiling(self, contracts: Decimal, fee: FeePolicy) -> Result<Decimal, Fault> {
         match self {
-            Self::Configured(_, _, _, tier) => tier
-                .tiers
-                .iter()
-                .find(|row| contracts >= row.minimum && contracts <= row.maximum)
-                .map(|row| row.maximum)
-                .ok_or("UNSUPPORTED_POSITION_TIER"),
+            Self::Configured(scenario, product, _, _, at) => {
+                super::super::configured_tier(scenario, product, at, contracts)?
+                    .map(|(_, row)| row.maximum)
+                    .ok_or("UNSUPPORTED_POSITION_TIER")
+            }
             _ => Ok(self.active(fee)?.maximum),
         }
     }

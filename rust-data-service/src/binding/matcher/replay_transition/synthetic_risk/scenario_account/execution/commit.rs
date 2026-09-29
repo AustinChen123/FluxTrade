@@ -189,7 +189,13 @@ impl ScenarioAccount {
                 let (scenario, _) = self.btc_context()?;
                 let (spec, tier) = scenario.resolve(product, template.matching_effective_at)?;
                 let context = if scenario.configured.is_some() {
-                    hypothetical_settlement::Context::Configured(scenario, product, spec, tier)
+                    hypothetical_settlement::Context::Configured(
+                        scenario,
+                        product,
+                        spec,
+                        tier,
+                        candidate.template.matching_effective_at,
+                    )
                 } else {
                     hypothetical_settlement::Context::BtcEth(scenario, spec)
                 };

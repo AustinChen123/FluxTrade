@@ -18,7 +18,7 @@ fn configured_fee_changes_reachable_reducing_stress_decision() {
         position.lots[0].entry = d("100");
         seed.positions = vec![position];
         seed.cash = d("0.21");
-        let mut owner = ScenarioAccount::from_configured(&seed, d("10"), products).unwrap();
+        let mut owner = ScenarioAccount::from_configured(&seed, d("5"), products).unwrap();
         let mut candidate = super::super::super::fixture_intent(
             &owner,
             &format!("REDUCE-{rate}"),
@@ -39,6 +39,7 @@ fn configured_fee_changes_reachable_reducing_stress_decision() {
         let super::super::super::Evaluation::BtcEth(evidence) = &reply.result.evaluation else {
             panic!("configured BTC-like risk evidence expected");
         };
+        assert!(evidence.post_reservation.as_ref().unwrap().available_margin < Decimal::ZERO);
         let stress = evidence
             .stress
             .as_ref()

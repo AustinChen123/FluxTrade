@@ -2,7 +2,7 @@
 //! Covers 4A valuation and 4B account, reservation, admission, and execution;
 //! no public API, 4C actions, persistence, scheduling, or delivery semantics.
 use num_bigint_dig::BigInt;
-use num_traits::{ToPrimitive, Zero};
+use num_traits::{Pow, ToPrimitive, Zero};
 use rust_decimal::Decimal;
 
 use super::Fault;
@@ -122,12 +122,24 @@ impl FrozenScenario {
                         && input.effective_at < m.valid_to
                 })
                 .ok_or("MARK_COVERAGE_MISSING")?;
-            let (tier_index, tier) = tier_version
-                .tiers
-                .iter()
-                .enumerate()
-                .find(|(_, t)| position.contracts >= t.minimum && position.contracts <= t.maximum)
-                .ok_or("UNSUPPORTED_POSITION_TIER")?;
+            let (tier_index, tier) = if self.configured.is_some() {
+                configured_tier(
+                    self,
+                    &position.product,
+                    input.effective_at,
+                    position.contracts,
+                )?
+                .ok_or("UNSUPPORTED_POSITION_TIER")?
+            } else {
+                tier_version
+                    .tiers
+                    .iter()
+                    .enumerate()
+                    .find(|(_, t)| {
+                        position.contracts >= t.minimum && position.contracts <= t.maximum
+                    })
+                    .ok_or("UNSUPPORTED_POSITION_TIER")?
+            };
             let base = mul(
                 mul(position.contracts, spec.contract_value)?,
                 spec.multiplier,
@@ -152,8 +164,11 @@ impl FrozenScenario {
             }
             let upl = signed_sum(&lot_upl)?;
             let contribution = mul(value, tier.mmr)?;
-            // Initialization admits configured leverage 10 only, never tier IMR.
-            let margin = exact(value.mantissa(), value.scale() + 1)?;
+            let margin = if self.configured.is_some() {
+                exact_div(value, self.leverage)?
+            } else {
+                exact(value.mantissa(), value.scale() + 1)?
+            };
             equity_terms.push(upl);
             mmr = add(mmr, contribution)?;
             exposure = add(exposure, margin)?;
@@ -182,6 +197,31 @@ impl FrozenScenario {
             available_margin: add(equity, -exposure)?,
         })
     }
+}
+
+fn configured_tier<'a>(
+    scenario: &'a FrozenScenario,
+    product: &Product,
+    at: i64,
+    contracts: Decimal,
+) -> Result<Option<(usize, &'a Tier)>, Fault> {
+    if contracts < Decimal::ZERO {
+        return Err("UNSUPPORTED_POSITION_TIER");
+    }
+    if contracts == Decimal::ZERO {
+        return Ok(None);
+    }
+    let (_, version) = scenario.resolve(product, at)?;
+    let (index, tier) = version
+        .tiers
+        .iter()
+        .enumerate()
+        .find(|(_, row)| contracts >= row.minimum && contracts <= row.maximum)
+        .ok_or("UNSUPPORTED_POSITION_TIER")?;
+    if scenario.leverage > tier.max_leverage {
+        return Err("LEVERAGE_TIER_CONFLICT");
+    }
+    Ok(Some((index, tier)))
 }
 
 fn mul(left: Decimal, right: Decimal) -> Result<Decimal, Fault> {
@@ -221,6 +261,61 @@ fn exact(mut mantissa: i128, mut scale: u32) -> Result<Decimal, Fault> {
         return Err("DECIMAL_PRECISION_LOSS");
     }
     Decimal::try_from_i128_with_scale(mantissa, scale).map_err(|_| "DECIMAL_OVERFLOW")
+}
+
+fn exact_div(numerator: Decimal, denominator: Decimal) -> Result<Decimal, Fault> {
+    if denominator == Decimal::ZERO {
+        return Err("DECIMAL_DIVISION_BY_ZERO");
+    }
+    if numerator == Decimal::ZERO {
+        return Ok(Decimal::ZERO);
+    }
+    let mut top = BigInt::from(numerator.mantissa()) * BigInt::from(10).pow(denominator.scale());
+    let mut bottom = BigInt::from(denominator.mantissa()) * BigInt::from(10).pow(numerator.scale());
+    if bottom < BigInt::zero() {
+        top = -top;
+        bottom = -bottom;
+    }
+    let divisor = bigint_gcd(top.clone(), bottom.clone());
+    top /= &divisor;
+    bottom /= divisor;
+    let two = BigInt::from(2);
+    let five = BigInt::from(5);
+    let mut twos = 0;
+    let mut fives = 0;
+    while (&bottom % &two).is_zero() {
+        bottom /= &two;
+        twos += 1;
+    }
+    while (&bottom % &five).is_zero() {
+        bottom /= &five;
+        fives += 1;
+    }
+    if bottom != BigInt::from(1) {
+        return Err("DECIMAL_PRECISION_LOSS");
+    }
+    let scale = twos.max(fives);
+    if scale > Decimal::MAX_SCALE {
+        return Err("DECIMAL_PRECISION_LOSS");
+    }
+    top *= two.pow(scale - twos);
+    top *= five.pow(scale - fives);
+    exact(top.to_i128().ok_or("DECIMAL_OVERFLOW")?, scale)
+}
+
+fn bigint_gcd(mut left: BigInt, mut right: BigInt) -> BigInt {
+    if left < BigInt::zero() {
+        left = -left;
+    }
+    if right < BigInt::zero() {
+        right = -right;
+    }
+    while !right.is_zero() {
+        let remainder = &left % &right;
+        left = right;
+        right = remainder;
+    }
+    left
 }
 
 fn add(left: Decimal, right: Decimal) -> Result<Decimal, Fault> {

@@ -544,6 +544,9 @@ impl AdmissionResult {
 }
 
 #[cfg(test)]
+#[path = "configured_leverage_tests.rs"]
+mod configured_leverage_tests;
+#[cfg(test)]
 mod golden_cancel_tests;
 #[cfg(test)]
 mod min_cash_tests;

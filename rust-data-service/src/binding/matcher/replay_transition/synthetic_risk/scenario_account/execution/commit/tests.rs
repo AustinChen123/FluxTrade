@@ -387,7 +387,7 @@ fn configured_execution_uses_product_owned_specs_for_fifo_and_duplicates() {
 }
 
 #[test]
-fn configured_settlement_invalid_origin_leverage_and_tiers_publish_no_financial_state() {
+fn configured_settlement_invalid_origin_and_tier_leverage_publish_no_financial_state() {
     let (mut seed, mut products) = super::super::super::configured_tests::input(2);
     let product = products[0].product.clone();
     let prototype = fixture().0.orders[0].clone();
@@ -403,28 +403,23 @@ fn configured_settlement_invalid_origin_leverage_and_tiers_publish_no_financial_
     let expected = [
         "INVALID_LOT_ORIGIN_SPEC",
         "INVALID_LOT_ORIGIN_SPEC",
-        "UNSUPPORTED_CONFIGURED_SETTLEMENT",
-        "UNSUPPORTED_POSITION_TIER",
-        "UNSUPPORTED_POSITION_TIER",
+        "LEVERAGE_TIER_CONFLICT",
     ];
     for index in 0..expected.len() {
         let mut rows = products.clone();
         let mut leverage = d("10");
         match index {
-            2 => leverage = d("5"),
-            3 => rows[0].tiers[0].tiers[0].maximum = d("0.75"),
-            4 => {
-                rows[0].tiers[0].interval.to = Some(501);
-                rows[0].tiers[0].tiers[0].maximum = d("0.75");
-                let mut future = rows[0].tiers[0].clone();
-                future.version = "future-tier".into();
-                future.interval = Interval {
-                    from: 501,
-                    to: None,
-                };
-                future.tiers[0].maximum = d("100");
-                rows[0].tiers.push(future);
-                assert!(rows[0].tiers[1].tiers[0].maximum >= d("1"));
+            2 => {
+                leverage = d("20");
+                let tiers = &mut rows[0].tiers[0].tiers;
+                let mut low = tiers[0].clone();
+                low.maximum = d("0.75");
+                low.max_leverage = d("10");
+                let mut high = tiers[0].clone();
+                high.minimum = d("0.76");
+                high.maximum = d("100");
+                high.max_leverage = d("20");
+                *tiers = vec![low, high];
             }
             _ => {}
         }
@@ -433,7 +428,6 @@ fn configured_settlement_invalid_origin_leverage_and_tiers_publish_no_financial_
         match index {
             0 => configured_position(&mut owner, &product, "unknown-spec"),
             1 => configured_position(&mut owner, &product, "foreign-spec"),
-            3 | 4 => configured_position(&mut owner, &product, "scale-spec-v1"),
             _ => {}
         }
         let mut candidate = input(&owner, "L", &format!("BAD-{index}"), "0.5", "100");
