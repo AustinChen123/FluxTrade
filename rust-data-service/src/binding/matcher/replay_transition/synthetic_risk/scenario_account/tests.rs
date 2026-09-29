@@ -70,6 +70,9 @@ fn shared_constructor_foundation_preserves_p1_order_and_validation_precedence() 
     }
 }
 
+#[path = "historical/owner_tests.rs"]
+mod historical_owner_tests;
+
 #[test]
 fn owned_identity_is_value_based_but_does_not_admit_new_p1_products() {
     use std::borrow::Cow;

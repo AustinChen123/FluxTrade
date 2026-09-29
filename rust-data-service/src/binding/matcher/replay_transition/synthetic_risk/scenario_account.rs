@@ -15,6 +15,7 @@ mod event_limit;
 mod execution;
 mod golden_cancel;
 mod group;
+mod historical;
 mod hypothetical_settlement;
 mod inspection;
 mod min_cash;

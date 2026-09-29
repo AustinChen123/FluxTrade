@@ -30,6 +30,7 @@ impl ScenarioAccount {
         let order = self.target_order(&template.order_id)?;
         Ok(ExecutionCandidate {
             template: template.clone(),
+            canonical_execution_id: None,
             candidate_id: format!("E{}", index + 1),
             event_id: "C".into(),
             source_id: "golden-c09".into(),

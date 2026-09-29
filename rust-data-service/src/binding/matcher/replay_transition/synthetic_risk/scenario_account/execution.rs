@@ -89,6 +89,7 @@ impl ExecutionTemplate {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ExecutionCandidate {
     template: ExecutionTemplate,
+    canonical_execution_id: Option<Hash>,
     candidate_id: String,
     event_id: String,
     source_id: String,
@@ -100,6 +101,13 @@ pub(super) struct ExecutionCandidate {
 }
 
 impl ExecutionCandidate {
+    pub(super) fn event_id(&self) -> &str {
+        &self.event_id
+    }
+    pub(super) fn canonical_execution_id(&self) -> Hash {
+        self.canonical_execution_id
+            .unwrap_or_else(|| self.template.key.canonical_id())
+    }
     pub(super) fn wire_product(&self) -> &ProfileProduct {
         &self.template.key.product
     }
@@ -121,10 +129,56 @@ impl ExecutionCandidate {
         (
             &self.event_id,
             self.template.matching_effective_at,
-            self.template.key.canonical_id(),
+            self.canonical_execution_id(),
             self.template.digest(),
         )
     }
+}
+
+pub(super) fn historical_candidate(
+    owner: &ScenarioAccount,
+    order_id: &str,
+    price: Decimal,
+    quantity: Decimal,
+    effective_at: i64,
+    execution_id: Hash,
+) -> Result<ExecutionCandidate, Fault> {
+    let order = owner.target_order(order_id)?;
+    let (scenario, _) = owner.btc_context()?;
+    let product = order.facts.product.btc()?;
+    let (spec, tier) = scenario.resolve(product, effective_at)?;
+    let external_id = execution_id.iter().fold(String::new(), |mut value, byte| {
+        use std::fmt::Write as _;
+        write!(&mut value, "{byte:02x}").expect("writing to String is infallible");
+        value
+    });
+    Ok(ExecutionCandidate {
+        template: ExecutionTemplate {
+            key: ExternalExecutionKey {
+                account: owner.key.clone(),
+                namespace: "P3_EXECUTION_V1".into(),
+                product: order.facts.product.clone(),
+                external_id: external_id.clone(),
+            },
+            order_id: order_id.into(),
+            side: order.facts.side,
+            price,
+            quantity,
+            liquidity: LiquidityRole::SyntheticTaker,
+            fee_asset: None,
+            fee_amount: None,
+            matching_effective_at: effective_at,
+        },
+        canonical_execution_id: Some(execution_id),
+        candidate_id: format!("P3-CANDIDATE-{external_id}"),
+        event_id: format!("P3-EXECUTION-{external_id}"),
+        source_id: external_id,
+        visible_at: effective_at,
+        expected_account_version: owner.state_version,
+        expected_order_version: order.version,
+        spec_version: spec.version.clone(),
+        rule_data_version: tier.version.clone(),
+    })
 }
 
 // Closed BTC evidence for this checkpoint; neutral execution remains unsupported.
@@ -179,6 +233,12 @@ enum Preparation<'a> {
 }
 
 impl CommittedExecution {
+    pub(super) fn historical_order_id(&self) -> &str {
+        &self.order_id
+    }
+    pub(super) fn historical_fill(&self) -> (Decimal, Decimal, Hash) {
+        (self.quantity, self.price, self.execution_id)
+    }
     pub(super) fn source_event(&self) -> &str {
         &self.event_id
     }
@@ -345,7 +405,7 @@ impl ScenarioAccount {
         stamp: &risk_transition::cancel::Stamp,
     ) -> Result<Preparation<'_>, Fault> {
         let template = &candidate.template;
-        let execution_id = template.key.canonical_id();
+        let execution_id = candidate.canonical_execution_id();
         let digest = template.digest();
         if template.key.namespace == "seed" || self.seed_executions.contains(&execution_id) {
             return Err("SEED_IDENTITY_CONFLICT");

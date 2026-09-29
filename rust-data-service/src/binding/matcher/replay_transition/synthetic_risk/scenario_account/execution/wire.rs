@@ -111,6 +111,7 @@ pub(in super::super) fn decode(
                 .transpose()?,
             matching_effective_at: rows["matching_effective_at"].integer(false)?,
         },
+        canonical_execution_id: None,
         candidate_id: rows["candidate_id"].id()?,
         event_id: event_id.into(),
         source_id: rows["source_id"].id()?,

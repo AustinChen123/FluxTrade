@@ -39,6 +39,7 @@ pub(super) fn fixture_candidate() -> (ScenarioAccount, ExecutionCandidate) {
             fee_amount: None,
             matching_effective_at: 500,
         },
+        canonical_execution_id: None,
         candidate_id: "candidate-1".into(),
         event_id: "event-1".into(),
         source_id: "transport-A".into(),
