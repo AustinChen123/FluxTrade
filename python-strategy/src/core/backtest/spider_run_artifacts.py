@@ -8,7 +8,7 @@ import json
 import re
 from collections.abc import Sequence
 from decimal import Decimal
-from typing import cast
+from typing import NamedTuple, cast
 
 from src.core.decimal_math import canonical_decimal_text
 
@@ -18,6 +18,13 @@ _HASH_NAMES = "SCENARIO_PLAN PROGRAM NATIVE_ARTIFACT POLICY_SOURCE_MANIFEST".spl
 _KINDS = "SOURCE_GROUP_RESULT SNAPSHOT_FACT DELIVERY_ATTEMPT CALLBACK_RESULT".split()
 _TERMINALS = "SCHEDULED_MTM LEGAL_NATIVE_LIQUIDATION_FINAL_EVENT O03_NON_ATOMIC_COMPLETE".split()
 _FAILURES = "UNSUPPORTED_CONFIGURATION PERSISTENCE_FAILED CALLBACK_FAILED NATIVE_FAULT NATIVE_POISONED SCHEDULER_FAILED ENDPOINT_RECONCILIATION_FAILED ARTIFACT_WRITE_FAILED PUBLICATION_FAILED PUBLICATION_DURABILITY_UNKNOWN UNEXPECTED_EXCEPTION".split()
+
+
+class ConfigurationContext(NamedTuple):
+    schema_version: str
+    config_id: str
+    configuration_sha256: str
+    products: tuple[str, ...]
 
 
 def _require(condition: bool) -> None:
@@ -62,6 +69,34 @@ def _enum(value: object, choices: Sequence[str]) -> str:
     text = _text(value)
     _require(text in choices)
     return text
+
+
+def configuration_context(value: object) -> ConfigurationContext:
+    """Validate and detach configured-product identity without retaining config."""
+    if type(value) is ConfigurationContext:
+        context = cast(ConfigurationContext, value)
+        schema_version = context.schema_version
+        config_id = context.config_id
+        configuration_sha256 = context.configuration_sha256
+        raw_products: object = context.products
+        _require(type(raw_products) is tuple)
+    else:
+        row = _object(value, "schema_version config_id configuration_sha256 products")
+        schema_version = row["schema_version"]
+        config_id = row["config_id"]
+        configuration_sha256 = row["configuration_sha256"]
+        raw_products = row["products"]
+        _require(type(raw_products) is list)
+    _enum(schema_version, ["spider_configuration_context_v1"])
+    validated_config_id = _text(config_id)
+    validated_hash = _text(configuration_sha256, r"[0-9a-f]{64}")
+    products = tuple(_text(product) for product in cast(Sequence[object], raw_products))
+    _require(bool(products) and len(products) == len(set(products)))
+    if type(value) is ConfigurationContext:
+        return value
+    return ConfigurationContext(
+        cast(str, schema_version), validated_config_id, validated_hash, products
+    )
 
 
 def _decimal_text(value: object) -> str:

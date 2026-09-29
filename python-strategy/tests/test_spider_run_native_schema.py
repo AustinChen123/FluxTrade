@@ -7,6 +7,7 @@ from typing import Any, Callable
 import pytest
 
 from src.core.backtest import spider_run_native_schema as n
+from src.core.backtest.spider_run_artifacts import configuration_context
 
 H = "a" * 64
 A = {"venue": "v", "environment": "test", "account": "A"}
@@ -74,6 +75,21 @@ def delivery(kind: str, payload: object) -> dict[str, object]:
 
 
 DELIVERY_KINDS = ["MARKET_SNAPSHOT", "EARN_SNAPSHOT", "TRADING_SNAPSHOT", "POSITION_SNAPSHOT", "OPEN_ORDER_SNAPSHOT"]
+
+CONFIGURED_PRODUCTS = ("CFG-FIRST", "CFG-MIDDLE", "CFG-LAST")
+
+
+def configured_context(config_id="configured-v1"):
+    return configuration_context(
+        {
+            "schema_version": "spider_configuration_context_v1",
+            "config_id": config_id,
+            "configuration_sha256": H,
+            "products": list(CONFIGURED_PRODUCTS),
+        }
+    )
+
+
 CASES: list[tuple[Callable[[object], None], object]] = [
     (n.account, A), (n.stamp, S), (n.reference, R), (n.rejection, {"event_id": "e", "reason": "CODE"}),
     (n.group, group()), (n.group_result, RESULT), (n.snapshot_request, REQUEST), (n.position, P),
@@ -329,3 +345,193 @@ def test_all_native_profile_and_ordering_tokens_remain_structurally_supported():
                     "SYNTHETIC_P1_LIQUIDATION_V1", "SYNTHETIC_P1_O03_V1"]:
         n.inspection({**INSPECTION, "profile_id": profile})
     n.group({**group(), "ordering_contract_id": "S_order_v1_reverse_execution_cancel_effective"})
+
+
+@pytest.mark.parametrize("product", CONFIGURED_PRODUCTS)
+def test_configured_products_reach_every_product_bearing_native_boundary(product):
+    context = configured_context()
+
+    marks = member("CONTEXT_MARKS")
+    at(marks, ("payload", "rows", 0))["product_id"] = product
+    n.member(marks, context=context)
+
+    for kind in ("EXECUTION", "INTENT"):
+        value = member(kind)
+        at(value, ("payload",))["product_id"] = product
+        n.member(value, context=context)
+
+    configured_group = group()
+    at(configured_group, ("members", 0, "payload"))["product_id"] = product
+    n.group(configured_group, context=context)
+
+    position_row = {**P, "product_id": product}
+    order_row = {**ORDER, "product_id": product}
+    market_row = {**M, "product_id": product}
+    n.position(position_row, context=context)
+    n.open_order(order_row, context=context)
+    n.snapshot_payload({"markets": [market_row]}, "MARKET", context=context)
+    n.snapshot_payload(
+        {"outcome": "SUCCESS", "rows": [position_row]}, "POSITIONS", context=context
+    )
+    n.snapshot_payload(
+        {"outcome": "SUCCESS", "rows": [order_row]}, "OPEN_ORDERS", context=context
+    )
+
+    execution = {**EXECUTION, "product_id": product}
+    n.execution_fact(execution, context=context)
+    transport_payload = {**TRANSPORT, "product_id": product}
+    n.transport(transport_payload, context=context)
+
+    for snapshot_kind, payload_kind, snapshot_payload_value in (
+        ("MARKET", "MARKET_SNAPSHOT", {"markets": [market_row]}),
+        (
+            "POSITIONS",
+            "POSITION_SNAPSHOT",
+            {"outcome": "SUCCESS", "rows": [position_row]},
+        ),
+        (
+            "OPEN_ORDERS",
+            "OPEN_ORDER_SNAPSHOT",
+            {"outcome": "SUCCESS", "rows": [order_row]},
+        ),
+    ):
+        snapshot = fact(snapshot_kind)
+        snapshot["immutable_payload"] = snapshot_payload_value
+        n.snapshot_fact(snapshot, context=context)
+        n.delivery(delivery(payload_kind, snapshot_payload_value), context=context)
+    n.delivery(delivery("EXECUTION_FACT", execution), context=context)
+    n.delivery(delivery("TRANSPORT_ACK", transport_payload), context=context)
+
+
+@pytest.mark.parametrize("product", ["BTC-USDT-SWAP", "CFG-OTHER"])
+def test_configured_context_rejects_nonmembers_at_every_product_boundary(product):
+    context = configured_context()
+    marks = member("CONTEXT_MARKS")
+    at(marks, ("payload", "rows", 0))["product_id"] = product
+    intent = member("INTENT")
+    at(intent, ("payload",))["product_id"] = product
+    execution_member = member("EXECUTION")
+    at(execution_member, ("payload",))["product_id"] = product
+    configured_group = {**group(), "members": [intent]}
+    position = {**P, "product_id": product}
+    order = {**ORDER, "product_id": product}
+    market = {**M, "product_id": product}
+    execution = {**EXECUTION, "product_id": product}
+    transport_payload = {**TRANSPORT, "product_id": product}
+    position_payload = {"outcome": "SUCCESS", "rows": [position]}
+    order_payload = {"outcome": "SUCCESS", "rows": [order]}
+    market_payload = {"markets": [market]}
+    boundaries = [
+        (n.member, marks),
+        (n.member, execution_member),
+        (n.member, intent),
+        (n.group, configured_group),
+        (n.position, position),
+        (n.open_order, order),
+        (n.transport, transport_payload),
+        (
+            lambda value, context: n.snapshot_payload(value, "MARKET", context=context),
+            market_payload,
+        ),
+        (
+            lambda value, context: n.snapshot_payload(value, "POSITIONS", context=context),
+            position_payload,
+        ),
+        (
+            lambda value, context: n.snapshot_payload(value, "OPEN_ORDERS", context=context),
+            order_payload,
+        ),
+    ]
+    for kind, payload in (
+        ("MARKET", market_payload),
+        ("POSITIONS", position_payload),
+        ("OPEN_ORDERS", order_payload),
+    ):
+        snapshot = fact(kind)
+        snapshot["immutable_payload"] = payload
+        boundaries.append((n.snapshot_fact, snapshot))
+    for kind, payload in (
+        ("TRANSPORT_ACK", transport_payload),
+        ("MARKET_SNAPSHOT", market_payload),
+        ("POSITION_SNAPSHOT", position_payload),
+        ("OPEN_ORDER_SNAPSHOT", order_payload),
+        ("EXECUTION_FACT", execution),
+    ):
+        boundaries.append((n.delivery, delivery(kind, payload)))
+
+    for check, fixture in boundaries:
+        with pytest.raises(ValueError):
+            check(deepcopy(fixture), context=context)
+
+
+@pytest.mark.parametrize(
+    "product", ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "P_A", "CFG-OTHER"]
+)
+def test_configured_product_context_replaces_p1_membership(product):
+    context = configured_context()
+    value = member("INTENT")
+    at(value, ("payload",))["product_id"] = product
+    with pytest.raises(ValueError):
+        n.member(value, context=context)
+    with pytest.raises(ValueError):
+        n.group({**group(), "members": [value]}, context=context)
+
+
+def test_configured_nested_context_is_required_through_group_delivery_and_snapshot():
+    context = configured_context()
+    configured_intent = member("INTENT")
+    at(configured_intent, ("payload",))["product_id"] = "CFG-MIDDLE"
+    configured_group = {**group(), "members": [configured_intent]}
+    n.group(configured_group, context=context)
+    with pytest.raises(ValueError):
+        n.group(configured_group)
+
+    execution = {**EXECUTION, "product_id": "CFG-MIDDLE"}
+    execution_delivery = delivery("EXECUTION_FACT", execution)
+    n.delivery(execution_delivery, context=context)
+    with pytest.raises(ValueError):
+        n.delivery(execution_delivery)
+
+    snapshot = fact("POSITIONS")
+    snapshot["immutable_payload"] = {
+        "outcome": "SUCCESS",
+        "rows": [{**P, "product_id": "CFG-MIDDLE"}],
+    }
+    n.snapshot_fact(snapshot, context=context)
+    snapshot["immutable_payload"]["rows"][0]["product_id"] = "CFG-OTHER"
+    with pytest.raises(ValueError):
+        n.snapshot_fact(snapshot, context=context)
+
+    position_delivery = delivery(
+        "POSITION_SNAPSHOT",
+        {"outcome": "SUCCESS", "rows": [{**P, "product_id": "CFG-OTHER"}]},
+    )
+    with pytest.raises(ValueError):
+        n.delivery(position_delivery, context=context)
+
+
+def test_configured_inspection_binds_profile_and_config_id_not_product_membership():
+    first = configured_context("config-one")
+    second = configured_context("config-two")
+    assert first.products == second.products == CONFIGURED_PRODUCTS
+    assert first.config_id != second.config_id
+    configured = {
+        **INSPECTION,
+        "profile_id": "SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1",
+        "config_id": "config-one",
+    }
+    n.inspection(configured, context=first)
+    with pytest.raises(ValueError):
+        n.inspection(configured, context=second)
+    with pytest.raises(ValueError):
+        n.inspection(configured)
+    with pytest.raises(ValueError):
+        n.inspection(INSPECTION, context=first)
+
+
+@pytest.mark.parametrize("profile", n._PROFILES)
+def test_every_p1_profile_rejects_a_configured_validation_context(profile):
+    context = configured_context()
+    n.inspection({**INSPECTION, "profile_id": profile})
+    with pytest.raises(ValueError):
+        n.inspection({**INSPECTION, "profile_id": profile}, context=context)

@@ -42,6 +42,16 @@ def rejected() -> dict[str, object]:
     return row
 
 
+def configuration_context(products=None, config_id="configured-v1"):
+    products = ["CFG-FIRST", "CFG-MIDDLE", "CFG-LAST"] if products is None else products
+    return {
+        "schema_version": "spider_configuration_context_v1",
+        "config_id": config_id,
+        "configuration_sha256": "a" * 64,
+        "products": list(products),
+    }
+
+
 def status() -> dict[str, object]:
     return dict(schema_version="spider_status_v1", run_id="r-1", state="RUNNING",
                 processed_boundary=None, persisted_boundary=None, failure_reason=None, primary_failure=None)
@@ -280,3 +290,38 @@ def test_nonprotocol_values_do_not_claim_semantic_validation():
     for value in [None, [], {"run_id": "r", "schema_version": "spider_completion_v1"}]:
         with pytest.raises(ValueError):
             a.validate_artifact(value)
+
+
+def test_configuration_context_is_exact_detached_and_immutable():
+    source = configuration_context()
+    context = a.configuration_context(source)
+    assert context.schema_version == "spider_configuration_context_v1"
+    assert context.config_id == "configured-v1"
+    assert context.configuration_sha256 == "a" * 64
+    assert context.products == ("CFG-FIRST", "CFG-MIDDLE", "CFG-LAST")
+    source["config_id"] = "mutated"
+    source["configuration_sha256"] = "b" * 64
+    source["products"][1] = "MUTATED"
+    assert context.config_id == "configured-v1"
+    assert context.configuration_sha256 == "a" * 64
+    assert context.products == ("CFG-FIRST", "CFG-MIDDLE", "CFG-LAST")
+    with pytest.raises(AttributeError):
+        context.config_id = "changed"
+
+
+@pytest.mark.parametrize(
+    "update",
+    [
+        {"schema_version": "other"},
+        {"config_id": ""},
+        {"configuration_sha256": "A" * 64},
+        {"configuration_sha256": "a" * 63},
+        {"products": []},
+        {"products": ["CFG", "CFG"]},
+        {"products": ["CFG", ""]},
+        {"extra": 1},
+    ],
+)
+def test_configuration_context_rejects_invalid_identity(update):
+    with pytest.raises(ValueError):
+        a.configuration_context({**configuration_context(), **update})
