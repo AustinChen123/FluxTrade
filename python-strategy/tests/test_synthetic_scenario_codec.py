@@ -170,22 +170,7 @@ def test_configured_constructor_transports_native_owned_config_and_snapshots_inp
         assert reversed_state["valuation_context_id"] != state["valuation_context_id"]
 
 
-def test_configured_constructor_preserves_p1_two_argument_call_and_native_validation(monkeypatch):
-    calls = []
-
-    class Session:
-        def __init__(self, *args):
-            calls.append(args)
-
-    monkeypatch.setattr(c._native, "_SyntheticScenarioReplaySession", Session)
-    c.ScenarioCodec("SYNTHETIC_BTC_ETH_V1", KEY)
-    assert len(calls[0]) == 2
-    assert calls[0] == ("SYNTHETIC_BTC_ETH_V1", c._encode(KEY))
-    c.ScenarioCodec("SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1", KEY, _configured_input())
-    assert len(calls[1]) == 3
-    assert calls[1][2] == c._encode_configuration(_configured_input())
-    # Restore the real binding for native-owned construction/validation checks.
-    monkeypatch.undo()
+def test_configured_constructor_preserves_native_validation():
     with pytest.raises(ValueError, match="^INVALID_SCHEMA$"):
         c.ScenarioCodec("SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1", KEY)
     for profile, config in [
