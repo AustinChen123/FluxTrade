@@ -129,7 +129,7 @@ fn multi_version_input() -> (CleanSeed, ConfiguredProduct) {
 fn assert_invalid_timeline(change: impl FnOnce(&mut ConfiguredProduct)) {
     let (seed, mut product) = multi_version_input();
     change(&mut product);
-    let result = ScenarioAccount::from_configured_empty(&seed, d("10"), vec![product]);
+    let result = ScenarioAccount::from_configured(&seed, d("10"), vec![product]);
     assert_eq!(result, Err("INVALID_SCHEMA"));
 }
 fn assert_context_changes(
@@ -138,8 +138,7 @@ fn assert_context_changes(
     products: &[ConfiguredProduct],
     change: impl FnOnce(&mut CleanSeed, &mut Decimal, &mut Vec<ConfiguredProduct>),
 ) {
-    let original =
-        ScenarioAccount::from_configured_empty(seed, leverage, products.to_vec()).unwrap();
+    let original = ScenarioAccount::from_configured(seed, leverage, products.to_vec()).unwrap();
     let mut changed_seed = seed.clone();
     let mut changed_leverage = leverage;
     let mut changed_products = products.to_vec();
@@ -149,7 +148,7 @@ fn assert_context_changes(
         &mut changed_products,
     );
     let changed =
-        ScenarioAccount::from_configured_empty(&changed_seed, changed_leverage, changed_products)
+        ScenarioAccount::from_configured(&changed_seed, changed_leverage, changed_products)
             .unwrap();
     assert_ne!(original.valuation_context_id, changed.valuation_context_id);
 }
@@ -237,8 +236,7 @@ fn assert_timeline_scale_equivalent(
 fn configured_empty_owners_preserve_order_and_shared_cash() {
     for count in [1, 2, 12] {
         let (seed, products) = input(count);
-        let owner =
-            ScenarioAccount::from_configured_empty(&seed, d("10"), products.clone()).unwrap();
+        let owner = ScenarioAccount::from_configured(&seed, d("10"), products.clone()).unwrap();
         let snapshot = owner.reservation().unwrap();
         assert_eq!(
             (
@@ -269,7 +267,7 @@ fn configured_empty_owners_preserve_order_and_shared_cash() {
         );
         let mut reversed = products;
         reversed.reverse();
-        let other = ScenarioAccount::from_configured_empty(&seed, d("10"), reversed).unwrap();
+        let other = ScenarioAccount::from_configured(&seed, d("10"), reversed).unwrap();
         assert_eq!(
             owner.valuation_context_id == other.valuation_context_id,
             count == 1
@@ -325,7 +323,7 @@ fn configured_shape_deviations_never_expose_owner() {
         let mut rows = products.clone();
         change(&mut rows[0]);
         assert_eq!(
-            ScenarioAccount::from_configured_empty(&seed, d("10"), rows),
+            ScenarioAccount::from_configured(&seed, d("10"), rows),
             Err("INVALID_SCHEMA")
         );
     }
@@ -333,32 +331,30 @@ fn configured_shape_deviations_never_expose_owner() {
     duplicate_id[1].instrument_code = 2;
     for rows in [vec![], duplicate_id] {
         assert_eq!(
-            ScenarioAccount::from_configured_empty(&seed, d("10"), rows),
+            ScenarioAccount::from_configured(&seed, d("10"), rows),
             Err("INVALID_SCHEMA")
         );
     }
     let mut duplicate_code = products.clone();
     duplicate_code[1].instrument_code = duplicate_code[0].instrument_code;
     assert_eq!(
-        ScenarioAccount::from_configured_empty(&seed, d("10"), duplicate_code),
+        ScenarioAccount::from_configured(&seed, d("10"), duplicate_code),
         Err("INVALID_SCHEMA")
     );
     for change in [
         |s: &mut CleanSeed| s.key.venue.clear(),
         |s: &mut CleanSeed| s.effective_at = -1,
         |s: &mut CleanSeed| s.config_id.clear(),
-        |s: &mut CleanSeed| s.positions = fixture().0.positions,
-        |s: &mut CleanSeed| s.orders = fixture().0.orders,
     ] {
         let mut invalid = seed.clone();
         change(&mut invalid);
         assert_eq!(
-            ScenarioAccount::from_configured_empty(&invalid, d("10"), products.clone()),
+            ScenarioAccount::from_configured(&invalid, d("10"), products.clone()),
             Err("INVALID_SCHEMA")
         );
     }
     assert_eq!(
-        ScenarioAccount::from_configured_empty(&seed, d("0"), products),
+        ScenarioAccount::from_configured(&seed, d("0"), products),
         Err("INVALID_SCHEMA")
     );
 }
@@ -399,7 +395,7 @@ fn configured_empty_accepts_non_scale_values_and_multiple_tiers() {
         product.marks[0].valid_from = 50;
         product.marks[0].valid_to = 100;
     }
-    let owner = ScenarioAccount::from_configured_empty(&seed, d("25"), products.clone()).unwrap();
+    let owner = ScenarioAccount::from_configured(&seed, d("25"), products.clone()).unwrap();
     assert!(owner.positions.is_empty() && owner.orders.is_empty());
     assert_eq!(owner.cash, d("-17.25"));
     assert_eq!(owner.seed_effective_at, 73);
@@ -409,14 +405,14 @@ fn configured_empty_accepts_non_scale_values_and_multiple_tiers() {
     assert_eq!(scenario.leverage, d("25"));
     let mut changed_seed = seed.clone();
     changed_seed.config_id = "another-config".into();
-    let other = ScenarioAccount::from_configured_empty(&changed_seed, d("25"), products).unwrap();
+    let other = ScenarioAccount::from_configured(&changed_seed, d("25"), products).unwrap();
     assert_ne!(owner.valuation_context_id, other.valuation_context_id);
 }
 
 #[test]
 fn configured_multi_version_timelines_resolve_boundaries_and_mark_gaps() {
     let (seed, product) = multi_version_input();
-    let owner = ScenarioAccount::from_configured_empty(&seed, d("10"), vec![product]).unwrap();
+    let owner = ScenarioAccount::from_configured(&seed, d("10"), vec![product]).unwrap();
     let (scenario, marks) = owner.btc_context().unwrap();
     let products = scenario.products();
     for (at, expected) in [
@@ -605,14 +601,13 @@ fn configured_context_identity_covers_every_configured_semantic_field() {
     equivalent[0].specs[0].contract_value = d("1.0");
     equivalent[0].tiers[0].tiers[0].mmr = d("0.0050");
     equivalent[0].marks[0].price = d("100.0");
-    let original = ScenarioAccount::from_configured_empty(&seed, leverage, products).unwrap();
-    let same = ScenarioAccount::from_configured_empty(&seed, leverage, equivalent).unwrap();
+    let original = ScenarioAccount::from_configured(&seed, leverage, products).unwrap();
+    let same = ScenarioAccount::from_configured(&seed, leverage, equivalent).unwrap();
     assert_eq!(original.valuation_context_id, same.valuation_context_id);
 
     let mut cash_only = seed.clone();
     cash_only.cash += d("1");
-    let cash_owner =
-        ScenarioAccount::from_configured_empty(&cash_only, leverage, input(2).1).unwrap();
+    let cash_owner = ScenarioAccount::from_configured(&cash_only, leverage, input(2).1).unwrap();
     assert_eq!(
         original.valuation_context_id,
         cash_owner.valuation_context_id

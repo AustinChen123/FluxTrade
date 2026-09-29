@@ -15,10 +15,7 @@ pub(super) fn construct(input: &str, key: AccountKey) -> Result<ScenarioAccount,
         ],
         &[],
     )?;
-    if rows["schema_version"].text()? != "synthetic_multi_product_config_v1"
-        || !rows["positions"].array()?.is_empty()
-        || !rows["orders"].array()?.is_empty()
-    {
+    if rows["schema_version"].text()? != "synthetic_multi_product_config_v1" {
         return Err("INVALID_SCHEMA");
     }
     let seed = CleanSeed {
@@ -26,18 +23,94 @@ pub(super) fn construct(input: &str, key: AccountKey) -> Result<ScenarioAccount,
         config_id: rows["config_id"].id()?,
         effective_at: rows["seed_effective_at"].integer(false)?,
         cash: rows["cash"].decimal()?,
-        positions: Vec::new(),
-        orders: Vec::new(),
+        positions: rows["positions"]
+            .array()?
+            .iter()
+            .map(position)
+            .collect::<Result<_, _>>()?,
+        orders: rows["orders"]
+            .array()?
+            .iter()
+            .map(order)
+            .collect::<Result<_, _>>()?,
     };
     let products = rows["products"]
         .array()?
         .iter()
         .map(product)
         .collect::<Result<Vec<_>, _>>()?;
-    ScenarioAccount::from_configured_empty(&seed, rows["leverage"].decimal()?, products)
+    ScenarioAccount::from_configured(&seed, rows["leverage"].decimal()?, products)
         .map_err(|_| "INVALID_SCHEMA")
 }
 
+fn position(value: &Json) -> Result<SeedPosition, Fault> {
+    let rows = value.object(&["product_id", "side", "quantity_contracts", "lots"], &[])?;
+    Ok(SeedPosition {
+        product: Product(rows["product_id"].id()?.into()),
+        side: rows["side"].side()?,
+        contracts: rows["quantity_contracts"].decimal()?,
+        lots: rows["lots"]
+            .array()?
+            .iter()
+            .map(seed_lot)
+            .collect::<Result<_, _>>()?,
+    })
+}
+fn seed_lot(value: &Json) -> Result<SeedLot, Fault> {
+    let rows = value.object(
+        &[
+            "seed_execution_id",
+            "seed_sequence",
+            "strategy_id",
+            "quantity_contracts",
+            "entry_price",
+        ],
+        &[],
+    )?;
+    Ok(SeedLot {
+        seed_execution_id: rows["seed_execution_id"].id()?,
+        seed_sequence: u64::try_from(rows["seed_sequence"].integer(true)?)
+            .map_err(|_| "INVALID_SCHEMA")?,
+        strategy_id: rows["strategy_id"].id()?,
+        contracts: rows["quantity_contracts"].decimal()?,
+        entry: rows["entry_price"].decimal()?,
+    })
+}
+fn order(value: &Json) -> Result<SeedOrder, Fault> {
+    let rows = value.object(
+        &[
+            "intent_id",
+            "order_id",
+            "client_order_id",
+            "strategy_id",
+            "product_id",
+            "side",
+            "limit_price",
+            "reduce_only",
+            "original_quantity_contracts",
+            "filled_quantity_contracts",
+            "canceled_quantity_contracts",
+            "remaining_quantity_contracts",
+            "status",
+        ],
+        &[],
+    )?;
+    Ok(SeedOrder {
+        intent_id: rows["intent_id"].id()?,
+        order_id: rows["order_id"].id()?,
+        client_id: rows["client_order_id"].id()?,
+        strategy_id: rows["strategy_id"].id()?,
+        product: ProfileProduct::BtcEth(Product(rows["product_id"].id()?.into())),
+        side: rows["side"].side()?,
+        price: rows["limit_price"].decimal()?,
+        reduce_only: rows["reduce_only"].boolean()?,
+        original: rows["original_quantity_contracts"].decimal()?,
+        filled: rows["filled_quantity_contracts"].decimal()?,
+        canceled: rows["canceled_quantity_contracts"].decimal()?,
+        remaining: rows["remaining_quantity_contracts"].decimal()?,
+        status: rows["status"].text()?.into(),
+    })
+}
 fn product(value: &Json) -> Result<ConfiguredProduct, Fault> {
     let rows = value.object(
         &[
@@ -171,6 +244,42 @@ mod tests {
         )
     }
 
+    fn lot(id: &str, sequence: &str, quantity: &str, entry: &str) -> String {
+        format!(
+            r#"{{"seed_execution_id":"{id}","seed_sequence":{sequence},"strategy_id":"strategy-a","quantity_contracts":"{quantity}","entry_price":"{entry}"}}"#
+        )
+    }
+    fn position(product: &str, side: &str, quantity: &str, lots: &[String]) -> String {
+        format!(
+            r#"{{"product_id":"{product}","side":"{side}","quantity_contracts":"{quantity}","lots":[{}]}}"#,
+            lots.join(",")
+        )
+    }
+    fn seed_order(
+        id: &str,
+        product: &str,
+        side: &str,
+        reduce: bool,
+        original: &str,
+        filled: &str,
+        remaining: &str,
+        status: &str,
+    ) -> String {
+        format!(
+            r#"{{"intent_id":"intent-{id}","order_id":"order-{id}","client_order_id":"client-{id}","strategy_id":"strategy-a","product_id":"{product}","side":"{side}","limit_price":"2","reduce_only":{reduce},"original_quantity_contracts":"{original}","filled_quantity_contracts":"{filled}","canceled_quantity_contracts":"0","remaining_quantity_contracts":"{remaining}","status":"{status}"}}"#
+        )
+    }
+    fn seeded(input: &str, positions: &[String], orders: &[String]) -> String {
+        edit(
+            input,
+            r#""positions":[],"orders":[]"#,
+            &format!(
+                "\"positions\":[{}],\"orders\":[{}]",
+                positions.join(","),
+                orders.join(",")
+            ),
+        )
+    }
     fn key() -> AccountKey {
         AccountKey {
             venue: "test-venue".into(),
@@ -190,6 +299,9 @@ mod tests {
         assert_eq!(construct(&input, key()), Err("INVALID_SCHEMA"));
     }
 
+    fn reject_position(input: &str, position: String) {
+        rejected(seeded(input, &[position], &[]));
+    }
     #[test]
     fn accepts_product_counts_preserves_array_order_and_ignores_object_key_order() {
         for count in [1, 2, 12] {
@@ -216,6 +328,134 @@ mod tests {
             reversed.reservation().unwrap().products[0].product,
             Product("ASSET-1".into())
         );
+    }
+    #[test]
+    fn seeded_positions_orders_and_fifo_are_canonical() {
+        let input = config(2, false);
+        let a = vec![
+            lot("exec-a", "0", "0.5", "2"),
+            lot("exec-b", "1", "0.5", "2"),
+        ];
+        let b = vec![lot("exec-c", "2", "0.5", "2")];
+        let positions = vec![
+            position("ASSET-0", "LONG", "1", &a),
+            position("ASSET-1", "SHORT", "0.5", &b),
+        ];
+        let orders = vec![
+            seed_order("open", "ASSET-0", "LONG", false, "0.5", "0", "0.5", "OPEN"),
+            seed_order(
+                "partial",
+                "ASSET-1",
+                "LONG",
+                true,
+                "0.5",
+                "0.2",
+                "0.3",
+                "PARTIALLY_FILLED",
+            ),
+        ];
+        let owner = construct(&seeded(&input, &positions, &orders), key()).unwrap();
+        let reversed = construct(
+            &seeded(
+                &input,
+                &[
+                    positions[1].clone(),
+                    position("ASSET-0", "LONG", "1", &[a[1].clone(), a[0].clone()]),
+                ],
+                &[orders[1].clone(), orders[0].clone()],
+            ),
+            key(),
+        )
+        .unwrap();
+        assert_eq!(owner, reversed);
+        let evidence = |owner: &ScenarioAccount| {
+            (
+                owner.reservation().unwrap(),
+                owner.inspect_state().unwrap().wire_json().unwrap(),
+            )
+        };
+        assert_eq!(evidence(&owner), evidence(&reversed));
+        let positions = reversed.positions.btc().unwrap();
+        assert_eq!(positions[&Product("ASSET-0".into())].side, Side::Long);
+        assert_eq!(positions[&Product("ASSET-1".into())].side, Side::Short);
+        assert_eq!(
+            positions[&Product("ASSET-0".into())]
+                .lots
+                .iter()
+                .map(|lot| lot.source.seed_sequence)
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
+        assert_eq!(reversed.orders["order-open"].facts.status, "OPEN");
+        assert_eq!(
+            reversed.orders["order-partial"].facts.status,
+            "PARTIALLY_FILLED"
+        );
+    }
+    #[test]
+    fn seed_wire_errors_fail_before_owner_exposure() {
+        let input = config(2, false);
+        let lots = vec![lot("exec-a", "0", "1", "2")];
+        let position_json = position("ASSET-0", "LONG", "1", &lots);
+        let order = seed_order("open", "ASSET-0", "LONG", false, "0.5", "0", "0.5", "OPEN");
+        let base = seeded(
+            &input,
+            std::slice::from_ref(&position_json),
+            std::slice::from_ref(&order),
+        );
+        for (old, new) in [
+            (r#""side":"LONG""#, r#""side":"BUY""#),
+            (r#""status":"OPEN""#, r#""status":"NEW""#),
+            (
+                r#""original_quantity_contracts":"0.5""#,
+                r#""original_quantity_contracts":"0.6""#,
+            ),
+            (r#""reduce_only":false"#, r#""reduce_only":true"#),
+            (r#""entry_price":"2""#, r#""entry_price":"2000""#),
+        ] {
+            rejected(edit(&base, old, new));
+        }
+        reject_position(&input, position("UNKNOWN", "LONG", "1", &lots));
+        for (quantity, lots) in [
+            ("1", vec![lot("exec-a", "0", "0.5", "2")]),
+            ("1", vec![lot("exec-a", "1", "1", "2")]),
+            ("1", vec![lot("exec-a", "-1", "1", "2")]),
+            ("1", vec![lot("exec-a", "9223372036854775808", "1", "2")]),
+            (
+                "1",
+                vec![
+                    lot("exec-a", "0", "0.5", "2"),
+                    lot("exec-a", "1", "0.5", "2"),
+                ],
+            ),
+            (
+                "1",
+                vec![
+                    lot("exec-a", "0", "0.5", "2"),
+                    lot("exec-b", "0", "0.5", "2"),
+                ],
+            ),
+        ] {
+            reject_position(&input, position("ASSET-0", "LONG", quantity, &lots));
+        }
+        let second = seed_order(
+            "second", "ASSET-0", "LONG", false, "0.5", "0", "0.5", "OPEN",
+        );
+        for (field, prefix) in [
+            ("intent_id", "intent"),
+            ("order_id", "order"),
+            ("client_order_id", "client"),
+        ] {
+            let duplicate = second.replace(
+                &format!(r#""{field}":"{prefix}-second""#),
+                &format!(r#""{field}":"{prefix}-open""#),
+            );
+            rejected(seeded(
+                &input,
+                std::slice::from_ref(&position_json),
+                &[order.clone(), duplicate],
+            ));
+        }
     }
 
     #[test]

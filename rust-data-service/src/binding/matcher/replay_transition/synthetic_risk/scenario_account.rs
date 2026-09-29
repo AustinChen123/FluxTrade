@@ -386,17 +386,13 @@ fn aligned(value: Decimal, step: Decimal) -> bool {
 }
 
 impl ScenarioAccount {
-    fn from_configured_empty(
+    fn from_configured(
         seed: &CleanSeed,
         leverage: Decimal,
         products: Vec<ConfiguredProduct>,
     ) -> Result<Self, Fault> {
         seed.key.validate().map_err(|_| "INVALID_SCHEMA")?;
-        if !identity(&seed.config_id)
-            || seed.effective_at < 0
-            || !seed.positions.is_empty()
-            || !seed.orders.is_empty()
-        {
+        if !identity(&seed.config_id) || seed.effective_at < 0 {
             return Err("INVALID_SCHEMA");
         }
         let scenario = FrozenScenario {
