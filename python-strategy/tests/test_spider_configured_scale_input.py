@@ -4,11 +4,14 @@ import hashlib
 import json
 from decimal import Decimal
 from typing import Any, cast
+from unittest.mock import patch
 
 from src.core.backtest import spider_configured_scale_input as scale
 from src.core.backtest import spider_scenario_plans
 from src.core.backtest import synthetic_scenario_codec as codec
+from src.core.backtest.synthetic_scenario_replay import _ReplayComposition
 from src.core.backtest.spider_run_artifacts import canonical_bytes
+from spider_acceptance_fixtures import delivery_id
 
 _PRODUCTS = [
     "BTC-USDT-SWAP",
@@ -28,7 +31,8 @@ _ORDER_ID = "scenario-order-v1:[17, 9a, 5a, ba, 18, 13, 08, a2, cd, 67, 71, 3c, 
 _CONFIGURATION_SHA256 = (
     "807054044bdd182274509535ecf8bbc4598f00b6a92b598c6228129a6ff11b70"
 )
-_PLAN_INPUT_SHA256 = "a0be02b617817716be635b60c0d6332e759341a75040fe8ed83e9d8249f93c6f"
+_PLAN_INPUT_SHA256 = "bf83787295303b933007849c5bf323649a19806db4c30f5dc6bc3e0eff324396"
+_DOGE_ORDER_ID = "scenario-order-v1:[e8, dd, fc, 11, a7, a3, d8, 1e, 93, 5c, 69, dc, 3e, f8, 71, 12, 83, 76, 45, 7d, 9f, 76, 54, db, a0, c0, 3b, ff, ae, 79, a7, d5]"
 
 
 def _input() -> dict[str, Any]:
@@ -117,6 +121,7 @@ def test_plan_input_schema_hash_detachment_and_p1_vectors_are_frozen():
         "configuration_sha256",
         "products",
         "recipe",
+        "callback_plans",
     }
     assert set(first) == expected_keys
     assert first["schema_version"] == "spider_configured_plan_input_v1"
@@ -138,8 +143,8 @@ def test_plan_input_schema_hash_detachment_and_p1_vectors_are_frozen():
         scale._PLAN_INPUT_SHA256 == hashlib.sha256(canonical_bytes(first)).hexdigest()
     )
     assert scale._PLAN_INPUT_SHA256 == _PLAN_INPUT_SHA256
-    assert len(first["recipe"]) == 17
-    assert [step["at"] for step in first["recipe"]] == list(range(501, 518))
+    assert len(first["recipe"]) == 22
+    assert [step["at"] for step in first["recipe"][:17]] == list(range(501, 518))
     assert [step["group"]["group_id"] for step in first["recipe"][:16]] == [
         f"G-{at}" for at in range(501, 517)
     ]
@@ -147,6 +152,8 @@ def test_plan_input_schema_hash_detachment_and_p1_vectors_are_frozen():
         "namespace": "SOURCE",
         "fact_id": "event-516",
     }
+    assert [step["at"] for step in first["recipe"][17:19]] == [518, 519]
+    assert first["configuration_sha256"] == _CONFIGURATION_SHA256
 
     def no_float(value: object) -> None:
         assert type(value) is not float
@@ -161,6 +168,7 @@ def test_plan_input_schema_hash_detachment_and_p1_vectors_are_frozen():
     before = canonical_bytes(first)
     first["configuration"]["products"][0]["specs"][0]["contract_value"] = "9"
     first["recipe"][0]["group"]["members"][0]["payload"]["product_id"] = "changed"
+    first["callback_plans"][0]["expected_policy_events"].append("changed")
     assert canonical_bytes(_input()) == before
 
     assert spider_scenario_plans.PLAN_IDS == (
@@ -361,3 +369,285 @@ def test_literal_section6_configuration_and_recipe_drive_real_native_codec():
     }
     assert owner.inspect_state() == before_ack
     _assert_checkpoint(owner, account, 517)
+
+
+def test_configured_tail_execution_callback_and_overlapping_polls_are_causal():
+    plan_input = _input()
+    account = cast(codec.Account, plan_input["account_key"])
+    callback_plans = cast(list[dict[str, Any]], plan_input["callback_plans"])
+    expected_callback_ids = [
+        "0a8a37271c61a66b240643fc8d9f88ba6e6c534b898cff02906bedd665f65a5a",
+        "1bb9face9ceb3ebd7ce8b6a0563bd98af203dd584cebef5d13ecfbe34399a126",
+        "2ea7684018d26b983bdaeb77cf3328199fd1cdb8275aa5baa932eac5e646a5be",
+        "0e10645813c9635ae226bbb928a2b12a97b553a5588da4486e4335bfe375a31e",
+        "8a08c04f06607365d119435cdd419b4d4a5a31bc865f8065dcd8f7b68440d3cc",
+        "abb4b7b0a891762cef3459945e4f4ade4255777affd4854eb89171798590617d",
+        "10f5772ed0c36142e315e24201395e64f7b0740dce530b779483fff2eff54c74",
+        "aeb806c3647e4e0fe89139d512fc0d5e71e5904f1e4edf978130c47bdfa319a1",
+    ]
+    assert [plan["delivery_id"] for plan in callback_plans] == expected_callback_ids
+    assert all(
+        set(plan)
+        == {
+            "delivery_id",
+            "expected_policy_events",
+            "financial_items",
+            "market_requests",
+        }
+        and plan["expected_policy_events"] == []
+        and plan["financial_items"] == []
+        and plan["market_requests"] == []
+        for plan in callback_plans
+    )
+    emissions = {plan["delivery_id"]: plan for plan in callback_plans}
+    replay = _ReplayComposition(
+        plan_input["native_profile"],
+        account,
+        emissions,
+        configuration=cast(dict[str, object], plan_input["configuration"]),
+    )
+    recipe = cast(list[dict[str, Any]], plan_input["recipe"])
+    assert [step["kind"] for step in recipe[17:]] == [
+        "SOURCE_GROUP",
+        "SOURCE_GROUP",
+        "DELIVERY",
+        "POLL_BEGIN",
+        "POLL_BEGIN",
+    ]
+
+    for step in recipe[:17]:
+        if step["kind"] == "SOURCE_GROUP":
+            assert step["schedule_sequence"] == 0
+            group = _wire_group(step["group"])
+            queued = replay._enqueue(
+                dict(
+                    kind="SOURCE_GROUP",
+                    schedule_sequence=step["schedule_sequence"],
+                    group=group,
+                )
+            )
+            assert queued["classification"] == "PENDING"
+            result = replay._dispatch_due(step["at"])
+            assert result["classification"] == "SUCCESS"
+        else:
+            delivery = replay._codec.build_delivery(
+                cast(codec.Projection, step["projection"])
+            )
+            assert delivery["delivery_id"] == expected_callback_ids[0]
+            queued = replay._enqueue(
+                dict(kind="DELIVERY", delivery=delivery),
+                emissions[delivery["delivery_id"]],
+            )
+            assert queued["classification"] == "PENDING"
+            assert replay._dispatch_due(step["at"])["classification"] == "SUCCESS"
+
+    before_tail = replay._codec.inspect_state()
+    assert before_tail["account_version"] == 15
+    assert (before_tail["cash"], before_tail["total_fees"]) == (
+        Decimal("121.15"),
+        Decimal("0.05"),
+    )
+
+    for step in recipe[17:19]:
+        assert step["schedule_sequence"] == 0
+        group = _wire_group(step["group"])
+        assert group["group_id"] == f"G-{step['at']}"
+        stamp = group["members"][0]["stamp"]
+        assert stamp["event_id"] == f"event-{step['at']}"
+        assert stamp["scenario_ordinal"] == 30
+        assert stamp["causal_parent_ids"] == (
+            [] if step["at"] == 518 else ["event-518"]
+        )
+        payload = group["members"][0]["payload"]
+        assert payload["order_id"] == _DOGE_ORDER_ID
+        assert payload["external_execution_id"] == f"fill-{step['at']}"
+        assert payload["candidate_id"] == f"candidate-{step['at']}"
+        assert payload["source_id"] == f"source-{step['at']}"
+        assert payload["namespace"] == "test"
+        assert payload["product_id"] == "DOGE-USDT-SWAP"
+        assert payload["side"] == "LONG"
+        assert payload["price"] == Decimal("100")
+        assert payload["quantity_contracts"] == Decimal("0.5")
+        assert payload["liquidity"] == "SYNTHETIC_TAKER"
+        assert payload["matching_effective_at"] == payload["visible_at"] == step["at"]
+        assert payload["expected_account_version"] == (15 if step["at"] == 518 else 16)
+        assert payload["expected_order_version"] == (1 if step["at"] == 518 else 2)
+        result = replay._enqueue(
+            dict(kind="SOURCE_GROUP", schedule_sequence=0, group=group)
+        )
+        assert result["classification"] == "PENDING"
+        assert replay._dispatch_due(step["at"])["classification"] == "SUCCESS"
+        committed = replay._records[(0, group["group_id"])]["result"]["group_result"]
+        assert committed["classification"] == "COMMITTED"
+        assert committed["account_version_before"] == (15 if step["at"] == 518 else 16)
+        assert committed["account_version_after"] == (16 if step["at"] == 518 else 17)
+
+    native_v17 = replay._codec.inspect_state()
+    assert native_v17["account_version"] == 17
+    assert native_v17["cash"] == Decimal("121.05")
+    assert native_v17["total_fees"] == Decimal("0.15")
+    assert native_v17["gross_realized"] == Decimal("0")
+    assert native_v17["lifecycle"] == "RISK_STABLE"
+    assert _account_values(replay._codec, account, 519) == (
+        Decimal("121.05"),
+        Decimal("5.05"),
+    )
+    assert Decimal("121.05") - Decimal("5.05") == Decimal("116")
+    positions = cast(
+        codec.Positions,
+        _snapshot(replay._codec, account, "POSITIONS", 519, "DOGE-POSITIONS")[
+            "immutable_payload"
+        ],
+    )["rows"]
+    assert positions == [
+        {
+            "product_id": "BTC-USDT-SWAP",
+            "margin_mode": "cross",
+            "position_contracts": Decimal("0.5"),
+            "last_price": Decimal("100"),
+            "notional_usd": Decimal("50"),
+        },
+        {
+            "product_id": "DOGE-USDT-SWAP",
+            "margin_mode": "cross",
+            "position_contracts": Decimal("1"),
+            "last_price": Decimal("100"),
+            "notional_usd": Decimal("100"),
+        },
+    ]
+
+    delayed_step = recipe[19]
+    delayed_projection = delayed_step["projection"]
+    assert delayed_projection == {
+        "schema_version": "delivery_projection_v1",
+        "reference": {"namespace": "SOURCE", "fact_id": "event-518"},
+        "payload_kind": "EXECUTION_FACT",
+        "occurrence_index": 0,
+        "schedule_sequence": 6,
+        "visible_at": 100018,
+    }
+    delayed = replay._codec.build_delivery(cast(codec.Projection, delayed_projection))
+    assert delayed["delivery_id"] == expected_callback_ids[1]
+    immutable_fact = delayed["immutable_payload"]
+    assert (
+        immutable_fact["state"],
+        immutable_fact["cumulative_filled_size_contracts"],
+        immutable_fact["commit_account_version"],
+        immutable_fact["execution_effective_at"],
+    ) == ("partially_filled", Decimal("0.5"), 16, 518)
+    assert (
+        replay._enqueue(
+            dict(kind="DELIVERY", delivery=delayed), emissions[delayed["delivery_id"]]
+        )["classification"]
+        == "PENDING"
+    )
+
+    poll_steps = recipe[20:]
+    assert [
+        (step["plan"]["poll_id"], step["plan"]["issued_at"]) for step in poll_steps
+    ] == [
+        ("Q1", 100000),
+        ("Q2", 100001),
+    ]
+    for step in poll_steps:
+        plan = step["plan"]
+        assert "earn" not in plan
+        assert replay._begin_poll(plan)["classification"] == "SUCCESS"
+        for index, key in enumerate(("trading", "positions", "open_orders")):
+            stage = plan[key]
+            request = stage["snapshot_request"]
+            projection = stage["delivery_projection"]
+            expected_sequence = index + (0 if plan["poll_id"] == "Q1" else 3)
+            expected_time = (100020 if plan["poll_id"] == "Q1" else 100010) + 2 * index
+            expected_kind = {
+                "trading": "TRADING_SNAPSHOT",
+                "positions": "POSITION_SNAPSHOT",
+                "open_orders": "OPEN_ORDER_SNAPSHOT",
+            }[key]
+            expected_fixture = {
+                "trading": "POLL_Q1_S1" if plan["poll_id"] == "Q1" else "POLL_Q2_S2",
+                "positions": "POLL_POSITIONS_EMPTY",
+                "open_orders": "POLL_OPEN_ORDERS_EMPTY",
+            }[key]
+            assert request["snapshot_id"] == f"{plan['poll_id']}{key}"
+            assert request["capture_mode"] == "FROZEN_POLL_FIXTURE"
+            assert request["fixture_key"] == expected_fixture
+            assert (
+                request["continuation_id"]
+                == projection["continuation_id"]
+                == plan["poll_id"]
+            )
+            assert request["captured_at"] == projection["visible_at"] == expected_time
+            assert projection["schedule_sequence"] == expected_sequence
+            assert projection["occurrence_index"] == 0
+            assert "transport" not in projection
+            assert projection["payload_kind"] == expected_kind
+            assert projection["reference"] == {
+                "namespace": "SNAPSHOT",
+                "fact_id": request["snapshot_id"],
+            }
+            assert (
+                emissions[
+                    delivery_id(
+                        request["snapshot_id"],
+                        expected_kind,
+                        "SNAPSHOT",
+                        account=account,
+                    )
+                ]["delivery_id"]
+                == expected_callback_ids[expected_sequence + 2]
+            )
+
+    policy_orders = replay._policy.orders
+    policy_fills = replay._policy.order_filled
+    local_actions: list[tuple[str, str]] = []
+
+    def observe_local(name, original):
+        def call(*args, **kwargs):
+            active = [
+                poll_id
+                for poll_id, record in replay._polls.items()
+                if record.index == 2 and record.observation.status == "IN_PROGRESS"
+            ]
+            local_actions.extend((name, poll_id) for poll_id in active)
+            return original(*args, **kwargs)
+
+        return call
+
+    with (
+        patch.object(replay._policy, "orders", wraps=policy_orders) as orders,
+        patch.object(replay._policy, "order_filled", wraps=policy_fills) as fills,
+        patch.object(
+            replay._policy,
+            "raise_leverage",
+            side_effect=observe_local("raise_leverage", replay._policy.raise_leverage),
+        ) as leverage,
+        patch.object(
+            replay._policy,
+            "check_risk",
+            side_effect=observe_local("check_risk", replay._policy.check_risk),
+        ) as risk,
+    ):
+        assert replay._dispatch_due(100014)["classification"] == "SUCCESS"
+        assert replay._polls["Q2"].observation.status == "COMPLETED"
+        assert replay._policy.capital["total"] == Decimal("110")
+        assert replay._dispatch_due(100018)["classification"] == "SUCCESS"
+        assert replay._policy.replies[_DOGE_ORDER_ID]["accFillSz"] == "0.5"
+        assert replay._policy.capital["total"] == Decimal("110")
+        assert replay._codec.inspect_state() == native_v17
+        assert replay._dispatch_due(100024)["classification"] == "SUCCESS"
+        assert replay._polls["Q1"].observation.status == "COMPLETED"
+        assert replay._policy.capital["total"] == Decimal("100")
+        assert replay._codec.inspect_state() == native_v17
+        assert orders.call_count == 1
+        assert fills.call_count == 0
+        assert leverage.call_count == risk.call_count == 2
+
+    assert local_actions == [
+        ("raise_leverage", "Q2"),
+        ("check_risk", "Q2"),
+        ("raise_leverage", "Q1"),
+        ("check_risk", "Q1"),
+    ]
+    assert replay._policy.events == []
+    assert replay._policy.replies == {}
