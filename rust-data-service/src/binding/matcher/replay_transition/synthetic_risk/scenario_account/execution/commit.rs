@@ -187,13 +187,18 @@ impl ScenarioAccount {
                         sequence: self.commit_sequence,
                     });
                 let (scenario, _) = self.btc_context()?;
-                let (spec, _) = scenario.resolve(product, template.matching_effective_at)?;
+                let (spec, tier) = scenario.resolve(product, template.matching_effective_at)?;
+                let context = if scenario.configured.is_some() {
+                    hypothetical_settlement::Context::Configured(scenario, product, spec, tier)
+                } else {
+                    hypothetical_settlement::Context::BtcEth(scenario, spec)
+                };
                 let settled = hypothetical_settlement::calculate(
                     position_before.as_ref(),
                     template.side,
                     template.quantity,
                     template.price,
-                    (scenario, spec),
+                    context,
                     hypothetical_settlement::FeePolicy::BtcEthTradingTaker,
                     opening.as_ref(),
                 )?;

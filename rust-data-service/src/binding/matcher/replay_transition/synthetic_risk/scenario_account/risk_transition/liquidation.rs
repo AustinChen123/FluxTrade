@@ -240,6 +240,9 @@ fn prepare_step(owner: &ScenarioAccount, history: &[Receipt]) -> Result<commit::
     let step_index = next_index(&owner.key, episode.id, history)?;
     let before = owner.projection()?;
     let (scenario, marks) = owner.btc_context()?;
+    if scenario.configured.is_some() {
+        return Err("UNSUPPORTED_CONFIGURED_LIQUIDATION");
+    }
     owner.validate_context(before.effective_at)?;
     let reservation_before = owner.reservation()?;
     let risk = owner.classify_risk(&reservation_before)?;

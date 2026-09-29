@@ -188,7 +188,9 @@ pub(super) fn calculate<'a>(
     } else {
         signed_sum(&realized)?
     };
-    if position.contracts > spec.maximum {
+    if position.contracts > Decimal::ZERO
+        && position.contracts > context.tier_ceiling(position.contracts, fee_policy)?
+    {
         return Err("UNSUPPORTED_POSITION_TIER");
     }
     Ok(Draft {

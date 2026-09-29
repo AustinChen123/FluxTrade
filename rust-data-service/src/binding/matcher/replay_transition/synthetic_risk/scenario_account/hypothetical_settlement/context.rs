@@ -4,6 +4,7 @@ use super::*;
 #[derive(Clone, Copy)]
 pub(in super::super) enum Context<'a> {
     BtcEth(&'a FrozenScenario, &'a Spec),
+    Configured(&'a FrozenScenario, &'a Product, &'a Spec, &'a TierVersion),
     GoldenCancel(&'a golden_cancel::Config),
     P1O03,
 }
@@ -50,6 +51,32 @@ impl<'a> Context<'a> {
                 }
                 Ok(Self::btc(spec))
             }
+            Self::Configured(scenario, product, spec, tier) => {
+                if scenario.leverage != Decimal::TEN
+                    || scenario.configured.as_ref().is_none_or(|rows| {
+                        rows.iter().any(|row| {
+                            row.taker_fee != Decimal::new(1, 3)
+                                || (row.product == *product
+                                    && (!row.specs.contains(spec) || !row.tiers.contains(tier)))
+                        })
+                    })
+                {
+                    return Err("UNSUPPORTED_CONFIGURED_SETTLEMENT");
+                }
+                Ok(Scaling {
+                    version: &spec.version,
+                    contract_value: spec.contract_value,
+                    multiplier: spec.multiplier,
+                    tick: spec.tick,
+                    lot: spec.lot,
+                    minimum: spec.minimum,
+                    maximum: tier
+                        .tiers
+                        .last()
+                        .ok_or("UNSUPPORTED_POSITION_TIER")?
+                        .maximum,
+                })
+            }
             Self::GoldenCancel(_) | Self::P1O03 => {
                 let expected = match self {
                     Self::GoldenCancel(config) => {
@@ -82,11 +109,44 @@ impl<'a> Context<'a> {
                 .find(|s| s.product == active.product && s.version == version)
                 .map(Self::btc)
                 .ok_or("INVALID_LOT_ORIGIN_SPEC"),
+            Self::Configured(scenario, product, _, _) => scenario
+                .configured
+                .as_ref()
+                .and_then(|rows| rows.iter().find(|row| row.product == *product))
+                .and_then(|row| row.specs.iter().find(|spec| spec.version == version))
+                .map(|spec| Scaling {
+                    version: &spec.version,
+                    contract_value: spec.contract_value,
+                    multiplier: spec.multiplier,
+                    tick: spec.tick,
+                    lot: spec.lot,
+                    minimum: spec.minimum,
+                    maximum: scenario
+                        .configured
+                        .as_ref()
+                        .and_then(|rows| rows.iter().find(|row| row.product == *product))
+                        .and_then(|row| row.tiers.last())
+                        .and_then(|tiers| tiers.tiers.last())
+                        .map_or(Decimal::ZERO, |row| row.maximum),
+                })
+                .ok_or("INVALID_LOT_ORIGIN_SPEC"),
             Self::GoldenCancel(_) if version == "gt03-spec-v1" => {
                 self.active(FeePolicy::GoldenCancelTradingTaker)
             }
             Self::P1O03 if version == "gt03-spec-v1" => self.active(FeePolicy::P1O03Zero),
             _ => Err("INVALID_LOT_ORIGIN_SPEC"),
+        }
+    }
+
+    pub(super) fn tier_ceiling(self, contracts: Decimal, fee: FeePolicy) -> Result<Decimal, Fault> {
+        match self {
+            Self::Configured(_, _, _, tier) => tier
+                .tiers
+                .iter()
+                .find(|row| contracts >= row.minimum && contracts <= row.maximum)
+                .map(|row| row.maximum)
+                .ok_or("UNSUPPORTED_POSITION_TIER"),
+            _ => Ok(self.active(fee)?.maximum),
         }
     }
 }

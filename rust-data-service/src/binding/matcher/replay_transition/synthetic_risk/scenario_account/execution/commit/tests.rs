@@ -177,6 +177,315 @@ fn committed(owner: &mut ScenarioAccount, candidate: &ExecutionCandidate) -> Com
     receipt
 }
 
+fn configured_position(owner: &mut ScenarioAccount, product: &Product, origin: &str) {
+    owner.commit_sequence = 1;
+    owner.positions.btc_mut().unwrap().insert(
+        product.clone(),
+        ProductPosition {
+            side: Side::Long,
+            contracts: d("0.5"),
+            entry_basis: d("50"),
+            lots: vec![EntryLot {
+                source: SeedLot {
+                    seed_execution_id: "seed".into(),
+                    seed_sequence: 0,
+                    strategy_id: "strategy".into(),
+                    contracts: d("0.5"),
+                    entry: d("100"),
+                },
+                origin_spec_version: origin.into(),
+                execution_id: [9; 32],
+                base_quantity: d("0.5"),
+            }],
+        },
+    );
+}
+
+fn configured_order(
+    seed: &SeedOrder,
+    id: &str,
+    product: &Product,
+    side: Side,
+    price: &str,
+    qty: &str,
+) -> SeedOrder {
+    SeedOrder {
+        order_id: id.into(),
+        intent_id: format!("I-{id}"),
+        client_id: format!("C-{id}"),
+        product: ProfileProduct::BtcEth(product.clone()),
+        side,
+        price: d(price),
+        reduce_only: false,
+        original: d(qty),
+        filled: Decimal::ZERO,
+        canceled: Decimal::ZERO,
+        remaining: d(qty),
+        status: "OPEN".into(),
+        ..seed.clone()
+    }
+}
+
+#[test]
+fn configured_execution_uses_product_owned_specs_for_fifo_and_duplicates() {
+    for index in [0, 2, 3] {
+        let (mut seed, mut products) = super::super::super::configured_tests::input(4);
+        let product = products[index].product.clone();
+        let (contract_value, multiplier) = match index {
+            0 => ("1", "1"),
+            2 => ("2", "1.25"),
+            _ => ("3", "1.5"),
+        };
+        let unit = d(contract_value) * d(multiplier);
+        products[index].specs[0].contract_value = d(contract_value);
+        products[index].specs[0].multiplier = d(multiplier);
+        products[index].tiers[0].tiers[0].minimum = d("0.5");
+        let prototype = fixture().0.orders[0].clone();
+        seed.orders = [("L", Side::Long, "101"), ("S", Side::Short, "99")]
+            .map(|(id, side, price)| configured_order(&prototype, id, &product, side, price, "1"))
+            .into();
+        let mut owner = ScenarioAccount::from_configured(&seed, d("10"), products).unwrap();
+        let mut second_lot = None;
+        for (step, (order, side, quantity, price, remaining)) in [
+            ("L", Side::Long, "0.5", "100", "0.5"),
+            ("L", Side::Long, "0.5", "101", "0"),
+            ("S", Side::Short, "0.5", "102", "0.5"),
+            ("S", Side::Short, "0.5", "99", "0"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut candidate = input(
+                &owner,
+                order,
+                &format!("CFG-{index}-{step}"),
+                quantity,
+                price,
+            );
+            candidate.template.matching_effective_at = 501 + step as i64;
+            candidate.spec_version = "scale-spec-v1".into();
+            candidate.rule_data_version = "scale-tier-v1".into();
+            candidate.expected_account_version = owner.state_version;
+            candidate.expected_order_version = owner.orders[order].version;
+            candidate.template.side = side;
+            let receipt = committed(&mut owner, &candidate);
+            let fee = unit * d(["0.05", "0.0505", "0.051", "0.0495"][step]);
+            let pnl = unit * d(["0", "0", "1", "-1"][step]);
+            assert_eq!(receipt.fee_amount, fee);
+            assert_eq!(receipt.realized_pnl_delta, pnl);
+            assert_eq!(
+                (receipt.contract_value, receipt.quantity, receipt.price),
+                (d(contract_value), d("0.5"), d(price))
+            );
+            assert_eq!(receipt.product, ProfileProduct::BtcEth(product.clone()));
+            let cumulative_fees = unit * d(["0.05", "0.1005", "0.1515", "0.201"][step]);
+            assert_eq!(
+                owner.cash,
+                d("121.2") + unit * d(["0", "0", "1", "0"][step]) - cumulative_fees
+            );
+            assert_eq!(owner.fees, cumulative_fees);
+            assert_eq!(
+                (
+                    receipt.state_version_before,
+                    receipt.state_version_after,
+                    receipt.commit_sequence
+                ),
+                (step as u64, step as u64 + 1, step as u64)
+            );
+            assert_eq!(
+                (receipt.order_version_before, receipt.order_version_after),
+                ([0, 1, 0, 1][step], [1, 2, 1, 2][step])
+            );
+            assert_eq!(
+                (
+                    receipt.order_after.filled,
+                    receipt.order_after.remaining,
+                    receipt.order_after.status.as_str()
+                ),
+                (
+                    d(["0.5", "1", "0.5", "1"][step]),
+                    d(remaining),
+                    if remaining == "0" {
+                        "FILLED"
+                    } else {
+                        "PARTIALLY_FILLED"
+                    }
+                )
+            );
+            if step == 0 {
+                assert!(receipt.position_before.is_none());
+            } else {
+                let before = receipt.position_before.as_ref().unwrap();
+                assert_eq!(
+                    (before.contracts, before.entry_basis),
+                    (
+                        d(["0.5", "1", "0.5"][step - 1]),
+                        unit * d(["50", "100.5", "50.5"][step - 1])
+                    )
+                );
+            }
+            if step == 1 {
+                second_lot = Some(receipt.execution_id);
+            }
+            assert_eq!(
+                (
+                    receipt.spec_version.as_str(),
+                    receipt.rule_data_version.as_str()
+                ),
+                ("scale-spec-v1", "scale-tier-v1")
+            );
+            let position = owner.positions.btc().unwrap().get(&product);
+            if step == 3 {
+                assert!(position.is_none() && receipt.position_after.is_none());
+            } else {
+                let position = position.unwrap();
+                assert_eq!(
+                    (position.contracts, position.entry_basis),
+                    (
+                        d(["0.5", "1", "0.5"][step.min(2)]),
+                        unit * d(["50", "100.5", "50.5"][step.min(2)])
+                    )
+                );
+                assert_eq!(receipt.position_after.as_ref(), Some(position));
+                if step == 2 {
+                    assert_eq!(position.lots.len(), 1);
+                    assert_eq!(position.lots[0].execution_id, second_lot.unwrap());
+                    assert_eq!(position.lots[0].source.entry, d("101"));
+                }
+            }
+            assert_eq!(receipt.cash_deltas[0].1, pnl - fee);
+            if step == 0 {
+                let after = owner.clone();
+                assert_eq!(owner.execute(&candidate), Ok(Reply::Duplicate(receipt)));
+                assert_eq!(owner, after);
+            }
+        }
+    }
+}
+
+#[test]
+fn configured_settlement_mismatches_and_invalid_domains_publish_no_financial_state() {
+    let (mut seed, mut products) = super::super::super::configured_tests::input(2);
+    let product = products[0].product.clone();
+    let prototype = fixture().0.orders[0].clone();
+    seed.orders = vec![configured_order(
+        &prototype,
+        "L",
+        &product,
+        Side::Long,
+        "100",
+        "1",
+    )];
+    products[1].taker_fee = d("0.001");
+    products[1].specs[0].version = "foreign-spec".into();
+    let expected = [
+        "INVALID_LOT_ORIGIN_SPEC",
+        "INVALID_LOT_ORIGIN_SPEC",
+        "UNSUPPORTED_CONFIGURED_SETTLEMENT",
+        "UNSUPPORTED_CONFIGURED_SETTLEMENT",
+        "UNSUPPORTED_CONFIGURED_SETTLEMENT",
+        "UNSUPPORTED_POSITION_TIER",
+        "UNSUPPORTED_POSITION_TIER",
+    ];
+    for index in 0..expected.len() {
+        let mut rows = products.clone();
+        let mut leverage = d("10");
+        match index {
+            2 => leverage = d("5"),
+            3 => rows[0].taker_fee = d("0.002"),
+            4 => rows[1].taker_fee = d("0.002"),
+            5 => rows[0].tiers[0].tiers[0].maximum = d("0.75"),
+            6 => {
+                rows[0].tiers[0].interval.to = Some(501);
+                rows[0].tiers[0].tiers[0].maximum = d("0.75");
+                let mut future = rows[0].tiers[0].clone();
+                future.version = "future-tier".into();
+                future.interval = Interval {
+                    from: 501,
+                    to: None,
+                };
+                future.tiers[0].maximum = d("100");
+                rows[0].tiers.push(future);
+                assert!(rows[0].tiers[1].tiers[0].maximum >= d("1"));
+            }
+            _ => {}
+        }
+        let mut case_seed = seed.clone();
+        if index == 4 {
+            let other = configured_order(
+                &fixture().0.orders[0],
+                "OTHER",
+                &products[1].product,
+                Side::Long,
+                "100",
+                "0.5",
+            );
+            case_seed.orders.push(other);
+        }
+        let mut owner = ScenarioAccount::from_configured(&case_seed, leverage, rows).unwrap();
+        match index {
+            0 => configured_position(&mut owner, &product, "unknown-spec"),
+            1 => configured_position(&mut owner, &product, "foreign-spec"),
+            5 | 6 => configured_position(&mut owner, &product, "scale-spec-v1"),
+            _ => {}
+        }
+        let mut candidate = input(&owner, "L", &format!("BAD-{index}"), "0.5", "100");
+        candidate.spec_version = "scale-spec-v1".into();
+        candidate.rule_data_version = "scale-tier-v1".into();
+        candidate.expected_account_version = owner.state_version;
+        candidate.expected_order_version = owner.orders["L"].version;
+        assert_eq!(candidate.template.matching_effective_at, 500);
+        let before = owner.clone();
+        assert_eq!(owner.execute(&candidate), Err(expected[index]));
+        assert_eq!(owner.gate, Gate::Failed(expected[index]));
+        let mut after = owner.clone();
+        after.gate = before.gate.clone();
+        assert_eq!(after, before);
+    }
+}
+
+#[test]
+fn configured_liquidation_fails_after_committed_fill_without_liquidation_publication() {
+    for liquidation_fee in [d("0.02"), d("0.00602")] {
+        let (mut seed, mut products) = super::super::super::configured_tests::input(2);
+        products[0].liquidation_fee = liquidation_fee;
+        seed.cash = d("0.04");
+        let product = products[0].product.clone();
+        let template = fixture().0.orders[0].clone();
+        seed.orders = vec![configured_order(
+            &template,
+            "L",
+            &product,
+            Side::Long,
+            "100",
+            "0.5",
+        )];
+        let mut owner = ScenarioAccount::from_configured(&seed, d("10"), products).unwrap();
+        let mut candidate = input(&owner, "L", "CFG-LIQ", "0.5", "100");
+        candidate.spec_version = "scale-spec-v1".into();
+        candidate.rule_data_version = "scale-tier-v1".into();
+        candidate.expected_account_version = owner.state_version;
+        candidate.expected_order_version = owner.orders["L"].version;
+        assert_eq!(
+            owner.execute(&candidate),
+            Err("UNSUPPORTED_CONFIGURED_LIQUIDATION")
+        );
+        assert_eq!((owner.cash, owner.fees), (d("-0.01"), d("0.05")));
+        assert_eq!(owner.positions.btc().unwrap()[&product].contracts, d("0.5"));
+        assert_eq!(owner.orders["L"].facts.status, "FILLED");
+        assert_eq!(owner.execution_receipts.len(), 1);
+        assert_eq!(owner.liquidation_ids().count(), 0);
+        assert_eq!(
+            owner.gate,
+            Gate::Failed("UNSUPPORTED_CONFIGURED_LIQUIDATION")
+        );
+        let after = owner.clone();
+        let receipt = owner.execution_receipts.values().next().unwrap().clone();
+        assert_eq!(owner.execute(&candidate), Ok(Reply::Duplicate(receipt)));
+        assert_eq!(owner, after);
+    }
+}
+
 #[test]
 fn long_and_short_golden_fifo_runs_use_actual_commits() {
     let long = [
