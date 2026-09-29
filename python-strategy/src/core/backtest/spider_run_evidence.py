@@ -5,7 +5,12 @@ from hashlib import sha256 as _sha256
 from typing import Any as _Any
 from typing import cast as _cast
 
-from src.core.backtest.spider_run_artifacts import canonical_bytes as _bytes
+from src.core.backtest.spider_run_artifacts import (
+    ConfigurationContext as _ConfigurationContext,
+    _configuration_context,
+    canonical_bytes as _bytes,
+    configuration_context as _validate_context,
+)
 from src.core.backtest.spider_run_completion_schema import report as _validate_report
 from src.core.backtest.spider_run_envelope_schema import endpoint as _validate_endpoint
 from src.core.backtest.spider_run_reconciliation_schema import _CHECKS, reconciliation as _validate
@@ -13,6 +18,8 @@ from src.core.backtest.spider_scenario_plans import plan_bundle as _plan_bundle
 
 _INITIAL = "artifact:endpoint.json#/initial_owner_evidence"
 _FINAL = "artifact:endpoint.json#/final_owner_evidence"
+_P1_RUN_CONTRACT = "SPIDER_SYNTHETIC_P1_RUN_V1"
+_P2_RUN_CONTRACT = "SPIDER_SYNTHETIC_P2_CONFIGURED_RUN_V1"
 
 
 class ReconciliationProjectionError(ValueError):
@@ -22,6 +29,29 @@ class ReconciliationProjectionError(ValueError):
 
     def __init__(self) -> None:
         super().__init__(self.reason)
+
+
+def _context_chain(attempt: dict[str, _Any], *artifacts: object) -> _ConfigurationContext | None:
+    """Return the attempt's context only when every supplied artifact agrees."""
+    contract = attempt["run_contract_id"]
+    expected = (
+        _validate_context(attempt["configuration_context"])
+        if contract == _P2_RUN_CONTRACT else None
+    )
+    if contract not in (_P1_RUN_CONTRACT, _P2_RUN_CONTRACT):
+        raise ReconciliationProjectionError()
+    for artifact in artifacts:
+        rows = artifact if type(artifact) is list else [artifact]
+        for row in rows:
+            if type(row) is not dict:
+                raise ReconciliationProjectionError()
+            present = "configuration_context" in row
+            if expected is None:
+                if present:
+                    raise ReconciliationProjectionError()
+            elif not present or _validate_context(row["configuration_context"]) != expected:
+                raise ReconciliationProjectionError()
+    return expected
 
 
 def _required(row: dict[str, _Any], key: str) -> _Any:
@@ -96,6 +126,7 @@ def build_endpoint_artifacts(run_id: str, attempt: dict[str, _Any], status: dict
         if error.args == ("UNSUPPORTED_CONFIGURATION",):
             raise ReconciliationProjectionError() from error
         raise
+    context = _context_chain(attempt, status, journal)
     persisted = _required(status, "persisted_boundary")
     terminal = _required(attempt, "terminal_policy")
     endpoint = _copy(dict(schema_version="spider_endpoint_v1", run_id=run_id, terminal_reason=terminal,
@@ -103,6 +134,8 @@ def build_endpoint_artifacts(run_id: str, attempt: dict[str, _Any], status: dict
                           initial_owner_evidence=initial_owner_evidence, final_owner_evidence=final_owner_evidence,
                           scheduler_observation=scheduler_observation,
                           remaining_planned_barriers=attempt["planned_coverage"][persisted["ordinal"]:]))
+    if context is not None:
+        endpoint["configuration_context"] = _configuration_context(context)
     final = final_owner_evidence
     inspection = final["inspection"]
     trading = final["trading_fact"]["immutable_payload"]
@@ -112,7 +145,7 @@ def build_endpoint_artifacts(run_id: str, attempt: dict[str, _Any], status: dict
     for template in frozen["report"]:
         product = template["product_id"]
         position = next((row for row in positions if row["product_id"] == product), None)
-        report.append(dict(schema_version="spider_product_report_v1", run_id=run_id, product_id=product, terminal_reason=terminal,
+        row = dict(schema_version="spider_product_report_v1", run_id=run_id, product_id=product, terminal_reason=terminal,
                            position_contracts=_required(position, "position_contracts") if position is not None else "0",
                            mark_price=_required(position, "last_price") if position is not None else None,
                            notional_usd=_required(position, "notional_usd") if position is not None else "0",
@@ -120,9 +153,12 @@ def build_endpoint_artifacts(run_id: str, attempt: dict[str, _Any], status: dict
                            committed_execution_refs=template["committed_execution_refs"], source_evidence_refs=template["source_evidence_refs"],
                            account_cash=_required(inspection, "cash"), account_equity=_required(trading, "equity"),
                            account_available_equity=_required(trading, "available_equity"), account_gross_realized=_required(inspection, "gross_realized"),
-                           account_total_fees=_required(inspection, "total_fees")))
+                           account_total_fees=_required(inspection, "total_fees"))
+        if context is not None:
+            row["configuration_context"] = _configuration_context(context)
+        report.append(row)
     _validate_endpoint(endpoint)
-    _validate_report(report)
+    _validate_report(report, context=context)
     return _copy(dict(endpoint=endpoint, report=report,
                       reconciliation=build_reconciliation(run_id, attempt, status, journal, endpoint, report)))
 
@@ -138,6 +174,7 @@ def build_reconciliation(run_id: str, attempt: dict[str, _Any], status: dict[str
         if error.args == ("UNSUPPORTED_CONFIGURATION",):
             raise ReconciliationProjectionError() from error
         raise
+    context = _context_chain(attempt, status, journal, endpoint, report)
     plan, frozen_journal, frozen_endpoint = frozen["plan"], frozen["journal"], frozen["endpoint"]
     if not journal or not attempt["planned_coverage"]:
         raise ReconciliationProjectionError()
@@ -155,7 +192,9 @@ def build_reconciliation(run_id: str, attempt: dict[str, _Any], status: dict[str
     expected_report = frozen["report"]
     for row in expected_report:
         row["run_id"] = run_id
-    _validate_report(expected_report)
+        if context is not None:
+            row["configuration_context"] = _configuration_context(context)
+    _validate_report(expected_report, context=context)
     coverage = plan["planned_coverage"]
     observed_coverage = _coverage(journal)
     last = coverage[-1]
@@ -202,6 +241,8 @@ def build_reconciliation(run_id: str, attempt: dict[str, _Any], status: dict[str
             [_FINAL, *[f"artifact:report.jsonl#/{index}" for index in range(len(report))]]]
     checks = [dict(name=name, expected=wanted, observed=actual, evidence_refs=references, result="OK" if additional and _equal(wanted, actual) else "FAILED")
               for name, wanted, actual, references, additional in zip(_CHECKS, expected, observed, refs, extra, strict=True)]
-    result = _copy(dict(schema_version="spider_reconciliation_v1", run_id=run_id, result="OK" if all(row["result"] == "OK" for row in checks) else "FAILED", checks=checks))
+    result: dict[str, _Any] = _copy(dict(schema_version="spider_reconciliation_v1", run_id=run_id, result="OK" if all(row["result"] == "OK" for row in checks) else "FAILED", checks=checks))
+    if context is not None:
+        result["configuration_context"] = _configuration_context(context)
     _validate(result)
     return result

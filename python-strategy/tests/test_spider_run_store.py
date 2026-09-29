@@ -11,8 +11,14 @@ import pytest
 
 from src.core.backtest import spider_run_store as module
 from src.core.backtest.spider_run_admission import admit_spider_run
-from src.core.backtest.spider_run_artifacts import decode_jsonl
-from test_spider_run_artifacts import rejected
+from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_jsonl, validate_artifact
+from src.core.backtest.spider_run_completion_schema import report as validate_report
+from src.core.backtest.spider_run_envelope_schema import endpoint as validate_endpoint, journal as validate_journal
+from src.core.backtest.spider_run_reconciliation_schema import reconciliation as validate_reconciliation
+from test_spider_run_artifacts import configured_attempt, configuration_context, rejected
+from test_spider_run_completion_schema import configured_report_rows
+from test_spider_run_envelope_schema import configured_endpoint, configured_group_record
+from test_spider_run_reconciliation_schema import configured_fixture as configured_reconciliation_fixture
 from test_spider_run_evidence import RUN, expected_checks, fixture
 
 
@@ -36,6 +42,35 @@ def ready(store, values):
         status = decode_jsonl((store._path / "status.json").read_bytes())[0]
         assert status["state"] == "RUNNING"
         assert status["processed_boundary"] == status["persisted_boundary"] == boundary(row)
+
+
+def configured_ready(tmp_path):
+    store = module.SpiderRunStore.create(str(tmp_path), "r-1")
+    attempt = configured_attempt()
+    attempt.update(run_id="r-1", planned_coverage=[
+        {"ordinal": 1, "barrier_id": "barrier-1", "record_kind": "SOURCE_GROUP_RESULT"}
+    ])
+    assert store.register(attempt) == "NATIVE_CONSTRUCTION_ALLOWED"
+    row = configured_group_record("CFG-FIRST")
+    row.update(run_id="r-1", barrier_id="barrier-1")
+    store.mark_processed(boundary(row))
+    store.append_journal(row)
+    status = decode_jsonl((store._path / "status.json").read_bytes())[0]
+    endpoint = configured_endpoint("CFG-FIRST")
+    endpoint["run_id"] = "r-1"
+    endpoint["cutoff"]["persisted_boundary"] = boundary(row)
+    reconciliation_value = configured_reconciliation_fixture()
+    reconciliation_value["run_id"] = "r-1"
+    report = configured_report_rows()
+    for entry in report:
+        entry["run_id"] = "r-1"
+    validate_artifact(attempt)
+    validate_artifact(status)
+    validate_journal([row])
+    validate_endpoint(endpoint)
+    validate_reconciliation(reconciliation_value)
+    validate_report(report, context=attempt["configuration_context"])
+    return store, attempt, status, [row], endpoint, reconciliation_value, report
 
 
 @pytest.mark.parametrize("index", range(3))
@@ -211,6 +246,133 @@ def test_first_append_failure_retains_zero_persisted_frontier(tmp_path, monkeypa
     store.publish_failure(error.value.reason, error.value.primary_failure)
     assert store._persisted is None
     assert admit_spider_run(tmp_path / RUN)["reason"] == "INCOMPLETE_PERSISTENCE"
+
+
+def test_context_mismatch_append_writes_neither_journal_nor_status(tmp_path):
+    store = module.SpiderRunStore.create(str(tmp_path), "r-1")
+    attempt = configured_attempt()
+    attempt["planned_coverage"] = [
+        {"ordinal": 1, "barrier_id": "barrier-1", "record_kind": "SOURCE_GROUP_RESULT"}
+    ]
+    store.register(attempt)
+    assert decode_jsonl((store._path / "status.json").read_bytes())[0]["configuration_context"] == attempt["configuration_context"]
+    row = configured_group_record("CFG-MIDDLE")
+    row.update(run_id="r-1", barrier_id="barrier-1")
+    wrong_context = configuration_context(config_id="configured-v1")
+    wrong_context["configuration_sha256"] = "b" * 64
+
+    def replace_context(value):
+        if type(value) is dict:
+            if "configuration_context" in value:
+                value["configuration_context"] = deepcopy(wrong_context)
+            for nested in value.values():
+                replace_context(nested)
+        elif type(value) is list:
+            for nested in value:
+                replace_context(nested)
+
+    replace_context(row)
+    target = boundary(row)
+    store.mark_processed(target)
+    journal_path, status_path = store._path / "journal.jsonl", store._path / "status.json"
+    before_journal, before_status = journal_path.read_bytes(), status_path.read_bytes()
+    with pytest.raises(module.SpiderRunStoreError) as error:
+        store.append_journal(row)
+    assert error.value.reason == "ENDPOINT_RECONCILIATION_FAILED"
+    assert journal_path.read_bytes() == before_journal
+    assert status_path.read_bytes() == before_status
+    assert store._processed == target and store._persisted is None
+
+
+def test_configured_report_validation_uses_candidate_context_for_reread(tmp_path):
+    store, attempt, _, _, _, _, _ = configured_ready(tmp_path)
+    candidate = configuration_context()
+    candidate["configuration_sha256"] = "b" * 64
+    rows = configured_report_rows(candidate)
+    for row in rows:
+        row["run_id"] = "r-1"
+    path = store._path / "report.jsonl"
+    path.write_bytes(b"".join(canonical_bytes(row) + b"\n" for row in rows))
+    reread, _ = store._reread("report.jsonl", module._report_validator(attempt))
+    assert reread == rows
+
+
+@pytest.mark.parametrize("mutation", ["hash", "order"])
+def test_finalize_valid_candidate_report_mismatch_reaches_context_chain(tmp_path, monkeypatch, mutation):
+    store, attempt, _, _, endpoint, recon, _ = configured_ready(tmp_path)
+    candidate = deepcopy(attempt["configuration_context"])
+    if mutation == "hash":
+        candidate["configuration_sha256"] = "b" * 64
+    else:
+        candidate["products"].reverse()
+    report = configured_report_rows(candidate)
+    for row in report:
+        row["run_id"] = "r-1"
+    original = module._context_chain
+    seen = []
+
+    def observe(attempt_value, *artifacts):
+        seen.append(artifacts[-1])
+        return original(attempt_value, *artifacts)
+
+    monkeypatch.setattr(module, "_context_chain", observe)
+    with pytest.raises(module.SpiderRunStoreError) as error:
+        store.finalize(endpoint, recon, report)
+    assert error.value.reason == "ENDPOINT_RECONCILIATION_FAILED"
+    assert seen == [report]
+    assert not (store._path / "endpoint.json").exists()
+
+
+def test_configured_context_control_reaches_unavailable_selector(tmp_path, monkeypatch):
+    store, attempt, _, _, endpoint, recon, report = configured_ready(tmp_path)
+    from src.core.backtest import spider_run_evidence as evidence
+
+    original = evidence._plan_bundle
+    selected = []
+
+    def observe(plan_id):
+        selected.append(plan_id)
+        return original(plan_id)
+
+    monkeypatch.setattr(evidence, "_plan_bundle", observe)
+    with pytest.raises(module.SpiderRunStoreError) as error:
+        store.finalize(endpoint, recon, report)
+    assert error.value.reason == "ENDPOINT_RECONCILIATION_FAILED"
+    assert selected == [attempt["scenario_plan_id"]]
+    assert (store._path / "endpoint.json").exists()
+    assert not (store._path / "completion.json").exists()
+
+
+@pytest.mark.parametrize("report", [[None], ["row"], [{}]])
+def test_configured_malformed_report_is_invalid_artifact_before_context_chain(tmp_path, report):
+    store, _, _, _, endpoint, recon, _ = configured_ready(tmp_path)
+    with pytest.raises(ValueError, match="^INVALID_ARTIFACT$"):
+        store.finalize(endpoint, recon, report)
+
+
+@pytest.mark.parametrize("gate", [1, 2, 3])
+def test_finalize_rejects_at_each_context_chain_gate(tmp_path, monkeypatch, gate):
+    store, values, recon = prepared(tmp_path)
+    ready(store, values)
+    original = module._context_chain
+    calls = 0
+
+    def reject_selected(*args):
+        nonlocal calls
+        calls += 1
+        if calls == gate:
+            raise module.ReconciliationProjectionError()
+        return original(*args)
+
+    monkeypatch.setattr(module, "_context_chain", reject_selected)
+    with pytest.raises(module.SpiderRunStoreError) as error:
+        store.finalize(values[3], recon, values[4])
+    root = tmp_path / RUN
+    assert error.value.reason == "ENDPOINT_RECONCILIATION_FAILED"
+    assert calls == gate
+    assert (root / "endpoint.json").exists() is (gate >= 2)
+    assert (b'"COMPLETE"' in (root / "status.json").read_bytes()) is (gate == 3)
+    assert not (root / "completion.json").exists()
 
 
 def test_root_directory_fsync_failure_has_no_artifact_authority(tmp_path, monkeypatch):

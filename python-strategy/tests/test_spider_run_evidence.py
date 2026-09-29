@@ -303,6 +303,53 @@ def test_unrelated_programming_value_error_propagates(monkeypatch):
     assert type(error.value) is ValueError
 
 
+def test_context_chain_uses_attempt_mode_and_exact_ordered_context():
+    context = artifacts.ConfigurationContext(
+        "spider_configuration_context_v1", "configured-v1", "a" * 64,
+        ("CFG-FIRST", "CFG-MIDDLE", "CFG-LAST"),
+    )
+    attempt = {"run_contract_id": "SPIDER_SYNTHETIC_P2_CONFIGURED_RUN_V1",
+               "configuration_context": context}
+    embedded = dict(schema_version=context.schema_version, config_id=context.config_id,
+                    configuration_sha256=context.configuration_sha256, products=list(context.products))
+    chain = [
+        {"configuration_context": deepcopy(embedded)},
+        [{"configuration_context": deepcopy(embedded)} for _ in range(3)],
+        {"configuration_context": deepcopy(embedded)},
+        {"configuration_context": deepcopy(embedded)},
+        [{"configuration_context": deepcopy(embedded)} for _ in range(3)],
+        {"configuration_context": deepcopy(embedded)},
+    ]
+    assert evidence._context_chain(attempt, *chain) == context
+    for artifact_index, row_index in [(0, None), (1, 0), (1, 1), (1, 2), (2, None),
+                                      (3, None), (4, 0), (4, 1), (4, 2), (5, None)]:
+        supplied = deepcopy(chain)
+        target = supplied[artifact_index] if row_index is None else supplied[artifact_index][row_index]
+        del target["configuration_context"]
+        with pytest.raises(evidence.ReconciliationProjectionError):
+            evidence._context_chain(attempt, *supplied)
+    positions = [(0, None), (1, 0), (1, 1), (1, 2), (2, None),
+                 (3, None), (4, 0), (4, 1), (4, 2), (5, None)]
+    for artifact_index, row_index in positions:
+        for field, value in [("configuration_sha256", "b" * 64),
+                             ("products", ["CFG-MIDDLE", "CFG-FIRST", "CFG-LAST"])]:
+            supplied = deepcopy(chain)
+            target = supplied[artifact_index] if row_index is None else supplied[artifact_index][row_index]
+            target["configuration_context"][field] = value
+            with pytest.raises(evidence.ReconciliationProjectionError):
+                evidence._context_chain(attempt, *supplied)
+        p1_chain = deepcopy(chain)
+        for p1_index, p1_row in positions:
+            p1_value = p1_chain[p1_index] if p1_row is None else p1_chain[p1_index][p1_row]
+            p1_value.pop("configuration_context")
+        p1_target = p1_chain[artifact_index] if row_index is None else p1_chain[artifact_index][row_index]
+        p1_target["configuration_context"] = deepcopy(embedded)
+        with pytest.raises(evidence.ReconciliationProjectionError):
+            evidence._context_chain(
+                {"run_contract_id": "SPIDER_SYNTHETIC_P1_RUN_V1"}, *p1_chain
+            )
+
+
 def test_no_reconciliation_authority_and_public_import_boundary():
     assert {name for name in vars(evidence) if not name.startswith("_")} == {"ReconciliationProjectionError", "build_reconciliation", "build_endpoint_artifacts"}
     with pytest.raises(TypeError):

@@ -9,10 +9,10 @@ from json import JSONDecodeError
 from pathlib import Path
 from typing import Any
 
-from src.core.backtest.spider_run_artifacts import _boundary, _text, canonical_bytes, decode_jsonl, validate_artifact
+from src.core.backtest.spider_run_artifacts import _boundary, _configuration_context, _require, _text, canonical_bytes, configuration_context, decode_jsonl, validate_artifact
 from src.core.backtest.spider_run_completion_schema import _ARTIFACTS, completion, report as validate_report
 from src.core.backtest.spider_run_envelope_schema import endpoint as validate_endpoint, journal as validate_journal, journal_record
-from src.core.backtest.spider_run_evidence import ReconciliationProjectionError, build_reconciliation
+from src.core.backtest.spider_run_evidence import ReconciliationProjectionError, _context_chain, build_reconciliation
 from src.core.backtest.spider_run_reconciliation_schema import reconciliation as validate_reconciliation
 
 
@@ -22,6 +22,16 @@ class SpiderRunStoreError(Exception):
         self.reason = reason
         self.requested_failure_reason = requested_failure_reason
         self.primary_failure = deepcopy(primary_failure)
+
+
+def _report_validator(attempt: dict[str, Any]):
+    def validate(value: list[dict[str, Any]]) -> None:
+        context = None
+        if attempt.get("run_contract_id") == "SPIDER_SYNTHETIC_P2_CONFIGURED_RUN_V1":
+            _require(type(value) is list and bool(value) and type(value[0]) is dict)
+            context = configuration_context(value[0].get("configuration_context"))
+        validate_report(value, context=context)
+    return validate
 
 
 def _sync(directory: Path) -> None:
@@ -102,6 +112,8 @@ class SpiderRunStore:
         value = dict(schema_version="spider_status_v1", run_id=self._run_id, state=state,
                      processed_boundary=deepcopy(self._processed), persisted_boundary=deepcopy(self._persisted),
                      failure_reason=reason, primary_failure=deepcopy(primary))
+        if "configuration_context" in self._attempt:
+            value["configuration_context"] = _configuration_context(self._attempt["configuration_context"])
         validate_artifact(value)
         return value
 
@@ -143,6 +155,10 @@ class SpiderRunStore:
         if (self._barrier_failed or self._processed is None or self._processed == self._persisted or boundary != self._processed
                 or row["run_id"] != self._run_id or row["record_kind"] != self._attempt["planned_coverage"][boundary["ordinal"] - 1]["record_kind"]):
             raise RuntimeError("INVALID_STORE_OPERATION")
+        try:
+            _context_chain(self._attempt, row)
+        except ReconciliationProjectionError as error:
+            raise SpiderRunStoreError("ENDPOINT_RECONCILIATION_FAILED") from error
         try:
             _write(self._path / "journal.jsonl", canonical_bytes(row) + b"\n", append=True)
             self._persisted = deepcopy(self._processed)
@@ -194,15 +210,32 @@ class SpiderRunStore:
         self._allowed("RUNNING")
         if self._barrier_failed or self._processed != self._persisted or self._persisted is None or self._persisted["ordinal"] != len(self._attempt["planned_coverage"]):
             raise RuntimeError("INVALID_STORE_OPERATION")
-        for name, value, validator in [("endpoint.json", endpoint, validate_endpoint), ("reconciliation.json", reconciliation, validate_reconciliation), ("report.jsonl", report, validate_report)]:
-            validator(value)
-            rows = value if name.endswith(".jsonl") else [value]
-            if any(row["run_id"] != self._run_id for row in rows):
+        validate_endpoint(endpoint)
+        validate_reconciliation(reconciliation)
+        candidate_report_validator = _report_validator(self._attempt)
+        candidate_report_validator(report)
+        for name, value in (("endpoint.json", endpoint), ("reconciliation.json", reconciliation)):
+            if any(row["run_id"] != self._run_id for row in [value]):
                 raise ValueError("INVALID_ARTIFACT")
+        if any(row["run_id"] != self._run_id for row in report):
+            raise ValueError("INVALID_ARTIFACT")
+        try:
+            current = [self._reread(name, validator)[0] for name, validator in (
+                ("attempt.json", validate_artifact), ("status.json", validate_artifact), ("journal.jsonl", validate_journal))]
+            _context_chain(current[0], current[1], current[2], endpoint, reconciliation, report)
+        except ReconciliationProjectionError as error:
+            raise SpiderRunStoreError("ENDPOINT_RECONCILIATION_FAILED") from error
+        for name, value in [("endpoint.json", endpoint), ("reconciliation.json", reconciliation), ("report.jsonl", report)]:
+            rows = value if name.endswith(".jsonl") else [value]
             self._publish(name, b"".join(canonical_bytes(row) + b"\n" for row in rows))
-        validators = (validate_artifact, validate_artifact, validate_journal, validate_endpoint, validate_reconciliation, validate_report)
-        reread = [self._reread(name, validator) for (name, _), validator in zip(_ARTIFACTS, validators, strict=True)]
+        validators = (validate_artifact, validate_artifact, validate_journal, validate_endpoint, validate_reconciliation)
+        reread = [self._reread(name, validator) for (name, _), validator in zip(_ARTIFACTS[:-1], validators, strict=True)]
+        reread.append(self._reread("report.jsonl", _report_validator(reread[0][0])))
         attempt, status, journal, final, supplied, rows = (value for value, _ in reread)
+        try:
+            _context_chain(attempt, status, journal, final, supplied, rows)
+        except ReconciliationProjectionError as error:
+            raise SpiderRunStoreError("ENDPOINT_RECONCILIATION_FAILED") from error
         try:
             computed = build_reconciliation(self._run_id, attempt, status, journal, final, rows)
         except ReconciliationProjectionError as error:
@@ -219,6 +252,12 @@ class SpiderRunStore:
                         input_contract_hashes=attempt["input_contract_hashes"], planned_coverage=attempt["planned_coverage"],
                         processed_boundary=self._processed, persisted_boundary=self._persisted,
                         endpoint_state_digest=sha256(canonical_bytes(final)).hexdigest(), reconciliation_digest=sha256(canonical_bytes(supplied)).hexdigest(), artifacts=metadata)
+        if "configuration_context" in attempt:
+            manifest["configuration_context"] = _configuration_context(attempt["configuration_context"])
         completion(manifest)
+        try:
+            _context_chain(attempt, complete_status, journal, final, supplied, rows, manifest)
+        except ReconciliationProjectionError as error:
+            raise SpiderRunStoreError("ENDPOINT_RECONCILIATION_FAILED") from error
         self._publish("completion.json", canonical_bytes(manifest) + b"\n")
         return "COMPLETE_PUBLISHED"

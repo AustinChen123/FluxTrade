@@ -7,10 +7,10 @@ from hashlib import sha256 as _sha256
 from json import JSONDecodeError as _JSONDecodeError
 from typing import Any as _Any
 
-from src.core.backtest.spider_run_artifacts import canonical_bytes as _bytes, decode_jsonl as _decode_jsonl, validate_artifact as _artifact
+from src.core.backtest.spider_run_artifacts import canonical_bytes as _bytes, configuration_context as _validate_context, decode_jsonl as _decode_jsonl, validate_artifact as _artifact
 from src.core.backtest.spider_run_completion_schema import _ARTIFACTS, completion as _completion, report as _report
 from src.core.backtest.spider_run_envelope_schema import endpoint as _endpoint, journal as _journal
-from src.core.backtest.spider_run_evidence import ReconciliationProjectionError as _ProjectionError, build_reconciliation as _build
+from src.core.backtest.spider_run_evidence import ReconciliationProjectionError as _ProjectionError, _context_chain, build_reconciliation as _build
 from src.core.backtest.spider_run_reconciliation_schema import reconciliation as _reconciliation
 from src.core.backtest.spider_scenario_plans import plan_bundle as _plan_bundle
 
@@ -178,12 +178,27 @@ def _admit(directory: int) -> dict[str, _Any]:
         try:
             if any(row.get("schema_version") != schema for row in rows):
                 raise _Invalid()
-            _validate(validator, value)
+            if name == "report.jsonl" and values["attempt.json"].get("run_contract_id") == "SPIDER_SYNTHETIC_P2_CONFIGURED_RUN_V1":
+                if not rows:
+                    raise _Invalid()
+                try:
+                    report_context = _validate_context(rows[0].get("configuration_context"))
+                    _report(value, context=report_context)
+                except ValueError as error:
+                    if error.args != ("INVALID_ARTIFACT",):
+                        raise
+                    raise _Invalid() from error
+            else:
+                _validate(validator, value)
         except _Invalid:
             bad.append(name)
     if bad:
         return _reject("UNSUPPORTED_SCHEMA", tuple(bad))
     attempt, status, journal, endpoint, supplied, report = (values[name] for name in _NAMES)
+    try:
+        _context_chain(attempt, status, journal, endpoint, supplied, report, manifest)
+    except _ProjectionError:
+        return _reject("ENDPOINT_RECONCILIATION_FAILED", _ALL)
     coverage = attempt["planned_coverage"]
     frontier = dict(ordinal=len(journal), journal_seq=len(journal), barrier_id=journal[-1]["barrier_id"]) if journal else None
     if (status["state"] != "COMPLETE" or not coverage or not journal or manifest["planned_coverage"] != coverage

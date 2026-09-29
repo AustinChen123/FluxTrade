@@ -11,6 +11,7 @@ import pytest
 
 from src.core.backtest import spider_run_admission as admission
 from src.core.backtest.spider_run_artifacts import canonical_bytes
+from test_spider_run_artifacts import configuration_context
 from test_spider_run_evidence import RUN, expected_checks, fixture
 
 NAMES = ("attempt.json", "status.json", "journal.jsonl", "endpoint.json", "reconciliation.json", "report.jsonl", "completion.json")
@@ -94,6 +95,13 @@ def test_directory_and_leaf_basic_paths(tmp_path, monkeypatch):
     assert admission.admit_spider_run(parent / root.name)["decision"] == "ACCEPT"
     monkeypatch.chdir(tmp_path)
     assert admission.admit_spider_run(root.name)["decision"] == "ACCEPT"
+
+
+def test_p1_completion_context_leak_is_cross_artifact_failure(tmp_path):
+    values = bundle(tmp_path)
+    values["completion.json"]["configuration_context"] = configuration_context()
+    write_bundle(tmp_path, values)
+    rejected(tmp_path, "ENDPOINT_RECONCILIATION_FAILED", NAMES)
 
 
 @pytest.mark.parametrize("name", ["completion.json", "endpoint.json"])
@@ -206,7 +214,28 @@ def test_rehashed_causal_mutations(tmp_path, mutation, reason, tokens):
     rejected(tmp_path, reason, tokens)
 
 
-@pytest.mark.parametrize("site", ["_decode_jsonl", "_completion", "_plan_bundle", "_build"])
+@pytest.mark.parametrize("mutation", ["middle-missing", "middle-hash", "middle-money"])
+def test_configured_report_schema_failures_keep_unsupported_schema(tmp_path, mutation):
+    values = bundle(tmp_path)
+    attempt, report = values["attempt.json"], values["report.jsonl"]
+    context = configuration_context(products=[row["product_id"] for row in report])
+    attempt.update(run_contract_id="SPIDER_SYNTHETIC_P2_CONFIGURED_RUN_V1",
+                   profile_id="SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1",
+                   funding_exclusion="SYNTHETIC_P2_NO_FUNDING_INPUT_OR_CLAIM",
+                   configuration_context=deepcopy(context))
+    for row in report:
+        row["configuration_context"] = deepcopy(context)
+    if mutation == "middle-missing":
+        del report[1]["configuration_context"]
+    elif mutation == "middle-hash":
+        report[1]["configuration_context"]["configuration_sha256"] = "b" * 64
+    else:
+        report[1]["account_cash"] = "1.0"
+    write_bundle(tmp_path, values)
+    rejected(tmp_path, "UNSUPPORTED_SCHEMA", ("report.jsonl",))
+
+
+@pytest.mark.parametrize("site", ["_decode_jsonl", "_completion", "_report", "_plan_bundle", "_build"])
 @pytest.mark.parametrize("error", [ValueError("programming"), RuntimeError("programming"), AssertionError("programming")])
 def test_programming_errors_propagate_and_directory_closes(tmp_path, monkeypatch, site, error):
     bundle(tmp_path)
