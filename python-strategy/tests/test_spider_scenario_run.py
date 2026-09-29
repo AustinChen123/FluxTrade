@@ -17,6 +17,14 @@ from src.core.backtest.spider_run_artifacts import decode_jsonl
 from src.core.backtest.spider_run_admission import admit_spider_run
 from src.core.backtest.spider_scenario_plans import PLAN_IDS, plan_bundle
 
+CONFIGURED_GROUP_VERSIONS = (
+    ("G-501", 1), ("G-502", 2), ("G-503", 3), ("G-504", 4),
+    ("G-505", 5), ("G-506", 6), ("G-507", 7), ("G-508", 8),
+    ("G-509", 9), ("G-510", 10), ("G-511", 11), ("G-512", 12),
+    ("G-513", 12), ("G-514", 13), ("G-515", 14), ("G-516", 15),
+    ("G-518", 16), ("G-519", 17),
+)
+
 
 def read(root, run_id, name):
     return cast(list[dict[str, Any]], decode_jsonl((root / run_id / name).read_bytes()))
@@ -313,6 +321,105 @@ def test_projection_failure_is_bounded_but_missing_callback_is_not_retried(tmp_p
 
 def _invoke_configured(root, run_id="p2", select=None):
     return run._invoke(str(root), run_id, "SPIDER_P2_CONFIGURED_SCALE_V1", select or run._plans.plan_bundle)
+
+
+def test_configured_f01_append_failure_after_second_execution_has_exact_frontier(tmp_path, monkeypatch):
+    attempted, append_attempts, finalize_calls, group_versions = [], [], [], []
+    original_append = storage.SpiderRunStore.append_journal
+    original_apply = wire.ScenarioCodec.apply_group
+    def apply(codec, request):
+        result = original_apply(codec, request)
+        group_versions.append((request["group_id"], result["account_version_after"]))
+        return result
+    def fail_at_twenty(store, row):
+        append_attempts.append(row["journal_seq"])
+        if row["journal_seq"] == 20:
+            attempted.append(deepcopy(row))
+            raise storage.SpiderRunStoreError("PERSISTENCE_FAILED", "PERSISTENCE_FAILED",
+                                              dict(kind="PERSISTENCE", reason="ARTIFACT_WRITE_FAILED"))
+        original_append(store, row)
+    monkeypatch.setattr(storage.SpiderRunStore, "append_journal", fail_at_twenty)
+    monkeypatch.setattr(wire.ScenarioCodec, "apply_group", apply)
+    monkeypatch.setattr(storage.SpiderRunStore, "finalize", lambda *_args, **_kwargs: finalize_calls.append(True))
+    monkeypatch.setattr(run, "_admit", lambda *_: pytest.fail("admission must not follow persistence failure"))
+
+    result = _invoke_configured(tmp_path, "f01")
+    assert result == dict(run_id="f01", outcome="FAILED", reason="PERSISTENCE_FAILED")
+    rows = read(tmp_path, "f01", "journal.jsonl")
+    status = read(tmp_path, "f01", "status.json")[0]
+    assert [row["journal_seq"] for row in rows] == list(range(1, 20))
+    plan = scale._configured_scale_plan_input()
+    assert [(row["barrier_id"], row["record_kind"]) for row in rows] == [
+        (row["barrier_id"], row["record_kind"]) for row in plan["planned_barriers"][:19]]
+    assert append_attempts == list(range(1, 21))
+    assert tuple(group_versions) == CONFIGURED_GROUP_VERSIONS
+    assert len(attempted) == 1 and attempted[0]["journal_seq"] == 20
+    assert attempted[0]["barrier_id"] == "SOURCE_GROUP:G-519"
+    assert attempted[0]["payload"]["result"]["account_version_after"] == 17
+    assert attempted[0]["payload"]["owner_evidence_after"]["inspection"]["account_version"] == 17
+    assert (status["state"], status["failure_reason"], status["primary_failure"]) == (
+        "FAILED", "PERSISTENCE_FAILED", dict(kind="PERSISTENCE", reason="ARTIFACT_WRITE_FAILED"))
+    assert (status["processed_boundary"]["ordinal"], status["persisted_boundary"]["ordinal"]) == (20, 19)
+    assert not any((tmp_path / "f01" / name).exists() for name in (
+        "endpoint.json", "reconciliation.json", "report.jsonl", "completion.json"))
+    assert finalize_calls == []
+    directory = tmp_path / "f01"
+    before = {path.name: path.read_bytes() for path in directory.iterdir() if path.is_file()}
+    assert admit_spider_run(directory)["reason"] == "INCOMPLETE_PERSISTENCE"
+    assert {path.name: path.read_bytes() for path in directory.iterdir() if path.is_file()} == before
+
+
+def test_configured_f02_callback_prefix_persists_once_without_retry_or_resume(tmp_path, monkeypatch):
+    calls, finalize_calls, owners, group_versions = [], [], [], []
+    original_apply = run._ReplayComposition._apply_payload
+    original_finalize, original_admit = storage.SpiderRunStore.finalize, run._admit
+    original_group = wire.ScenarioCodec.apply_group
+    def apply_group(codec, request):
+        result = original_group(codec, request)
+        group_versions.append((request["group_id"], result["account_version_after"]))
+        return result
+    def fail_after_prefix(owner, delivery):
+        owners.append(owner)
+        calls.append((delivery["delivery_id"], owner._codec.inspect_state()["account_version"]))
+        owner._policy.emit("alert", reason="total_limit")
+        raise RuntimeError("private callback detail")
+    monkeypatch.setattr(run._ReplayComposition, "_apply_payload", fail_after_prefix)
+    monkeypatch.setattr(wire.ScenarioCodec, "apply_group", apply_group)
+    monkeypatch.setattr(storage.SpiderRunStore, "finalize", lambda *_args, **_kwargs: finalize_calls.append(True))
+    monkeypatch.setattr(run, "_admit", lambda *_: pytest.fail("admission must not follow callback failure"))
+
+    result = _invoke_configured(tmp_path, "f02")
+    rows = read(tmp_path, "f02", "journal.jsonl")
+    status = read(tmp_path, "f02", "status.json")[0]
+    assert result == dict(run_id="f02", outcome="FAILED", reason="CALLBACK_FAILED")
+    plan = scale._configured_scale_plan_input()
+    assert calls == [(plan["callback_plans"][0]["delivery_id"], 15)] and len(rows) == 18
+    assert tuple(group_versions) == CONFIGURED_GROUP_VERSIONS[:16]
+    assert len(owners) == 1 and owners[0]._codec.inspect_state()["account_version"] == 15
+    assert [(row["journal_seq"], row["barrier_id"], row["record_kind"]) for row in rows] == [
+        (row["ordinal"], row["barrier_id"], row["record_kind"]) for row in plan["planned_barriers"][:18]]
+    callback = rows[-1]
+    assert callback["record_kind"] == "CALLBACK_RESULT" and callback["barrier_id"].startswith("CALLBACK_RESULT:")
+    assert callback["payload"] == dict(
+        actions=[], delivery_id=plan["callback_plans"][0]["delivery_id"],
+        failure=dict(kind="CALLBACK", reason="CALLBACK_FAILED"), outcome="CALLBACK_FAILED",
+        policy_events=[dict(at_ms=100000, kind="alert", reason="total_limit")])
+    assert (status["state"], status["failure_reason"], status["primary_failure"]) == (
+        "FAILED", "CALLBACK_FAILED", dict(kind="CALLBACK", reason="CALLBACK_FAILED"))
+    assert (status["processed_boundary"]["ordinal"], status["persisted_boundary"]["ordinal"]) == (18, 18)
+    assert not any((tmp_path / "f02" / name).exists() for name in (
+        "endpoint.json", "reconciliation.json", "report.jsonl", "completion.json"))
+    assert finalize_calls == []
+    directory = tmp_path / "f02"
+    before = {path.name: path.read_bytes() for path in directory.iterdir() if path.is_file()}
+    assert admit_spider_run(directory)["reason"] == "MISSING_COMPLETE_MANIFEST"
+    assert {path.name: path.read_bytes() for path in directory.iterdir() if path.is_file()} == before
+
+    monkeypatch.setattr(run._ReplayComposition, "_apply_payload", original_apply)
+    monkeypatch.setattr(storage.SpiderRunStore, "finalize", original_finalize)
+    monkeypatch.setattr(run, "_admit", original_admit)
+    assert run.run_spider_scenario(str(tmp_path), "clean-after-f02", "SPIDER_P2_CONFIGURED_SCALE_V1") == dict(
+        run_id="clean-after-f02", outcome="ADMITTED", reason=None)
 
 
 def test_configured_runner_projects_finalizes_and_admits_exact_forty_barriers(tmp_path, monkeypatch):

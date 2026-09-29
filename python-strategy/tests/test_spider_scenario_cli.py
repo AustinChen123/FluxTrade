@@ -136,6 +136,21 @@ def test_actual_losing_admission_and_two_run_rehashed_determinism(tmp_path, sele
     assert normalized[0] == normalized[1]
 
 
+def test_configured_cli_success_and_f03_report_truncation(tmp_path):
+    configured = "SPIDER_P2_CONFIGURED_SCALE_V1"
+    assert PLAN_IDS == ("SPIDER_P1_SCHEDULED_MTM_V1", "SPIDER_P1_LEGAL_LIQUIDATION_V1", "SPIDER_P1_O03_DURABLE_V1")
+    assert CLI_PLAN_IDS == (*PLAN_IDS[:2], configured)
+    result = command(tmp_path, "configured", configured)
+    assert (result.returncode, result.stderr, result.stdout) == (
+        0, "", json.dumps(dict(run_id="configured", outcome="ADMITTED", reason=None),
+                           sort_keys=True, separators=(",", ":")) + "\n")
+    directory = tmp_path / "configured"
+    assert admit_spider_run(directory)["decision"] == "ACCEPT"
+    report = directory / "report.jsonl"
+    report.write_bytes(report.read_bytes()[:-1])
+    assert admit_spider_run(directory)["reason"] == "ARTIFACT_MISMATCH"
+
+
 @pytest.mark.parametrize("mutation,reason", [("missing", "MISSING_COMPLETE_MANIFEST"), ("truncated", "ARTIFACT_MISMATCH"),
     ("mixed", "RUN_ID_MISMATCH"), ("open", "ENDPOINT_RECONCILIATION_FAILED")])
 def test_gt06_tamper_real_cli_bundle(tmp_path, mutation, reason):

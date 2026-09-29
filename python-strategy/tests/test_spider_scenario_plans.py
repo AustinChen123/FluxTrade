@@ -31,7 +31,7 @@ class TextSubclass(str):
 def test_exact_public_surface_and_order():
     assert {name for name in vars(plans) if not name.startswith("_")} == {"PLAN_IDS", "CLI_PLAN_IDS", "plan_bundle", "cli_plan_bundle"}
     assert type(plans.PLAN_IDS) is tuple and plans.PLAN_IDS == IDS
-    assert type(plans.CLI_PLAN_IDS) is tuple and plans.CLI_PLAN_IDS == IDS[:2]
+    assert type(plans.CLI_PLAN_IDS) is tuple and plans.CLI_PLAN_IDS == (*IDS[:2], P2_ID)
 
 
 @pytest.mark.parametrize("index", range(3))
@@ -86,7 +86,7 @@ def test_import_boundary():
                    node.func.id in {"open", "eval", "exec", "__import__"} for node in ast.walk(tree))
 
 
-def test_configured_input_selection_is_exact_detached_and_not_cli_authorized():
+def test_configured_input_selection_is_exact_detached_and_cli_authorized():
     first = cast(dict[str, Any], plans.plan_bundle(P2_ID))
     before = canonical_bytes(first)
     assert set(first) == P2_KEYS and len(first) == 13
@@ -100,5 +100,4 @@ def test_configured_input_selection_is_exact_detached_and_not_cli_authorized():
     first["planned_barriers"].clear()
     second = cast(dict[str, Any], plans.plan_bundle(P2_ID))
     assert canonical_bytes(second) == before
-    with pytest.raises(ValueError, match="^UNSUPPORTED_CONFIGURATION$"):
-        plans.cli_plan_bundle(P2_ID)
+    assert canonical_bytes(plans.cli_plan_bundle(P2_ID)) == before

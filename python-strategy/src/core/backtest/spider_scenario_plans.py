@@ -10,14 +10,15 @@ PLAN_IDS = (
     "SPIDER_P1_LEGAL_LIQUIDATION_V1",
     "SPIDER_P1_O03_DURABLE_V1",
 )
-CLI_PLAN_IDS = PLAN_IDS[:2]
+_P2_CONFIGURED_SELECTOR = "SPIDER_P2_CONFIGURED_SCALE_V1"
+CLI_PLAN_IDS = (*PLAN_IDS[:2], _P2_CONFIGURED_SELECTOR)
 
 
 def plan_bundle(plan_id: object) -> dict[str, object]:
     """Select one fixed P1 artifact bundle or detached P2 input."""
     if type(plan_id) is not str:
         raise ValueError("UNSUPPORTED_CONFIGURATION")
-    if plan_id == "SPIDER_P2_CONFIGURED_SCALE_V1":
+    if plan_id == _P2_CONFIGURED_SELECTOR:
         return _configured_scale_input._configured_scale_plan_input()
     if plan_id not in PLAN_IDS:
         raise ValueError("UNSUPPORTED_CONFIGURATION")
