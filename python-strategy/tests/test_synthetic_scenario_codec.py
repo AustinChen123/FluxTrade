@@ -1,4 +1,5 @@
 import json
+from copy import deepcopy
 from decimal import Decimal, localcontext
 from typing import cast
 
@@ -119,6 +120,97 @@ def test_source_sequence_optional_integer_boundary():
     assert json.loads(c._encode({**stamp, "source_sequence": 7})) == {**stamp, "source_sequence": 7}
     with pytest.raises(ValueError, match="^INVALID_SCHEMA$"):
         c._encode({**stamp, "source_sequence": True})
+
+
+def _configured_input(count: int = 1) -> dict[str, object]:
+    names = ["WIRE-Z", "WIRE-A", "WIRE-M"][:count]
+    products = []
+    for index, name in enumerate(names, start=1):
+        products.append({
+            "product_id": name,
+            "instrument_code": index,
+            "taker_fee_rate": Decimal("0.0010"),
+            "liquidation_fee_rate": Decimal("0.0020"),
+            "specs": [{"version": "s1", "valid_from": 0, "valid_to": None,
+                "contract_value": Decimal("1"), "multiplier": Decimal("1"),
+                "price_tick": Decimal("1"), "quantity_step": Decimal("0.5"),
+                "minimum_quantity": Decimal("0.5")}],
+            "tiers": [{"version": "t1", "valid_from": 0, "valid_to": None,
+                "rows": [{"minimum_contracts": Decimal("0"), "maximum_contracts": Decimal("10"),
+                    "mmr": Decimal("0.005"), "imr": Decimal("0.1"), "max_leverage": Decimal("10")}]}],
+            "marks": [{"valid_from": 0, "valid_to": 100, "mark": Decimal("1")}],
+        })
+    return {"schema_version": "synthetic_multi_product_config_v1", "config_id": "codec-config",
+        "seed_effective_at": 50, "cash": Decimal("10"), "leverage": Decimal("1"),
+        "products": products, "positions": [], "orders": []}
+
+
+@pytest.mark.parametrize("count", [1, 3])
+def test_configured_constructor_transports_native_owned_config_and_snapshots_input(count):
+    configuration = _configured_input(count)
+    before_encoding = deepcopy(configuration)
+    original = json.loads(c._encode_configuration(configuration))
+    assert configuration == before_encoding
+    codec = c.ScenarioCodec("SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1", KEY, configuration)
+    configuration["config_id"] = "mutated-after-construction"
+    cast(list[dict[str, object]], configuration["products"])[0]["product_id"] = "CHANGED"
+    state = codec.inspect_state()
+    assert state["profile_id"] == "SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1"
+    assert state["config_id"] == "codec-config"
+    assert [row["product_id"] for row in original["products"]] == [
+        "WIRE-Z", "WIRE-A", "WIRE-M"
+    ][:count]
+    assert codec.__slots__ == ("_session",)
+    if count == 3:
+        reversed_configuration = _configured_input(count)
+        cast(list[dict[str, object]], reversed_configuration["products"]).reverse()
+        reversed_state = c.ScenarioCodec(
+            "SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1", KEY, reversed_configuration
+        ).inspect_state()
+        assert reversed_state["valuation_context_id"] != state["valuation_context_id"]
+
+
+def test_configured_constructor_preserves_p1_two_argument_call_and_native_validation(monkeypatch):
+    calls = []
+
+    class Session:
+        def __init__(self, *args):
+            calls.append(args)
+
+    monkeypatch.setattr(c._native, "_SyntheticScenarioReplaySession", Session)
+    c.ScenarioCodec("SYNTHETIC_BTC_ETH_V1", KEY)
+    assert len(calls[0]) == 2
+    assert calls[0] == ("SYNTHETIC_BTC_ETH_V1", c._encode(KEY))
+    c.ScenarioCodec("SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1", KEY, _configured_input())
+    assert len(calls[1]) == 3
+    assert calls[1][2] == c._encode_configuration(_configured_input())
+    # Restore the real binding for native-owned construction/validation checks.
+    monkeypatch.undo()
+    with pytest.raises(ValueError, match="^INVALID_SCHEMA$"):
+        c.ScenarioCodec("SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1", KEY)
+    for profile, config in [
+        ("SYNTHETIC_BTC_ETH_V1", _configured_input()),
+        ("unknown", _configured_input()),
+        ("SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1", {}),
+    ]:
+        with pytest.raises(ValueError, match="^INVALID_SCHEMA$"):
+            c.ScenarioCodec(profile, KEY, config)
+
+
+@pytest.mark.parametrize("invalid", [
+    {"x": 1.25}, {"x": Decimal("NaN")}, {1: "non-string key"},
+    {"x": (1, 2)}, {"x": object()}, ["not a mapping"],
+])
+def test_configured_transport_rejects_noncanonical_python_values(invalid):
+    with pytest.raises(ValueError, match="^INVALID_SCHEMA$"):
+        c._encode_configuration(cast(dict[str, object], invalid))
+
+
+def test_configured_transport_preserves_mapping_and_list_order_and_nested_nulls():
+    value = {"second": [Decimal("1.2500"), None], "first": {"enabled": True}}
+    encoded = c._encode_configuration(value)
+    assert encoded == '{"second":["1.25",null],"first":{"enabled":true}}'
+    assert value == {"second": [Decimal("1.2500"), None], "first": {"enabled": True}}
 
 
 @pytest.mark.parametrize("fixture,kind", [

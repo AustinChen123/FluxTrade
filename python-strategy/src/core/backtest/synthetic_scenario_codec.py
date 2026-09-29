@@ -21,7 +21,14 @@ def loaded_native_artifact_path() -> str:
     raise ValueError("UNSUPPORTED_CONFIGURATION")
 
 Product = Literal["BTC-USDT-SWAP", "ETH-USDT-SWAP", "P_A"]
-Profile = Literal["SYNTHETIC_BTC_ETH_V1", "SYNTHETIC_GOLDEN_CANCEL_V1", "SYNTHETIC_MIN_CASH_V1", "SYNTHETIC_P1_LIQUIDATION_V1", "SYNTHETIC_P1_O03_V1"]
+Profile = Literal[
+    "SYNTHETIC_BTC_ETH_V1",
+    "SYNTHETIC_GOLDEN_CANCEL_V1",
+    "SYNTHETIC_MIN_CASH_V1",
+    "SYNTHETIC_P1_LIQUIDATION_V1",
+    "SYNTHETIC_P1_O03_V1",
+    "SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1",
+]
 Side = Literal["LONG", "SHORT"]
 ObservedSide = Literal["buy", "sell"]
 Ordering = Literal["S_order_v1", "S_order_v1_reverse_execution_cancel_effective"]
@@ -385,6 +392,30 @@ def _encode(value: object) -> str:
     return json.dumps(_convert(value, reading=False), ensure_ascii=False, separators=(",", ":"))
 
 
+def _encode_configuration(value: Mapping[str, object]) -> str:
+    """Transport configured input without interpreting its native-owned schema."""
+    if not isinstance(value, Mapping):
+        raise _native.ScenarioReplayInputError("INVALID_SCHEMA")
+
+    def convert(item: object) -> object:
+        if isinstance(item, Mapping):
+            encoded: dict[str, object] = {}
+            for key, nested in item.items():
+                if type(key) is not str:
+                    raise _native.ScenarioReplayInputError("INVALID_SCHEMA")
+                encoded[key] = convert(nested)
+            return encoded
+        if type(item) is list:
+            return [convert(nested) for nested in item]
+        if isinstance(item, Decimal):
+            return _decimal(item)
+        if item is None or type(item) in (str, int, bool):
+            return item
+        raise _native.ScenarioReplayInputError("INVALID_SCHEMA")
+
+    return json.dumps(convert(value), ensure_ascii=False, separators=(",", ":"))
+
+
 def _decode(value: str) -> object:
     return _convert(cast(_Json, json.loads(value)), reading=True)
 
@@ -392,8 +423,18 @@ def _decode(value: str) -> object:
 class ScenarioCodec:
     __slots__ = ("_session",)
 
-    def __init__(self, profile: Profile, account: Account) -> None:
-        self._session = _native._SyntheticScenarioReplaySession(profile, _encode(account))
+    def __init__(
+        self,
+        profile: Profile,
+        account: Account,
+        configuration: Mapping[str, object] | None = None,
+    ) -> None:
+        if configuration is None:
+            self._session = _native._SyntheticScenarioReplaySession(profile, _encode(account))
+        else:
+            self._session = _native._SyntheticScenarioReplaySession(
+                profile, _encode(account), _encode_configuration(configuration)
+            )
 
     def apply_group(self, request: Group) -> GroupResult:
         return cast(GroupResult, _decode(self._session.apply_group(_encode(request))))
