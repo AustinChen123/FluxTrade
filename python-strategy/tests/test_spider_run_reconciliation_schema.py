@@ -8,7 +8,9 @@ from typing import Any
 import pytest
 
 from src.core.backtest import spider_run_reconciliation_schema as schema
-from test_spider_run_completion_schema import report_row
+from test_spider_run_completion_schema import (
+    CONFIGURED_PRODUCTS, configured_context, configured_report_rows, report_row,
+)
 
 NAMES = ["PLANNED_COVERAGE_COMPLETE", "PROCESSED_EQUALS_PERSISTED", "JOURNAL_CONTIGUOUS",
          "OWNER_IDENTITY_MATCH", "OWNER_DIGEST_MATCH", "ENDPOINT_SNAPSHOT_VERSION_MATCH",
@@ -42,6 +44,19 @@ def fixture() -> dict[str, Any]:
     return dict(schema_version="spider_reconciliation_v1", run_id="run", result="OK",
                 checks=[dict(name=name, expected=deepcopy(value), observed=deepcopy(value), result="OK",
                              evidence_refs=["journal:9", "journal:1"]) for name, value in zip(NAMES, values, strict=True)])
+
+
+def configured_fixture() -> dict[str, Any]:
+    value = fixture()
+    value["configuration_context"] = configured_context()
+    for side in ("expected", "observed"):
+        value["checks"][3][side][0].update(
+            profile_id="SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1", config_id="configured-v1"
+        )
+        value["checks"][10][side]["report_rows"] = configured_report_rows(
+            value["configuration_context"]
+        )
+    return value
 
 
 def paths(value: Any, prefix: tuple = ()):
@@ -267,3 +282,75 @@ def test_import_boundary():
     assert package_names == {"spider_run_envelope_schema", "spider_run_native_schema"}
     assert not any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and
                    node.func.id in {"open", "eval", "exec", "__import__"} for node in ast.walk(tree))
+
+
+def test_configured_reconciliation_context_validates_identity_and_report_projection():
+    value = configured_fixture()
+    before = deepcopy(value)
+    schema.reconciliation(value)
+    assert value == before
+
+    without_root = deepcopy(value)
+    del without_root["configuration_context"]
+    rejects(without_root)
+
+    p1_with_configured_context = fixture()
+    p1_with_configured_context["configuration_context"] = configured_context()
+    rejects(p1_with_configured_context)
+
+
+@pytest.mark.parametrize("side", ["expected", "observed"])
+def test_configured_report_projection_requires_root_context_and_exact_rows(side):
+    value = configured_fixture()
+    rows = value["checks"][10][side]["report_rows"]
+    for changed_rows in [
+        rows[::-1], rows[:-1], [rows[0], rows[0], rows[2]],
+        [*rows, deepcopy(rows[0])],
+    ]:
+        changed = deepcopy(value)
+        changed["checks"][10][side]["report_rows"] = changed_rows
+        rejects(changed)
+
+    changed = deepcopy(value)
+    del changed["checks"][10][side]["report_rows"][1]["configuration_context"]
+    rejects(changed)
+
+    changed = deepcopy(value)
+    changed["checks"][10][side]["report_rows"][1]["configuration_context"]["products"] = list(reversed(CONFIGURED_PRODUCTS))
+    rejects(changed)
+
+
+@pytest.mark.parametrize("side", ["expected", "observed"])
+def test_context_drop_from_owner_identity_value_is_causally_rejected(monkeypatch, side):
+    value = configured_fixture()
+    target_call = 1 if side == "expected" else 2
+    calls = 0
+    original = schema.native._profile_config_identity
+
+    def identity(profile, config, context, *, p1_config_id=None):
+        nonlocal calls
+        calls += 1
+        if calls == target_call:
+            context = None
+        return original(profile, config, context, p1_config_id=p1_config_id)
+
+    monkeypatch.setattr(schema.native, "_profile_config_identity", identity)
+    rejects(value)
+
+
+@pytest.mark.parametrize("side", ["expected", "observed"])
+def test_context_drop_from_report_projection_value_is_causally_rejected(monkeypatch, side):
+    value = configured_fixture()
+    target_call = 1 if side == "expected" else 2
+    calls = 0
+    original = schema.report
+
+    def report(rows, *, context=None):
+        nonlocal calls
+        calls += 1
+        if calls == target_call:
+            context = None
+        return original(rows, context=context)
+
+    monkeypatch.setattr(schema, "report", report)
+    rejects(value)

@@ -3,10 +3,11 @@
 from src.core.backtest import spider_run_envelope_schema as envelope
 from src.core.backtest import spider_run_native_schema as native
 from src.core.backtest.spider_run_artifacts import (
-    _KINDS, _TERMINALS, _boundary, _enum, _integer, _list, _object, _require, _text,
+    ConfigurationContext, _KINDS, _TERMINALS, _boundary, _enum, _integer,
+    _list, _object, _require, _text,
 )
 from src.core.backtest.spider_run_completion_schema import (
-    evidence_reference, evidence_references, report,
+    _embedded_context, evidence_reference, evidence_references, report,
 )
 
 _CHECKS = (
@@ -55,7 +56,9 @@ def _actions(value: object) -> None:
     envelope._ordered(identities)
 
 
-def _value(name: str, value: object) -> None:
+def _value(
+    name: str, value: object, *, context: ConfigurationContext | None = None
+) -> None:
     if name == "PLANNED_COVERAGE_COMPLETE":
         _barriers(value)
     elif name == "PROCESSED_EQUALS_PERSISTED":
@@ -72,8 +75,10 @@ def _value(name: str, value: object) -> None:
             row = _object(item, "evidence_ref account_key profile_id config_id")
             refs.append(evidence_reference(row["evidence_ref"]))
             native.account(row["account_key"])
-            _enum(row["profile_id"], native._PROFILES)
-            _enum(row["config_id"], ["scenario-v1"])
+            _require(native._profile_config_identity(
+                row["profile_id"], row["config_id"], context,
+                p1_config_id="scenario-v1",
+            ))
         _unique(refs)
     elif name == "OWNER_DIGEST_MATCH":
         barriers: list[str] = []
@@ -115,13 +120,17 @@ def _value(name: str, value: object) -> None:
     else:
         _require(name == "REPORT_PROJECTION_MATCH")
         row = _object(value, "report_rows report_sha256")
-        report(row["report_rows"])
+        report(row["report_rows"], context=context)
         native._hash(row["report_sha256"])
 
 
 def reconciliation(value: object) -> None:
     """Validate all eleven shapes without comparing or interpreting evidence."""
-    row = _object(value, "schema_version run_id result checks")
+    row = _object(value, "schema_version run_id result checks", "configuration_context")
+    context = (
+        _embedded_context(row["configuration_context"])
+        if "configuration_context" in row else None
+    )
     _enum(row["schema_version"], ["spider_reconciliation_v1"])
     _text(row["run_id"], "[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
     _enum(row["result"], ["OK", "FAILED"])
@@ -132,5 +141,5 @@ def reconciliation(value: object) -> None:
         _enum(check["name"], [name])
         _enum(check["result"], ["OK", "FAILED"])
         evidence_references(check["evidence_refs"])
-        _value(name, check["expected"])
-        _value(name, check["observed"])
+        _value(name, check["expected"], context=context)
+        _value(name, check["observed"], context=context)

@@ -4,8 +4,9 @@ import re
 from typing import cast
 
 from src.core.backtest.spider_run_artifacts import (
-    _HASH_NAMES, _KINDS, _TERMINALS, _boundary, _decimal_text, _enum, _integer,
-    _list, _object, _require, _text,
+    ConfigurationContext, _HASH_NAMES, _KINDS, _TERMINALS, _boundary,
+    _decimal_text, _enum, _integer, _list, _object, _require, _text,
+    configuration_context as validate_configuration_context,
 )
 from src.core.backtest.spider_run_native_schema import open_order
 
@@ -17,6 +18,18 @@ _ARTIFACTS = (
     ("reconciliation.json", "spider_reconciliation_v1"),
     ("report.jsonl", "spider_product_report_v1"),
 )
+
+
+def _embedded_context(value: object) -> ConfigurationContext:
+    row = _object(value, "schema_version config_id configuration_sha256 products")
+    _require(type(row["products"]) is list)
+    return validate_configuration_context(row)
+
+
+def _root_context(row: dict[str, object]) -> ConfigurationContext | None:
+    if "configuration_context" not in row:
+        return None
+    return _embedded_context(row["configuration_context"])
 
 
 def evidence_reference(value: object) -> str:
@@ -44,17 +57,22 @@ def _header(row: dict[str, object], schema: str) -> None:
     _enum(row["terminal_reason"], _TERMINALS)
 
 
-def report_row(value: object) -> None:
-    row = _object(value, "schema_version run_id product_id terminal_reason position_contracts mark_price notional_usd open_orders committed_execution_refs account_cash account_equity account_available_equity account_gross_realized account_total_fees source_evidence_refs")
+def report_row(value: object, *, context: ConfigurationContext | None = None) -> None:
+    row = _object(value, "schema_version run_id product_id terminal_reason position_contracts mark_price notional_usd open_orders committed_execution_refs account_cash account_equity account_available_equity account_gross_realized account_total_fees source_evidence_refs", "configuration_context")
     _header(row, "spider_product_report_v1")
-    _enum(row["product_id"], ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "P_A"])
+    if context is None:
+        _require("configuration_context" not in row)
+        _enum(row["product_id"], ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "P_A"])
+    else:
+        _require(_embedded_context(row.get("configuration_context")) == context)
+        _enum(row["product_id"], context.products)
     for name in "position_contracts notional_usd account_cash account_equity account_available_equity account_gross_realized account_total_fees".split():
         _decimal_text(row[name])
     if row["mark_price"] is not None:
         _decimal_text(row["mark_price"])
     orders: list[tuple[str, str]] = []
     for item in _list(row["open_orders"]):
-        open_order(item)
+        open_order(item, context=context)
         order = cast(dict[str, object], item)
         orders.append((_text(order["product_id"]), _text(order["order_id"])))
     _require(orders == sorted(set(orders)))
@@ -70,16 +88,22 @@ def report_row(value: object) -> None:
     evidence_references(row["source_evidence_refs"])
 
 
-def report(value: object) -> None:
+def report(value: object, *, context: ConfigurationContext | None = None) -> None:
+    if context is not None:
+        context = validate_configuration_context(context)
     rows = _list(value)
     for row in rows:
-        report_row(row)
+        report_row(row, context=context)
     products = [cast(dict[str, object], row)["product_id"] for row in rows]
-    _require(products in (["P_A"], ["BTC-USDT-SWAP", "ETH-USDT-SWAP"]))
+    if context is None:
+        _require(products in (["P_A"], ["BTC-USDT-SWAP", "ETH-USDT-SWAP"]))
+    else:
+        _require(products == list(context.products))
 
 
 def completion(value: object) -> None:
-    row = _object(value, "schema_version run_id state terminal_reason input_contract_hashes planned_coverage processed_boundary persisted_boundary endpoint_state_digest reconciliation_digest artifacts")
+    row = _object(value, "schema_version run_id state terminal_reason input_contract_hashes planned_coverage processed_boundary persisted_boundary endpoint_state_digest reconciliation_digest artifacts", "configuration_context")
+    _root_context(row)
     _header(row, "spider_completion_v1")
     _enum(row["state"], ["COMPLETE"])
     for name in ("endpoint_state_digest", "reconciliation_digest"):

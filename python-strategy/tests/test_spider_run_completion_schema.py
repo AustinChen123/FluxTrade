@@ -1,6 +1,7 @@
 """Causal structure tests, deliberately independent of evidence truth."""
 
 import ast
+import hashlib
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, cast
@@ -8,7 +9,10 @@ from typing import Any, cast
 import pytest
 
 from src.core.backtest import spider_run_completion_schema as schema
-from src.core.backtest.spider_run_artifacts import decode_jsonl, encode_jsonl
+from src.core.backtest.spider_run_artifacts import (
+    ConfigurationContext, canonical_bytes, configuration_context, decode_canonical,
+    decode_jsonl, encode_jsonl,
+)
 
 HASH = "a" * 64
 PATHS = ["attempt.json", "status.json", "journal.jsonl", "endpoint.json", "reconciliation.json", "report.jsonl"]
@@ -23,6 +27,31 @@ def report_row(product: str = "P_A") -> dict[str, Any]:
                 notional_usd="0", open_orders=[], committed_execution_refs=["SOURCE:中文😀", "LIQUIDATION:a"],
                 account_cash="1", account_equity="2", account_available_equity="3",
                 account_gross_realized="-1", account_total_fees="0.1", source_evidence_refs=["journal:1"])
+
+
+CONFIGURED_PRODUCTS = ["CFG-FIRST", "CFG-MIDDLE", "CFG-LAST"]
+
+
+def configured_context(products=None, config_id="configured-v1") -> dict[str, Any]:
+    return {
+        "schema_version": "spider_configuration_context_v1",
+        "config_id": config_id,
+        "configuration_sha256": HASH,
+        "products": list(CONFIGURED_PRODUCTS if products is None else products),
+    }
+
+
+def configured_report_row(product: str, context=None) -> dict[str, Any]:
+    context = configured_context() if context is None else context
+    row = report_row(product)
+    row["configuration_context"] = deepcopy(context)
+    row["open_orders"] = [dict(ORDER, product_id=product)]
+    return row
+
+
+def configured_report_rows(context=None) -> list[dict[str, Any]]:
+    context = configured_context() if context is None else context
+    return [configured_report_row(product, context) for product in context["products"]]
 
 
 def manifest() -> dict[str, Any]:
@@ -210,3 +239,109 @@ def test_import_boundary():
     assert {alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names} == {"re"}
     assert not any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and
                    node.func.id in {"open", "eval", "exec", "__import__"} for node in ast.walk(tree))
+
+
+def test_configured_report_requires_exact_context_products_and_order():
+    raw_context = configured_context()
+    context = configuration_context(raw_context)
+    rows = configured_report_rows(raw_context)
+    schema.report(rows, context=context)
+
+    for changed in [
+        rows[::-1],
+        rows[:-1],
+        [rows[0], rows[0], rows[2]],
+        [*rows, configured_report_row("CFG-EXTRA", raw_context)],
+    ]:
+        with pytest.raises(ValueError):
+            schema.report(changed, context=context)
+
+    changed = deepcopy(rows)
+    del changed[1]["configuration_context"]
+    with pytest.raises(ValueError):
+        schema.report(changed, context=context)
+
+    changed = deepcopy(rows)
+    changed[1]["configuration_context"]["config_id"] = "other-config"
+    with pytest.raises(ValueError):
+        schema.report(changed, context=context)
+
+    changed = deepcopy(rows)
+    changed[1]["product_id"] = "CFG-LAST"
+    with pytest.raises(ValueError):
+        schema.report(changed, context=context)
+
+
+def test_configured_report_context_is_detached_and_preserves_product_order():
+    source = configured_context(["CFG-LAST", "CFG-MIDDLE", "CFG-FIRST"])
+    context = configuration_context(source)
+    rows = configured_report_rows(source)
+    schema.report(rows, context=context)
+    source["products"].reverse()
+    assert context.products == ("CFG-LAST", "CFG-MIDDLE", "CFG-FIRST")
+    assert [row["product_id"] for row in rows] == [
+        "CFG-LAST", "CFG-MIDDLE", "CFG-FIRST"
+    ]
+    schema.report(rows, context=context)
+
+
+def test_empty_configured_context_rejects_empty_report():
+    context = ConfigurationContext(
+        "spider_configuration_context_v1", "configured-v1", HASH, ()
+    )
+    with pytest.raises(ValueError):
+        schema.report([], context=context)
+
+
+def test_configured_report_validates_nested_orders_against_context():
+    context = configuration_context(configured_context())
+    rows = configured_report_rows()
+    rows[0]["open_orders"][0]["product_id"] = "BTC-USDT-SWAP"
+    with pytest.raises(ValueError):
+        schema.report(rows, context=context)
+
+
+def test_configured_report_rows_cannot_be_validated_without_root_context(monkeypatch):
+    rows = configured_report_rows()
+    with pytest.raises(ValueError):
+        schema.report(rows)
+
+    context = configuration_context(configured_context())
+    rows = configured_report_rows()
+    original = schema.report_row
+    monkeypatch.setattr(schema, "report_row", lambda value, **kwargs: original(value))
+    with pytest.raises(ValueError):
+        schema.report(rows, context=context)
+
+
+def test_p1_report_domains_reject_context_leak_and_keep_canonical_bytes():
+    schema.report([report_row()])
+    schema.report([report_row("BTC-USDT-SWAP"), report_row("ETH-USDT-SWAP")])
+    leaked = report_row()
+    leaked["configuration_context"] = configured_context()
+    with pytest.raises(ValueError):
+        schema.report([leaked])
+    assert hashlib.sha256(canonical_bytes(report_row())).hexdigest() == (
+        "bde6f37495c4a4aea5916c8cd82f6f95b7b28f6059101d1376a2aec1a3641bc8"
+    )
+
+
+def test_completion_context_roundtrips_without_changing_manifest_semantics():
+    row = manifest()
+    row["configuration_context"] = configured_context(
+        ["CFG-LAST", "CFG-MIDDLE", "CFG-FIRST"]
+    )
+    schema.completion(row)
+    encoded = canonical_bytes(row)
+    assert decode_canonical(encoded) == row
+    assert b'"products":["CFG-LAST","CFG-MIDDLE","CFG-FIRST"]' in encoded
+
+    p1_bytes_hash = hashlib.sha256(canonical_bytes(manifest())).hexdigest()
+    assert p1_bytes_hash == "e650d5f2d6e1f9508560706441d6563e1b06631725dd955283e5597ccba579a5"
+    for invalid in [
+        {**row, "configuration_context": None},
+        {**row, "configuration_context": {**configured_context(), "products": ()}},
+        {**row, "configuration_context": {**configured_context(), "extra": "x"}},
+    ]:
+        with pytest.raises(ValueError):
+            schema.completion(invalid)

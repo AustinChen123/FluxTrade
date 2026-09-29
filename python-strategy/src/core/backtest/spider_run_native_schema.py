@@ -21,6 +21,7 @@ _KINDS = ["MARKET", "EARN", "TRADING", "POSITIONS", "OPEN_ORDERS"]
 _ORDERING = ["S_order_v1", "S_order_v1_reverse_execution_cancel_effective"]
 _LIFECYCLES = ["RISK_STABLE", "AWAITING_CANCEL_EFFECTIVE", "LIQUIDATED_FLAT", "LIQUIDATED_INSOLVENT"]
 _PROFILES = ["SYNTHETIC_BTC_ETH_V1", "SYNTHETIC_GOLDEN_CANCEL_V1", "SYNTHETIC_MIN_CASH_V1", "SYNTHETIC_P1_LIQUIDATION_V1", "SYNTHETIC_P1_O03_V1"]
+_CONFIGURED_PROFILE = "SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1"
 
 
 def _fields(row: dict[str, object], names: str, check: Callable[[object], object]) -> None:
@@ -50,6 +51,21 @@ def _product_id(
     if context is not None:
         return _enum(value, context.products)
     return _text(value) if default_domain is None else _enum(value, default_domain)
+
+
+def _profile_config_identity(
+    profile_id: object,
+    config_id: object,
+    context: ConfigurationContext | None,
+    *,
+    p1_config_id: str | None = None,
+) -> bool:
+    profile = _text(profile_id)
+    config = _text(config_id)
+    context = _context(context)
+    if context is not None:
+        return profile == _CONFIGURED_PROFILE and config == context.config_id
+    return profile in _PROFILES and (p1_config_id is None or config == p1_config_id)
 
 
 def _reason(value: object) -> str:
@@ -288,15 +304,7 @@ def inspection(value: object, *, context: ConfigurationContext | None = None) ->
     row = _object(value, "schema_version account_key profile_id config_id account_version valuation_context_id gate lifecycle cash gross_realized total_fees positions_digest orders_digest reservations_digest owner_state_digest", "gate_failure")
     _enum(row["schema_version"], ["inspect_state_v1"])
     account(row["account_key"])
-    profile = _text(row["profile_id"])
-    if profile == "SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1":
-        _require(context is not None)
-    else:
-        _enum(profile, _PROFILES)
-        _require(context is None)
-    config_id = _text(row["config_id"])
-    if context is not None:
-        _require(config_id == context.config_id)
+    _require(_profile_config_identity(row["profile_id"], row["config_id"], context))
     _integer(row["account_version"])
     _fields(row, "valuation_context_id positions_digest orders_digest reservations_digest owner_state_digest", _hash)
     _enum(row["gate"], ["RUNNING", "FAILED"])

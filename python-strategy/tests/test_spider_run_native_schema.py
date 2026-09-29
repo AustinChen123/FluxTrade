@@ -527,6 +527,14 @@ def test_configured_inspection_binds_profile_and_config_id_not_product_membershi
         n.inspection(configured)
     with pytest.raises(ValueError):
         n.inspection(INSPECTION, context=first)
+    n.inspection({**INSPECTION, "config_id": "any-other-nonempty-id"})
+    assert n._profile_config_identity(
+        INSPECTION["profile_id"], "any-other-nonempty-id", None
+    )
+    assert not n._profile_config_identity(
+        INSPECTION["profile_id"], "scenario-v1", first,
+        p1_config_id="scenario-v1",
+    )
 
 
 @pytest.mark.parametrize("profile", n._PROFILES)
