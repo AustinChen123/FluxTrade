@@ -266,12 +266,44 @@ fn product_id(product: &Product) -> &str {
 }
 
 fn context_id(scenario: &FrozenScenario, marks: &[Mark], at: i64) -> Result<Hash, Fault> {
+    context_id_at(scenario, marks, at, at)
+}
+
+fn owner_context_id(
+    scenario: &FrozenScenario,
+    marks: &[Mark],
+    active_at: i64,
+    seed_effective_at: i64,
+    config_id: &str,
+) -> Result<Hash, Fault> {
+    let encoded_at = if scenario.configured.is_some() {
+        seed_effective_at
+    } else {
+        active_at
+    };
+    let context = context_id_at(scenario, marks, active_at, encoded_at)?;
+    if scenario.configured.is_some() {
+        Ok(hash_fields(&[
+            Some(format!("{:02x?}", context)),
+            Some(config_id.into()),
+        ]))
+    } else {
+        Ok(context)
+    }
+}
+
+fn context_id_at(
+    scenario: &FrozenScenario,
+    marks: &[Mark],
+    active_at: i64,
+    encoded_at: i64,
+) -> Result<Hash, Fault> {
     let mut fields = Vec::new();
     for product in scenario.products() {
-        let (spec, tier) = scenario.resolve(&product, at)?;
+        let (spec, tier) = scenario.resolve(&product, active_at)?;
         let mark = marks
             .iter()
-            .find(|m| m.product == product && m.valid_from <= at && at < m.valid_to)
+            .find(|m| m.product == product && m.valid_from <= active_at && active_at < m.valid_to)
             .ok_or("MARK_COVERAGE_MISSING")?;
         fields.extend([
             Some(product_id(&product).into()),
@@ -290,7 +322,7 @@ fn context_id(scenario: &FrozenScenario, marks: &[Mark], at: i64) -> Result<Hash
                 .find(|row| row.product == product)
                 .ok_or("INVALID_SCHEMA")?;
             fields.extend([
-                Some(at.to_string()),
+                Some(encoded_at.to_string()),
                 Some(row.instrument_code.to_string()),
                 Some(row.taker_fee.normalize().to_string()),
                 Some(row.liquidation_fee.normalize().to_string()),
@@ -487,15 +519,13 @@ impl ScenarioAccount {
         scenario: FrozenScenario,
         marks: &[Mark],
     ) -> Result<Self, Fault> {
-        let context = context_id(&scenario, marks, seed.effective_at)?;
-        let valuation_context_id = if scenario.configured.is_some() {
-            hash_fields(&[
-                Some(format!("{:02x?}", context)),
-                Some(seed.config_id.clone()),
-            ])
-        } else {
-            context
-        };
+        let valuation_context_id = owner_context_id(
+            &scenario,
+            marks,
+            seed.effective_at,
+            seed.effective_at,
+            &seed.config_id,
+        )?;
         let mut positions = BTreeMap::new();
         let mut sequences = BTreeSet::new();
         let mut seed_ids = BTreeSet::new();
@@ -679,7 +709,13 @@ impl ScenarioAccount {
         let current = match &self.profile {
             ProfileContext::BtcEthScenario {
                 scenario, marks, ..
-            } => context_id(scenario, marks, effective_at),
+            } => owner_context_id(
+                scenario,
+                marks,
+                effective_at,
+                self.seed_effective_at,
+                &self.config_id,
+            ),
             ProfileContext::GoldenCapacity(config) => config.context_id(effective_at),
             ProfileContext::EventLimit(config) => config.context_id(effective_at),
             ProfileContext::GoldenCancel(config) => config.context_id(effective_at),

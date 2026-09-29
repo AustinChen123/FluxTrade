@@ -151,6 +151,23 @@ fn configured_product_type_and_account_error_precedence_are_preserved() {
 }
 
 #[test]
+fn twelve_product_first_intent_passes_configured_context_validation() {
+    let mut owner = configured_owner(12);
+    let mut value = request("INTENT");
+    value["group_effective_at"] = json!(501);
+    value["members"][0]["stamp"]["effective_at"] = json!(501);
+    value["members"][0]["payload"]["requested_at"] = json!(501);
+    value["members"][0]["payload"]["limit_price"] = json!("100");
+    value["members"][0]["payload"]["config_id"] = json!(owner.config_id);
+    let decoded = parse(&value, &owner).unwrap();
+    let result = owner.apply_group_observed(&decoded, |_| Ok(())).unwrap();
+    let crate::binding::matcher::replay_transition::synthetic_risk::scenario_account::group::Applied::Fresh(completion) = result else {
+        panic!("first intent should be fresh")
+    };
+    assert_ne!(completion.failure, Some("UNSUPPORTED_CONTEXT_TRANSITION"));
+}
+
+#[test]
 fn legacy_wire_product_matrix_keeps_p1_tokens_and_context_rejection() {
     let owner = owner();
     for token in ["BTC-USDT-SWAP", "ETH-USDT-SWAP"] {

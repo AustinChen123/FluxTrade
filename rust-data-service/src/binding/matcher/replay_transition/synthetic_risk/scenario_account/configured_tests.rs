@@ -613,3 +613,144 @@ fn configured_context_identity_covers_every_configured_semantic_field() {
         cash_owner.valuation_context_id
     );
 }
+
+fn configured_context_owner(products: Vec<ConfiguredProduct>, at: i64) -> ScenarioAccount {
+    let mut seed = input(products.len()).0;
+    seed.effective_at = at;
+    ScenarioAccount::from_configured(&seed, d("10"), products).unwrap()
+}
+
+#[test]
+fn configured_context_identity_is_stable_within_active_rows_and_p1_singleton_is_exact() {
+    let (seed, products) = input(1);
+    let owner = ScenarioAccount::from_configured(&seed, d("10"), products.clone()).unwrap();
+    assert_eq!(owner.valuation_context_id, PARENT_SINGLETON_CONTEXT);
+    assert_eq!(owner.validate_context(seed.effective_at), Ok(()));
+    assert_eq!(owner.validate_context(seed.effective_at + 1), Ok(()));
+    assert_eq!(owner.validate_context(2999), Ok(()));
+
+    let mut other_id = seed.clone();
+    other_id.config_id.push_str("-other");
+    let other_id = ScenarioAccount::from_configured(&other_id, d("10"), products.clone()).unwrap();
+    assert_ne!(owner.valuation_context_id, other_id.valuation_context_id);
+
+    let later_seed = configured_context_owner(products, seed.effective_at + 1);
+    assert_ne!(owner.valuation_context_id, later_seed.valuation_context_id);
+}
+
+#[test]
+fn configured_spec_tier_and_mark_boundaries_mismatch_independently() {
+    let (_seed, base) = input(1);
+
+    let mut spec_products = base.clone();
+    let mut spec_v1 = spec_products[0].specs[0].clone();
+    spec_v1.interval.to = Some(100);
+    let spec_v2 = Spec {
+        version: "spec-v2".into(),
+        interval: Interval {
+            from: 100,
+            to: None,
+        },
+        ..spec_v1.clone()
+    };
+    spec_products[0].specs = vec![spec_v1, spec_v2];
+    let spec_owner = configured_context_owner(spec_products, 50);
+    let before_spec = spec_owner.valuation_context_id;
+    assert_eq!(spec_owner.validate_context(99), Ok(()));
+    assert_ne!(
+        before_spec,
+        owner_context_id(
+            &spec_owner.btc_context().unwrap().0,
+            spec_owner.btc_context().unwrap().1,
+            100,
+            spec_owner.seed_effective_at,
+            &spec_owner.config_id,
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        spec_owner.validate_context(100),
+        Err("UNSUPPORTED_CONTEXT_TRANSITION")
+    );
+
+    let mut tier_products = base.clone();
+    let mut tier_v1 = tier_products[0].tiers[0].clone();
+    tier_v1.interval.to = Some(100);
+    let tier_v2 = TierVersion {
+        version: "tier-v2".into(),
+        interval: Interval {
+            from: 100,
+            to: None,
+        },
+        ..tier_v1.clone()
+    };
+    tier_products[0].tiers = vec![tier_v1, tier_v2];
+    let tier_owner = configured_context_owner(tier_products, 50);
+    assert_eq!(tier_owner.validate_context(99), Ok(()));
+    assert_eq!(
+        tier_owner.validate_context(100),
+        Err("UNSUPPORTED_CONTEXT_TRANSITION")
+    );
+
+    let mut mark_products = base.clone();
+    let mut mark_v1 = mark_products[0].marks[0].clone();
+    mark_v1.valid_to = 100;
+    let mark_v2 = Mark {
+        price: d("101"),
+        valid_from: 100,
+        valid_to: 3000,
+        ..mark_v1.clone()
+    };
+    mark_products[0].marks = vec![mark_v1, mark_v2];
+    let mark_owner = configured_context_owner(mark_products, 50);
+    assert_eq!(mark_owner.validate_context(99), Ok(()));
+    assert_eq!(
+        mark_owner.validate_context(100),
+        Err("UNSUPPORTED_CONTEXT_TRANSITION")
+    );
+}
+
+#[test]
+fn configured_mark_gap_keeps_the_existing_failure_and_owner_is_unchanged() {
+    let (seed, mut products) = input(1);
+    let second_mark = products[0].marks[0].clone();
+    products[0].marks[0].valid_to = 100;
+    products[0].marks.push(Mark {
+        valid_from: 150,
+        valid_to: 3000,
+        ..second_mark
+    });
+    let owner = ScenarioAccount::from_configured(&seed, d("10"), products).unwrap();
+    let before = owner.clone();
+    assert_eq!(
+        owner.validate_context(125),
+        Err("UNSUPPORTED_CONTEXT_TRANSITION")
+    );
+    assert_eq!(owner, before);
+}
+
+#[test]
+fn configured_two_product_mark_activation_updates_and_stabilizes_owner_identity() {
+    let (seed, mut products) = input(2);
+    for product in &mut products {
+        product.marks[0].valid_to = 600;
+        product.marks.push(Mark {
+            price: d("101"),
+            valid_from: 600,
+            valid_to: 3000,
+            ..product.marks[0].clone()
+        });
+    }
+    let mut owner = ScenarioAccount::from_configured(&seed, d("10"), products.clone()).unwrap();
+    assert_eq!(owner.validate_context(501), Ok(()));
+    let marks = products
+        .iter()
+        .flat_map(|row| row.marks.iter().cloned())
+        .collect::<Vec<_>>();
+    let activation =
+        context::tests::activation(&owner, 600, context::tests::mark_rows(&marks, 600));
+    let receipt = owner.activate_context(&activation).unwrap();
+    assert_eq!(owner.valuation_context_id, activation.expected_after);
+    assert_ne!(receipt.input.expected_before, receipt.input.expected_after);
+    assert_eq!(owner.validate_context(601), Ok(()));
+}

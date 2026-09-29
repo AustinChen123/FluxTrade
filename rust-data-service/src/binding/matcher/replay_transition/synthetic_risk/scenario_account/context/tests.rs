@@ -27,7 +27,14 @@ pub(in super::super) fn activation(owner: &ScenarioAccount, at: i64, rows: Rows)
             },
         ),
         expected_before: owner.valuation_context_id,
-        expected_after: context_id(scenario, marks, at).unwrap(),
+        expected_after: owner_context_id(
+            scenario,
+            marks,
+            at,
+            owner.seed_effective_at,
+            &owner.config_id,
+        )
+        .unwrap(),
         rows,
     }
 }

@@ -178,10 +178,12 @@ impl ScenarioAccount {
             return Err("UNSUPPORTED_CONTEXT_TRANSITION");
         }
         let (scenario, marks) = self.btc_context()?;
-        let after_id = context_id(scenario, marks, at).map_err(|fault| match fault {
-            "MARK_COVERAGE_MISSING" => "UNSUPPORTED_CONTEXT_TRANSITION",
-            other => other,
-        })?;
+        let after_id =
+            owner_context_id(scenario, marks, at, self.seed_effective_at, &self.config_id)
+                .map_err(|fault| match fault {
+                    "MARK_COVERAGE_MISSING" => "UNSUPPORTED_CONTEXT_TRANSITION",
+                    other => other,
+                })?;
         if input.expected_after != after_id {
             return Err("UNSUPPORTED_CONTEXT_TRANSITION");
         }
