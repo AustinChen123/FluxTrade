@@ -3,6 +3,7 @@ use super::super::super::tests::{d, fixture};
 use super::*;
 use execution::commit::tests::{at, input};
 mod closure;
+mod configured_fee_cancel;
 fn projection(namespace: &'static str, id: &str, kind: &'static str) -> Projection {
     Projection {
         schema_version: "delivery_projection_v1".into(),
