@@ -4,7 +4,7 @@ use super::*;
 #[test]
 fn o03_capacity_counts_occupied_and_resting_without_mutation() {
     let mut owner =
-        super::super::wire::profiles::construct("SYNTHETIC_P1_O03_V1", seed().key).unwrap();
+        super::super::wire::profiles::construct("SYNTHETIC_P1_O03_V1", seed().key, None).unwrap();
     let PositionState::GoldenCancel(Some(position)) = &mut owner.positions else {
         panic!("position")
     };
@@ -70,7 +70,8 @@ fn o03_zero_fee_cannot_enter_other_settlement_contexts() {
             Err(expected)
         );
     }
-    let owner = super::super::wire::profiles::construct("SYNTHETIC_P1_O03_V1", seed.key).unwrap();
+    let owner =
+        super::super::wire::profiles::construct("SYNTHETIC_P1_O03_V1", seed.key, None).unwrap();
     let PositionState::GoldenCancel(Some(position)) = &owner.positions else {
         panic!("position")
     };

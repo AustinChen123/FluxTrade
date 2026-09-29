@@ -7,6 +7,18 @@ fn text(s: &str) -> Json {
 fn account() -> Json {
     decode(r#"{"venue":"okx-scenario","environment":"test","account":"A"}"#).unwrap()
 }
+fn configured() -> String {
+    let product = |id: &str, code| {
+        format!(
+            r#"{{"product_id":"{id}","instrument_code":{code},"taker_fee_rate":"0","liquidation_fee_rate":"0","specs":[{{"version":"s1","valid_from":0,"valid_to":null,"contract_value":"1","multiplier":"1","price_tick":"1","quantity_step":"1","minimum_quantity":"1"}}],"tiers":[{{"version":"t1","valid_from":0,"valid_to":null,"rows":[{{"minimum_contracts":"0","maximum_contracts":"10","mmr":"0","imr":"0","max_leverage":"1"}}]}}],"marks":[{{"valid_from":0,"valid_to":100,"mark":"1"}}]}}"#
+        )
+    };
+    format!(
+        r#"{{"schema_version":"synthetic_multi_product_config_v1","config_id":"wire-config","seed_effective_at":50,"cash":"10","leverage":"1","products":[{},{}],"positions":[],"orders":[]}}"#,
+        product("WIRE-Z", 2),
+        product("WIRE-A", 1)
+    )
+}
 
 #[test]
 fn strict_json_preserves_keys_and_separates_syntax_from_schema() {
@@ -164,12 +176,12 @@ fn account_schema_and_absent_null_equivalence_are_exact() {
 fn closed_constructors_equal_existing_owners_and_literal_anchors() {
     let key = account().account().unwrap();
     let (seed, config, marks) = super::super::tests::fixture();
-    let btc = construct("SYNTHETIC_BTC_ETH_V1", key.clone()).unwrap();
+    let btc = construct("SYNTHETIC_BTC_ETH_V1", key.clone(), None).unwrap();
     assert_eq!(
         btc,
         ScenarioAccount::from_seed(&seed, &config, &marks).unwrap()
     );
-    let golden = construct("SYNTHETIC_GOLDEN_CANCEL_V1", key.clone()).unwrap();
+    let golden = construct("SYNTHETIC_GOLDEN_CANCEL_V1", key.clone(), None).unwrap();
     assert_eq!(
         (golden.cash, golden.state_version, golden.seed_effective_at),
         (Decimal::from(1000), 0, 500)
@@ -180,7 +192,7 @@ fn closed_constructors_equal_existing_owners_and_literal_anchors() {
         golden.profile,
         ProfileContext::GoldenCancel(golden_cancel::Config::frozen())
     );
-    let min = construct("SYNTHETIC_MIN_CASH_V1", key.clone()).unwrap();
+    let min = construct("SYNTHETIC_MIN_CASH_V1", key.clone(), None).unwrap();
     assert_eq!(
         min,
         ScenarioAccount::synthetic_min_cash(key.clone()).unwrap()
@@ -198,15 +210,58 @@ fn closed_constructors_equal_existing_owners_and_literal_anchors() {
     ] {
         let mut other = key.clone();
         other.account = "B".into();
-        assert_eq!(construct(profile, other.clone()).unwrap().key, other);
+        assert_eq!(construct(profile, other.clone(), None).unwrap().key, other);
     }
-    assert_eq!(construct("unknown", key.clone()), Err("INVALID_SCHEMA"));
+    assert_eq!(
+        construct("unknown", key.clone(), None),
+        Err("INVALID_SCHEMA")
+    );
     let mut invalid = key;
     invalid.account.clear();
     assert_eq!(
-        construct("SYNTHETIC_MIN_CASH_V1", invalid),
+        construct("SYNTHETIC_MIN_CASH_V1", invalid, None),
         Err("INVALID_SCHEMA")
     );
+}
+
+#[test]
+fn configured_profile_dispatch_is_the_only_optional_configuration_path() {
+    let key = account().account().unwrap();
+    let config = configured();
+    let owner = construct(profiles::CONFIGURED_PROFILE, key.clone(), Some(&config)).unwrap();
+    assert_eq!(owner.config_id, "wire-config");
+    assert!(matches!(
+        owner.profile,
+        ProfileContext::BtcEthScenario { .. }
+    ));
+    assert_eq!(
+        owner
+            .reservation()
+            .unwrap()
+            .products
+            .iter()
+            .map(|p| p.product.0.as_ref())
+            .collect::<Vec<_>>(),
+        ["WIRE-Z", "WIRE-A"]
+    );
+    let Json::Object(state) = owner.inspect_state().unwrap().wire_json().unwrap() else {
+        panic!()
+    };
+    assert_eq!(state["profile_id"], text(profiles::CONFIGURED_PROFILE));
+    assert_eq!(state["config_id"], text("wire-config"));
+    for (profile, config) in [
+        (profiles::CONFIGURED_PROFILE, None),
+        (profiles::CONFIGURED_PROFILE, Some("null")),
+        (profiles::CONFIGURED_PROFILE, Some("{")),
+        ("SYNTHETIC_BTC_ETH_V1", Some(config.as_str())),
+        ("unknown", None),
+        ("unknown", Some(config.as_str())),
+    ] {
+        assert_eq!(
+            construct(profile, key.clone(), config),
+            Err("INVALID_SCHEMA")
+        );
+    }
 }
 
 #[test]
@@ -235,7 +290,7 @@ fn p1_liquidation_profile_reuses_frozen_owner_transition() {
         unreachable!()
     };
     *p1_liquidation_profile = true;
-    let mut owner = construct("SYNTHETIC_P1_LIQUIDATION_V1", seed.key).unwrap();
+    let mut owner = construct("SYNTHETIC_P1_LIQUIDATION_V1", seed.key, None).unwrap();
     assert_eq!(owner, expected);
     // Independent raw-byte SHA256: entry basis 500; lot entry 50000; base 0.01.
     let hex = |hash: Hash| hash.iter().map(|b| format!("{b:02x}")).collect::<String>();

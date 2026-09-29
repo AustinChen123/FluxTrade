@@ -43,10 +43,20 @@ impl PySession {
 #[pymethods]
 impl PySession {
     #[new]
-    #[pyo3(signature = (profile_id, account_key))]
-    fn new(profile_id: &Bound<'_, PyAny>, account_key: &Bound<'_, PyAny>) -> PyResult<Self> {
+    #[pyo3(signature = (profile_id, account_key, configuration=None))]
+    fn new(
+        profile_id: &Bound<'_, PyAny>,
+        account_key: &Bound<'_, PyAny>,
+        configuration: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        let configuration = configuration.map(text).transpose()?;
         Ok(Self {
-            inner: Session::new(&text(profile_id)?, &text(account_key)?).map_err(error)?,
+            inner: Session::new(
+                &text(profile_id)?,
+                &text(account_key)?,
+                configuration.as_deref(),
+            )
+            .map_err(error)?,
         })
     }
     #[pyo3(signature = (request))]

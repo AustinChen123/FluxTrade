@@ -8,9 +8,12 @@ mod output_tests {
     #[test]
     fn golden_saved_alias_and_checked_version() {
         let (seed, _, _) = super::super::super::tests::fixture();
-        let mut owner =
-            super::super::super::wire::profiles::construct("SYNTHETIC_GOLDEN_CANCEL_V1", seed.key)
-                .unwrap();
+        let mut owner = super::super::super::wire::profiles::construct(
+            "SYNTHETIC_GOLDEN_CANCEL_V1",
+            seed.key,
+            None,
+        )
+        .unwrap();
         admission::inspection_tests::golden_admit(&mut owner);
         let id = owner.orders.keys().next().unwrap().clone();
         owner

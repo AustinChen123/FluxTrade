@@ -29,11 +29,15 @@ struct Session {
     poisoned: bool,
 }
 impl Session {
-    fn new(profile: &str, account: &str) -> Result<Self, BoundaryError> {
+    fn new(
+        profile: &str,
+        account: &str,
+        configuration: Option<&str>,
+    ) -> Result<Self, BoundaryError> {
         let key = wire::decode(account)
             .and_then(|v| v.account())
             .map_err(boundary)?;
-        let owner = wire::profiles::construct(profile, key).map_err(boundary)?;
+        let owner = wire::profiles::construct(profile, key, configuration).map_err(boundary)?;
         Ok(Self {
             snapshots: snapshot::Store::new(owner.key.clone()),
             deliveries: delivery::store::Store::new(owner.key.clone()),

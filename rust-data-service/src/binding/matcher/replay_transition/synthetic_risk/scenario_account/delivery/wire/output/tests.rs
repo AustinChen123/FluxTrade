@@ -154,6 +154,7 @@ fn golden_source_delivery_preserves_both_client_identities() {
     let mut owner = super::super::super::super::wire::profiles::construct(
         "SYNTHETIC_GOLDEN_CANCEL_V1",
         seed.key,
+        None,
     )
     .unwrap();
     admission::inspection_tests::golden_admit(&mut owner);

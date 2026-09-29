@@ -2,11 +2,21 @@ use super::*;
 
 mod configured;
 
+pub(super) const CONFIGURED_PROFILE: &str = "SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1";
+
 pub(in super::super) fn construct(
     profile: &str,
     key: AccountKey,
+    configuration: Option<&str>,
 ) -> Result<ScenarioAccount, Fault> {
     key.validate().map_err(|_| "INVALID_SCHEMA")?;
+    if profile == CONFIGURED_PROFILE {
+        return configured::construct(configuration.ok_or("INVALID_SCHEMA")?, key)
+            .map_err(|_| "INVALID_SCHEMA");
+    }
+    if configuration.is_some() {
+        return Err("INVALID_SCHEMA");
+    }
     if profile == "SYNTHETIC_MIN_CASH_V1" {
         return ScenarioAccount::synthetic_min_cash(key).map_err(|_| "NATIVE_INVARIANT");
     }

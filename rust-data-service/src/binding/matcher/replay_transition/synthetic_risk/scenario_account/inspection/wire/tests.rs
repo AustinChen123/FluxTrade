@@ -9,7 +9,8 @@ fn detached_inspection_three_profiles_and_checked_boundary() {
         "SYNTHETIC_MIN_CASH_V1",
     ] {
         let mut owner =
-            super::super::super::wire::profiles::construct(profile, seed.key.clone()).unwrap();
+            super::super::super::wire::profiles::construct(profile, seed.key.clone(), None)
+                .unwrap();
         for gate in [Gate::Running, Gate::Failed("EXACT_REASON")] {
             owner.gate = gate.clone();
             let before = owner.clone();

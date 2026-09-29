@@ -27,15 +27,37 @@ factory = native._SyntheticScenarioReplaySession
 profile = 'SYNTHETIC_BTC_ETH_V1'
 key = '{"venue":"okx-scenario","environment":"test","account":"A"}'
 s = factory(profile_id=profile, account_key=key)
+assert factory(profile, key, None).inspect_state() == s.inspect_state()
 class Coerce:
     def __str__(self):
         raise AssertionError('coercion forbidden')
+def product(product_id, code):
+    return {'product_id':product_id,'instrument_code':code,'taker_fee_rate':'0','liquidation_fee_rate':'0',
+        'specs':[{'version':'s1','valid_from':0,'valid_to':None,'contract_value':'1','multiplier':'1','price_tick':'1','quantity_step':'1','minimum_quantity':'1'}],
+        'tiers':[{'version':'t1','valid_from':0,'valid_to':None,'rows':[{'minimum_contracts':'0','maximum_contracts':'10','mmr':'0','imr':'0','max_leverage':'1'}]}],
+        'marks':[{'valid_from':0,'valid_to':100,'mark':'1'}]}
+configuration = json.dumps({'schema_version':'synthetic_multi_product_config_v1','config_id':'py-config',
+    'seed_effective_at':50,'cash':'10','leverage':'1','products':[product('WIRE-Z',2),product('WIRE-A',1)],'positions':[],'orders':[]})
+configured = 'SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1'
+valid = factory(configured, key, configuration)
+facts = json.loads(valid.inspect_state())
+assert facts['profile_id'] == configured and facts['config_id'] == 'py-config'
+assert factory(profile_id=configured, account_key=key, configuration=configuration).inspect_state() == valid.inspect_state()
+class Text(str): pass
+assert json.loads(factory(Text(configured), Text(key), Text(configuration)).inspect_state())['config_id'] == 'py-config'
+for call in [lambda: factory(configured, key), lambda: factory(configured, key, None),
+             lambda: factory(configured, key, 'null'), lambda: factory(configured, key, '{'),
+             lambda: factory(configured, key, '{}'), lambda: factory(profile, key, configuration),
+             lambda: factory('unknown', key), lambda: factory('unknown', key, configuration),
+             lambda: factory(profile, key, key)]:
+    failure(call, native.ScenarioReplayInputError, 'INVALID_SCHEMA')
 for invalid in [None, 1, True, {}, b'{}', Coerce(), '\ud800']:
     failure(lambda: factory(invalid, key), native.ScenarioReplayInputError, 'INVALID_SCHEMA')
     failure(lambda: factory(profile, invalid), native.ScenarioReplayInputError, 'INVALID_SCHEMA')
+    failure(lambda: factory(configured, key, invalid), native.ScenarioReplayInputError, 'INVALID_SCHEMA')
     for name in ['apply_group', 'capture_snapshot', 'build_delivery']:
         failure(lambda: getattr(s, name)(invalid), native.ScenarioReplayInputError, 'INVALID_SCHEMA')
-for args, kwargs in [((), {}), ((profile,), {}), ((profile,key,key), {}), ((profile,key), {'other':1})]:
+for args, kwargs in [((), {}), ((profile,), {}), ((profile,key,key,key), {}), ((profile,key), {'other':1})]:
     failure(lambda: factory(*args, **kwargs), TypeError)
 for name in ['apply_group', 'capture_snapshot', 'build_delivery']:
     method = getattr(s, name)
@@ -74,7 +96,7 @@ assert s.inspect_state() == raw
 fn poisoned_python_boundary_is_fixed_and_inspection_remains_guarded() {
     Python::with_gil(|py| {
         let key = r#"{"venue":"okx-scenario","environment":"test","account":"A"}"#;
-        let mut inner = Session::new("SYNTHETIC_BTC_ETH_V1", key).unwrap();
+        let mut inner = Session::new("SYNTHETIC_BTC_ETH_V1", key, None).unwrap();
         assert_eq!(
             inner.guarded(true, |_| panic!("private test")),
             Err(BoundaryError::Invariant)

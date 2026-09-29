@@ -3,7 +3,7 @@ mod poison;
 use serde_json::{json, Value};
 const KEY: &str = r#"{"venue":"okx-scenario","environment":"test","account":"A"}"#;
 fn session() -> Session {
-    Session::new("SYNTHETIC_BTC_ETH_V1", KEY).unwrap()
+    Session::new("SYNTHETIC_BTC_ETH_V1", KEY, None).unwrap()
 }
 fn value(reply: Reply) -> Value {
     serde_json::from_str(&reply.unwrap()).unwrap()
@@ -169,7 +169,7 @@ fn ordinary_errors_and_detached_projections_leave_financial_owner_unchanged() {
     assert_eq!(s.owner, before);
     let mut other_key: Value = serde_json::from_str(KEY).unwrap();
     other_key["account"] = json!("B");
-    let mut other = Session::new("SYNTHETIC_BTC_ETH_V1", &other_key.to_string()).unwrap();
+    let mut other = Session::new("SYNTHETIC_BTC_ETH_V1", &other_key.to_string(), None).unwrap();
     let other_before = other.owner.clone();
     assert_eq!(
         other.capture_snapshot(&snapshot.to_string()),
