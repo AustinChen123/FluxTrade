@@ -104,6 +104,14 @@ def test_p1_completion_context_leak_is_cross_artifact_failure(tmp_path):
     rejected(tmp_path, "ENDPOINT_RECONCILIATION_FAILED", NAMES)
 
 
+def test_selected_v2_is_unavailable_after_existing_preselection_checks(tmp_path):
+    values = bundle(tmp_path)
+    values["attempt.json"]["scenario_plan_id"] = "SPIDER_P2_CONFIGURED_SCALE_V1"
+    values["attempt.json"]["requested_scenario_selector"] = "SPIDER_P2_CONFIGURED_SCALE_V1"
+    write_bundle(tmp_path, values)
+    rejected(tmp_path, "ENDPOINT_RECONCILIATION_FAILED", NAMES)
+
+
 @pytest.mark.parametrize("name", ["completion.json", "endpoint.json"])
 @pytest.mark.parametrize("kind", ["symlink", "directory"])
 def test_final_leaf_rejection(tmp_path, name, kind):

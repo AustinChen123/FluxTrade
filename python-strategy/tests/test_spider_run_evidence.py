@@ -294,6 +294,24 @@ def test_invalid_plan_resolution(selector):
         evidence.build_reconciliation(RUN, *values)
 
 
+@pytest.mark.parametrize("builder", ["endpoint", "reconciliation"])
+def test_selected_v2_fails_before_malformed_context_or_p1_projection(builder, monkeypatch):
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("v2 unavailable guard must precede context and P1 projection")
+
+    monkeypatch.setattr(evidence, "_context_chain", forbidden)
+    attempt: dict[str, Any] = {"run_id": RUN, "scenario_plan_id": "SPIDER_P2_CONFIGURED_SCALE_V1",
+                               "configuration_context": {"malformed": True}}
+    status: dict[str, Any] = {"run_id": RUN}
+    if builder == "endpoint":
+        with pytest.raises(evidence.ReconciliationProjectionError, match="^ENDPOINT_RECONCILIATION_FAILED$"):
+            evidence.build_endpoint_artifacts(RUN, attempt, status, [], {}, {}, {})
+    else:
+        endpoint: dict[str, Any] = {"run_id": RUN}
+        with pytest.raises(evidence.ReconciliationProjectionError, match="^ENDPOINT_RECONCILIATION_FAILED$"):
+            evidence.build_reconciliation(RUN, attempt, status, [], endpoint, [])
+
+
 def test_unrelated_programming_value_error_propagates(monkeypatch):
     def broken(_):
         raise ValueError("programming defect")

@@ -213,6 +213,8 @@ def _admit(directory: int) -> dict[str, _Any]:
         if error.args != ("UNSUPPORTED_CONFIGURATION",):
             raise
         return _reject("ENDPOINT_RECONCILIATION_FAILED", _ALL)
+    if selected.get("schema_version") == "spider_scenario_plan_v2":
+        return _reject("ENDPOINT_RECONCILIATION_FAILED", _ALL)
     hash_fields = ("scenario_plan_sha256", "program_sha256", "native_artifact_sha256", "policy_source_sha256")
     if (attempt["requested_scenario_selector"] != attempt["scenario_plan_id"]
             or any(entry["sha256"] != attempt[key] for entry, key in zip(attempt["input_contract_hashes"], hash_fields, strict=True))

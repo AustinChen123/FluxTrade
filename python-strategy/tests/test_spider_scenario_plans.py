@@ -9,8 +9,16 @@ import pytest
 
 from src.core.backtest import spider_scenario_plans as plans
 from src.core.backtest.spider_run_artifacts import canonical_bytes
+from src.core.backtest.spider_configured_scale_input import _PLAN_INPUT_SHA256
 
 IDS = ("SPIDER_P1_SCHEDULED_MTM_V1", "SPIDER_P1_LEGAL_LIQUIDATION_V1", "SPIDER_P1_O03_DURABLE_V1")
+P2_ID = "SPIDER_P2_CONFIGURED_SCALE_V1"
+P2_PRODUCTS = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP", "BNB-USDT-SWAP",
+               "XRP-USDT-SWAP", "DOGE-USDT-SWAP", "ARB-USDT-SWAP", "OP-USDT-SWAP",
+               "NEAR-USDT-SWAP", "APT-USDT-SWAP", "SUI-USDT-SWAP", "ADA-USDT-SWAP"]
+P2_KEYS = {"schema_version", "scenario_plan_id", "native_profile", "account_key", "terminal_policy",
+           "initial_cutoff", "final_cutoff", "configuration", "configuration_sha256", "products", "recipe",
+           "callback_plans", "planned_barriers"}
 VECTORS = [(1451, "8fb335d6a98afb6bb08fa837386347c4db90f0b00e8661e305599618f05f1520"),
            (598, "4e149110d228fc7422b6149efe31de1dc036eabf648340049ca95ce12dda2512"),
            (1200, "439906a52cba32b5d1d1bcc1cbd4439270aad175f58a118568fcb754dd42eef8")]
@@ -72,6 +80,25 @@ def test_import_boundary():
     imports = [node for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)]
     assert all(node.module == "src.core.backtest" for node in imports)
     assert {alias.name for node in imports for alias in node.names} == {
-        "spider_scenario_plan_scheduled", "spider_scenario_plan_liquidation", "spider_scenario_plan_o03"}
+        "spider_scenario_plan_scheduled", "spider_scenario_plan_liquidation", "spider_scenario_plan_o03",
+        "spider_configured_scale_input"}
     assert not any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and
                    node.func.id in {"open", "eval", "exec", "__import__"} for node in ast.walk(tree))
+
+
+def test_configured_input_selection_is_exact_detached_and_not_cli_authorized():
+    first = cast(dict[str, Any], plans.plan_bundle(P2_ID))
+    before = canonical_bytes(first)
+    assert set(first) == P2_KEYS and len(first) == 13
+    assert sha256(before).hexdigest() == _PLAN_INPUT_SHA256 == "8235c952a5d199825a2a77842b03f49e213ef707c0f30b24d8bf623fde53c2b3"
+    assert first["configuration_sha256"] == "807054044bdd182274509535ecf8bbc4598f00b6a92b598c6228129a6ff11b70"
+    assert first["products"] == P2_PRODUCTS
+    assert len(first["planned_barriers"]) == 40
+    assert all(set(row) == {"ordinal", "barrier_id", "record_kind", "scheduler_key", "causal_parent_ids"}
+               for row in first["planned_barriers"])
+    first["configuration"]["products"].clear()
+    first["planned_barriers"].clear()
+    second = cast(dict[str, Any], plans.plan_bundle(P2_ID))
+    assert canonical_bytes(second) == before
+    with pytest.raises(ValueError, match="^UNSUPPORTED_CONFIGURATION$"):
+        plans.cli_plan_bundle(P2_ID)

@@ -126,6 +126,8 @@ def build_endpoint_artifacts(run_id: str, attempt: dict[str, _Any], status: dict
         if error.args == ("UNSUPPORTED_CONFIGURATION",):
             raise ReconciliationProjectionError() from error
         raise
+    if frozen.get("schema_version") == "spider_scenario_plan_v2":
+        raise ReconciliationProjectionError()
     context = _context_chain(attempt, status, journal)
     persisted = _required(status, "persisted_boundary")
     terminal = _required(attempt, "terminal_policy")
@@ -174,6 +176,8 @@ def build_reconciliation(run_id: str, attempt: dict[str, _Any], status: dict[str
         if error.args == ("UNSUPPORTED_CONFIGURATION",):
             raise ReconciliationProjectionError() from error
         raise
+    if frozen.get("schema_version") == "spider_scenario_plan_v2":
+        raise ReconciliationProjectionError()
     context = _context_chain(attempt, status, journal, endpoint, report)
     plan, frozen_journal, frozen_endpoint = frozen["plan"], frozen["journal"], frozen["endpoint"]
     if not journal or not attempt["planned_coverage"]:
