@@ -4,7 +4,8 @@ from typing import cast
 
 from src.core.backtest import spider_run_native_schema as native
 from src.core.backtest.spider_run_artifacts import (
-    _boolean, _boundary, _decimal_text, _enum, _integer, _list, _object, _require, _text,
+    ConfigurationContext, _boolean, _boundary, _decimal_text, _enum, _integer,
+    _list, _object, _require, _text, configuration_context,
 )
 
 _CLASSES = ["SOURCE_GROUP", "SNAPSHOT_CAPTURE", "DELIVERY"]
@@ -30,6 +31,12 @@ def _code(value: object) -> None:
 
 def _ordered(keys: list[tuple]) -> None:
     _require(keys == sorted(set(keys)))
+
+
+def _context(row: dict[str, object]) -> ConfigurationContext | None:
+    if "configuration_context" not in row:
+        return None
+    return configuration_context(row["configuration_context"])
 
 
 def _policy_order(value: object, operation: str) -> None:
@@ -92,13 +99,13 @@ def _policy_event(value: object) -> None:
                 _string(row[key])
 
 
-def owner_evidence(value: object) -> None:
+def owner_evidence(value: object, *, context: ConfigurationContext | None = None) -> None:
     row = _object(value, "cutoff inspection trading_request trading_fact positions_request positions_fact open_orders_request open_orders_fact")
     _integer(row["cutoff"])
-    native.inspection(row["inspection"])
+    native.inspection(row["inspection"], context=context)
     for name in ("trading", "positions", "open_orders"):
         native.snapshot_request(row[name + "_request"])
-        native.snapshot_fact(row[name + "_fact"])
+        native.snapshot_fact(row[name + "_fact"], context=context)
         request = cast(dict[str, object], row[name + "_request"])
         fact = cast(dict[str, object], row[name + "_fact"])
         _require(request["capture_mode"] == "OWNER_CURRENT")
@@ -146,7 +153,8 @@ def callback_result(value: object) -> None:
 
 
 def journal_record(value: object) -> None:
-    row = _object(value, "schema_version run_id journal_seq barrier_id record_kind scheduler_key causal_parent_ids effective_at visible_at account_version_before account_version_after payload")
+    row = _object(value, "schema_version run_id journal_seq barrier_id record_kind scheduler_key causal_parent_ids effective_at visible_at account_version_before account_version_after payload", "configuration_context")
+    context = _context(row)
     _enum(row["schema_version"], ["spider_journal_record_v1"])
     _text(row["run_id"], "[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
     _require(_integer(row["journal_seq"]) > 0)
@@ -165,18 +173,18 @@ def journal_record(value: object) -> None:
             _require(row[key] is None)
     if kind == "SOURCE_GROUP_RESULT":
         payload = _object(row["payload"], "request result owner_evidence_before owner_evidence_after")
-        native.group(payload["request"])
+        native.group(payload["request"], context=context)
         native.group_result(payload["result"])
-        owner_evidence(payload["owner_evidence_before"])
-        owner_evidence(payload["owner_evidence_after"])
+        owner_evidence(payload["owner_evidence_before"], context=context)
+        owner_evidence(payload["owner_evidence_after"], context=context)
     elif kind == "SNAPSHOT_FACT":
         payload = _object(row["payload"], "purpose request fact")
         _enum(payload["purpose"], ["INITIAL", "POST_GROUP", "POLL", "FINAL"])
         native.snapshot_request(payload["request"])
-        native.snapshot_fact(payload["fact"])
+        native.snapshot_fact(payload["fact"], context=context)
     elif kind == "DELIVERY_ATTEMPT":
         payload = _object(row["payload"], "delivery emission_plan_digest")
-        native.delivery(payload["delivery"])
+        native.delivery(payload["delivery"], context=context)
         if payload["emission_plan_digest"] is not None:
             _text(payload["emission_plan_digest"], "[0-9a-f]{64}")
     else:
@@ -236,15 +244,16 @@ def scheduler_observation(value: object) -> None:
 
 
 def endpoint(value: object) -> None:
-    row = _object(value, "schema_version run_id terminal_reason cutoff initial_owner_evidence final_owner_evidence scheduler_observation remaining_planned_barriers")
+    row = _object(value, "schema_version run_id terminal_reason cutoff initial_owner_evidence final_owner_evidence scheduler_observation remaining_planned_barriers", "configuration_context")
+    context = _context(row)
     _enum(row["schema_version"], ["spider_endpoint_v1"])
     _text(row["run_id"], "[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
     _enum(row["terminal_reason"], ["SCHEDULED_MTM", "LEGAL_NATIVE_LIQUIDATION_FINAL_EVENT", "O03_NON_ATOMIC_COMPLETE"])
     cutoff = _object(row["cutoff"], "scheduler_time persisted_boundary")
     _integer(cutoff["scheduler_time"])
     _boundary(cutoff["persisted_boundary"])
-    owner_evidence(row["initial_owner_evidence"])
-    owner_evidence(row["final_owner_evidence"])
+    owner_evidence(row["initial_owner_evidence"], context=context)
+    owner_evidence(row["final_owner_evidence"], context=context)
     scheduler_observation(row["scheduler_observation"])
     barriers: list[tuple] = []
     for item in _list(row["remaining_planned_barriers"]):

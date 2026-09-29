@@ -52,6 +52,18 @@ def configuration_context(products=None, config_id="configured-v1"):
     }
 
 
+def configured_attempt(products=None):
+    row = attempt()
+    row.update(
+        run_contract_id="SPIDER_SYNTHETIC_P2_CONFIGURED_RUN_V1",
+        profile_id="SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1",
+        scenario_plan_id="SPIDER_P2_CONFIGURED_SCALE_V1",
+        funding_exclusion="SYNTHETIC_P2_NO_FUNDING_INPUT_OR_CLAIM",
+        configuration_context=configuration_context(products),
+    )
+    return row
+
+
 def status() -> dict[str, object]:
     return dict(schema_version="spider_status_v1", run_id="r-1", state="RUNNING",
                 processed_boundary=None, persisted_boundary=None, failure_reason=None, primary_failure=None)
@@ -325,3 +337,158 @@ def test_configuration_context_is_exact_detached_and_immutable():
 def test_configuration_context_rejects_invalid_identity(update):
     with pytest.raises(ValueError):
         a.configuration_context({**configuration_context(), **update})
+
+
+def test_attempt_p1_p2_validated_and_rejected_matrix():
+    p1 = attempt()
+    p2 = configured_attempt()
+    p1_rejected = rejected()
+    p2_rejected_without_context = rejected()
+    p2_rejected_without_context["run_contract_id"] = "SPIDER_SYNTHETIC_P2_CONFIGURED_RUN_V1"
+    p2_rejected_with_context = deepcopy(p2_rejected_without_context)
+    p2_rejected_with_context["configuration_context"] = configuration_context()
+
+    for row in (p1, p2, p1_rejected, p2_rejected_without_context, p2_rejected_with_context):
+        a.validate_artifact(row)
+        assert a.decode_artifact(a.encode_artifact(row)) == row
+
+    with pytest.raises(ValueError):
+        a.validate_artifact({**p1, "configuration_context": configuration_context()})
+    with pytest.raises(ValueError):
+        a.validate_artifact({**p2, "configuration_context": None})
+    with pytest.raises(ValueError):
+        a.validate_artifact({**p2, "run_contract_id": "SPIDER_SYNTHETIC_P1_RUN_V1"})
+    with pytest.raises(ValueError):
+        a.validate_artifact({**p1, "run_contract_id": "SPIDER_SYNTHETIC_P2_CONFIGURED_RUN_V1"})
+
+
+def test_configured_validated_attempt_requires_context():
+    row = configured_attempt()
+    del row["configuration_context"]
+    with pytest.raises(ValueError):
+        a.validate_artifact(row)
+
+
+def test_rejected_p1_attempt_forbids_valid_configuration_context():
+    row = rejected()
+    row["configuration_context"] = configuration_context()
+    with pytest.raises(ValueError):
+        a.validate_artifact(row)
+
+
+def test_configured_context_is_serialized_as_detached_ordered_list_data():
+    source = configuration_context(["CFG-LAST", "CFG-MIDDLE", "CFG-FIRST"])
+    immutable = a.configuration_context(source)
+    row = configured_attempt()
+    row["configuration_context"] = immutable
+
+    encoded = a.encode_artifact(row)
+    decoded = a.decode_artifact(encoded)
+    assert decoded["configuration_context"] == {
+        **source,
+        "products": ["CFG-LAST", "CFG-MIDDLE", "CFG-FIRST"],
+    }
+    assert b'"products":["CFG-LAST","CFG-MIDDLE","CFG-FIRST"]' in encoded
+    source["products"][0] = "MUTATED"
+    assert decoded["configuration_context"]["products"] == [
+        "CFG-LAST", "CFG-MIDDLE", "CFG-FIRST"
+    ]
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("run_contract_id", "SPIDER_SYNTHETIC_P1_RUN_V1"),
+        ("registration_state", "UNKNOWN"),
+        ("profile_id", None),
+        ("account_key", None),
+        ("scenario_plan_id", None),
+        ("scenario_plan_sha256", "F" * 64),
+        ("program_sha256", None),
+        ("native_artifact_sha256", None),
+        ("policy_source_sha256", None),
+        ("ordering_contract_id", None),
+        ("cost_contract_id", None),
+        ("funding_exclusion", "SYNTHETIC_P1_NO_FUNDING_INPUT_OR_CLAIM"),
+        ("terminal_policy", None),
+        ("artifact_encoding", None),
+        ("input_contract_hashes", []),
+        ("planned_coverage", [{"ordinal": 2, "barrier_id": "x", "record_kind": "SOURCE_GROUP_RESULT"}]),
+        ("registration_failure", "UNSUPPORTED_CONFIGURATION"),
+        ("requested_scenario_selector", "invalid/selector"),
+    ],
+)
+def test_configured_validated_attempt_mutations_reject(field, value):
+    row = configured_attempt()
+    row[field] = value
+    with pytest.raises(ValueError):
+        a.validate_artifact(row)
+
+
+def test_rejected_configured_attempt_context_is_optional_but_not_fabricated():
+    rejected_p2 = rejected()
+    rejected_p2["run_contract_id"] = "SPIDER_SYNTHETIC_P2_CONFIGURED_RUN_V1"
+    for update in [
+        {"configuration_context": None},
+        {"configuration_context": {**configuration_context(), "products": []}},
+        {"configuration_context": configuration_context(), "scenario_plan_id": "P2"},
+        {"configuration_context": configuration_context(), "input_contract_hashes": attempt()["input_contract_hashes"]},
+        {"configuration_context": configuration_context(), "planned_coverage": attempt()["planned_coverage"]},
+        {"configuration_context": configuration_context(), "registration_failure": None},
+        {"configuration_context": configuration_context(), "requested_scenario_selector": "bad/selector"},
+    ]:
+        with pytest.raises(ValueError):
+            a.validate_artifact({**rejected_p2, **update})
+
+
+@pytest.mark.parametrize("field", NULL_IDENTITIES)
+def test_rejected_configured_attempt_keeps_every_identity_null(field):
+    row = rejected()
+    row["run_contract_id"] = "SPIDER_SYNTHETIC_P2_CONFIGURED_RUN_V1"
+    row["configuration_context"] = configuration_context()
+    row[field] = attempt()[field]
+    with pytest.raises(ValueError):
+        a.validate_artifact(row)
+
+
+@pytest.mark.parametrize("state", ["RUNNING", "FAILED", "COMPLETE"])
+def test_status_optional_configuration_context_preserves_order(state):
+    row = status()
+    row["state"] = state
+    if state == "FAILED":
+        row.update(failure_reason="NATIVE_FAULT", primary_failure=None)
+    products = ["CFG-LAST", "CFG-MIDDLE", "CFG-FIRST"]
+    row["configuration_context"] = configuration_context(products)
+    encoded = a.encode_artifact(row)
+    assert a.decode_artifact(encoded) == row
+    assert b'"products":["CFG-LAST","CFG-MIDDLE","CFG-FIRST"]' in encoded
+    products.reverse()
+    assert row["configuration_context"]["products"] == ["CFG-LAST", "CFG-MIDDLE", "CFG-FIRST"]
+
+
+def test_p1_attempt_and_status_bytes_remain_exact_without_context():
+    assert a.encode_artifact(attempt()) == (
+        b'{"account_key":{"account":"A","environment":"test","venue":"venue"},'
+        b'"artifact_encoding":"artifact_encoding_v1","cost_contract_id":"SPIDER_SYNTHETIC_COSTS_V1",'
+        b'"funding_exclusion":"SYNTHETIC_P1_NO_FUNDING_INPUT_OR_CLAIM","input_contract_hashes":'
+        b'[{"name":"SCENARIO_PLAN","sha256":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"},'
+        b'{"name":"PROGRAM","sha256":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"},'
+        b'{"name":"NATIVE_ARTIFACT","sha256":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"},'
+        b'{"name":"POLICY_SOURCE_MANIFEST","sha256":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}],'
+        b'"native_artifact_sha256":"3333333333333333333333333333333333333333333333333333333333333333",'
+        b'"ordering_contract_id":"S_order_v1","planned_coverage":[{"barrier_id":"SOURCE_GROUP:x",'
+        b'"ordinal":1,"record_kind":"SOURCE_GROUP_RESULT"}],"policy_source_sha256":'
+        b'"4444444444444444444444444444444444444444444444444444444444444444",'
+        b'"profile_id":"SYNTHETIC_MIN_CASH_V1","program_sha256":'
+        b'"2222222222222222222222222222222222222222222222222222222222222222",'
+        b'"registration_failure":null,"registration_state":"VALIDATED",'
+        b'"requested_scenario_selector":"bounded.future","run_contract_id":"SPIDER_SYNTHETIC_P1_RUN_V1",'
+        b'"run_id":"r-1","scenario_plan_id":"not-a-protocol-equality-check",'
+        b'"scenario_plan_sha256":"1111111111111111111111111111111111111111111111111111111111111111",'
+        b'"schema_version":"spider_attempt_v1","terminal_policy":"SCHEDULED_MTM"}\n'
+    )
+    assert a.encode_artifact(status()) == (
+        b'{"failure_reason":null,"persisted_boundary":null,"primary_failure":null,'
+        b'"processed_boundary":null,"run_id":"r-1","schema_version":"spider_status_v1",'
+        b'"state":"RUNNING"}\n'
+    )

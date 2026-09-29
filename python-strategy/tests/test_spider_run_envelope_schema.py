@@ -75,6 +75,65 @@ def endpoint() -> dict[str, Any]:
                 final_owner_evidence=owner(), scheduler_observation=observation(), remaining_planned_barriers=[])
 
 
+CONFIGURED_PRODUCTS = ["CFG-FIRST", "CFG-MIDDLE", "CFG-LAST"]
+
+
+def configured_context() -> dict[str, Any]:
+    return {
+        "schema_version": "spider_configuration_context_v1",
+        "config_id": "configured-v1",
+        "configuration_sha256": "a" * 64,
+        "products": list(CONFIGURED_PRODUCTS),
+    }
+
+
+def configured_owner(product: str) -> dict[str, Any]:
+    value = owner()
+    value["inspection"].update(
+        profile_id="SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1", config_id="configured-v1"
+    )
+    value["positions_fact"]["immutable_payload"]["rows"][0]["product_id"] = product
+    value["open_orders_fact"]["immutable_payload"]["rows"][0]["product_id"] = product
+    return value
+
+
+def configured_group_record(product: str) -> dict[str, Any]:
+    value = record("SOURCE_GROUP_RESULT")
+    value["configuration_context"] = configured_context()
+    value["payload"]["request"]["members"][0]["payload"]["product_id"] = product
+    value["payload"]["owner_evidence_before"] = configured_owner(product)
+    value["payload"]["owner_evidence_after"] = configured_owner(product)
+    return value
+
+
+def configured_execution_delivery_record(product: str) -> dict[str, Any]:
+    value = record("DELIVERY_ATTEMPT")
+    value["configuration_context"] = configured_context()
+    value["scheduler_key"]["queue_class"] = "DELIVERY"
+    value["account_version_before"] = None
+    value["account_version_after"] = None
+    execution = {
+        "order_id": "o", "owner_client_order_id": "c", "policy_client_order_id": "c",
+        "product_id": product, "state": "filled", "side": "sell", "limit_price": "1",
+        "fill_price": "1", "original_size_contracts": "1", "cumulative_filled_size_contracts": "1",
+        "contract_value": "1", "execution_effective_at": 0, "commit_account_version": 1,
+        "spec_version": "v", "rule_data_version": "v",
+    }
+    value["payload"] = {
+        "delivery": delivery("EXECUTION_FACT", execution),
+        "emission_plan_digest": None,
+    }
+    return value
+
+
+def configured_endpoint(product: str) -> dict[str, Any]:
+    value = endpoint()
+    value["configuration_context"] = configured_context()
+    value["initial_owner_evidence"] = configured_owner(product)
+    value["final_owner_evidence"] = configured_owner(product)
+    return value
+
+
 CASES = [(e.owner_evidence, owner()), (e.scheduler_key, key()), (e.callback_action, action()),
          (e.callback_result, callback()), (e.scheduler_observation, observation()), (e.endpoint, endpoint())]
 CASES += [(e.journal_record, record(kind)) for kind in PAYLOADS]
@@ -298,6 +357,89 @@ def test_owner_and_journal_structural_discriminants():
         changed["scheduler_key"]["queue_class"] = "DELIVERY" if kind == "SOURCE_GROUP_RESULT" else "SOURCE_GROUP"
         with pytest.raises(ValueError):
             e.journal_record(changed)
+
+
+@pytest.mark.parametrize("product", CONFIGURED_PRODUCTS)
+def test_configured_context_reaches_journal_and_endpoint_native_boundaries(product):
+    group_row = configured_group_record(product)
+    e.journal_record(group_row)
+
+    snapshot_row = record("SNAPSHOT_FACT")
+    snapshot_row["configuration_context"] = configured_context()
+    snapshot_row["payload"]["request"]["snapshot_kind"] = "POSITIONS"
+    snapshot_row["payload"]["fact"] = fact("POSITIONS")
+    snapshot_row["payload"]["fact"]["immutable_payload"]["rows"][0]["product_id"] = product
+    e.journal_record(snapshot_row)
+
+    delivery_row = record("DELIVERY_ATTEMPT")
+    delivery_row["configuration_context"] = configured_context()
+    delivery_row["payload"]["delivery"] = delivery(
+        "POSITION_SNAPSHOT", {"outcome": "SUCCESS", "rows": [{
+            "product_id": product, "margin_mode": "cross", "position_contracts": "-1"
+        }]}
+    )
+    e.journal_record(delivery_row)
+    e.endpoint(configured_endpoint(product))
+
+
+def test_configured_context_rejects_mismatched_nested_identity():
+    value = configured_group_record("CFG-MIDDLE")
+    value["payload"]["request"]["members"][0]["payload"]["product_id"] = "BTC-USDT-SWAP"
+    with pytest.raises(ValueError):
+        e.journal_record(value)
+
+    for field, replacement in [
+        ("profile_id", "SYNTHETIC_P1_O03_V1"),
+        ("config_id", "another-config"),
+    ]:
+        changed = configured_endpoint("CFG-FIRST")
+        changed["initial_owner_evidence"]["inspection"][field] = replacement
+        with pytest.raises(ValueError):
+            e.endpoint(changed)
+
+    changed = configured_endpoint("CFG-LAST")
+    changed["final_owner_evidence"]["positions_fact"]["immutable_payload"]["rows"][0]["product_id"] = "ETH-USDT-SWAP"
+    with pytest.raises(ValueError):
+        e.endpoint(changed)
+
+
+@pytest.mark.parametrize("boundary", ["group", "delivery"])
+def test_configured_journal_rejects_when_nested_context_is_dropped(monkeypatch, boundary):
+    value = configured_group_record("CFG-MIDDLE")
+    if boundary == "group":
+        original = e.native.group
+        monkeypatch.setattr(e.native, "group", lambda item, **kwargs: original(item))
+    else:
+        value = configured_execution_delivery_record("CFG-MIDDLE")
+        e.journal_record(value)
+        original = e.native.delivery
+        monkeypatch.setattr(e.native, "delivery", lambda item, **kwargs: original(item))
+    with pytest.raises(ValueError):
+        e.journal_record(value)
+
+
+def test_configured_delivery_rejects_product_outside_context():
+    value = configured_execution_delivery_record("BTC-USDT-SWAP")
+    with pytest.raises(ValueError):
+        e.journal_record(value)
+
+
+@pytest.mark.parametrize("dropped_call", [1, 2])
+def test_configured_endpoint_rejects_context_drop_at_each_owner_evidence(monkeypatch, dropped_call):
+    value = configured_endpoint("CFG-MIDDLE")
+    calls = 0
+    original = e.native.inspection
+
+    def inspection(item, *, context=None):
+        nonlocal calls
+        calls += 1
+        if calls == dropped_call:
+            return original(item)
+        return original(item, context=context)
+
+    monkeypatch.setattr(e.native, "inspection", inspection)
+    with pytest.raises(ValueError):
+        e.endpoint(value)
 
 
 def test_callback_failure_objects_and_unapproved_nulls_are_closed():
