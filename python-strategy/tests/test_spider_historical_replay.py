@@ -264,7 +264,10 @@ def test_market_cache_uses_exact_1440_closed_bars_and_ignores_future_until_its_c
     assert left._dispatch_due(due)["classification"] == "SUCCESS"
     assert right._dispatch_due(due)["classification"] == "SUCCESS"
     assert left._policy.markets == right._policy.markets
-    assert left._policy.events == right._policy.events == []
+    assert left._policy.events == right._policy.events
+    assert all(common.range_start_ms < event["at_ms"] < close_ms
+               and (event["at_ms"] - common.range_start_ms) % 5_000 == 0
+               for event in left._policy.events)
     snapshot_left = left._records[(4, f"MARKET_CLOSE_{close_ms}")]["result"]["market_snapshot"]
     snapshot_right = right._records[(4, f"MARKET_CLOSE_{close_ms}")]["result"]["market_snapshot"]
     assert snapshot_left == snapshot_right
@@ -326,5 +329,177 @@ def test_step3_cache_and_next_open_dispatch_in_frozen_phase_order(monkeypatch):
     assert composition._dispatch_due(close_ms * 16 + 7)["classification"] == "SUCCESS"
     assert [entry[0] for entry in calls] == ["STEP", "CACHE", "STEP"]
     assert calls[0] == ("STEP", 3) and calls[2] == ("STEP", 0)
-    assert composition._policy.events == []
+    assert composition._policy.events
+    assert all(run.range_start_ms < event["at_ms"] < close_ms
+               and (event["at_ms"] - run.range_start_ms) % 5_000 == 0
+               for event in composition._policy.events)
     assert composition._records[(4, f"MARKET_CLOSE_{close_ms}")]["result"]["market_snapshot"]["close_ms"] == close_ms
+
+
+def test_historical_poll_timers_use_raw_policy_and_effective_scheduler_clocks():
+    run = _valid_run()
+    composition = _composition(run)
+    policy = composition._policy
+    assert (policy.now_ms, policy.shared_ms, policy.last_earn_ms, policy.last_market_ms,
+            policy.reset_ms, policy.last_capital) == (
+        run.range_start_ms, run.range_start_ms - 12_000, run.range_start_ms - 61_000, 0, {}, None)
+    timer_records = [record for record in composition._records.values()
+                     if record["item"]["kind"] == "HISTORICAL_TIMER"]
+    assert [row["raw_time_ms"] for row in timer_records] == list(
+        range(run.range_start_ms + 5_000, run.range_end_ms, 5_000))
+    first_raw = run.range_start_ms + 5_000
+    assert composition._dispatch_due(first_raw * 16 + 9)["classification"] == "SUCCESS"
+    first = composition._records[(5, f"P3_TIMER_{first_raw}")]["result"]
+    assert first["events"] == ({"at_ms": first_raw, "kind": "request_earn"},)
+    assert policy.now_ms == first_raw
+    assert composition._current_time == first_raw * 16 + 9
+    assert len(composition._continuations) == 1
+
+    earn = composition._records[(1, f"P3_POLL_{first_raw}_EARN")]["item"]
+    request = earn["request"]
+    assert request["capture_mode"] == "FROZEN_POLL_FIXTURE"
+    assert request["fixture_key"] == "P3_POLL_EARN_ZERO"
+    assert request["captured_at"] == (first_raw + 1) * 16 + 5
+    assert earn["delivery_projection"]["visible_at"] == (first_raw + 5) * 16 + 6
+    assert composition._records[(1, request["snapshot_id"])]["key"][0] == request["captured_at"]
+    first_poll = composition._polls[f"P3_POLL_{first_raw}"]
+    assert [(stage["snapshot_request"]["captured_at"], stage["delivery_projection"]["visible_at"])
+            for stage in first_poll.stages] == [
+        ((first_raw + 1) * 16 + 5, (first_raw + 5) * 16 + 6),
+        ((first_raw + 6) * 16 + 5, (first_raw + 10) * 16 + 6),
+        ((first_raw + 11) * 16 + 5, (first_raw + 15) * 16 + 6),
+        ((first_raw + 16) * 16 + 5, (first_raw + 20) * 16 + 6),
+    ]
+    assert composition._dispatch_due(request["captured_at"])["classification"] == "SUCCESS"
+    earn_delivery = next(record["item"]["delivery"] for record in composition._records.values()
+                         if record["item"]["kind"] == "DELIVERY"
+                         and record["item"]["delivery"]["continuation_id"] == f"P3_CONT_{first_raw}"
+                         and record["item"]["delivery"]["payload_kind"] == "EARN_SNAPSHOT")
+    assert earn_delivery["immutable_payload"] == {"outcome": "SUCCESS", "earn": D(0)}
+    assert earn_delivery["snapshot_as_of"] == request["captured_at"]
+    delivery_key = next(record["key"][0] for record in composition._records.values()
+                        if record["item"]["kind"] == "DELIVERY"
+                        and record["item"]["delivery"]["delivery_id"] == earn_delivery["delivery_id"])
+    assert delivery_key == earn["delivery_projection"]["visible_at"]
+
+    second_raw = first_raw + 5_000
+    assert composition._dispatch_due(second_raw * 16 + 9)["classification"] == "SUCCESS"
+    second_poll = composition._polls[f"P3_POLL_{second_raw}"]
+    assert [stage["snapshot_request"]["snapshot_kind"] for stage in second_poll.stages] == [
+        "TRADING", "POSITIONS", "OPEN_ORDERS"]
+    assert [(stage["snapshot_request"]["captured_at"], stage["delivery_projection"]["visible_at"])
+            for stage in second_poll.stages] == [
+        ((second_raw + 1) * 16 + 5, (second_raw + 5) * 16 + 6),
+        ((second_raw + 6) * 16 + 5, (second_raw + 10) * 16 + 6),
+        ((second_raw + 11) * 16 + 5, (second_raw + 15) * 16 + 6),
+    ]
+    assert [stage["snapshot_request"]["capture_mode"] for stage in second_poll.stages] == [
+        "OWNER_CURRENT", "OWNER_CURRENT", "OWNER_CURRENT"]
+    assert policy.now_ms == second_raw
+
+
+def test_historical_timer_phase_follows_same_time_market_cache_and_excludes_endpoint():
+    run = _extend_one_minute(_valid_run())
+    composition = _composition(run)
+    same_time = run.range_start_ms + 60_000
+    assert composition._dispatch_due(same_time * 16 + 9)["classification"] == "SUCCESS"
+    assert composition._records[(4, f"MARKET_CLOSE_{same_time}")]["result"]["classification"] == "SUCCESS"
+    timer = composition._records[(5, f"P3_TIMER_{same_time}")]
+    assert timer["result"]["classification"] == "SUCCESS"
+    assert composition._last_popped == (same_time * 16 + 9, 5, 11, f"P3_TIMER_{same_time}")
+    assert len(composition._continuations) == 12
+
+    endpoint = _composition(_valid_run())
+    end = run.range_start_ms + 60_000
+    assert all(record["item"]["raw_at"] != end for record in endpoint._records.values()
+               if record["item"]["kind"] == "HISTORICAL_TIMER")
+
+
+def test_historical_poll_audit_only_records_actions_without_financial_children():
+    run = _extend_one_minute(_valid_run())
+    composition = _composition(run)
+    until = run.range_start_ms + 30_000
+    assert composition._dispatch_due(until * 16 + 6)["classification"] == "SUCCESS"
+    actions = [action for events in composition._audit.values() for event in events
+               for action in event.get("actions", [])]
+    assert actions and all(action["status"] == "UNSUBMITTED" for action in actions)
+    assert not any(record["item"]["kind"] == "SOURCE_GROUP" for record in composition._records.values())
+    assert all(record["item"]["kind"] == "DELIVERY"
+               or record["item"]["kind"] in ("HISTORICAL_TIMER", "HISTORICAL_MARKET_CACHE")
+               or (record["item"]["kind"] == "SNAPSHOT_CAPTURE"
+                   and record["item"]["request"].get("continuation_id") is not None)
+               or record["item"]["kind"] == "HISTORICAL_MARKET_STEP"
+               for record in composition._records.values())
+
+
+def _complete_poll_through_native_deliveries(
+    composition: _ReplayComposition, issued_at: int, *, before_final=None,
+) -> None:
+    poll_plan = composition._historical_poll_plan(issued_at, len(composition._polls))
+    started = composition._start_poll(poll_plan, lambda *_: None)
+    assert started.observation.status == "IN_PROGRESS"
+    poll = composition._polls[poll_plan["poll_id"]]
+    while poll.observation.status == "IN_PROGRESS":
+        stage = poll.stages[poll.index]
+        if poll.index == len(poll.stages) - 1 and before_final is not None:
+            before_final()
+        request = stage["snapshot_request"]
+        fact = composition._codec.capture_snapshot(request)
+        projection = deepcopy(stage["delivery_projection"])
+        projection["reference"] = fact["reference"]
+        delivery = composition._codec.build_delivery(projection)
+        composition._resume_poll(delivery)
+    assert poll.observation.status == "COMPLETED"
+
+
+@pytest.mark.parametrize("issued_at,expected_day_ago", [
+    (129_540_000, False),  # 11:59 UTC
+    (129_600_000, True),   # 12:00 UTC
+    (129_660_000, False),  # 12:01 UTC
+])
+def test_historical_poll_completion_updates_day_ago_only_in_utc_noon_minute(issued_at, expected_day_ago):
+    composition = _composition(_valid_run())
+    composition._historical_poll_range = (issued_at, issued_at + 1)
+    _complete_poll_through_native_deliveries(composition, issued_at)
+    assert ("day_ago" in composition._policy.capital) is expected_day_ago
+    if expected_day_ago:
+        assert composition._policy.capital["day_ago"] == composition._policy.capital["total"]
+
+
+def test_historical_noon_rollover_refreshes_on_repeated_completed_five_second_ticks():
+    composition = _composition(_valid_run())
+    first_noon_tick = 129_600_005
+    second_noon_tick = first_noon_tick + 5_000
+    composition._historical_poll_range = (first_noon_tick, second_noon_tick + 1)
+    _complete_poll_through_native_deliveries(composition, first_noon_tick)
+    assert composition._policy.capital["day_ago"] == composition._policy.capital["total"]
+
+    _complete_poll_through_native_deliveries(
+        composition, second_noon_tick,
+        before_final=lambda: composition._policy.capital.__setitem__("total", D("777")),
+    )
+    assert composition._policy.capital["day_ago"] == D("777")
+
+
+def test_historical_timer_preserves_poll_start_terminal_and_stops_queue(monkeypatch):
+    composition = _composition(_valid_run())
+    first_raw = composition._historical_poll_range[0] + 5_000
+    original_plan = composition._historical_poll_plan
+
+    def invalid_plan(raw_at, sequence):
+        plan = original_plan(raw_at, sequence)
+        # A due EARN delivery is visible after this capture; force trading capture
+        # to precede that visible boundary so the real poll validator rejects it.
+        plan["trading"]["snapshot_request"]["captured_at"] = raw_at
+        return plan
+
+    monkeypatch.setattr(composition, "_historical_poll_plan", invalid_plan)
+    result = composition._dispatch_due(first_raw * 16 + 9)
+    timer = composition._records[(5, f"P3_TIMER_{first_raw}")]
+    assert result["classification"] == timer["result"]["classification"] == "TERMINAL"
+    assert result["reason"] == timer["result"]["reason"] == "INVALID_SCHEMA"
+    assert composition._terminal["classification"] == "TERMINAL"
+    assert composition._last_popped == timer["key"]
+    later_raw = first_raw + 5_000
+    assert (later_raw * 16 + 9, 5, 1, f"P3_TIMER_{later_raw}") in composition._queue
+    assert composition._records[(5, f"P3_TIMER_{later_raw}")]["result"]["classification"] == "PENDING"

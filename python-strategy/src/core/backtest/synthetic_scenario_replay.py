@@ -323,6 +323,9 @@ class _ReplayComposition:
         self._terminal: dict[str, Any] | None = None
         self._audit: dict[str, list] = {}
         self._evidence_callback = evidence_callback
+        self._historical_poll_range: tuple[int, int] | None = None
+        self._p3_audit_continuations: set[str] = set()
+        self._historical_poll_issued_at: dict[str, int] = {}
 
     @classmethod
     def _from_historical_run(cls, run: object) -> "_ReplayComposition":
@@ -342,8 +345,16 @@ class _ReplayComposition:
             configuration=prepared.configuration,
         )
         _restore_initial_policy(composition, historical_run, prepared)
+        composition._historical_poll_range = (historical_run.range_start_ms, historical_run.range_end_ms)
+        composition._current_time = historical_run.range_start_ms * 16
         for sequence, snapshot in enumerate(prepared.snapshots):
             result = composition._enqueue(_historical_market_item(snapshot, sequence))
+            if result["classification"] != "PENDING":
+                raise ValueError("INVALID_SCHEMA")
+        for sequence, raw_at in enumerate(range(historical_run.range_start_ms + 5_000, historical_run.range_end_ms, 5_000)):
+            item = dict(kind="HISTORICAL_TIMER", schedule_sequence=sequence,
+                        stable_id=f"P3_TIMER_{raw_at}", raw_at=raw_at)
+            result = composition._enqueue(item)
             if result["classification"] != "PENDING":
                 raise ValueError("INVALID_SCHEMA")
         return composition
@@ -386,7 +397,7 @@ class _ReplayComposition:
     @staticmethod
     def _queue_label(queue_class: int) -> str:
         return ("SOURCE_GROUP", "SNAPSHOT_CAPTURE", "DELIVERY", "HISTORICAL_MARKET_STEP",
-                "HISTORICAL_MARKET_CACHE")[queue_class]
+                "HISTORICAL_MARKET_CACHE", "HISTORICAL_TIMER")[queue_class]
 
     def _evidence(self, kind, key, evidence):
         if self._evidence_callback is None:
@@ -455,8 +466,15 @@ class _ReplayComposition:
                     **{k: d[k] for k in ("payload_kind", "occurrence_index", "schedule_sequence", "visible_at")}, continuation_id=d.get("continuation_id"))
                 policy_protocol._plan_projection(projection)
                 policy_protocol._event_id(d["delivery_id"])
-                content = (policy_protocol._plan_hash(d["payload_digest"]),
-                           policy_protocol._emission_plan_digest(plan, self._configured_product_ids))
+                audit_only = (self._historical_poll_range is not None
+                              and d.get("continuation_id") in self._p3_audit_continuations)
+                if audit_only:
+                    if plan is not None:
+                        raise _ScheduleError("INVALID_SCHEMA")
+                    plan_bytes = policy_protocol._event_text("P3_AUDIT_ONLY_POLL_V1")
+                else:
+                    plan_bytes = policy_protocol._emission_plan_digest(plan, self._configured_product_ids)
+                content = (policy_protocol._plan_hash(d["payload_digest"]), plan_bytes)
                 account, at, sequence, stable, cls = d["account_key"], d["visible_at"], d["schedule_sequence"], d["delivery_id"], 2
             elif kind == "HISTORICAL_MARKET_STEP":
                 row = cast(dict[str, Any], policy_protocol._event_object(
@@ -501,6 +519,22 @@ class _ReplayComposition:
                         raise _ScheduleError("INVALID_SCHEMA")
                 content = sequence_bytes + stable_bytes + snapshot.content_bytes()
                 account, cls = self._account, 4
+            elif kind == "HISTORICAL_TIMER":
+                row = cast(dict[str, Any], policy_protocol._event_object(
+                    item, "kind schedule_sequence stable_id raw_at"
+                ))
+                if self._historical_poll_range is None:
+                    raise _ScheduleError("INVALID_SCHEMA")
+                sequence, stable, raw = row["schedule_sequence"], row["stable_id"], row["raw_at"]
+                sequence_bytes = policy_protocol._plan_sequence(sequence)
+                stable_bytes = policy_protocol._event_id(stable)
+                if (type(raw) is not int or raw < self._historical_poll_range[0]
+                        or raw >= self._historical_poll_range[1] or raw % 5_000 != self._historical_poll_range[0] % 5_000
+                        or stable != f"P3_TIMER_{raw}"):
+                    raise _ScheduleError("INVALID_SCHEMA")
+                at = raw * 16 + 9
+                content = sequence_bytes + stable_bytes + policy_protocol._event_integer(raw)
+                account, cls = self._account, 5
             else:
                 raise _ScheduleError("INVALID_SCHEMA")
             if policy_protocol._plan_account(account) != policy_protocol._plan_account(self._account):
@@ -514,6 +548,10 @@ class _ReplayComposition:
                     raise _ScheduleError("INVALID_SCHEMA")
                 return dict(key=(at, cls, sequence, stable), content=content, item=deepcopy(item), plan=None,
                             raw_time_ms=historical_cache_raw_time,
+                            result=dict(kind=kind, stable_id=stable, classification="PENDING"))
+            if kind == "HISTORICAL_TIMER":
+                return dict(key=(at, cls, sequence, stable), content=content, item=deepcopy(item), plan=None,
+                            raw_time_ms=raw,
                             result=dict(kind=kind, stable_id=stable, classification="PENDING"))
             return dict(key=(at, cls, sequence, stable), content=content, item=deepcopy(item), plan=deepcopy(plan),
                         result=dict(kind=kind, stable_id=stable, classification="PENDING"))
@@ -544,7 +582,7 @@ class _ReplayComposition:
                 request, projection = item["request"], item["delivery_projection"]
                 if projection["visible_at"] < at or projection["reference"] != dict(namespace="SNAPSHOT", fact_id=request["snapshot_id"]):
                     raise _ScheduleError("INVALID_SCHEMA")
-            if cls == 2 and plan["delivery_id"] != stable:
+            if cls == 2 and plan is not None and plan["delivery_id"] != stable:
                 raise _ScheduleError("INVALID_SCHEMA")
             prospective[identity] = record
             added.append(record)
@@ -563,10 +601,10 @@ class _ReplayComposition:
             return self._admit_set([(item, plan)])[0]
         except Exception as exc:
             kind = item.get("kind") if isinstance(item, dict) else "QUEUE"
-            kind = kind if isinstance(kind, str) and kind in ("SOURCE_GROUP", "SNAPSHOT_CAPTURE", "DELIVERY", "HISTORICAL_MARKET_STEP", "HISTORICAL_MARKET_CACHE") else "QUEUE"
-            field, identity = {"SOURCE_GROUP": ("group", "group_id"), "SNAPSHOT_CAPTURE": ("request", "snapshot_id"), "DELIVERY": ("delivery", "delivery_id"), "HISTORICAL_MARKET_STEP": ("", "stable_id"), "HISTORICAL_MARKET_CACHE": ("", "stable_id")}.get(kind or "", ("", ""))
+            kind = kind if isinstance(kind, str) and kind in ("SOURCE_GROUP", "SNAPSHOT_CAPTURE", "DELIVERY", "HISTORICAL_MARKET_STEP", "HISTORICAL_MARKET_CACHE", "HISTORICAL_TIMER") else "QUEUE"
+            field, identity = {"SOURCE_GROUP": ("group", "group_id"), "SNAPSHOT_CAPTURE": ("request", "snapshot_id"), "DELIVERY": ("delivery", "delivery_id"), "HISTORICAL_MARKET_STEP": ("", "stable_id"), "HISTORICAL_MARKET_CACHE": ("", "stable_id"), "HISTORICAL_TIMER": ("", "stable_id")}.get(kind or "", ("", ""))
             value = item.get(field) if isinstance(item, dict) else None
-            if kind in ("HISTORICAL_MARKET_STEP", "HISTORICAL_MARKET_CACHE"):
+            if kind in ("HISTORICAL_MARKET_STEP", "HISTORICAL_MARKET_CACHE", "HISTORICAL_TIMER"):
                 value = item
             return self._stop_scheduler(exc, kind, value.get(identity) if isinstance(value, dict) else None)
 
@@ -623,22 +661,29 @@ class _ReplayComposition:
         if prefix.exception is not None:
             self._callback_evidence(record, prefix, events, "CALLBACK_FAILED", dict(kind="CALLBACK", reason="CALLBACK_FAILED"))
             raise _ScheduleError("CALLBACK_FAILED")
+        audit_only = (self._historical_poll_range is not None
+                      and delivery.get("continuation_id") in self._p3_audit_continuations)
         try:
-            validated = _validate_emission_plan(self._account, delivery, prefix.events, plan,
-                                                self._configured_product_ids)
+            validated = (() if audit_only else _validate_emission_plan(
+                self._account, delivery, prefix.events, plan, self._configured_product_ids
+            ))
         except ValueError as exc:
             if exc.args not in (("POLICY_EMISSION_MISMATCH",), ("MISSING_NEXT_EVENT_STAMP",)):
                 raise
             self._callback_evidence(record, prefix, events, "PLAN_FAILED", dict(kind="PLAN", reason=exc.args[0]))
             raise _ScheduleError(exc.args[0]) from exc
-        financial = iter(plan["financial_items"])
-        for event in events:
-            for action in event.get("actions", []):
-                action["group_id"] = next(financial)["expected_group"]["group_id"]
+        if not audit_only:
+            financial = iter(plan["financial_items"])
+            for event in events:
+                for action in event.get("actions", []):
+                    action["group_id"] = next(financial)["expected_group"]["group_id"]
         self._callback_evidence(record, prefix, events)
-        derived = [(dict(kind="SOURCE_GROUP", schedule_sequence=v["schedule_sequence"], group=v["expected_group"]), None)
-                   if "expected_group" in v else (self._capture_item(dict(capture_sequence=v["capture_sequence"],
-                       snapshot_request=v["snapshot_request"], delivery_projection=v["delivery_projection"])), None) for v in validated]
+        derived = ([] if audit_only else [
+            (dict(kind="SOURCE_GROUP", schedule_sequence=v["schedule_sequence"], group=v["expected_group"]), None)
+            if "expected_group" in v else (self._capture_item(dict(capture_sequence=v["capture_sequence"],
+                snapshot_request=v["snapshot_request"], delivery_projection=v["delivery_projection"])), None)
+            for v in validated
+        ])
         if next_stage is not None:
             derived.append((self._capture_item(next_stage), None))
         self._admit_set(derived)
@@ -684,7 +729,9 @@ class _ReplayComposition:
                     projection["reference"] = fact["reference"]
                     delivery = self._codec.build_delivery(projection)
                     plan = self._callback_plans.get(delivery["delivery_id"])
-                    if plan is None:
+                    audit_only = (self._historical_poll_range is not None
+                                  and delivery.get("continuation_id") in self._p3_audit_continuations)
+                    if plan is None and not audit_only:
                         raise _ScheduleError("INVALID_SCHEMA")
                     self._admit_set([(dict(kind="DELIVERY", delivery=delivery), plan)])
                 elif kind == "DELIVERY":
@@ -697,6 +744,13 @@ class _ReplayComposition:
                             or historical_result["effective_at"] != key[0]):
                         raise _ScheduleError("INVALID_SCHEMA")
                     result["historical_result"] = deepcopy(historical_result)
+                elif kind == "HISTORICAL_TIMER":
+                    plan = self._historical_poll_plan(record["raw_time_ms"], key[2])
+                    result = self._begin_poll(plan)
+                    result.update(kind=kind, stable_id=key[3])
+                    record["result"] = deepcopy(result)
+                    if result["classification"] == "TERMINAL":
+                        return deepcopy(result)
                 else:
                     snapshot = item["snapshot"]
                     self._policy.apply_market(snapshot.policy_markets())
@@ -711,6 +765,55 @@ class _ReplayComposition:
             if record is not None:
                 record["result"] = deepcopy(result)
             return result
+
+    def _historical_poll_plan(self, raw_at: int, timer_sequence: int) -> dict[str, Any]:
+        if self._historical_poll_range is None:
+            raise _ScheduleError("INVALID_SCHEMA")
+        start, end = self._historical_poll_range
+        if type(raw_at) is not int or not start <= raw_at < end:
+            raise _ScheduleError("INVALID_SCHEMA")
+        poll_id = f"P3_POLL_{raw_at}"
+        continuation = f"P3_CONT_{raw_at}"
+        result: dict[str, Any] = dict(account_key=deepcopy(self._account), poll_id=poll_id,
+                                      issued_at=raw_at, continuation_id=continuation)
+        earn_due = raw_at - self._policy.last_earn_ms > 60_000
+        due_stages = [
+            ("earn", "EARN", "EARN_SNAPSHOT", "FROZEN_POLL_FIXTURE", "P3_POLL_EARN_ZERO", 1, 5),
+            ("trading", "TRADING", "TRADING_SNAPSHOT", "OWNER_CURRENT", None, 6, 10),
+            ("positions", "POSITIONS", "POSITION_SNAPSHOT", "OWNER_CURRENT", None, 11, 15),
+            ("open_orders", "OPEN_ORDERS", "OPEN_ORDER_SNAPSHOT", "OWNER_CURRENT", None, 16, 20),
+        ]
+        no_earn_stages = [
+            ("trading", "TRADING", "TRADING_SNAPSHOT", "OWNER_CURRENT", None, 1, 5),
+            ("positions", "POSITIONS", "POSITION_SNAPSHOT", "OWNER_CURRENT", None, 6, 10),
+            ("open_orders", "OPEN_ORDERS", "OPEN_ORDER_SNAPSHOT", "OWNER_CURRENT", None, 11, 15),
+        ]
+        stages = due_stages if earn_due else no_earn_stages
+        if not earn_due:
+            result["earn"] = None
+        for index, (name, kind, payload_kind, capture_mode, fixture, capture_offset, visible_offset) in enumerate(stages):
+            capture_sequence = timer_sequence * 4 + index
+            snapshot_id = f"{poll_id}_{name.upper()}"
+            request = dict(
+                    schema_version="snapshot_request_v1", account_key=deepcopy(self._account),
+                    snapshot_id=snapshot_id, snapshot_kind=kind, capture_mode=capture_mode,
+                    captured_at=(raw_at + capture_offset) * 16 + 5,
+                    continuation_id=continuation,
+                )
+            if fixture is not None:
+                request["fixture_key"] = fixture
+            result[name] = dict(
+                capture_sequence=capture_sequence,
+                snapshot_request=request,
+                delivery_projection=dict(
+                    schema_version="delivery_projection_v1",
+                    reference=dict(namespace="SNAPSHOT", fact_id=snapshot_id),
+                    payload_kind=payload_kind, occurrence_index=capture_sequence,
+                    schedule_sequence=capture_sequence, visible_at=(raw_at + visible_offset) * 16 + 6,
+                    continuation_id=continuation,
+                ),
+            )
+        return result
 
     def _start_poll(self, plan, preflight: Callable[[int, dict[str, Any]], None]) -> _PollResult:
         try:
@@ -754,9 +857,13 @@ class _ReplayComposition:
             _poll_check(visible >= captured)
             stages.append(deepcopy(stage))
             previous = visible
-        preflight(issued, deepcopy(stages[0]))
+        scheduler_issued = issued * 16 + 9 if self._historical_poll_range is not None else issued
+        preflight(scheduler_issued, deepcopy(stages[0]))
         self._last_poll_at = issued
         self._continuations[continuation] = poll_id
+        if self._historical_poll_range is not None:
+            self._p3_audit_continuations.add(continuation)
+            self._historical_poll_issued_at[poll_id] = issued
         start = len(policy.events)
         policy.now_ms = issued
         error = None
@@ -769,7 +876,8 @@ class _ReplayComposition:
         prefix = _CallbackPrefix(tuple(deepcopy(policy.events[start:])), error)
         observation = _PollObservation("CALLBACK_FAILED" if error else "IN_PROGRESS", None if error else stages[0], prefix)
         self._polls[poll_id] = _PollRecord(digest, stages, 0, observation)
-        return _PollResult(deepcopy(observation), None if error else issued, None if error else deepcopy(stages[0]))
+        clock_advance = scheduler_issued if self._historical_poll_range is not None else issued
+        return _PollResult(deepcopy(observation), None if error else clock_advance, None if error else deepcopy(stages[0]))
 
     def _resume_poll(self, delivery: wire.Delivery) -> _PollResult:
         continuation = delivery.get("continuation_id")
@@ -792,6 +900,12 @@ class _ReplayComposition:
                 if policy.running and not policy.ws_open:
                     policy.emit("check_websocket")
                 policy.check_risk()
+                issued_at = self._historical_poll_issued_at.get(
+                    self._continuations[cast(str, continuation)]
+                )
+                if (self._historical_poll_range is not None and issued_at is not None
+                        and (issued_at // 60_000) % 1_440 == 12 * 60):
+                    policy.capital["day_ago"] = policy.capital["total"]
         except Exception as exc:
             error = exc
         record.index += 1

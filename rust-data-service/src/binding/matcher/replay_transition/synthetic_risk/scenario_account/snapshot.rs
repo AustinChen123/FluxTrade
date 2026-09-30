@@ -180,8 +180,19 @@ impl Store {
                 )
             }
             Mode::FrozenPollFixture => {
-                let (payload, at) =
-                    payload::fixture(request.fixture_key.as_deref().ok_or("INVALID_SCHEMA")?)?;
+                let fixture_key = request.fixture_key.as_deref().ok_or("INVALID_SCHEMA")?;
+                let p3_zero_earn = fixture_key == "P3_POLL_EARN_ZERO"
+                    && request.kind == Kind::Earn
+                    && matches!(
+                        &owner.profile,
+                        ProfileContext::BtcEthScenario { scenario, .. }
+                            if scenario.configured.is_some()
+                    );
+                let (payload, at) = if p3_zero_earn {
+                    (Payload::Earn(Decimal::ZERO), request.captured_at)
+                } else {
+                    payload::fixture(fixture_key)?
+                };
                 (payload, at, None)
             }
         };
