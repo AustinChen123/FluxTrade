@@ -65,6 +65,21 @@ def _digest(value: object) -> str:
     return sha256(_canonical(value)).hexdigest()
 
 
+def _parameter_projection(
+    parameters: tuple[tuple[str, str | Decimal], ...],
+) -> list[dict[str, str]]:
+    """Preserve parameter value types in every canonical identity projection."""
+    projected: list[dict[str, str]] = []
+    for key, value in parameters:
+        if type(value) is Decimal:
+            projected.append({"key": key, "kind": "DECIMAL", "value": _canonical_decimal(value)})
+        elif type(value) is str:
+            projected.append({"key": key, "kind": "STRING", "value": value})
+        else:
+            raise HistoricalInputError("parameters must be Decimal or string")
+    return projected
+
+
 @dataclass(frozen=True, slots=True)
 class HistoricalBar:
     product_id: str
@@ -634,6 +649,7 @@ def validate_historical_input(run: HistoricalRunInput) -> str:
                 raise HistoricalInputError("endpoint configured spec differs from run evidence")
     semantic_input = asdict(run)
     semantic_input.pop("run_id")
+    semantic_input["parameters"] = _parameter_projection(run.parameters)
     return _digest(semantic_input)
 
 
@@ -770,11 +786,7 @@ def encode_historical_run_input(run: HistoricalRunInput) -> bytes:
         raise HistoricalInputError("invalid run DTO")
     validate_historical_input(run)
     value: dict[str, object] = {key: getattr(run, key) for key in _RUN_INPUT_KEYS}
-    value["parameters"] = [
-        dict(key=key, kind="DECIMAL", value=_canonical_decimal(parameter))
-        if type(parameter) is Decimal else dict(key=key, kind="STRING", value=parameter)
-        for key, parameter in run.parameters
-    ]
+    value["parameters"] = _parameter_projection(run.parameters)
     for field in ("configuration_bytes", "initial_policy_cache", "initial_account_state"):
         value[field] = getattr(run, field).hex()
     value["ordered_products"] = list(run.ordered_products)

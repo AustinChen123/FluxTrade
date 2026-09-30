@@ -206,6 +206,20 @@ def test_valid_input_hash_is_deterministic_and_excludes_transport_run_id():
     assert all(validate_historical_input(change) != original for change in changes)
 
 
+def test_parameter_type_is_part_of_semantic_hash_and_survives_codec_roundtrip():
+    decimal_run = _valid_run()
+    string_run = replace(decimal_run, parameters=(("defaultN", "1"),))
+    decimal_hash = validate_historical_input(decimal_run)
+    string_hash = validate_historical_input(string_run)
+
+    assert decimal_hash == validate_historical_input(decimal_run)
+    assert string_hash == validate_historical_input(string_run)
+    assert decimal_hash != string_hash
+    assert validate_historical_input(replace(decimal_run, run_id="another-transport-id")) == decimal_hash
+    assert validate_historical_input(decode_historical_run_input(encode_historical_run_input(decimal_run))) == decimal_hash
+    assert validate_historical_input(decode_historical_run_input(encode_historical_run_input(string_run))) == string_hash
+
+
 @pytest.mark.parametrize("model_id", ["OHLC4_OPEN_HIGH_LOW_CLOSE_V1", "OHLC4_OPEN_LOW_HIGH_CLOSE_V1"])
 def test_historical_run_input_codec_roundtrips_exact_types_and_semantic_hash(model_id):
     run = replace(_valid_run(), model_id=model_id, parameters=(("defaultN", "1"),))
