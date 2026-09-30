@@ -10,6 +10,7 @@ from typing import Any, Callable, cast
 
 from src.core.backtest import synthetic_scenario_codec as wire
 from src.core.backtest import spider_policy_protocol as policy_protocol
+from src.core.backtest.spider_historical_input import historical_market_step_clock
 from src.core.backtest.spider_policy import Policy, fmt
 
 
@@ -206,10 +207,10 @@ def _historical_node_clock(value: object, configured_product_ids: tuple[str, ...
         raise ValueError("INVALID_SCHEMA")
     if type(step) is not int or step not in (0, 1, 2, 3):
         raise ValueError("INVALID_SCHEMA")
-    raw = raw_open + (0, 20_000, 40_000, 60_000)[step]
-    if raw >= 2**59:
-        raise ValueError("INVALID_SCHEMA")
-    effective = raw * 16 + (7, 8, 8, 4)[step]
+    try:
+        raw, effective = historical_market_step_clock(raw_open, step)
+    except ValueError as exc:
+        raise ValueError("INVALID_SCHEMA") from exc
     bars = row["bars"]
     if not isinstance(bars, list) or len(bars) != len(configured_product_ids):
         raise ValueError("INVALID_SCHEMA")

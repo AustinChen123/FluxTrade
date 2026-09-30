@@ -16,6 +16,10 @@ from src.core.backtest.spider_run_artifacts import (
     decode_jsonl,
     validate_artifact,
 )
+from src.core.backtest.spider_historical_input import (
+    decode_p2_configuration, encode_historical_run_input,
+    historical_context_for_input, historical_planned_coverage,
+)
 from src.core.backtest.spider_run_completion_schema import report as validate_report
 from src.core.backtest.spider_run_envelope_schema import endpoint as validate_endpoint, journal as validate_journal
 from src.core.backtest.spider_run_reconciliation_schema import reconciliation as validate_reconciliation
@@ -25,6 +29,7 @@ from test_spider_run_envelope_schema import configured_endpoint, configured_grou
 from test_spider_run_envelope_schema import record
 from test_spider_run_reconciliation_schema import configured_fixture as configured_reconciliation_fixture
 from test_spider_run_evidence import RUN, expected_checks, fixture
+from test_spider_historical_input import _valid_run
 
 
 class _ReportValidationBoundary(Protocol):
@@ -41,6 +46,39 @@ def prepared(tmp_path, index=0):
 
 def boundary(row):
     return dict(ordinal=row["journal_seq"], journal_seq=row["journal_seq"], barrier_id=row["barrier_id"])
+
+
+def historical_registration():
+    run = _valid_run()
+    raw = encode_historical_run_input(run)
+    configuration = decode_p2_configuration(
+        run.configuration_bytes, run.configuration_sha256, run.ordered_products
+    )
+    config_context = dict(
+        schema_version="spider_configuration_context_v1",
+        config_id=configuration["config_id"],
+        configuration_sha256=run.configuration_sha256,
+        products=list(run.ordered_products),
+    )
+    history_context = historical_context_for_input(run)
+    attempt = historical_attempt()
+    attempt.update(
+        run_id=run.run_id,
+        account_key={"venue": "SPIDER_HISTORICAL_RESEARCH", "environment": "RESEARCH_ONLY",
+                     "account": run.account_key},
+        scenario_plan_sha256=history_context["historical_input_sha256"],
+        configuration_context=config_context,
+        historical_context=history_context,
+        planned_coverage=historical_planned_coverage(run),
+    )
+    attempt["policy_source_sha256"] = run.policy_source_sha256
+    for item, key in zip(
+        attempt["input_contract_hashes"],
+        ("scenario_plan_sha256", "program_sha256", "native_artifact_sha256", "policy_source_sha256"),
+        strict=True,
+    ):
+        item["sha256"] = attempt[key]
+    return run, raw, attempt
 
 
 def ready(store, values):
@@ -295,25 +333,109 @@ def test_context_mismatch_append_writes_neither_journal_nor_status(tmp_path):
     assert store._processed == target and store._persisted is None
 
 
-def test_historical_registration_and_nonfinancial_journal_propagate_context_pair(tmp_path):
-    attempt = historical_attempt()
-    attempt["planned_coverage"] = [{"ordinal": 1, "barrier_id": "callback-only", "record_kind": "CALLBACK_RESULT"}]
-    store = module.SpiderRunStore.create(str(tmp_path), attempt["run_id"])
-    assert store.register(attempt) == "NATIVE_CONSTRUCTION_ALLOWED"
+def test_historical_registration_persists_input_and_dynamic_journal_frontier(tmp_path):
+    run, raw, attempt = historical_registration()
+    store = module.SpiderRunStore.create(str(tmp_path), run.run_id)
+    assert store.register(attempt, historical_input=raw) == "NATIVE_CONSTRUCTION_ALLOWED"
+    assert (store._path / "historical_input.json").read_bytes() == raw
+    assert (store._path / "historical_input.json").read_bytes().startswith(b"{")
     expected_config = attempt["configuration_context"]
     expected_history = attempt["historical_context"]
     running = decode_jsonl((store._path / "status.json").read_bytes())[0]
     assert (running["configuration_context"], running["historical_context"]) == (expected_config, expected_history)
 
-    row = record("CALLBACK_RESULT")
-    row.update(run_id=attempt["run_id"], barrier_id="callback-only", configuration_context=deepcopy(expected_config), historical_context=deepcopy(expected_history))
-    store.mark_processed(boundary(row))
-    store.append_journal(row)
+    rows = []
+    for sequence in (1, 2):
+        row = record("CALLBACK_RESULT")
+        row.update(run_id=attempt["run_id"], journal_seq=sequence, barrier_id=f"dynamic-{sequence}",
+                   configuration_context=deepcopy(expected_config), historical_context=deepcopy(expected_history))
+        rows.append(row)
+    malformed = dict(ordinal=1, journal_seq=2, barrier_id="malformed-frontier")
+    with pytest.raises(RuntimeError, match="INVALID_STORE_OPERATION"):
+        store.mark_processed(malformed, record_kind="CALLBACK_RESULT")
+    assert store._processed is store._processed_kind is None
+    assert store._persisted is None
+    store.mark_processed(boundary(rows[0]), record_kind="CALLBACK_RESULT")
+    store.append_journal(rows[0])
+    with pytest.raises(RuntimeError, match="INVALID_STORE_OPERATION"):
+        store.mark_processed(dict(ordinal=3, journal_seq=3, barrier_id="skip"), record_kind="CALLBACK_RESULT")
+    with pytest.raises(RuntimeError, match="INVALID_STORE_OPERATION"):
+        store.mark_processed(dict(ordinal=2, journal_seq=2, barrier_id="dynamic-1"), record_kind="CALLBACK_RESULT")
+    store.mark_processed(boundary(rows[1]), record_kind="CALLBACK_RESULT")
+    mismatched = record("DELIVERY_ATTEMPT")
+    mismatched.update(run_id=attempt["run_id"], journal_seq=2, barrier_id="dynamic-2",
+                      configuration_context=deepcopy(expected_config), historical_context=deepcopy(expected_history))
+    with pytest.raises(RuntimeError, match="INVALID_STORE_OPERATION"):
+        store.append_journal(mismatched)
+    store.append_journal(rows[1])
     persisted, status = (decode_jsonl((store._path / name).read_bytes())[0] for name in ("journal.jsonl", "status.json"))
+    assert decode_jsonl((store._path / "journal.jsonl").read_bytes()) == rows
     assert (persisted["configuration_context"], persisted["historical_context"]) == (expected_config, expected_history)
+    assert status["processed_boundary"] == status["persisted_boundary"] == boundary(rows[1])
     with pytest.raises(module.SpiderRunStoreError, match="ENDPOINT_RECONCILIATION_FAILED"):
         store.finalize({}, {}, [])
     assert not any((store._path / name).exists() for name in ("endpoint.json", "reconciliation.json", "report.jsonl", "completion.json"))
+
+
+@pytest.mark.parametrize("case", ["missing_input", "bad_input_bytes", "wrong_context", "wrong_coverage", "wrong_run_id"])
+def test_historical_registration_rejects_input_or_attempt_mismatch_before_attempt_publish(tmp_path, case):
+    run, raw, attempt = historical_registration()
+    if case == "wrong_context":
+        attempt["historical_context"]["source_sha256"] = "f" * 64
+    elif case == "wrong_coverage":
+        attempt["planned_coverage"].pop()
+    elif case == "wrong_run_id":
+        attempt["run_id"] = "other-run"
+    store = module.SpiderRunStore.create(str(tmp_path), run.run_id)
+    supplied = None if case == "missing_input" else raw + b" " if case == "bad_input_bytes" else raw
+    with pytest.raises(ValueError, match="INVALID_ARTIFACT"):
+        store.register(attempt, historical_input=supplied)
+    assert not (store._path / "attempt.json").exists()
+    assert not (store._path / "status.json").exists()
+    assert not (store._path / "historical_input.json").exists()
+
+
+@pytest.mark.parametrize("case", ["policy_source", "hash_0", "hash_1", "hash_2", "hash_3"])
+def test_historical_registration_rejects_identity_mismatch_without_publishing(tmp_path, case):
+    run, raw, attempt = historical_registration()
+    if case == "policy_source":
+        attempt["policy_source_sha256"] = "f" * 64
+        attempt["input_contract_hashes"][3]["sha256"] = "f" * 64
+    else:
+        index = int(case[-1])
+        attempt["input_contract_hashes"][index]["sha256"] = "f" * 64
+    store = module.SpiderRunStore.create(str(tmp_path), run.run_id)
+    with pytest.raises(ValueError, match="INVALID_ARTIFACT"):
+        store.register(attempt, historical_input=raw)
+    assert store._state == "CREATED"
+    assert store._attempt == {}
+    assert store._processed is store._persisted is None
+    assert list(store._path.iterdir()) == []
+
+
+def test_p1_p2_registration_rejects_historical_input_bytes(tmp_path):
+    store, values, _ = prepared(tmp_path)
+    with pytest.raises(ValueError, match="INVALID_ARTIFACT"):
+        store.register(values[0], historical_input=b"{}")
+    assert not (store._path / "attempt.json").exists()
+
+
+def test_historical_dynamic_append_rejects_context_mismatch_without_persisting(tmp_path):
+    run, raw, attempt = historical_registration()
+    store = module.SpiderRunStore.create(str(tmp_path), run.run_id)
+    store.register(attempt, historical_input=raw)
+    row = record("CALLBACK_RESULT")
+    row.update(run_id=run.run_id, journal_seq=1, barrier_id="dynamic-1",
+               configuration_context=deepcopy(attempt["configuration_context"]),
+               historical_context=deepcopy(attempt["historical_context"]))
+    row["historical_context"]["source_sha256"] = "f" * 64
+    store.mark_processed(boundary(row), record_kind="CALLBACK_RESULT")
+    journal_path, status_path = store._path / "journal.jsonl", store._path / "status.json"
+    before = journal_path.read_bytes(), status_path.read_bytes()
+    with pytest.raises(module.SpiderRunStoreError, match="ENDPOINT_RECONCILIATION_FAILED"):
+        store.append_journal(row)
+    assert (journal_path.read_bytes(), status_path.read_bytes()) == before
+    assert store._persisted is None
 
 
 def test_configured_report_validation_uses_candidate_context_for_reread(tmp_path):

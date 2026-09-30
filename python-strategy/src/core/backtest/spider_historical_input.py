@@ -20,6 +20,8 @@ SCHEMA_ID = "SPIDER_HISTORICAL_RESEARCH_RUN_V1"
 SCHEMA_VERSION = "spider_historical_research_run_v1"
 BAR_DURATION_MS = 60_000
 WARMUP_MS = 86_400_000
+_HISTORICAL_STEP_OFFSETS = (0, 20_000, 40_000, 60_000)
+_HISTORICAL_STEP_PHASES = (7, 8, 8, 4)
 MATCHING_MODEL_IDS = frozenset(
     {"OHLC4_OPEN_HIGH_LOW_CLOSE_V1", "OHLC4_OPEN_LOW_HIGH_CLOSE_V1"}
 )
@@ -31,6 +33,40 @@ _POLL_PROFILES = frozenset({"POLL_ORDERED_V1", "POLL_REVERSED_VISIBILITY_V1"})
 
 class HistoricalInputError(ValueError):
     """Input is not admissible for a historical Spider run."""
+
+
+def historical_market_step_clock(bar_open_ms: int, step_index: int) -> tuple[int, int]:
+    if (type(bar_open_ms) is not int or not 0 <= bar_open_ms < 2**59
+            or type(step_index) is not int or step_index not in range(4)):
+        raise HistoricalInputError("invalid historical market-step clock")
+    raw_time = bar_open_ms + _HISTORICAL_STEP_OFFSETS[step_index]
+    if raw_time >= 2**59:
+        raise HistoricalInputError("historical market-step clock overflow")
+    return raw_time, raw_time * 16 + _HISTORICAL_STEP_PHASES[step_index]
+
+
+def historical_planned_coverage(run: HistoricalRunInput) -> list[dict[str, object]]:
+    """Return input-only P3 market/cache/timer coverage in scheduler-key order."""
+    validate_historical_input(run)
+    scheduled: list[tuple[int, int, int, str, str]] = []
+    step_sequence = 0
+    cache_sequence = 0
+    for bar_open in range(run.range_start_ms, run.range_end_ms, run.bar_duration_ms):
+        for step in range(4):
+            _, effective_at = historical_market_step_clock(bar_open, step)
+            stable_id = f"P3_MARKET_{bar_open}_{step}"
+            scheduled.append((effective_at, 3, step_sequence, stable_id, "HISTORICAL_MARKET_STEP"))
+            step_sequence += 1
+        close_ms = bar_open + run.bar_duration_ms
+        scheduled.append((close_ms * 16 + 6, 4, cache_sequence,
+                          f"MARKET_CLOSE_{close_ms}", "HISTORICAL_MARKET_CACHE"))
+        cache_sequence += 1
+    for sequence, raw_at in enumerate(range(run.first_timer_ms, run.range_end_ms, run.timer_period_ms)):
+        scheduled.append((raw_at * 16 + 9, 5, sequence,
+                          f"P3_TIMER_{raw_at}", "HISTORICAL_TIMER"))
+    scheduled.sort()
+    return [dict(ordinal=ordinal, barrier_id=stable_id, record_kind=kind)
+            for ordinal, (_, _, _, stable_id, kind) in enumerate(scheduled, 1)]
 
 
 def _canonical_decimal(value: Decimal) -> str:

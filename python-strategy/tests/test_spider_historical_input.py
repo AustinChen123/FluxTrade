@@ -24,6 +24,7 @@ from src.core.backtest.spider_historical_input import (
     decode_p2_configuration,
     encode_historical_run_input,
     historical_context_for_input,
+    historical_planned_coverage,
     validate_historical_input,
 )
 
@@ -205,6 +206,26 @@ def test_valid_input_hash_is_deterministic_and_excludes_transport_run_id():
         replace(run, initial_policy_cache=_policy_cache(capital={"total": "1100", "usdt": "1000", "avail": "1000", "earn": "0", "position": "0"})),
     )
     assert all(validate_historical_input(change) != original for change in changes)
+
+
+def test_historical_planned_coverage_uses_closed_endpoint_and_timer_cadence():
+    run = _valid_run()
+    coverage = historical_planned_coverage(run)
+    assert len(coverage) == 16  # four market steps, one close cache, eleven timers
+    assert [row["record_kind"] for row in coverage] == [
+        "HISTORICAL_MARKET_STEP", "HISTORICAL_TIMER", "HISTORICAL_TIMER", "HISTORICAL_TIMER",
+        "HISTORICAL_MARKET_STEP", "HISTORICAL_TIMER", "HISTORICAL_TIMER", "HISTORICAL_TIMER",
+        "HISTORICAL_TIMER", "HISTORICAL_MARKET_STEP", "HISTORICAL_TIMER", "HISTORICAL_TIMER",
+        "HISTORICAL_TIMER", "HISTORICAL_TIMER", "HISTORICAL_MARKET_STEP", "HISTORICAL_MARKET_CACHE",
+    ]
+    assert coverage[0] == dict(ordinal=1, barrier_id=f"P3_MARKET_{run.range_start_ms}_0",
+                               record_kind="HISTORICAL_MARKET_STEP")
+    assert coverage[-2:] == [
+        dict(ordinal=15, barrier_id=f"P3_MARKET_{run.range_start_ms}_3",
+             record_kind="HISTORICAL_MARKET_STEP"),
+        dict(ordinal=16, barrier_id=f"MARKET_CLOSE_{run.range_end_ms}",
+             record_kind="HISTORICAL_MARKET_CACHE"),
+    ]
 
 
 def test_parameter_type_is_part_of_semantic_hash_and_survives_codec_roundtrip():

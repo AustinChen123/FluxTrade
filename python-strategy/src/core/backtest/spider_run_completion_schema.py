@@ -4,7 +4,7 @@ import re
 from typing import cast
 
 from src.core.backtest.spider_run_artifacts import (
-    ConfigurationContext, HistoricalContext, _HASH_NAMES, _KINDS, _artifact_contexts,
+    ConfigurationContext, HistoricalContext, _HASH_NAMES, _KINDS, _P3_COVERAGE_KINDS, _artifact_contexts,
     _boundary, _decimal_text, _enum, _integer, _list,
     _object, _require, _terminal_policy, _text,
     configuration_context as validate_configuration_context,
@@ -151,7 +151,7 @@ def completion(value: object) -> None:
         entry = _object(item, "ordinal barrier_id record_kind")
         _require(_integer(entry["ordinal"]) == ordinal)
         barriers.append(_text(entry["barrier_id"]))
-        _enum(entry["record_kind"], _KINDS)
+        _enum(entry["record_kind"], _P3_COVERAGE_KINDS if historical is not None else _KINDS)
     _require(len(barriers) == len(set(barriers)))
     artifacts = _list(row["artifacts"])
     _require(len(artifacts) == len(_ARTIFACTS))

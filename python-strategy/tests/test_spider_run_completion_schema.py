@@ -357,6 +357,23 @@ def test_completion_context_roundtrips_without_changing_manifest_semantics():
             schema.completion(invalid)
 
 
+def test_completion_coverage_kinds_are_historical_context_specific():
+    coverage = [{"ordinal": 1, "barrier_id": "P3_TIMER_86405000", "record_kind": "HISTORICAL_TIMER"}]
+    historical = manifest()
+    historical.update(
+        planned_coverage=coverage,
+        configuration_context=configured_context(),
+        historical_context=historical_context_row(),
+        terminal_reason="MTM_PRESERVE_OPEN_V1",
+    )
+    schema.completion(historical)
+
+    legacy = manifest()
+    legacy["planned_coverage"] = coverage
+    with pytest.raises(ValueError):
+        schema.completion(legacy)
+
+
 def test_embedded_artifact_contexts_remain_dict_only():
     raw = configured_context()
     typed = configuration_context(raw)
@@ -393,6 +410,9 @@ def test_reports_and_completion_bind_historical_context_pair_and_terminal():
     complete = manifest()
     complete.update(configuration_context=config, historical_context=deepcopy(historical),
                     terminal_reason="MTM_PRESERVE_OPEN_V1")
+    complete["planned_coverage"] = [
+        {"ordinal": 1, "barrier_id": "P3_TIMER_86405000", "record_kind": "HISTORICAL_TIMER"}
+    ]
     schema.completion(complete)
     for invalid in (
         {**complete, "configuration_context": None},

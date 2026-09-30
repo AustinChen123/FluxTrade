@@ -16,6 +16,7 @@ _IDENTITIES = "profile_id account_key scenario_plan_id scenario_plan_sha256 prog
 _HASHES = "scenario_plan_sha256 program_sha256 native_artifact_sha256 policy_source_sha256".split()
 _HASH_NAMES = "SCENARIO_PLAN PROGRAM NATIVE_ARTIFACT POLICY_SOURCE_MANIFEST".split()
 _KINDS = "SOURCE_GROUP_RESULT SNAPSHOT_FACT DELIVERY_ATTEMPT CALLBACK_RESULT".split()
+_P3_COVERAGE_KINDS = "HISTORICAL_MARKET_STEP HISTORICAL_MARKET_CACHE HISTORICAL_TIMER".split()
 _TERMINALS = "SCHEDULED_MTM LEGAL_NATIVE_LIQUIDATION_FINAL_EVENT O03_NON_ATOMIC_COMPLETE".split()
 _FAILURES = "UNSUPPORTED_CONFIGURATION PERSISTENCE_FAILED CALLBACK_FAILED NATIVE_FAULT NATIVE_POISONED SCHEDULER_FAILED ENDPOINT_RECONCILIATION_FAILED ARTIFACT_WRITE_FAILED PUBLICATION_FAILED PUBLICATION_DURABILITY_UNKNOWN UNEXPECTED_EXCEPTION".split()
 _P1_RUN_CONTRACT = "SPIDER_SYNTHETIC_P1_RUN_V1"
@@ -319,6 +320,7 @@ def _attempt(row: dict[str, object]) -> None:
     _require(row["artifact_encoding"] == "artifact_encoding_v1")
     if run_contract == _P3_RUN_CONTRACT:
         _require(row["terminal_policy"] == "MTM_PRESERVE_OPEN_V1")
+        _require(bool(coverage))
     else:
         _enum(row["terminal_policy"], _TERMINALS)
     seen: set[str] = set()
@@ -328,7 +330,7 @@ def _attempt(row: dict[str, object]) -> None:
         barrier = _text(entry["barrier_id"])
         _require(barrier not in seen)
         seen.add(barrier)
-        _enum(entry["record_kind"], _KINDS)
+        _enum(entry["record_kind"], _P3_COVERAGE_KINDS if run_contract == _P3_RUN_CONTRACT else _KINDS)
 
 
 def _status(row: dict[str, object]) -> None:

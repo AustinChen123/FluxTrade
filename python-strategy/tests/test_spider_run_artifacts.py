@@ -126,6 +126,8 @@ def historical_attempt():
         terminal_policy="MTM_PRESERVE_OPEN_V1",
         configuration_context=configuration_context(),
         historical_context=context,
+        planned_coverage=[{"ordinal": 1, "barrier_id": "P3_MARKET_86400000_0",
+                           "record_kind": "HISTORICAL_MARKET_STEP"}],
     )
     return row
 
@@ -502,6 +504,17 @@ def test_historical_context_is_forbidden_on_p1_p2_attempts_and_requires_configur
         a.validate_artifact(row)
     row["configuration_context"] = configuration_context()
     a.validate_artifact(row)
+
+
+def test_planned_coverage_kinds_are_run_contract_specific():
+    historical = historical_attempt()
+    a.validate_artifact(historical)
+    for base in (attempt(), configured_attempt()):
+        base["planned_coverage"] = [
+            {"ordinal": 1, "barrier_id": "P3_TIMER_86405000", "record_kind": "HISTORICAL_TIMER"}
+        ]
+        with pytest.raises(ValueError):
+            a.validate_artifact(base)
 
 
 def test_configured_validated_attempt_requires_context():

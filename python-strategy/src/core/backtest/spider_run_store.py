@@ -9,11 +9,16 @@ from json import JSONDecodeError
 from pathlib import Path
 from typing import Any
 
-from src.core.backtest.spider_run_artifacts import _P3_RUN_CONTRACT, _boundary, _configuration_context, _historical_context, _require, _text, canonical_bytes, configuration_context, decode_jsonl, historical_context, validate_artifact
+from src.core.backtest.spider_run_artifacts import _HASHES, _P3_RUN_CONTRACT, _boundary, _configuration_context, _historical_context, _require, _text, canonical_bytes, configuration_context, decode_jsonl, historical_context, validate_artifact
 from src.core.backtest.spider_run_completion_schema import _ARTIFACTS, completion, report as validate_report
 from src.core.backtest.spider_run_envelope_schema import endpoint as validate_endpoint, journal as validate_journal, journal_record
 from src.core.backtest.spider_run_evidence import ReconciliationProjectionError, _context_chain, build_reconciliation
 from src.core.backtest.spider_run_reconciliation_schema import reconciliation as validate_reconciliation
+from src.core.backtest.spider_historical_input import (
+    HistoricalRunInput, decode_historical_run_input, decode_p2_configuration,
+    encode_historical_run_input, historical_context_for_input, historical_planned_coverage,
+    validate_historical_input,
+)
 
 
 class SpiderRunStoreError(Exception):
@@ -75,6 +80,8 @@ class SpiderRunStore:
         self._processed: dict[str, Any] | None = None
         self._persisted: dict[str, Any] | None = None
         self._barrier_failed = False
+        self._processed_kind: str | None = None
+        self._historical_barrier_ids: set[str] = set()
 
     @classmethod
     def create(cls, output_root: str, run_id: str) -> "SpiderRunStore":
@@ -123,11 +130,57 @@ class SpiderRunStore:
         validate_artifact(value)
         return value
 
-    def register(self, attempt: dict[str, Any]) -> str:
+    def _historical_input(self, attempt: dict[str, Any], raw: bytes | None) -> bytes | None:
+        historical = attempt.get("run_contract_id") == _P3_RUN_CONTRACT
+        if not historical:
+            if raw is not None:
+                raise ValueError("INVALID_ARTIFACT")
+            return None
+        if type(raw) is not bytes:
+            raise ValueError("INVALID_ARTIFACT")
+        try:
+            run = decode_historical_run_input(raw)
+            if type(run) is not HistoricalRunInput or encode_historical_run_input(run) != raw:
+                raise ValueError("INVALID_ARTIFACT")
+            if run.run_id != self._run_id or attempt["run_id"] != run.run_id:
+                raise ValueError("INVALID_ARTIFACT")
+            history = historical_context(attempt["historical_context"])
+            expected_history = historical_context_for_input(run)
+            configuration = decode_p2_configuration(
+                run.configuration_bytes, run.configuration_sha256, run.ordered_products
+            )
+            expected_configuration = configuration_context(dict(
+                schema_version="spider_configuration_context_v1",
+                config_id=configuration["config_id"],
+                configuration_sha256=run.configuration_sha256,
+                products=list(run.ordered_products),
+            ))
+            semantic_hash = validate_historical_input(run)
+            if (history != historical_context(expected_history)
+                    or configuration_context(attempt["configuration_context"]) != expected_configuration
+                    or attempt["historical_context"] != expected_history
+                    or attempt["policy_source_sha256"] != run.policy_source_sha256
+                    or any(entry["sha256"] != attempt[key]
+                           for entry, key in zip(attempt["input_contract_hashes"], _HASHES, strict=True))
+                    or attempt["scenario_plan_sha256"] != semantic_hash
+                    or attempt["input_contract_hashes"][0]["sha256"] != semantic_hash
+                    or attempt["account_key"].get("account") != run.account_key
+                    or attempt["planned_coverage"] != historical_planned_coverage(run)):
+                raise ValueError("INVALID_ARTIFACT")
+        except ValueError as error:
+            if error.args == ("INVALID_ARTIFACT",):
+                raise
+            raise ValueError("INVALID_ARTIFACT") from error
+        return raw
+
+    def register(self, attempt: dict[str, Any], *, historical_input: bytes | None = None) -> str:
         self._allowed("CREATED")
         validate_artifact(attempt)
         if attempt["schema_version"] != "spider_attempt_v1" or attempt["run_id"] != self._run_id:
             raise ValueError("INVALID_ARTIFACT")
+        historical_input = self._historical_input(attempt, historical_input)
+        if historical_input is not None:
+            self._publish("historical_input.json", historical_input)
         self._publish("attempt.json", canonical_bytes(attempt) + b"\n")
         self._attempt = deepcopy(attempt)
         if attempt["registration_state"] == "REJECTED":
@@ -144,22 +197,33 @@ class SpiderRunStore:
             raise SpiderRunStoreError("PERSISTENCE_FAILED", "PERSISTENCE_FAILED", primary) from error
         return "NATIVE_CONSTRUCTION_ALLOWED"
 
-    def mark_processed(self, boundary: dict[str, Any]) -> None:
+    def mark_processed(self, boundary: dict[str, Any], *, record_kind: str | None = None) -> None:
         self._allowed("RUNNING")
         _boundary(boundary)
         ordinal = self._persisted["ordinal"] + 1 if self._persisted else 1
+        historical = self._attempt["run_contract_id"] == _P3_RUN_CONTRACT
         coverage = self._attempt["planned_coverage"]
-        if (self._barrier_failed or self._processed != self._persisted or ordinal > len(coverage)
-                or boundary != dict(ordinal=ordinal, journal_seq=ordinal, barrier_id=coverage[ordinal - 1]["barrier_id"])):
+        if historical:
+            valid_kind = record_kind in ("SOURCE_GROUP_RESULT", "SNAPSHOT_FACT", "DELIVERY_ATTEMPT", "CALLBACK_RESULT")
+            invalid = (not valid_kind or boundary["ordinal"] != ordinal or boundary["journal_seq"] != ordinal
+                       or boundary["barrier_id"] in self._historical_barrier_ids)
+        else:
+            invalid = (record_kind is not None or ordinal > len(coverage)
+                       or boundary != dict(ordinal=ordinal, journal_seq=ordinal,
+                                           barrier_id=coverage[ordinal - 1]["barrier_id"]))
+        if self._barrier_failed or self._processed != self._persisted or invalid:
             raise RuntimeError("INVALID_STORE_OPERATION")
         self._processed = deepcopy(boundary)
+        self._processed_kind = record_kind if historical else None
 
     def append_journal(self, row: dict[str, Any]) -> None:
         self._allowed("RUNNING")
         journal_record(row)
         boundary = dict(ordinal=row["journal_seq"], journal_seq=row["journal_seq"], barrier_id=row["barrier_id"])
+        historical = self._attempt["run_contract_id"] == _P3_RUN_CONTRACT
+        expected_kind = self._processed_kind if historical else self._attempt["planned_coverage"][boundary["ordinal"] - 1]["record_kind"]
         if (self._barrier_failed or self._processed is None or self._processed == self._persisted or boundary != self._processed
-                or row["run_id"] != self._run_id or row["record_kind"] != self._attempt["planned_coverage"][boundary["ordinal"] - 1]["record_kind"]):
+                or row["run_id"] != self._run_id or row["record_kind"] != expected_kind):
             raise RuntimeError("INVALID_STORE_OPERATION")
         try:
             _context_chain(self._attempt, row)
@@ -167,8 +231,11 @@ class SpiderRunStore:
             raise SpiderRunStoreError("ENDPOINT_RECONCILIATION_FAILED") from error
         try:
             _write(self._path / "journal.jsonl", canonical_bytes(row) + b"\n", append=True)
+            if historical:
+                self._historical_barrier_ids.add(boundary["barrier_id"])
             self._persisted = deepcopy(self._processed)
             self._publish("status.json", canonical_bytes(self._status("RUNNING")) + b"\n")
+            self._processed_kind = None
         except SpiderRunStoreError as error:
             self._barrier_failed = True
             raise SpiderRunStoreError("PERSISTENCE_FAILED", "PERSISTENCE_FAILED", dict(kind="PERSISTENCE", reason=error.reason)) from error
