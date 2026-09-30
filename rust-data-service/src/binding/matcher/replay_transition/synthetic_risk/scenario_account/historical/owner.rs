@@ -332,6 +332,8 @@ impl ScenarioAccount {
                             quantity,
                             price,
                             execution_id,
+                            source_event_id: receipt.source_event().to_owned(),
+                            occurrence_index: 0,
                         });
                     }
                     Reply::Duplicate(_) | Reply::Rejected(_) => {}

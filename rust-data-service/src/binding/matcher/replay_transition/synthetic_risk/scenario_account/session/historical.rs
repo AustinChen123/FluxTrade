@@ -198,6 +198,8 @@ fn encode_result(
                         ("quantity_contracts", wire::decimal(fill.quantity)),
                         ("price", wire::decimal(fill.price)),
                         ("execution_id", wire::hash(fill.execution_id)),
+                        ("source_event_id", wire::string(&fill.source_event_id)),
+                        ("occurrence_index", wire::number(fill.occurrence_index)?),
                     ]))
                 })
                 .collect::<Result<Vec<_>, Fault>>()?;

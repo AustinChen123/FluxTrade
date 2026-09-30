@@ -192,6 +192,8 @@ pub(super) struct HistoricalFill {
     pub quantity: Decimal,
     pub price: Decimal,
     pub execution_id: Hash,
+    pub source_event_id: String,
+    pub occurrence_index: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

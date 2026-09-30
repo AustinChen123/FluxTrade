@@ -328,6 +328,8 @@ class _ReplayComposition:
         self._historical_poll_issued_at: dict[str, int] = {}
         self._historical_order_contract: dict[str, Any] | None = None
         self._historical_order_sequence = 0
+        self._historical_notice_sequence = 0
+        self._p3_execution_notice_deliveries: set[str] = set()
         self._historical_run: object | None = None
         self._historical_bars: dict[tuple[int, str], tuple[object, object]] = {}
         self._historical_step_sequence = 0
@@ -364,6 +366,7 @@ class _ReplayComposition:
             config_id=prepared.configuration["config_id"],
             strategy_identity=historical_run.strategy_identity,
             order_accept_delay_ms=historical_run.order_accept_delay_ms,
+            order_notice_delay_ms=historical_run.order_notice_delay_ms,
             range_end_ms=historical_run.range_end_ms,
         )
         composition._historical_run = historical_run
@@ -460,6 +463,14 @@ class _ReplayComposition:
         return ("SOURCE_GROUP", "SNAPSHOT_CAPTURE", "DELIVERY", "HISTORICAL_MARKET_STEP",
                 "HISTORICAL_MARKET_CACHE", "HISTORICAL_TIMER")[queue_class]
 
+    def _historical_audit_delivery(self, delivery: wire.Delivery) -> bool:
+        poll_notice = (self._historical_poll_range is not None
+                       and delivery.get("continuation_id") in self._p3_audit_continuations)
+        execution_notice = (self._historical_run is not None
+                            and delivery["delivery_id"] in self._p3_execution_notice_deliveries
+                            and delivery["payload_kind"] == "EXECUTION_FACT")
+        return poll_notice or execution_notice
+
     def _evidence(self, kind, key, evidence):
         if self._evidence_callback is None:
             return
@@ -534,12 +545,14 @@ class _ReplayComposition:
                     **{k: d[k] for k in ("payload_kind", "occurrence_index", "schedule_sequence", "visible_at")}, continuation_id=d.get("continuation_id"))
                 policy_protocol._plan_projection(projection)
                 policy_protocol._event_id(d["delivery_id"])
-                audit_only = (self._historical_poll_range is not None
-                              and d.get("continuation_id") in self._p3_audit_continuations)
+                audit_only = self._historical_audit_delivery(d)
                 if audit_only:
                     if plan is not None:
                         raise _ScheduleError("INVALID_SCHEMA")
-                    plan_bytes = policy_protocol._event_text("P3_AUDIT_ONLY_POLL_V1")
+                    plan_bytes = policy_protocol._event_text(
+                        "P3_AUDIT_ONLY_POLL_V1" if d.get("continuation_id") is not None
+                        else "P3_AUDIT_ONLY_EXECUTION_NOTICE_V1"
+                    )
                 else:
                     plan_bytes = policy_protocol._emission_plan_digest(plan, self._configured_product_ids)
                 content = (policy_protocol._plan_hash(d["payload_digest"]), plan_bytes)
@@ -735,8 +748,12 @@ class _ReplayComposition:
         if prefix.exception is not None:
             self._callback_evidence(record, prefix, events, "CALLBACK_FAILED", dict(kind="CALLBACK", reason="CALLBACK_FAILED"))
             raise _ScheduleError("CALLBACK_FAILED")
-        audit_only = (self._historical_poll_range is not None
-                      and delivery.get("continuation_id") in self._p3_audit_continuations)
+        poll_audit_only = (self._historical_poll_range is not None
+                           and delivery.get("continuation_id") in self._p3_audit_continuations)
+        execution_audit_only = (self._historical_run is not None
+                                and delivery["delivery_id"] in self._p3_execution_notice_deliveries
+                                and delivery["payload_kind"] == "EXECUTION_FACT")
+        audit_only = poll_audit_only or execution_audit_only
         try:
             validated = (() if audit_only else _validate_emission_plan(
                 self._account, delivery, prefix.events, plan, self._configured_product_ids
@@ -751,14 +768,14 @@ class _ReplayComposition:
             for event in events:
                 for action in event.get("actions", []):
                     action["group_id"] = next(financial)["expected_group"]["group_id"]
-        historical_groups = self._historical_order_children(record, prefix.events, events) if audit_only else []
+        historical_groups = self._historical_order_children(record, prefix.events, events) if poll_audit_only else []
         self._callback_evidence(record, prefix, events)
-        derived = (historical_groups if audit_only else [
+        derived = (historical_groups if poll_audit_only else ([] if execution_audit_only else [
             (dict(kind="SOURCE_GROUP", schedule_sequence=v["schedule_sequence"], group=v["expected_group"]), None)
             if "expected_group" in v else (self._capture_item(dict(capture_sequence=v["capture_sequence"],
                 snapshot_request=v["snapshot_request"], delivery_projection=v["delivery_projection"])), None)
             for v in validated
-        ])
+        ]))
         if next_stage is not None:
             derived.append((self._capture_item(next_stage), None))
         self._admit_set(derived)
@@ -874,8 +891,7 @@ class _ReplayComposition:
                     projection["reference"] = fact["reference"]
                     delivery = self._codec.build_delivery(projection)
                     plan = self._callback_plans.get(delivery["delivery_id"])
-                    audit_only = (self._historical_poll_range is not None
-                                  and delivery.get("continuation_id") in self._p3_audit_continuations)
+                    audit_only = self._historical_audit_delivery(delivery)
                     if plan is None and not audit_only:
                         raise _ScheduleError("INVALID_SCHEMA")
                     self._admit_set([(dict(kind="DELIVERY", delivery=delivery), plan)])
@@ -894,6 +910,26 @@ class _ReplayComposition:
                     if working_orders is not None:
                         result["working_orders_snapshot"] = deepcopy(working_orders)
                         run = cast(Any, self._historical_run)
+                        derived: list[tuple[dict[str, Any], Any]] = []
+                        for product in historical_result["products"]:
+                            for fill in product["fills"]:
+                                notice_raw = (historical_result["raw_time_ms"]
+                                              + self._historical_order_contract["order_notice_delay_ms"])
+                                visible_at = notice_raw * 16 + 6
+                                if not 0 <= visible_at < 2**63:
+                                    raise _ScheduleError("INVALID_SCHEMA")
+                                projection = dict(
+                                    schema_version="delivery_projection_v1",
+                                    reference=dict(namespace="SOURCE", fact_id=fill["source_event_id"]),
+                                    payload_kind="EXECUTION_FACT",
+                                    occurrence_index=fill["occurrence_index"],
+                                    schedule_sequence=self._historical_notice_sequence,
+                                    visible_at=visible_at,
+                                )
+                                delivery = self._codec.build_delivery(projection)
+                                self._p3_execution_notice_deliveries.add(delivery["delivery_id"])
+                                derived.append((dict(kind="DELIVERY", delivery=delivery), None))
+                                self._historical_notice_sequence += 1
                         open_ms, step = node["bar_open_ms"], node["step_index"]
                         if step < 3:
                             next_open, next_step = open_ms, step + 1
@@ -904,10 +940,12 @@ class _ReplayComposition:
                             following = self._historical_node_item(
                                 next_open, next_step, self._historical_step_sequence, next_working_orders
                             )
-                            queued = self._enqueue(following)
-                            if queued["classification"] != "PENDING":
-                                record["result"] = deepcopy(self._terminal or queued)
-                                return deepcopy(record["result"])
+                            derived.append((following, None))
+                        queued = self._admit_set(derived)
+                        if any(value["classification"] != "PENDING" for value in queued):
+                            record["result"] = deepcopy(self._terminal or queued[0])
+                            return deepcopy(record["result"])
+                        if next_open < run.range_end_ms:
                             self._historical_step_sequence += 1
                 elif kind == "HISTORICAL_TIMER":
                     plan = self._historical_poll_plan(record["raw_time_ms"], key[2])

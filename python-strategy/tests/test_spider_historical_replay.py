@@ -526,6 +526,33 @@ def test_historical_chain_uses_frozen_owner_orders_and_commits_one_partial_fill(
     assert selected["side"] == "SHORT" and selected["limit_price"] == D("101")
     assert fill["price"] == D("103")
     assert len(fill["execution_id"]) == 64
+    assert fill["source_event_id"]
+    assert fill["occurrence_index"] == 0
+    notice = next(record for record in composition._records.values()
+                  if record["item"]["kind"] == "DELIVERY"
+                  and record["item"]["delivery"]["source_fact_id"] == fill["source_event_id"])
+    assert notice["key"][0] == (start + 40_002) * 16 + 6
+    assert notice["item"]["delivery"]["immutable_payload"]["state"] == "partially_filled"
+    owner_before_notice = composition._codec.inspect_state()
+    assert composition._dispatch_due(notice["key"][0])["classification"] == "SUCCESS"
+    notice_events = composition._audit[notice["item"]["delivery"]["delivery_id"]]
+    assert not any(event["event"]["kind"] in ("send", "cancel") for event in notice_events)
+    owner_after_notice = composition._codec.inspect_state()
+    for field in ("account_version", "cash", "total_fees", "positions_digest", "orders_digest"):
+        assert owner_after_notice[field] == owner_before_notice[field]
+    policy_events_after_notice = deepcopy(composition._policy.events)
+    delivered_notice = notice["item"]["delivery"]
+    assert composition._codec.build_delivery(dict(
+        schema_version="delivery_projection_v1",
+        reference=dict(namespace=delivered_notice["source_namespace"], fact_id=delivered_notice["source_fact_id"]),
+        payload_kind=delivered_notice["payload_kind"],
+        occurrence_index=delivered_notice["occurrence_index"],
+        schedule_sequence=delivered_notice["schedule_sequence"],
+        visible_at=delivered_notice["visible_at"],
+    )) == delivered_notice
+    duplicate = composition._enqueue(dict(kind="DELIVERY", delivery=delivered_notice))
+    assert duplicate["classification"] == "SUCCESS"
+    assert composition._policy.events == policy_events_after_notice
     owner_after = step2_result["owner_evidence"]
     assert owner_after["account_version"] > first_result["owner_evidence"]["account_version"]
     assert owner_after["orders_digest"] != first_result["owner_evidence"]["orders_digest"]
@@ -553,6 +580,79 @@ def test_historical_chain_uses_frozen_owner_orders_and_commits_one_partial_fill(
     step3_key = run.range_end_ms * 16 + 4
     assert composition._dispatch_due(step3_key)["classification"] == "SUCCESS"
     assert step3["result"]["classification"] == "SUCCESS"
+
+
+def test_historical_full_execution_notice_uses_original_limit_and_stays_unsubmitted():
+    run = _valid_run()
+    trade_rows = tuple(
+        replace(row, high=D("103"), low=D("98"), volume=D("1"))
+        if row.product_id == "A-USDT-SWAP" else row
+        for row in run.trade_bars
+    )
+    run = _rehashed_run(run, trade_rows=trade_rows)
+    composition = _composition(run)
+    composition._policy.rows[1]["active"] = "false"
+    start = run.range_start_ms
+    assert composition._dispatch_due((start + 40_002) * 16 + 6)["classification"] == "SUCCESS"
+
+    full_notices = [record for record in composition._records.values()
+                    if record["item"]["kind"] == "DELIVERY"
+                    and record["item"]["delivery"]["payload_kind"] == "EXECUTION_FACT"
+                    and record["item"]["delivery"]["immutable_payload"]["state"] == "filled"
+                    and record["result"]["classification"] == "SUCCESS"]
+    assert full_notices
+    notice = next(record for record in full_notices
+                  if record["item"]["delivery"]["immutable_payload"]["limit_price"]
+                  != record["item"]["delivery"]["immutable_payload"]["fill_price"])
+    fact = notice["item"]["delivery"]["immutable_payload"]
+    events = composition._audit[notice["item"]["delivery"]["delivery_id"]]
+    sends = [event for event in events if event["event"]["kind"] == "send"]
+    cancels = [event for event in events if event["event"]["kind"] == "cancel"]
+    assert sends and cancels
+    replacement_prices = [order["px"] for event in sends for order in event["event"]["orders"]]
+    assert fact["limit_price"] == D("101") and fact["fill_price"] == D("103")
+    assert "100" in replacement_prices
+    assert str(fact["fill_price"]) not in replacement_prices
+    assert all(action["status"] == "UNSUBMITTED" and action["group_id"] is None
+               for event in (*sends, *cancels) for action in event["actions"])
+    assert len([record for record in composition._records.values()
+                if record["item"]["kind"] == "SOURCE_GROUP"
+                and record["item"]["group"].get("ordering_contract_id") == "HISTORICAL_ORDER_V1"]) == 4
+    policy_events_after_full = deepcopy(composition._policy.events)
+    delivered_notice = notice["item"]["delivery"]
+    assert composition._codec.build_delivery(dict(
+        schema_version="delivery_projection_v1",
+        reference=dict(namespace=delivered_notice["source_namespace"], fact_id=delivered_notice["source_fact_id"]),
+        payload_kind=delivered_notice["payload_kind"],
+        occurrence_index=delivered_notice["occurrence_index"],
+        schedule_sequence=delivered_notice["schedule_sequence"],
+        visible_at=delivered_notice["visible_at"],
+    )) == delivered_notice
+    duplicate = composition._enqueue(dict(kind="DELIVERY", delivery=delivered_notice))
+    assert duplicate["classification"] == "SUCCESS"
+    assert composition._policy.events == policy_events_after_full
+
+
+def test_historical_execution_notice_after_endpoint_remains_pending():
+    run = _valid_run()
+    trade_rows = tuple(
+        replace(row, high=D("103"), low=D("98"), volume=D("1"))
+        if row.product_id == "A-USDT-SWAP" else row
+        for row in run.trade_bars
+    )
+    run = _rehashed_run(run, trade_rows=trade_rows)
+    composition = _composition(run)
+    composition._policy.rows[1]["active"] = "false"
+    endpoint = run.range_end_ms * 16 + 6
+    assert composition._dispatch_due(endpoint)["classification"] == "SUCCESS"
+    pending = [record for record in composition._records.values()
+               if record["item"]["kind"] == "DELIVERY"
+               and record["item"]["delivery"]["payload_kind"] == "EXECUTION_FACT"
+               and record["key"][0] > endpoint]
+    assert pending
+    assert all(record["result"]["classification"] == "PENDING" for record in pending)
+    assert all(record["item"]["delivery"]["visible_at"] == run.range_end_ms * 16 + 38
+               for record in pending)
 
 
 def test_historical_chain_runs_final_close_without_endpoint_next_open():

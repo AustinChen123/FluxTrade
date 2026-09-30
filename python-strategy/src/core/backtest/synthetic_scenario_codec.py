@@ -416,6 +416,8 @@ class HistoricalFill(TypedDict):
     quantity_contracts: Decimal
     price: Decimal
     execution_id: str
+    source_event_id: str
+    occurrence_index: int
 
 
 class HistoricalProductResult(TypedDict):
