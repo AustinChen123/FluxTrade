@@ -2,6 +2,7 @@ from copy import deepcopy
 from dataclasses import replace
 from decimal import Decimal as D
 from hashlib import sha256
+import json
 import re
 from typing import cast
 
@@ -814,6 +815,132 @@ def test_frozen_h01_runs_policy_poll_native_fill_notice_and_endpoint_oracle():
     assert expected_used == D("20.5")
     assert accept_snapshot["equity"] - accept_snapshot["available_equity"] == expected_used
     assert accept_snapshot["available_equity"] == expected_available
+
+
+def test_seed_limit_projection_is_ranked_and_fills_only_after_seed_effective_at():
+    run = _valid_run()
+    start = run.range_start_ms
+    config = json.loads(run.configuration_bytes)
+    config["seed_effective_at"] = start
+    # Reverse configuration order intentionally: native seed ordering is the
+    # owner_order_id lexical rank, not input-array order.
+    seed_orders = [
+        {
+            "intent_id": "SEED-INTENT-2",
+            "order_id": "SEED-ORDER-2",
+            "client_order_id": "SEED-CLIENT-2",
+            "strategy_id": "seed-policy",
+            "product_id": "A-USDT-SWAP",
+            "side": "LONG",
+            "limit_price": "101",
+            "reduce_only": False,
+            "original_quantity_contracts": "0.5",
+            "filled_quantity_contracts": "0",
+            "canceled_quantity_contracts": "0",
+            "remaining_quantity_contracts": "0.5",
+            "status": "OPEN",
+        },
+        {
+            "intent_id": "SEED-INTENT-1",
+            "order_id": "SEED-ORDER-1",
+            "client_order_id": "SEED-CLIENT-1",
+            "strategy_id": "seed-policy",
+            "product_id": "A-USDT-SWAP",
+            "side": "LONG",
+            "limit_price": "101",
+            "reduce_only": False,
+            "original_quantity_contracts": "0.5",
+            "filled_quantity_contracts": "0",
+            "canceled_quantity_contracts": "0",
+            "remaining_quantity_contracts": "0.5",
+            "status": "OPEN",
+        },
+    ]
+    config["orders"] = seed_orders
+    run = _run_with_configuration(run, config)
+    run = replace(
+        run,
+        initial_account_state=_initial_account_state(orders=seed_orders),
+        initial_policy_cache=_policy_cache(running=False),
+    )
+    trade_rows = tuple(
+        replace(row, high=D("120"), low=D("80"), close=D("110"), volume=D("1"))
+        if row.product_id == "A-USDT-SWAP" and row.bar_open_ms == start
+        else row
+        for row in run.trade_bars
+    )
+    run = _rehashed_run(run, trade_rows=trade_rows)
+    assert validate_historical_input(run)
+
+    composition = _composition(run)
+    projection = composition._codec.historical_working_orders()
+    assert [
+        (
+            order["order_id"],
+            order["product_id"],
+            order["side"],
+            order["limit_price"],
+            order["remaining_quantity_contracts"],
+            order["accepted_at"],
+            order["accepted_source_sequence"],
+            order["order_kind"],
+        )
+        for order in projection
+    ] == [
+        (
+            "SEED-ORDER-1",
+            "A-USDT-SWAP",
+            "LONG",
+            D("101"),
+            D("0.5"),
+            start * 16,
+            1,
+            "LIMIT",
+        ),
+        (
+            "SEED-ORDER-2",
+            "A-USDT-SWAP",
+            "LONG",
+            D("101"),
+            D("0.5"),
+            start * 16,
+            2,
+            "LIMIT",
+        ),
+    ]
+
+    seed_effective_at = start * 16
+    market_steps = [
+        record
+        for record in composition._records.values()
+        if record["item"]["kind"] == "HISTORICAL_MARKET_STEP"
+    ]
+    assert min(record["key"][0] for record in market_steps) > seed_effective_at
+
+    # The first queued market segment is phase 7, after seed phase 0. Both
+    # orders have the same trigger; one segment lot proves rank 1 is first.
+    assert composition._dispatch_due(start * 16 + 7)["classification"] == "SUCCESS"
+    first = next(
+        record["result"]["historical_result"]
+        for record in composition._records.values()
+        if record["item"]["kind"] == "HISTORICAL_MARKET_STEP"
+        and record["item"]["node"]["bar_open_ms"] == start
+        and record["item"]["node"]["step_index"] == 0
+    )
+    fills = [fill for product in first["products"] for fill in product["fills"]]
+    assert [
+        (fill["order_id"], fill["quantity_contracts"], fill["price"])
+        for fill in fills
+    ] == [("SEED-ORDER-1", D("0.25"), D("100"))]
+    after_partial = composition._codec.historical_working_orders()
+    assert [
+        (order["order_id"], order["remaining_quantity_contracts"],
+         order["accepted_source_sequence"], order["status"])
+        for order in after_partial
+    ] == [
+        ("SEED-ORDER-1", D("0.25"), 1, "PARTIALLY_FILLED"),
+        ("SEED-ORDER-2", D("0.5"), 2, "OPEN"),
+    ]
 
 
 def test_historical_chain_uses_frozen_owner_orders_and_commits_one_partial_fill():

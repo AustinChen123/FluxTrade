@@ -224,11 +224,28 @@ impl ScenarioAccount {
     ) -> Result<Vec<super::historical::WorkingOrderMeta>, Fault> {
         const HISTORICAL: &str = "HISTORICAL_ORDER_V1";
         if !matches!(self.profile, ProfileContext::BtcEthScenario { ref scenario, .. } if scenario.configured.is_some())
-            || !self.seed_orders.is_empty()
-            || !self.seed_intents.is_empty()
         {
             return Err("INVALID_HISTORICAL_ORDER_SNAPSHOT");
         }
+        if self.seed_orders.len() != self.seed_intents.len()
+            || self
+                .seed_orders
+                .iter()
+                .any(|id| !self.orders.contains_key(id))
+        {
+            return Err("INVALID_HISTORICAL_ORDER_SNAPSHOT");
+        }
+        let seed_sequences = self
+            .seed_orders
+            .iter()
+            .enumerate()
+            .map(|(index, id)| {
+                Ok((
+                    id.as_str(),
+                    i64::try_from(index + 1).map_err(|_| "NATIVE_INVARIANT")?,
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>, Fault>>()?;
         let mut projection = Vec::new();
         for (order_id, order) in &self.orders {
             if !order
@@ -242,6 +259,33 @@ impl ScenarioAccount {
                 continue;
             }
             let facts = &order.facts;
+            if let Some(sequence) = seed_sequences.get(order_id.as_str()) {
+                if order.created_at != self.seed_effective_at
+                    || facts.order_id != *order_id
+                    || !self.seed_intents.contains(&facts.intent_id)
+                    || facts.product.btc().is_err()
+                {
+                    return Err("INVALID_HISTORICAL_ORDER_SNAPSHOT");
+                }
+                projection.push(super::historical::WorkingOrderMeta {
+                    order_id: order_id.clone(),
+                    product: facts.product.btc()?.clone(),
+                    order_version: order.version,
+                    status: facts.status.clone(),
+                    remaining: facts.remaining,
+                    accepted_at: self.seed_effective_at,
+                    accepted_source_sequence: *sequence,
+                    kind: super::historical::OrderKind::Limit,
+                    side: facts.side,
+                    limit_price: Some(facts.price),
+                    risk_cancel_pending: matches!(
+                        order.cancel,
+                        risk_transition::cancel::State::Requested(ref request)
+                            if matches!(request.reason, risk_transition::cancel::Reason::RiskShortfall | risk_transition::cancel::Reason::MmrBreach)
+                    ),
+                });
+                continue;
+            }
             let admission = self
                 .intent_results
                 .get(&facts.intent_id)

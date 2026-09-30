@@ -183,6 +183,83 @@ fn historical_step_commits_through_the_existing_execution_owner() {
 }
 
 #[test]
+fn configured_seed_order_projection_uses_owner_id_rank_and_seed_time() {
+    let (mut seed, products) = configured_ab();
+    seed.orders = ["SEED-ORDER-2", "SEED-ORDER-1"]
+        .into_iter()
+        .map(|order_id| SeedOrder {
+            intent_id: format!("INTENT-{order_id}"),
+            order_id: order_id.into(),
+            client_id: format!("CLIENT-{order_id}"),
+            strategy_id: "seed-policy".into(),
+            product: ProfileProduct::BtcEth(Product("A-USDT-SWAP".into())),
+            side: Side::Long,
+            price: d("100"),
+            reduce_only: false,
+            original: d("0.5"),
+            filled: Decimal::ZERO,
+            canceled: Decimal::ZERO,
+            remaining: d("0.5"),
+            status: "OPEN".into(),
+        })
+        .collect();
+    let owner = ScenarioAccount::from_configured(&seed, d("10"), products).unwrap();
+    let projected = owner.historical_working_orders().unwrap();
+    assert_eq!(
+        projected
+            .iter()
+            .map(|order| (
+                order.order_id.as_str(),
+                order.accepted_at,
+                order.accepted_source_sequence,
+                order.kind,
+                order.side,
+                order.limit_price,
+                order.remaining,
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (
+                "SEED-ORDER-1",
+                seed.effective_at,
+                1,
+                historical::OrderKind::Limit,
+                Side::Long,
+                Some(d("100")),
+                d("0.5"),
+            ),
+            (
+                "SEED-ORDER-2",
+                seed.effective_at,
+                2,
+                historical::OrderKind::Limit,
+                Side::Long,
+                Some(d("100")),
+                d("0.5"),
+            ),
+        ]
+    );
+
+    let mut invalid = owner.clone();
+    invalid.orders.get_mut("SEED-ORDER-1").unwrap().created_at += 1;
+    assert_eq!(
+        invalid.historical_working_orders(),
+        Err("INVALID_HISTORICAL_ORDER_SNAPSHOT")
+    );
+    let mut invalid = owner;
+    invalid
+        .orders
+        .get_mut("SEED-ORDER-1")
+        .unwrap()
+        .facts
+        .order_id = "OTHER-ORDER".into();
+    assert_eq!(
+        invalid.historical_working_orders(),
+        Err("INVALID_HISTORICAL_ORDER_SNAPSHOT")
+    );
+}
+
+#[test]
 fn h04_owner_steps_honor_pending_cancel_then_effect_and_exact_settlement() {
     let (mut seed, mut products) = configured_ab();
     seed.cash = d("1000");
