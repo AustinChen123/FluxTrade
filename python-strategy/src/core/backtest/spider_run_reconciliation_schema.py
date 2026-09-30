@@ -3,7 +3,7 @@
 from src.core.backtest import spider_run_envelope_schema as envelope
 from src.core.backtest import spider_run_native_schema as native
 from src.core.backtest.spider_run_artifacts import (
-    ConfigurationContext, HistoricalContext, _KINDS,
+    ConfigurationContext, HistoricalContext, _KINDS, _P3_COVERAGE_KINDS,
     _boundary, _enum, _integer, _list, _object, _require, _terminal_policy,
     _text,
 )
@@ -17,13 +17,15 @@ _CHECKS = (
     "NO_UNRESOLVED_QUEUE", "NO_UNRESOLVED_POLL", "NO_UNSUBMITTED_CALLBACK_ACTION",
     "TERMINAL_POLICY_MATCH", "REPORT_PROJECTION_MATCH",
 )
+_P3_JOURNAL_KINDS = ["HISTORICAL_MARKET_RESULT"]
 
 
 def _unique(values: list) -> None:
     _require(len(values) == len(set(values)))
 
 
-def _barriers(value: object, *, journal: bool = False, ordered: bool = False) -> None:
+def _barriers(value: object, *, journal: bool = False, ordered: bool = False,
+              historical: bool = False) -> None:
     identities: list[tuple[int, str]] = []
     sequences: list[int] = []
     for item in _list(value):
@@ -31,7 +33,8 @@ def _barriers(value: object, *, journal: bool = False, ordered: bool = False) ->
         ordinal = _integer(row["ordinal"])
         _require(ordinal > 0)
         identities.append((ordinal, _text(row["barrier_id"])))
-        _enum(row["record_kind"], _KINDS)
+        kinds = ([*_KINDS, *_P3_JOURNAL_KINDS] if journal else _P3_COVERAGE_KINDS) if historical else _KINDS
+        _enum(row["record_kind"], kinds)
         if journal:
             sequence = _integer(row["journal_seq"])
             _require(sequence > 0)
@@ -62,15 +65,15 @@ def _value(
     historical: HistoricalContext | None = None,
 ) -> None:
     if name == "PLANNED_COVERAGE_COMPLETE":
-        _barriers(value)
+        _barriers(value, historical=historical is not None)
     elif name == "PROCESSED_EQUALS_PERSISTED":
         row = _object(value, "processed_boundary persisted_boundary last_planned")
         for key in ("processed_boundary", "persisted_boundary"):
             _require(row[key] is not None)
             _boundary(row[key])
-        _barriers([row["last_planned"]])
+        _barriers([row["last_planned"]], historical=historical is not None)
     elif name == "JOURNAL_CONTIGUOUS":
-        _barriers(value, journal=True)
+        _barriers(value, journal=True, historical=historical is not None)
     elif name == "OWNER_IDENTITY_MATCH":
         refs: list[str] = []
         for item in _list(value):
@@ -101,8 +104,9 @@ def _value(
             _integer(snapshot["snapshot_as_of"])
     elif name == "NO_UNRESOLVED_QUEUE":
         row = _object(value, "pending_keys remaining_planned_barriers")
-        envelope._ordered([envelope.scheduler_key(item) for item in _list(row["pending_keys"])])
-        _barriers(row["remaining_planned_barriers"], ordered=True)
+        envelope._ordered([envelope.scheduler_key(item, historical=historical is not None)
+                           for item in _list(row["pending_keys"])])
+        _barriers(row["remaining_planned_barriers"], ordered=True, historical=historical is not None)
     elif name == "NO_UNRESOLVED_POLL":
         polls = [envelope.poll(item) for item in _list(value)]
         envelope._ordered(polls)
@@ -117,8 +121,8 @@ def _value(
         _enum(row["scheduler_gate"], ["RUNNING", "FAILED"])
         _enum(row["owner_gate"], ["RUNNING", "FAILED"])
         _enum(row["owner_lifecycle"], native._LIFECYCLES)
-        envelope.scheduler_terminal(row["scheduler_terminal"])
-        _barriers(row["remaining_planned_barriers"], ordered=True)
+        envelope.scheduler_terminal(row["scheduler_terminal"], historical=historical is not None)
+        _barriers(row["remaining_planned_barriers"], ordered=True, historical=historical is not None)
     else:
         _require(name == "REPORT_PROJECTION_MATCH")
         row = _object(value, "report_rows report_sha256")

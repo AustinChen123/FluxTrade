@@ -81,12 +81,13 @@ def account(value: object) -> None:
     _optional(row, "subaccount", _text, nullable=True)
 
 
-def stamp(value: object) -> None:
+def stamp(value: object, *, historical: bool = False) -> None:
     row = _object(value, "event_id effective_at causal_parent_ids ordering_contract_id scenario_ordinal", "source_sequence")
     _text(row["event_id"])
     _fields(row, "effective_at scenario_ordinal", _integer)
     _optional(row, "source_sequence", _integer, nullable=True)
-    _enum(row["ordering_contract_id"], _ORDERING)
+    ordering = _ORDERING + (["HISTORICAL_ORDER_V1"] if historical else [])
+    _enum(row["ordering_contract_id"], ordering)
     parents = [_text(item) for item in _list(row["causal_parent_ids"])]
     _require(parents == sorted(set(parents)))
 
@@ -103,10 +104,10 @@ def rejection(value: object) -> None:
     _reason(row["reason"])
 
 
-def member(value: object, *, context: ConfigurationContext | None = None) -> None:
+def member(value: object, *, context: ConfigurationContext | None = None, historical: bool = False) -> None:
     context = _context(context)
     row = _object(value, "kind stamp payload")
-    stamp(row["stamp"])
+    stamp(row["stamp"], historical=historical)
     kind = _enum(row["kind"], ["CONTEXT_MARKS", "EXECUTION", "INTENT", "CANCEL_REQUEST", "CANCEL_EFFECT"])
     if kind == "CONTEXT_MARKS":
         payload = _object(row["payload"], "expected_before expected_after rows")
@@ -150,18 +151,19 @@ def member(value: object, *, context: ConfigurationContext | None = None) -> Non
         _require(len(targets) == len(set(targets)))
 
 
-def group(value: object, *, context: ConfigurationContext | None = None) -> None:
+def group(value: object, *, context: ConfigurationContext | None = None, historical: bool = False) -> None:
     context = _context(context)
     row = _object(value, "schema_version group_id account_key ordering_contract_id group_effective_at declared_member_count members")
     _enum(row["schema_version"], ["scenario_group_v1"])
     _text(row["group_id"])
     account(row["account_key"])
-    _enum(row["ordering_contract_id"], _ORDERING)
+    ordering = _ORDERING + (["HISTORICAL_ORDER_V1"] if historical else [])
+    _enum(row["ordering_contract_id"], ordering)
     _integer(row["group_effective_at"])
     members = _list(row["members"])
     _require(_integer(row["declared_member_count"]) == len(members))
     for item in members:
-        member(item, context=context)
+        member(item, context=context, historical=historical)
     events = [cast(dict[str, object], cast(dict[str, object], item)["stamp"])["event_id"] for item in members]
     _require(len(events) == len(set(events)))
 

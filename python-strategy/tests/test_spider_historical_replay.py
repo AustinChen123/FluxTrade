@@ -18,6 +18,7 @@ from src.core.backtest.spider_historical_replay import _ClosedMarketSnapshot
 from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_canonical, decode_jsonl
 from src.core.backtest.spider_run_envelope_schema import journal_record
 from src.core.backtest.spider_run_store import SpiderRunStore, SpiderRunStoreError
+from src.core.backtest.spider_run_evidence import build_endpoint_artifacts, build_reconciliation
 from src.core.backtest.synthetic_scenario_replay import ReplayPersistenceError, _ReplayComposition
 from test_spider_historical_input import (
     ANSWERS,
@@ -212,6 +213,101 @@ def _composition(run: HistoricalRunInput, evidence_callback=None) -> _ReplayComp
     composition = _ReplayComposition._from_historical_run(run)
     composition._evidence_callback = evidence_callback
     return composition
+
+
+def _historical_snapshot_requests(composition, cutoff, prefix):
+    return [dict(schema_version="snapshot_request_v1", account_key=composition._account,
+                 snapshot_id=f"{prefix}-{kind}", snapshot_kind=kind,
+                 capture_mode="OWNER_CURRENT", captured_at=cutoff)
+            for kind in ("TRADING", "POSITIONS", "OPEN_ORDERS")]
+
+
+def _capture_historical_owner(composition, cutoff, prefix):
+    return decode_canonical(canonical_bytes(composition.capture_owner_evidence(
+        cutoff, *_historical_snapshot_requests(composition, cutoff, prefix),
+    )))
+
+
+def _historical_endpoint_case(tmp_path, *, partial_fill):
+    run = _valid_run()
+    if partial_fill:
+        trade_rows = tuple(
+            replace(row, high=D("103"), low=D("98"), volume=D("0.1"))
+            if row.product_id == "A-USDT-SWAP" and row.bar_open_ms == run.range_start_ms else row
+            for row in run.trade_bars
+        )
+        run = _rehashed_run(run, trade_rows=trade_rows)
+    run = replace(run, run_id="p3-partial-endpoint" if partial_fill else "p3-no-fill-endpoint")
+    raw_input = encode_historical_run_input(run)
+    configuration = decode_p2_configuration(run.configuration_bytes, run.configuration_sha256, run.ordered_products)
+    config_context = dict(schema_version="spider_configuration_context_v1", config_id=configuration["config_id"],
+                          configuration_sha256=run.configuration_sha256, products=list(run.ordered_products))
+    history_context = historical_context_for_input(run)
+    attempt = historical_attempt()
+    attempt.update(run_id=run.run_id,
+                   account_key={"venue": "SPIDER_HISTORICAL_RESEARCH", "environment": "RESEARCH_ONLY",
+                                "account": run.account_key},
+                   scenario_plan_sha256=history_context["historical_input_sha256"],
+                   policy_source_sha256=run.policy_source_sha256,
+                   configuration_context=config_context, historical_context=history_context,
+                   planned_coverage=historical_planned_coverage(run))
+    for item, key in zip(attempt["input_contract_hashes"],
+                         ("scenario_plan_sha256", "program_sha256", "native_artifact_sha256", "policy_source_sha256"),
+                         strict=True):
+        item["sha256"] = attempt[key]
+    store = SpiderRunStore.create(str(tmp_path), run.run_id)
+    store.register(attempt, historical_input=raw_input)
+    composition = None
+    previous_owner = None
+
+    def persist(kind, key, payload):
+        nonlocal previous_owner
+        if kind == "DELIVERY_ATTEMPT":
+            return
+        ordinal = len(decode_jsonl((store._path / "journal.jsonl").read_bytes())) + 1
+        payload = decode_canonical(canonical_bytes(payload))
+        before_version = after_version = None
+        if kind == "SOURCE_GROUP_RESULT":
+            if previous_owner is None:
+                raise AssertionError("source group precedes initial owner evidence")
+            payload["owner_evidence_before"] = previous_owner
+            capture_at = payload["request"]["group_effective_at"]
+            after = _capture_historical_owner(composition, capture_at, f"GROUP-{ordinal}")["owner_evidence"]
+            payload["owner_evidence_after"] = after
+            before_version = payload["result"]["account_version_before"]
+            after_version = payload["result"]["account_version_after"]
+            previous_owner = after
+        elif kind == "HISTORICAL_MARKET_RESULT":
+            before_version = payload["owner_inspection_before"]["account_version"]
+            after_version = payload["owner_inspection_after"]["account_version"]
+            capture_at = payload["result"]["effective_at"]
+            previous_owner = _capture_historical_owner(composition, capture_at, f"MARKET-{ordinal}")["owner_evidence"]
+        if kind in ("SOURCE_GROUP_RESULT", "SNAPSHOT_FACT"):
+            effective = payload["request"].get("group_effective_at", payload["request"].get("captured_at"))
+        else:
+            effective = key["visible_at"]
+        row = dict(schema_version="spider_journal_record_v1", run_id=run.run_id, journal_seq=ordinal,
+                   barrier_id=key["stable_id"], record_kind=kind, scheduler_key=key, causal_parent_ids=[],
+                   effective_at=effective, visible_at=key["visible_at"], account_version_before=before_version,
+                   account_version_after=after_version, payload=payload,
+                   configuration_context=config_context, historical_context=history_context)
+        store.mark_processed(dict(ordinal=ordinal, journal_seq=ordinal, barrier_id=key["stable_id"]), record_kind=kind)
+        store.append_journal(row)
+
+    composition = _composition(run, persist)
+    composition._policy.rows[1]["active"] = "false"
+    start = run.range_start_ms
+    initial = _capture_historical_owner(composition, start * 16, "INITIAL")["owner_evidence"]
+    previous_owner = initial
+    cutoff = run.range_end_ms * 16 + 6
+    result = composition._dispatch_due(cutoff)
+    assert result["classification"] == "SUCCESS"
+    final_capture = _capture_historical_owner(composition, cutoff, "FINAL")
+    journal = decode_jsonl((store._path / "journal.jsonl").read_bytes())
+    status = store._status("RUNNING")
+    artifacts = build_endpoint_artifacts(run.run_id, attempt, status, journal, initial,
+                                         final_capture["owner_evidence"], final_capture["scheduler_observation"])
+    return run, attempt, status, journal, artifacts, composition
 
 
 def _extend_one_minute(run: HistoricalRunInput) -> HistoricalRunInput:
@@ -1312,6 +1408,221 @@ def test_historical_market_evidence_failure_stops_before_derived_events():
     assert steps == [initial]
     assert not any(record["item"]["kind"] == "DELIVERY"
                    for record in composition._records.values())
+
+
+@pytest.mark.parametrize("partial_fill", [False, True])
+def test_historical_endpoint_and_reconciliation_project_authoritative_market_evidence(tmp_path, partial_fill):
+    run, attempt, status, journal, artifacts, composition = _historical_endpoint_case(
+        tmp_path, partial_fill=partial_fill,
+    )
+    endpoint, report, reconciliation = artifacts["endpoint"], artifacts["report"], artifacts["reconciliation"]
+    assert endpoint["terminal_reason"] == "MTM_PRESERVE_OPEN_V1"
+    assert endpoint["cutoff"]["scheduler_time"] == endpoint["scheduler_observation"]["current_time"]
+    assert endpoint["remaining_planned_barriers"] == []
+    assert reconciliation["result"] == "OK", reconciliation
+    assert build_reconciliation(run.run_id, attempt, status, journal, endpoint, report) == reconciliation
+    market_rows = [row for row in journal if row["record_kind"] == "HISTORICAL_MARKET_RESULT"]
+    fills = [fill for row in market_rows for item in row["payload"]["result"]["products"] for fill in item["fills"]]
+    assert bool(fills) is partial_fill
+    if partial_fill:
+        fill = fills[0]
+        product_report = next(row for row in report if row["product_id"] == "A-USDT-SWAP")
+        assert f"SOURCE:{fill['source_event_id']}" in product_report["committed_execution_refs"]
+        assert any(ref.startswith("journal:") for ref in product_report["source_evidence_refs"])
+    assert all(row["historical_context"] == attempt["historical_context"] for row in report)
+
+
+def test_historical_endpoint_rejects_missing_duplicate_and_past_due_coverage(tmp_path):
+    run, attempt, status, journal, artifacts, _ = _historical_endpoint_case(tmp_path, partial_fill=False)
+    endpoint = artifacts["endpoint"]
+    for mutation in ("missing", "duplicate", "past_due", "unrecorded_future"):
+        observation = deepcopy(endpoint["scheduler_observation"])
+        planned = next(row for row in observation["records"] if row["kind"] == "HISTORICAL_MARKET_STEP")
+        if mutation == "missing":
+            observation["records"].remove(planned)
+        elif mutation == "duplicate":
+            observation["records"].append(deepcopy(planned))
+            observation["records"].sort(key=lambda row: (
+                ["SOURCE_GROUP", "SNAPSHOT_CAPTURE", "DELIVERY", "HISTORICAL_MARKET_STEP",
+                 "HISTORICAL_MARKET_CACHE", "HISTORICAL_TIMER"].index(row["kind"]), row["stable_id"],
+            ))
+        else:
+            cutoff = endpoint["cutoff"]["scheduler_time"]
+            visible_at = cutoff if mutation == "past_due" else cutoff + 1
+            test_key = dict(visible_at=visible_at, queue_class="DELIVERY", schedule_sequence=999_999,
+                            stable_id=f"{mutation}-test")
+            observation["pending_keys"].append(test_key)
+            observation["pending_keys"].sort(key=lambda key: (
+                key["visible_at"], ["SOURCE_GROUP", "SNAPSHOT_CAPTURE", "DELIVERY", "HISTORICAL_MARKET_STEP",
+                                    "HISTORICAL_MARKET_CACHE", "HISTORICAL_TIMER"].index(key["queue_class"]),
+                key["schedule_sequence"], key["stable_id"],
+            ))
+            if mutation == "past_due":
+                observation["records"].append(dict(key=test_key, kind="DELIVERY", stable_id="past-due-test",
+                                                   classification="PENDING"))
+                observation["records"].sort(key=lambda row: (
+                    ["SOURCE_GROUP", "SNAPSHOT_CAPTURE", "DELIVERY", "HISTORICAL_MARKET_STEP",
+                     "HISTORICAL_MARKET_CACHE", "HISTORICAL_TIMER"].index(row["kind"]), row["stable_id"],
+                ))
+        with pytest.raises(ValueError):
+            build_endpoint_artifacts(run.run_id, attempt, status, journal,
+                                     endpoint["initial_owner_evidence"], endpoint["final_owner_evidence"], observation)
+
+
+def test_historical_endpoint_binds_final_owner_and_snapshot_payload_digests(tmp_path):
+    run, attempt, status, journal, artifacts, _ = _historical_endpoint_case(tmp_path, partial_fill=False)
+    endpoint = artifacts["endpoint"]
+    for mutation in ("cash", "equity", "position", "open_order"):
+        final = deepcopy(endpoint["final_owner_evidence"])
+        if mutation == "cash":
+            final["inspection"]["cash"] = "999"
+        elif mutation == "equity":
+            final["trading_fact"]["immutable_payload"]["equity"] = "999"
+        elif mutation == "position":
+            final["positions_fact"]["immutable_payload"]["rows"].append(dict(
+                product_id="A-USDT-SWAP", margin_mode="cross", position_contracts="1",
+                last_price="100", notional_usd="100",
+            ))
+        else:
+            final["open_orders_fact"]["immutable_payload"]["rows"][0]["original_size_contracts"] = "0.097"
+        with pytest.raises(ValueError):
+            build_endpoint_artifacts(run.run_id, attempt, status, journal,
+                                     endpoint["initial_owner_evidence"], final,
+                                     endpoint["scheduler_observation"])
+        changed_endpoint = deepcopy(endpoint)
+        changed_endpoint["final_owner_evidence"] = final
+        result = build_reconciliation(run.run_id, attempt, status, journal, changed_endpoint, artifacts["report"])
+        assert result["result"] == "FAILED"
+        assert result["checks"][4 if mutation == "cash" else 5]["result"] == "FAILED"
+
+
+def test_historical_endpoint_rejects_native_cross_account_snapshot_transplant(tmp_path):
+    run, attempt, status, journal, artifacts, _ = _historical_endpoint_case(tmp_path, partial_fill=False)
+    foreign = replace(_valid_run(), account_key="another-account")
+    config = _p2_configuration()
+    config["cash"] = "2000"
+    foreign = _run_with_configuration(foreign, config)
+    foreign = replace(
+        foreign,
+        initial_account_state=_initial_account_state(cash="2000", orders=[], positions=[]),
+        initial_policy_cache=_policy_cache(capital={
+            "total": "2000", "usdt": "2000", "avail": "2000", "earn": "0", "position": "0",
+        }),
+    )
+    assert validate_historical_input(foreign)
+    foreign_composition = _composition(foreign)
+    foreign_composition._policy.rows[1]["active"] = "false"
+    cutoff = foreign.range_end_ms * 16 + 6
+    assert foreign_composition._dispatch_due(cutoff)["classification"] == "SUCCESS"
+    owner = _capture_historical_owner(foreign_composition, cutoff, "FINAL")["owner_evidence"]
+    original = artifacts["endpoint"]["final_owner_evidence"]["trading_fact"]
+    transplanted = owner["trading_fact"]
+    assert original["reference"] == transplanted["reference"]
+    assert original["captured_account_version"] == transplanted["captured_account_version"]
+    assert original["snapshot_as_of"] == transplanted["snapshot_as_of"]
+    assert original["request_digest"] != transplanted["request_digest"]
+    assert original["immutable_payload"]["equity"] != transplanted["immutable_payload"]["equity"]
+
+    final = deepcopy(artifacts["endpoint"]["final_owner_evidence"])
+    final["trading_fact"] = transplanted
+    with pytest.raises(ValueError):
+        build_endpoint_artifacts(run.run_id, attempt, status, journal,
+                                 artifacts["endpoint"]["initial_owner_evidence"], final,
+                                 artifacts["endpoint"]["scheduler_observation"])
+
+
+def test_historical_endpoint_rejects_pending_key_mismatch_and_incomplete_polls(tmp_path):
+    run, attempt, status, journal, artifacts, _ = _historical_endpoint_case(tmp_path, partial_fill=False)
+    endpoint = artifacts["endpoint"]
+    cutoff = endpoint["cutoff"]["scheduler_time"]
+    key = dict(visible_at=cutoff + 1, queue_class="DELIVERY", schedule_sequence=999_999,
+               stable_id="future-delivery-test")
+    for mutation in ("duplicate_identity", "visible_at_mismatch", "sequence_mismatch"):
+        observation = deepcopy(endpoint["scheduler_observation"])
+        observation["pending_keys"] = [key]
+        record_key = deepcopy(key)
+        if mutation == "duplicate_identity":
+            duplicate = deepcopy(key)
+            duplicate["schedule_sequence"] += 1
+            observation["pending_keys"].append(duplicate)
+        elif mutation == "visible_at_mismatch":
+            record_key["visible_at"] += 1
+        else:
+            record_key["schedule_sequence"] += 1
+        observation["records"].append(dict(key=record_key, kind="DELIVERY", stable_id=key["stable_id"],
+                                           classification="PENDING"))
+        observation["pending_keys"].sort(key=lambda row: (row["visible_at"], row["queue_class"],
+                                                           row["schedule_sequence"], row["stable_id"]))
+        class_order = {name: index for index, name in enumerate((
+            "SOURCE_GROUP", "SNAPSHOT_CAPTURE", "DELIVERY", "HISTORICAL_MARKET_STEP",
+            "HISTORICAL_MARKET_CACHE", "HISTORICAL_TIMER",
+        ))}
+        observation["records"].sort(key=lambda row: (class_order[row["kind"]], row["stable_id"]))
+        with pytest.raises(ValueError):
+            build_endpoint_artifacts(run.run_id, attempt, status, journal,
+                                     endpoint["initial_owner_evidence"], endpoint["final_owner_evidence"],
+                                     observation)
+        changed_endpoint = deepcopy(endpoint)
+        changed_endpoint["scheduler_observation"] = observation
+        result = build_reconciliation(run.run_id, attempt, status, journal, changed_endpoint, artifacts["report"])
+        assert result["checks"][6]["result"] == "FAILED"
+
+    for mutation in ("orphan_poll", "unrelated_work", "failed_poll"):
+        observation = deepcopy(endpoint["scheduler_observation"])
+        poll = dict(poll_id="poll-test", continuation_id="continuation-test",
+                    status="CALLBACK_FAILED" if mutation == "failed_poll" else "PAUSED",
+                    awaiting="LOCAL_ACTIONS")
+        observation["polls"] = [poll]
+        if mutation == "unrelated_work":
+            unrelated = dict(visible_at=cutoff + 1, queue_class="SNAPSHOT_CAPTURE",
+                             schedule_sequence=999_999, stable_id="unrelated-snapshot")
+            observation["pending_keys"] = [unrelated]
+            observation["records"].append(dict(key=unrelated, kind="SNAPSHOT_CAPTURE",
+                                               stable_id=unrelated["stable_id"], classification="PENDING"))
+            class_order = {name: index for index, name in enumerate((
+                "SOURCE_GROUP", "SNAPSHOT_CAPTURE", "DELIVERY", "HISTORICAL_MARKET_STEP",
+                "HISTORICAL_MARKET_CACHE", "HISTORICAL_TIMER",
+            ))}
+            observation["records"].sort(key=lambda row: (class_order[row["kind"]], row["stable_id"]))
+        with pytest.raises(ValueError):
+            build_endpoint_artifacts(run.run_id, attempt, status, journal,
+                                     endpoint["initial_owner_evidence"], endpoint["final_owner_evidence"],
+                                     observation)
+        changed_endpoint = deepcopy(endpoint)
+        changed_endpoint["scheduler_observation"] = observation
+        result = build_reconciliation(run.run_id, attempt, status, journal, changed_endpoint, artifacts["report"])
+        assert result["checks"][7]["result"] == "FAILED"
+
+
+def test_historical_reconciliation_rejects_missing_fill_chain_and_report_reference(tmp_path):
+    run, attempt, status, journal, artifacts, _ = _historical_endpoint_case(tmp_path, partial_fill=True)
+    endpoint, report = artifacts["endpoint"], artifacts["report"]
+    fill_row = next(row for row in journal if row["record_kind"] == "HISTORICAL_MARKET_RESULT"
+                    and any(product["fills"] for product in row["payload"]["result"]["products"]))
+    missing_fill = deepcopy(journal)
+    missing_fill.remove(fill_row)
+    for sequence, row in enumerate(missing_fill, 1):
+        row["journal_seq"] = sequence
+    frontier = dict(ordinal=len(missing_fill), journal_seq=len(missing_fill),
+                    barrier_id=missing_fill[-1]["barrier_id"])
+    changed_status = deepcopy(status)
+    changed_status.update(processed_boundary=frontier, persisted_boundary=frontier)
+    changed_endpoint = deepcopy(endpoint)
+    changed_endpoint["cutoff"]["persisted_boundary"] = frontier
+    missing_result = build_reconciliation(run.run_id, attempt, changed_status, missing_fill, changed_endpoint, report)
+    assert missing_result["checks"][4]["result"] == "FAILED"
+
+    changed_journal = deepcopy(journal)
+    changed_fill = next(row for row in changed_journal if row["barrier_id"] == fill_row["barrier_id"])
+    changed_fill["payload"]["owner_inspection_before"]["owner_state_digest"] = "0" * 64
+    chain_result = build_reconciliation(run.run_id, attempt, status, changed_journal, endpoint, report)
+    assert chain_result["checks"][4]["result"] == "FAILED"
+
+    changed_report = deepcopy(report)
+    product = next(row for row in changed_report if row["committed_execution_refs"])
+    product["committed_execution_refs"].pop()
+    report_result = build_reconciliation(run.run_id, attempt, status, journal, endpoint, changed_report)
+    assert report_result["checks"][10]["result"] == "FAILED"
 
 
 def test_historical_full_execution_notice_derives_native_cancel_and_replacements():

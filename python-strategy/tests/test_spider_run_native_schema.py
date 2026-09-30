@@ -546,3 +546,10 @@ def test_every_p1_profile_rejects_a_configured_validation_context(profile):
     n.inspection({**INSPECTION, "profile_id": profile})
     with pytest.raises(ValueError):
         n.inspection({**INSPECTION, "profile_id": profile}, context=context)
+
+
+def test_historical_ordering_contract_is_only_admitted_by_historical_group_validation():
+    historical = {**group(), "ordering_contract_id": "HISTORICAL_ORDER_V1"}
+    with pytest.raises(ValueError):
+        n.group(historical)
+    n.group(historical, historical=True)

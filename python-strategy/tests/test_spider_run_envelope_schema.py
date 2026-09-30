@@ -269,6 +269,21 @@ def test_all_scheduler_sort_and_duplicate_rules_use_exact_identity():
         e.scheduler_observation({**observation(), "records": [{**records[0], "stable_id": "different"}]})
 
 
+def test_historical_scheduler_classes_are_closed_and_contract_scoped():
+    classes = ["HISTORICAL_MARKET_STEP", "HISTORICAL_MARKET_CACHE", "HISTORICAL_TIMER"]
+    keys = [key(kind, kind, time=index + 1, sequence=index) for index, kind in enumerate(classes)]
+    records = [dict(key=item, kind=item["queue_class"], stable_id=item["stable_id"], classification="SUCCESS")
+               for item in keys]
+    value = {**observation(), "current_time": 3, "last_popped": keys[-1], "pending_keys": [], "records": records}
+    e.scheduler_observation(value, historical=True)
+    with pytest.raises(ValueError):
+        e.scheduler_observation(value)
+    unknown = deepcopy(value)
+    unknown["records"][0]["kind"] = "HISTORICAL_UNKNOWN"
+    with pytest.raises(ValueError):
+        e.scheduler_observation(unknown, historical=True)
+
+
 def test_callback_failure_and_action_branches_remain_diagnostic():
     for status, group_id, result, failure in product(["SUBMITTED", "UNSUBMITTED"], [None, "g"],
                                                     [None, RESULT], [None, {"reason": "CODE", "poisoned": True}]):

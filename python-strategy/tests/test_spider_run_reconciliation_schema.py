@@ -65,7 +65,15 @@ def test_reconciliation_accepts_paired_historical_context_and_binds_report_termi
     value = configured_fixture()
     context = historical_context()
     value["historical_context"] = context
+    coverage = dict(ordinal=1, barrier_id="market", record_kind="HISTORICAL_MARKET_STEP")
+    journal_barrier = dict(ordinal=1, barrier_id="market-result", record_kind="HISTORICAL_MARKET_RESULT")
     for side in ("expected", "observed"):
+        value["checks"][0][side] = [coverage]
+        value["checks"][1][side]["last_planned"] = coverage
+        value["checks"][2][side] = [dict(journal_barrier, journal_seq=1)]
+        value["checks"][6][side]["pending_keys"] = [dict(KEY, queue_class="HISTORICAL_MARKET_STEP", stable_id="market")]
+        value["checks"][6][side]["remaining_planned_barriers"] = [coverage]
+        value["checks"][9][side]["remaining_planned_barriers"] = [coverage]
         value["checks"][9][side].update(
             terminal_policy="MTM_PRESERVE_OPEN_V1", terminal_reason="MTM_PRESERVE_OPEN_V1"
         )

@@ -5,10 +5,12 @@ from typing import cast
 from src.core.backtest import spider_run_native_schema as native
 from src.core.backtest.spider_run_artifacts import (
     ConfigurationContext, _artifact_contexts, _boolean, _boundary, _decimal_text,
-    _enum, _historical_context, _integer, _list, _object, _require, _terminal_policy, _text,
+    _enum, _historical_context, _integer, _list, _object, _P3_COVERAGE_KINDS,
+    _require, _terminal_policy, _text,
 )
 
 _CLASSES = ["SOURCE_GROUP", "SNAPSHOT_CAPTURE", "DELIVERY"]
+_P3_CLASSES = ["HISTORICAL_MARKET_STEP", "HISTORICAL_MARKET_CACHE", "HISTORICAL_TIMER"]
 _KINDS = ["SOURCE_GROUP_RESULT", "SNAPSHOT_FACT", "DELIVERY_ATTEMPT", "CALLBACK_RESULT"]
 _P3_KIND = "HISTORICAL_MARKET_RESULT"
 
@@ -111,9 +113,11 @@ def owner_evidence(value: object, *, context: ConfigurationContext | None = None
         _require(request["snapshot_kind"] == fact["snapshot_kind"] == name.upper())
 
 
-def scheduler_key(value: object, *, historical_market_step: bool = False) -> tuple[int, int, int, str]:
+def scheduler_key(value: object, *, historical: bool = False,
+                  historical_market_step: bool = False) -> tuple[int, int, int, str]:
     row = _object(value, "visible_at queue_class schedule_sequence stable_id")
-    classes = [*_CLASSES, "HISTORICAL_MARKET_STEP"] if historical_market_step else _CLASSES
+    classes = ([*_CLASSES, *_P3_CLASSES] if historical else
+               [*_CLASSES, "HISTORICAL_MARKET_STEP"] if historical_market_step else _CLASSES)
     return (_integer(row["visible_at"]), classes.index(_enum(row["queue_class"], classes)),
             _integer(row["schedule_sequence"]), _text(row["stable_id"]))
 
@@ -177,7 +181,7 @@ def journal_record(value: object) -> None:
             _require(row[version_field] is None)
     if kind == "SOURCE_GROUP_RESULT":
         payload = _object(row["payload"], "request result owner_evidence_before owner_evidence_after")
-        native.group(payload["request"], context=context)
+        native.group(payload["request"], context=context, historical=historical is not None)
         native.group_result(payload["result"])
         owner_evidence(payload["owner_evidence_before"], context=context)
         owner_evidence(payload["owner_evidence_after"], context=context)
@@ -223,11 +227,11 @@ def journal(value: object) -> None:
     _require(len(barriers) == len(set(barriers)))
 
 
-def scheduler_terminal(value: object) -> None:
+def scheduler_terminal(value: object, *, historical: bool = False) -> None:
     if value is None:
         return
     row = _object(value, "kind stable_id classification reason")
-    kind = _enum(row["kind"], [*_CLASSES, "POLL", "DISPATCH", "QUEUE"])
+    kind = _enum(row["kind"], [*_CLASSES, *(_P3_CLASSES if historical else []), "POLL", "DISPATCH", "QUEUE"])
     if row["stable_id"] is not None or kind not in ("DISPATCH", "QUEUE"):
         _text(row["stable_id"])
     _enum(row["classification"], ["TERMINAL"])
@@ -242,19 +246,20 @@ def poll(value: object) -> tuple[str, str]:
     return _text(row["poll_id"]), _text(row["continuation_id"])
 
 
-def scheduler_observation(value: object) -> None:
+def scheduler_observation(value: object, *, historical: bool = False) -> None:
     row = _object(value, "current_time last_popped gate terminal pending_keys records polls callback_actions")
     _integer(row["current_time"])
     if row["last_popped"] is not None:
-        scheduler_key(row["last_popped"])
+        scheduler_key(row["last_popped"], historical=historical)
     _enum(row["gate"], ["RUNNING", "FAILED"])
-    scheduler_terminal(row["terminal"])
-    _ordered([scheduler_key(item) for item in _list(row["pending_keys"])])
+    scheduler_terminal(row["terminal"], historical=historical)
+    classes = [*_CLASSES, *(_P3_CLASSES if historical else [])]
+    _ordered([scheduler_key(item, historical=historical) for item in _list(row["pending_keys"])])
     records: list[tuple] = []
     for item in _list(row["records"]):
         record = _object(item, "key kind stable_id classification")
-        key = scheduler_key(record["key"])
-        identity = (_CLASSES.index(_enum(record["kind"], _CLASSES)), _text(record["stable_id"]))
+        key = scheduler_key(record["key"], historical=historical)
+        identity = (classes.index(_enum(record["kind"], classes)), _text(record["stable_id"]))
         _require(identity == (key[1], key[3]))
         _enum(record["classification"], ["PENDING", "SUCCESS", "TERMINAL"])
         records.append(identity)
@@ -276,12 +281,12 @@ def endpoint(value: object) -> None:
     _boundary(cutoff["persisted_boundary"])
     owner_evidence(row["initial_owner_evidence"], context=context)
     owner_evidence(row["final_owner_evidence"], context=context)
-    scheduler_observation(row["scheduler_observation"])
+    scheduler_observation(row["scheduler_observation"], historical=historical is not None)
     barriers: list[tuple] = []
     for item in _list(row["remaining_planned_barriers"]):
         barrier = _object(item, "ordinal barrier_id record_kind")
         _require(_integer(barrier["ordinal"]) > 0)
-        _enum(barrier["record_kind"], _KINDS)
+        _enum(barrier["record_kind"], _P3_COVERAGE_KINDS if historical is not None else _KINDS)
         barriers.append((barrier["ordinal"], _text(barrier["barrier_id"])))
     _ordered(barriers)
     _require(len({item[0] for item in barriers}) == len(barriers) == len({item[1] for item in barriers}))
