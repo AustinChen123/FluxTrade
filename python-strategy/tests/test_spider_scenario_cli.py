@@ -1,6 +1,7 @@
 """CLI transport and GT-06 evidence from real frozen runs, never profit fixtures."""
 
 from copy import deepcopy
+from dataclasses import replace
 from decimal import Decimal
 from hashlib import sha256
 import json
@@ -18,6 +19,8 @@ from src.core.backtest.spider_run_admission import admit_spider_run
 from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_jsonl
 from src.core.backtest.spider_scenario_plans import CLI_PLAN_IDS, PLAN_IDS
 from test_spider_run_admission import write_bundle
+from src.core.backtest.spider_historical_input import encode_historical_run_input
+from test_spider_historical_input import _rehashed_run, _valid_run
 
 ROOT = Path(__file__).parents[1]
 CLI = ROOT / "examples/run_spider_scenario_replay.py"
@@ -100,6 +103,49 @@ def test_subprocess_unsupported_selector_is_durable_rejected(tmp_path, selector)
 def test_actual_invalid_invocation_emits_no_json_or_artifacts(tmp_path):
     result = command(tmp_path, "../invalid")
     assert (result.returncode, result.stdout, result.stderr) == (2, "", "INVALID_INVOCATION\n")
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("partial_fill", [False, True])
+def test_actual_historical_cli_admits_native_input(tmp_path, partial_fill):
+    run_input = _valid_run()
+    if partial_fill:
+        trade_rows = tuple(
+            replace(row, high=Decimal("103"), low=Decimal("98"), volume=Decimal("0.1"))
+            if row.product_id == "A-USDT-SWAP" and row.bar_open_ms == run_input.range_start_ms else row
+            for row in run_input.trade_bars
+        )
+        run_input = _rehashed_run(run_input, trade_rows=trade_rows)
+    name = "cli-p3-fill" if partial_fill else "cli-p3-flat"
+    run_input = replace(run_input, run_id=name, policy_source_sha256=run._POLICY)
+    input_path = tmp_path / "historical-input.json"
+    input_path.write_bytes(encode_historical_run_input(run_input))
+    result = subprocess.run(
+        [sys.executable, str(CLI), "--output-root", str(tmp_path), "--run-id", name,
+         "--scenario-selector", "SPIDER_HISTORICAL_RESEARCH_RUN_V1",
+         "--historical-input", str(input_path)],
+        cwd=ROOT, env=dict(os.environ, PYTHONPATH=str(ROOT)), capture_output=True,
+        text=True, encoding="utf-8", timeout=30,
+    )
+    assert (result.returncode, result.stderr) == (0, "")
+    assert json.loads(result.stdout) == dict(run_id=name, outcome="ADMITTED", reason=None)
+    assert admit_spider_run(tmp_path / name)["decision"] == "ACCEPT"
+
+
+def test_historical_cli_missing_input_rejects_without_run_directory(tmp_path, capsys):
+    code = cli.main(args(tmp_path, selector="SPIDER_HISTORICAL_RESEARCH_RUN_V1"))
+    assert code == 2
+    assert json.loads(capsys.readouterr().out) == dict(
+        run_id="r1", outcome="REJECTED", reason="UNSUPPORTED_CONFIGURATION",
+    )
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_historical_cli_preserves_invalid_invocation_precedence(tmp_path, capsys):
+    code = cli.main(args(tmp_path, name="../invalid", selector="SPIDER_HISTORICAL_RESEARCH_RUN_V1")
+                    + ["--historical-input", str(tmp_path / "missing.json")])
+    captured = capsys.readouterr()
+    assert (code, captured.out, captured.err) == (2, "", "INVALID_INVOCATION\n")
     assert list(tmp_path.iterdir()) == []
 
 

@@ -2,6 +2,7 @@
 
 import ast
 from copy import deepcopy
+from dataclasses import replace
 from decimal import Decimal
 from hashlib import sha256
 from pathlib import Path
@@ -13,9 +14,11 @@ import pytest
 from src.core.backtest import spider_scenario_run as run, synthetic_scenario_codec as wire
 from src.core.backtest import spider_configured_scale_input as scale
 from src.core.backtest import spider_run_store as storage
-from src.core.backtest.spider_run_artifacts import decode_jsonl
+from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_jsonl
 from src.core.backtest.spider_run_admission import admit_spider_run
 from src.core.backtest.spider_scenario_plans import PLAN_IDS, plan_bundle
+from src.core.backtest.spider_historical_input import encode_historical_run_input
+from test_spider_historical_input import _rehashed_run, _valid_run
 
 CONFIGURED_GROUP_VERSIONS = (
     ("G-501", 1), ("G-502", 2), ("G-503", 3), ("G-504", 4),
@@ -32,6 +35,19 @@ def read(root, run_id, name):
 
 def invoke(root, index=0, name="r1"):
     return (run._run_o03 if index == 2 else run.run_spider_scenario)(str(root), name, PLAN_IDS[index])
+
+
+def historical_input(name="p3-run", *, partial_fill=False):
+    value = _valid_run()
+    if partial_fill:
+        trade_rows = tuple(
+            replace(row, high=Decimal("103"), low=Decimal("98"), volume=Decimal("0.1"))
+            if row.product_id == "A-USDT-SWAP" and row.bar_open_ms == value.range_start_ms else row
+            for row in value.trade_bars
+        )
+        value = _rehashed_run(value, trade_rows=trade_rows)
+    value = replace(value, run_id=name, policy_source_sha256=run._POLICY)
+    return value, encode_historical_run_input(value)
 
 
 @pytest.mark.parametrize("index", range(3))
@@ -72,6 +88,149 @@ def test_invalid_transport_never_creates(tmp_path, field, value):
     with pytest.raises(ValueError, match="^INVALID_INVOCATION$"):
         run.run_spider_scenario(*args)
     assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("partial_fill", [False, True])
+def test_public_historical_run_uses_existing_store_and_admission(tmp_path, partial_fill):
+    value, raw = historical_input("historical-fill" if partial_fill else "historical-flat",
+                                  partial_fill=partial_fill)
+    result = run.run_spider_scenario(str(tmp_path), value.run_id, run._P3_SELECTOR, raw)
+    assert result == dict(run_id=value.run_id, outcome="ADMITTED", reason=None)
+    admitted = admit_spider_run(tmp_path / value.run_id)
+    assert admitted["decision"] == "ACCEPT"
+    artifacts = admitted["artifacts"]
+    assert artifacts["historical_input.json"]["run_id"] == value.run_id
+    assert artifacts["attempt.json"]["run_contract_id"] == run._P3_RUN_CONTRACT
+    assert artifacts["completion.json"]["state"] == "COMPLETE"
+    market_rows = [row for row in artifacts["journal.jsonl"] if row["record_kind"] == "HISTORICAL_MARKET_RESULT"]
+    fills = [fill for row in market_rows for product in row["payload"]["result"]["products"]
+             for fill in product["fills"]]
+    assert bool(fills) is partial_fill
+    assert artifacts["report.jsonl"]
+    assert (tmp_path / value.run_id / "historical_input.json").read_bytes() == raw
+
+
+@pytest.mark.parametrize("case", ["missing", "noncanonical", "run_id", "selector", "policy_source", "p1_bytes"])
+def test_historical_input_rejections_precede_store_and_owner(tmp_path, monkeypatch, case):
+    value, raw = historical_input("historical-invalid")
+    selector, supplied = run._P3_SELECTOR, raw
+    if case == "missing":
+        supplied = None
+    elif case == "noncanonical":
+        supplied = raw + b"\n"
+    elif case == "run_id":
+        other, supplied = historical_input("other-run")
+        assert other.run_id != value.run_id
+    elif case == "selector":
+        selector = PLAN_IDS[0]
+    elif case == "policy_source":
+        mismatched = replace(_valid_run(), run_id=value.run_id)
+        supplied = encode_historical_run_input(mismatched)
+    else:
+        selector = PLAN_IDS[0]
+    store_calls = []
+    monkeypatch.setattr(run._Store, "create", lambda *args, **kwargs: store_calls.append(args))
+    monkeypatch.setattr(run, "_ReplayComposition", SimpleNamespace(
+        _from_historical_run=lambda *_: pytest.fail("historical owner constructed before admission"),
+    ))
+    result = run.run_spider_scenario(str(tmp_path), value.run_id, selector, supplied)
+    assert result == dict(run_id=value.run_id, outcome="REJECTED", reason="UNSUPPORTED_CONFIGURATION")
+    assert not store_calls and list(tmp_path.iterdir()) == []
+
+
+def test_historical_persistence_failure_is_terminal_and_unadmitted(tmp_path, monkeypatch):
+    value, raw = historical_input("historical-write-failure")
+    calls = []
+    def fail_append(self, row):
+        calls.append(row)
+        raise storage.SpiderRunStoreError(
+            "ARTIFACT_WRITE_FAILED", "PERSISTENCE_FAILED", dict(kind="PERSISTENCE", reason="ARTIFACT_WRITE_FAILED"),
+        )
+    monkeypatch.setattr(storage.SpiderRunStore, "append_journal", fail_append)
+    result = run.run_spider_scenario(str(tmp_path), value.run_id, run._P3_SELECTOR, raw)
+    assert result == dict(run_id=value.run_id, outcome="FAILED", reason="PERSISTENCE_FAILED")
+    assert len(calls) == 1
+    assert read(tmp_path, value.run_id, "status.json")[0]["failure_reason"] == "PERSISTENCE_FAILED"
+    assert not (tmp_path / value.run_id / "completion.json").exists()
+
+
+@pytest.mark.parametrize("capture_site", ["SOURCE_GROUP_RESULT", "HISTORICAL_MARKET_RESULT"])
+def test_historical_post_mutation_capture_failure_preserves_unpersisted_frontier(
+    tmp_path, monkeypatch, capture_site,
+):
+    value, raw = historical_input(f"capture-failure-{capture_site.lower()}",
+                                  partial_fill=capture_site == "HISTORICAL_MARKET_RESULT")
+    original_capture = run._ReplayComposition.capture_owner_evidence
+    original_group = wire.ScenarioCodec.apply_group
+    original_market = wire.ScenarioCodec.historical_market_step
+    mutation = []
+    fail_market_capture = [False]
+    failed_captures = []
+
+    def capture(owner, cutoff, *requests):
+        snapshot_id = requests[0]["snapshot_id"]
+        matches = (capture_site == "SOURCE_GROUP_RESULT" and snapshot_id.startswith("GROUP-")
+                   or capture_site == "HISTORICAL_MARKET_RESULT" and snapshot_id.startswith("MARKET-")
+                   and fail_market_capture[0])
+        if matches:
+            failed_captures.append(snapshot_id)
+            raise RuntimeError("injected post-mutation owner capture failure")
+        return original_capture(owner, cutoff, *requests)
+
+    def apply_group(codec, request):
+        before = codec.inspect_state()["account_version"]
+        result = original_group(codec, request)
+        if result["classification"] == "COMMITTED":
+            mutation.append(("SOURCE_GROUP_RESULT", before, result["account_version_after"]))
+        return result
+
+    def market_step(codec, node):
+        before = codec.inspect_state()["account_version"]
+        result = original_market(codec, node)
+        fills = sum(len(product["fills"]) for product in result["products"])
+        after = result["owner_evidence"]["account_version"]
+        if fills and after > before:
+            mutation.append(("HISTORICAL_MARKET_RESULT", before, after, fills))
+            fail_market_capture[0] = True
+        return result
+
+    monkeypatch.setattr(run._ReplayComposition, "capture_owner_evidence", capture)
+    monkeypatch.setattr(wire.ScenarioCodec, "apply_group", apply_group)
+    monkeypatch.setattr(wire.ScenarioCodec, "historical_market_step", market_step)
+    result = run.run_spider_scenario(str(tmp_path), value.run_id, run._P3_SELECTOR, raw)
+    assert result == dict(run_id=value.run_id, outcome="FAILED", reason="PERSISTENCE_FAILED")
+    changed = next(row for row in mutation if row[0] == capture_site)
+    assert changed[2] > changed[1]
+    if capture_site == "HISTORICAL_MARKET_RESULT":
+        assert changed[3] > 0
+    assert len(failed_captures) == 1
+
+    directory = tmp_path / value.run_id
+    status = read(tmp_path, value.run_id, "status.json")[0]
+    journal = read(tmp_path, value.run_id, "journal.jsonl")
+    processed, persisted = status["processed_boundary"], status["persisted_boundary"]
+    assert status["state"] == "FAILED" and status["failure_reason"] == "PERSISTENCE_FAILED"
+    assert processed is not None and processed["ordinal"] == len(journal) + 1
+    assert (persisted["ordinal"] if persisted is not None else 0) == len(journal)
+    assert not any(row["barrier_id"] == processed["barrier_id"] for row in journal)
+    if capture_site == "HISTORICAL_MARKET_RESULT":
+        assert processed["barrier_id"].startswith("P3_MARKET_")
+    assert not (directory / "completion.json").exists()
+    assert admit_spider_run(directory)["reason"] == "INCOMPLETE_PERSISTENCE"
+
+
+def test_historical_endpoint_mutation_is_rejected_by_existing_admission(tmp_path, monkeypatch):
+    value, raw = historical_input("historical-endpoint-mutation")
+    original = run._admit
+    def tamper(path):
+        endpoint_path = path / "endpoint.json"
+        endpoint = decode_jsonl(endpoint_path.read_bytes())[0]
+        endpoint["terminal_reason"] = "SCHEDULED_MTM"
+        endpoint_path.write_bytes(canonical_bytes(endpoint) + b"\n")
+        return original(path)
+    monkeypatch.setattr(run, "_admit", tamper)
+    result = run.run_spider_scenario(str(tmp_path), value.run_id, run._P3_SELECTOR, raw)
+    assert result == dict(run_id=value.run_id, outcome="FAILED", reason="ARTIFACT_MISMATCH")
 
 
 @pytest.mark.parametrize("selector", ["unknown", PLAN_IDS[2]])

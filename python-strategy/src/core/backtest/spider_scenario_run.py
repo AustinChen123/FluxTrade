@@ -12,6 +12,20 @@ from src.core.backtest.spider_run_evidence import ReconciliationProjectionError 
 from src.core.backtest.spider_run_admission import admit_spider_run as _admit
 from src.core.backtest.spider_run_store import SpiderRunStore as _Store, SpiderRunStoreError as _StoreError
 from src.core.backtest.synthetic_scenario_replay import _ReplayComposition, ReplayPersistenceError as _PersistenceError
+from src.core.backtest.spider_historical_input import (
+    SCHEMA_ID as _P3_SELECTOR,
+    HistoricalInputError as _HistoricalInputError,
+    HistoricalRunInput as _HistoricalRunInput,
+    decode_historical_run_input as _decode_historical_input,
+    decode_p2_configuration as _decode_p2_configuration,
+    historical_context_for_input as _historical_context_for_input,
+    historical_planned_coverage as _historical_planned_coverage,
+    validate_historical_input as _validate_historical_input,
+)
+from src.core.backtest.spider_run_artifacts import (
+    configuration_context as _configuration_context,
+    historical_context as _historical_context,
+)
 
 _ROOT = _Path(__file__).resolve().parents[4]
 _PROGRAM = tuple("python-strategy/src/core/backtest/" + name + ".py" for name in (
@@ -24,6 +38,9 @@ _P2_SELECTOR = "SPIDER_P2_CONFIGURED_SCALE_V1"
 _P2_PLAN_SHA256 = "8235c952a5d199825a2a77842b03f49e213ef707c0f30b24d8bf623fde53c2b3"
 _P2_CONFIG_SHA256 = "807054044bdd182274509535ecf8bbc4598f00b6a92b598c6228129a6ff11b70"
 _P2_RUN_CONTRACT = "SPIDER_SYNTHETIC_P2_CONFIGURED_RUN_V1"
+_P3_RUN_CONTRACT = "SPIDER_HISTORICAL_RESEARCH_RUN_V1"
+_P3_PROGRAM = (*_PROGRAM, "python-strategy/src/core/backtest/spider_historical_input.py",
+               "python-strategy/src/core/backtest/spider_historical_replay.py")
 
 
 def _normalized(value):
@@ -87,6 +104,45 @@ def _configuration(selector, run_id, select):
     return bundle, [bundle["plan_sha256"], program.hexdigest(), native, policy]
 
 
+def _historical_configuration(raw: bytes, run_id: str):
+    if type(raw) is not bytes:
+        raise _HistoricalInputError("historical input bytes are required")
+    run = _decode_historical_input(raw)
+    if run.run_id != run_id:
+        raise _HistoricalInputError("historical run id does not match invocation")
+    semantic_hash = _validate_historical_input(run)
+    policy = _sha256((_ROOT / "docs/internal/spider_source_replica_v1/source_manifest.json").read_bytes()).hexdigest()
+    if policy != _POLICY or policy != run.policy_source_sha256:
+        raise _HistoricalInputError("current policy source does not match historical input")
+    configuration = _decode_p2_configuration(
+        run.configuration_bytes, run.configuration_sha256, run.ordered_products,
+    )
+    context = _configuration_context(dict(
+        schema_version="spider_configuration_context_v1",
+        config_id=configuration["config_id"],
+        configuration_sha256=run.configuration_sha256,
+        products=list(run.ordered_products),
+    ))._asdict()
+    context["products"] = list(context["products"])
+    history = _historical_context(_historical_context_for_input(run))._asdict()
+    plan = dict(
+        schema_version="spider_historical_research_run_v1",
+        scenario_plan_id=_P3_SELECTOR,
+        native_profile="SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1",
+        account_key=dict(venue="SPIDER_HISTORICAL_RESEARCH", environment="RESEARCH_ONLY",
+                         account=run.account_key),
+        terminal_policy="MTM_PRESERVE_OPEN_V1",
+        planned_coverage=_historical_planned_coverage(run),
+    )
+    bundle = dict(plan=plan, configuration_context=context, historical_context=history)
+    program = _sha256()
+    for name in sorted(_P3_PROGRAM):
+        encoded = name.encode()
+        program.update(len(encoded).to_bytes(8, "big") + encoded + _sha256((_ROOT / name).read_bytes()).digest())
+    native = _sha256(_Path(_wire.loaded_native_artifact_path()).read_bytes()).hexdigest()
+    return run, bundle, [semantic_hash, program.hexdigest(), native, policy]
+
+
 def _attempt(run_id, selector, bundle=None, hashes=(), rejected_contract="SPIDER_SYNTHETIC_P1_RUN_V1"):
     row = dict(schema_version="spider_attempt_v1", run_id=run_id, run_contract_id=rejected_contract,
                registration_state="REJECTED", requested_scenario_selector=selector, registration_failure="UNSUPPORTED_CONFIGURATION",
@@ -94,15 +150,25 @@ def _attempt(run_id, selector, bundle=None, hashes=(), rejected_contract="SPIDER
     if bundle is not None:
         plan = bundle["plan"]
         configured = plan["schema_version"] == "spider_scenario_plan_v2"
+        historical = plan["schema_version"] == "spider_historical_research_run_v1"
         row.update(registration_state="VALIDATED", registration_failure=None, profile_id=plan["native_profile"], account_key=plan["account_key"],
-                   scenario_plan_id=selector, ordering_contract_id="S_order_v1", cost_contract_id="SPIDER_SYNTHETIC_COSTS_V1",
-                   funding_exclusion="SYNTHETIC_P2_NO_FUNDING_INPUT_OR_CLAIM" if configured else "SYNTHETIC_P1_NO_FUNDING_INPUT_OR_CLAIM", terminal_policy=plan["terminal_policy"],
+                   scenario_plan_id=selector,
+                   ordering_contract_id="HISTORICAL_ORDER_V1" if historical else "S_order_v1",
+                   cost_contract_id="SPIDER_HISTORICAL_RESEARCH_COSTS_V1" if historical else "SPIDER_SYNTHETIC_COSTS_V1",
+                   funding_exclusion=("HISTORICAL_FUNDING_DISABLED" if historical else
+                                      "SYNTHETIC_P2_NO_FUNDING_INPUT_OR_CLAIM" if configured else
+                                      "SYNTHETIC_P1_NO_FUNDING_INPUT_OR_CLAIM"),
+                   terminal_policy=plan["terminal_policy"],
                    planned_coverage=([dict(ordinal=item["ordinal"], barrier_id=item["barrier_id"], record_kind=item["record_kind"]) for item in plan["planned_barriers"]]
                                      if configured else plan["planned_coverage"]), artifact_encoding="artifact_encoding_v1",
                    **dict(zip(_HASHES, hashes, strict=True)))
         if configured:
             row["run_contract_id"] = _P2_RUN_CONTRACT
             row["configuration_context"] = bundle["configuration_context"]
+        elif historical:
+            row["run_contract_id"] = _P3_RUN_CONTRACT
+            row["configuration_context"] = bundle["configuration_context"]
+            row["historical_context"] = bundle["historical_context"]
         row["input_contract_hashes"] = [dict(name=name, sha256=value) for name, value in zip(_HASH_NAMES, hashes, strict=True)]
     _validate(row)
     return row
@@ -323,7 +389,90 @@ def _execute(store, bundle, attempt):
     return None if admitted["decision"] == "ACCEPT" else admitted["reason"]
 
 
-def _invoke(output_root, run_id, selector, select):
+def _execute_historical(store, attempt, run: _HistoricalRunInput):
+    journal = []
+    previous_owner = None
+    closed = False
+    composition = _ReplayComposition._from_historical_run(run)
+    configuration = attempt["configuration_context"]
+    historical = attempt["historical_context"]
+
+    def capture(cutoff, prefix):
+        return _normalized(composition.capture_owner_evidence(
+            cutoff, *_owner_requests(composition._account, cutoff, prefix),
+        ))
+
+    def persist(kind, key, observed):
+        nonlocal previous_owner, closed
+        if kind == "DELIVERY_ATTEMPT":
+            return
+        ordinal = len(journal) + 1
+        boundary = dict(ordinal=ordinal, journal_seq=ordinal, barrier_id=key["stable_id"])
+        store.mark_processed(boundary, record_kind=kind)
+        try:
+            payload = _normalized(observed)
+            before_version = after_version = None
+            if kind == "SOURCE_GROUP_RESULT":
+                if previous_owner is None:
+                    raise RuntimeError("MISSING_INITIAL_OWNER_EVIDENCE")
+                payload["owner_evidence_before"] = previous_owner
+                group_at = payload["request"]["group_effective_at"]
+                after = capture(group_at, f"GROUP-{ordinal}")["owner_evidence"]
+                payload["owner_evidence_after"] = after
+                before_version = payload["result"]["account_version_before"]
+                after_version = payload["result"]["account_version_after"]
+                previous_owner = after
+            elif kind == "HISTORICAL_MARKET_RESULT":
+                before_version = payload["owner_inspection_before"]["account_version"]
+                after_version = payload["owner_inspection_after"]["account_version"]
+                previous_owner = capture(payload["result"]["effective_at"], f"MARKET-{ordinal}")["owner_evidence"]
+            if kind in ("SOURCE_GROUP_RESULT", "SNAPSHOT_FACT"):
+                effective = payload["request"].get("group_effective_at", payload["request"].get("captured_at"))
+            else:
+                effective = key["visible_at"]
+            row = dict(
+                schema_version="spider_journal_record_v1", run_id=run.run_id,
+                journal_seq=ordinal, barrier_id=key["stable_id"], record_kind=kind,
+                scheduler_key=key, causal_parent_ids=[], effective_at=effective,
+                visible_at=key["visible_at"], account_version_before=before_version,
+                account_version_after=after_version, payload=payload,
+                configuration_context=configuration, historical_context=historical,
+            )
+            store.append_journal(row)
+        except Exception as error:
+            primary = (error.primary_failure if isinstance(error, _StoreError)
+                       else dict(kind="PERSISTENCE", reason="EVIDENCE_CAPTURE_FAILED"))
+            try:
+                store.publish_failure("PERSISTENCE_FAILED", primary)
+            finally:
+                closed = True
+            raise _PersistenceError() from error
+        journal.append(row)
+
+    composition._evidence_callback = persist
+    start = run.range_start_ms * 16
+    initial = capture(start, "INITIAL")["owner_evidence"]
+    previous_owner = initial
+    cutoff = run.range_end_ms * 16 + 6
+    result = composition._dispatch_due(cutoff)
+    if result["classification"] != "SUCCESS":
+        reason, primary = _terminal(result, closed)
+        if not closed:
+            store.publish_failure(reason, primary)
+        return reason
+    final_capture = capture(cutoff, "FINAL")
+    status = store._status("RUNNING")
+    artifacts = _build(
+        run.run_id, attempt, status, journal, initial, final_capture["owner_evidence"],
+        final_capture["scheduler_observation"],
+    )
+    if store.finalize(**artifacts) != "COMPLETE_PUBLISHED":
+        raise RuntimeError("INVALID_STORE_ACKNOWLEDGEMENT")
+    admitted = _admit(store._path)
+    return None if admitted["decision"] == "ACCEPT" else admitted["reason"]
+
+
+def _invoke(output_root, run_id, selector, select, historical_input: bytes | None = None):
     try:
         _text(output_root)
         _text(run_id, r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
@@ -340,8 +489,24 @@ def _invoke(output_root, run_id, selector, select):
             except _StoreError as newer:
                 error = newer
         return dict(run_id=run_id, outcome="DURABILITY_UNKNOWN" if error.reason == "PUBLICATION_DURABILITY_UNKNOWN" else "FAILED", reason=error.reason)
+    historical_run = None
+    historical_attempt = None
+    if selector == _P3_SELECTOR or historical_input is not None:
+        if selector != _P3_SELECTOR or type(historical_input) is not bytes:
+            return dict(run_id=run_id, outcome="REJECTED", reason="UNSUPPORTED_CONFIGURATION")
+        try:
+            historical_run, bundle, hashes = _historical_configuration(historical_input, run_id)
+            historical_attempt = _attempt(run_id, selector, bundle, hashes, _P3_RUN_CONTRACT)
+        except (OSError, ValueError, TypeError, KeyError):
+            return dict(run_id=run_id, outcome="REJECTED", reason="UNSUPPORTED_CONFIGURATION")
     try:
         store = _Store.create(output_root, run_id)
+        if historical_run is not None:
+            assert historical_attempt is not None
+            if store.register(historical_attempt, historical_input=historical_input) != "NATIVE_CONSTRUCTION_ALLOWED":
+                raise RuntimeError("INVALID_STORE_ACKNOWLEDGEMENT")
+            reason = _execute_historical(store, historical_attempt, historical_run)
+            return dict(run_id=run_id, outcome="ADMITTED" if reason is None else "FAILED", reason=reason)
         try:
             bundle, hashes = _configuration(selector, run_id, select)
             attempt = _attempt(run_id, selector, bundle, hashes)
@@ -369,9 +534,12 @@ def _invoke(output_root, run_id, selector, select):
         raise
 
 
-def run_spider_scenario(output_root: str, run_id: str, scenario_selector: str) -> dict[str, _Any]:
+def run_spider_scenario(
+    output_root: str, run_id: str, scenario_selector: str,
+    historical_input: bytes | None = None,
+) -> dict[str, _Any]:
     """Run only a CLI-approved fixed recipe and admit its exact persisted output."""
-    return _invoke(output_root, run_id, scenario_selector, _plans.cli_plan_bundle)
+    return _invoke(output_root, run_id, scenario_selector, _plans.cli_plan_bundle, historical_input)
 
 
 def _run_o03(output_root: str, run_id: str, scenario_selector: str) -> dict[str, _Any]:

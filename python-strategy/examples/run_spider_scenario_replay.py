@@ -13,11 +13,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--scenario-selector", required=True)
+    parser.add_argument("--historical-input")
     args = parser.parse_args(argv)
     try:
         from src.core.backtest.spider_scenario_run import run_spider_scenario
 
-        result = run_spider_scenario(args.output_root, args.run_id, args.scenario_selector)
+        historical_input = None
+        if args.historical_input is not None:
+            try:
+                historical_input = Path(args.historical_input).read_bytes()
+            except OSError:
+                result = run_spider_scenario(args.output_root, args.run_id, args.scenario_selector, b"")
+            else:
+                result = run_spider_scenario(args.output_root, args.run_id, args.scenario_selector, historical_input)
+        else:
+            result = run_spider_scenario(args.output_root, args.run_id, args.scenario_selector)
     except Exception as error:
         invalid = type(error) is ValueError and error.args == ("INVALID_INVOCATION",)
         sys.stderr.write("INVALID_INVOCATION\n" if invalid else "INTERNAL_FAILURE\n")
