@@ -1,6 +1,8 @@
 from copy import deepcopy
 from dataclasses import replace
 from decimal import Decimal as D
+from hashlib import sha256
+import re
 from typing import cast
 
 import pytest
@@ -10,12 +12,158 @@ from src.core.backtest.spider_historical_input import HistoricalInputError, Hist
 from src.core.backtest.spider_historical_replay import _ClosedMarketSnapshot
 from src.core.backtest.synthetic_scenario_replay import _ReplayComposition
 from test_spider_historical_input import (
+    ANSWERS,
+    ANSWERS_SHA256,
+    INPUTS,
+    INPUTS_SHA256,
+    _initial_account_state,
+    _manifest,
     _p2_configuration,
     _policy_cache,
     _rehashed_run,
     _run_with_configuration,
     _valid_run,
 )
+
+
+_P3_ORACLE_EPOCH_MS = 1_790_640_000_000
+
+
+def _frozen_h01_input() -> dict[str, str]:
+    raw = INPUTS.read_bytes()
+    assert sha256(raw).hexdigest() == INPUTS_SHA256
+    line = next(row for row in raw.decode("utf-8").splitlines() if row.startswith("H01|"))
+    fields: dict[str, str] = {}
+    for segment in line.split("|")[1:]:
+        key, separator, value = segment.partition("=")
+        if not separator:
+            match = re.fullmatch(r"([a-z_]+)([0-9]+)", segment)
+            assert match is not None
+            key, value = match.groups()
+        assert key not in fields
+        fields[key] = value
+    assert fields["case"] == "H01" and fields["base"] == "BASE_V1"
+    return fields
+
+
+def _h01_run(record: dict[str, str]) -> HistoricalRunInput:
+    """Materialize only the frozen H01 input over admitted historical DTOs."""
+    base = _valid_run()
+    start = _P3_ORACLE_EPOCH_MS
+    products = tuple(record["products"].split(","))
+    assert products == base.ordered_products
+    policy_identity, policy_hash = record["policy"].split(":sha256:")
+    policy_id, policy_version = policy_identity.split("@")
+    config_id = record["config"].split(":sha256:")[0]
+    delta = start - base.range_start_ms
+    shifted_trade = tuple(replace(row, bar_open_ms=row.bar_open_ms + delta) for row in base.trade_bars)
+    shifted_marks = tuple(replace(row, bar_open_ms=row.bar_open_ms + delta) for row in base.mark_bars)
+    trade_manifest = _manifest("P3_ORACLE_TRADE_V1", shifted_trade, trade=True)
+    mark_manifest = _manifest("P3_ORACLE_MARK_V1", shifted_marks, trade=False)
+    run = replace(
+        base,
+        run_id="h01-transport-only",
+        account_key=record["account"],
+        policy_id=policy_id,
+        policy_version=policy_version,
+        policy_source_sha256=policy_hash,
+        strategy_identity=policy_id,
+        range_start_ms=start,
+        range_end_ms=start + 60_000,
+        warmup_start_ms=start - 86_400_000,
+        first_timer_ms=start + 5_000,
+        trade_bars=shifted_trade,
+        mark_bars=shifted_marks,
+        trade_manifest=trade_manifest,
+        mark_manifest=mark_manifest,
+    )
+    run = _extend_one_minute(run)
+
+    # The input record is the only source of the changed market path.
+    bars: dict[tuple[str, int], tuple[D, D, D, D, D]] = {}
+    product = None
+    product_ids = dict(zip(("A", "B"), products, strict=True))
+    for segment in record["bars"].split(";"):
+        if ":" in segment:
+            label, segment = segment.split(":", 1)
+            product = product_ids[label]
+        assert product is not None
+        offset, values = segment.split("=", 1)
+        raw_open = start + (0 if offset == "E" else int(offset.removeprefix("E+")))
+        bars[(product, raw_open)] = tuple(D(value) for value in values.split("/"))  # type: ignore[assignment]
+
+    def apply_bars(rows, *, trade: bool):
+        updated = []
+        for row in rows:
+            values = bars.get((row.product_id, row.bar_open_ms))
+            if values is None:
+                updated.append(row)
+                continue
+            opening, high, low, close, volume = values
+            updated.append(replace(row, open=opening, high=high, low=low, close=close,
+                                  volume=volume if trade else None))
+        return tuple(updated)
+
+    trade_rows = apply_bars(run.trade_bars, trade=True)
+    mark_rows = apply_bars(run.mark_bars, trade=False)
+    run = _rehashed_run(run, trade_rows=trade_rows, mark_rows=mark_rows)
+
+    configuration = _p2_configuration()
+    configuration["config_id"] = config_id
+    configuration["cash"] = "1000"
+    for product in configuration["products"]:
+        product["taker_fee_rate"] = "0.001"
+        product["liquidation_fee_rate"] = "0.00602"
+        product["specs"][0].update(
+            contract_value="1", multiplier="1", price_tick="1",
+            quantity_step="1", minimum_quantity="1",
+        )
+        product["tiers"][0]["rows"][0].update(
+            maximum_contracts="1000", mmr="0.005", imr="0.1", max_leverage="10",
+        )
+        product["marks"][0].update(valid_to=start + 120_000, mark="100")
+    run = _run_with_configuration(run, configuration)
+    run = replace(
+        run,
+        range_end_ms=start + 120_000,
+        spec_before=tuple(replace(spec, effective_at_ms=start, price_tick=D("1"),
+                                  quantity_step=D("1"), minimum_quantity=D("1"))
+                          for spec in run.spec_before),
+        spec_after=tuple(replace(spec, effective_at_ms=start + 120_000, price_tick=D("1"),
+                                 quantity_step=D("1"), minimum_quantity=D("1"))
+                         for spec in run.spec_after),
+        initial_policy_cache=_policy_cache(
+            running=True, paused=False, online=True, ws_open=False, order_id=1,
+            capital={"total": "1000", "usdt": "1000", "avail": "1000", "earn": "0", "position": "0"},
+            rows=[
+                {"product_id": product, "name": product, "active": "true", "leverage": "1",
+                 "歩差": "1", "單數": "1", "hold上限": "0.8", "hold下限": "-0.8", "hold": "0"}
+                for product in run.ordered_products
+            ],
+            markets=[
+                {"product_id": product, "price": "100", "ctVal": "1", "lotSz": "1", "minSz": "1",
+                 "increment": "1", "ratioHL": "0", "state": "live", "instIdCode": code}
+                for product, code in zip(run.ordered_products, (1, 2), strict=True)
+            ],
+            replies={}, orders={}, positions={}, last_filled_price={},
+        ),
+        initial_account_state=_initial_account_state(cash="1000", orders=[], positions=[]),
+    )
+    assert validate_historical_input(run)
+    return run
+
+
+def _frozen_h01_answer() -> dict[str, str]:
+    raw = ANSWERS.read_bytes()
+    assert sha256(raw).hexdigest() == ANSWERS_SHA256
+    line = next(row for row in raw.decode("utf-8").splitlines() if row.startswith("H01|"))
+    fields: dict[str, str] = {}
+    for segment in line.split("|")[1:]:
+        key, separator, value = segment.partition("=")
+        assert separator and key not in fields
+        fields[key] = value
+    assert fields["endpoint"].startswith("E+60002")
+    return fields
 
 
 def _snapshot_event(composition: _ReplayComposition, index: int = 0) -> dict[str, object]:
@@ -463,6 +611,209 @@ def test_historical_poll_sends_become_native_groups_only_after_acceptance_tick()
     assert all(action["status"] == "SUBMITTED" for action in actions if action["group_id"] is not None)
     assert composition._codec.inspect_state()["orders_digest"] != orders_before_accept
     assert all(record["key"][3] in {action["group_id"] for action in actions} for record in groups)
+
+
+def test_frozen_h01_runs_policy_poll_native_fill_notice_and_endpoint_oracle():
+    source = _frozen_h01_input()
+    run = _h01_run(source)
+    composition = _composition(run)
+    start = run.range_start_ms
+    endpoint = start + 60_002
+
+    # The market opens at E before the first poll can create any owner orders.
+    first_open = next(record for record in composition._records.values()
+                      if record["item"]["kind"] == "HISTORICAL_MARKET_STEP"
+                      and record["item"]["node"]["bar_open_ms"] == start
+                      and record["item"]["node"]["step_index"] == 0)
+    assert composition._dispatch_due(start * 16 + 7)["classification"] == "SUCCESS"
+    first_result = first_open["result"]["historical_result"]
+    assert all(not product["fills"] for product in first_result["products"])
+    assert composition._codec.historical_working_orders() == []
+
+    # The frozen input's initial ordered poll is visible at E+5020.
+    poll_issue = start + 5_000
+    poll_visible = start + 5_020
+    assert composition._dispatch_due(poll_visible * 16 + 6)["classification"] == "SUCCESS"
+    sends = [event for event in composition._policy.events
+             if event["at_ms"] == poll_issue and event["kind"] == "send"]
+    actual_source_orders = [
+        (order["instId"], "LONG" if order["side"] == "buy" else "SHORT",
+         D(order["sz"]), D(order["px"]))
+        for event in sends for order in event["orders"]
+    ]
+    assert [event["orders"][0]["instId"] for event in sends] == list(run.ordered_products)
+
+    groups = [record for record in composition._records.values()
+              if record["item"]["kind"] == "SOURCE_GROUP"
+              and record["item"]["group"].get("ordering_contract_id") == "HISTORICAL_ORDER_V1"]
+    assert len(groups) == 4
+    accepted_at = (poll_visible + run.order_accept_delay_ms) * 16 + 3
+    assert {record["key"][0] for record in groups} == {accepted_at}
+    assert all(record["result"]["classification"] == "PENDING" for record in groups)
+    assert composition._codec.historical_working_orders() == []
+    assert composition._dispatch_due(accepted_at - 1)["classification"] == "SUCCESS"
+    assert composition._codec.historical_working_orders() == []
+    assert composition._dispatch_due(accepted_at)["classification"] == "SUCCESS"
+    assert all(record["result"]["group_result"]["classification"] == "COMMITTED" for record in groups)
+    accepted_orders = composition._codec.historical_working_orders()
+    assert [(order["product_id"], order["side"], order["limit_price"],
+             order["remaining_quantity_contracts"]) for order in accepted_orders] == [
+        ("A-USDT-SWAP", "LONG", D("50"), D("1")),
+        ("A-USDT-SWAP", "SHORT", D("200"), D("1")),
+        ("B-USDT-SWAP", "LONG", D("50"), D("1")),
+        ("B-USDT-SWAP", "SHORT", D("200"), D("1")),
+    ]
+    accept_snapshot = composition._codec.capture_snapshot(dict(
+        schema_version="snapshot_request_v1", account_key=composition._account,
+        snapshot_id="H01_ACCEPT_TRADING", snapshot_kind="TRADING",
+        capture_mode="OWNER_CURRENT", captured_at=accepted_at,
+    ))["immutable_payload"]
+
+    # Every intervening completed poll sees the same four native orders and emits no repair.
+    for offset in range(10_000, 60_000, 5_000):
+        visible = start + offset + 20
+        assert composition._dispatch_due(visible * 16 + 6)["classification"] == "SUCCESS"
+        if offset < 60_000:
+            assert composition._polls[f"P3_POLL_{start + offset}"].observation.status == "COMPLETED"
+            assert len(composition._codec.historical_working_orders()) == 4
+    assert len([record for record in composition._records.values()
+                if record["item"]["kind"] == "SOURCE_GROUP"
+                and record["item"]["group"].get("ordering_contract_id") == "HISTORICAL_ORDER_V1"]) == 4
+
+    # The next bar opens at 45. Only A LONG fills; execution notice is separate and delayed.
+    fill_time = start + 60_000
+    assert composition._dispatch_due(fill_time * 16 + 9)["classification"] == "SUCCESS"
+    market_steps = [record for record in composition._records.values()
+                    if record["item"]["kind"] == "HISTORICAL_MARKET_STEP"]
+    fill_result = next(record["result"]["historical_result"] for record in market_steps
+                       if record["item"]["node"]["bar_open_ms"] == fill_time
+                       and record["item"]["node"]["step_index"] == 0)
+    fills = [fill for product in fill_result["products"] for fill in product["fills"]]
+    assert len(fills) == 1
+    fill = fills[0]
+    selected = next(order for order in accepted_orders if order["order_id"] == fill["order_id"])
+    assert (selected["product_id"], selected["side"], selected["limit_price"],
+            fill["quantity_contracts"], fill["price"]) == (
+        "A-USDT-SWAP", "LONG", D("50"), D("1"), D("45"))
+    after_fill = composition._codec.inspect_state()
+    assert (after_fill["cash"], after_fill["gross_realized"], after_fill["total_fees"]) == (
+        D("999.955"), D("0"), D("0.045"))
+
+    notice_visible = (fill_time + run.order_notice_delay_ms) * 16 + 6
+    notice = next(record for record in composition._records.values()
+                  if record["item"]["kind"] == "DELIVERY"
+                  and record["item"]["delivery"]["payload_kind"] == "EXECUTION_FACT"
+                  and record["item"]["delivery"]["source_fact_id"] == fill["source_event_id"])
+    assert notice["key"][0] == notice_visible
+    assert notice["item"]["delivery"]["immutable_payload"]["limit_price"] == D("50")
+    assert notice["item"]["delivery"]["immutable_payload"]["fill_price"] == D("45")
+    assert composition._dispatch_due(notice_visible)["classification"] == "SUCCESS"
+    after_notice = composition._codec.inspect_state()
+    for field in ("account_version", "cash", "gross_realized", "total_fees",
+                  "positions_digest", "orders_digest"):
+        assert after_notice[field] == after_fill[field]
+    derived_actions = [action for events in composition._audit.values() for event in events
+                       for action in event.get("actions", [])
+                       if action.get("group_id") is not None
+                       and action["group_id"] not in {record["item"]["group"]["group_id"] for record in groups}]
+    assert len(derived_actions) == 3
+    assert all(action["status"] == "UNSUBMITTED" for action in derived_actions)
+    child_groups = [record for record in composition._records.values()
+                    if record["item"]["kind"] == "SOURCE_GROUP"
+                    and record["item"]["group"].get("ordering_contract_id") == "HISTORICAL_ORDER_V1"
+                    and record["item"]["group"]["members"][0]["stamp"]["source_sequence"] >= 4]
+    child_groups.sort(key=lambda record: record["item"]["group"]["members"][0]["stamp"]["source_sequence"])
+    assert len(child_groups) == 3
+    assert all(record["key"][0] == (endpoint + 1) * 16 + 3 for record in child_groups)
+    assert all(record["result"]["classification"] == "PENDING" for record in child_groups)
+    notice_audit = composition._audit[notice["item"]["delivery"]["delivery_id"]]
+    notice_actions = [entry["event"] for entry in notice_audit
+                      if entry["event"]["kind"] in ("cancel", "send")]
+    assert [entry["kind"] for entry in notice_actions] == ["cancel", "send"]
+    initial_a_short = next(order["order_id"] for order in accepted_orders
+                           if order["product_id"] == "A-USDT-SWAP" and order["side"] == "SHORT")
+    assert [row["ordId"] for row in notice_actions[0]["orders"]] == [initial_a_short]
+    assert [row["instId"] for row in notice_actions[0]["orders"]] == ["A-USDT-SWAP"]
+
+    # At the frozen H01 observation endpoint, only the original A-short and B grid remain.
+    assert composition._dispatch_due(endpoint * 16 + 6)["classification"] == "SUCCESS"
+    pending_poll = composition._polls[f"P3_POLL_{fill_time}"]
+    assert pending_poll.observation.status == "IN_PROGRESS"
+    endpoint_inspection = composition._codec.inspect_state()
+    assert (endpoint_inspection["cash"], endpoint_inspection["gross_realized"],
+            endpoint_inspection["total_fees"]) == (D("999.955"), D("0"), D("0.045"))
+    trading = composition._codec.capture_snapshot(dict(
+        schema_version="snapshot_request_v1", account_key=composition._account,
+        snapshot_id="H01_ENDPOINT_TRADING", snapshot_kind="TRADING",
+        capture_mode="OWNER_CURRENT", captured_at=endpoint * 16 + 6,
+    ))["immutable_payload"]
+    positions = composition._codec.capture_snapshot(dict(
+        schema_version="snapshot_request_v1", account_key=composition._account,
+        snapshot_id="H01_ENDPOINT_POSITIONS", snapshot_kind="POSITIONS",
+        capture_mode="OWNER_CURRENT", captured_at=endpoint * 16 + 6,
+    ))["immutable_payload"]["rows"]
+    open_orders = composition._codec.capture_snapshot(dict(
+        schema_version="snapshot_request_v1", account_key=composition._account,
+        snapshot_id="H01_ENDPOINT_ORDERS", snapshot_kind="OPEN_ORDERS",
+        capture_mode="OWNER_CURRENT", captured_at=endpoint * 16 + 6,
+    ))["immutable_payload"]["rows"]
+    assert trading["equity"] == D("999.955")
+    assert [(row["product_id"], row["position_contracts"], row["last_price"], row["notional_usd"])
+            for row in positions] == [("A-USDT-SWAP", D("1"), D("45"), D("45"))]
+    actual_open = [(row["product_id"], "LONG" if row["side"] == "buy" else "SHORT",
+                    row["original_size_contracts"], row["limit_price"])
+                   for row in open_orders]
+    assert set(actual_open) == {
+        ("A-USDT-SWAP", "SHORT", D("1"), D("200")),
+        ("B-USDT-SWAP", "LONG", D("1"), D("50")),
+        ("B-USDT-SWAP", "SHORT", D("1"), D("200")),
+    }
+
+    # Read the answer record only after runtime behavior is complete; it is never input to replay.
+    answer = _frozen_h01_answer()
+    expected_source = []
+    for product_row in answer["source_orders"].split(";"):
+        label, orders = product_row.split(":", 1)
+        product = dict(zip(("A", "B"), run.ordered_products, strict=True))[label]
+        for encoded in orders.split(","):
+            match = re.fullmatch(r"(LONG|SHORT)([0-9.]+)@([0-9.]+)", encoded)
+            assert match is not None
+            expected_source.append((product, match.group(1), D(match.group(2)), D(match.group(3))))
+    assert actual_source_orders == expected_source
+    open_match = re.fullmatch(
+        r"E\+\d+:(A_LONG)([0-9.]+)@([0-9.]+)_gaps_fills([0-9.]+)@([0-9.]+),"
+        r"fee([0-9.]+),cash/equity([0-9.]+)", answer["open"])
+    assert open_match is not None
+    assert (selected["side"], fill["quantity_contracts"], fill["price"]) == (
+        "LONG", D(open_match.group(4)), D(open_match.group(5)))
+    expected_accept = int(re.search(r"E\+(\d+)", answer["accepts"]).group(1))
+    assert accepted_at == (start + expected_accept) * 16 + 3
+    expected_equity = D(open_match.group(7))
+    expected_fee = D(open_match.group(6))
+    assert (after_fill["cash"], after_fill["total_fees"], trading["equity"]) == (
+        expected_equity, expected_fee, expected_equity)
+    notice_expected = answer["notice"].split(":", 1)[1].split(";")
+    assert notice_expected == ["cancel_A_SHORT", "LONG3@25", "SHORT2@100"]
+    replacement_orders = [order for event in notice_actions if event["kind"] == "send"
+                          for order in event["orders"]]
+    assert [("LONG" if order["side"] == "buy" else "SHORT", D(order["sz"]), D(order["px"]))
+            for order in replacement_orders] == [
+        ("LONG", D("3"), D("25")), ("SHORT", D("2"), D("100")),
+    ]
+    assert answer["endpoint"].startswith("E+60002,")
+    assert "children>=E+60003_UNSUBMITTED" in answer["endpoint"]
+    assert len(derived_actions) == len(notice_expected)
+    accepted_used = next(value for key, value in answer.items() if key.startswith("accepted_used"))
+    accepted_match = re.fullmatch(
+        r"exposure([0-9.]+)\+long_loss([0-9.]+)\+all_fee_holds([0-9.]+),available([0-9.]+)",
+        accepted_used,
+    )
+    assert accepted_match is not None
+    expected_available = D(accepted_match.group(4))
+    expected_used = sum((D(accepted_match.group(index)) for index in (1, 2, 3)), D(0))
+    assert expected_used == D("20.5")
+    assert accept_snapshot["equity"] - accept_snapshot["available_equity"] == expected_used
+    assert accept_snapshot["available_equity"] == expected_available
 
 
 def test_historical_chain_uses_frozen_owner_orders_and_commits_one_partial_fill():
