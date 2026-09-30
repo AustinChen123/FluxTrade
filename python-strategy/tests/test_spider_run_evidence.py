@@ -152,30 +152,40 @@ def test_h03_in_progress_poll_is_allowed_only_for_its_exact_future_continuation(
     next(record for record in due["records"] if record["stable_id"] == continuation["stable_id"])["key"]["visible_at"] = cutoff
     assert not evidence._historical_polls_endpoint_compatible(due, cutoff)
 
+    market_coverage, market_observation, market_cutoff = h03_endpoint_observation(100_000)
+    assert evidence._historical_coverage_records_compatible(
+        market_coverage, market_observation, market_cutoff,
+    )
     future_market = next(
-        record for record in observation["records"]
+        record for record in market_observation["records"]
         if record["kind"] == "HISTORICAL_MARKET_STEP" and record["classification"] == "PENDING"
     )
-    missing_market = deepcopy(observation)
+    missing_market = deepcopy(market_observation)
     missing_market["pending_keys"] = [key for key in missing_market["pending_keys"]
                                      if key != future_market["key"]]
     missing_market["records"] = [record for record in missing_market["records"]
                                  if record["key"] != future_market["key"]]
-    assert not evidence._historical_coverage_records_compatible(coverage, missing_market, cutoff)
+    assert not evidence._historical_coverage_records_compatible(
+        market_coverage, missing_market, market_cutoff,
+    )
 
-    mismatched_market = deepcopy(observation)
+    mismatched_market = deepcopy(market_observation)
     changed_key = next(key for key in mismatched_market["pending_keys"]
                        if key["stable_id"] == future_market["stable_id"])
     changed_key["schedule_sequence"] += 1
-    assert not evidence._historical_coverage_records_compatible(coverage, mismatched_market, cutoff)
+    assert not evidence._historical_coverage_records_compatible(
+        market_coverage, mismatched_market, market_cutoff,
+    )
 
-    due_market = deepcopy(observation)
+    due_market = deepcopy(market_observation)
     due_key = next(key for key in due_market["pending_keys"]
                    if key["stable_id"] == future_market["stable_id"])
-    due_key["visible_at"] = cutoff
+    due_key["visible_at"] = market_cutoff
     next(record for record in due_market["records"]
-         if record["stable_id"] == future_market["stable_id"])["key"]["visible_at"] = cutoff
-    assert not evidence._historical_coverage_records_compatible(coverage, due_market, cutoff)
+         if record["stable_id"] == future_market["stable_id"])["key"]["visible_at"] = market_cutoff
+    assert not evidence._historical_coverage_records_compatible(
+        market_coverage, due_market, market_cutoff,
+    )
 
 
 @pytest.mark.parametrize("offset", [100_001, 100_005, 100_006, 100_010, 100_011, 100_015])
