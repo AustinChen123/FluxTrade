@@ -16,11 +16,12 @@ import pytest
 
 from src.core.backtest import spider_scenario_run as run, synthetic_scenario_codec as wire
 from src.core.backtest import spider_configured_scale_input as scale
+from src.core.backtest import spider_policy as spider_policy
 from src.core.backtest import spider_run_store as storage
 from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_jsonl
 from src.core.backtest.spider_run_admission import admit_spider_run
 from src.core.backtest.spider_scenario_plans import PLAN_IDS, plan_bundle
-from src.core.backtest.spider_historical_input import encode_historical_run_input
+from src.core.backtest.spider_historical_input import encode_historical_run_input, historical_planned_coverage
 from test_spider_historical_input import _rehashed_run, _valid_run
 from test_spider_historical_oracle import _case_answer, _enqueue_policy_order, _oracle_run
 
@@ -179,6 +180,199 @@ def test_public_historical_run_uses_existing_store_and_admission(tmp_path, parti
     assert bool(fills) is partial_fill
     assert artifacts["report.jsonl"]
     assert (tmp_path / value.run_id / "historical_input.json").read_bytes() == raw
+
+
+@pytest.mark.parametrize("variant,expected_margin,expected_available,expected_actions", [
+    ("A", Decimal("1200"), Decimal("8800"), "global"),
+    ("B", Decimal("900"), Decimal("9100"), "individual"),
+    ("hold_boundary", Decimal("800"), Decimal("9200"), "none"),
+    ("elapsed_boundary", Decimal("900"), Decimal("9100"), "none"),
+])
+def test_h06_frozen_policy_limits_run_through_public_admission(
+    tmp_path, monkeypatch, variant, expected_margin, expected_available, expected_actions,
+):
+    source, value = _oracle_run("H06", h06_variant=variant)
+    answer = _case_answer("H06")
+    assert source["config"] == (
+        "P3_ORACLE_CONFIG_BASE_V1:sha256:"
+        "e4198c375c41c8c3e9b0a6d8aa7f836f4f5545e8f2b5abc712851c3b556009dd"
+    )
+    assert answer["check"] == "E+5020_after_failed_OPEN_ORDERS,cache_stale,owner_unchanged,childrenE+5021_UNSUBMITTED"
+    assert all(
+        tuple(str(getattr(spec, field)) for field in
+              ("contract_value", "multiplier", "price_tick", "quantity_step", "minimum_quantity"))
+        == ("1", "1", "1", "1", "1")
+        for spec in (*value.spec_before, *value.spec_after)
+    )
+    coverage = historical_planned_coverage(value)
+    assert [row["barrier_id"] for row in coverage if row["record_kind"] == "HISTORICAL_MARKET_STEP"] == [
+        f"P3_MARKET_{value.range_start_ms}_0",
+    ]
+    assert not any(row["barrier_id"] in {
+        f"P3_MARKET_{value.range_start_ms}_1",
+        f"P3_MARKET_{value.range_start_ms}_2",
+        f"P3_MARKET_{value.range_start_ms}_3",
+        f"MARKET_CLOSE_{value.range_start_ms + 60_000}",
+    } for row in coverage)
+
+    compare_calls = []
+    original_compare = spider_policy.Policy.compare_reply
+    monkeypatch.setattr(
+        spider_policy.Policy, "compare_reply",
+        lambda policy: (compare_calls.append(True), original_compare(policy))[1],
+    )
+    raw = encode_historical_run_input(replace(value, run_id=f"h06-{variant}"))
+    value = replace(value, run_id=f"h06-{variant}")
+    result = run.run_spider_scenario(str(tmp_path), value.run_id, run._P3_SELECTOR, raw)
+    assert result == dict(run_id=value.run_id, outcome="ADMITTED", reason=None)
+    admitted = admit_spider_run(tmp_path / value.run_id)
+    assert admitted["decision"] == "ACCEPT"
+    artifacts = admitted["artifacts"]
+    endpoint = artifacts["endpoint.json"]
+    report = artifacts["report.jsonl"]
+    journal = artifacts["journal.jsonl"]
+    assert artifacts["reconciliation.json"]["result"] == "OK"
+    assert not compare_calls
+    assert not [row for row in journal if row["record_kind"] == "SOURCE_GROUP_RESULT"]
+    assert not [row for row in journal if row["record_kind"] == "HISTORICAL_MARKET_RESULT"
+                and any(product["fills"] for product in row["payload"]["result"]["products"])]
+
+    initial = endpoint["initial_owner_evidence"]
+    final = endpoint["final_owner_evidence"]
+    observation_metadata = {"account_version", "owner_state_digest", "valuation_context_id"}
+    assert {key: value for key, value in initial["inspection"].items()
+            if key not in observation_metadata} == {
+                key: value for key, value in final["inspection"].items()
+                if key not in observation_metadata
+            }
+    assert initial["inspection"]["account_version"] == 0
+    assert final["inspection"]["account_version"] == 1
+    assert Decimal(final["inspection"]["cash"]) == Decimal("10000")
+    assert Decimal(final["inspection"]["total_fees"]) == Decimal("0")
+    assert Decimal(final["inspection"]["gross_realized"]) == Decimal("0")
+    trading = final["trading_fact"]["immutable_payload"]
+    assert Decimal(trading["equity"]) == Decimal("10000")
+    assert Decimal(trading["available_equity"]) == expected_available
+    assert Decimal("10000") - Decimal(trading["available_equity"]) == expected_margin
+    assert final["open_orders_fact"]["immutable_payload"]["rows"] == []
+    assert all(row["open_orders"] == [] for row in report)
+    assert all(Decimal(row["account_cash"]) == Decimal("10000")
+               and Decimal(row["account_equity"]) == Decimal("10000")
+               and Decimal(row["account_available_equity"]) == expected_available
+               and Decimal(row["account_total_fees"]) == Decimal("0")
+               and Decimal(row["account_gross_realized"]) == Decimal("0")
+               for row in report)
+    assert endpoint["scheduler_observation"]["polls"] == [dict(
+        poll_id=f"P3_POLL_{value.range_start_ms + 5_000}",
+        continuation_id=f"P3_CONT_{value.range_start_ms + 5_000}",
+        status="COMPLETED", awaiting=None,
+    )]
+    assert any(row["record_kind"] == "SNAPSHOT_FACT"
+               and row["payload"]["request"]["snapshot_kind"] == "OPEN_ORDERS"
+               and row["payload"]["fact"]["immutable_payload"] ==
+               dict(outcome="FAILURE", reason="SYNTHETIC_FAILURE") for row in journal)
+
+    callbacks = [row["payload"] for row in journal if row["record_kind"] == "CALLBACK_RESULT"]
+    callback = next(row for row in callbacks if row["policy_events"])
+    events = callback["policy_events"]
+    assert all(event["at_ms"] == value.range_start_ms + 5_020 for event in events)
+    summary = []
+    for event in events:
+        if event["kind"] in ("send", "cancel"):
+            summary.append((event["kind"], tuple(
+                (order.get("instId"), order.get("side"), order.get("ordType"),
+                 order.get("px"), order.get("sz"), order.get("ordId"))
+                for order in event["orders"]
+            )))
+        elif event["kind"] == "alert":
+            summary.append(("alert", event["reason"]))
+        else:
+            summary.append((event["kind"],))
+    if expected_actions == "global":
+        assert summary == [
+            ("check_websocket",), ("request_market",),
+            ("send", (("A-USDT-SWAP", "sell", "market", "", "55", None),
+                      ("B-USDT-SWAP", "sell", "market", "", "15", None))),
+            ("cancel", (("A-USDT-SWAP", None, None, None, None, "H06-GRID-A-1"),
+                        ("A-USDT-SWAP", None, None, None, None, "H06-GRID-A-2"))),
+            ("send", (("A-USDT-SWAP", "buy", "limit", "50", "46", None),
+                      ("A-USDT-SWAP", "sell", "limit", "200", "35", None))),
+            ("cancel", (("B-USDT-SWAP", None, None, None, None, "H06-GRID-B-1"),
+                        ("B-USDT-SWAP", None, None, None, None, "H06-GRID-B-2"))),
+            ("send", (("B-USDT-SWAP", "buy", "limit", "50", "46", None),
+                      ("B-USDT-SWAP", "sell", "limit", "200", "35", None))),
+            ("alert", "total_limit"),
+        ]
+    elif expected_actions == "individual":
+        assert summary == [
+            ("check_websocket",), ("request_market",),
+            ("send", (("A-USDT-SWAP", "buy", "market", "", "115", None),)),
+            ("cancel", (("A-USDT-SWAP", None, None, None, None, "H06-GRID-A-1"),
+                        ("A-USDT-SWAP", None, None, None, None, "H06-GRID-A-2"))),
+            ("send", (("A-USDT-SWAP", "buy", "limit", "50", "46", None),
+                      ("A-USDT-SWAP", "sell", "limit", "200", "35", None))),
+            ("alert", "individual_limit"),
+        ]
+    else:
+        assert summary == [("check_websocket",)]
+
+    deferred = endpoint["scheduler_observation"]["callback_actions"]
+    if expected_actions == "none":
+        assert deferred == []
+    else:
+        assert len(deferred) == (10 if expected_actions == "global" else 5)
+        assert all(action["status"] == "UNSUBMITTED" and action["group_id"] is None
+                   and action["effective_at"] == (value.range_start_ms + 5_021) * 16 + 3
+                   for action in deferred)
+        assert artifacts["reconciliation.json"]["checks"][8]["expected"] == [
+            {"delivery_id": deferred_action["delivery_id"], "event_index": deferred_action["event_index"],
+             "action_index": deferred_action["action_index"], "group_id": None, "status": "UNSUBMITTED",
+             "cancel_effect_ref": None, "group_result_ref": None,
+             "effective_at": (value.range_start_ms + 5_021) * 16 + 3}
+            for deferred_action in deferred
+        ]
+
+
+@pytest.mark.parametrize("mutation", [
+    "missing_effective_at", "wrong_effective_at", "due_effective_at", "parent_failed",
+    "delete_one_observation_action", "delete_all_observation_actions", "mark_deferred_submitted",
+])
+def test_h06_endpoint_reconciliation_rejects_invalid_deferred_action_evidence(tmp_path, mutation):
+    _, value = _oracle_run("H06", h06_variant="A")
+    value = replace(value, run_id="h06-deferred-mutation")
+    raw = encode_historical_run_input(value)
+    assert run.run_spider_scenario(str(tmp_path), value.run_id, run._P3_SELECTOR, raw) == dict(
+        run_id=value.run_id, outcome="ADMITTED", reason=None,
+    )
+    admitted = admit_spider_run(tmp_path / value.run_id)
+    artifacts = admitted["artifacts"]
+    endpoint = deepcopy(artifacts["endpoint.json"])
+    observation_actions = endpoint["scheduler_observation"]["callback_actions"]
+    action = observation_actions[0]
+    if mutation == "missing_effective_at":
+        del action["effective_at"]
+    elif mutation == "wrong_effective_at":
+        action["effective_at"] += 1
+    elif mutation == "due_effective_at":
+        action["effective_at"] = endpoint["cutoff"]["scheduler_time"]
+    elif mutation == "parent_failed":
+        parent = next(row for row in endpoint["scheduler_observation"]["records"]
+                      if row["kind"] == "DELIVERY" and row["stable_id"] == action["delivery_id"])
+        parent["classification"] = "TERMINAL"
+    elif mutation == "delete_one_observation_action":
+        del observation_actions[0]
+    elif mutation == "delete_all_observation_actions":
+        observation_actions.clear()
+    else:
+        action["status"] = "SUBMITTED"
+        action.pop("effective_at")
+    from src.core.backtest.spider_run_evidence import build_reconciliation
+    reconciliation = build_reconciliation(
+        value.run_id, artifacts["attempt.json"], artifacts["status.json"],
+        artifacts["journal.jsonl"], endpoint, artifacts["report.jsonl"],
+    )
+    assert reconciliation["result"] == "FAILED"
+    assert reconciliation["checks"][8]["result"] == "FAILED"
 
 
 @pytest.mark.parametrize("case", ["missing", "noncanonical", "run_id", "selector", "policy_source", "p1_bytes"])

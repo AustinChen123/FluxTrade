@@ -24,6 +24,8 @@ from src.core.backtest.spider_historical_input import (
     decode_p2_configuration,
     encode_historical_run_input,
     historical_context_for_input,
+    historical_market_step_clock,
+    historical_market_step_in_range,
     historical_planned_coverage,
     validate_historical_input,
 )
@@ -208,10 +210,34 @@ def test_valid_input_hash_is_deterministic_and_excludes_transport_run_id():
     assert all(validate_historical_input(change) != original for change in changes)
 
 
-def test_historical_planned_coverage_uses_closed_endpoint_and_timer_cadence():
+def test_optional_shared_elapsed_cache_state_is_hashed_and_defaults_without_byte_drift():
+    run = _valid_run()
+    baseline_state = decode_canonical(run.initial_policy_cache)
+    assert "shared_elapsed_ms" not in baseline_state
+    baseline_bytes = run.initial_policy_cache
+    baseline_hash = validate_historical_input(run)
+
+    explicit_state = dict(baseline_state, shared_elapsed_ms=0)
+    explicit = replace(run, initial_policy_cache=canonical_bytes(explicit_state))
+    assert validate_historical_input(explicit) != baseline_hash
+    assert decode_historical_run_input(encode_historical_run_input(explicit)).initial_policy_cache == explicit.initial_policy_cache
+    assert run.initial_policy_cache == baseline_bytes
+    assert decode_historical_run_input(encode_historical_run_input(run)).initial_policy_cache == baseline_bytes
+
+
+@pytest.mark.parametrize("elapsed", [-1, True, "12000"])
+def test_optional_shared_elapsed_cache_state_rejects_invalid_values(elapsed):
+    run = _valid_run()
+    state = decode_canonical(run.initial_policy_cache)
+    state["shared_elapsed_ms"] = elapsed
+    with pytest.raises(HistoricalInputError, match="shared cooldown"):
+        validate_historical_input(replace(run, initial_policy_cache=canonical_bytes(state)))
+
+
+def test_historical_planned_coverage_uses_half_open_steps_and_closed_endpoint_cache():
     run = _valid_run()
     coverage = historical_planned_coverage(run)
-    assert len(coverage) == 16  # four market steps, one close cache, eleven timers
+    assert len(coverage) == 16  # four steps including final-bar close, endpoint cache, eleven timers
     assert [row["record_kind"] for row in coverage] == [
         "HISTORICAL_MARKET_STEP", "HISTORICAL_TIMER", "HISTORICAL_TIMER", "HISTORICAL_TIMER",
         "HISTORICAL_MARKET_STEP", "HISTORICAL_TIMER", "HISTORICAL_TIMER", "HISTORICAL_TIMER",
@@ -226,6 +252,22 @@ def test_historical_planned_coverage_uses_closed_endpoint_and_timer_cadence():
         dict(ordinal=16, barrier_id=f"MARKET_CLOSE_{run.range_end_ms}",
              record_kind="HISTORICAL_MARKET_CACHE"),
     ]
+    assert coverage[-3] == dict(
+        ordinal=14, barrier_id=f"P3_TIMER_{run.range_end_ms - 5_000}",
+        record_kind="HISTORICAL_TIMER",
+    )
+
+
+@pytest.mark.parametrize("step", range(4))
+def test_historical_final_bar_close_step_classifier(step):
+    run = _valid_run()
+    step_raw, _ = historical_market_step_clock(run.range_start_ms, step)
+    assert historical_market_step_in_range(
+        run.range_start_ms, step, step_raw
+    ) is (step == 3)
+    assert historical_market_step_in_range(
+        run.range_start_ms + run.bar_duration_ms, step, run.range_end_ms
+    ) is False
 
 
 def test_parameter_type_is_part_of_semantic_hash_and_survives_codec_roundtrip():

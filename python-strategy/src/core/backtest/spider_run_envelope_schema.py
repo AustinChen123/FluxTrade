@@ -122,12 +122,19 @@ def scheduler_key(value: object, *, historical: bool = False,
             _integer(row["schedule_sequence"]), _text(row["stable_id"]))
 
 
-def callback_action(value: object, *, observed: bool = False) -> tuple:
-    row = _object(value, "event_index action_index group_id status group_result native_failure" + (" delivery_id" if observed else ""))
+def callback_action(value: object, *, observed: bool = False, historical: bool = False) -> tuple:
+    row = _object(
+        value,
+        "event_index action_index group_id status group_result native_failure" + (" delivery_id" if observed else ""),
+        "effective_at" if observed and historical else "",
+    )
     pair = (_integer(row["event_index"]), _integer(row["action_index"]))
-    _enum(row["status"], ["UNSUBMITTED", "SUBMITTED"])
+    status = _enum(row["status"], ["UNSUBMITTED", "SUBMITTED"])
     if row["group_id"] is not None:
         _text(row["group_id"])
+    if "effective_at" in row:
+        _require(historical and observed and status == "UNSUBMITTED" and row["group_id"] is None)
+        _integer(row["effective_at"])
     if row["group_result"] is not None:
         native.group_result(row["group_result"])
     if row["native_failure"] is not None:
@@ -267,7 +274,8 @@ def scheduler_observation(value: object, *, historical: bool = False) -> None:
     polls = [poll(item) for item in _list(row["polls"])]
     _ordered(polls)
     _require(len({item[0] for item in polls}) == len(polls) == len({item[1] for item in polls}))
-    _ordered([callback_action(item, observed=True) for item in _list(row["callback_actions"])])
+    _ordered([callback_action(item, observed=True, historical=historical)
+              for item in _list(row["callback_actions"])])
 
 
 def endpoint(value: object) -> None:

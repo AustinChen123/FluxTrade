@@ -70,13 +70,14 @@ def _record(path, digest, case):
     return fields
 
 
-def _oracle_run(case, *, model_id=None):
+def _oracle_run(case, *, model_id=None, h06_variant="A"):
     source = _record(INPUTS, INPUTS_SHA256, case)
     base = _valid_run()
     start = EPOCH
     end_offset = {
         "H02": 20_002, "H03": 100_001, "H04": 100_001,
         "H05": 20_004, "H09": 60_000, "H10": 1,
+        "H06": 5_020,
     }[case]
     end = start + end_offset
     delta = start - base.range_start_ms
@@ -122,15 +123,16 @@ def _oracle_run(case, *, model_id=None):
             )
 
     bars = {}
-    product = None
+    products = []
     ids = {"A": "A-USDT-SWAP", "B": "B-USDT-SWAP"}
     for entry in source["bars"].split(";"):
         if ":" in entry:
             label, entry = entry.split(":", 1)
-            product = ids[label]
+            products = [ids[item] for item in label.split("/")]
         offset, raw_values = entry.split("=", 1)
         timestamp = start + (0 if offset == "E" else int(offset.removeprefix("E+")))
-        bars[(product, timestamp)] = tuple(D(value) for value in raw_values.split("/"))
+        for product in products:
+            bars[(product, timestamp)] = tuple(D(value) for value in raw_values.split("/"))
 
     def apply(rows, trade):
         output = []
@@ -157,7 +159,7 @@ def _oracle_run(case, *, model_id=None):
     config = _p2_configuration()
     config["config_id"] = config_id
     config["seed_effective_at"] = start - 1
-    cash = {"H02": "1000", "H03": "1000", "H04": "1000", "H05": "20.15", "H09": "1000", "H10": "2001"}[case]
+    cash = {"H02": "1000", "H03": "1000", "H04": "1000", "H05": "20.15", "H06": "10000", "H09": "1000", "H10": "2001"}[case]
     config["cash"] = cash
     config["leverage"] = "1000" if case == "H10" else "10"
     seed_orders = []
@@ -213,6 +215,7 @@ def _oracle_run(case, *, model_id=None):
         "H03": {"A-USDT-SWAP": ("1", "1", "1", "1", "1"), "B-USDT-SWAP": ("1", "1", "1", "1", "1")},
         "H04": {"A-USDT-SWAP": ("1", "1", "0.5", "0.5", "0.5"), "B-USDT-SWAP": ("1", "1", "1", "1", "1")},
         "H05": {"A-USDT-SWAP": ("2", "1", "1", "1", "1"), "B-USDT-SWAP": ("0.5", "1", "1", "1", "1")},
+        "H06": {"A-USDT-SWAP": ("1", "1", "1", "1", "1"), "B-USDT-SWAP": ("1", "1", "1", "1", "1")},
         "H09": {"A-USDT-SWAP": ("1", "1", "1", "1", "1"), "B-USDT-SWAP": ("1", "1", "1", "1", "1")},
         "H10": {"A-USDT-SWAP": ("0.01", "1", "1", "1", "1"), "B-USDT-SWAP": ("1", "1", "1", "1", "1")},
     }
@@ -278,6 +281,39 @@ def _oracle_run(case, *, model_id=None):
         policy_state["capital"].update(total=cash, usdt=cash, avail=cash)
         policy_state["markets"][0]["price"] = "50" if case == "H05" else "49900"
         policy_state["markets"][1]["price"] = "200"
+    elif case == "H06":
+        variants = {
+            "A": {"A": ("LONG", "80"), "B": ("LONG", "40"), "shared_elapsed_ms": 6_980},
+            "B": {"A": ("SHORT", "90"), "B": None, "shared_elapsed_ms": 5_981},
+            "hold_boundary": {"A": ("SHORT", "80"), "B": None, "shared_elapsed_ms": 6_980},
+            "elapsed_boundary": {"A": ("SHORT", "90"), "B": None, "shared_elapsed_ms": 5_980},
+        }
+        if h06_variant not in variants:
+            raise AssertionError(f"unknown H06 variant: {h06_variant}")
+        overlay = variants[h06_variant]
+        policy_state["capital"].update(total=cash, usdt=cash, avail=cash, position="0")
+        policy_state["replies"] = {}
+        for product_ordinal, (product_label, product_id) in enumerate(ids.items(), start=1):
+            spec = overlay[product_label]
+            notional = "0" if spec is None else (spec[1] if spec[0] == "LONG" else f"-{spec[1]}")
+            next(row for row in policy_state["rows"] if row["product_id"] == product_id).update(
+                leverage="4", 歩差="1", 單數="1", hold=notional,
+            )
+            next(row for row in policy_state["markets"] if row["product_id"] == product_id).update(
+                price="100", instIdCode=product_ordinal,
+            )
+            if spec is not None:
+                policy_state["capital"]["position"] = str(
+                    D(policy_state["capital"]["position"]) + D(notional)
+                )
+            for number, side in enumerate(("buy", "sell"), start=1):
+                order_id = f"H06-GRID-{product_label}-{number}"
+                policy_state["replies"][order_id] = dict(
+                    clOrdId=f"H06-GRID-CLIENT-{product_label}-{number}",
+                    instId=product_id, state="live", side=side, px="50" if side == "buy" else "200",
+                    sz="1", accFillSz="0",
+                )
+        policy_state["shared_elapsed_ms"] = overlay["shared_elapsed_ms"]
     if case == "H02":
         for seed, row in zip(seed_orders, ORDERS[case], strict=True):
             owner_id, product_id, side, price, quantity, client_id = row
@@ -298,11 +334,29 @@ def _oracle_run(case, *, model_id=None):
                           lots=[dict(seed_execution_id=f"{case}-SEED-EXECUTION", seed_sequence=0,
                                      strategy_id="SPIDER_GRID_ORIGINAL_V1", quantity_contracts=quantity,
                                      entry_price=entry)])]
+    if case == "H06":
+        variants = {
+            "A": {"A": ("LONG", "80"), "B": ("LONG", "40")},
+            "B": {"A": ("SHORT", "90"), "B": None},
+            "hold_boundary": {"A": ("SHORT", "80"), "B": None},
+            "elapsed_boundary": {"A": ("SHORT", "90"), "B": None},
+        }
+        for sequence, (label, value) in enumerate(variants[h06_variant].items()):
+            if value is None:
+                continue
+            side, quantity = value
+            product_id = ids[label]
+            positions.append(dict(
+                product_id=product_id, side=side, quantity_contracts=quantity,
+                lots=[dict(seed_execution_id=f"H06-{h06_variant}-{label}-SEED", seed_sequence=sequence,
+                           strategy_id="SPIDER_GRID_ORIGINAL_V1", quantity_contracts=quantity,
+                           entry_price="100")],
+            ))
     config["positions"] = positions
     config_bytes_run = _run_with_configuration(base, config)
     run = replace(
         config_bytes_run,
-        run_id=f"oracle-{case.lower()}",
+        run_id=f"oracle-{case.lower()}" + (f"-{h06_variant.lower()}" if case == "H06" else ""),
         account_key=source["account"],
         model_id=model_id or source.get("model", "OHLC4_OPEN_HIGH_LOW_CLOSE_V1"),
         policy_id="SPIDER_GRID_ORIGINAL_V1",
@@ -344,6 +398,13 @@ def _oracle_run(case, *, model_id=None):
         initial_policy_cache=canonical_bytes(policy_state),
         initial_account_state=_initial_account_state(cash=cash, orders=seed_orders, positions=positions),
     )
+    if case == "H06":
+        run = replace(
+            run,
+            parameters=(("Clear", D("1")), ("TotalLimit", D("1")),
+                        ("TotalLong", D("0.5")), ("defaultN", D("1"))),
+            poll_profile="POLL_OPEN_ORDERS_FAILURE_V1",
+        )
     run = _rehashed_run(run, trade_rows=trade_rows, mark_rows=mark_rows)
     assert {
         spec.product_id: (

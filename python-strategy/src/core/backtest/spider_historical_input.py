@@ -31,7 +31,10 @@ MATCHING_MODEL_IDS = frozenset(
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
 _UTC = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\Z")
 _FEE_PROVENANCE = re.compile(r"[A-Z][A-Z0-9_]*@v[1-9][0-9]*:sha256:[0-9a-f]{64}\Z")
-_POLL_PROFILES = frozenset({"POLL_ORDERED_V1", "POLL_REVERSED_VISIBILITY_V1"})
+POLL_OPEN_ORDERS_FAILURE_PROFILE = "POLL_OPEN_ORDERS_FAILURE_V1"
+_POLL_PROFILES = frozenset({
+    "POLL_ORDERED_V1", "POLL_REVERSED_VISIBILITY_V1", POLL_OPEN_ORDERS_FAILURE_PROFILE,
+})
 
 
 class HistoricalInputError(ValueError):
@@ -48,6 +51,16 @@ def historical_market_step_clock(bar_open_ms: int, step_index: int) -> tuple[int
     return raw_time, raw_time * 16 + _HISTORICAL_STEP_PHASES[step_index]
 
 
+def historical_market_step_in_range(bar_open_ms: int, step_index: int, range_end_ms: int) -> bool:
+    """Include ordinary in-range steps and the preceding bar's final close step."""
+    raw_time, _ = historical_market_step_clock(bar_open_ms, step_index)
+    if type(range_end_ms) is not int or not 0 <= range_end_ms < 2**59:
+        raise HistoricalInputError("invalid historical market range end")
+    return raw_time < range_end_ms or (
+        step_index == 3 and raw_time == range_end_ms and bar_open_ms < range_end_ms
+    )
+
+
 def historical_planned_coverage(run: HistoricalRunInput) -> list[dict[str, object]]:
     """Return input-only P3 market/cache/timer coverage in scheduler-key order."""
     validate_historical_input(run)
@@ -57,13 +70,16 @@ def historical_planned_coverage(run: HistoricalRunInput) -> list[dict[str, objec
     for bar_open in range(run.range_start_ms, run.range_end_ms, run.bar_duration_ms):
         for step in range(4):
             _, effective_at = historical_market_step_clock(bar_open, step)
+            if not historical_market_step_in_range(bar_open, step, run.range_end_ms):
+                continue
             stable_id = f"P3_MARKET_{bar_open}_{step}"
             scheduled.append((effective_at, 3, step_sequence, stable_id, "HISTORICAL_MARKET_STEP"))
             step_sequence += 1
         close_ms = bar_open + run.bar_duration_ms
-        scheduled.append((close_ms * 16 + 6, 4, cache_sequence,
-                          f"MARKET_CLOSE_{close_ms}", "HISTORICAL_MARKET_CACHE"))
-        cache_sequence += 1
+        if close_ms <= run.range_end_ms:
+            scheduled.append((close_ms * 16 + 6, 4, cache_sequence,
+                              f"MARKET_CLOSE_{close_ms}", "HISTORICAL_MARKET_CACHE"))
+            cache_sequence += 1
     for sequence, raw_at in enumerate(range(run.first_timer_ms, run.range_end_ms, run.timer_period_ms)):
         scheduled.append((raw_at * 16 + 9, 5, sequence,
                           f"P3_TIMER_{raw_at}", "HISTORICAL_TIMER"))
@@ -378,11 +394,14 @@ def _validate_initial_policy_cache(raw: bytes, ordered_products: tuple[str, ...]
     value = _decode_canonical(raw)
     required = {"schema_version", "running", "paused", "online", "ws_open", "order_id",
                 "capital", "rows", "markets", "replies", "orders", "positions", "last_filled_price"}
-    if type(value) is not dict or set(value) != required:
+    if type(value) is not dict or set(value) not in (required, required | {"shared_elapsed_ms"}):
         raise HistoricalInputError("invalid initial policy-cache shape")
     state = cast(dict[str, object], value)
     if state["schema_version"] != "SPIDER_POLICY_CACHE_V1":
         raise HistoricalInputError("unsupported policy-cache version")
+    shared_elapsed = state.get("shared_elapsed_ms", 12_000)
+    if type(shared_elapsed) is not int or shared_elapsed < 0:
+        raise HistoricalInputError("invalid policy shared cooldown elapsed time")
     if any(type(state[key]) is not bool for key in ("running", "paused", "online", "ws_open")):
         raise HistoricalInputError("invalid policy runtime flags")
     if type(state["order_id"]) is not int or state["order_id"] < 0:

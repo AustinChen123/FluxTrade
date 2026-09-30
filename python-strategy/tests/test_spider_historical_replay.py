@@ -505,6 +505,7 @@ def test_configured_spec_exact_run_end_boundary_is_valid_and_uses_run_cache(monk
     assert composition._dispatch_due(run.range_end_ms * 16 + 6)["classification"] == "SUCCESS"
     final_close = composition._records[(3, f"P3_MARKET_{run.range_start_ms}_3")]
     assert final_close["result"]["classification"] == "SUCCESS"
+    assert composition._records[(4, f"MARKET_CLOSE_{run.range_end_ms}")]["result"]["classification"] == "SUCCESS"
     for market in composition._policy.markets.values():
         assert (market["ctVal"], market["lotSz"], market["minSz"], market["increment"]) == (
             D("1"), D("0.001"), D("0.001"), D("0.01"))
@@ -541,9 +542,11 @@ def test_market_cache_uses_exact_1440_closed_bars_and_ignores_future_until_its_c
     assert right._dispatch_due(due)["classification"] == "SUCCESS"
     assert left._policy.markets == right._policy.markets
     assert left._policy.events == right._policy.events
-    assert all(common.range_start_ms < event["at_ms"] < close_ms
-               and (event["at_ms"] - common.range_start_ms) % 5_000 == 0
-               for event in left._policy.events)
+    assert [(event["at_ms"] - common.range_start_ms, event["kind"])
+            for event in left._policy.events] == [
+                (5_000, "request_earn"), (5_020, "check_websocket"),
+                *((offset + 15, "check_websocket") for offset in range(10_000, 60_000, 5_000)),
+            ]
     snapshot_left = left._records[(4, f"MARKET_CLOSE_{close_ms}")]["result"]["market_snapshot"]
     snapshot_right = right._records[(4, f"MARKET_CLOSE_{close_ms}")]["result"]["market_snapshot"]
     assert snapshot_left == snapshot_right
@@ -741,11 +744,10 @@ def test_frozen_h01_runs_policy_poll_native_fill_notice_and_endpoint_oracle():
     assert composition._codec.historical_working_orders() == []
 
     # The frozen input's initial ordered poll is visible at E+5020.
-    poll_issue = start + 5_000
     poll_visible = start + 5_020
     assert composition._dispatch_due(poll_visible * 16 + 6)["classification"] == "SUCCESS"
     sends = [event for event in composition._policy.events
-             if event["at_ms"] == poll_issue and event["kind"] == "send"]
+             if event["at_ms"] == poll_visible and event["kind"] == "send"]
     actual_source_orders = [
         (order["instId"], "LONG" if order["side"] == "buy" else "SHORT",
          D(order["sz"]), D(order["px"]))
@@ -1960,6 +1962,7 @@ def test_historical_execution_notice_after_endpoint_remains_pending():
         row["active"] = "false"
     endpoint = run.range_end_ms * 16 + 6
     assert composition._dispatch_due(endpoint)["classification"] == "SUCCESS"
+    assert (3, f"P3_MARKET_{start}_3") in composition._records
     pending = [record for record in composition._records.values()
                if record["item"]["kind"] == "DELIVERY"
                and record["item"]["delivery"]["payload_kind"] == "EXECUTION_FACT"
@@ -1972,8 +1975,38 @@ def test_historical_execution_notice_after_endpoint_remains_pending():
 
 def test_historical_chain_runs_final_close_without_endpoint_next_open():
     run = _valid_run()
+    start, end = run.range_start_ms, run.range_end_ms
+
+    def close_bar(rows, *, trade):
+        return tuple(
+            replace(row, open=D("100"), high=D("110"), low=D("90"), close=D("105"))
+            if row.bar_open_ms == start else row
+            for row in rows
+        )
+
+    run = _rehashed_run(
+        run,
+        trade_rows=close_bar(run.trade_bars, trade=True),
+        mark_rows=close_bar(run.mark_bars, trade=False),
+    )
+    configuration = _p2_configuration()
+    configuration["cash"] = "10000"
+    configuration["positions"] = [
+        dict(product_id=product, side="LONG", quantity_contracts=quantity,
+             lots=[dict(seed_execution_id=f"FINAL-CLOSE-{product}", seed_sequence=sequence,
+                        strategy_id="SPIDER_GRID_ORIGINAL_V1", quantity_contracts=quantity,
+                        entry_price="100")])
+        for sequence, (product, quantity) in enumerate(
+            (("A-USDT-SWAP", "80"), ("B-USDT-SWAP", "40"))
+        )
+    ]
+    run = _run_with_configuration(run, configuration)
+    run = replace(
+        run,
+        initial_account_state=_initial_account_state(cash="10000", positions=configuration["positions"]),
+        initial_policy_cache=_policy_cache(running=False),
+    )
     composition = _composition(run)
-    end = run.range_end_ms
     assert composition._dispatch_due(end * 16 + 6)["classification"] == "SUCCESS"
     steps = [record for record in composition._records.values()
              if record["item"]["kind"] == "HISTORICAL_MARKET_STEP"]
@@ -1983,7 +2016,28 @@ def test_historical_chain_runs_final_close_without_endpoint_next_open():
     final = steps[-1]
     assert final["key"][0] == end * 16 + 4
     assert final["result"]["classification"] == "SUCCESS"
+    cache = composition._records[(4, f"MARKET_CLOSE_{end}")]
+    assert cache["key"][0] == end * 16 + 6
+    assert cache["result"]["classification"] == "SUCCESS"
     assert not any(record["item"]["node"]["bar_open_ms"] == end for record in steps)
+    assert all(not product["fills"] for step in steps
+               for product in step["result"]["historical_result"]["products"])
+    trading = composition._codec.capture_snapshot(dict(
+        schema_version="snapshot_request_v1", account_key=composition._account,
+        snapshot_id="FINAL_CLOSE_TRADING", snapshot_kind="TRADING",
+        capture_mode="OWNER_CURRENT", captured_at=end * 16 + 6,
+    ))["immutable_payload"]
+    positions = composition._codec.capture_snapshot(dict(
+        schema_version="snapshot_request_v1", account_key=composition._account,
+        snapshot_id="FINAL_CLOSE_POSITIONS", snapshot_kind="POSITIONS",
+        capture_mode="OWNER_CURRENT", captured_at=end * 16 + 6,
+    ))["immutable_payload"]["rows"]
+    assert trading["equity"] == D("10600")
+    assert [(row["product_id"], row["position_contracts"], row["last_price"])
+            for row in positions] == [
+                ("A-USDT-SWAP", D("80"), D("105")),
+                ("B-USDT-SWAP", D("40"), D("105")),
+            ]
 
 
 def test_private_future_bar_does_not_change_policy_prefix_before_its_close():

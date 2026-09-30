@@ -10,7 +10,11 @@ from typing import Any, Callable, cast
 
 from src.core.backtest import synthetic_scenario_codec as wire
 from src.core.backtest import spider_policy_protocol as policy_protocol
-from src.core.backtest.spider_historical_input import historical_market_step_clock
+from src.core.backtest.spider_historical_input import (
+    POLL_OPEN_ORDERS_FAILURE_PROFILE,
+    historical_market_step_clock,
+    historical_market_step_in_range,
+)
 from src.core.backtest.spider_policy import Policy, fmt
 
 
@@ -338,6 +342,7 @@ class _ReplayComposition:
         self._p3_execution_notice_delivered_facts: set[str] = set()
         self._p3_cancel_ack_deliveries: set[str] = set()
         self._historical_cancel_effects: dict[str, dict[str, Any]] = {}
+        self._historical_endpoint_action_times: dict[tuple[str, int, int], int] = {}
         self._historical_run: object | None = None
         self._historical_bars: dict[tuple[int, str], tuple[object, object]] = {}
         self._historical_step_sequence = 0
@@ -387,6 +392,8 @@ class _ReplayComposition:
         }
         composition._current_time = historical_run.range_start_ms * 16
         for sequence, snapshot in enumerate(prepared.snapshots):
+            if snapshot.close_ms > historical_run.range_end_ms:
+                continue
             result = composition._enqueue(_historical_market_item(snapshot, sequence))
             if result["classification"] != "PENDING":
                 raise ValueError("INVALID_SCHEMA")
@@ -455,10 +462,19 @@ class _ReplayComposition:
             stage = awaiting["snapshot_request"]["snapshot_kind"] if awaiting is not None else None
             polls.append(dict(poll_id=poll_id, continuation_id=continuation, status=observation.status,
                               awaiting="EARN_IF_DUE" if stage == "EARN" else stage))
-        actions = [dict(delivery_id=delivery_id, event_index=i, action_index=j, group_id=action["group_id"],
-                        status=action["status"], group_result=action.get("group_result"), native_failure=action.get("native_failure"))
-                   for delivery_id, events in sorted(self._audit.items()) for i, event in enumerate(events)
-                   for j, action in enumerate(event.get("actions", []))]
+        actions = []
+        for delivery_id, events in sorted(self._audit.items()):
+            for event_index, event in enumerate(events):
+                for action_index, action in enumerate(event.get("actions", [])):
+                    row = dict(delivery_id=delivery_id, event_index=event_index, action_index=action_index,
+                               group_id=action["group_id"], status=action["status"],
+                               group_result=action.get("group_result"), native_failure=action.get("native_failure"))
+                    effective_at = self._historical_endpoint_action_times.get(
+                        (delivery_id, event_index, action_index)
+                    )
+                    if effective_at is not None:
+                        row["effective_at"] = effective_at
+                    actions.append(row)
         observation = dict(current_time=self._current_time, last_popped=key(self._last_popped) if self._last_popped is not None else None,
                            gate="FAILED" if self._terminal is not None else "RUNNING",
                            terminal={name: self._terminal[name] for name in ("kind", "stable_id", "classification", "reason")} if self._terminal is not None else None,
@@ -857,6 +873,10 @@ class _ReplayComposition:
                 child_ordinal += 1
                 acceptance_raw = parent_raw + delay
                 if acceptance_raw >= end:
+                    if self._historical_run is not None:
+                        self._historical_endpoint_action_times[
+                            (delivery["delivery_id"], event_index, order_index)
+                        ] = acceptance_raw * 16 + 3
                     continue
                 if event["kind"] == "send":
                     if order["ordType"] not in ("limit", "market"):
@@ -1120,7 +1140,10 @@ class _ReplayComposition:
                             next_open, next_step = open_ms, step + 1
                         else:
                             next_open, next_step = open_ms + 60_000, 0
-                        if next_open < run.range_end_ms:
+                        enqueue_next = historical_market_step_in_range(
+                            next_open, next_step, run.range_end_ms
+                        )
+                        if enqueue_next:
                             next_working_orders = self._codec.historical_working_orders()
                             following = self._historical_node_item(
                                 next_open, next_step, self._historical_step_sequence, next_working_orders
@@ -1130,7 +1153,7 @@ class _ReplayComposition:
                         if any(value["classification"] != "PENDING" for value in queued):
                             record["result"] = deepcopy(self._terminal or queued[0])
                             return deepcopy(record["result"])
-                        if next_open < run.range_end_ms:
+                        if enqueue_next:
                             self._historical_step_sequence += 1
                 elif kind == "HISTORICAL_TIMER":
                     plan = self._historical_poll_plan(record["raw_time_ms"], key[2])
@@ -1157,6 +1180,7 @@ class _ReplayComposition:
     def _historical_poll_plan(self, raw_at: int, timer_sequence: int) -> dict[str, Any]:
         if self._historical_poll_range is None:
             raise _ScheduleError("INVALID_SCHEMA")
+        historical_run = cast(Any, self._historical_run)
         start, end = self._historical_poll_range
         if type(raw_at) is not int or not start <= raw_at < end:
             raise _ScheduleError("INVALID_SCHEMA")
@@ -1169,7 +1193,10 @@ class _ReplayComposition:
             ("earn", "EARN", "EARN_SNAPSHOT", "FROZEN_POLL_FIXTURE", "P3_POLL_EARN_ZERO", 1, 5),
             ("trading", "TRADING", "TRADING_SNAPSHOT", "OWNER_CURRENT", None, 6, 10),
             ("positions", "POSITIONS", "POSITION_SNAPSHOT", "OWNER_CURRENT", None, 11, 15),
-            ("open_orders", "OPEN_ORDERS", "OPEN_ORDER_SNAPSHOT", "OWNER_CURRENT", None, 16, 20),
+            ("open_orders", "OPEN_ORDERS", "OPEN_ORDER_SNAPSHOT",
+             "FROZEN_POLL_FIXTURE" if historical_run.poll_profile == POLL_OPEN_ORDERS_FAILURE_PROFILE else "OWNER_CURRENT",
+             "POLL_OPEN_ORDERS_FAILURE" if historical_run.poll_profile == POLL_OPEN_ORDERS_FAILURE_PROFILE else None,
+             16, 20),
         ]
         no_earn_stages = [
             ("trading", "TRADING", "TRADING_SNAPSHOT", "OWNER_CURRENT", None, 1, 5),
@@ -1282,6 +1309,8 @@ class _ReplayComposition:
         policy, start = self._policy, len(self._policy.events)
         error = None
         try:
+            if self._historical_poll_range is not None:
+                policy.now_ms = (cast(int, delivery["visible_at"]) - 6) // 16
             self._apply_payload(delivery)
             if record.index == len(record.stages) - 1:
                 policy.raise_leverage()

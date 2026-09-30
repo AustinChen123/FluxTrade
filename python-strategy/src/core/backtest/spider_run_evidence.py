@@ -325,8 +325,94 @@ def _actions(journal: list[dict[str, _Any]], actions: list[dict[str, _Any]]) -> 
                    and _equal(row["payload"]["result"], action["group_result"])] if action["status"] == "SUBMITTED" else []
         projected.append(dict(delivery_id=action["delivery_id"], event_index=action["event_index"], action_index=action["action_index"],
                               group_id=action["group_id"], status=action["status"], cancel_effect_ref=None,
-                              group_result_ref=f"journal:{matches[0]['journal_seq']}" if len(matches) == 1 else None))
+                              group_result_ref=f"journal:{matches[0]['journal_seq']}" if len(matches) == 1 else None,
+                              **({"effective_at": action["effective_at"]} if "effective_at" in action else {})))
     return projected
+
+
+def _historical_deferred_actions_compatible(
+    journal: list[dict[str, _Any]], observation: dict[str, _Any], cutoff: int,
+) -> bool:
+    records = observation["records"]
+    observed_actions = {}
+    for action in observation["callback_actions"]:
+        identity = (action["delivery_id"], action["event_index"], action["action_index"])
+        if identity in observed_actions:
+            return False
+        observed_actions[identity] = action
+
+    callback_actions = {}
+    callback_rows = {}
+    for row in journal:
+        if row["record_kind"] != "CALLBACK_RESULT":
+            continue
+        callback = row["payload"]
+        for item in callback["actions"]:
+            identity = (callback["delivery_id"], item["event_index"], item["action_index"])
+            if identity in callback_actions:
+                return False
+            callback_actions[identity] = item
+            callback_rows[identity] = row
+    if observed_actions.keys() != callback_actions.keys():
+        return False
+
+    pending_keys = observation["pending_keys"]
+    source_results = [row for row in journal if row["record_kind"] == "SOURCE_GROUP_RESULT"]
+    for identity, action in observed_actions.items():
+        callback_action, callback = callback_actions[identity], callback_rows[identity]
+        if (callback["payload"]["outcome"] != "SUCCESS"
+                or callback["payload"]["delivery_id"] != identity[0]
+                or callback_action["status"] != "UNSUBMITTED"
+                or callback_action["group_id"] != action["group_id"]
+                or callback_action.get("group_result") is not None
+                or callback_action.get("native_failure") is not None
+                or action.get("native_failure") is not None):
+            return False
+        parents = [record for record in records
+                   if record["kind"] == "DELIVERY" and record["stable_id"] == action["delivery_id"]]
+        if len(parents) != 1 or parents[0]["classification"] != "SUCCESS":
+            return False
+        parent_key = parents[0]["key"]
+        if callback["scheduler_key"] != parent_key:
+            return False
+        visible_at = parent_key["visible_at"]
+        if visible_at > cutoff or visible_at < 6 or visible_at % 16 != 6:
+            return False
+
+        group_id = action["group_id"]
+        if action["status"] == "SUBMITTED":
+            if "effective_at" in action or group_id is None or action.get("group_result") is None:
+                return False
+            matches = [row for row in source_results
+                       if row["payload"]["result"]["group_id"] == group_id]
+            if (len(matches) != 1
+                    or not _equal(matches[0]["payload"]["result"], action["group_result"])):
+                return False
+            continue
+
+        if action["status"] != "UNSUBMITTED" or action.get("group_result") is not None:
+            return False
+        if group_id is not None:
+            if "effective_at" in action:
+                return False
+            group_records = [record for record in records
+                             if record["kind"] == "SOURCE_GROUP" and record["stable_id"] == group_id]
+            group_keys = [key for key in pending_keys
+                          if key["queue_class"] == "SOURCE_GROUP" and key["stable_id"] == group_id]
+            if (len(group_records) != 1 or group_records[0]["classification"] != "PENDING"
+                    or len(group_keys) != 1 or group_records[0]["key"] != group_keys[0]
+                    or group_keys[0]["visible_at"] <= cutoff):
+                return False
+            continue
+
+        if "effective_at" not in action:
+            return False
+        if visible_at > cutoff or visible_at < 6 or visible_at % 16 != 6:
+            return False
+        expected_effective_at = (((visible_at - 6) // 16) + 1) * 16 + 3
+        if action["effective_at"] != expected_effective_at or expected_effective_at <= cutoff:
+            return False
+    return True
 
 
 def _terminal(policy: str, endpoint: dict[str, _Any]) -> dict[str, _Any]:
@@ -407,12 +493,8 @@ def _historical_endpoint(run_id: str, attempt: dict[str, _Any], status: dict[str
         raise ReconciliationProjectionError()
     if not _historical_polls_endpoint_compatible(observation, cutoff):
         raise ReconciliationProjectionError()
-    pending = observation["pending_keys"]
-    for action in observation["callback_actions"]:
-        if action["status"] == "UNSUBMITTED" and not any(
-                key["queue_class"] == "DELIVERY" and key["stable_id"] == action["delivery_id"]
-                for key in pending):
-            raise ReconciliationProjectionError()
+    if not _historical_deferred_actions_compatible(journal, observation, cutoff):
+        raise ReconciliationProjectionError()
     if len(journal) != persisted["journal_seq"] or any(
             row["journal_seq"] != index or row["run_id"] != run_id
             for index, row in enumerate(journal, 1)):
@@ -576,9 +658,7 @@ def _historical_reconciliation(run_id: str, attempt: dict[str, _Any], status: di
     polls = observation["polls"]
     polls_ok = _historical_polls_endpoint_compatible(observation, cutoff)
     actions = _actions(journal, observation["callback_actions"])
-    actions_ok = all(action["status"] != "UNSUBMITTED" or any(
-        key["queue_class"] == "DELIVERY" and key["stable_id"] == action["delivery_id"] for key in pending
-    ) for action in observation["callback_actions"])
+    actions_ok = _historical_deferred_actions_compatible(journal, observation, cutoff)
     expected_queue = dict(pending_keys=pending, remaining_planned_barriers=[])
     observed_queue = dict(pending_keys=pending, remaining_planned_barriers=endpoint["remaining_planned_barriers"])
     terminal_expected = dict(terminal_policy="MTM_PRESERVE_OPEN_V1", terminal_reason="MTM_PRESERVE_OPEN_V1",

@@ -46,14 +46,18 @@ def _barriers(value: object, *, journal: bool = False, ordered: bool = False,
         envelope._ordered(identities)
 
 
-def _actions(value: object) -> None:
+def _actions(value: object, *, historical: bool = False) -> None:
     identities: list[tuple[str, int, int]] = []
     for item in _list(value):
-        row = _object(item, "delivery_id event_index action_index group_id status group_result_ref cancel_effect_ref")
+        row = _object(item, "delivery_id event_index action_index group_id status group_result_ref cancel_effect_ref",
+                       "effective_at" if historical else "")
         identities.append((_text(row["delivery_id"]), _integer(row["event_index"]), _integer(row["action_index"])))
-        _enum(row["status"], ["SUBMITTED", "UNSUBMITTED"])
+        status = _enum(row["status"], ["SUBMITTED", "UNSUBMITTED"])
         if row["group_id"] is not None:
             _text(row["group_id"])
+        if "effective_at" in row:
+            _require(historical and status == "UNSUBMITTED" and row["group_id"] is None)
+            _integer(row["effective_at"])
         for key in ("group_result_ref", "cancel_effect_ref"):
             if row[key] is not None:
                 evidence_reference(row[key])
@@ -113,7 +117,7 @@ def _value(
         _unique([item[0] for item in polls])
         _unique([item[1] for item in polls])
     elif name == "NO_UNSUBMITTED_CALLBACK_ACTION":
-        _actions(value)
+        _actions(value, historical=historical is not None)
     elif name == "TERMINAL_POLICY_MATCH":
         row = _object(value, "terminal_policy terminal_reason scheduler_gate scheduler_terminal owner_gate owner_lifecycle remaining_planned_barriers")
         _terminal_policy(row["terminal_policy"], historical=historical is not None)
