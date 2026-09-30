@@ -1713,11 +1713,24 @@ def test_frozen_h09_named_ohlc_paths_preserve_execution_order_and_reports():
     assert any("noticesE+20002/E+40002" in value for value in answer.values())
 
     reports = {}
+    runs = {}
     for model_id, report_id in model_cases:
         _, run = _oracle_run("H09", model_id=model_id)
+        runs[model_id] = run
         composition = _ReplayComposition._from_historical_run(run)
         start = run.range_start_ms
         endpoint = run.range_end_ms * 16 + 6
+        assert composition._policy.running is False
+        assert [row["active"] for row in composition._policy.rows] == ["false", "false"]
+        preopen = _snapshot(composition, "OPEN_ORDERS", f"{report_id}-PREOPEN", start * 16)["rows"]
+        assert [
+            (row["order_id"], row["client_order_id"], row["side"],
+             row["original_size_contracts"], row["limit_price"], row["state"])
+            for row in preopen
+        ] == [
+            ("H09-LONG", "MANL", "buy", D("1"), D("95"), "live"),
+            ("H09-SHORT", "MANS", "sell", D("1"), D("105"), "live"),
+        ]
         assert composition._dispatch_due(endpoint)["classification"] == "SUCCESS"
 
         steps = [
@@ -1749,6 +1762,25 @@ def test_frozen_h09_named_ohlc_paths_preserve_execution_order_and_reports():
             (start + 20_002) * 16 + 6, (start + 40_002) * 16 + 6
         ]
         assert all(record["result"]["classification"] == "SUCCESS" for record in notices)
+        fills_with_sources = [
+            (record["result"]["historical_result"]["raw_time_ms"], fill)
+            for record in sorted(steps, key=lambda row: row["key"])
+            for product in record["result"]["historical_result"]["products"]
+            for fill in product["fills"]
+        ]
+        notices_by_source = {
+            record["item"]["delivery"]["source_fact_id"]: record for record in notices
+        }
+        assert len(notices_by_source) == len(fills_with_sources) == 2
+        for raw_time_ms, fill in fills_with_sources:
+            notice = notices_by_source[fill["source_event_id"]]
+            delivery = notice["item"]["delivery"]
+            payload = delivery["immutable_payload"]
+            assert delivery["visible_at"] == (raw_time_ms + 2) * 16 + 6
+            assert payload["order_id"] == fill["order_id"]
+            assert payload["fill_price"] == fill["price"]
+            assert payload["original_size_contracts"] == fill["quantity_contracts"]
+            assert payload["state"] == "filled"
         assert all(row["active"] == "false" for row in composition._policy.rows)
         intent_groups = [
             record for record in composition._records.values()
@@ -1804,6 +1836,7 @@ def test_frozen_h09_named_ohlc_paths_preserve_execution_order_and_reports():
                       ("H09-SHORT", EPOCH + 40_000, D("1"), D("105"))),
     }
     assert reports[model_cases[0][0]]["cash"] == reports[model_cases[1][0]]["cash"]
+    assert replace(runs[model_cases[0][0]], model_id=model_cases[1][0]) == runs[model_cases[1][0]]
     assert any("each_endpointE+60000,cash1009.8,flat,gross10,fees0.2,mark105,equity1009.8" in value for value in answer.values())
     assert any("both_journals_required" in value for value in answer.values())
 
