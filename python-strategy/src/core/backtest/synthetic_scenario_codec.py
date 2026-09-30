@@ -3,7 +3,7 @@ import json
 from importlib.machinery import EXTENSION_SUFFIXES
 from collections.abc import Mapping
 from decimal import Decimal
-from typing import Literal, NotRequired, TypeAlias, TypedDict, cast
+from typing import Literal, NotRequired, Protocol, TypeAlias, TypedDict, cast
 
 import fluxtrade_core as _native
 
@@ -360,6 +360,27 @@ HistoricalModel = Literal[
 ]
 
 
+class _NativeSession(Protocol):
+    def apply_group(self, request: str) -> str: ...
+    def capture_snapshot(self, request: str) -> str: ...
+    def build_delivery(self, request: str) -> str: ...
+    def historical_market_step(self, request: str) -> str: ...
+    def _historical_working_orders(self) -> str: ...
+    def inspect_state(self) -> str: ...
+
+
+def _new_native_session(
+    profile: Profile, account_json: str, configuration_json: str | None = None,
+) -> _NativeSession:
+    """Construct the sole native session behind a private codec-owned seam."""
+    if configuration_json is None:
+        return cast(_NativeSession, _native._SyntheticScenarioReplaySession(profile, account_json))
+    return cast(
+        _NativeSession,
+        _native._SyntheticScenarioReplaySession(profile, account_json, configuration_json),
+    )
+
+
 class HistoricalBarValues(TypedDict):
     open: Decimal
     high: Decimal
@@ -511,9 +532,9 @@ class ScenarioCodec:
         configuration: Mapping[str, object] | None = None,
     ) -> None:
         if configuration is None:
-            self._session = _native._SyntheticScenarioReplaySession(profile, _encode(account))
+            self._session = _new_native_session(profile, _encode(account))
         else:
-            self._session = _native._SyntheticScenarioReplaySession(
+            self._session = _new_native_session(
                 profile, _encode(account), _encode_configuration(configuration)
             )
 

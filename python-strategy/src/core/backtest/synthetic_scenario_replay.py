@@ -11,6 +11,7 @@ from typing import Any, Callable, cast
 from src.core.backtest import synthetic_scenario_codec as wire
 from src.core.backtest import spider_policy_protocol as policy_protocol
 from src.core.backtest.spider_historical_input import (
+    HistoricalBar,
     POLL_OPEN_ORDERS_FAILURE_PROFILE,
     historical_market_step_clock,
     historical_market_step_in_range,
@@ -24,6 +25,8 @@ def _pairing_check(condition: bool) -> None:
 
 
 def _historical_order_ordinal(kind: object) -> int | None:
+    if type(kind) is not str:
+        return None
     return {"INTENT": 60, "CANCEL_REQUEST": 40, "CANCEL_EFFECT": 50}.get(kind)
 
 
@@ -344,7 +347,7 @@ class _ReplayComposition:
         self._historical_cancel_effects: dict[str, dict[str, Any]] = {}
         self._historical_endpoint_action_times: dict[tuple[str, int, int], int] = {}
         self._historical_run: object | None = None
-        self._historical_bars: dict[tuple[int, str], tuple[object, object]] = {}
+        self._historical_bars: dict[tuple[int, str], tuple[HistoricalBar, HistoricalBar]] = {}
         self._historical_step_sequence = 0
 
     @classmethod
@@ -413,28 +416,36 @@ class _ReplayComposition:
         return composition
 
     def _historical_node_item(
-        self, bar_open_ms: int, step_index: int, sequence: int, working_orders: list[dict[str, Any]]
+        self, bar_open_ms: int, step_index: int, sequence: int,
+        working_orders: list[wire.HistoricalWorkingOrder],
     ) -> dict[str, Any]:
         from src.core.backtest.spider_historical_input import HistoricalRunInput
 
         run = cast(HistoricalRunInput, self._historical_run)
-        bars = []
+        contract = self._historical_order_contract
+        if contract is None:
+            raise _ScheduleError("INVALID_SCHEMA")
+        bars: list[wire.HistoricalProductBars] = []
         for product_id in run.ordered_products:
             trade, mark = self._historical_bars[(bar_open_ms, product_id)]
-            bars.append(dict(
-                product_id=product_id,
-                trade=dict(open=trade.open, high=trade.high, low=trade.low, close=trade.close,
-                           volume_contracts=trade.volume, confirmed=True,
-                           source_row_hash=trade.source_row_hash),
-                mark=dict(open=mark.open, high=mark.high, low=mark.low, close=mark.close,
-                          confirmed=True, source_row_hash=mark.source_row_hash),
+            trade_bar = cast(wire.HistoricalTradeBar, dict(
+                open=trade.open, high=trade.high, low=trade.low, close=trade.close,
+                volume_contracts=cast(D, trade.volume), confirmed=True,
+                source_row_hash=trade.source_row_hash,
             ))
+            mark_bar = cast(wire.HistoricalMarkBar, dict(
+                open=mark.open, high=mark.high, low=mark.low, close=mark.close,
+                confirmed=True, source_row_hash=mark.source_row_hash,
+            ))
+            bars.append(cast(wire.HistoricalProductBars, dict(
+                product_id=product_id, trade=trade_bar, mark=mark_bar,
+            )))
         return dict(
             kind="HISTORICAL_MARKET_STEP",
             schedule_sequence=sequence,
             stable_id=f"P3_MARKET_{bar_open_ms}_{step_index}",
             node=dict(schema_version="historical_node_v1", model_id=run.model_id, model_version="1",
-                      run_contract_hash=self._historical_order_contract["run_contract_hash"],
+                      run_contract_hash=contract["run_contract_hash"],
                       bar_open_ms=bar_open_ms, bar_duration_ms=60_000, step_index=step_index,
                       market_slippage_bps=run.market_slippage_bps, bars=bars,
                       working_orders=deepcopy(working_orders)),
@@ -506,7 +517,7 @@ class _ReplayComposition:
                 or source_fact_id not in self._p3_execution_notice_facts
                 or delivery.get("immutable_payload") != self._p3_execution_notice_facts[source_fact_id]):
             return None
-        projection = dict(
+        projection = cast(wire.Projection, dict(
             schema_version="delivery_projection_v1",
             reference=dict(
                 namespace=delivery.get("source_namespace"),
@@ -517,7 +528,7 @@ class _ReplayComposition:
             schedule_sequence=delivery.get("schedule_sequence"),
             visible_at=delivery.get("visible_at"),
             continuation_id=delivery.get("continuation_id"),
-        )
+        ))
         try:
             canonical = self._codec.build_delivery(projection)
         except Exception:
@@ -599,7 +610,7 @@ class _ReplayComposition:
                     **{k: d[k] for k in ("payload_kind", "occurrence_index", "schedule_sequence", "visible_at")}, continuation_id=d.get("continuation_id"))
                 policy_protocol._plan_projection(projection)
                 policy_protocol._event_id(d["delivery_id"])
-                audit_only = self._historical_audit_delivery(d)
+                audit_only = self._historical_audit_delivery(cast(wire.Delivery, d))
                 if audit_only:
                     if plan is not None:
                         raise _ScheduleError("INVALID_SCHEMA")
@@ -1003,14 +1014,14 @@ class _ReplayComposition:
         visible_at = visible_raw * 16 + 6
         if not 0 <= visible_at < 2**63:
             raise _ScheduleError("INVALID_SCHEMA")
-        projection = dict(
+        projection = cast(wire.Projection, dict(
             schema_version="delivery_projection_v1",
             reference=dict(namespace="SOURCE", fact_id=stamp["event_id"]),
             payload_kind="TRANSPORT_ACK",
             occurrence_index=0,
             schedule_sequence=self._historical_notice_sequence,
             visible_at=visible_at,
-        )
+        ))
         delivery = self._codec.build_delivery(projection)
         self._p3_cancel_ack_deliveries.add(delivery["delivery_id"])
         self._historical_notice_sequence += 1
@@ -1096,6 +1107,9 @@ class _ReplayComposition:
                         raise _ScheduleError("INVALID_SCHEMA")
                     result["historical_result"] = deepcopy(historical_result)
                     if working_orders is not None:
+                        contract = self._historical_order_contract
+                        if contract is None:
+                            raise _ScheduleError("INVALID_SCHEMA")
                         result["working_orders_snapshot"] = deepcopy(working_orders)
                         self._evidence("HISTORICAL_MARKET_RESULT", key, dict(
                             account_key=self._account,
@@ -1109,22 +1123,21 @@ class _ReplayComposition:
                         derived: list[tuple[dict[str, Any], Any]] = []
                         for product in historical_result["products"]:
                             for fill in product["fills"]:
-                                notice_raw = (historical_result["raw_time_ms"]
-                                              + self._historical_order_contract["order_notice_delay_ms"])
+                                notice_raw = historical_result["raw_time_ms"] + contract["order_notice_delay_ms"]
                                 visible_at = notice_raw * 16 + 6
                                 if not 0 <= visible_at < 2**63:
                                     raise _ScheduleError("INVALID_SCHEMA")
-                                projection = dict(
+                                projection = cast(wire.Projection, dict(
                                     schema_version="delivery_projection_v1",
                                     reference=dict(namespace="SOURCE", fact_id=fill["source_event_id"]),
                                     payload_kind="EXECUTION_FACT",
                                     occurrence_index=fill["occurrence_index"],
                                     schedule_sequence=self._historical_notice_sequence,
                                     visible_at=visible_at,
-                                )
+                                ))
                                 delivery = self._codec.build_delivery(projection)
                                 source_fact_id = delivery["source_fact_id"]
-                                payload = deepcopy(delivery["immutable_payload"])
+                                payload = cast(dict[str, Any], deepcopy(delivery["immutable_payload"]))
                                 known_payload = self._p3_execution_notice_facts.get(
                                     source_fact_id
                                 )

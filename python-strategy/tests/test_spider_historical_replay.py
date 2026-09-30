@@ -217,6 +217,18 @@ def _composition(run: HistoricalRunInput, evidence_callback=None) -> _ReplayComp
     return composition
 
 
+def _count_native_session_constructions(monkeypatch) -> list[bool]:
+    calls: list[bool] = []
+    original = wire._new_native_session
+
+    def count(profile: wire.Profile, account_json: str, configuration_json: str | None = None):
+        calls.append(True)
+        return original(profile, account_json, configuration_json)
+
+    monkeypatch.setattr(wire, "_new_native_session", count)
+    return calls
+
+
 def _historical_snapshot_requests(composition, cutoff, prefix):
     return [dict(schema_version="snapshot_request_v1", account_key=composition._account,
                  snapshot_id=f"{prefix}-{kind}", snapshot_kind=kind,
@@ -392,20 +404,14 @@ def test_historical_account_identity_uses_frozen_research_namespace_only():
 
 def test_invalid_historical_run_constructs_neither_composition_nor_native_owner(monkeypatch):
     composition_calls = []
-    owner_calls = []
+    owner_calls = _count_native_session_constructions(monkeypatch)
     original_init = _ReplayComposition.__init__
-    original_native = wire._native._SyntheticScenarioReplaySession
 
     def count_composition(self, *args, **kwargs):
         composition_calls.append(True)
         original_init(self, *args, **kwargs)
 
-    def count_owner(*args, **kwargs):
-        owner_calls.append(True)
-        return original_native(*args, **kwargs)
-
     monkeypatch.setattr(_ReplayComposition, "__init__", count_composition)
-    monkeypatch.setattr(wire._native, "_SyntheticScenarioReplaySession", count_owner)
     with pytest.raises(HistoricalInputError):
         _composition(replace(_valid_run(), policy_id=""))
     assert composition_calls == [] and owner_calls == []
@@ -413,20 +419,14 @@ def test_invalid_historical_run_constructs_neither_composition_nor_native_owner(
 
 def _assert_rejected_before_owner(run: HistoricalRunInput, monkeypatch, *, message: str | None = None) -> None:
     composition_calls = []
-    owner_calls = []
+    owner_calls = _count_native_session_constructions(monkeypatch)
     original_init = _ReplayComposition.__init__
-    original_native = wire._native._SyntheticScenarioReplaySession
 
     def count_composition(self, *args, **kwargs):
         composition_calls.append(True)
         original_init(self, *args, **kwargs)
 
-    def count_owner(*args, **kwargs):
-        owner_calls.append(True)
-        return original_native(*args, **kwargs)
-
     monkeypatch.setattr(_ReplayComposition, "__init__", count_composition)
-    monkeypatch.setattr(wire._native, "_SyntheticScenarioReplaySession", count_owner)
     with pytest.raises(HistoricalInputError, match=message):
         _composition(run)
     assert composition_calls == [] and owner_calls == []
@@ -492,14 +492,7 @@ def test_configured_spec_exact_run_end_boundary_is_valid_and_uses_run_cache(monk
     # Historical timers now perform real Policy polling; keep this cache test
     # isolated from intentional grid-order acceptance.
     run = replace(run, initial_policy_cache=_policy_cache(running=False))
-    owner_calls = []
-    original_native = wire._native._SyntheticScenarioReplaySession
-
-    def count_owner(*args, **kwargs):
-        owner_calls.append(True)
-        return original_native(*args, **kwargs)
-
-    monkeypatch.setattr(wire._native, "_SyntheticScenarioReplaySession", count_owner)
+    owner_calls = _count_native_session_constructions(monkeypatch)
     composition = _composition(run)
     assert len(owner_calls) == 1
     assert composition._dispatch_due(run.range_end_ms * 16 + 6)["classification"] == "SUCCESS"
