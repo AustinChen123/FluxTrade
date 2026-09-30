@@ -14,7 +14,10 @@ from src.core.backtest import spider_run_envelope_schema as envelope
 from src.core.backtest import spider_run_evidence as evidence
 from src.core.backtest.spider_run_reconciliation_schema import reconciliation
 from src.core.backtest.spider_scenario_plans import PLAN_IDS, plan_bundle
+from src.core.backtest.spider_historical_input import historical_planned_coverage
 from test_spider_run_artifacts import attempt as attempt_fixture, historical_context
+from test_spider_historical_oracle import _oracle_run
+from src.core.backtest.synthetic_scenario_replay import _ReplayComposition
 
 RUN = "evidence-test-1"
 NAMES = ["PLANNED_COVERAGE_COMPLETE", "PROCESSED_EQUALS_PERSISTED", "JOURNAL_CONTIGUOUS", "OWNER_IDENTITY_MATCH", "OWNER_DIGEST_MATCH",
@@ -61,6 +64,135 @@ def validate_inputs(values):
     envelope.journal(values[2])
     envelope.endpoint(values[3])
     completion.report(values[4])
+
+
+def h03_endpoint_observation(offset=100_001):
+    _, run = _oracle_run("H03")
+    composition = _ReplayComposition._from_historical_run(run)
+    cutoff = (run.range_start_ms + offset) * 16 + 6
+    assert composition._dispatch_due(cutoff)["classification"] == "SUCCESS"
+    requests = [
+        dict(
+            schema_version="snapshot_request_v1",
+            account_key=composition._account,
+            snapshot_id=f"H03_ENDPOINT_{kind}",
+            snapshot_kind=kind,
+            capture_mode="OWNER_CURRENT",
+            captured_at=cutoff,
+        )
+        for kind in ("TRADING", "POSITIONS", "OPEN_ORDERS")
+    ]
+    observation = composition.capture_owner_evidence(cutoff, *requests)["scheduler_observation"]
+    return historical_planned_coverage(run), observation, cutoff
+
+
+def test_h03_in_progress_poll_is_allowed_only_for_its_exact_future_continuation():
+    coverage, observation, cutoff = h03_endpoint_observation()
+    assert evidence._historical_polls_endpoint_compatible(observation, cutoff)
+    assert evidence._historical_coverage_records_compatible(coverage, observation, cutoff)
+
+    poll = next(row for row in observation["polls"] if row["status"] == "IN_PROGRESS")
+    assert poll["awaiting"] == "TRADING"
+    capture_id = f"{poll['poll_id']}_{poll['awaiting']}"
+    capture = next(row for row in observation["records"] if row["stable_id"] == capture_id)
+    continuation = next(
+        row for row in observation["records"]
+        if row["kind"] == "DELIVERY" and row["classification"] == "PENDING"
+        and row["key"]["schedule_sequence"] == capture["key"]["schedule_sequence"]
+    )
+
+    missing = deepcopy(observation)
+    missing["pending_keys"] = [key for key in missing["pending_keys"]
+                               if key != continuation["key"]]
+    missing["records"] = [record for record in missing["records"] if record["key"] != continuation["key"]]
+    assert not evidence._historical_polls_endpoint_compatible(missing, cutoff)
+
+    mismatched = deepcopy(observation)
+    next(row for row in mismatched["polls"] if row["poll_id"] == poll["poll_id"])["continuation_id"] += "-other"
+    assert not evidence._historical_polls_endpoint_compatible(mismatched, cutoff)
+
+    bad_capture_sequence = deepcopy(observation)
+    next(row for row in bad_capture_sequence["records"] if row["stable_id"] == capture_id)["key"]["schedule_sequence"] += 1
+    assert not evidence._historical_polls_endpoint_compatible(bad_capture_sequence, cutoff)
+
+    bad_capture_time = deepcopy(observation)
+    next(row for row in bad_capture_time["records"] if row["stable_id"] == capture_id)["key"]["visible_at"] += 1
+    assert not evidence._historical_polls_endpoint_compatible(bad_capture_time, cutoff)
+
+    bad_capture_identity = deepcopy(observation)
+    next(row for row in bad_capture_identity["records"] if row["stable_id"] == capture_id)["stable_id"] += "-other"
+    assert not evidence._historical_polls_endpoint_compatible(bad_capture_identity, cutoff)
+
+    bad_delivery_sequence = deepcopy(observation)
+    for key in bad_delivery_sequence["pending_keys"]:
+        if key["stable_id"] == continuation["stable_id"]:
+            key["schedule_sequence"] += 1
+    for row in bad_delivery_sequence["records"]:
+        if row["stable_id"] == continuation["stable_id"]:
+            row["key"]["schedule_sequence"] += 1
+    assert not evidence._historical_polls_endpoint_compatible(bad_delivery_sequence, cutoff)
+
+    bad_delivery_time = deepcopy(observation)
+    for key in bad_delivery_time["pending_keys"]:
+        if key["stable_id"] == continuation["stable_id"]:
+            key["visible_at"] += 1
+    for row in bad_delivery_time["records"]:
+        if row["stable_id"] == continuation["stable_id"]:
+            row["key"]["visible_at"] += 1
+    assert not evidence._historical_polls_endpoint_compatible(bad_delivery_time, cutoff)
+
+    bad_delivery_identity = deepcopy(observation)
+    next(row for row in bad_delivery_identity["records"]
+         if row["stable_id"] == continuation["stable_id"])["key"]["stable_id"] += "-other"
+    assert not evidence._historical_polls_endpoint_compatible(bad_delivery_identity, cutoff)
+
+    due = deepcopy(observation)
+    due_key = next(key for key in due["pending_keys"] if key["stable_id"] == continuation["stable_id"])
+    due_key["visible_at"] = cutoff
+    next(record for record in due["records"] if record["stable_id"] == continuation["stable_id"])["key"]["visible_at"] = cutoff
+    assert not evidence._historical_polls_endpoint_compatible(due, cutoff)
+
+    future_market = next(
+        record for record in observation["records"]
+        if record["kind"] == "HISTORICAL_MARKET_STEP" and record["classification"] == "PENDING"
+    )
+    missing_market = deepcopy(observation)
+    missing_market["pending_keys"] = [key for key in missing_market["pending_keys"]
+                                     if key != future_market["key"]]
+    missing_market["records"] = [record for record in missing_market["records"]
+                                 if record["key"] != future_market["key"]]
+    assert not evidence._historical_coverage_records_compatible(coverage, missing_market, cutoff)
+
+    mismatched_market = deepcopy(observation)
+    changed_key = next(key for key in mismatched_market["pending_keys"]
+                       if key["stable_id"] == future_market["stable_id"])
+    changed_key["schedule_sequence"] += 1
+    assert not evidence._historical_coverage_records_compatible(coverage, mismatched_market, cutoff)
+
+    due_market = deepcopy(observation)
+    due_key = next(key for key in due_market["pending_keys"]
+                   if key["stable_id"] == future_market["stable_id"])
+    due_key["visible_at"] = cutoff
+    next(record for record in due_market["records"]
+         if record["stable_id"] == future_market["stable_id"])["key"]["visible_at"] = cutoff
+    assert not evidence._historical_coverage_records_compatible(coverage, due_market, cutoff)
+
+
+@pytest.mark.parametrize("offset", [100_001, 100_005, 100_006, 100_010, 100_011, 100_015])
+def test_h03_poll_endpoint_stage_boundary_matrix(offset):
+    _, observation, cutoff = h03_endpoint_observation(offset)
+    assert evidence._historical_polls_endpoint_compatible(observation, cutoff)
+
+
+def test_h03_earn_if_due_uses_frozen_earn_snapshot_stage():
+    _, observation, cutoff = h03_endpoint_observation(5_001)
+    poll = next(row for row in observation["polls"] if row["status"] == "IN_PROGRESS")
+    assert poll["awaiting"] == "EARN_IF_DUE"
+    assert any(
+        row["stable_id"] == f"{poll['poll_id']}_EARN"
+        for row in observation["records"]
+    )
+    assert evidence._historical_polls_endpoint_compatible(observation, cutoff)
 
 
 def expected_checks(values):

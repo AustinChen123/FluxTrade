@@ -110,10 +110,15 @@ def _diagnose(directory: int) -> dict[str, _Any]:
             raise _Invalid()
         persisted = dict(ordinal=len(journal), journal_seq=len(journal), barrier_id=journal[-1]["barrier_id"]) if journal else None
         processed = status["processed_boundary"]
-        if (status["schema_version"] == "spider_status_v1" and status["state"] == "FAILED"
-                and status["failure_reason"] == "PERSISTENCE_FAILED" and status["persisted_boundary"] == persisted
-                and processed is not None and processed["ordinal"] == processed["journal_seq"] > len(journal)
-                and all(row["run_id"] == status["run_id"] for row in journal)):
+        advanced = (processed is not None and processed["ordinal"] == processed["journal_seq"] > len(journal)
+                    and processed["ordinal"] > (persisted["ordinal"] if persisted is not None else 0))
+        matching_journal = status["persisted_boundary"] == persisted and all(
+            row["run_id"] == status["run_id"] for row in journal
+        )
+        failed_persistence = (status["state"] == "FAILED" and status["failure_reason"] == "PERSISTENCE_FAILED")
+        running_p3_frontier = status["state"] == "RUNNING" and "historical_context" in status
+        if (status["schema_version"] == "spider_status_v1" and matching_journal and advanced
+                and (failed_persistence or running_p3_frontier)):
             return _reject("INCOMPLETE_PERSISTENCE", _DIAGNOSTIC)
     except (OSError, _Unsafe, _Oversize, _Invalid):
         pass

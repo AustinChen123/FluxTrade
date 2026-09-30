@@ -34,6 +34,7 @@ _PROGRAM = tuple("python-strategy/src/core/backtest/" + name + ".py" for name in
     "spider_run_native_schema", "spider_run_reconciliation_schema", "spider_run_store", "spider_scenario_plan_liquidation",
     "spider_scenario_plan_o03", "spider_scenario_plan_scheduled", "spider_scenario_plans", "spider_scenario_run"))
 _POLICY = "eb6ab34d8685fb59e286f5ffda8af24cbecf3e5ab2c729c585ccdca797cac336"
+_P3_POLICY_SOURCE = "4dbf2bdbee87d4100004fe5b14a93f597e64a9bca6525ed2902afd3476ee40ec"
 _P2_SELECTOR = "SPIDER_P2_CONFIGURED_SCALE_V1"
 _P2_PLAN_SHA256 = "8235c952a5d199825a2a77842b03f49e213ef707c0f30b24d8bf623fde53c2b3"
 _P2_CONFIG_SHA256 = "807054044bdd182274509535ecf8bbc4598f00b6a92b598c6228129a6ff11b70"
@@ -111,8 +112,8 @@ def _historical_configuration(raw: bytes, run_id: str):
     if run.run_id != run_id:
         raise _HistoricalInputError("historical run id does not match invocation")
     semantic_hash = _validate_historical_input(run)
-    policy = _sha256((_ROOT / "docs/internal/spider_source_replica_v1/source_manifest.json").read_bytes()).hexdigest()
-    if policy != _POLICY or policy != run.policy_source_sha256:
+    policy = _sha256((_ROOT / "docs/internal/spider_source_replica_v1/policy.py").read_bytes()).hexdigest()
+    if policy != _P3_POLICY_SOURCE or policy != run.policy_source_sha256:
         raise _HistoricalInputError("current policy source does not match historical input")
     configuration = _decode_p2_configuration(
         run.configuration_bytes, run.configuration_sha256, run.ordered_products,
@@ -408,8 +409,8 @@ def _execute_historical(store, attempt, run: _HistoricalRunInput):
             return
         ordinal = len(journal) + 1
         boundary = dict(ordinal=ordinal, journal_seq=ordinal, barrier_id=key["stable_id"])
-        store.mark_processed(boundary, record_kind=kind)
         try:
+            store.mark_processed(boundary, record_kind=kind)
             payload = _normalized(observed)
             before_version = after_version = None
             if kind == "SOURCE_GROUP_RESULT":
@@ -442,6 +443,9 @@ def _execute_historical(store, attempt, run: _HistoricalRunInput):
         except Exception as error:
             primary = (error.primary_failure if isinstance(error, _StoreError)
                        else dict(kind="PERSISTENCE", reason="EVIDENCE_CAPTURE_FAILED"))
+            if isinstance(error, _StoreError) and error.reason == "PUBLICATION_DURABILITY_UNKNOWN":
+                closed = True
+                raise error
             try:
                 store.publish_failure("PERSISTENCE_FAILED", primary)
             finally:

@@ -343,6 +343,10 @@ def test_historical_registration_persists_input_and_dynamic_journal_frontier(tmp
     expected_history = attempt["historical_context"]
     running = decode_jsonl((store._path / "status.json").read_bytes())[0]
     assert (running["configuration_context"], running["historical_context"]) == (expected_config, expected_history)
+    assert admit_spider_run(store._path) == dict(
+        decision="REJECT", reason="MISSING_COMPLETE_MANIFEST",
+        evidence=("completion.json", "status.json", "journal.jsonl"),
+    )
 
     rows = []
     for sequence in (1, 2):

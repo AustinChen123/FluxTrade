@@ -185,6 +185,16 @@ class SpiderRunStore:
             raise RuntimeError("INVALID_STORE_OPERATION")
         self._processed = deepcopy(boundary)
         self._processed_kind = record_kind if historical else None
+        if historical:
+            try:
+                self._publish("status.json", canonical_bytes(self._status("RUNNING")) + b"\n")
+            except SpiderRunStoreError as error:
+                self._barrier_failed = True
+                reason = ("PUBLICATION_DURABILITY_UNKNOWN" if error.reason == "PUBLICATION_DURABILITY_UNKNOWN"
+                          else "PERSISTENCE_FAILED")
+                raise SpiderRunStoreError(
+                    reason, "PERSISTENCE_FAILED", dict(kind="PERSISTENCE", reason=error.reason),
+                ) from error
 
     def append_journal(self, row: dict[str, Any]) -> None:
         self._allowed("RUNNING")

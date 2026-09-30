@@ -1,6 +1,9 @@
 """Bounded orchestration proofs across the real store, scheduler and native owner."""
 
 import ast
+import multiprocessing
+import os
+import signal
 from copy import deepcopy
 from dataclasses import replace
 from decimal import Decimal
@@ -19,6 +22,7 @@ from src.core.backtest.spider_run_admission import admit_spider_run
 from src.core.backtest.spider_scenario_plans import PLAN_IDS, plan_bundle
 from src.core.backtest.spider_historical_input import encode_historical_run_input
 from test_spider_historical_input import _rehashed_run, _valid_run
+from test_spider_historical_oracle import _case_answer, _enqueue_policy_order, _oracle_run
 
 CONFIGURED_GROUP_VERSIONS = (
     ("G-501", 1), ("G-502", 2), ("G-503", 3), ("G-504", 4),
@@ -46,8 +50,75 @@ def historical_input(name="p3-run", *, partial_fill=False):
             for row in value.trade_bars
         )
         value = _rehashed_run(value, trade_rows=trade_rows)
-    value = replace(value, run_id=name, policy_source_sha256=run._POLICY)
+    value = replace(value, run_id=name, policy_source_sha256=run._P3_POLICY_SOURCE)
     return value, encode_historical_run_input(value)
+
+
+def frozen_h03_input(run_id):
+    source, value = _oracle_run("H03")
+    answer = _case_answer("H03")
+    assert source["policy"].endswith(run._P3_POLICY_SOURCE)
+    assert answer["S1"] == "E+40000_crossing_before_accept,no_fill"
+    assert answer["S2"] == "acceptE+40001,no_backfill"
+    assert answer["S3"].startswith("E+100000_fillLONG1@95,fee0.095,cash999.905")
+    assert answer["endpoint"].startswith("E+100001,before_noticeE+100002")
+    value = replace(value, run_id=run_id)
+    return value, encode_historical_run_input(value)
+
+
+def queue_frozen_h03_order(composition, value):
+    start = value.range_start_ms
+    return _enqueue_policy_order(
+        composition,
+        start + 40_000,
+        "send",
+        dict(
+            instId="A-USDT-SWAP",
+            side="buy",
+            ordType="limit",
+            clOrdId="H03-ORDER-1",
+            sz="1",
+            px="95",
+        ),
+    )
+
+
+def frozen_h03_factory(original):
+    def with_frozen_order(historical_run):
+        composition = original(historical_run)
+        queue_frozen_h03_order(composition, historical_run)
+        return composition
+
+    return with_frozen_order
+
+
+def install_frozen_h03_order(monkeypatch):
+    monkeypatch.setattr(
+        run._ReplayComposition,
+        "_from_historical_run",
+        staticmethod(frozen_h03_factory(run._ReplayComposition._from_historical_run)),
+    )
+
+
+def _kill_child_after_filled_market_marker(output_root, run_id, raw, connection):
+    original_append = storage.SpiderRunStore.append_journal
+    original_factory = run._ReplayComposition._from_historical_run
+    run._ReplayComposition._from_historical_run = staticmethod(frozen_h03_factory(original_factory))
+    def block_before_append(store, row):
+        fills = [fill for product in row.get("payload", {}).get("result", {}).get("products", [])
+                 for fill in product.get("fills", [])]
+        if row["record_kind"] == "HISTORICAL_MARKET_RESULT" and fills:
+            connection.send(("MARKED", row["barrier_id"], row["journal_seq"], len(fills)))
+            connection.recv()
+        return original_append(store, row)
+    storage.SpiderRunStore.append_journal = block_before_append
+    try:
+        result = run.run_spider_scenario(output_root, run_id, run._P3_SELECTOR, raw)
+        connection.send(("RETURNED", result))
+    finally:
+        storage.SpiderRunStore.append_journal = original_append
+        run._ReplayComposition._from_historical_run = staticmethod(original_factory)
+        connection.close()
 
 
 @pytest.mark.parametrize("index", range(3))
@@ -154,6 +225,31 @@ def test_historical_persistence_failure_is_terminal_and_unadmitted(tmp_path, mon
     assert not (tmp_path / value.run_id / "completion.json").exists()
 
 
+def test_historical_processed_marker_publication_failure_stops_before_append(tmp_path, monkeypatch):
+    value, raw = historical_input("h11-marker-publication-failure")
+    original = storage.SpiderRunStore._publish
+    failures = []
+
+    def fail_first_processed_status(store, name, data):
+        if name == "status.json" and store._processed is not None and not failures:
+            failures.append(store._processed.copy())
+            raise storage.SpiderRunStoreError("ARTIFACT_WRITE_FAILED")
+        return original(store, name, data)
+
+    monkeypatch.setattr(storage.SpiderRunStore, "_publish", fail_first_processed_status)
+    result = run.run_spider_scenario(str(tmp_path), value.run_id, run._P3_SELECTOR, raw)
+    assert result == dict(run_id=value.run_id, outcome="FAILED", reason="PERSISTENCE_FAILED")
+    directory = tmp_path / value.run_id
+    status = read(tmp_path, value.run_id, "status.json")[0]
+    journal = read(tmp_path, value.run_id, "journal.jsonl")
+    assert len(failures) == 1
+    assert status["state"] == "FAILED" and status["failure_reason"] == "PERSISTENCE_FAILED"
+    assert status["processed_boundary"] == failures[0]
+    assert status["persisted_boundary"] is None and journal == []
+    assert not (directory / "completion.json").exists()
+    assert admit_spider_run(directory)["reason"] == "INCOMPLETE_PERSISTENCE"
+
+
 @pytest.mark.parametrize("capture_site", ["SOURCE_GROUP_RESULT", "HISTORICAL_MARKET_RESULT"])
 def test_historical_post_mutation_capture_failure_preserves_unpersisted_frontier(
     tmp_path, monkeypatch, capture_site,
@@ -219,6 +315,140 @@ def test_historical_post_mutation_capture_failure_preserves_unpersisted_frontier
     assert admit_spider_run(directory)["reason"] == "INCOMPLETE_PERSISTENCE"
 
 
+def test_historical_sigkill_after_durable_market_marker_then_clean_new_run(tmp_path, monkeypatch):
+    failed_run, failed_input = frozen_h03_input("h11-killed-run")
+    baseline_run = replace(failed_run, run_id="h11-baseline-run")
+    baseline_input = encode_historical_run_input(baseline_run)
+    install_frozen_h03_order(monkeypatch)
+    baseline_result = run.run_spider_scenario(
+        str(tmp_path), baseline_run.run_id, run._P3_SELECTOR, baseline_input,
+    )
+    assert baseline_result == dict(run_id=baseline_run.run_id, outcome="ADMITTED", reason=None)
+    baseline_admission = admit_spider_run(tmp_path / baseline_run.run_id)
+    assert baseline_admission["decision"] == "ACCEPT"
+
+    context = multiprocessing.get_context("spawn")
+    parent, child = context.Pipe()
+    process = context.Process(
+        target=_kill_child_after_filled_market_marker,
+        args=(str(tmp_path), failed_run.run_id, failed_input, child),
+    )
+    process.start()
+    child.close()
+    try:
+        assert parent.poll(60), "child never reached post-marker, pre-journal append window"
+        message = parent.recv()
+        assert message[0] == "MARKED", message
+        barrier_id, ordinal, fills = message[1:]
+        assert fills > 0
+
+        failed_directory = tmp_path / failed_run.run_id
+        status = read(tmp_path, failed_run.run_id, "status.json")[0]
+        journal = read(tmp_path, failed_run.run_id, "journal.jsonl")
+        processed, persisted = status["processed_boundary"], status["persisted_boundary"]
+        assert status["state"] == "RUNNING"
+        assert processed == dict(ordinal=ordinal, journal_seq=ordinal, barrier_id=barrier_id)
+        assert processed["ordinal"] == len(journal) + 1
+        assert (persisted["ordinal"] if persisted is not None else 0) == len(journal)
+        assert not any(row["barrier_id"] == barrier_id for row in journal)
+        assert not (failed_directory / "completion.json").exists()
+
+        os.kill(process.pid, signal.SIGKILL)
+        process.join(10)
+        assert process.exitcode == -signal.SIGKILL
+        assert admit_spider_run(failed_directory) == dict(
+            decision="REJECT", reason="INCOMPLETE_PERSISTENCE",
+            evidence=("completion.json", "status.json", "journal.jsonl"),
+        )
+        killed_bytes = {path.name: path.read_bytes() for path in failed_directory.iterdir() if path.is_file()}
+
+        clean_run = replace(failed_run, run_id="h11-clean-run")
+        clean_input = encode_historical_run_input(clean_run)
+        assert run._historical_configuration(failed_input, failed_run.run_id)[2][0] == run._historical_configuration(
+            clean_input, clean_run.run_id,
+        )[2][0]
+        clean_result = run.run_spider_scenario(str(tmp_path), clean_run.run_id, run._P3_SELECTOR, clean_input)
+        assert clean_result == dict(run_id=clean_run.run_id, outcome="ADMITTED", reason=None)
+        clean_admission = admit_spider_run(tmp_path / clean_run.run_id)
+        assert clean_admission["decision"] == "ACCEPT"
+        failed_after = {path.name: path.read_bytes() for path in failed_directory.iterdir() if path.is_file()}
+        assert failed_after == killed_bytes
+
+        failed_attempt = read(tmp_path, failed_run.run_id, "attempt.json")[0]
+        clean_attempt = read(tmp_path, clean_run.run_id, "attempt.json")[0]
+        assert failed_attempt["historical_context"] == clean_attempt["historical_context"]
+        assert failed_attempt["input_contract_hashes"] == clean_attempt["input_contract_hashes"]
+
+        def normalize(value):
+            if isinstance(value, dict):
+                return {key: "<run-id>" if key == "run_id" else normalize(item)
+                        for key, item in value.items()}
+            if isinstance(value, list):
+                return [normalize(item) for item in value]
+            return value
+
+        for name in ("journal.jsonl", "endpoint.json", "report.jsonl"):
+            assert normalize(baseline_admission["artifacts"][name]) == normalize(
+                clean_admission["artifacts"][name],
+            )
+        baseline_attempt = baseline_admission["artifacts"]["attempt.json"]
+        assert baseline_attempt["historical_context"] == clean_attempt["historical_context"]
+        assert baseline_attempt["input_contract_hashes"] == clean_attempt["input_contract_hashes"]
+    finally:
+        if process.is_alive():
+            os.kill(process.pid, signal.SIGKILL)
+            process.join(10)
+        parent.close()
+
+
+def test_historical_filled_market_append_failure_keeps_native_mutation_and_unpersisted_marker(
+    tmp_path, monkeypatch,
+):
+    value, raw = frozen_h03_input("h11-append-failure")
+    install_frozen_h03_order(monkeypatch)
+    original = storage.SpiderRunStore.append_journal
+    original_market = wire.ScenarioCodec.historical_market_step
+    failed_rows = []
+    mutated_owners = []
+
+    def record_filled_market(codec, node):
+        result = original_market(codec, node)
+        if any(product["fills"] for product in result["products"]):
+            mutated_owners.append((codec, deepcopy(result["owner_evidence"])))
+        return result
+
+    def fail_filled_market_append(store, row):
+        fills = [fill for product in row.get("payload", {}).get("result", {}).get("products", [])
+                 for fill in product.get("fills", [])]
+        if row["record_kind"] == "HISTORICAL_MARKET_RESULT" and fills:
+            failed_rows.append(row)
+            raise storage.SpiderRunStoreError(
+                "ARTIFACT_WRITE_FAILED", "PERSISTENCE_FAILED",
+                dict(kind="PERSISTENCE", reason="ARTIFACT_WRITE_FAILED"),
+            )
+        return original(store, row)
+
+    monkeypatch.setattr(storage.SpiderRunStore, "append_journal", fail_filled_market_append)
+    monkeypatch.setattr(wire.ScenarioCodec, "historical_market_step", record_filled_market)
+    result = run.run_spider_scenario(str(tmp_path), value.run_id, run._P3_SELECTOR, raw)
+    assert result == dict(run_id=value.run_id, outcome="FAILED", reason="PERSISTENCE_FAILED")
+    assert len(failed_rows) == 1
+    row = failed_rows[0]
+    assert any(product["fills"] for product in row["payload"]["result"]["products"])
+    assert row["payload"]["owner_inspection_after"]["account_version"] > row["payload"]["owner_inspection_before"]["account_version"]
+    assert mutated_owners and mutated_owners[-1][0].inspect_state() == mutated_owners[-1][1]
+    directory = tmp_path / value.run_id
+    status = read(tmp_path, value.run_id, "status.json")[0]
+    journal = read(tmp_path, value.run_id, "journal.jsonl")
+    assert status["state"] == "FAILED" and status["failure_reason"] == "PERSISTENCE_FAILED"
+    assert status["processed_boundary"]["barrier_id"] == row["barrier_id"]
+    assert status["processed_boundary"]["ordinal"] == len(journal) + 1
+    assert (status["persisted_boundary"]["ordinal"] if status["persisted_boundary"] else 0) == len(journal)
+    assert not any(item["barrier_id"] == row["barrier_id"] for item in journal)
+    assert not (directory / "completion.json").exists()
+    assert admit_spider_run(directory)["reason"] == "INCOMPLETE_PERSISTENCE"
+
+
 def test_historical_endpoint_mutation_is_rejected_by_existing_admission(tmp_path, monkeypatch):
     value, raw = historical_input("historical-endpoint-mutation")
     original = run._admit
@@ -231,6 +461,19 @@ def test_historical_endpoint_mutation_is_rejected_by_existing_admission(tmp_path
     monkeypatch.setattr(run, "_admit", tamper)
     result = run.run_spider_scenario(str(tmp_path), value.run_id, run._P3_SELECTOR, raw)
     assert result == dict(run_id=value.run_id, outcome="FAILED", reason="ARTIFACT_MISMATCH")
+
+
+def test_historical_completed_bundle_rejects_one_byte_truncated_endpoint(tmp_path, monkeypatch):
+    value, raw = frozen_h03_input("h11-truncated-endpoint")
+    install_frozen_h03_order(monkeypatch)
+    result = run.run_spider_scenario(str(tmp_path), value.run_id, run._P3_SELECTOR, raw)
+    assert result == dict(run_id=value.run_id, outcome="ADMITTED", reason=None)
+    endpoint = tmp_path / value.run_id / "endpoint.json"
+    original = endpoint.read_bytes()
+    endpoint.write_bytes(original[:-1])
+    rejected = admit_spider_run(tmp_path / value.run_id)
+    assert rejected["decision"] == "REJECT"
+    assert rejected["reason"] in ("ARTIFACT_MISMATCH", "UNSUPPORTED_SCHEMA", "INVALID_MANIFEST")
 
 
 @pytest.mark.parametrize("selector", ["unknown", PLAN_IDS[2]])

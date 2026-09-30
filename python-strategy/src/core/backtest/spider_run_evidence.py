@@ -154,9 +154,109 @@ def _historical_pending_matches(observation: dict[str, _Any], cutoff: int) -> bo
     return seen == set(by_identity)
 
 
-def _historical_polls_complete(observation: dict[str, _Any]) -> bool:
-    return all(poll["status"] == "COMPLETED" and poll["awaiting"] is None
-               for poll in observation["polls"])
+def _historical_polls_endpoint_compatible(observation: dict[str, _Any], cutoff: int) -> bool:
+    """Accept completed polls or an exact, still-future frozen continuation."""
+    if not _historical_pending_matches(observation, cutoff):
+        return False
+    records = observation["records"]
+    pending_keys = observation["pending_keys"]
+    stage_layouts = {
+        True: (("EARN", 0, 1, 5), ("TRADING", 1, 6, 10),
+               ("POSITIONS", 2, 11, 15), ("OPEN_ORDERS", 3, 16, 20)),
+        False: (("TRADING", 0, 1, 5), ("POSITIONS", 1, 6, 10),
+                ("OPEN_ORDERS", 2, 11, 15)),
+    }
+    for poll in observation["polls"]:
+        if poll["status"] == "COMPLETED" and poll["awaiting"] is None:
+            continue
+        if poll["status"] != "IN_PROGRESS":
+            return False
+        awaiting = "EARN" if poll["awaiting"] == "EARN_IF_DUE" else poll["awaiting"]
+        if awaiting not in ("EARN", "TRADING", "POSITIONS", "OPEN_ORDERS"):
+            return False
+        prefix, separator, raw_text = poll["poll_id"].partition("P3_POLL_")
+        if prefix or not separator or not raw_text.isascii() or not raw_text.isdigit():
+            return False
+        raw_at = int(raw_text)
+        if poll["continuation_id"] != f"P3_CONT_{raw_at}":
+            return False
+        timer_id = f"P3_TIMER_{raw_at}"
+        timers = [record for record in records
+                  if record["kind"] == "HISTORICAL_TIMER" and record["stable_id"] == timer_id]
+        if len(timers) != 1:
+            return False
+        has_earn = any(record["kind"] == "SNAPSHOT_CAPTURE"
+                       and record["stable_id"] == f"{poll['poll_id']}_EARN" for record in records)
+        layout = stage_layouts[has_earn]
+        if awaiting == "EARN" and not has_earn:
+            return False
+        stage = next((item for item in layout if item[0] == awaiting), None)
+        if stage is None:
+            return False
+        _, stage_index, capture_offset, delivery_offset = stage
+        expected_sequence = timers[0]["key"]["schedule_sequence"] * 4 + stage_index
+        snapshot_id = f"{poll['poll_id']}_{awaiting}"
+        captures = [record for record in records
+                    if record["kind"] == "SNAPSHOT_CAPTURE" and record["stable_id"] == snapshot_id]
+        if len(captures) != 1:
+            return False
+        capture = captures[0]
+        capture_key = capture["key"]
+        expected_capture_at = (raw_at + capture_offset) * 16 + 5
+        if (capture_key["queue_class"] != "SNAPSHOT_CAPTURE"
+                or capture_key["stable_id"] != snapshot_id
+                or capture_key["schedule_sequence"] != expected_sequence
+                or capture_key["visible_at"] != expected_capture_at):
+            return False
+        if capture["classification"] == "PENDING":
+            if expected_capture_at <= cutoff or capture_key not in pending_keys:
+                return False
+            delivery_at = (raw_at + delivery_offset) * 16 + 6
+            if any(record["kind"] == "DELIVERY" and record["key"]["schedule_sequence"] == expected_sequence
+                   and record["key"]["visible_at"] == delivery_at for record in records):
+                return False
+            continue
+        if capture["classification"] != "SUCCESS" or expected_capture_at > cutoff:
+            return False
+        delivery_at = (raw_at + delivery_offset) * 16 + 6
+        continuations = [record for record in records
+                         if record["kind"] == "DELIVERY" and record["classification"] == "PENDING"
+                         and record["key"]["queue_class"] == "DELIVERY"
+                         and record["key"]["schedule_sequence"] == expected_sequence
+                         and record["key"]["visible_at"] == delivery_at
+                         and record["key"] in pending_keys]
+        if len(continuations) != 1 or delivery_at <= cutoff:
+            return False
+    return True
+
+
+def _historical_coverage_records_compatible(coverage: list[dict[str, _Any]],
+                                            observation: dict[str, _Any], cutoff: int) -> bool:
+    """Require every frozen planned identity, accepting only exact future pending keys."""
+    if not _historical_pending_matches(observation, cutoff):
+        return False
+    planned = {(item["record_kind"], item["barrier_id"]): item for item in coverage}
+    if len(planned) != len(coverage):
+        return False
+    seen: set[tuple[str, str]] = set()
+    kinds = ("HISTORICAL_MARKET_STEP", "HISTORICAL_MARKET_CACHE", "HISTORICAL_TIMER")
+    for record in observation["records"]:
+        if record["kind"] not in kinds:
+            continue
+        identity = record["kind"], record["stable_id"]
+        visible_at = record["key"]["visible_at"]
+        if identity not in planned or identity in seen:
+            return False
+        if record["classification"] == "SUCCESS":
+            if visible_at > cutoff:
+                return False
+        elif record["classification"] == "PENDING":
+            if visible_at <= cutoff or record["key"] not in observation["pending_keys"]:
+                return False
+        else:
+            return False
+        seen.add(identity)
+    return seen == set(planned)
 
 
 def _context_chain(attempt: dict[str, _Any], *artifacts: object) -> _ConfigurationContext | None:
@@ -301,22 +401,11 @@ def _historical_endpoint(run_id: str, attempt: dict[str, _Any], status: dict[str
     if persisted is None or persisted != processed or type(cutoff) is not int:
         raise ReconciliationProjectionError()
     coverage = attempt["planned_coverage"]
-    planned = {(item["record_kind"], item["barrier_id"]): item for item in coverage}
-    seen: set[tuple[str, str]] = set()
-    planned_records = [record for record in observation["records"]
-                       if record["kind"] in ("HISTORICAL_MARKET_STEP", "HISTORICAL_MARKET_CACHE", "HISTORICAL_TIMER")]
-    for record in planned_records:
-        identity = record["kind"], record["stable_id"]
-        if identity not in planned or identity in seen or record["classification"] != "SUCCESS":
-            raise ReconciliationProjectionError()
-        if record["key"]["visible_at"] > cutoff:
-            raise ReconciliationProjectionError()
-        seen.add(identity)
-    if seen != set(planned):
+    if not _historical_coverage_records_compatible(coverage, observation, cutoff):
         raise ReconciliationProjectionError()
     if observation.get("gate") != "RUNNING" or observation.get("terminal") is not None:
         raise ReconciliationProjectionError()
-    if not _historical_pending_matches(observation, cutoff) or not _historical_polls_complete(observation):
+    if not _historical_polls_endpoint_compatible(observation, cutoff):
         raise ReconciliationProjectionError()
     pending = observation["pending_keys"]
     for action in observation["callback_actions"]:
@@ -374,9 +463,8 @@ def _historical_reconciliation(run_id: str, attempt: dict[str, _Any], status: di
     ))
     observed_coverage = [dict(ordinal=index, barrier_id=row["stable_id"], record_kind=row["kind"])
                          for index, row in enumerate(market_records, 1)]
-    coverage_ok = (_equal(planned, observed_coverage) and len(market_records) == len(planned)
-                   and all(row["classification"] == "SUCCESS" and row["key"]["visible_at"] <= cutoff
-                           for row in market_records)
+    coverage_ok = (_equal(planned, observed_coverage)
+                   and _historical_coverage_records_compatible(planned, observation, cutoff)
                    and endpoint["remaining_planned_barriers"] == [])
     boundary = (dict(ordinal=journal[-1]["journal_seq"], barrier_id=journal[-1]["barrier_id"],
                      journal_seq=journal[-1]["journal_seq"]) if journal else None)
@@ -486,7 +574,7 @@ def _historical_reconciliation(run_id: str, attempt: dict[str, _Any], status: di
     queue_ok = (_historical_pending_matches(observation, cutoff)
                 and endpoint["remaining_planned_barriers"] == [])
     polls = observation["polls"]
-    polls_ok = _historical_polls_complete(observation)
+    polls_ok = _historical_polls_endpoint_compatible(observation, cutoff)
     actions = _actions(journal, observation["callback_actions"])
     actions_ok = all(action["status"] != "UNSUBMITTED" or any(
         key["queue_class"] == "DELIVERY" and key["stable_id"] == action["delivery_id"] for key in pending

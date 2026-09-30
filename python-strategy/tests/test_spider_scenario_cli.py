@@ -117,7 +117,7 @@ def test_actual_historical_cli_admits_native_input(tmp_path, partial_fill):
         )
         run_input = _rehashed_run(run_input, trade_rows=trade_rows)
     name = "cli-p3-fill" if partial_fill else "cli-p3-flat"
-    run_input = replace(run_input, run_id=name, policy_source_sha256=run._POLICY)
+    run_input = replace(run_input, run_id=name, policy_source_sha256=run._P3_POLICY_SOURCE)
     input_path = tmp_path / "historical-input.json"
     input_path.write_bytes(encode_historical_run_input(run_input))
     result = subprocess.run(
