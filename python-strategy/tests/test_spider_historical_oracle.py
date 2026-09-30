@@ -1,4 +1,4 @@
-"""Independent causal closure for the frozen H02-H04 oracle cases."""
+"""Independent causal closure for the frozen historical oracle cases."""
 
 from dataclasses import replace
 from copy import deepcopy
@@ -35,6 +35,13 @@ ORDERS = {
     "H04": [
         ("H04-ORDER-1", "A-USDT-SWAP", "SHORT", "105", "3", "H04-CLIENT-1"),
     ],
+    "H05": [
+        ("H05-A-REDUCE", "A-USDT-SWAP", "SHORT", "55", "1", "H05-A-REDUCE-CLIENT", True),
+    ],
+    "H10": [
+        ("H10-ORDER-1", "A-USDT-SWAP", "LONG", "49900", "1", "H10-CLIENT-1"),
+        ("H10-ORDER-2", "A-USDT-SWAP", "LONG", "49900", "1", "H10-CLIENT-2"),
+    ],
 }
 
 
@@ -45,10 +52,15 @@ def _record(path, digest, case):
         row for row in raw.decode("utf-8").splitlines() if row.startswith(case + "|")
     )
     fields = {}
+    opaque_index = 0
     for field in line.split("|")[1:]:
         key, separator, value = field.partition("=")
-        assert separator and key not in fields
-        fields[key] = value
+        if separator:
+            assert key not in fields
+            fields[key] = value
+        else:
+            fields[f"_terms_{opaque_index}"] = field
+            opaque_index += 1
     assert line.startswith(case + "|")
     fields["case"] = case
     return fields
@@ -58,7 +70,10 @@ def _oracle_run(case):
     source = _record(INPUTS, INPUTS_SHA256, case)
     base = _valid_run()
     start = EPOCH
-    end_offset = {"H02": 20_002, "H03": 100_001, "H04": 100_001}[case]
+    end_offset = {
+        "H02": 20_002, "H03": 100_001, "H04": 100_001,
+        "H05": 20_004, "H10": 1,
+    }[case]
     end = start + end_offset
     delta = start - base.range_start_ms
     trade_rows = tuple(
@@ -138,9 +153,12 @@ def _oracle_run(case):
     config = _p2_configuration()
     config["config_id"] = config_id
     config["seed_effective_at"] = start - 1
-    config["cash"] = "1000"
+    cash = {"H02": "1000", "H03": "1000", "H04": "1000", "H05": "20.15", "H10": "2001"}[case]
+    config["cash"] = cash
+    config["leverage"] = "1000" if case == "H10" else "10"
     seed_orders = []
-    for owner_id, product_id, side, price, quantity, client_id in ORDERS.get(case, []):
+    for row in ORDERS.get(case, []):
+        owner_id, product_id, side, price, quantity, client_id, *extras = row
         seed_orders.append(
             dict(
                 intent_id=f"INTENT-{owner_id}",
@@ -150,7 +168,7 @@ def _oracle_run(case):
                 product_id=product_id,
                 side=side,
                 limit_price=price,
-                reduce_only=False,
+                reduce_only=bool(extras[0]) if extras else False,
                 original_quantity_contracts=quantity,
                 filled_quantity_contracts="0",
                 canceled_quantity_contracts="0",
@@ -179,52 +197,82 @@ def _oracle_run(case):
     for row in policy_state["rows"]:
         row.update(
             active="true",
-            leverage="1",
+            leverage="1000" if case == "H10" else "10" if case == "H05" else "1",
             歩差="1",
             單數="1",
             hold上限="0.8",
             hold下限="-0.8",
             hold="0",
         )
-    spec_values = {
-        "H02": {"A-USDT-SWAP": ("1", "1", "1"), "B-USDT-SWAP": ("1", "1", "1")},
-        "H03": {"A-USDT-SWAP": ("1", "1", "1"), "B-USDT-SWAP": ("1", "1", "1")},
-        "H04": {"A-USDT-SWAP": ("0.5", "0.5", "0.5"), "B-USDT-SWAP": ("1", "1", "1")},
-    }[case]
+    frozen_specs = {
+        "H02": {"A-USDT-SWAP": ("1", "1", "1", "1", "1"), "B-USDT-SWAP": ("1", "1", "1", "1", "1")},
+        "H03": {"A-USDT-SWAP": ("1", "1", "1", "1", "1"), "B-USDT-SWAP": ("1", "1", "1", "1", "1")},
+        "H04": {"A-USDT-SWAP": ("1", "1", "0.5", "0.5", "0.5"), "B-USDT-SWAP": ("1", "1", "1", "1", "1")},
+        "H05": {"A-USDT-SWAP": ("2", "1", "1", "1", "1"), "B-USDT-SWAP": ("0.5", "1", "1", "1", "1")},
+        "H10": {"A-USDT-SWAP": ("0.01", "1", "1", "1", "1"), "B-USDT-SWAP": ("1", "1", "1", "1", "1")},
+    }
+    spec_values = frozen_specs[case]
+    if case == "H04":
+        tick_step_min = source["tick_step_min"]
+        frozen_policy_steps = {
+            {"A": "A-USDT-SWAP", "B": "B-USDT-SWAP"}[product]: tuple(values.split(","))
+            for product, values in (part.split(":") for part in tick_step_min.split(";"))
+        }
+        assert frozen_policy_steps == {
+            product: values[2:] for product, values in spec_values.items()
+        }
+    if case == "H05":
+        assert source["config"].startswith("P3_ORACLE_CONFIG_H05_V1:")
     for product_config, market in zip(
         config["products"], policy_state["markets"], strict=True
     ):
         product = product_config["product_id"]
-        tick, lot, minimum = spec_values[product]
+        expected_values = spec_values[product]
+        contract_value, multiplier, tick, lot, minimum = spec_values[product]
         product_config["taker_fee_rate"] = "0.001"
         product_config["liquidation_fee_rate"] = "0.00602"
         product_config["specs"][0].update(
-            contract_value="1",
-            multiplier="1",
+            contract_value=contract_value,
+            multiplier=multiplier,
             price_tick=tick,
             quantity_step=lot,
             minimum_quantity=minimum,
         )
-        product_config["tiers"][0]["rows"][0].update(
-            maximum_contracts="1000",
-            mmr="0.005",
-            imr="0.1",
-            max_leverage="10",
-        )
-        product_config["marks"][0].update(valid_to=end + 60_000, mark="100")
+        if case == "H10" and product == "A-USDT-SWAP":
+            product_config["tiers"][0]["rows"] = [
+                dict(minimum_contracts="0", maximum_contracts="1000", mmr="0.004", imr="0.001", max_leverage="1000"),
+                dict(minimum_contracts="1000.01", maximum_contracts="5000", mmr="0.005", imr="0.001", max_leverage="1000"),
+            ]
+        else:
+            product_config["tiers"][0]["rows"][0].update(
+                maximum_contracts="1000", mmr="0.005", imr="0.1", max_leverage="10",
+            )
+        default_mark = {"H05": {"A-USDT-SWAP": "50", "B-USDT-SWAP": "200"}, "H10": {"A-USDT-SWAP": "49900", "B-USDT-SWAP": "200"}}.get(case, {})
+        product_config["marks"][0].update(valid_to=end + 60_000, mark=default_mark.get(product, "100"))
         market.update(
-            ctVal="1",
+            ctVal=contract_value,
             lotSz=lot,
             minSz=minimum,
             increment=tick,
             ratioHL="0",
             state="live",
         )
+        assert tuple(
+            product_config["specs"][0][field]
+            for field in ("contract_value", "multiplier", "price_tick", "quantity_step", "minimum_quantity")
+        ) == expected_values
+        assert tuple(market[field] for field in ("ctVal", "increment", "lotSz", "minSz")) == (
+            expected_values[0], expected_values[2], expected_values[3], expected_values[4]
+        )
     if case == "H04":
         policy_state["rows"][0].update(歩差="0.5")
         policy_state["markets"][0]["price"] = "105"
     elif case == "H03":
         policy_state["markets"][0]["price"] = "100"
+    elif case in ("H05", "H10"):
+        policy_state["capital"].update(total=cash, usdt=cash, avail=cash)
+        policy_state["markets"][0]["price"] = "50" if case == "H05" else "49900"
+        policy_state["markets"][1]["price"] = "200"
     if case == "H02":
         for seed, row in zip(seed_orders, ORDERS[case], strict=True):
             owner_id, product_id, side, price, quantity, client_id = row
@@ -237,7 +285,15 @@ def _oracle_run(case):
                 sz=quantity,
                 accFillSz="0",
             )
-    config["positions"] = []
+    positions = []
+    if case in ("H05", "H10"):
+        product_id = "A-USDT-SWAP"
+        quantity, entry = ("1", "50") if case == "H05" else ("1000", "49900")
+        positions = [dict(product_id=product_id, side="LONG", quantity_contracts=quantity,
+                          lots=[dict(seed_execution_id=f"{case}-SEED-EXECUTION", seed_sequence=0,
+                                     strategy_id="SPIDER_GRID_ORIGINAL_V1", quantity_contracts=quantity,
+                                     entry_price=entry)])]
+    config["positions"] = positions
     config_bytes_run = _run_with_configuration(base, config)
     run = replace(
         config_bytes_run,
@@ -260,9 +316,11 @@ def _oracle_run(case):
             replace(
                 spec,
                 effective_at_ms=start,
-                price_tick=D(spec_values[spec.product_id][0]),
-                quantity_step=D(spec_values[spec.product_id][1]),
-                minimum_quantity=D(spec_values[spec.product_id][2]),
+                contract_value=D(spec_values[spec.product_id][0]),
+                multiplier=D(spec_values[spec.product_id][1]),
+                price_tick=D(spec_values[spec.product_id][2]),
+                quantity_step=D(spec_values[spec.product_id][3]),
+                minimum_quantity=D(spec_values[spec.product_id][4]),
             )
             for spec in base.spec_before
         ),
@@ -270,18 +328,32 @@ def _oracle_run(case):
             replace(
                 spec,
                 effective_at_ms=end,
-                price_tick=D(spec_values[spec.product_id][0]),
-                quantity_step=D(spec_values[spec.product_id][1]),
-                minimum_quantity=D(spec_values[spec.product_id][2]),
+                contract_value=D(spec_values[spec.product_id][0]),
+                multiplier=D(spec_values[spec.product_id][1]),
+                price_tick=D(spec_values[spec.product_id][2]),
+                quantity_step=D(spec_values[spec.product_id][3]),
+                minimum_quantity=D(spec_values[spec.product_id][4]),
             )
             for spec in base.spec_after
         ),
         initial_policy_cache=canonical_bytes(policy_state),
-        initial_account_state=_initial_account_state(
-            cash="1000", orders=seed_orders, positions=[]
-        ),
+        initial_account_state=_initial_account_state(cash=cash, orders=seed_orders, positions=positions),
     )
     run = _rehashed_run(run, trade_rows=trade_rows, mark_rows=mark_rows)
+    assert {
+        spec.product_id: (
+            str(spec.contract_value), str(spec.multiplier), str(spec.price_tick),
+            str(spec.quantity_step), str(spec.minimum_quantity),
+        )
+        for spec in run.spec_before
+    } == spec_values
+    assert {
+        spec.product_id: (
+            str(spec.contract_value), str(spec.multiplier), str(spec.price_tick),
+            str(spec.quantity_step), str(spec.minimum_quantity),
+        )
+        for spec in run.spec_after
+    } == spec_values
     assert validate_historical_input(run)
     return source, run
 
@@ -883,3 +955,127 @@ def test_frozen_h04_fill_then_cancel_request_effect_ack_and_later_exclusion():
         "E+100001,cash999.7375,basis262.5,mark110,upl-12.5,equity987.2375,"
         "gross0,fees0.2625,mmr1.375,no_working_order"
     )
+
+
+def test_frozen_h05_shared_admission_reject_then_accept_after_a_close():
+    source, run = _oracle_run("H05")
+    answer = _case_answer("H05")
+    assert source["cash"] == "20.15"
+    assert "usedA10.11+proposedB10.1=20.21" in answer["B-ATTEMPT-1"]
+    composition = _ReplayComposition._from_historical_run(run)
+    start = run.range_start_ms
+    assert composition._dispatch_due(start * 16 + 7)["classification"] == "SUCCESS"
+    before_rejection = composition._codec.inspect_state()
+
+    _enqueue_policy_order(
+        composition, start, "send",
+        dict(clOrdId="H05-B-ATTEMPT-1", instId="B-USDT-SWAP", side="buy",
+             ordType="limit", sz="1", px="200"),
+    )
+    assert composition._dispatch_due((start + 1) * 16 + 3)["classification"] == "SUCCESS"
+    rejected = [
+        record["result"]["group_result"]
+        for record in composition._records.values()
+        if record["item"]["kind"] == "SOURCE_GROUP"
+    ][0]
+    assert rejected["classification"] == "REJECTED"
+    assert [row["reason"] for row in rejected["rejections"]] == [
+        "INSUFFICIENT_SHARED_EQUITY"
+    ]
+    after_rejection = composition._codec.inspect_state()
+    assert after_rejection["account_version"] == before_rejection["account_version"]
+    assert (after_rejection["cash"], after_rejection["total_fees"]) == (D("20.15"), D("0"))
+    assert [row["order_id"] for row in composition._codec.historical_working_orders()] == [
+        "H05-A-REDUCE"
+    ]
+
+    assert composition._dispatch_due((start + 20_000) * 16 + 8)["classification"] == "SUCCESS"
+    close = next(
+        record["result"]["historical_result"]
+        for record in composition._records.values()
+        if record["item"]["kind"] == "HISTORICAL_MARKET_STEP"
+        and record["item"]["node"]["step_index"] == 1
+    )
+    assert [
+        (fill["order_id"], fill["quantity_contracts"], fill["price"])
+        for row in close["products"] for fill in row["fills"]
+    ] == [("H05-A-REDUCE", D("1"), D("55"))]
+    after_close = composition._codec.inspect_state()
+    assert (after_close["cash"], after_close["gross_realized"], after_close["total_fees"]) == (
+        D("30.04"), D("10"), D("0.11")
+    )
+    assert composition._codec.historical_working_orders() == []
+
+    _enqueue_policy_order(
+        composition, start + 20_001, "send",
+        dict(clOrdId="H05-B-ATTEMPT-2", instId="B-USDT-SWAP", side="buy",
+             ordType="limit", sz="1", px="200"),
+    )
+    assert composition._dispatch_due((start + 20_002) * 16 + 3)["classification"] == "SUCCESS"
+    accepted = [
+        record["result"]["group_result"]
+        for record in composition._records.values()
+        if record["item"]["kind"] == "SOURCE_GROUP"
+    ][1]
+    assert accepted["classification"] == "COMMITTED"
+    assert len(accepted["committed_references"]) == 1
+    assert composition._dispatch_due((start + 20_004) * 16 + 6)["classification"] == "SUCCESS"
+    state = composition._codec.inspect_state()
+    assert (state["cash"], state["gross_realized"], state["total_fees"]) == (
+        D("30.04"), D("10"), D("0.11")
+    )
+    assert [
+        (row["side"], row["remaining_quantity_contracts"], row["limit_price"])
+        for row in composition._codec.historical_working_orders()
+    ] == [("LONG", D("1"), D("200"))]
+    endpoint = (start + 20_004) * 16 + 6
+    trading = _snapshot(composition, "TRADING", "H05-END-TRADING", endpoint)
+    assert trading == {"available_equity": D("19.94"), "equity": D("30.04"), "outcome": "SUCCESS"}
+    open_orders = _snapshot(composition, "OPEN_ORDERS", "H05-END-ORDERS", endpoint)
+    assert [(row["client_order_id"], row["state"], row["limit_price"]) for row in open_orders["rows"]] == [
+        ("H05-B-ATTEMPT-2", "live", D("200"))
+    ]
+    assert "creates_only_B-ORDER-2" in answer["B-ATTEMPT-2"]
+
+
+def test_frozen_h10_first_candidate_triggers_immediate_risk_transition():
+    source, run = _oracle_run("H10")
+    answer = _case_answer("H10")
+    assert source["orders"].startswith("H10-ORDER-1")
+    assert answer["candidate2"] == "no_execution_no_fee_no_receipt"
+    composition = _ReplayComposition._from_historical_run(run)
+    start = run.range_start_ms
+    assert [
+        (row["order_id"], row["accepted_source_sequence"])
+        for row in composition._codec.historical_working_orders()
+    ] == [("H10-ORDER-1", 1), ("H10-ORDER-2", 2)]
+    assert composition._dispatch_due(start * 16 + 7)["classification"] == "SUCCESS"
+    step = next(
+        record["result"]["historical_result"]
+        for record in composition._records.values()
+        if record["item"]["kind"] == "HISTORICAL_MARKET_STEP"
+        and record["item"]["node"]["step_index"] == 0
+    )
+    fills = [fill for product in step["products"] for fill in product["fills"]]
+    assert [(fill["order_id"], fill["quantity_contracts"], fill["price"]) for fill in fills] == [
+        ("H10-ORDER-1", D("1"), D("49900"))
+    ]
+    state = composition._codec.inspect_state()
+    assert (state["cash"], state["gross_realized"], state["total_fees"], state["gate"]) == (
+        D("1997.49702"), D("0"), D("3.50298"), "RUNNING"
+    )
+    endpoint = start * 16 + 7
+    assert _snapshot(composition, "TRADING", "H10-END-TRADING", endpoint) == {
+        "available_equity": D("1498.49702"),
+        "equity": D("1997.49702"),
+        "outcome": "SUCCESS",
+    }
+    positions = _snapshot(composition, "POSITIONS", "H10-END-POSITIONS", endpoint)
+    assert [
+        (row["product_id"], row["position_contracts"], row["notional_usd"])
+        for row in positions["rows"]
+    ] == [("A-USDT-SWAP", D("1000"), D("499000"))]
+    assert _snapshot(composition, "OPEN_ORDERS", "H10-END-ORDERS", endpoint)["rows"] == []
+    assert composition._codec.historical_working_orders() == []
+    assert "liquidate1@49900" in answer["risk"]
+    assert "total_fees3.50298" in answer["endpoint"]
