@@ -42,6 +42,10 @@ ORDERS = {
         ("H10-ORDER-1", "A-USDT-SWAP", "LONG", "49900", "1", "H10-CLIENT-1"),
         ("H10-ORDER-2", "A-USDT-SWAP", "LONG", "49900", "1", "H10-CLIENT-2"),
     ],
+    "H09": [
+        ("H09-LONG", "A-USDT-SWAP", "LONG", "95", "1", "MANL"),
+        ("H09-SHORT", "A-USDT-SWAP", "SHORT", "105", "1", "MANS"),
+    ],
 }
 
 
@@ -66,13 +70,13 @@ def _record(path, digest, case):
     return fields
 
 
-def _oracle_run(case):
+def _oracle_run(case, *, model_id=None):
     source = _record(INPUTS, INPUTS_SHA256, case)
     base = _valid_run()
     start = EPOCH
     end_offset = {
         "H02": 20_002, "H03": 100_001, "H04": 100_001,
-        "H05": 20_004, "H10": 1,
+        "H05": 20_004, "H09": 60_000, "H10": 1,
     }[case]
     end = start + end_offset
     delta = start - base.range_start_ms
@@ -153,7 +157,7 @@ def _oracle_run(case):
     config = _p2_configuration()
     config["config_id"] = config_id
     config["seed_effective_at"] = start - 1
-    cash = {"H02": "1000", "H03": "1000", "H04": "1000", "H05": "20.15", "H10": "2001"}[case]
+    cash = {"H02": "1000", "H03": "1000", "H04": "1000", "H05": "20.15", "H09": "1000", "H10": "2001"}[case]
     config["cash"] = cash
     config["leverage"] = "1000" if case == "H10" else "10"
     seed_orders = []
@@ -196,7 +200,7 @@ def _oracle_run(case):
     )
     for row in policy_state["rows"]:
         row.update(
-            active="true",
+            active="false" if case == "H09" else "true",
             leverage="1000" if case == "H10" else "10" if case == "H05" else "1",
             歩差="1",
             單數="1",
@@ -209,6 +213,7 @@ def _oracle_run(case):
         "H03": {"A-USDT-SWAP": ("1", "1", "1", "1", "1"), "B-USDT-SWAP": ("1", "1", "1", "1", "1")},
         "H04": {"A-USDT-SWAP": ("1", "1", "0.5", "0.5", "0.5"), "B-USDT-SWAP": ("1", "1", "1", "1", "1")},
         "H05": {"A-USDT-SWAP": ("2", "1", "1", "1", "1"), "B-USDT-SWAP": ("0.5", "1", "1", "1", "1")},
+        "H09": {"A-USDT-SWAP": ("1", "1", "1", "1", "1"), "B-USDT-SWAP": ("1", "1", "1", "1", "1")},
         "H10": {"A-USDT-SWAP": ("0.01", "1", "1", "1", "1"), "B-USDT-SWAP": ("1", "1", "1", "1", "1")},
     }
     spec_values = frozen_specs[case]
@@ -299,7 +304,7 @@ def _oracle_run(case):
         config_bytes_run,
         run_id=f"oracle-{case.lower()}",
         account_key=source["account"],
-        model_id=source.get("model", "OHLC4_OPEN_HIGH_LOW_CLOSE_V1"),
+        model_id=model_id or source.get("model", "OHLC4_OPEN_HIGH_LOW_CLOSE_V1"),
         policy_id="SPIDER_GRID_ORIGINAL_V1",
         policy_version="1",
         policy_source_sha256=source["policy"].split(":sha256:")[1],
@@ -1079,3 +1084,117 @@ def test_frozen_h10_first_candidate_triggers_immediate_risk_transition():
     assert composition._codec.historical_working_orders() == []
     assert "liquidate1@49900" in answer["risk"]
     assert "total_fees3.50298" in answer["endpoint"]
+
+
+def test_frozen_h09_named_ohlc_paths_preserve_execution_order_and_reports():
+    source = _record(INPUTS, INPUTS_SHA256, "H09")
+    answer = _case_answer("H09")
+    model_cases = (
+        ("OHLC4_OPEN_HIGH_LOW_CLOSE_V1", "H09-HIGH-LOW"),
+        ("OHLC4_OPEN_LOW_HIGH_CLOSE_V1", "H09-LOW-HIGH"),
+    )
+    assert source["bars"] == "A:E=100/110/90/105/8;B:E=100/100/100/100/4"
+    assert source["seed_orders"] == (
+        "A:H09-LONG:client=MANL:LONG:qty1:px95;"
+        "A:H09-SHORT:client=MANS:SHORT:qty1:px105"
+    )
+    assert source["models"] == "OHLC4_OPEN_HIGH_LOW_CLOSE_V1,OHLC4_OPEN_LOW_HIGH_CLOSE_V1"
+    assert source["notices"] == "E+20002,E+40002"
+    assert answer["OPEN_HIGH_LOW_CLOSE"].startswith("SHORT1@105@E+20000_then_LONG1@95@E+40000")
+    assert answer["OPEN_LOW_HIGH_CLOSE"].startswith("LONG1@95@E+20000_then_SHORT1@105@E+40000")
+    assert any("noticesE+20002/E+40002" in value for value in answer.values())
+
+    reports = {}
+    for model_id, report_id in model_cases:
+        _, run = _oracle_run("H09", model_id=model_id)
+        composition = _ReplayComposition._from_historical_run(run)
+        start = run.range_start_ms
+        endpoint = run.range_end_ms * 16 + 6
+        assert composition._dispatch_due(endpoint)["classification"] == "SUCCESS"
+
+        steps = [
+            record for record in composition._records.values()
+            if record["item"]["kind"] == "HISTORICAL_MARKET_STEP"
+        ]
+        journal = tuple(
+            (fill["order_id"], record["result"]["historical_result"]["raw_time_ms"],
+             fill["quantity_contracts"], fill["price"])
+            for record in sorted(steps, key=lambda row: row["key"])
+            for product in record["result"]["historical_result"]["products"]
+            for fill in product["fills"]
+        )
+        expected = (
+            (("H09-SHORT", start + 20_000, D("1"), D("105")),
+             ("H09-LONG", start + 40_000, D("1"), D("95")))
+            if model_id == "OHLC4_OPEN_HIGH_LOW_CLOSE_V1" else
+            (("H09-LONG", start + 20_000, D("1"), D("95")),
+             ("H09-SHORT", start + 40_000, D("1"), D("105")))
+        )
+        assert journal == expected
+
+        notices = [
+            record for record in composition._records.values()
+            if record["item"]["kind"] == "DELIVERY"
+            and record["item"]["delivery"]["payload_kind"] == "EXECUTION_FACT"
+        ]
+        assert sorted(record["key"][0] for record in notices) == [
+            (start + 20_002) * 16 + 6, (start + 40_002) * 16 + 6
+        ]
+        assert all(record["result"]["classification"] == "SUCCESS" for record in notices)
+        assert all(row["active"] == "false" for row in composition._policy.rows)
+        intent_groups = [
+            record for record in composition._records.values()
+            if record["item"]["kind"] == "SOURCE_GROUP"
+            and any(member["kind"] == "INTENT" for member in record["item"]["group"]["members"])
+        ]
+        assert intent_groups == []
+        assert not any(
+            event.get("kind") in ("send", "cancel")
+            for event in composition._policy.events
+        )
+        assert not any(
+            entry["event"].get("kind") in ("send", "cancel")
+            or entry.get("actions")
+            for audit in composition._audit.values()
+            for entry in audit
+        )
+
+        owner = composition._codec.inspect_state()
+        trading = _snapshot(composition, "TRADING", f"{report_id}-TRADING", endpoint)
+        positions = _snapshot(composition, "POSITIONS", f"{report_id}-POSITIONS", endpoint)["rows"]
+        orders = _snapshot(composition, "OPEN_ORDERS", f"{report_id}-ORDERS", endpoint)["rows"]
+        report = {
+            "cash": owner["cash"],
+            "equity": trading["equity"],
+            "positions": positions,
+            "open_orders": orders,
+            "gross_realized": owner["gross_realized"],
+            "fees": owner["total_fees"],
+            "mark": composition._policy.markets["A-USDT-SWAP"]["price"],
+            "journal": journal,
+        }
+        assert report == {
+            "cash": D("1009.8"),
+            "equity": D("1009.8"),
+            "positions": [],
+            "open_orders": [],
+            "gross_realized": D("10"),
+            "fees": D("0.2"),
+            "mark": D("105"),
+            "journal": expected,
+        }
+        reports[model_id] = report
+
+    difference = {
+        "first_fill": (reports[model_cases[0][0]]["journal"][0], reports[model_cases[1][0]]["journal"][0]),
+        "last_fill": (reports[model_cases[0][0]]["journal"][1], reports[model_cases[1][0]]["journal"][1]),
+    }
+    assert difference == {
+        "first_fill": (("H09-SHORT", EPOCH + 20_000, D("1"), D("105")),
+                       ("H09-LONG", EPOCH + 20_000, D("1"), D("95"))),
+        "last_fill": (("H09-LONG", EPOCH + 40_000, D("1"), D("95")),
+                      ("H09-SHORT", EPOCH + 40_000, D("1"), D("105"))),
+    }
+    assert reports[model_cases[0][0]]["cash"] == reports[model_cases[1][0]]["cash"]
+    assert any("each_endpointE+60000,cash1009.8,flat,gross10,fees0.2,mark105,equity1009.8" in value for value in answer.values())
+    assert any("both_journals_required" in value for value in answer.values())
