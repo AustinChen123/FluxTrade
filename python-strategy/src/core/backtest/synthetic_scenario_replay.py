@@ -333,7 +333,8 @@ class _ReplayComposition:
         self._historical_order_contract: dict[str, Any] | None = None
         self._historical_order_sequence = 0
         self._historical_notice_sequence = 0
-        self._p3_execution_notice_deliveries: set[str] = set()
+        self._p3_execution_notice_facts: dict[str, dict[str, Any]] = {}
+        self._p3_execution_notice_delivered_facts: set[str] = set()
         self._p3_cancel_ack_deliveries: set[str] = set()
         self._historical_cancel_effects: dict[str, dict[str, Any]] = {}
         self._historical_run: object | None = None
@@ -474,13 +475,37 @@ class _ReplayComposition:
     def _historical_audit_delivery(self, delivery: wire.Delivery) -> bool:
         poll_notice = (self._historical_poll_range is not None
                        and delivery.get("continuation_id") in self._p3_audit_continuations)
-        execution_notice = (self._historical_run is not None
-                            and delivery["delivery_id"] in self._p3_execution_notice_deliveries
-                            and delivery["payload_kind"] == "EXECUTION_FACT")
+        execution_notice = self._historical_execution_occurrence(delivery) is not None
         cancel_ack = (self._historical_run is not None
                       and delivery["delivery_id"] in self._p3_cancel_ack_deliveries
                       and delivery["payload_kind"] == "TRANSPORT_ACK")
         return poll_notice or execution_notice or cancel_ack
+
+    def _historical_execution_occurrence(self, delivery: wire.Delivery) -> str | None:
+        if self._historical_run is None or delivery.get("payload_kind") != "EXECUTION_FACT":
+            return None
+        source_fact_id = delivery.get("source_fact_id")
+        if (type(source_fact_id) is not str
+                or source_fact_id not in self._p3_execution_notice_facts
+                or delivery.get("immutable_payload") != self._p3_execution_notice_facts[source_fact_id]):
+            return None
+        projection = dict(
+            schema_version="delivery_projection_v1",
+            reference=dict(
+                namespace=delivery.get("source_namespace"),
+                fact_id=source_fact_id,
+            ),
+            payload_kind=delivery["payload_kind"],
+            occurrence_index=delivery.get("occurrence_index"),
+            schedule_sequence=delivery.get("schedule_sequence"),
+            visible_at=delivery.get("visible_at"),
+            continuation_id=delivery.get("continuation_id"),
+        )
+        try:
+            canonical = self._codec.build_delivery(projection)
+        except Exception:
+            return None
+        return source_fact_id if canonical == delivery else None
 
     def _evidence(self, kind, key, evidence):
         if self._evidence_callback is None:
@@ -744,6 +769,15 @@ class _ReplayComposition:
         self._evidence("DELIVERY_ATTEMPT", record["key"], dict(delivery=delivery,
                        emission_plan_digest=policy_protocol._emission_plan_digest(
                            plan, self._configured_product_ids) if plan is not None else None))
+        execution_fact_id = self._historical_execution_occurrence(delivery)
+        if (
+            execution_fact_id is not None
+            and execution_fact_id in self._p3_execution_notice_delivered_facts
+        ):
+            prefix = _CallbackPrefix((), None)
+            self._audit[delivery["delivery_id"]] = []
+            self._callback_evidence(record, prefix, [], "CONSUMER_DEDUPLICATED")
+            return []
         next_stage = None
         if delivery.get("continuation_id") is not None:
             try:
@@ -763,9 +797,7 @@ class _ReplayComposition:
             raise _ScheduleError("CALLBACK_FAILED")
         poll_audit_only = (self._historical_poll_range is not None
                            and delivery.get("continuation_id") in self._p3_audit_continuations)
-        execution_audit_only = (self._historical_run is not None
-                                and delivery["delivery_id"] in self._p3_execution_notice_deliveries
-                                and delivery["payload_kind"] == "EXECUTION_FACT")
+        execution_audit_only = execution_fact_id is not None
         cancel_ack_audit_only = (self._historical_run is not None
                                  and delivery["delivery_id"] in self._p3_cancel_ack_deliveries
                                  and delivery["payload_kind"] == "TRANSPORT_ACK")
@@ -795,6 +827,8 @@ class _ReplayComposition:
         if next_stage is not None:
             derived.append((self._capture_item(next_stage), None))
         self._admit_set(derived)
+        if execution_fact_id is not None:
+            self._p3_execution_notice_delivered_facts.add(execution_fact_id)
         return deepcopy(events)
 
     def _historical_order_children(self, record, policy_events, audit_events):
@@ -1059,7 +1093,16 @@ class _ReplayComposition:
                                     visible_at=visible_at,
                                 )
                                 delivery = self._codec.build_delivery(projection)
-                                self._p3_execution_notice_deliveries.add(delivery["delivery_id"])
+                                source_fact_id = delivery["source_fact_id"]
+                                payload = deepcopy(delivery["immutable_payload"])
+                                known_payload = self._p3_execution_notice_facts.get(
+                                    source_fact_id
+                                )
+                                if known_payload is not None and known_payload != payload:
+                                    raise _ScheduleError("INVALID_SCHEMA")
+                                self._p3_execution_notice_facts[source_fact_id] = (
+                                    payload
+                                )
                                 derived.append((dict(kind="DELIVERY", delivery=delivery), None))
                                 self._historical_notice_sequence += 1
                         open_ms, step = node["bar_open_ms"], node["step_index"]
