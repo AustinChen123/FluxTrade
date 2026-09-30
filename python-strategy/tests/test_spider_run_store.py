@@ -19,9 +19,10 @@ from src.core.backtest.spider_run_artifacts import (
 from src.core.backtest.spider_run_completion_schema import report as validate_report
 from src.core.backtest.spider_run_envelope_schema import endpoint as validate_endpoint, journal as validate_journal
 from src.core.backtest.spider_run_reconciliation_schema import reconciliation as validate_reconciliation
-from test_spider_run_artifacts import configured_attempt, configuration_context, rejected
+from test_spider_run_artifacts import configured_attempt, configuration_context, historical_attempt, rejected
 from test_spider_run_completion_schema import configured_report_rows
 from test_spider_run_envelope_schema import configured_endpoint, configured_group_record
+from test_spider_run_envelope_schema import record
 from test_spider_run_reconciliation_schema import configured_fixture as configured_reconciliation_fixture
 from test_spider_run_evidence import RUN, expected_checks, fixture
 
@@ -292,6 +293,27 @@ def test_context_mismatch_append_writes_neither_journal_nor_status(tmp_path):
     assert journal_path.read_bytes() == before_journal
     assert status_path.read_bytes() == before_status
     assert store._processed == target and store._persisted is None
+
+
+def test_historical_registration_and_nonfinancial_journal_propagate_context_pair(tmp_path):
+    attempt = historical_attempt()
+    attempt["planned_coverage"] = [{"ordinal": 1, "barrier_id": "callback-only", "record_kind": "CALLBACK_RESULT"}]
+    store = module.SpiderRunStore.create(str(tmp_path), attempt["run_id"])
+    assert store.register(attempt) == "NATIVE_CONSTRUCTION_ALLOWED"
+    expected_config = attempt["configuration_context"]
+    expected_history = attempt["historical_context"]
+    running = decode_jsonl((store._path / "status.json").read_bytes())[0]
+    assert (running["configuration_context"], running["historical_context"]) == (expected_config, expected_history)
+
+    row = record("CALLBACK_RESULT")
+    row.update(run_id=attempt["run_id"], barrier_id="callback-only", configuration_context=deepcopy(expected_config), historical_context=deepcopy(expected_history))
+    store.mark_processed(boundary(row))
+    store.append_journal(row)
+    persisted, status = (decode_jsonl((store._path / name).read_bytes())[0] for name in ("journal.jsonl", "status.json"))
+    assert (persisted["configuration_context"], persisted["historical_context"]) == (expected_config, expected_history)
+    with pytest.raises(module.SpiderRunStoreError, match="ENDPOINT_RECONCILIATION_FAILED"):
+        store.finalize({}, {}, [])
+    assert not any((store._path / name).exists() for name in ("endpoint.json", "reconciliation.json", "report.jsonl", "completion.json"))
 
 
 def test_configured_report_validation_uses_candidate_context_for_reread(tmp_path):

@@ -4,9 +4,11 @@ import re
 from typing import cast
 
 from src.core.backtest.spider_run_artifacts import (
-    ConfigurationContext, _HASH_NAMES, _KINDS, _TERMINALS, _boundary,
-    _decimal_text, _enum, _integer, _list, _object, _require, _text,
+    ConfigurationContext, HistoricalContext, _HASH_NAMES, _KINDS, _artifact_contexts,
+    _boundary, _decimal_text, _enum, _integer, _list,
+    _object, _require, _terminal_policy, _text,
     configuration_context as validate_configuration_context,
+    historical_context as validate_historical_context,
 )
 from src.core.backtest.spider_run_native_schema import open_order
 
@@ -26,10 +28,24 @@ def _embedded_context(value: object) -> ConfigurationContext:
     return validate_configuration_context(row)
 
 
+def _embedded_context_pair(
+    row: dict[str, object],
+) -> tuple[ConfigurationContext | None, HistoricalContext | None]:
+    if "configuration_context" in row:
+        _embedded_context(row["configuration_context"])
+    if "historical_context" in row:
+        _require(type(row["historical_context"]) is dict)
+    return _artifact_contexts(row)
+
+
 def _root_context(row: dict[str, object]) -> ConfigurationContext | None:
-    if "configuration_context" not in row:
-        return None
-    return _embedded_context(row["configuration_context"])
+    return _root_context_pair(row)[0]
+
+
+def _root_context_pair(
+    row: dict[str, object],
+) -> tuple[ConfigurationContext | None, HistoricalContext | None]:
+    return _embedded_context_pair(row)
 
 
 def evidence_reference(value: object) -> str:
@@ -51,20 +67,27 @@ def evidence_references(value: object) -> None:
     _require(bool(refs) and len(refs) == len(set(refs)))
 
 
-def _header(row: dict[str, object], schema: str) -> None:
+def _header(row: dict[str, object], schema: str, *, historical: bool = False) -> None:
     _enum(row["schema_version"], [schema])
     _text(row["run_id"], "[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
-    _enum(row["terminal_reason"], _TERMINALS)
+    _terminal_policy(row["terminal_reason"], historical=historical)
 
 
-def report_row(value: object, *, context: ConfigurationContext | None = None) -> None:
-    row = _object(value, "schema_version run_id product_id terminal_reason position_contracts mark_price notional_usd open_orders committed_execution_refs account_cash account_equity account_available_equity account_gross_realized account_total_fees source_evidence_refs", "configuration_context")
-    _header(row, "spider_product_report_v1")
+def report_row(
+    value: object, *, context: ConfigurationContext | None = None,
+    historical_context: HistoricalContext | None = None,
+) -> None:
+    row = _object(value, "schema_version run_id product_id terminal_reason position_contracts mark_price notional_usd open_orders committed_execution_refs account_cash account_equity account_available_equity account_gross_realized account_total_fees source_evidence_refs", "configuration_context historical_context")
+    if context is not None:
+        context = validate_configuration_context(context)
+    if historical_context is not None:
+        historical_context = validate_historical_context(historical_context)
+    _require(historical_context is None or context is not None)
+    _require(_embedded_context_pair(row) == (context, historical_context))
+    _header(row, "spider_product_report_v1", historical=historical_context is not None)
     if context is None:
-        _require("configuration_context" not in row)
         _enum(row["product_id"], ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "P_A"])
     else:
-        _require(_embedded_context(row.get("configuration_context")) == context)
         _enum(row["product_id"], context.products)
     for name in "position_contracts notional_usd account_cash account_equity account_available_equity account_gross_realized account_total_fees".split():
         _decimal_text(row[name])
@@ -88,12 +111,18 @@ def report_row(value: object, *, context: ConfigurationContext | None = None) ->
     evidence_references(row["source_evidence_refs"])
 
 
-def report(value: object, *, context: ConfigurationContext | None = None) -> None:
+def report(
+    value: object, *, context: ConfigurationContext | None = None,
+    historical_context: HistoricalContext | None = None,
+) -> None:
     if context is not None:
         context = validate_configuration_context(context)
+    if historical_context is not None:
+        historical_context = validate_historical_context(historical_context)
+    _require(historical_context is None or context is not None)
     rows = _list(value)
     for row in rows:
-        report_row(row, context=context)
+        report_row(row, context=context, historical_context=historical_context)
     products = [cast(dict[str, object], row)["product_id"] for row in rows]
     if context is None:
         _require(products in (["P_A"], ["BTC-USDT-SWAP", "ETH-USDT-SWAP"]))
@@ -102,9 +131,9 @@ def report(value: object, *, context: ConfigurationContext | None = None) -> Non
 
 
 def completion(value: object) -> None:
-    row = _object(value, "schema_version run_id state terminal_reason input_contract_hashes planned_coverage processed_boundary persisted_boundary endpoint_state_digest reconciliation_digest artifacts", "configuration_context")
-    _root_context(row)
-    _header(row, "spider_completion_v1")
+    row = _object(value, "schema_version run_id state terminal_reason input_contract_hashes planned_coverage processed_boundary persisted_boundary endpoint_state_digest reconciliation_digest artifacts", "configuration_context historical_context")
+    _, historical = _root_context_pair(row)
+    _header(row, "spider_completion_v1", historical=historical is not None)
     _enum(row["state"], ["COMPLETE"])
     for name in ("endpoint_state_digest", "reconciliation_digest"):
         _text(row[name], "[0-9a-f]{64}")

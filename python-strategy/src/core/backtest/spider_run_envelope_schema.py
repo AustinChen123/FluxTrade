@@ -4,8 +4,8 @@ from typing import cast
 
 from src.core.backtest import spider_run_native_schema as native
 from src.core.backtest.spider_run_artifacts import (
-    ConfigurationContext, _boolean, _boundary, _decimal_text, _enum, _integer,
-    _list, _object, _require, _text, configuration_context,
+    ConfigurationContext, _artifact_contexts, _boolean, _boundary, _decimal_text,
+    _enum, _integer, _list, _object, _require, _terminal_policy, _text,
 )
 
 _CLASSES = ["SOURCE_GROUP", "SNAPSHOT_CAPTURE", "DELIVERY"]
@@ -34,9 +34,7 @@ def _ordered(keys: list[tuple]) -> None:
 
 
 def _context(row: dict[str, object]) -> ConfigurationContext | None:
-    if "configuration_context" not in row:
-        return None
-    return configuration_context(row["configuration_context"])
+    return _artifact_contexts(row)[0]
 
 
 def _policy_order(value: object, operation: str) -> None:
@@ -153,7 +151,7 @@ def callback_result(value: object) -> None:
 
 
 def journal_record(value: object) -> None:
-    row = _object(value, "schema_version run_id journal_seq barrier_id record_kind scheduler_key causal_parent_ids effective_at visible_at account_version_before account_version_after payload", "configuration_context")
+    row = _object(value, "schema_version run_id journal_seq barrier_id record_kind scheduler_key causal_parent_ids effective_at visible_at account_version_before account_version_after payload", "configuration_context historical_context")
     context = _context(row)
     _enum(row["schema_version"], ["spider_journal_record_v1"])
     _text(row["run_id"], "[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
@@ -244,11 +242,11 @@ def scheduler_observation(value: object) -> None:
 
 
 def endpoint(value: object) -> None:
-    row = _object(value, "schema_version run_id terminal_reason cutoff initial_owner_evidence final_owner_evidence scheduler_observation remaining_planned_barriers", "configuration_context")
-    context = _context(row)
+    row = _object(value, "schema_version run_id terminal_reason cutoff initial_owner_evidence final_owner_evidence scheduler_observation remaining_planned_barriers", "configuration_context historical_context")
+    context, historical = _artifact_contexts(row)
     _enum(row["schema_version"], ["spider_endpoint_v1"])
     _text(row["run_id"], "[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
-    _enum(row["terminal_reason"], ["SCHEDULED_MTM", "LEGAL_NATIVE_LIQUIDATION_FINAL_EVENT", "O03_NON_ATOMIC_COMPLETE"])
+    _terminal_policy(row["terminal_reason"], historical=historical is not None)
     cutoff = _object(row["cutoff"], "scheduler_time persisted_boundary")
     _integer(cutoff["scheduler_time"])
     _boundary(cutoff["persisted_boundary"])

@@ -7,9 +7,10 @@ from typing import cast as _cast
 
 from src.core.backtest.spider_run_artifacts import (
     ConfigurationContext as _ConfigurationContext,
+    _P3_RUN_CONTRACT,
+    _artifact_contexts,
     _configuration_context,
     canonical_bytes as _bytes,
-    configuration_context as _validate_context,
 )
 from src.core.backtest.spider_run_completion_schema import report as _validate_report
 from src.core.backtest.spider_run_envelope_schema import endpoint as _validate_endpoint
@@ -37,24 +38,23 @@ class ReconciliationProjectionError(ValueError):
 def _context_chain(attempt: dict[str, _Any], *artifacts: object) -> _ConfigurationContext | None:
     """Return the attempt's context only when every supplied artifact agrees."""
     contract = attempt["run_contract_id"]
-    expected = (
-        _validate_context(attempt["configuration_context"])
-        if contract == _P2_RUN_CONTRACT else None
-    )
-    if contract not in (_P1_RUN_CONTRACT, _P2_RUN_CONTRACT):
+    if contract not in (_P1_RUN_CONTRACT, _P2_RUN_CONTRACT, _P3_RUN_CONTRACT):
+        raise ReconciliationProjectionError()
+    expected = _artifact_contexts(attempt)
+    configuration, historical = expected
+    if (contract == _P1_RUN_CONTRACT and expected != (None, None)
+            or contract == _P2_RUN_CONTRACT and (configuration is None or historical is not None)
+            or contract == _P3_RUN_CONTRACT and (configuration is None or historical is None)):
         raise ReconciliationProjectionError()
     for artifact in artifacts:
         rows = artifact if type(artifact) is list else [artifact]
         for row in rows:
             if type(row) is not dict:
                 raise ReconciliationProjectionError()
-            present = "configuration_context" in row
-            if expected is None:
-                if present:
-                    raise ReconciliationProjectionError()
-            elif not present or _validate_context(row["configuration_context"]) != expected:
+            supplied = _artifact_contexts(row)
+            if supplied != expected:
                 raise ReconciliationProjectionError()
-    return expected
+    return configuration
 
 
 def _required(row: dict[str, _Any], key: str) -> _Any:

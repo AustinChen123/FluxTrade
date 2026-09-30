@@ -9,7 +9,7 @@ from json import JSONDecodeError
 from pathlib import Path
 from typing import Any
 
-from src.core.backtest.spider_run_artifacts import _boundary, _configuration_context, _require, _text, canonical_bytes, configuration_context, decode_jsonl, validate_artifact
+from src.core.backtest.spider_run_artifacts import _P3_RUN_CONTRACT, _boundary, _configuration_context, _historical_context, _require, _text, canonical_bytes, configuration_context, decode_jsonl, historical_context, validate_artifact
 from src.core.backtest.spider_run_completion_schema import _ARTIFACTS, completion, report as validate_report
 from src.core.backtest.spider_run_envelope_schema import endpoint as validate_endpoint, journal as validate_journal, journal_record
 from src.core.backtest.spider_run_evidence import ReconciliationProjectionError, _context_chain, build_reconciliation
@@ -27,10 +27,14 @@ class SpiderRunStoreError(Exception):
 def _report_validator(attempt: dict[str, Any]):
     def validate(value: list[dict[str, Any]]) -> None:
         context = None
+        historical = None
         if attempt.get("run_contract_id") == "SPIDER_SYNTHETIC_P2_CONFIGURED_RUN_V1":
             _require(type(value) is list and bool(value) and type(value[0]) is dict)
             context = configuration_context(value[0].get("configuration_context"))
-        validate_report(value, context=context)
+        elif attempt.get("run_contract_id") == "SPIDER_HISTORICAL_RESEARCH_RUN_V1":
+            context = configuration_context(attempt["configuration_context"])
+            historical = historical_context(attempt["historical_context"])
+        validate_report(value, context=context, historical_context=historical)
     return validate
 
 
@@ -114,6 +118,8 @@ class SpiderRunStore:
                      failure_reason=reason, primary_failure=deepcopy(primary))
         if "configuration_context" in self._attempt:
             value["configuration_context"] = _configuration_context(self._attempt["configuration_context"])
+        if "historical_context" in self._attempt:
+            value["historical_context"] = _historical_context(self._attempt["historical_context"])
         validate_artifact(value)
         return value
 
@@ -208,6 +214,8 @@ class SpiderRunStore:
 
     def finalize(self, endpoint: dict, reconciliation: dict, report: list) -> str:
         self._allowed("RUNNING")
+        if self._attempt.get("run_contract_id") == _P3_RUN_CONTRACT:
+            raise SpiderRunStoreError("ENDPOINT_RECONCILIATION_FAILED")
         if self._barrier_failed or self._processed != self._persisted or self._persisted is None or self._persisted["ordinal"] != len(self._attempt["planned_coverage"]):
             raise RuntimeError("INVALID_STORE_OPERATION")
         validate_endpoint(endpoint)
@@ -254,6 +262,8 @@ class SpiderRunStore:
                         endpoint_state_digest=sha256(canonical_bytes(final)).hexdigest(), reconciliation_digest=sha256(canonical_bytes(supplied)).hexdigest(), artifacts=metadata)
         if "configuration_context" in attempt:
             manifest["configuration_context"] = _configuration_context(attempt["configuration_context"])
+        if "historical_context" in attempt:
+            manifest["historical_context"] = _historical_context(attempt["historical_context"])
         completion(manifest)
         try:
             _context_chain(attempt, complete_status, journal, final, supplied, rows, manifest)

@@ -41,6 +41,16 @@ def configured_context(products=None, config_id="configured-v1") -> dict[str, An
     }
 
 
+def historical_context_row() -> dict[str, Any]:
+    return dict(
+        schema_version="spider_historical_context_v1", research_classification="RESEARCH_ONLY",
+        historical_input_sha256="1" * 64, path_pair_sha256="2" * 64,
+        source_sha256="3" * 64, model_sha256="4" * 64,
+        assumption_sha256="5" * 64, coverage_sha256="6" * 64,
+        model_id="OHLC4_OPEN_HIGH_LOW_CLOSE_V1", model_version=1,
+    )
+
+
 def configured_report_row(product: str, context=None) -> dict[str, Any]:
     context = configured_context() if context is None else context
     row = report_row(product)
@@ -343,5 +353,52 @@ def test_completion_context_roundtrips_without_changing_manifest_semantics():
         {**row, "configuration_context": {**configured_context(), "products": ()}},
         {**row, "configuration_context": {**configured_context(), "extra": "x"}},
     ]:
+        with pytest.raises(ValueError):
+            schema.completion(invalid)
+
+
+def test_embedded_artifact_contexts_remain_dict_only():
+    raw = configured_context()
+    typed = configuration_context(raw)
+    rows = configured_report_rows(raw)
+    rows[0]["configuration_context"] = typed
+    with pytest.raises(ValueError):
+        schema.report(rows, context=typed)
+
+    complete = manifest()
+    complete["configuration_context"] = typed
+    with pytest.raises(ValueError):
+        schema.completion(complete)
+
+
+
+
+def test_reports_and_completion_bind_historical_context_pair_and_terminal():
+    config = configured_context()
+    historical = historical_context_row()
+    context = configuration_context(config)
+    rows = configured_report_rows(config)
+    for row in rows:
+        row.update(historical_context=deepcopy(historical), terminal_reason="MTM_PRESERVE_OPEN_V1")
+    schema.report(rows, context=context, historical_context=historical)
+    for changed in (
+        [*rows[:1], {**rows[1], "historical_context": None}, *rows[2:]],
+        [{**row, "terminal_reason": "SCHEDULED_MTM"} for row in rows],
+    ):
+        with pytest.raises(ValueError):
+            schema.report(changed, context=context, historical_context=historical)
+    with pytest.raises(ValueError):
+        schema.report(rows, context=context)
+
+    complete = manifest()
+    complete.update(configuration_context=config, historical_context=deepcopy(historical),
+                    terminal_reason="MTM_PRESERVE_OPEN_V1")
+    schema.completion(complete)
+    for invalid in (
+        {**complete, "configuration_context": None},
+        {**complete, "terminal_reason": "SCHEDULED_MTM"},
+        {**manifest(), "terminal_reason": "MTM_PRESERVE_OPEN_V1"},
+        {**manifest(), "historical_context": historical},
+    ):
         with pytest.raises(ValueError):
             schema.completion(invalid)

@@ -8,6 +8,7 @@ import pytest
 
 from src.core.backtest import spider_run_envelope_schema as e
 from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_canonical
+from test_spider_run_artifacts import historical_context
 from test_spider_run_native_schema import INSPECTION, REQUEST, RESULT, at, delivery, fact, group, objects
 
 SEND = dict(instId="P_A", instIdCode=1, tdMode="", clOrdId="c", tag="", side="buy", ordType="limit", px="1", sz="1")
@@ -496,3 +497,26 @@ def test_policy_text_utf8_boundary_through_canonical_json(text):
                 else:
                     with pytest.raises(ValueError, match="INVALID_ARTIFACT"):
                         e.callback_result(value)
+
+
+
+
+def test_journal_and_endpoint_accept_three_context_modes_with_terminal_binding():
+    p3_journal = configured_group_record("CFG-FIRST")
+    p3_journal["historical_context"] = historical_context()
+    e.journal_record(p3_journal)
+    historical_only = record()
+    historical_only["historical_context"] = historical_context()
+    with pytest.raises(ValueError):
+        e.journal_record(historical_only)
+
+    p2_endpoint = configured_endpoint("CFG-FIRST")
+    p3_endpoint = deepcopy(p2_endpoint)
+    p3_endpoint.update(historical_context=historical_context(), terminal_reason="MTM_PRESERVE_OPEN_V1")
+    e.endpoint(p3_endpoint)
+    for bad in (
+        {**p3_endpoint, "terminal_reason": "SCHEDULED_MTM"},
+        {**p2_endpoint, "terminal_reason": "MTM_PRESERVE_OPEN_V1"},
+    ):
+        with pytest.raises(ValueError):
+            e.endpoint(bad)

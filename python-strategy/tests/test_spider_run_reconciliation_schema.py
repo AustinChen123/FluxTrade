@@ -8,9 +8,11 @@ from typing import Any
 import pytest
 
 from src.core.backtest import spider_run_reconciliation_schema as schema
+from src.core.backtest.spider_run_artifacts import configuration_context as validate_configuration_context
 from test_spider_run_completion_schema import (
     CONFIGURED_PRODUCTS, configured_context, configured_report_rows, report_row,
 )
+from test_spider_run_artifacts import historical_context
 
 NAMES = ["PLANNED_COVERAGE_COMPLETE", "PROCESSED_EQUALS_PERSISTED", "JOURNAL_CONTIGUOUS",
          "OWNER_IDENTITY_MATCH", "OWNER_DIGEST_MATCH", "ENDPOINT_SNAPSHOT_VERSION_MATCH",
@@ -57,6 +59,32 @@ def configured_fixture() -> dict[str, Any]:
             value["configuration_context"]
         )
     return value
+
+
+def test_reconciliation_accepts_paired_historical_context_and_binds_report_terminal():
+    value = configured_fixture()
+    context = historical_context()
+    value["historical_context"] = context
+    for side in ("expected", "observed"):
+        value["checks"][9][side].update(
+            terminal_policy="MTM_PRESERVE_OPEN_V1", terminal_reason="MTM_PRESERVE_OPEN_V1"
+        )
+        rows = value["checks"][10][side]["report_rows"]
+        for row in rows:
+            row.update(historical_context=deepcopy(context), terminal_reason="MTM_PRESERVE_OPEN_V1")
+    schema.reconciliation(value)
+
+    missing_row_context = deepcopy(value)
+    del missing_row_context["checks"][10]["observed"]["report_rows"][1]["historical_context"]
+    with pytest.raises(ValueError):
+        schema.reconciliation(missing_row_context)
+
+
+def test_reconciliation_embedded_context_remains_dict_only():
+    value = configured_fixture()
+    value["configuration_context"] = validate_configuration_context(value["configuration_context"])
+    with pytest.raises(ValueError):
+        schema.reconciliation(value)
 
 
 def paths(value: Any, prefix: tuple = ()):

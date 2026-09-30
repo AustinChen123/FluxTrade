@@ -156,6 +156,22 @@ def _historical_context(value: object) -> dict[str, object]:
     return historical_context(value)._asdict()
 
 
+def _artifact_contexts(value: object) -> tuple[ConfigurationContext | None, HistoricalContext | None]:
+    _require(type(value) is dict)
+    row = cast(dict[str, object], value)
+    configuration = configuration_context(row["configuration_context"]) if "configuration_context" in row else None
+    historical = historical_context(row["historical_context"]) if "historical_context" in row else None
+    _require(historical is None or configuration is not None)
+    return configuration, historical
+
+
+def _terminal_policy(value: object, *, historical: bool) -> None:
+    if historical:
+        _require(value == "MTM_PRESERVE_OPEN_V1")
+    else:
+        _enum(value, _TERMINALS)
+
+
 def _optional_context(row: dict[str, object]) -> dict[str, object] | None:
     if "configuration_context" not in row:
         return None

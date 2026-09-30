@@ -14,7 +14,7 @@ from src.core.backtest import spider_run_envelope_schema as envelope
 from src.core.backtest import spider_run_evidence as evidence
 from src.core.backtest.spider_run_reconciliation_schema import reconciliation
 from src.core.backtest.spider_scenario_plans import PLAN_IDS, plan_bundle
-from test_spider_run_artifacts import attempt as attempt_fixture
+from test_spider_run_artifacts import attempt as attempt_fixture, historical_context
 
 RUN = "evidence-test-1"
 NAMES = ["PLANNED_COVERAGE_COMPLETE", "PROCESSED_EQUALS_PERSISTED", "JOURNAL_CONTIGUOUS", "OWNER_IDENTITY_MATCH", "OWNER_DIGEST_MATCH",
@@ -574,6 +574,39 @@ def test_context_chain_uses_attempt_mode_and_exact_ordered_context():
             evidence._context_chain(
                 {"run_contract_id": "SPIDER_SYNTHETIC_P1_RUN_V1"}, *p1_chain
             )
+
+
+def test_context_chain_requires_exact_historical_pair_on_every_artifact_and_row():
+    config_value = {
+        "schema_version": "spider_configuration_context_v1", "config_id": "configured-v1",
+        "configuration_sha256": "a" * 64, "products": ["CFG-FIRST", "CFG-MIDDLE", "CFG-LAST"],
+    }
+    historical_value = historical_context()
+    config = artifacts.configuration_context(config_value)
+    artifacts.historical_context(historical_value)
+    attempt = {
+        "run_contract_id": "SPIDER_HISTORICAL_RESEARCH_RUN_V1",
+        "configuration_context": config_value, "historical_context": historical_value,
+    }
+    chain = [
+        {"configuration_context": deepcopy(config_value), "historical_context": deepcopy(historical_value)},
+        [{"configuration_context": deepcopy(config_value), "historical_context": deepcopy(historical_value)} for _ in range(2)],
+    ]
+    assert evidence._context_chain(attempt, *chain) == config
+    for artifact_index, row_index in ((0, None), (1, 0), (1, 1)):
+        for field, replacement in (
+            ("historical_context", None),
+            ("configuration_context", None),
+            ("historical_context", {**historical_value, "path_pair_sha256": "f" * 64}),
+        ):
+            changed = deepcopy(chain)
+            target = changed[artifact_index] if row_index is None else changed[artifact_index][row_index]
+            if replacement is None:
+                target.pop(field)
+            else:
+                target[field] = replacement
+            with pytest.raises(ValueError):
+                evidence._context_chain(attempt, *changed)
 
 
 def test_no_reconciliation_authority_and_public_import_boundary():
