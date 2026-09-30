@@ -39,7 +39,7 @@ impl Projection {
             || self.sequence < 0
             || self.visible_at < 0
             || self.continuation.as_deref().is_some_and(|s| !identity(s))
-            || (self.kind == "TRANSPORT_ACK") != self.transport.is_some()
+            || (self.kind != "TRANSPORT_ACK" && self.transport.is_some())
         {
             return Err("INVALID_SCHEMA");
         }

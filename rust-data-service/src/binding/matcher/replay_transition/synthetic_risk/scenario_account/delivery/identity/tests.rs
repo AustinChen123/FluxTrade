@@ -156,12 +156,15 @@ fn structural_errors_are_pure_and_times_have_no_owner_clock() {
             5 => p.sequence = -1,
             6 => p.visible_at = -1,
             7 => p.continuation = Some(" ".into()),
-            8 => p.transport = None,
+            8 => p.kind = "EXECUTION_FACT",
             _ => p.reference.namespace = "LIQUIDATION",
         }
         assert_eq!(p.validate(), Err("INVALID_SCHEMA"));
         assert_eq!(owner, before);
     }
+    let mut derived_historical_ack = fixture_delivery().projection;
+    derived_historical_ack.transport = None;
+    assert_eq!(derived_historical_ack.validate(), Ok(()));
     for time in [0, i64::MAX] {
         let mut p = fixture_delivery().projection;
         p.visible_at = time;

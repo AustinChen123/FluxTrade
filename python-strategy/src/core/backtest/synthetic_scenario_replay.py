@@ -334,6 +334,7 @@ class _ReplayComposition:
         self._historical_order_sequence = 0
         self._historical_notice_sequence = 0
         self._p3_execution_notice_deliveries: set[str] = set()
+        self._p3_cancel_ack_deliveries: set[str] = set()
         self._historical_cancel_effects: dict[str, dict[str, Any]] = {}
         self._historical_run: object | None = None
         self._historical_bars: dict[tuple[int, str], tuple[object, object]] = {}
@@ -372,6 +373,7 @@ class _ReplayComposition:
             strategy_identity=historical_run.strategy_identity,
             order_accept_delay_ms=historical_run.order_accept_delay_ms,
             cancel_effect_delay_ms=historical_run.cancel_effect_delay_ms,
+            cancel_ack_delay_ms=historical_run.cancel_ack_delay_ms,
             order_notice_delay_ms=historical_run.order_notice_delay_ms,
             range_end_ms=historical_run.range_end_ms,
         )
@@ -475,7 +477,10 @@ class _ReplayComposition:
         execution_notice = (self._historical_run is not None
                             and delivery["delivery_id"] in self._p3_execution_notice_deliveries
                             and delivery["payload_kind"] == "EXECUTION_FACT")
-        return poll_notice or execution_notice
+        cancel_ack = (self._historical_run is not None
+                      and delivery["delivery_id"] in self._p3_cancel_ack_deliveries
+                      and delivery["payload_kind"] == "TRANSPORT_ACK")
+        return poll_notice or execution_notice or cancel_ack
 
     def _evidence(self, kind, key, evidence):
         if self._evidence_callback is None:
@@ -558,6 +563,7 @@ class _ReplayComposition:
                         raise _ScheduleError("INVALID_SCHEMA")
                     plan_bytes = policy_protocol._event_text(
                         "P3_AUDIT_ONLY_POLL_V1" if d.get("continuation_id") is not None
+                        else "P3_AUDIT_ONLY_CANCEL_ACK_V1" if d["delivery_id"] in self._p3_cancel_ack_deliveries
                         else "P3_AUDIT_ONLY_EXECUTION_NOTICE_V1"
                     )
                 else:
@@ -760,7 +766,10 @@ class _ReplayComposition:
         execution_audit_only = (self._historical_run is not None
                                 and delivery["delivery_id"] in self._p3_execution_notice_deliveries
                                 and delivery["payload_kind"] == "EXECUTION_FACT")
-        audit_only = poll_audit_only or execution_audit_only
+        cancel_ack_audit_only = (self._historical_run is not None
+                                 and delivery["delivery_id"] in self._p3_cancel_ack_deliveries
+                                 and delivery["payload_kind"] == "TRANSPORT_ACK")
+        audit_only = poll_audit_only or execution_audit_only or cancel_ack_audit_only
         try:
             validated = (() if audit_only else _validate_emission_plan(
                 self._account, delivery, prefix.events, plan, self._configured_product_ids
@@ -917,6 +926,41 @@ class _ReplayComposition:
         policy_protocol._plan_group(group, self._configured_product_ids)
         return dict(kind="SOURCE_GROUP", schedule_sequence=sequence, group=group)
 
+    def _historical_cancel_ack_item(self, group):
+        contract = self._historical_order_contract
+        if contract is None or self._historical_poll_range is None:
+            raise _ScheduleError("INVALID_SCHEMA")
+        members = group.get("members")
+        if (group.get("ordering_contract_id") != "HISTORICAL_ORDER_V1"
+                or not isinstance(members, list) or len(members) != 1
+                or members[0].get("kind") != "CANCEL_EFFECT"):
+            raise _ScheduleError("INVALID_SCHEMA")
+        stamp = members[0].get("stamp")
+        if not isinstance(stamp, dict):
+            raise _ScheduleError("INVALID_SCHEMA")
+        effective_at = stamp.get("effective_at")
+        delay = contract["cancel_ack_delay_ms"]
+        if (type(effective_at) is not int or effective_at < 2 or effective_at % 16 != 2
+                or type(delay) is not int or delay < 0):
+            raise _ScheduleError("INVALID_SCHEMA")
+        effect_raw = effective_at // 16
+        visible_raw = effect_raw + delay
+        visible_at = visible_raw * 16 + 6
+        if not 0 <= visible_at < 2**63:
+            raise _ScheduleError("INVALID_SCHEMA")
+        projection = dict(
+            schema_version="delivery_projection_v1",
+            reference=dict(namespace="SOURCE", fact_id=stamp["event_id"]),
+            payload_kind="TRANSPORT_ACK",
+            occurrence_index=0,
+            schedule_sequence=self._historical_notice_sequence,
+            visible_at=visible_at,
+        )
+        delivery = self._codec.build_delivery(projection)
+        self._p3_cancel_ack_deliveries.add(delivery["delivery_id"])
+        self._historical_notice_sequence += 1
+        return dict(kind="DELIVERY", delivery=delivery)
+
     def _dispatch_due(self, until):
         if self._terminal is not None:
             return deepcopy(self._terminal)
@@ -962,6 +1006,16 @@ class _ReplayComposition:
                                 record["result"] = deepcopy(self._terminal or queued_effect)
                                 return deepcopy(record["result"])
                             self._historical_order_sequence += 1
+                    is_historical_effect = (
+                        item["group"]["ordering_contract_id"] == "HISTORICAL_ORDER_V1"
+                        and item["group"]["members"][0]["kind"] == "CANCEL_EFFECT"
+                    )
+                    if is_historical_effect and group["classification"] == "COMMITTED":
+                        ack_item = self._historical_cancel_ack_item(item["group"])
+                        queued_ack = self._admit_set([(ack_item, None)])[0]
+                        if queued_ack["classification"] != "PENDING":
+                            record["result"] = deepcopy(self._terminal or queued_ack)
+                            return deepcopy(record["result"])
                 elif kind == "SNAPSHOT_CAPTURE":
                     fact = self._codec.capture_snapshot(item["request"])
                     self._evidence("SNAPSHOT_FACT", key, dict(purpose="POLL", request=item["request"], fact=fact))

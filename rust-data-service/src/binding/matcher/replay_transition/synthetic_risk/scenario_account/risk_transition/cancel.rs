@@ -299,6 +299,46 @@ impl Facts {
     }
 }
 
+impl ScenarioAccount {
+    pub(in super::super) fn historical_cancel_ack_transport(
+        &self,
+        event: &str,
+    ) -> Result<super::super::delivery::Transport, Fault> {
+        let mut receipts = self
+            .cancel_facts
+            .effects
+            .values()
+            .map(|stored| &stored.value)
+            .filter(|receipt| receipt.event_id == event);
+        let receipt = receipts.next().ok_or("INVALID_SCHEMA")?;
+        if receipts.next().is_some()
+            || receipt.target_order_id != receipt.after.order_id
+            || self
+                .orders
+                .get(&receipt.target_order_id)
+                .is_none_or(|order| order.facts != receipt.after)
+        {
+            return Err("INVALID_SCHEMA");
+        }
+        let transport = super::super::delivery::Transport {
+            route: "WS",
+            operation: "CANCEL",
+            client: receipt.after.client_id.clone(),
+            order: Some(receipt.target_order_id.clone()),
+            code: "0".into(),
+            message: None,
+            product: None,
+            side: None,
+            price: None,
+            size: None,
+        };
+        if !self.cancel_facts.delivery_match(event, &transport) {
+            return Err("INVALID_SCHEMA");
+        }
+        Ok(transport)
+    }
+}
+
 pub(in super::super) use super::Stage;
 
 impl ScenarioAccount {

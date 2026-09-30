@@ -106,6 +106,12 @@ fn nested_schema_and_closed_shape_matrix() {
     for path in ["", "/reference", "/transport"] {
         let object = v.pointer(path).unwrap().as_object().unwrap();
         for key in object.keys() {
+            if path.is_empty() && key == "transport" {
+                let mut derived = v.clone();
+                derived.as_object_mut().unwrap().remove(key);
+                assert!(parse(&derived).is_ok());
+                continue;
+            }
             let mut bad = v.clone();
             bad.pointer_mut(path)
                 .unwrap()

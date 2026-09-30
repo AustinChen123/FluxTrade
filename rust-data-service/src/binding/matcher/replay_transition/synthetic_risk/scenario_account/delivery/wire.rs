@@ -55,6 +55,12 @@ pub(in super::super) fn decode_projection(input: &str) -> Result<Projection, Fau
         continuation: optional(r, "continuation_id").map(Json::id).transpose()?,
         transport: optional(r, "transport").map(transport).transpose()?,
     };
+    if projection.kind == "TRANSPORT_ACK"
+        && r.get("transport")
+            .is_some_and(|value| matches!(value, Json::Null))
+    {
+        return Err("INVALID_SCHEMA");
+    }
     projection.validate()?;
     Ok(projection)
 }

@@ -661,6 +661,47 @@ def test_historical_full_execution_notice_derives_native_cancel_and_replacements
         ]
         assert target in {order["order_id"] for order in composition._codec.historical_working_orders()}
     assert composition._dispatch_due((start + 45_003) * 16 + 2)["classification"] == "SUCCESS"
+    ack_visible = (start + 45_005) * 16 + 6
+    ack_records = [record for record in composition._records.values()
+                   if record["item"]["kind"] == "DELIVERY"
+                   and record["item"]["delivery"]["payload_kind"] == "TRANSPORT_ACK"]
+    assert len(ack_records) == 1
+    ack_record = ack_records[0]
+    ack_delivery = ack_record["item"]["delivery"]
+    effect_event = effects[0]["item"]["group"]["members"][0]["stamp"]["event_id"]
+    assert ack_record["key"][0] == ack_delivery["visible_at"] == ack_visible
+    assert ack_delivery["source_fact_id"] == effect_event
+    ack_payload = ack_delivery["immutable_payload"]
+    assert set(ack_payload) == {"route", "operation", "client_order_id", "order_id", "code"}
+    assert (ack_payload["route"], ack_payload["operation"], ack_payload["order_id"], ack_payload["code"]) == (
+        "WS", "CANCEL", target, "0",
+    )
+    assert isinstance(ack_payload["client_order_id"], str) and ack_payload["client_order_id"]
+    state_after_effect = deepcopy(composition._codec.inspect_state())
+    policy_events_before_ack = deepcopy(composition._policy.events)
+    ack_calls = []
+    capture_callback = composition._capture_callback
+
+    def count_ack_callback(delivery):
+        if delivery["delivery_id"] == ack_delivery["delivery_id"]:
+            ack_calls.append(delivery["delivery_id"])
+        return capture_callback(delivery)
+
+    composition._capture_callback = count_ack_callback
+    assert composition._dispatch_due(ack_visible - 1)["classification"] == "SUCCESS"
+    assert ack_record["result"]["classification"] == "PENDING"
+    assert composition._dispatch_due(ack_visible)["classification"] == "SUCCESS"
+    assert ack_record["result"]["classification"] == "SUCCESS"
+    assert ack_record["result"]["events"] == []
+    assert ack_calls == [ack_delivery["delivery_id"]]
+    assert composition._codec.inspect_state() == state_after_effect
+    assert composition._policy.events == policy_events_before_ack
+    ack_audit_after_delivery = deepcopy(composition._audit[ack_delivery["delivery_id"]])
+    assert composition._enqueue(dict(kind="DELIVERY", delivery=ack_delivery))["classification"] == "SUCCESS"
+    assert composition._policy.events == policy_events_before_ack
+    assert composition._codec.inspect_state() == state_after_effect
+    assert composition._audit[ack_delivery["delivery_id"]] == ack_audit_after_delivery
+    assert ack_calls == [ack_delivery["delivery_id"]]
     assert composition._dispatch_due((start + 45_025) * 16 + 6)["classification"] == "SUCCESS"
     requests = [record for record in composition._records.values()
                 if record["item"]["kind"] == "SOURCE_GROUP"
@@ -725,6 +766,43 @@ def test_historical_full_execution_notice_derives_native_cancel_and_replacements
     assert all(fill["order_id"] != target
                for product in close_node["result"]["historical_result"]["products"]
                for fill in product["fills"])
+
+
+def test_historical_cancel_ack_after_endpoint_remains_pending_without_extending_run():
+    base = _valid_run()
+    start = base.range_start_ms
+    trade_rows = tuple(
+        replace(row, open=D("101"), high=D("101.5"), low=D("100.5"), close=D("101"), volume=D("0.4"))
+        if row.product_id == "A-USDT-SWAP" else row
+        for row in base.trade_bars
+    )
+    run = replace(_rehashed_run(base, trade_rows=trade_rows), range_end_ms=start + 45_004)
+    composition = _composition(run)
+    composition._policy.rows[1]["active"] = "false"
+    ack_calls = []
+    capture_callback = composition._capture_callback
+
+    def count_ack_callback(delivery):
+        if delivery["payload_kind"] == "TRANSPORT_ACK":
+            ack_calls.append(delivery["delivery_id"])
+        return capture_callback(delivery)
+
+    composition._capture_callback = count_ack_callback
+    endpoint = run.range_end_ms * 16 + 6
+    assert composition._dispatch_due(endpoint)["classification"] == "SUCCESS"
+    effects = [record for record in composition._records.values()
+               if record["item"]["kind"] == "SOURCE_GROUP"
+               and record["item"]["group"]["members"][0]["kind"] == "CANCEL_EFFECT"
+               and record["result"].get("group_result", {}).get("classification") == "COMMITTED"]
+    acks = [record for record in composition._records.values()
+            if record["item"]["kind"] == "DELIVERY"
+            and record["item"]["delivery"]["payload_kind"] == "TRANSPORT_ACK"]
+    assert len(effects) == len(acks) == 1
+    ack = acks[0]
+    assert ack["item"]["delivery"]["source_fact_id"] == effects[0]["item"]["group"]["members"][0]["stamp"]["event_id"]
+    assert ack["key"][0] > endpoint == run.range_end_ms * 16 + 6
+    assert ack["result"]["classification"] == "PENDING"
+    assert ack_calls == []
 
 
 def test_historical_execution_notice_after_endpoint_remains_pending():

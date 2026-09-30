@@ -132,6 +132,23 @@ pub(super) fn source(
             }
             Ok(Payload::Transport(t.clone()))
         }
+        (source::Kind::CancelEffect, "TRANSPORT_ACK", None) if matches!(owner.profile, ProfileContext::BtcEthScenario { ref scenario, .. } if scenario.configured.is_some()) =>
+        {
+            let (stamp, _) = owner
+                .transition
+                .events
+                .get(event)
+                .ok_or("UNKNOWN_RECEIPT_REFERENCE")?;
+            if stamp.ordering_contract_id != "HISTORICAL_ORDER_V1"
+                || stamp.source_sequence.is_none()
+                || stamp.scenario_ordinal != 50
+            {
+                return Err("INVALID_SCHEMA");
+            }
+            Ok(Payload::Transport(
+                owner.historical_cancel_ack_transport(event)?,
+            ))
+        }
         _ => Err("INVALID_SCHEMA"),
     }
 }
