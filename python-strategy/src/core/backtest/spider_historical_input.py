@@ -11,7 +11,7 @@ from decimal import Decimal
 from hashlib import sha256
 import json
 import re
-from typing import Callable, TypeVar, cast
+from typing import Any, Callable, TypeVar, cast
 
 from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_canonical
 
@@ -635,6 +635,211 @@ def validate_historical_input(run: HistoricalRunInput) -> str:
     semantic_input = asdict(run)
     semantic_input.pop("run_id")
     return _digest(semantic_input)
+
+
+_RUN_INPUT_KEYS = frozenset({
+    "schema_id", "schema_version", "run_id", "account_key", "policy_id", "policy_version",
+    "policy_source_sha256", "strategy_identity", "parameters", "configuration_bytes",
+    "configuration_sha256", "ordered_products", "model_id", "model_version", "range_start_ms",
+    "range_end_ms", "bar_duration_ms", "warmup_start_ms", "trade_manifest", "mark_manifest",
+    "trade_bars", "mark_bars", "spec_before", "spec_after", "market_slippage_bps",
+    "execution_fee_provenance", "timer_period_ms", "first_timer_ms", "local_clock_zone",
+    "order_accept_delay_ms", "cancel_effect_delay_ms", "order_notice_delay_ms", "cancel_ack_delay_ms",
+    "poll_profile", "endpoint_policy_id", "initial_policy_cache", "initial_account_state", "funding_mode",
+})
+_MANIFEST_KEYS = frozenset({
+    "source_id", "provider", "endpoint", "request_parameters", "retrieved_at_utc", "http_status",
+    "raw_sha256", "canonical_rows_sha256", "schema_version", "field_map_version", "product_mapping",
+    "units", "source_row_count", "normalized_row_count", "first_source_timestamp_ms",
+    "last_source_timestamp_ms", "duplicate_policy", "gap_policy", "evidence_label",
+})
+_BAR_KEYS = frozenset({
+    "product_id", "bar_open_ms", "open", "high", "low", "close", "confirm", "source_sequence",
+    "volume", "source_row_hash",
+})
+_SPEC_KEYS = frozenset({
+    "product_id", "effective_at_ms", "contract_value", "multiplier", "price_tick", "quantity_step",
+    "minimum_quantity", "tier_hash",
+})
+
+
+def _codec_object(value: object, keys: frozenset[str], label: str) -> dict[str, object]:
+    if type(value) is not dict or set(cast(dict[object, object], value)) != keys:
+        raise HistoricalInputError(f"invalid encoded {label} shape")
+    return cast(dict[str, object], value)
+
+
+def _codec_text(value: object, label: str) -> str:
+    if type(value) is not str:
+        raise HistoricalInputError(f"invalid encoded {label}")
+    return cast(str, value)
+
+
+def _codec_decimal(value: object, label: str) -> Decimal:
+    text = _codec_text(value, label)
+    try:
+        decimal = Decimal(text)
+    except (ValueError, ArithmeticError) as error:
+        raise HistoricalInputError(f"invalid encoded {label}") from error
+    if _canonical_decimal(decimal) != text:
+        raise HistoricalInputError(f"noncanonical encoded {label}")
+    return decimal
+
+
+def _codec_bytes(value: object, label: str) -> bytes:
+    text = _codec_text(value, label)
+    if re.fullmatch(r"(?:[0-9a-f]{2})*", text) is None:
+        raise HistoricalInputError(f"invalid encoded {label} hex")
+    return bytes.fromhex(text)
+
+
+def _codec_pairs(value: object, label: str) -> tuple[tuple[str, str], ...]:
+    if type(value) is not list:
+        raise HistoricalInputError(f"invalid encoded {label} pairs")
+    pairs = []
+    for item in cast(list[object], value):
+        if type(item) is not list or len(cast(list[object], item)) != 2:
+            raise HistoricalInputError(f"invalid encoded {label} pair")
+        pair = cast(list[object], item)
+        pairs.append((_codec_text(pair[0], label), _codec_text(pair[1], label)))
+    return tuple(pairs)
+
+
+def _manifest_value(manifest: SourceManifest) -> dict[str, object]:
+    if type(manifest) is not SourceManifest:
+        raise HistoricalInputError("invalid source manifest DTO")
+    value = {key: getattr(manifest, key) for key in _MANIFEST_KEYS}
+    value["request_parameters"] = [list(pair) for pair in manifest.request_parameters]
+    value["product_mapping"] = [list(pair) for pair in manifest.product_mapping]
+    return value
+
+
+def _decode_manifest(value: object) -> SourceManifest:
+    row = _codec_object(value, _MANIFEST_KEYS, "source manifest")
+    decoded = dict(row)
+    decoded["request_parameters"] = _codec_pairs(row["request_parameters"], "request_parameters")
+    decoded["product_mapping"] = _codec_pairs(row["product_mapping"], "product_mapping")
+    return SourceManifest(**cast(Any, decoded))
+
+
+def _bar_value(bar: HistoricalBar) -> dict[str, object]:
+    if type(bar) is not HistoricalBar:
+        raise HistoricalInputError("invalid historical bar DTO")
+    return {
+        "product_id": bar.product_id, "bar_open_ms": bar.bar_open_ms, "open": _canonical_decimal(bar.open),
+        "high": _canonical_decimal(bar.high), "low": _canonical_decimal(bar.low),
+        "close": _canonical_decimal(bar.close), "confirm": bar.confirm,
+        "source_sequence": bar.source_sequence,
+        "volume": None if bar.volume is None else _canonical_decimal(bar.volume),
+        "source_row_hash": bar.source_row_hash,
+    }
+
+
+def _decode_bar(value: object) -> HistoricalBar:
+    row = _codec_object(value, _BAR_KEYS, "historical bar")
+    decoded = dict(row)
+    for field in ("open", "high", "low", "close"):
+        decoded[field] = _codec_decimal(row[field], "bar " + field)
+    if row["volume"] is not None:
+        decoded["volume"] = _codec_decimal(row["volume"], "bar volume")
+    return HistoricalBar(**cast(Any, decoded))
+
+
+def _spec_value(spec: InstrumentSpecEvidence) -> dict[str, object]:
+    if type(spec) is not InstrumentSpecEvidence:
+        raise HistoricalInputError("invalid instrument spec DTO")
+    return {
+        "product_id": spec.product_id, "effective_at_ms": spec.effective_at_ms,
+        "contract_value": _canonical_decimal(spec.contract_value), "multiplier": _canonical_decimal(spec.multiplier),
+        "price_tick": _canonical_decimal(spec.price_tick), "quantity_step": _canonical_decimal(spec.quantity_step),
+        "minimum_quantity": _canonical_decimal(spec.minimum_quantity), "tier_hash": spec.tier_hash,
+    }
+
+
+def _decode_spec(value: object) -> InstrumentSpecEvidence:
+    row = _codec_object(value, _SPEC_KEYS, "instrument spec")
+    decoded = dict(row)
+    for field in ("contract_value", "multiplier", "price_tick", "quantity_step", "minimum_quantity"):
+        decoded[field] = _codec_decimal(row[field], "spec " + field)
+    return InstrumentSpecEvidence(**cast(Any, decoded))
+
+
+def encode_historical_run_input(run: HistoricalRunInput) -> bytes:
+    """Encode the exact immutable historical input as canonical JSON bytes."""
+    if type(run) is not HistoricalRunInput:
+        raise HistoricalInputError("invalid run DTO")
+    validate_historical_input(run)
+    value: dict[str, object] = {key: getattr(run, key) for key in _RUN_INPUT_KEYS}
+    value["parameters"] = [
+        dict(key=key, kind="DECIMAL", value=_canonical_decimal(parameter))
+        if type(parameter) is Decimal else dict(key=key, kind="STRING", value=parameter)
+        for key, parameter in run.parameters
+    ]
+    for field in ("configuration_bytes", "initial_policy_cache", "initial_account_state"):
+        value[field] = getattr(run, field).hex()
+    value["ordered_products"] = list(run.ordered_products)
+    value["trade_manifest"] = _manifest_value(run.trade_manifest)
+    value["mark_manifest"] = _manifest_value(run.mark_manifest)
+    value["trade_bars"] = [_bar_value(row) for row in run.trade_bars]
+    value["mark_bars"] = [_bar_value(row) for row in run.mark_bars]
+    value["spec_before"] = [_spec_value(row) for row in run.spec_before]
+    value["spec_after"] = [_spec_value(row) for row in run.spec_after]
+    value["market_slippage_bps"] = _canonical_decimal(run.market_slippage_bps)
+    return _canonical(value)
+
+
+def decode_historical_run_input(raw: bytes) -> HistoricalRunInput:
+    """Decode canonical historical input bytes and revalidate before returning."""
+    value = _decode_canonical(raw)
+    row = _codec_object(value, _RUN_INPUT_KEYS, "historical run")
+    raw_parameters = row["parameters"]
+    if type(raw_parameters) is not list:
+        raise HistoricalInputError("invalid encoded strategy parameters")
+    parameters = []
+    for item in cast(list[object], raw_parameters):
+        parameter = _codec_object(item, frozenset({"key", "kind", "value"}), "strategy parameter")
+        key = _codec_text(parameter["key"], "parameter key")
+        kind = _codec_text(parameter["kind"], "parameter kind")
+        if kind == "DECIMAL":
+            parameter_value: str | Decimal = _codec_decimal(parameter["value"], "parameter value")
+        elif kind == "STRING":
+            parameter_value = _codec_text(parameter["value"], "parameter value")
+        else:
+            raise HistoricalInputError("unsupported encoded parameter kind")
+        parameters.append((key, parameter_value))
+    products = row["ordered_products"]
+    if type(products) is not list:
+        raise HistoricalInputError("invalid encoded ordered products")
+    bars: dict[str, tuple[HistoricalBar, ...]] = {}
+    specs: dict[str, tuple[InstrumentSpecEvidence, ...]] = {}
+    for name in ("trade_bars", "mark_bars"):
+        collection = row[name]
+        if type(collection) is not list:
+            raise HistoricalInputError(f"invalid encoded {name}")
+        bars[name] = tuple(_decode_bar(item) for item in cast(list[object], collection))
+    for name in ("spec_before", "spec_after"):
+        collection = row[name]
+        if type(collection) is not list:
+            raise HistoricalInputError(f"invalid encoded {name}")
+        specs[name] = tuple(_decode_spec(item) for item in cast(list[object], collection))
+    decoded: dict[str, object] = dict(row)
+    decoded.update({
+        "parameters": tuple(parameters),
+        "configuration_bytes": _codec_bytes(row["configuration_bytes"], "configuration bytes"),
+        "ordered_products": tuple(_codec_text(product, "ordered product") for product in cast(list[object], products)),
+        "trade_manifest": _decode_manifest(row["trade_manifest"]),
+        "mark_manifest": _decode_manifest(row["mark_manifest"]),
+        "trade_bars": bars["trade_bars"], "mark_bars": bars["mark_bars"],
+        "spec_before": specs["spec_before"], "spec_after": specs["spec_after"],
+        "market_slippage_bps": _codec_decimal(row["market_slippage_bps"], "market slippage"),
+        "initial_policy_cache": _codec_bytes(row["initial_policy_cache"], "initial policy cache"),
+        "initial_account_state": _codec_bytes(row["initial_account_state"], "initial account state"),
+    })
+    run = HistoricalRunInput(**cast(Any, decoded))
+    validate_historical_input(run)
+    if encode_historical_run_input(run) != raw:
+        raise HistoricalInputError("noncanonical historical run encoding")
+    return run
 
 
 OwnerT = TypeVar("OwnerT")

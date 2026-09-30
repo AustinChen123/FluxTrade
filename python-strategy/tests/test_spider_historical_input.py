@@ -4,11 +4,12 @@ from hashlib import sha256
 from pathlib import Path
 import ast
 import re
+from typing import cast
 
 import pytest
 
 from src.core.backtest import spider_configured_scale_input as scale
-from src.core.backtest.spider_run_artifacts import canonical_bytes
+from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_canonical
 from src.core.backtest.spider_historical_input import (
     BAR_DURATION_MS,
     SCHEMA_ID,
@@ -19,7 +20,9 @@ from src.core.backtest.spider_historical_input import (
     InstrumentSpecEvidence,
     SourceManifest,
     admit_before_construction,
+    decode_historical_run_input,
     decode_p2_configuration,
+    encode_historical_run_input,
     validate_historical_input,
 )
 
@@ -201,6 +204,71 @@ def test_valid_input_hash_is_deterministic_and_excludes_transport_run_id():
         replace(run, initial_policy_cache=_policy_cache(capital={"total": "1100", "usdt": "1000", "avail": "1000", "earn": "0", "position": "0"})),
     )
     assert all(validate_historical_input(change) != original for change in changes)
+
+
+@pytest.mark.parametrize("model_id", ["OHLC4_OPEN_HIGH_LOW_CLOSE_V1", "OHLC4_OPEN_LOW_HIGH_CLOSE_V1"])
+def test_historical_run_input_codec_roundtrips_exact_types_and_semantic_hash(model_id):
+    run = replace(_valid_run(), model_id=model_id, parameters=(("defaultN", "1"),))
+    encoded = encode_historical_run_input(run)
+    decoded = decode_historical_run_input(encoded)
+    assert type(decoded) is HistoricalRunInput
+    assert type(decoded.trade_manifest) is SourceManifest
+    assert type(decoded.trade_bars[0]) is HistoricalBar
+    assert type(decoded.spec_before[0]) is InstrumentSpecEvidence
+    assert type(decoded.parameters[0][1]) is str
+    assert decoded == run
+    assert decoded.configuration_bytes == run.configuration_bytes
+    assert decoded.initial_policy_cache == run.initial_policy_cache
+    assert decoded.initial_account_state == run.initial_account_state
+    assert validate_historical_input(decoded) == validate_historical_input(run)
+    assert encode_historical_run_input(decoded) == encoded
+
+
+def test_historical_run_input_codec_preserves_decimal_parameter_tag():
+    decimal_run = _valid_run()
+    string_run = replace(decimal_run, parameters=(("defaultN", "1"),))
+    decimal_wire = cast(dict[str, object], decode_canonical(encode_historical_run_input(decimal_run)))
+    string_wire = cast(dict[str, object], decode_canonical(encode_historical_run_input(string_run)))
+    assert decimal_wire["parameters"] == [dict(key="defaultN", kind="DECIMAL", value="1")]
+    assert string_wire["parameters"] == [dict(key="defaultN", kind="STRING", value="1")]
+    assert type(decode_historical_run_input(encode_historical_run_input(decimal_run)).parameters[0][1]) is Decimal
+    assert type(decode_historical_run_input(encode_historical_run_input(string_run)).parameters[0][1]) is str
+
+
+@pytest.mark.parametrize("mutation", [
+    "missing", "extra", "noncanonical_decimal", "bad_hex", "mutable_parameters",
+])
+def test_historical_run_input_codec_rejects_nonexact_schema_and_values(mutation):
+    raw = encode_historical_run_input(_valid_run())
+    value = cast(dict[str, object], decode_canonical(raw))
+    if mutation == "missing":
+        del value["run_id"]
+    elif mutation == "extra":
+        value["unknown"] = "extra"
+    elif mutation == "noncanonical_decimal":
+        cast(list[dict[str, object]], value["parameters"])[0]["value"] = "1.0"
+    elif mutation == "bad_hex":
+        value["configuration_bytes"] = "0"
+    else:
+        value["parameters"] = {"defaultN": "1"}
+    with pytest.raises(HistoricalInputError):
+        decode_historical_run_input(canonical_bytes(value))
+
+
+@pytest.mark.parametrize("raw_mutation", ["duplicate_key", "float"])
+def test_historical_run_input_codec_rejects_ambiguous_json(raw_mutation):
+    raw = encode_historical_run_input(_valid_run())
+    if raw_mutation == "duplicate_key":
+        raw = raw.replace(b'"run_id":', b'"run_id":"duplicate","run_id":', 1)
+    else:
+        raw = raw.replace(b'"model_version":1', b'"model_version":1.0', 1)
+    with pytest.raises(HistoricalInputError):
+        decode_historical_run_input(raw)
+
+
+def test_historical_run_input_codec_rejects_float_parameters_before_encoding():
+    with pytest.raises(HistoricalInputError, match="parameters must be Decimal or string"):
+        encode_historical_run_input(replace(_valid_run(), parameters=(("defaultN", 1.0),)))
 
 
 def test_existing_p2_configuration_codec_and_identity_are_reused():
