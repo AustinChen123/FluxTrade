@@ -74,8 +74,8 @@ def _p2_configuration(products=("A-USDT-SWAP", "B-USDT-SWAP")):
             "taker_fee_rate": "0.001",
             "liquidation_fee_rate": "0.001",
             "specs": [{"version": "spec-v1", "valid_from": 0, "valid_to": None,
-                       "contract_value": "1", "multiplier": "1", "price_tick": "1",
-                       "quantity_step": "1", "minimum_quantity": "1"}],
+                       "contract_value": "1", "multiplier": "1", "price_tick": "0.01",
+                       "quantity_step": "0.001", "minimum_quantity": "0.001"}],
             "tiers": [{"version": "tier-v1", "valid_from": 0, "valid_to": None,
                        "rows": [{"minimum_contracts": "0", "maximum_contracts": "100",
                                  "mmr": "0.005", "imr": "0.1", "max_leverage": "10"}]}],
@@ -130,9 +130,13 @@ def _valid_run() -> HistoricalRunInput:
                          key=lambda row: (row.bar_open_ms, 0 if row.product_id.startswith("A-") else 1)))
     mark = tuple(sorted(_rows("A-USDT-SWAP", warmup, trade=False) + _rows("B-USDT-SWAP", warmup, trade=False),
                         key=lambda row: (row.bar_open_ms, 0 if row.product_id.startswith("A-") else 1)))
-    specs = tuple(InstrumentSpecEvidence(p, start, Decimal("1"), Decimal("1"), Decimal("1"), Decimal("1"), Decimal("1"), HASH)
+    specs = tuple(InstrumentSpecEvidence(p, start, Decimal("1"), Decimal("1"), Decimal("0.01"),
+                                         Decimal("0.001"), Decimal("0.001"), HASH)
                   for p in ("A-USDT-SWAP", "B-USDT-SWAP"))
-    configuration_bytes = canonical_bytes(_p2_configuration())
+    configuration = _p2_configuration()
+    for product in configuration["products"]:
+        product["marks"][0]["valid_to"] = end
+    configuration_bytes = canonical_bytes(configuration)
     return HistoricalRunInput(
         SCHEMA_ID, SCHEMA_VERSION, "transport-id", "account", "SPIDER_GRID_ORIGINAL_V1", "1", HASH,
         "SPIDER_GRID_ORIGINAL_V1", (("defaultN", Decimal("1")),), configuration_bytes,

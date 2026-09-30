@@ -43,11 +43,21 @@ pub(in super::super) fn decode_group(input: &str, owner: &ScenarioAccount) -> Re
     if group.account_key != owner.key {
         return Err("ACCOUNT_KEY_MISMATCH");
     }
+    if group.ordering_contract_id == "HISTORICAL_ORDER_V1"
+        && (!matches!(owner.profile, ProfileContext::BtcEthScenario { ref scenario, .. } if scenario.configured.is_some())
+            || group.members.iter().any(|member| {
+                !matches!(member.input, Input::Intent(_)) || member.stamp.source_sequence.is_none()
+            }))
+    {
+        return Err("INVALID_SCENARIO_GROUP");
+    }
     Ok(group)
 }
 fn ordering(value: &Json) -> Result<String, Fault> {
     match value.text()? {
-        "S_order_v1" | "S_order_v1_reverse_execution_cancel_effective" => value.id(),
+        "S_order_v1" | "S_order_v1_reverse_execution_cancel_effective" | "HISTORICAL_ORDER_V1" => {
+            value.id()
+        }
         _ => Err("INVALID_SCHEMA"),
     }
 }

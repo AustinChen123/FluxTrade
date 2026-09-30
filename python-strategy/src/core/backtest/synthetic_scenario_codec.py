@@ -31,7 +31,7 @@ Profile = Literal[
 ]
 Side = Literal["LONG", "SHORT"]
 ObservedSide = Literal["buy", "sell"]
-Ordering = Literal["S_order_v1", "S_order_v1_reverse_execution_cancel_effective"]
+Ordering = Literal["S_order_v1", "S_order_v1_reverse_execution_cancel_effective", "HISTORICAL_ORDER_V1"]
 Reason = Literal["EXPLICIT_SCENARIO", "RISK_SHORTFALL", "MMR_BREACH", "SPEC_MIGRATION", "UNSUPPORTED"]
 Kind = Literal["MARKET", "EARN", "TRADING", "POSITIONS", "OPEN_ORDERS"]
 PayloadKind = Literal["EXECUTION_FACT", "TRANSPORT_ACK", "MARKET_SNAPSHOT", "EARN_SNAPSHOT", "TRADING_SNAPSHOT", "POSITION_SNAPSHOT", "OPEN_ORDER_SNAPSHOT"]

@@ -326,6 +326,8 @@ class _ReplayComposition:
         self._historical_poll_range: tuple[int, int] | None = None
         self._p3_audit_continuations: set[str] = set()
         self._historical_poll_issued_at: dict[str, int] = {}
+        self._historical_order_contract: dict[str, Any] | None = None
+        self._historical_order_sequence = 0
 
     @classmethod
     def _from_historical_run(cls, run: object) -> "_ReplayComposition":
@@ -339,13 +341,28 @@ class _ReplayComposition:
 
         historical_run = cast(HistoricalRunInput, run)
         prepared = _prepare_historical_replay(historical_run)
+        configuration = deepcopy(prepared.configuration)
+        configuration["seed_effective_at"] = cast(int, configuration["seed_effective_at"]) * 16
+        for product in cast(list[dict[str, Any]], configuration["products"]):
+            for field in ("specs", "tiers", "marks"):
+                for version in cast(list[dict[str, Any]], product[field]):
+                    for key in ("valid_from", "valid_to"):
+                        if version[key] is not None:
+                            version[key] = cast(int, version[key]) * 16
         composition = cls(
             "SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1",
             prepared.account,
-            configuration=prepared.configuration,
+            configuration=configuration,
         )
         _restore_initial_policy(composition, historical_run, prepared)
         composition._historical_poll_range = (historical_run.range_start_ms, historical_run.range_end_ms)
+        composition._historical_order_contract = dict(
+            run_contract_hash=prepared.contract_hash,
+            config_id=prepared.configuration["config_id"],
+            strategy_identity=historical_run.strategy_identity,
+            order_accept_delay_ms=historical_run.order_accept_delay_ms,
+            range_end_ms=historical_run.range_end_ms,
+        )
         composition._current_time = historical_run.range_start_ms * 16
         for sequence, snapshot in enumerate(prepared.snapshots):
             result = composition._enqueue(_historical_market_item(snapshot, sequence))
@@ -454,6 +471,13 @@ class _ReplayComposition:
                 content = policy_protocol._plan_sequence(row["schedule_sequence"]) + policy_protocol._plan_group(
                     group, self._configured_product_ids)
                 account, at, sequence, stable, cls = group["account_key"], group["group_effective_at"], row["schedule_sequence"], group["group_id"], 0
+                if group["ordering_contract_id"] == "HISTORICAL_ORDER_V1":
+                    member = group["members"][0]
+                    if len(group["members"]) != 1 or member["kind"] != "INTENT":
+                        raise _ScheduleError("INVALID_SCHEMA")
+                    source_sequence = member["stamp"].get("source_sequence")
+                    if type(source_sequence) is not int or source_sequence != sequence:
+                        raise _ScheduleError("INVALID_SCHEMA")
             elif kind == "SNAPSHOT_CAPTURE":
                 row = cast(dict[str, Any], policy_protocol._event_object(item, "kind capture_sequence request delivery_projection"))
                 request, projection = row["request"], row["delivery_projection"]
@@ -576,7 +600,13 @@ class _ReplayComposition:
                 raise _ScheduleError("INVALID_SCHEMA")
             for other in prospective.values():
                 other_key = other["key"]
-                if key[:3] == other_key[:3] or (cls == other_key[1] == 0 and at == other_key[0]):
+                historical_same_tick = (
+                    cls == other_key[1] == 0 and at == other_key[0]
+                    and item.get("kind") == other["item"].get("kind") == "SOURCE_GROUP"
+                    and item["group"]["ordering_contract_id"] == other["item"]["group"]["ordering_contract_id"] == "HISTORICAL_ORDER_V1"
+                    and sequence != other_key[2]
+                )
+                if key[:3] == other_key[:3] or (cls == other_key[1] == 0 and at == other_key[0] and not historical_same_tick):
                     raise _ScheduleError("INVALID_SCHEMA")
             if cls == 1:
                 request, projection = item["request"], item["delivery_projection"]
@@ -677,8 +707,9 @@ class _ReplayComposition:
             for event in events:
                 for action in event.get("actions", []):
                     action["group_id"] = next(financial)["expected_group"]["group_id"]
+        historical_groups = self._historical_order_children(record, prefix.events, events) if audit_only else []
         self._callback_evidence(record, prefix, events)
-        derived = ([] if audit_only else [
+        derived = (historical_groups if audit_only else [
             (dict(kind="SOURCE_GROUP", schedule_sequence=v["schedule_sequence"], group=v["expected_group"]), None)
             if "expected_group" in v else (self._capture_item(dict(capture_sequence=v["capture_sequence"],
                 snapshot_request=v["snapshot_request"], delivery_projection=v["delivery_projection"])), None)
@@ -688,6 +719,76 @@ class _ReplayComposition:
             derived.append((self._capture_item(next_stage), None))
         self._admit_set(derived)
         return deepcopy(events)
+
+    def _historical_order_children(self, record, policy_events, audit_events):
+        contract = self._historical_order_contract
+        if self._historical_poll_range is None or contract is None:
+            raise _ScheduleError("INVALID_SCHEMA")
+        delivery = record["item"]["delivery"]
+        visible = delivery["visible_at"]
+        if type(visible) is not int or visible < 6 or visible % 16 != 6:
+            raise _ScheduleError("INVALID_SCHEMA")
+        parent_raw = (visible - 6) // 16
+        delay, end = contract["order_accept_delay_ms"], contract["range_end_ms"]
+        if type(delay) is not int or type(end) is not int or parent_raw + delay >= 2**59:
+            raise _ScheduleError("INVALID_SCHEMA")
+        groups = []
+        child_ordinal = 0
+        sequence = self._historical_order_sequence
+        for event_index, event in enumerate(policy_events):
+            if event.get("kind") not in ("send", "cancel"):
+                continue
+            for order_index, order in enumerate(event["orders"]):
+                ordinal = child_ordinal
+                child_ordinal += 1
+                if event["kind"] != "send":
+                    continue
+                acceptance_raw = parent_raw + delay
+                if acceptance_raw >= end:
+                    continue
+                if order["ordType"] not in ("limit", "market"):
+                    raise _ScheduleError("INVALID_SCHEMA")
+                product_id = order["instId"]
+                if product_id not in self._configured_product_ids:
+                    raise _ScheduleError("INVALID_SCHEMA")
+                group_id = policy_protocol._historical_child_id(
+                    contract["run_contract_hash"], delivery["delivery_id"], "ORDER_GROUP", ordinal
+                )
+                event_id = policy_protocol._historical_child_id(
+                    contract["run_contract_hash"], delivery["delivery_id"], "ORDER_EVENT", ordinal
+                )
+                intent_id = policy_protocol._historical_child_id(
+                    contract["run_contract_hash"], delivery["delivery_id"], "ORDER_INTENT", ordinal
+                )
+                side = {"buy": "LONG", "sell": "SHORT"}.get(order["side"])
+                if side is None:
+                    raise _ScheduleError("INVALID_SCHEMA")
+                quantity = D(order["sz"])
+                limit_price = D(order["px"]) if order["ordType"] == "limit" else None
+                member = dict(
+                    kind="INTENT",
+                    stamp=dict(event_id=event_id, effective_at=acceptance_raw * 16 + 3,
+                               source_sequence=sequence, causal_parent_ids=[],
+                               ordering_contract_id="HISTORICAL_ORDER_V1", scenario_ordinal=60),
+                    payload=dict(
+                        intent_id=intent_id, client_order_id=order["clOrdId"],
+                        config_id=contract["config_id"], product_id=product_id,
+                        strategy_id=contract["strategy_identity"], side=side,
+                        order_type="LIMIT" if order["ordType"] == "limit" else "MARKET",
+                        quantity_contracts=quantity, limit_price=limit_price,
+                        reduce_only=False, requested_at=parent_raw,
+                    ),
+                )
+                group = dict(schema_version="scenario_group_v1", group_id=group_id,
+                             account_key=deepcopy(self._account), ordering_contract_id="HISTORICAL_ORDER_V1",
+                             group_effective_at=acceptance_raw * 16 + 3,
+                             declared_member_count=1, members=[member])
+                policy_protocol._plan_group(group, self._configured_product_ids)
+                audit_events[event_index]["actions"][order_index]["group_id"] = group_id
+                groups.append((dict(kind="SOURCE_GROUP", schedule_sequence=sequence, group=group), None))
+                sequence += 1
+        self._historical_order_sequence = sequence
+        return groups
 
     def _dispatch_due(self, until):
         if self._terminal is not None:

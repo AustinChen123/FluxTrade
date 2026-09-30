@@ -153,7 +153,7 @@ def test_invalid_historical_run_constructs_neither_composition_nor_native_owner(
     assert composition_calls == [] and owner_calls == []
 
 
-def _assert_rejected_before_owner(run: HistoricalRunInput, monkeypatch) -> None:
+def _assert_rejected_before_owner(run: HistoricalRunInput, monkeypatch, *, message: str | None = None) -> None:
     composition_calls = []
     owner_calls = []
     original_init = _ReplayComposition.__init__
@@ -169,7 +169,7 @@ def _assert_rejected_before_owner(run: HistoricalRunInput, monkeypatch) -> None:
 
     monkeypatch.setattr(_ReplayComposition, "__init__", count_composition)
     monkeypatch.setattr(wire._native, "_SyntheticScenarioReplaySession", count_owner)
-    with pytest.raises(HistoricalInputError):
+    with pytest.raises(HistoricalInputError, match=message):
         _composition(run)
     assert composition_calls == [] and owner_calls == []
 
@@ -188,6 +188,8 @@ def test_configured_spec_semantics_reject_before_composition_or_native_owner(cas
     start, end = run.range_start_ms, run.range_end_ms
     last_open = end - run.bar_duration_ms
     evidence_product = 1 if case in {"multiplier", "quantity_step"} else 0
+    for product in configuration["products"]:
+        product["marks"][0]["valid_to"] = end
     if case == "no_active":
         first["valid_from"] = start + 1
     elif case == "multiple_active":
@@ -207,7 +209,16 @@ def test_configured_spec_semantics_reject_before_composition_or_native_owner(cas
         product = configuration["products"][evidence_product]
         product["specs"][0][case] = "2"
     run = _run_with_configuration(run, configuration)
-    _assert_rejected_before_owner(run, monkeypatch)
+    message = ("configured product spec differs from run evidence"
+               if case in {"contract_value", "multiplier", "price_tick", "quantity_step", "minimum_quantity"}
+               else None)
+    _assert_rejected_before_owner(run, monkeypatch, message=message)
+
+
+def test_configured_spec_coherent_baseline_is_accepted():
+    composition = _composition(_valid_run())
+    assert composition._policy.markets["A-USDT-SWAP"]["increment"] == "0.01"
+    assert composition._policy.markets["A-USDT-SWAP"]["lotSz"] == "0.001"
 
 
 def test_configured_spec_exact_run_end_boundary_is_valid_and_drives_cache(monkeypatch):
@@ -234,7 +245,7 @@ def test_configured_spec_exact_run_end_boundary_is_valid_and_drives_cache(monkey
     assert composition._dispatch_due(close_ms * 16 + 6)["classification"] == "SUCCESS"
     for market in composition._policy.markets.values():
         assert (market["ctVal"], market["lotSz"], market["minSz"], market["increment"]) == (
-            D("1"), D("1"), D("1"), D("1"))
+            D("1"), D("0.001"), D("0.001"), D("0.01"))
 
 
 def test_market_cache_uses_exact_1440_closed_bars_and_ignores_future_until_its_close():
@@ -274,7 +285,8 @@ def test_market_cache_uses_exact_1440_closed_bars_and_ignores_future_until_its_c
     rows = snapshot_left["markets"]
     assert [row["product_id"] for row in rows] == ["A-USDT-SWAP", "B-USDT-SWAP"]
     assert [(row["ctVal"], row["lotSz"], row["minSz"], row["increment"]) for row in rows] == [
-        (D("1"), D("1"), D("1"), D("1")), (D("1"), D("1"), D("1"), D("1"))]
+        (D("1"), D("0.001"), D("0.001"), D("0.01")),
+        (D("1"), D("0.001"), D("0.001"), D("0.01"))]
     assert rows[0]["ratioHL"] == D("100")
     assert rows[1]["ratioHL"] == D("0")
     assert rows[0]["price"] == D("100")
@@ -307,6 +319,7 @@ def test_step3_cache_and_next_open_dispatch_in_frozen_phase_order(monkeypatch):
         product["marks"][0]["valid_to"] = 200_000_000
     run = _run_with_configuration(run, config)
     composition = _composition(run)
+    composition._policy.running = False
     calls = []
     original_step = wire.ScenarioCodec.historical_market_step
     original_market = composition._policy.apply_market
@@ -415,21 +428,69 @@ def test_historical_timer_phase_follows_same_time_market_cache_and_excludes_endp
                if record["item"]["kind"] == "HISTORICAL_TIMER")
 
 
-def test_historical_poll_audit_only_records_actions_without_financial_children():
+def test_historical_poll_sends_become_native_groups_only_after_acceptance_tick():
     run = _extend_one_minute(_valid_run())
     composition = _composition(run)
-    until = run.range_start_ms + 30_000
-    assert composition._dispatch_due(until * 16 + 6)["classification"] == "SUCCESS"
+    composition._policy.rows[1]["active"] = "false"
+    parent_raw = run.range_start_ms + 5_020
+    assert composition._dispatch_due(parent_raw * 16 + 6)["classification"] == "SUCCESS"
     actions = [action for events in composition._audit.values() for event in events
                for action in event.get("actions", [])]
     assert actions and all(action["status"] == "UNSUBMITTED" for action in actions)
-    assert not any(record["item"]["kind"] == "SOURCE_GROUP" for record in composition._records.values())
-    assert all(record["item"]["kind"] == "DELIVERY"
-               or record["item"]["kind"] in ("HISTORICAL_TIMER", "HISTORICAL_MARKET_CACHE")
-               or (record["item"]["kind"] == "SNAPSHOT_CAPTURE"
-                   and record["item"]["request"].get("continuation_id") is not None)
-               or record["item"]["kind"] == "HISTORICAL_MARKET_STEP"
-               for record in composition._records.values())
+    groups = [record for record in composition._records.values()
+              if record["item"]["kind"] == "SOURCE_GROUP"
+              and record["item"]["group"]["ordering_contract_id"] == "HISTORICAL_ORDER_V1"]
+    assert len(groups) == 4
+    assert len({record["key"][0] for record in groups}) == 1
+    accepted_at = (parent_raw + run.order_accept_delay_ms) * 16 + 3
+    assert {record["key"][0] for record in groups} == {accepted_at}
+    assert [record["key"][2] for record in groups] == list(range(4))
+    assert [record["item"]["group"]["members"][0]["payload"]["client_order_id"]
+            for record in groups] == [
+        order["clOrdId"] for event in composition._policy.events
+        if event["kind"] == "send" for order in event["orders"]
+    ]
+    assert all(record["result"]["classification"] == "PENDING" for record in groups)
+    assert all(action["status"] == "UNSUBMITTED" for action in actions)
+    orders_before_accept = composition._codec.inspect_state()["orders_digest"]
+    assert composition._dispatch_due(accepted_at - 1)["classification"] == "SUCCESS"
+    assert composition._codec.inspect_state()["orders_digest"] == orders_before_accept
+    assert composition._dispatch_due(accepted_at)["classification"] == "SUCCESS"
+    assert all(record["result"]["group_result"]["classification"] == "COMMITTED" for record in groups)
+    assert all(action["status"] == "SUBMITTED" for action in actions if action["group_id"] is not None)
+    assert composition._codec.inspect_state()["orders_digest"] != orders_before_accept
+    assert all(record["key"][3] in {action["group_id"] for action in actions} for record in groups)
+
+
+def test_historical_derived_ids_bind_contract_parent_and_ordinal_not_run_id():
+    from src.core.backtest.spider_policy_protocol import _historical_child_id
+
+    digest = "a" * 64
+    first = _historical_child_id(digest, "delivery-a", "ORDER_GROUP", 0)
+    assert first == _historical_child_id(digest, "delivery-a", "ORDER_GROUP", 0)
+    assert first != _historical_child_id("b" * 64, "delivery-a", "ORDER_GROUP", 0)
+    assert first != _historical_child_id(digest, "delivery-b", "ORDER_GROUP", 0)
+    assert first != _historical_child_id(digest, "delivery-a", "ORDER_GROUP", 1)
+    with pytest.raises(ValueError):
+        _historical_child_id("not-a-hash", "delivery-a", "ORDER_GROUP", 0)
+    with pytest.raises(ValueError):
+        _historical_child_id(digest, "delivery-a", "ORDER_GROUP", -1)
+
+
+def test_historical_send_at_endpoint_stays_unsubmitted_without_native_group():
+    run = _extend_one_minute(_valid_run())
+    composition = _composition(run)
+    composition._policy.rows[1]["active"] = "false"
+    parent_raw = run.range_start_ms + 5_020
+    accepted_raw = parent_raw + run.order_accept_delay_ms
+    composition._historical_order_contract["range_end_ms"] = accepted_raw
+    assert composition._dispatch_due(parent_raw * 16 + 6)["classification"] == "SUCCESS"
+    assert not any(record["item"]["kind"] == "SOURCE_GROUP"
+                   and record["item"]["group"].get("ordering_contract_id") == "HISTORICAL_ORDER_V1"
+                   for record in composition._records.values())
+    actions = [action for events in composition._audit.values() for event in events
+               for action in event.get("actions", [])]
+    assert actions and all(action["status"] == "UNSUBMITTED" and action["group_id"] is None for action in actions)
 
 
 def _complete_poll_through_native_deliveries(

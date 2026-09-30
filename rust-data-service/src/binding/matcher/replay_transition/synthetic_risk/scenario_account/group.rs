@@ -3,6 +3,7 @@ use super::*;
 use risk_transition::cancel::{identity::Encoding, EffectInput, RequestInput, Stamp};
 
 const REVERSE: &str = "S_order_v1_reverse_execution_cancel_effective";
+const HISTORICAL: &str = "HISTORICAL_ORDER_V1";
 const REVERSE_ID: &str = "reverse-execution-cancel-effective-v1";
 type PreparedGroup<'a> = (Hash, Vec<(&'a Member, Hash)>, Option<Completion>);
 
@@ -370,13 +371,18 @@ impl ScenarioAccount {
             return Err("RUN_TERMINAL");
         }
         let reverse = group.ordering_contract_id == REVERSE;
+        let historical = group.ordering_contract_id == HISTORICAL;
+        let configured_owner = matches!(self.profile, ProfileContext::BtcEthScenario { ref scenario, .. } if scenario.configured.is_some());
         if group.account_key != self.key
             || group.members.is_empty()
             || group.declared_member_count != members.len()
             || !identity(&group.group_id)
             || (reverse && group.group_id != REVERSE_ID)
             || (!reverse
-                && (group.group_id == REVERSE_ID || group.ordering_contract_id != "S_order_v1"))
+                && (group.group_id == REVERSE_ID
+                    || !(group.ordering_contract_id == "S_order_v1"
+                        || (historical && configured_owner))))
+            || (historical && (!configured_owner || members.len() != 1))
         {
             return Err("INVALID_SCENARIO_GROUP");
         }
@@ -392,6 +398,9 @@ impl ScenarioAccount {
                 || stamp.effective_at < 0
                 || stamp.ordering_contract_id != group.ordering_contract_id
                 || stamp.scenario_ordinal != member.ordinal(reverse)
+                || (historical
+                    && (stamp.source_sequence.is_none()
+                        || !matches!(member.input, Input::Intent(_))))
                 || !identity(&stamp.event_id)
                 || ids.insert(stamp.event_id.clone(), stamp).is_some()
                 || stamp.source_sequence.is_some_and(|s| !sequences.insert(s))
@@ -428,17 +437,40 @@ impl ScenarioAccount {
                     .copied()
                     .or_else(|| self.transition.events.get(parent).map(|(s, _)| s))
                     .ok_or("INVALID_SCENARIO_GROUP")?;
-                if (p.effective_at, p.scenario_ordinal)
-                    >= (stamp.effective_at, stamp.scenario_ordinal)
-                    || matches!((p.source_sequence, stamp.source_sequence), (Some(a), Some(b)) if a >= b)
+                if (if historical {
+                    (
+                        p.effective_at,
+                        p.scenario_ordinal,
+                        p.source_sequence.unwrap_or(-1),
+                    ) >= (
+                        stamp.effective_at,
+                        stamp.scenario_ordinal,
+                        stamp.source_sequence.unwrap_or(-1),
+                    )
+                } else {
+                    (p.effective_at, p.scenario_ordinal)
+                        >= (stamp.effective_at, stamp.scenario_ordinal)
+                }) || matches!((p.source_sequence, stamp.source_sequence), (Some(a), Some(b)) if a >= b)
                 {
                     return Err("INVALID_SCENARIO_GROUP");
                 }
             }
             if !self.transition.events.contains_key(&stamp.event_id) {
                 if last.is_some_and(|p| {
-                    (p.effective_at, p.scenario_ordinal)
-                        >= (stamp.effective_at, stamp.scenario_ordinal)
+                    if historical {
+                        (
+                            p.effective_at,
+                            p.scenario_ordinal,
+                            p.source_sequence.unwrap_or(-1),
+                        ) >= (
+                            stamp.effective_at,
+                            stamp.scenario_ordinal,
+                            stamp.source_sequence.unwrap_or(-1),
+                        )
+                    } else {
+                        (p.effective_at, p.scenario_ordinal)
+                            >= (stamp.effective_at, stamp.scenario_ordinal)
+                    }
                 }) {
                     return Err("STALE_EVENT");
                 }

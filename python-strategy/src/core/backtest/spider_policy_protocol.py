@@ -309,11 +309,25 @@ def _plan_group(value: object, configured_product_ids: tuple[str, ...] | None = 
         _event_token(row["schema_version"], ("scenario_group_v1",))
         + _event_id(row["group_id"])
         + _plan_account(row["account_key"])
-        + _event_token(row["ordering_contract_id"], ("S_order_v1", "S_order_v1_reverse_execution_cancel_effective"))
+        + _event_token(row["ordering_contract_id"], (
+            "S_order_v1", "S_order_v1_reverse_execution_cancel_effective", "HISTORICAL_ORDER_V1"
+        ))
         + _event_integer(row["group_effective_at"])
         + _event_integer(row["declared_member_count"])
         + _plan_list(row["members"], lambda item: _plan_member(item, configured_product_ids))
     )
+
+
+def _historical_child_id(run_contract_hash: object, parent_delivery_id: object,
+                         identity_kind: object, child_ordinal: object) -> str:
+    """Stable P3 child identity; excludes run and scheduler sequence."""
+    _plan_hash(run_contract_hash)
+    _plan_sequence(child_ordinal)
+    encoded = (_event_text("P3_DERIVED_ID_V1") + _event_text(run_contract_hash)
+               + _event_id(parent_delivery_id)
+               + _event_token(identity_kind, ("ORDER_GROUP", "ORDER_EVENT", "ORDER_INTENT"))
+               + _event_integer(child_ordinal))
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _plan_snapshot(value: object) -> bytes:

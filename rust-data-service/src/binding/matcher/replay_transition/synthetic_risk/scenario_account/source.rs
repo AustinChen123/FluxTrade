@@ -66,8 +66,29 @@ impl ScenarioAccount {
         ) {
             risk_transition::cancel::identity::stamp_shape(stamp, self.transition.reverse_group)?;
         }
+        let historical = stamp.ordering_contract_id == "HISTORICAL_ORDER_V1";
+        if historical
+            && (kind != Kind::Intent
+                || !matches!(self.profile, ProfileContext::BtcEthScenario { ref scenario, .. } if scenario.configured.is_some())
+                || stamp.source_sequence.is_none())
+        {
+            return Err("INVALID_SCENARIO_GROUP");
+        }
         if self.transition.accepted_stamp.as_ref().is_some_and(|old| {
-            (stamp.effective_at, stamp.scenario_ordinal) <= (old.effective_at, old.scenario_ordinal)
+            if historical && old.ordering_contract_id == "HISTORICAL_ORDER_V1" {
+                (
+                    stamp.effective_at,
+                    stamp.scenario_ordinal,
+                    stamp.source_sequence.unwrap_or(-1),
+                ) <= (
+                    old.effective_at,
+                    old.scenario_ordinal,
+                    old.source_sequence.unwrap_or(-1),
+                )
+            } else {
+                (stamp.effective_at, stamp.scenario_ordinal)
+                    <= (old.effective_at, old.scenario_ordinal)
+            }
         }) {
             return Err("STALE_EVENT");
         }

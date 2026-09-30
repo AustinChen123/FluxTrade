@@ -62,6 +62,25 @@ fn set_product(value: &mut Value, kind: &str, product: Value) {
     *value.pointer_mut(path).unwrap() = product;
 }
 
+fn historical_intent(group_id: &str, event_id: &str, source_sequence: i64) -> Value {
+    let mut value = request("INTENT");
+    value["group_id"] = json!(group_id);
+    value["ordering_contract_id"] = json!("HISTORICAL_ORDER_V1");
+    value["group_effective_at"] = json!(501);
+    value["members"][0]["stamp"]["event_id"] = json!(event_id);
+    value["members"][0]["stamp"]["effective_at"] = json!(501);
+    value["members"][0]["stamp"]["ordering_contract_id"] = json!("HISTORICAL_ORDER_V1");
+    value["members"][0]["stamp"]["source_sequence"] = json!(source_sequence);
+    value["members"][0]["payload"]["intent_id"] = json!(format!("I-{group_id}"));
+    value["members"][0]["payload"]["client_order_id"] = json!(format!("C-{group_id}"));
+    value["members"][0]["payload"]["config_id"] = json!("SYNTHETIC_P2_SCALE_12_V1");
+    value["members"][0]["payload"]["reduce_only"] = json!(false);
+    value["members"][0]["payload"]["quantity_contracts"] = json!("0.5");
+    value["members"][0]["payload"]["limit_price"] = json!("100");
+    value["members"][0]["payload"]["requested_at"] = json!(500);
+    value
+}
+
 #[test]
 fn configured_group_products_are_exactly_configuration_owned_for_all_decoders() {
     let owner = configured_owner(12);
@@ -148,6 +167,44 @@ fn configured_product_type_and_account_error_precedence_are_preserved() {
     let mut valid = request("INTENT");
     valid["account_key"]["account"] = json!("OTHER");
     assert_eq!(parse(&valid, &owner), Err("ACCOUNT_KEY_MISMATCH"));
+}
+
+#[test]
+fn historical_order_groups_are_configured_only_and_same_tick_source_sequence_is_authoritative() {
+    let unconfigured = owner();
+    assert_eq!(
+        parse(&historical_intent("HG0", "HE0", 0), &unconfigured),
+        Err("INVALID_SCENARIO_GROUP")
+    );
+
+    let mut configured = configured_owner(12);
+    let first = parse(&historical_intent("HG0", "HE0", 7), &configured).unwrap();
+    configured.apply_group_observed(&first, |_| Ok(())).unwrap();
+    assert_eq!(configured.orders.len(), 1);
+
+    let second = parse(&historical_intent("HG1", "HE1", 8), &configured).unwrap();
+    configured
+        .apply_group_observed(&second, |_| Ok(()))
+        .unwrap();
+    assert_eq!(configured.orders.len(), 2);
+
+    let reversed = parse(&historical_intent("HG2", "HE2", 6), &configured).unwrap();
+    assert!(matches!(
+        configured.apply_group_observed(&reversed, |_| Ok(())),
+        Err("STALE_EVENT")
+    ));
+    assert_eq!(configured.orders.len(), 2);
+}
+
+#[test]
+fn historical_order_stamp_requires_source_sequence() {
+    let configured = configured_owner(12);
+    let mut value = historical_intent("HG0", "HE0", 0);
+    value["members"][0]["stamp"]
+        .as_object_mut()
+        .unwrap()
+        .remove("source_sequence");
+    assert_eq!(parse(&value, &configured), Err("INVALID_SCENARIO_GROUP"));
 }
 
 #[test]
