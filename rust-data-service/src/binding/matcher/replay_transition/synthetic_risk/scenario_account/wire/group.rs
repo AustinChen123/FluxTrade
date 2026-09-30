@@ -1,5 +1,5 @@
 //! Closed schema conversion only; 4C owns group ordering and business outcomes.
-use super::super::group::{Group, Input, Member};
+use super::super::group::{historical_member_ordinal, Group, Input, Member};
 use super::*;
 use risk_transition::cancel::{EffectInput, Reason, RequestInput, Stamp};
 #[cfg(test)]
@@ -46,7 +46,8 @@ pub(in super::super) fn decode_group(input: &str, owner: &ScenarioAccount) -> Re
     if group.ordering_contract_id == "HISTORICAL_ORDER_V1"
         && (!matches!(owner.profile, ProfileContext::BtcEthScenario { ref scenario, .. } if scenario.configured.is_some())
             || group.members.iter().any(|member| {
-                !matches!(member.input, Input::Intent(_)) || member.stamp.source_sequence.is_none()
+                historical_member_ordinal(&member.input) != Some(member.stamp.scenario_ordinal)
+                    || member.stamp.source_sequence.is_none()
             }))
     {
         return Err("INVALID_SCENARIO_GROUP");

@@ -271,6 +271,9 @@ def test_market_cache_uses_exact_1440_closed_bars_and_ignores_future_until_its_c
     future_rows[future_index] = replace(future_rows[future_index], high=D("300"), low=D("90"), close=D("150"))
     different_future = _rehashed_run(common, trade_rows=tuple(future_rows))
     left, right = _composition(common), _composition(different_future)
+    for composition in (left, right):
+        for row in composition._policy.rows:
+            row["active"] = "false"
     close_ms = common.range_start_ms + 60_000
     due = close_ms * 16 + 6
     assert left._policy.markets["A-USDT-SWAP"]["price"] == "100"
@@ -582,10 +585,10 @@ def test_historical_chain_uses_frozen_owner_orders_and_commits_one_partial_fill(
     assert step3["result"]["classification"] == "SUCCESS"
 
 
-def test_historical_full_execution_notice_uses_original_limit_and_stays_unsubmitted():
+def test_historical_full_execution_notice_derives_native_cancel_and_replacements():
     run = _valid_run()
     trade_rows = tuple(
-        replace(row, high=D("103"), low=D("98"), volume=D("1"))
+        replace(row, open=D("101"), high=D("101.5"), low=D("100.5"), close=D("101"), volume=D("0.4"))
         if row.product_id == "A-USDT-SWAP" else row
         for row in run.trade_bars
     )
@@ -609,15 +612,96 @@ def test_historical_full_execution_notice_uses_original_limit_and_stays_unsubmit
     sends = [event for event in events if event["event"]["kind"] == "send"]
     cancels = [event for event in events if event["event"]["kind"] == "cancel"]
     assert sends and cancels
+    assert sum(bool(composition._audit[record["item"]["delivery"]["delivery_id"]])
+               for record in full_notices) == 1
     replacement_prices = [order["px"] for event in sends for order in event["event"]["orders"]]
-    assert fact["limit_price"] == D("101") and fact["fill_price"] == D("103")
+    assert fact["limit_price"] == D("101") and fact["fill_price"] == D("101.5")
     assert "100" in replacement_prices
     assert str(fact["fill_price"]) not in replacement_prices
-    assert all(action["status"] == "UNSUBMITTED" and action["group_id"] is None
+    assert all(action["status"] == "UNSUBMITTED" and action["group_id"] is not None
                for event in (*sends, *cancels) for action in event["actions"])
-    assert len([record for record in composition._records.values()
+
+    initial_groups = [record for record in composition._records.values()
+                      if record["item"]["kind"] == "SOURCE_GROUP"
+                      and record["item"]["group"].get("ordering_contract_id") == "HISTORICAL_ORDER_V1"]
+    child_groups = [record for record in initial_groups
+                    if record["item"]["group"]["members"][0]["stamp"]["source_sequence"] >= 4]
+    child_groups.sort(key=lambda record: record["item"]["group"]["members"][0]["stamp"]["source_sequence"])
+    assert [record["item"]["group"]["members"][0]["kind"] for record in child_groups] == [
+        "CANCEL_REQUEST", "INTENT", "INTENT",
+    ]
+    assert [record["item"]["group"]["members"][0]["stamp"]["source_sequence"]
+            for record in child_groups] == list(range(4, 7))
+    assert all(record["key"][0] == (start + 40_003) * 16 + 3 for record in child_groups)
+    assert composition._dispatch_due((start + 40_003) * 16 + 3)["classification"] == "SUCCESS"
+    assert all(record["result"]["group_result"]["classification"] == "COMMITTED"
+               for record in child_groups)
+    assert all(action["status"] == "SUBMITTED"
+               and action["group_result"]["classification"] == "COMMITTED"
+               for event in (*sends, *cancels) for action in event["actions"])
+
+    requests = [record for record in child_groups
+                if record["item"]["group"]["members"][0]["kind"] == "CANCEL_REQUEST"]
+    effects = [record for record in composition._records.values()
+               if record["item"]["kind"] == "SOURCE_GROUP"
+               and record["item"]["group"]["members"][0]["kind"] == "CANCEL_EFFECT"]
+    assert len(requests) == len(effects) == 1
+    for request in requests:
+        request_member = request["item"]["group"]["members"][0]
+        request_event = request_member["stamp"]["event_id"]
+        target = request_member["payload"]["targets"][0]["target_order_id"]
+        matching_effect = next(record for record in effects
+                               if record["item"]["group"]["members"][0]["payload"]["effects"][0]["detecting_event_id"]
+                               == request_event)
+        effect_member = matching_effect["item"]["group"]["members"][0]
+        assert matching_effect["key"][0] == (start + 45_003) * 16 + 2
+        assert effect_member["stamp"]["causal_parent_ids"] == [request_event]
+        assert effect_member["payload"]["effects"] == [dict(
+            detecting_event_id=request_event, target_order_id=target, reason="EXPLICIT_SCENARIO")
+        ]
+        assert target in {order["order_id"] for order in composition._codec.historical_working_orders()}
+    assert composition._dispatch_due((start + 45_003) * 16 + 2)["classification"] == "SUCCESS"
+    assert composition._dispatch_due((start + 45_025) * 16 + 6)["classification"] == "SUCCESS"
+    requests = [record for record in composition._records.values()
                 if record["item"]["kind"] == "SOURCE_GROUP"
-                and record["item"]["group"].get("ordering_contract_id") == "HISTORICAL_ORDER_V1"]) == 4
+                and record["item"]["group"]["members"][0]["kind"] == "CANCEL_REQUEST"]
+    effects = [record for record in composition._records.values()
+               if record["item"]["kind"] == "SOURCE_GROUP"
+               and record["item"]["group"]["members"][0]["kind"] == "CANCEL_EFFECT"]
+    target_requests = [record for record in requests
+                       if record["item"]["group"]["members"][0]["payload"]["targets"][0]["target_order_id"]
+                       == target]
+    target_effects = [record for record in effects
+                      if record["item"]["group"]["members"][0]["payload"]["effects"][0]["target_order_id"]
+                      == target]
+    assert sum(record["result"]["group_result"]["classification"] == "COMMITTED"
+               for record in target_requests) == 1
+    rejected_repeats = [record for record in target_requests
+                        if record["result"]["group_result"]["classification"] == "REJECTED"]
+    assert rejected_repeats
+    assert all(record["result"]["group_result"]["rejections"][0]["reason"]
+               == "CANCEL_REQUEST_TOO_LATE" for record in rejected_repeats)
+    assert len(target_effects) == 1
+    assert target_effects[0]["result"]["group_result"]["classification"] == "COMMITTED"
+    assert target not in {order["order_id"] for order in composition._codec.historical_working_orders()}
+
+    request_effects = {
+        effect_record["item"]["group"]["members"][0]["payload"]["effects"][0]["target_order_id"]:
+        effect_record
+        for effect_record in effects
+    }
+    pending_repeats = []
+    post_effect_repeats = []
+    for request_record in requests:
+        if request_record["result"]["group_result"]["classification"] != "REJECTED":
+            continue
+        request_target = request_record["item"]["group"]["members"][0]["payload"]["targets"][0]["target_order_id"]
+        if request_target not in request_effects:
+            continue
+        effect_record = request_effects[request_target]
+        (pending_repeats if request_record["key"] < effect_record["key"]
+         else post_effect_repeats).append(request_record)
+    assert pending_repeats and post_effect_repeats
     policy_events_after_full = deepcopy(composition._policy.events)
     delivered_notice = notice["item"]["delivery"]
     assert composition._codec.build_delivery(dict(
@@ -631,6 +715,16 @@ def test_historical_full_execution_notice_uses_original_limit_and_stays_unsubmit
     duplicate = composition._enqueue(dict(kind="DELIVERY", delivery=delivered_notice))
     assert duplicate["classification"] == "SUCCESS"
     assert composition._policy.events == policy_events_after_full
+    assert composition._dispatch_due((start + 60_000) * 16 + 4)["classification"] == "SUCCESS"
+    close_node = next(record for record in composition._records.values()
+                      if record["item"]["kind"] == "HISTORICAL_MARKET_STEP"
+                      and record["item"]["node"]["bar_open_ms"] == start
+                      and record["item"]["node"]["step_index"] == 3)
+    assert close_node["result"]["classification"] == "SUCCESS"
+    assert target in {order["order_id"] for order in close_node["item"]["node"]["working_orders"]}
+    assert all(fill["order_id"] != target
+               for product in close_node["result"]["historical_result"]["products"]
+               for fill in product["fills"])
 
 
 def test_historical_execution_notice_after_endpoint_remains_pending():
@@ -643,6 +737,11 @@ def test_historical_execution_notice_after_endpoint_remains_pending():
     run = _rehashed_run(run, trade_rows=trade_rows)
     composition = _composition(run)
     composition._policy.rows[1]["active"] = "false"
+    start = run.range_start_ms
+    assert composition._dispatch_due((start + 5_020) * 16 + 6)["classification"] == "SUCCESS"
+    assert composition._dispatch_due((start + 5_021) * 16 + 3)["classification"] == "SUCCESS"
+    for row in composition._policy.rows:
+        row["active"] = "false"
     endpoint = run.range_end_ms * 16 + 6
     assert composition._dispatch_due(endpoint)["classification"] == "SUCCESS"
     pending = [record for record in composition._records.values()

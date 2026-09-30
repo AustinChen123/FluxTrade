@@ -249,6 +249,10 @@ pub(in super::super) struct Facts {
 }
 
 impl Facts {
+    pub(in super::super) fn historical_effect_receipt(&self, action_id: &Hash) -> Option<&Receipt> {
+        self.effects.get(action_id).map(|stored| &stored.value)
+    }
+
     #[cfg(test)]
     pub(in super::super) fn assert_ambiguous_delivery_rejected(
         &self,
@@ -340,8 +344,8 @@ impl ScenarioAccount {
         hook: &mut impl FnMut(Stage) -> Result<(), Fault>,
     ) -> Result<Self, Fault> {
         let actions = identity::requests(self, input)?;
-        self.classify_cancel_actions(&actions, Kind::Request)?;
-        identity::validate(self, &input.stamp, &actions)?;
+        self.classify_cancel_actions(&actions, Kind::Request, false)?;
+        identity::validate(self, &input.stamp, &actions, Kind::Request)?;
         let episode = self
             .transition
             .episode
@@ -415,7 +419,12 @@ impl ScenarioAccount {
         input: &RequestInput,
     ) -> Result<Hash, Fault> {
         let actions = identity::requests(self, input)?;
-        self.classify_cancel_actions(&actions, Kind::Request)?;
+        self.classify_cancel_actions(
+            &actions,
+            Kind::Request,
+            input.stamp.ordering_contract_id == "HISTORICAL_ORDER_V1"
+                && matches!(self.profile, ProfileContext::BtcEthScenario { ref scenario, .. } if scenario.configured.is_some()),
+        )?;
         let digest = identity::batch_digest(&self.key, &input.stamp, Kind::Request, &actions);
         classify(
             self.cancel_facts
@@ -473,7 +482,7 @@ impl ScenarioAccount {
                 )],
             };
             let action = identity::effects(self, &input)?.remove(0);
-            self.classify_cancel_actions(std::slice::from_ref(&action), Kind::Effect)?;
+            self.classify_cancel_actions(std::slice::from_ref(&action), Kind::Effect, false)?;
             let receipt = self.apply_cancel(
                 &action,
                 stamp,
@@ -569,7 +578,9 @@ impl ScenarioAccount {
             )? {
                 return Ok((original.clone(), None));
             }
-            let duplicates = self.classify_cancel_actions(&actions, Kind::Request)?;
+            let historical_order = input.stamp.ordering_contract_id == "HISTORICAL_ORDER_V1"
+                && matches!(self.profile, ProfileContext::BtcEthScenario { ref scenario, .. } if scenario.configured.is_some());
+            let duplicates = self.classify_cancel_actions(&actions, Kind::Request, historical_order)?;
             if !duplicates.is_empty() && duplicates.iter().all(Option::is_some) {
                 return Ok((
                     BatchResult::duplicates(
@@ -581,7 +592,7 @@ impl ScenarioAccount {
                 ));
             }
             self.source_boundary(&input.stamp, digest, source::Kind::CancelRequest)?;
-            identity::validate(self, &input.stamp, &actions)?;
+            identity::validate(self, &input.stamp, &actions, Kind::Request)?;
             let mut batch = BatchResult {
                 event_id: input.stamp.event_id.clone(),
                 payload_digest: digest,
@@ -597,7 +608,9 @@ impl ScenarioAccount {
                     continue;
                 }
                 let order = self.target_order(&action.target)?;
-                if !order.facts.projects_remainder("INVALID_CANCEL_ORDER")? {
+                if (historical_order && historical_cancel_started(&order.cancel))
+                    || !order.facts.projects_remainder("INVALID_CANCEL_ORDER")?
+                {
                     batch.rejected = Some("CANCEL_REQUEST_TOO_LATE");
                 }
             }
@@ -685,7 +698,7 @@ impl ScenarioAccount {
             )? {
                 return Ok((key, digest, actions, Vec::new(), Some(original.clone())));
             }
-            let duplicates = self.classify_cancel_actions(&actions, Kind::Effect)?;
+            let duplicates = self.classify_cancel_actions(&actions, Kind::Effect, false)?;
             if !duplicates.is_empty() && duplicates.iter().all(Option::is_some) {
                 let original = BatchResult::duplicates(
                     &input.stamp,
@@ -706,7 +719,7 @@ impl ScenarioAccount {
                     return Err("CANCEL_EFFECT_BEFORE_REQUEST");
                 }
             }
-            identity::validate(self, &input.stamp, &actions)?;
+            identity::validate(self, &input.stamp, &actions, Kind::Effect)?;
             hook(Stage::Prepared)?;
             Ok((key, digest, actions, duplicates, None))
         }))
@@ -793,6 +806,7 @@ impl ScenarioAccount {
         &self,
         actions: &[PreparedAction],
         kind: Kind,
+        historical_order: bool,
     ) -> Result<Vec<Option<Receipt>>, Fault> {
         actions
             .iter()
@@ -813,6 +827,11 @@ impl ScenarioAccount {
                     return Ok(None);
                 };
                 match (kind, order.cancel.request()) {
+                    (Kind::Request, Some(_))
+                        if historical_order && historical_cancel_started(&order.cancel) =>
+                    {
+                        return Ok(None)
+                    }
                     (Kind::Request, Some(_)) => return Err("CANCEL_ACTION_CONFLICT"),
                     (Kind::Effect, Some(request))
                         if request.effect_action_id != action.id
@@ -963,4 +982,8 @@ impl ScenarioAccount {
             },
         })
     }
+}
+
+fn historical_cancel_started(state: &State) -> bool {
+    matches!(state, State::Requested(_) | State::EffectiveCanceled(_))
 }

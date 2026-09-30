@@ -18,6 +18,10 @@ def _pairing_check(condition: bool) -> None:
         raise ValueError("POLICY_EMISSION_MISMATCH")
 
 
+def _historical_order_ordinal(kind: object) -> int | None:
+    return {"INTENT": 60, "CANCEL_REQUEST": 40, "CANCEL_EFFECT": 50}.get(kind)
+
+
 def _pair_financial(item, digest, operation, order, account, previous, configured_product_ids=None):
     row = policy_protocol._event_object(item, "event_digest action_kind schedule_sequence expected_group")
     policy_protocol._plan_hash(row["event_digest"])
@@ -330,6 +334,7 @@ class _ReplayComposition:
         self._historical_order_sequence = 0
         self._historical_notice_sequence = 0
         self._p3_execution_notice_deliveries: set[str] = set()
+        self._historical_cancel_effects: dict[str, dict[str, Any]] = {}
         self._historical_run: object | None = None
         self._historical_bars: dict[tuple[int, str], tuple[object, object]] = {}
         self._historical_step_sequence = 0
@@ -366,6 +371,7 @@ class _ReplayComposition:
             config_id=prepared.configuration["config_id"],
             strategy_identity=historical_run.strategy_identity,
             order_accept_delay_ms=historical_run.order_accept_delay_ms,
+            cancel_effect_delay_ms=historical_run.cancel_effect_delay_ms,
             order_notice_delay_ms=historical_run.order_notice_delay_ms,
             range_end_ms=historical_run.range_end_ms,
         )
@@ -528,7 +534,8 @@ class _ReplayComposition:
                 account, at, sequence, stable, cls = group["account_key"], group["group_effective_at"], row["schedule_sequence"], group["group_id"], 0
                 if group["ordering_contract_id"] == "HISTORICAL_ORDER_V1":
                     member = group["members"][0]
-                    if len(group["members"]) != 1 or member["kind"] != "INTENT":
+                    if (len(group["members"]) != 1
+                            or _historical_order_ordinal(member["kind"]) != member["stamp"]["scenario_ordinal"]):
                         raise _ScheduleError("INVALID_SCHEMA")
                     source_sequence = member["stamp"].get("source_sequence")
                     if type(source_sequence) is not int or source_sequence != sequence:
@@ -768,14 +775,14 @@ class _ReplayComposition:
             for event in events:
                 for action in event.get("actions", []):
                     action["group_id"] = next(financial)["expected_group"]["group_id"]
-        historical_groups = self._historical_order_children(record, prefix.events, events) if poll_audit_only else []
+        historical_groups = self._historical_order_children(record, prefix.events, events) if audit_only else []
         self._callback_evidence(record, prefix, events)
-        derived = (historical_groups if poll_audit_only else ([] if execution_audit_only else [
+        derived = (historical_groups if audit_only else [
             (dict(kind="SOURCE_GROUP", schedule_sequence=v["schedule_sequence"], group=v["expected_group"]), None)
             if "expected_group" in v else (self._capture_item(dict(capture_sequence=v["capture_sequence"],
                 snapshot_request=v["snapshot_request"], delivery_projection=v["delivery_projection"])), None)
             for v in validated
-        ]))
+        ])
         if next_stage is not None:
             derived.append((self._capture_item(next_stage), None))
         self._admit_set(derived)
@@ -790,8 +797,10 @@ class _ReplayComposition:
         if type(visible) is not int or visible < 6 or visible % 16 != 6:
             raise _ScheduleError("INVALID_SCHEMA")
         parent_raw = (visible - 6) // 16
-        delay, end = contract["order_accept_delay_ms"], contract["range_end_ms"]
-        if type(delay) is not int or type(end) is not int or parent_raw + delay >= 2**59:
+        delay, effect_delay, end = (contract["order_accept_delay_ms"],
+                                    contract["cancel_effect_delay_ms"], contract["range_end_ms"])
+        if (type(delay) is not int or type(effect_delay) is not int or type(end) is not int
+                or parent_raw + max(delay, effect_delay) >= 2**59):
             raise _ScheduleError("INVALID_SCHEMA")
         groups = []
         child_ordinal = 0
@@ -802,43 +811,55 @@ class _ReplayComposition:
             for order_index, order in enumerate(event["orders"]):
                 ordinal = child_ordinal
                 child_ordinal += 1
-                if event["kind"] != "send":
-                    continue
                 acceptance_raw = parent_raw + delay
                 if acceptance_raw >= end:
                     continue
-                if order["ordType"] not in ("limit", "market"):
-                    raise _ScheduleError("INVALID_SCHEMA")
-                product_id = order["instId"]
-                if product_id not in self._configured_product_ids:
-                    raise _ScheduleError("INVALID_SCHEMA")
-                group_id = policy_protocol._historical_child_id(
-                    contract["run_contract_hash"], delivery["delivery_id"], "ORDER_GROUP", ordinal
-                )
-                event_id = policy_protocol._historical_child_id(
-                    contract["run_contract_hash"], delivery["delivery_id"], "ORDER_EVENT", ordinal
-                )
-                intent_id = policy_protocol._historical_child_id(
-                    contract["run_contract_hash"], delivery["delivery_id"], "ORDER_INTENT", ordinal
-                )
-                side = {"buy": "LONG", "sell": "SHORT"}.get(order["side"])
-                if side is None:
-                    raise _ScheduleError("INVALID_SCHEMA")
-                quantity = D(order["sz"])
-                limit_price = D(order["px"]) if order["ordType"] == "limit" else None
-                member = dict(
-                    kind="INTENT",
-                    stamp=dict(event_id=event_id, effective_at=acceptance_raw * 16 + 3,
-                               source_sequence=sequence, causal_parent_ids=[],
-                               ordering_contract_id="HISTORICAL_ORDER_V1", scenario_ordinal=60),
-                    payload=dict(
+                if event["kind"] == "send":
+                    if order["ordType"] not in ("limit", "market"):
+                        raise _ScheduleError("INVALID_SCHEMA")
+                    product_id = order["instId"]
+                    if product_id not in self._configured_product_ids:
+                        raise _ScheduleError("INVALID_SCHEMA")
+                    kind = "INTENT"
+                    scenario_ordinal = _historical_order_ordinal(kind)
+                    group_identity = "ORDER_GROUP"
+                    event_identity = "ORDER_EVENT"
+                    intent_id = policy_protocol._historical_child_id(
+                        contract["run_contract_hash"], delivery["delivery_id"], "ORDER_INTENT", ordinal
+                    )
+                    side = {"buy": "LONG", "sell": "SHORT"}.get(order["side"])
+                    if side is None:
+                        raise _ScheduleError("INVALID_SCHEMA")
+                    payload = dict(
                         intent_id=intent_id, client_order_id=order["clOrdId"],
                         config_id=contract["config_id"], product_id=product_id,
                         strategy_id=contract["strategy_identity"], side=side,
                         order_type="LIMIT" if order["ordType"] == "limit" else "MARKET",
-                        quantity_contracts=quantity, limit_price=limit_price,
+                        quantity_contracts=D(order["sz"]),
+                        limit_price=D(order["px"]) if order["ordType"] == "limit" else None,
                         reduce_only=False, requested_at=parent_raw,
-                    ),
+                    )
+                else:
+                    if event["kind"] != "cancel" or not order.get("ordId"):
+                        raise _ScheduleError("INVALID_SCHEMA")
+                    kind = "CANCEL_REQUEST"
+                    scenario_ordinal = _historical_order_ordinal(kind)
+                    group_identity = "CANCEL_REQUEST_GROUP"
+                    event_identity = "CANCEL_REQUEST_EVENT"
+                    payload = dict(targets=[dict(target_order_id=order["ordId"], reason="EXPLICIT_SCENARIO")])
+                group_id = policy_protocol._historical_child_id(
+                    contract["run_contract_hash"], delivery["delivery_id"], group_identity, ordinal
+                )
+                event_id = policy_protocol._historical_child_id(
+                    contract["run_contract_hash"], delivery["delivery_id"], event_identity, ordinal
+                )
+                member = dict(
+                    kind=kind,
+                    stamp=dict(event_id=event_id, effective_at=acceptance_raw * 16 + 3,
+                               source_sequence=sequence, causal_parent_ids=[],
+                               ordering_contract_id="HISTORICAL_ORDER_V1",
+                               scenario_ordinal=cast(int, scenario_ordinal)),
+                    payload=payload,
                 )
                 group = dict(schema_version="scenario_group_v1", group_id=group_id,
                              account_key=deepcopy(self._account), ordering_contract_id="HISTORICAL_ORDER_V1",
@@ -847,9 +868,54 @@ class _ReplayComposition:
                 policy_protocol._plan_group(group, self._configured_product_ids)
                 audit_events[event_index]["actions"][order_index]["group_id"] = group_id
                 groups.append((dict(kind="SOURCE_GROUP", schedule_sequence=sequence, group=group), None))
+                if kind == "CANCEL_REQUEST":
+                    effect_event_id = policy_protocol._historical_child_id(
+                        contract["run_contract_hash"], delivery["delivery_id"],
+                        "CANCEL_EFFECT_EVENT", ordinal,
+                    )
+                    effect_group_id = policy_protocol._historical_child_id(
+                        contract["run_contract_hash"], delivery["delivery_id"],
+                        "CANCEL_EFFECT_GROUP", ordinal,
+                    )
+                    self._historical_cancel_effects[group_id] = dict(
+                        parent_raw=parent_raw, request_event_id=event_id,
+                        effect_event_id=effect_event_id, effect_group_id=effect_group_id,
+                        target_order_id=order["ordId"], reason="EXPLICIT_SCENARIO",
+                    )
                 sequence += 1
         self._historical_order_sequence = sequence
         return groups
+
+    def _historical_cancel_effect_item(self, group_id: str):
+        spec = self._historical_cancel_effects.pop(group_id, None)
+        if spec is None:
+            return None
+        contract = self._historical_order_contract
+        if contract is None:
+            raise _ScheduleError("INVALID_SCHEMA")
+        effective_raw = spec["parent_raw"] + contract["cancel_effect_delay_ms"]
+        effective_at = effective_raw * 16 + 2
+        if not 0 <= effective_at < 2**63:
+            raise _ScheduleError("INVALID_SCHEMA")
+        sequence = self._historical_order_sequence
+        event_id = spec["effect_event_id"]
+        member = dict(
+            kind="CANCEL_EFFECT",
+            stamp=dict(event_id=event_id, effective_at=effective_at,
+                       source_sequence=sequence, causal_parent_ids=[spec["request_event_id"]],
+                       ordering_contract_id="HISTORICAL_ORDER_V1", scenario_ordinal=50),
+            payload=dict(effects=[dict(
+                detecting_event_id=spec["request_event_id"],
+                target_order_id=spec["target_order_id"], reason=spec["reason"],
+            )]),
+        )
+        group = dict(
+            schema_version="scenario_group_v1", group_id=spec["effect_group_id"],
+            account_key=deepcopy(self._account), ordering_contract_id="HISTORICAL_ORDER_V1",
+            group_effective_at=effective_at, declared_member_count=1, members=[member],
+        )
+        policy_protocol._plan_group(group, self._configured_product_ids)
+        return dict(kind="SOURCE_GROUP", schedule_sequence=sequence, group=group)
 
     def _dispatch_due(self, until):
         if self._terminal is not None:
@@ -884,6 +950,18 @@ class _ReplayComposition:
                     if group["classification"] == "FAULT":
                         record["result"] = self._stop_scheduler(_ScheduleError(cast(str, group.get("failure"))), kind, key[3], group=group)
                         return deepcopy(record["result"])
+                    is_historical_request = (
+                        item["group"]["ordering_contract_id"] == "HISTORICAL_ORDER_V1"
+                        and item["group"]["members"][0]["kind"] == "CANCEL_REQUEST"
+                    )
+                    if is_historical_request:
+                        effect_item = self._historical_cancel_effect_item(key[3])
+                        if effect_item is not None and group["classification"] == "COMMITTED":
+                            queued_effect = self._admit_set([(effect_item, None)])[0]
+                            if queued_effect["classification"] != "PENDING":
+                                record["result"] = deepcopy(self._terminal or queued_effect)
+                                return deepcopy(record["result"])
+                            self._historical_order_sequence += 1
                 elif kind == "SNAPSHOT_CAPTURE":
                     fact = self._codec.capture_snapshot(item["request"])
                     self._evidence("SNAPSHOT_FACT", key, dict(purpose="POLL", request=item["request"], fact=fact))

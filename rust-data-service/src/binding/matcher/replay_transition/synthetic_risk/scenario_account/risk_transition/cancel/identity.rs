@@ -235,8 +235,17 @@ pub(super) fn validate(
     owner: &ScenarioAccount,
     stamp: &Stamp,
     actions: &[PreparedAction],
+    kind: Kind,
 ) -> Result<(), Fault> {
-    stamp_shape(stamp, owner.transition.reverse_group)?;
+    let expected_historical_ordinal = match kind {
+        Kind::Request => 40,
+        Kind::Effect => 50,
+    };
+    let historical = matches!(owner.profile, ProfileContext::BtcEthScenario { ref scenario, .. } if scenario.configured.is_some())
+        && stamp.ordering_contract_id == "HISTORICAL_ORDER_V1"
+        && stamp.source_sequence.is_some()
+        && stamp.scenario_ordinal == expected_historical_ordinal;
+    stamp_shape(stamp, owner.transition.reverse_group, historical)?;
     let mut ids = BTreeSet::new();
     let mut targets = BTreeSet::new();
     let mut parents = BTreeSet::new();
@@ -246,7 +255,8 @@ pub(super) fn validate(
         || actions.is_empty()
         || !(stamp.ordering_contract_id == "S_order_v1"
             || (owner.transition.reverse_group
-                && stamp.ordering_contract_id == "S_order_v1_reverse_execution_cancel_effective"))
+                && stamp.ordering_contract_id == "S_order_v1_reverse_execution_cancel_effective")
+            || historical)
         || stamp
             .causal_parent_ids
             .iter()
@@ -267,13 +277,18 @@ pub(super) fn validate(
     Ok(())
 }
 
-pub(in super::super::super) fn stamp_shape(stamp: &Stamp, reverse: bool) -> Result<(), Fault> {
+pub(in super::super::super) fn stamp_shape(
+    stamp: &Stamp,
+    reverse: bool,
+    historical: bool,
+) -> Result<(), Fault> {
     if !identity(&stamp.event_id)
         || stamp.effective_at < 0
         || stamp.scenario_ordinal <= 0
         || !(stamp.ordering_contract_id == "S_order_v1"
             || (reverse
-                && stamp.ordering_contract_id == "S_order_v1_reverse_execution_cancel_effective"))
+                && stamp.ordering_contract_id == "S_order_v1_reverse_execution_cancel_effective")
+            || historical)
         || stamp.causal_parent_ids.iter().any(|p| !identity(p))
         || stamp
             .causal_parent_ids

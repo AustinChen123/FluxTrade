@@ -12,6 +12,15 @@ pub(super) enum Kind {
     EventC,
 }
 
+pub(super) fn historical_ordinal(kind: Kind) -> Option<i64> {
+    match kind {
+        Kind::Intent => Some(60),
+        Kind::CancelRequest => Some(40),
+        Kind::CancelEffect => Some(50),
+        Kind::Context | Kind::Execution | Kind::EventC => None,
+    }
+}
+
 pub(super) fn stamp(event: &str, at: i64, ordinal: i64) -> Stamp {
     Stamp {
         event_id: event.into(),
@@ -60,30 +69,34 @@ impl ScenarioAccount {
                 Err("RUN_FAILED")
             };
         }
+        let historical = stamp.ordering_contract_id == "HISTORICAL_ORDER_V1";
+        let historical_member = matches!(self.profile, ProfileContext::BtcEthScenario { ref scenario, .. } if scenario.configured.is_some())
+            && historical
+            && stamp.source_sequence.is_some()
+            && historical_ordinal(kind) == Some(stamp.scenario_ordinal);
         if matches!(
             kind,
             Kind::Context | Kind::CancelRequest | Kind::CancelEffect
         ) {
-            risk_transition::cancel::identity::stamp_shape(stamp, self.transition.reverse_group)?;
+            risk_transition::cancel::identity::stamp_shape(
+                stamp,
+                self.transition.reverse_group,
+                historical_member,
+            )?;
         }
-        let historical = stamp.ordering_contract_id == "HISTORICAL_ORDER_V1";
-        if historical
-            && (kind != Kind::Intent
-                || !matches!(self.profile, ProfileContext::BtcEthScenario { ref scenario, .. } if scenario.configured.is_some())
-                || stamp.source_sequence.is_none())
-        {
+        if historical && !historical_member {
             return Err("INVALID_SCENARIO_GROUP");
         }
         if self.transition.accepted_stamp.as_ref().is_some_and(|old| {
             if historical && old.ordering_contract_id == "HISTORICAL_ORDER_V1" {
                 (
                     stamp.effective_at,
-                    stamp.scenario_ordinal,
                     stamp.source_sequence.unwrap_or(-1),
+                    stamp.scenario_ordinal,
                 ) <= (
                     old.effective_at,
-                    old.scenario_ordinal,
                     old.source_sequence.unwrap_or(-1),
+                    old.scenario_ordinal,
                 )
             } else {
                 (stamp.effective_at, stamp.scenario_ordinal)

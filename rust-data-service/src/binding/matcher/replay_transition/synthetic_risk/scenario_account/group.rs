@@ -147,6 +147,11 @@ impl Member {
         })
     }
     fn ordinal(&self, reverse: bool) -> i64 {
+        if self.stamp.ordering_contract_id == HISTORICAL {
+            if let Some(ordinal) = historical_member_ordinal(&self.input) {
+                return ordinal;
+            }
+        }
         match self.input {
             Input::Context(context::Input {
                 rows: context::Rows::Marks(_),
@@ -170,6 +175,16 @@ impl Member {
                 }
             }
         }
+    }
+}
+
+pub(super) fn historical_member_ordinal(input: &Input) -> Option<i64> {
+    match input {
+        Input::Intent(_) => source::historical_ordinal(source::Kind::Intent),
+        Input::Request(_) => source::historical_ordinal(source::Kind::CancelRequest),
+        Input::Effect(_) => source::historical_ordinal(source::Kind::CancelEffect),
+        Input::Context(_) => source::historical_ordinal(source::Kind::Context),
+        Input::Execution(_) => source::historical_ordinal(source::Kind::Execution),
     }
 }
 
@@ -400,7 +415,8 @@ impl ScenarioAccount {
                 || stamp.scenario_ordinal != member.ordinal(reverse)
                 || (historical
                     && (stamp.source_sequence.is_none()
-                        || !matches!(member.input, Input::Intent(_))))
+                        || historical_member_ordinal(&member.input)
+                            != Some(stamp.scenario_ordinal)))
                 || !identity(&stamp.event_id)
                 || ids.insert(stamp.event_id.clone(), stamp).is_some()
                 || stamp.source_sequence.is_some_and(|s| !sequences.insert(s))
@@ -440,12 +456,12 @@ impl ScenarioAccount {
                 if (if historical {
                     (
                         p.effective_at,
-                        p.scenario_ordinal,
                         p.source_sequence.unwrap_or(-1),
+                        p.scenario_ordinal,
                     ) >= (
                         stamp.effective_at,
-                        stamp.scenario_ordinal,
                         stamp.source_sequence.unwrap_or(-1),
+                        stamp.scenario_ordinal,
                     )
                 } else {
                     (p.effective_at, p.scenario_ordinal)
@@ -456,16 +472,24 @@ impl ScenarioAccount {
                 }
             }
             if !self.transition.events.contains_key(&stamp.event_id) {
+                if !historical
+                    && last.is_some_and(|p| {
+                        p.effective_at == stamp.effective_at
+                            && matches!((p.source_sequence, stamp.source_sequence), (Some(a), Some(b)) if a >= b)
+                    })
+                {
+                    return Err("INVALID_SCENARIO_GROUP");
+                }
                 if last.is_some_and(|p| {
                     if historical {
                         (
                             p.effective_at,
-                            p.scenario_ordinal,
                             p.source_sequence.unwrap_or(-1),
+                            p.scenario_ordinal,
                         ) >= (
                             stamp.effective_at,
-                            stamp.scenario_ordinal,
                             stamp.source_sequence.unwrap_or(-1),
+                            stamp.scenario_ordinal,
                         )
                     } else {
                         (p.effective_at, p.scenario_ordinal)
@@ -474,7 +498,6 @@ impl ScenarioAccount {
                 }) {
                     return Err("STALE_EVENT");
                 }
-                if last.is_some_and(|p| p.effective_at == stamp.effective_at && matches!((p.source_sequence, stamp.source_sequence), (Some(a), Some(b)) if a >= b)) { return Err("INVALID_SCENARIO_GROUP"); }
                 last = Some(stamp);
             }
             if let Input::Context(input) = &member.input {

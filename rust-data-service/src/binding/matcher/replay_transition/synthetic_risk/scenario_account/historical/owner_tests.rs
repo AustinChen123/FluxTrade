@@ -145,6 +145,13 @@ fn historical_step_commits_through_the_existing_execution_owner() {
         }],
     };
     let before = owner.clone();
+    let mut economic_drift = input.clone();
+    economic_drift.working_orders[0].limit_price = Some(d("50000.2"));
+    assert_eq!(
+        owner.historical_market_step(&economic_drift),
+        Err("INVALID_HISTORICAL_ORDER_SNAPSHOT")
+    );
+    assert_eq!(owner, before);
     let mut market = input.clone();
     market.working_orders[0].kind = historical::OrderKind::Market;
     market.working_orders[0].limit_price = None;

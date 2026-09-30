@@ -1,6 +1,61 @@
 use super::*;
 
 impl ScenarioAccount {
+    fn historical_meta_matches(meta: &WorkingOrderMeta, facts: &SeedOrder) -> Result<bool, Fault> {
+        Ok(
+            facts.projects_remainder("INVALID_HISTORICAL_ORDER_SNAPSHOT")?
+                && meta.status == facts.status
+                && meta.remaining == facts.remaining
+                && meta.side == facts.side
+                && meta.product == *facts.product.btc()?
+                && meta.limit_price == Some(facts.price),
+        )
+    }
+
+    fn historical_cancel_projection_matches(
+        &self,
+        meta: &WorkingOrderMeta,
+        order: &RestingOrder,
+    ) -> Result<bool, Fault> {
+        use risk_transition::cancel::State;
+
+        let cancel_pending = |reason: risk_transition::cancel::Reason| {
+            matches!(
+                reason,
+                risk_transition::cancel::Reason::RiskShortfall
+                    | risk_transition::cancel::Reason::MmrBreach
+            )
+        };
+        match &order.cancel {
+            State::None => Ok(order.version == meta.order_version
+                && Self::historical_meta_matches(meta, &order.facts)?
+                && !meta.risk_cancel_pending),
+            State::Requested(request) => Ok((order.version == meta.order_version
+                || order.version == meta.order_version.saturating_add(1))
+                && Self::historical_meta_matches(meta, &order.facts)?
+                && meta.risk_cancel_pending == cancel_pending(request.reason)),
+            State::EffectiveCanceled(effect) => {
+                let Some(receipt) = self
+                    .cancel_facts
+                    .historical_effect_receipt(&effect.action_id)
+                else {
+                    return Ok(false);
+                };
+                Ok(
+                    receipt.outcome == risk_transition::cancel::Outcome::EffectiveCanceled
+                        && receipt.target_order_id == meta.order_id
+                        && receipt.order_version_after == order.version
+                        && receipt.order_version_before >= meta.order_version
+                        && receipt.order_version_before <= meta.order_version.saturating_add(1)
+                        && Self::historical_meta_matches(meta, &receipt.before)?
+                        && meta.risk_cancel_pending == cancel_pending(receipt.reason)
+                        && receipt.after == order.facts,
+                )
+            }
+            _ => Ok(false),
+        }
+    }
+
     fn activate_historical_spec_boundary(&mut self, raw_time_ms: i64) -> Result<(), Fault> {
         let effective_at = effective_time(raw_time_ms, 0)?;
         let previous_at = self.transition.context_at.unwrap_or(self.seed_effective_at);
@@ -91,24 +146,9 @@ impl ScenarioAccount {
                 .orders
                 .get(&meta.order_id)
                 .ok_or("INVALID_HISTORICAL_ORDER_SNAPSHOT")?;
-            let working = order
-                .facts
-                .projects_remainder("INVALID_HISTORICAL_ORDER_SNAPSHOT")?;
             if meta.accepted_source_sequence < 0
-                || !working
-                || meta.order_version != order.version
-                || meta.status != order.facts.status
-                || meta.remaining != order.facts.remaining
                 || meta.accepted_at != order.created_at
-                || meta.side != order.facts.side
-                || meta.product != order.facts.product.btc()?.clone()
-                || meta.limit_price != Some(order.facts.price)
-                || meta.risk_cancel_pending
-                    != matches!(
-                        order.cancel,
-                        risk_transition::cancel::State::Requested(ref request)
-                            if matches!(request.reason, risk_transition::cancel::Reason::RiskShortfall | risk_transition::cancel::Reason::MmrBreach)
-                    )
+                || !self.historical_cancel_projection_matches(meta, order)?
                 || meta.kind == OrderKind::Market
             {
                 return Err(if meta.kind == OrderKind::Market {

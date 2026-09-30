@@ -1,3 +1,4 @@
+use super::super::super::group::{Applied, Reference};
 use super::*;
 use serde_json::{json, Value};
 
@@ -78,6 +79,20 @@ fn historical_intent(group_id: &str, event_id: &str, source_sequence: i64) -> Va
     value["members"][0]["payload"]["quantity_contracts"] = json!("0.5");
     value["members"][0]["payload"]["limit_price"] = json!("100");
     value["members"][0]["payload"]["requested_at"] = json!(500);
+    value
+}
+
+fn historical_cancel(kind: &str, group_id: &str, event_id: &str, source_sequence: i64) -> Value {
+    let mut value = request(kind);
+    value["group_id"] = json!(group_id);
+    value["ordering_contract_id"] = json!("HISTORICAL_ORDER_V1");
+    value["group_effective_at"] = json!(501);
+    value["members"][0]["stamp"]["event_id"] = json!(event_id);
+    value["members"][0]["stamp"]["effective_at"] = json!(501);
+    value["members"][0]["stamp"]["scenario_ordinal"] =
+        json!(if kind == "CANCEL_REQUEST" { 40 } else { 50 });
+    value["members"][0]["stamp"]["ordering_contract_id"] = json!("HISTORICAL_ORDER_V1");
+    value["members"][0]["stamp"]["source_sequence"] = json!(source_sequence);
     value
 }
 
@@ -188,6 +203,17 @@ fn historical_order_groups_are_configured_only_and_same_tick_source_sequence_is_
         .unwrap();
     assert_eq!(configured.orders.len(), 2);
 
+    let mut repeated_sequence_owner = configured.clone();
+    let repeated = parse(
+        &historical_intent("HG-REPEATED", "HE-REPEATED", 8),
+        &configured,
+    )
+    .unwrap();
+    assert!(matches!(
+        repeated_sequence_owner.apply_group_observed(&repeated, |_| Ok(())),
+        Err("STALE_EVENT")
+    ));
+
     let reversed = parse(&historical_intent("HG2", "HE2", 6), &configured).unwrap();
     assert!(matches!(
         configured.apply_group_observed(&reversed, |_| Ok(())),
@@ -205,6 +231,187 @@ fn historical_order_stamp_requires_source_sequence() {
         .unwrap()
         .remove("source_sequence");
     assert_eq!(parse(&value, &configured), Err("INVALID_SCENARIO_GROUP"));
+}
+
+#[test]
+fn historical_order_contract_narrowly_accepts_cancel_request_and_effect_kinds() {
+    let configured = configured_owner(12);
+    for (kind, ordinal) in [("CANCEL_REQUEST", 40), ("CANCEL_EFFECT", 50)] {
+        let value = historical_cancel(kind, "HG-CANCEL", "HE-CANCEL", 7);
+        let parsed = parse(&value, &configured).unwrap();
+        assert_eq!(parsed.members[0].stamp.source_sequence, Some(7));
+        assert_eq!(parsed.members[0].stamp.scenario_ordinal, ordinal);
+
+        let mut wrong_ordinal = value.clone();
+        wrong_ordinal["members"][0]["stamp"]["scenario_ordinal"] = json!(60);
+        assert_eq!(
+            parse(&wrong_ordinal, &configured),
+            Err("INVALID_SCENARIO_GROUP")
+        );
+
+        let mut missing_sequence = value.clone();
+        missing_sequence["members"][0]["stamp"]
+            .as_object_mut()
+            .unwrap()
+            .remove("source_sequence");
+        assert_eq!(
+            parse(&missing_sequence, &configured),
+            Err("INVALID_SCENARIO_GROUP")
+        );
+
+        let unconfigured = owner();
+        assert_eq!(parse(&value, &unconfigured), Err("INVALID_SCENARIO_GROUP"));
+    }
+
+    for kind in ["EXECUTION", "CONTEXT_MARKS"] {
+        let mut unsupported = request(kind);
+        unsupported["ordering_contract_id"] = json!("HISTORICAL_ORDER_V1");
+        unsupported["group_effective_at"] = json!(501);
+        unsupported["members"][0]["stamp"]["effective_at"] = json!(501);
+        unsupported["members"][0]["stamp"]["ordering_contract_id"] = json!("HISTORICAL_ORDER_V1");
+        unsupported["members"][0]["stamp"]["source_sequence"] = json!(0);
+        assert_eq!(
+            parse(&unsupported, &configured),
+            Err("INVALID_SCENARIO_GROUP")
+        );
+    }
+}
+
+#[test]
+fn reverse_contract_keeps_reverse_cancel_effect_ordinal() {
+    let mut value = request("CANCEL_EFFECT");
+    value["ordering_contract_id"] = json!("S_order_v1_reverse_execution_cancel_effective");
+    value["members"][0]["stamp"]["ordering_contract_id"] =
+        json!("S_order_v1_reverse_execution_cancel_effective");
+    value["members"][0]["stamp"]["scenario_ordinal"] = json!(30);
+    let decoded = parse(&value, &owner()).unwrap();
+    assert_eq!(decoded.members[0].stamp.scenario_ordinal, 30);
+}
+
+#[test]
+fn historical_cancel_request_uses_source_sequence_before_ordinal_only_at_same_tick() {
+    let mut configured = configured_owner(12);
+    let first = parse(&historical_intent("HG-ORDER", "HE-ORDER", 7), &configured).unwrap();
+    configured.apply_group_observed(&first, |_| Ok(())).unwrap();
+    let target = configured.orders.keys().next().unwrap().clone();
+
+    let mut request = historical_cancel("CANCEL_REQUEST", "HG-REQUEST", "HE-REQUEST", 8);
+    request["members"][0]["payload"]["targets"][0]["target_order_id"] = json!(target);
+    let decoded = parse(&request, &configured).unwrap();
+    configured
+        .apply_group_observed(&decoded, |_| Ok(()))
+        .unwrap();
+
+    let mut effect = historical_cancel("CANCEL_EFFECT", "HG-EFFECT", "HE-EFFECT", 9);
+    effect["members"][0]["payload"]["effects"][0]["target_order_id"] = json!(target);
+    effect["members"][0]["payload"]["effects"][0]["detecting_event_id"] = json!("HE-REQUEST");
+    effect["members"][0]["stamp"]["causal_parent_ids"] = json!(["HE-REQUEST"]);
+    let decoded = parse(&effect, &configured).unwrap();
+    configured
+        .apply_group_observed(&decoded, |_| Ok(()))
+        .unwrap();
+}
+
+#[test]
+fn historical_source_sequence_only_breaks_equal_effective_time_ties() {
+    let (seed, mut products) = super::super::super::configured_tests::input(12);
+    for product in &mut products {
+        product.marks[0].valid_to = 50_000;
+    }
+    let mut configured =
+        ScenarioAccount::from_configured(&seed, super::super::super::tests::d("10"), products)
+            .unwrap();
+    let first = parse(&historical_intent("HG-BASE", "HE-BASE", 0), &configured).unwrap();
+    configured.apply_group_observed(&first, |_| Ok(())).unwrap();
+    let target = configured.orders.keys().next().unwrap().clone();
+
+    let mut request = historical_cancel("CANCEL_REQUEST", "HG-REQUEST", "HE-REQUEST", 6);
+    request["group_effective_at"] = json!(40_003);
+    request["members"][0]["stamp"]["effective_at"] = json!(40_003);
+    request["members"][0]["payload"]["targets"][0]["target_order_id"] = json!(target);
+    let decoded = parse(&request, &configured).unwrap();
+    configured
+        .apply_group_observed(&decoded, |_| Ok(()))
+        .unwrap();
+
+    let mut intervening = historical_intent("HG-INTERVENING", "HE-INTERVENING", 8);
+    intervening["group_effective_at"] = json!(41_003);
+    intervening["members"][0]["stamp"]["effective_at"] = json!(41_003);
+    let decoded = parse(&intervening, &configured).unwrap();
+    configured
+        .apply_group_observed(&decoded, |_| Ok(()))
+        .unwrap();
+
+    let mut effect = historical_cancel("CANCEL_EFFECT", "HG-EFFECT", "HE-EFFECT", 7);
+    effect["group_effective_at"] = json!(45_003);
+    effect["members"][0]["stamp"]["effective_at"] = json!(45_003);
+    effect["members"][0]["payload"]["effects"][0]["target_order_id"] = json!(target);
+    effect["members"][0]["payload"]["effects"][0]["detecting_event_id"] = json!("HE-REQUEST");
+    effect["members"][0]["stamp"]["causal_parent_ids"] = json!(["HE-REQUEST"]);
+    let decoded = parse(&effect, &configured).unwrap();
+    configured
+        .apply_group_observed(&decoded, |_| Ok(()))
+        .unwrap();
+    assert!(matches!(
+        configured.orders[&target].cancel,
+        risk_transition::cancel::State::EffectiveCanceled(_)
+    ));
+}
+
+#[test]
+fn generic_same_tick_source_sequence_cannot_move_backwards() {
+    let mut configured = configured_owner(12);
+    let mut first = historical_intent("SG-FIRST", "SE-FIRST", 7);
+    first["ordering_contract_id"] = json!("S_order_v1");
+    first["members"][0]["stamp"]["ordering_contract_id"] = json!("S_order_v1");
+    let decoded = parse(&first, &configured).unwrap();
+    configured
+        .apply_group_observed(&decoded, |_| Ok(()))
+        .unwrap();
+
+    let mut reversed = historical_intent("SG-REVERSED", "SE-REVERSED", 6);
+    reversed["ordering_contract_id"] = json!("S_order_v1");
+    reversed["members"][0]["stamp"]["ordering_contract_id"] = json!("S_order_v1");
+    let decoded = parse(&reversed, &configured).unwrap();
+    assert!(matches!(
+        configured.apply_group_observed(&decoded, |_| Ok(())),
+        Err("INVALID_SCENARIO_GROUP")
+    ));
+}
+
+#[test]
+fn historical_pending_cancel_request_is_a_nonterminal_too_late_rejection() {
+    let mut configured = configured_owner(12);
+    let first = parse(&historical_intent("HG-ORDER", "HE-ORDER", 0), &configured).unwrap();
+    configured.apply_group_observed(&first, |_| Ok(())).unwrap();
+    let target = configured.orders.keys().next().unwrap().clone();
+
+    let mut request = historical_cancel("CANCEL_REQUEST", "HG-REQUEST", "HE-REQUEST", 1);
+    request["members"][0]["payload"]["targets"][0]["target_order_id"] = json!(target);
+    let decoded = parse(&request, &configured).unwrap();
+    configured
+        .apply_group_observed(&decoded, |_| Ok(()))
+        .unwrap();
+
+    let mut repeated = historical_cancel("CANCEL_REQUEST", "HG-REPEATED", "HE-REPEATED", 2);
+    repeated["members"][0]["payload"]["targets"][0]["target_order_id"] = json!(target);
+    let decoded = parse(&repeated, &configured).unwrap();
+    let Applied::Fresh(completion) = configured
+        .apply_group_observed(&decoded, |_| Ok(()))
+        .unwrap()
+    else {
+        panic!("repeated request should be recorded as a fresh rejection")
+    };
+    assert_eq!(completion.failure, None);
+    assert_eq!(completion.committed, Vec::<Reference>::new());
+    assert_eq!(
+        completion.rejections,
+        vec![("HE-REPEATED".into(), "CANCEL_REQUEST_TOO_LATE")]
+    );
+    assert!(matches!(
+        configured.orders[&target].cancel,
+        risk_transition::cancel::State::Requested(_)
+    ));
 }
 
 #[test]

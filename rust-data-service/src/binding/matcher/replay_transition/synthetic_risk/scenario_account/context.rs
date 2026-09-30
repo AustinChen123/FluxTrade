@@ -155,6 +155,7 @@ impl ScenarioAccount {
         risk_transition::cancel::identity::stamp_shape(
             &input.stamp,
             self.transition.reverse_group,
+            false,
         )?;
         if input.stamp.scenario_ordinal
             != if matches!(input.rows, Rows::Marks(_)) {

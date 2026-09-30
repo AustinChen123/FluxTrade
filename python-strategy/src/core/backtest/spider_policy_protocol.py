@@ -325,7 +325,11 @@ def _historical_child_id(run_contract_hash: object, parent_delivery_id: object,
     _plan_sequence(child_ordinal)
     encoded = (_event_text("P3_DERIVED_ID_V1") + _event_text(run_contract_hash)
                + _event_id(parent_delivery_id)
-               + _event_token(identity_kind, ("ORDER_GROUP", "ORDER_EVENT", "ORDER_INTENT"))
+               + _event_token(identity_kind, (
+                   "ORDER_GROUP", "ORDER_EVENT", "ORDER_INTENT",
+                   "CANCEL_REQUEST_GROUP", "CANCEL_REQUEST_EVENT",
+                   "CANCEL_EFFECT_GROUP", "CANCEL_EFFECT_EVENT",
+               ))
                + _event_integer(child_ordinal))
     return hashlib.sha256(encoded).hexdigest()
 
