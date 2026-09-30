@@ -20,6 +20,7 @@ _ARTIFACTS = (
     ("reconciliation.json", "spider_reconciliation_v1"),
     ("report.jsonl", "spider_product_report_v1"),
 )
+_P3_ARTIFACTS = (*_ARTIFACTS, ("historical_input.json", "spider_historical_research_run_v1"))
 
 
 def _embedded_context(value: object) -> ConfigurationContext:
@@ -133,6 +134,7 @@ def report(
 def completion(value: object) -> None:
     row = _object(value, "schema_version run_id state terminal_reason input_contract_hashes planned_coverage processed_boundary persisted_boundary endpoint_state_digest reconciliation_digest artifacts", "configuration_context historical_context")
     _, historical = _root_context_pair(row)
+    artifact_specs = _P3_ARTIFACTS if historical is not None else _ARTIFACTS
     _header(row, "spider_completion_v1", historical=historical is not None)
     _enum(row["state"], ["COMPLETE"])
     for name in ("endpoint_state_digest", "reconciliation_digest"):
@@ -154,11 +156,13 @@ def completion(value: object) -> None:
         _enum(entry["record_kind"], _P3_COVERAGE_KINDS if historical is not None else _KINDS)
     _require(len(barriers) == len(set(barriers)))
     artifacts = _list(row["artifacts"])
-    _require(len(artifacts) == len(_ARTIFACTS))
-    for item, (path, schema) in zip(artifacts, _ARTIFACTS, strict=True):
+    _require(len(artifacts) == len(artifact_specs))
+    for item, (path, schema) in zip(artifacts, artifact_specs, strict=True):
         entry = _object(item, "path schema_version sha256 byte_count row_count")
         _enum(entry["path"], [path])
         _enum(entry["schema_version"], [schema])
         _text(entry["sha256"], "[0-9a-f]{64}")
         _integer(entry["byte_count"])
-        _integer(entry["row_count"])
+        rows = _integer(entry["row_count"])
+        if path == "historical_input.json":
+            _require(rows == 1)

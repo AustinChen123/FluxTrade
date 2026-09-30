@@ -269,5 +269,6 @@ def test_import_boundary():
     assert {node.name for item in ast.walk(tree) if isinstance(item, ast.Import) for node in item.names} == {"os", "re", "stat"}
     assert {item.module for item in ast.walk(tree) if isinstance(item, ast.ImportFrom)} <= {
         "hashlib", "json", "typing", "src.core.backtest.spider_run_artifacts", "src.core.backtest.spider_run_completion_schema",
+        "src.core.backtest.spider_historical_input",
         "src.core.backtest.spider_run_envelope_schema", "src.core.backtest.spider_run_evidence",
         "src.core.backtest.spider_run_reconciliation_schema", "src.core.backtest.spider_scenario_plans"}

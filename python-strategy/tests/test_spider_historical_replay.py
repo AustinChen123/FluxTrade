@@ -3,12 +3,14 @@ from dataclasses import replace
 from decimal import Decimal as D
 from hashlib import sha256
 import json
+import os
 import re
 from typing import cast
 
 import pytest
 
 from src.core.backtest import synthetic_scenario_codec as wire
+from src.core.backtest.spider_run_admission import admit_spider_run
 from src.core.backtest.spider_historical_input import (
     HistoricalInputError, HistoricalRunInput, decode_p2_configuration,
     encode_historical_run_input, historical_context_for_input,
@@ -228,7 +230,7 @@ def _capture_historical_owner(composition, cutoff, prefix):
     )))
 
 
-def _historical_endpoint_case(tmp_path, *, partial_fill):
+def _historical_endpoint_case(tmp_path, *, partial_fill, return_store=False):
     run = _valid_run()
     if partial_fill:
         trade_rows = tuple(
@@ -307,7 +309,8 @@ def _historical_endpoint_case(tmp_path, *, partial_fill):
     status = store._status("RUNNING")
     artifacts = build_endpoint_artifacts(run.run_id, attempt, status, journal, initial,
                                          final_capture["owner_evidence"], final_capture["scheduler_observation"])
-    return run, attempt, status, journal, artifacts, composition
+    result = (run, attempt, status, journal, artifacts, composition)
+    return (*result, store) if return_store else result
 
 
 def _extend_one_minute(run: HistoricalRunInput) -> HistoricalRunInput:
@@ -1430,6 +1433,101 @@ def test_historical_endpoint_and_reconciliation_project_authoritative_market_evi
         assert f"SOURCE:{fill['source_event_id']}" in product_report["committed_execution_refs"]
         assert any(ref.startswith("journal:") for ref in product_report["source_evidence_refs"])
     assert all(row["historical_context"] == attempt["historical_context"] for row in report)
+
+
+@pytest.mark.parametrize("partial_fill", [False, True])
+def test_historical_store_finalize_and_admission_accept_real_native_bundle(tmp_path, partial_fill):
+    run, attempt, status, journal, artifacts, _, store = _historical_endpoint_case(
+        tmp_path, partial_fill=partial_fill, return_store=True,
+    )
+    assert store.finalize(artifacts["endpoint"], artifacts["reconciliation"], artifacts["report"]) == "COMPLETE_PUBLISHED"
+    raw_input = (store._path / "historical_input.json").read_bytes()
+    assert raw_input == encode_historical_run_input(run)
+    manifest = decode_canonical((store._path / "completion.json").read_bytes().rstrip(b"\n"))
+    input_metadata = manifest["artifacts"][-1]
+    assert input_metadata == dict(
+        path="historical_input.json", schema_version="spider_historical_research_run_v1",
+        sha256=sha256(raw_input).hexdigest(), byte_count=len(raw_input), row_count=1,
+    )
+    admitted = admit_spider_run(store._path)
+    assert admitted["decision"] == "ACCEPT", admitted
+    assert admitted["artifacts"]["historical_input.json"]["run_id"] == run.run_id
+    assert admitted["artifacts"]["journal.jsonl"] == journal
+    assert status["state"] == "RUNNING"
+
+
+@pytest.mark.parametrize("mutation", [
+    "missing_input", "truncated_input", "changed_input", "symlink_input", "hardlink_input",
+    "context_mismatch", "hash_mismatch", "incomplete_frontier", "reconciliation_mismatch",
+])
+def test_historical_admission_rejects_mutated_finalized_bundle(tmp_path, mutation):
+    run, _, _, _, artifacts, _, store = _historical_endpoint_case(
+        tmp_path, partial_fill=True, return_store=True,
+    )
+    store.finalize(artifacts["endpoint"], artifacts["reconciliation"], artifacts["report"])
+    path = store._path
+    completion_path = path / "completion.json"
+    manifest = decode_canonical(completion_path.read_bytes().rstrip(b"\n"))
+
+    def write_object(name, value):
+        raw = canonical_bytes(value) + b"\n"
+        (path / name).write_bytes(raw)
+        entry = next(row for row in manifest["artifacts"] if row["path"] == name)
+        entry.update(sha256=sha256(raw).hexdigest(), byte_count=len(raw),
+                     row_count=len(value) if name.endswith(".jsonl") else 1)
+
+    historical_path = path / "historical_input.json"
+    if mutation == "missing_input":
+        historical_path.unlink()
+    elif mutation == "truncated_input":
+        historical_path.write_bytes(historical_path.read_bytes()[:24])
+    elif mutation == "changed_input":
+        changed = decode_canonical(historical_path.read_bytes())
+        changed["run_id"] = "other-run"
+        historical_path.write_bytes(canonical_bytes(changed))
+    elif mutation in ("symlink_input", "hardlink_input"):
+        historical_path.unlink()
+        if mutation == "symlink_input":
+            historical_path.symlink_to(path / "attempt.json")
+        else:
+            os.link(path / "attempt.json", historical_path)
+    elif mutation == "context_mismatch":
+        attempt_path = path / "attempt.json"
+        attempt = decode_canonical(attempt_path.read_bytes().rstrip(b"\n"))
+        attempt["historical_context"]["source_sha256"] = "f" * 64
+        write_object("attempt.json", attempt)
+    elif mutation == "hash_mismatch":
+        next(row for row in manifest["artifacts"] if row["path"] == "historical_input.json")["sha256"] = "f" * 64
+    elif mutation == "incomplete_frontier":
+        status_path = path / "status.json"
+        status = decode_canonical(status_path.read_bytes().rstrip(b"\n"))
+        status["state"] = "RUNNING"
+        write_object("status.json", status)
+    else:
+        reconciliation_path = path / "reconciliation.json"
+        reconciliation = decode_canonical(reconciliation_path.read_bytes().rstrip(b"\n"))
+        reconciliation["result"] = "FAILED"
+        write_object("reconciliation.json", reconciliation)
+        manifest["reconciliation_digest"] = sha256(canonical_bytes(reconciliation)).hexdigest()
+
+    completion_path.write_bytes(canonical_bytes(manifest) + b"\n")
+    assert admit_spider_run(path)["decision"] == "REJECT"
+
+
+@pytest.mark.parametrize("encoded_value", [[], None, "not-an-object"])
+def test_historical_admission_rejects_canonical_non_object_input(tmp_path, encoded_value):
+    _, _, _, _, artifacts, _, store = _historical_endpoint_case(
+        tmp_path, partial_fill=False, return_store=True,
+    )
+    store.finalize(artifacts["endpoint"], artifacts["reconciliation"], artifacts["report"])
+    raw = canonical_bytes(encoded_value)
+    (store._path / "historical_input.json").write_bytes(raw)
+    manifest_path = store._path / "completion.json"
+    manifest = decode_canonical(manifest_path.read_bytes().rstrip(b"\n"))
+    metadata = next(row for row in manifest["artifacts"] if row["path"] == "historical_input.json")
+    metadata.update(sha256=sha256(raw).hexdigest(), byte_count=len(raw), row_count=1)
+    manifest_path.write_bytes(canonical_bytes(manifest) + b"\n")
+    assert admit_spider_run(store._path)["decision"] == "REJECT"
 
 
 def test_historical_endpoint_rejects_missing_duplicate_and_past_due_coverage(tmp_path):

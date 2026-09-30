@@ -9,16 +9,12 @@ from json import JSONDecodeError
 from pathlib import Path
 from typing import Any
 
-from src.core.backtest.spider_run_artifacts import _HASHES, _P3_RUN_CONTRACT, _boundary, _configuration_context, _historical_context, _require, _text, canonical_bytes, configuration_context, decode_jsonl, historical_context, validate_artifact
+from src.core.backtest.spider_run_artifacts import _P3_RUN_CONTRACT, _boundary, _configuration_context, _historical_context, _require, _text, canonical_bytes, configuration_context, decode_jsonl, historical_context, validate_artifact
 from src.core.backtest.spider_run_completion_schema import _ARTIFACTS, completion, report as validate_report
 from src.core.backtest.spider_run_envelope_schema import endpoint as validate_endpoint, journal as validate_journal, journal_record
 from src.core.backtest.spider_run_evidence import ReconciliationProjectionError, _context_chain, build_reconciliation
 from src.core.backtest.spider_run_reconciliation_schema import reconciliation as validate_reconciliation
-from src.core.backtest.spider_historical_input import (
-    HistoricalRunInput, decode_historical_run_input, decode_p2_configuration,
-    encode_historical_run_input, historical_context_for_input, historical_planned_coverage,
-    validate_historical_input,
-)
+from src.core.backtest.spider_historical_input import _validate_historical_run_link
 
 
 class SpiderRunStoreError(Exception):
@@ -139,34 +135,7 @@ class SpiderRunStore:
         if type(raw) is not bytes:
             raise ValueError("INVALID_ARTIFACT")
         try:
-            run = decode_historical_run_input(raw)
-            if type(run) is not HistoricalRunInput or encode_historical_run_input(run) != raw:
-                raise ValueError("INVALID_ARTIFACT")
-            if run.run_id != self._run_id or attempt["run_id"] != run.run_id:
-                raise ValueError("INVALID_ARTIFACT")
-            history = historical_context(attempt["historical_context"])
-            expected_history = historical_context_for_input(run)
-            configuration = decode_p2_configuration(
-                run.configuration_bytes, run.configuration_sha256, run.ordered_products
-            )
-            expected_configuration = configuration_context(dict(
-                schema_version="spider_configuration_context_v1",
-                config_id=configuration["config_id"],
-                configuration_sha256=run.configuration_sha256,
-                products=list(run.ordered_products),
-            ))
-            semantic_hash = validate_historical_input(run)
-            if (history != historical_context(expected_history)
-                    or configuration_context(attempt["configuration_context"]) != expected_configuration
-                    or attempt["historical_context"] != expected_history
-                    or attempt["policy_source_sha256"] != run.policy_source_sha256
-                    or any(entry["sha256"] != attempt[key]
-                           for entry, key in zip(attempt["input_contract_hashes"], _HASHES, strict=True))
-                    or attempt["scenario_plan_sha256"] != semantic_hash
-                    or attempt["input_contract_hashes"][0]["sha256"] != semantic_hash
-                    or attempt["account_key"].get("account") != run.account_key
-                    or attempt["planned_coverage"] != historical_planned_coverage(run)):
-                raise ValueError("INVALID_ARTIFACT")
+            _validate_historical_run_link(raw, attempt, self._run_id)
         except ValueError as error:
             if error.args == ("INVALID_ARTIFACT",):
                 raise
@@ -283,11 +252,30 @@ class SpiderRunStore:
             raise SpiderRunStoreError("ENDPOINT_RECONCILIATION_FAILED")
         return value, dict(path=name, schema_version=schema, sha256=sha256(raw).hexdigest(), byte_count=len(raw), row_count=len(rows))
 
+    def _historical_input_metadata(self, attempt: dict[str, Any]) -> dict[str, Any]:
+        path = self._path / "historical_input.json"
+        try:
+            if path.is_symlink() or not path.is_file():
+                raise OSError("invalid historical input target")
+            raw = path.read_bytes()
+        except OSError as error:
+            raise SpiderRunStoreError("PUBLICATION_FAILED") from error
+        try:
+            _validate_historical_run_link(raw, attempt, self._run_id)
+        except ValueError as error:
+            raise SpiderRunStoreError("ENDPOINT_RECONCILIATION_FAILED") from error
+        return dict(path="historical_input.json", schema_version="spider_historical_research_run_v1",
+                    sha256=sha256(raw).hexdigest(), byte_count=len(raw), row_count=1)
+
     def finalize(self, endpoint: dict, reconciliation: dict, report: list) -> str:
         self._allowed("RUNNING")
-        if self._attempt.get("run_contract_id") == _P3_RUN_CONTRACT:
-            raise SpiderRunStoreError("ENDPOINT_RECONCILIATION_FAILED")
-        if self._barrier_failed or self._processed != self._persisted or self._persisted is None or self._persisted["ordinal"] != len(self._attempt["planned_coverage"]):
+        historical = self._attempt.get("run_contract_id") == _P3_RUN_CONTRACT
+        frontier_ready = (self._persisted is not None and self._processed == self._persisted
+                          and self._persisted["ordinal"] == self._persisted["journal_seq"] > 0)
+        if not historical:
+            frontier_ready = (frontier_ready and self._persisted is not None
+                              and self._persisted["ordinal"] == len(self._attempt["planned_coverage"]))
+        if self._barrier_failed or not frontier_ready:
             raise RuntimeError("INVALID_STORE_OPERATION")
         validate_endpoint(endpoint)
         validate_reconciliation(reconciliation)
@@ -302,6 +290,7 @@ class SpiderRunStore:
             current = [self._reread(name, validator)[0] for name, validator in (
                 ("attempt.json", validate_artifact), ("status.json", validate_artifact), ("journal.jsonl", validate_journal))]
             _context_chain(current[0], current[1], current[2], endpoint, reconciliation, report)
+            historical_metadata = self._historical_input_metadata(current[0]) if historical else None
         except ReconciliationProjectionError as error:
             raise SpiderRunStoreError("ENDPOINT_RECONCILIATION_FAILED") from error
         for name, value in [("endpoint.json", endpoint), ("reconciliation.json", reconciliation), ("report.jsonl", report)]:
@@ -327,6 +316,8 @@ class SpiderRunStore:
             raise SpiderRunStoreError("ENDPOINT_RECONCILIATION_FAILED")
         metadata = [entry for _, entry in reread]
         metadata[1] = status_metadata
+        if historical_metadata is not None:
+            metadata.append(historical_metadata)
         manifest = dict(schema_version="spider_completion_v1", run_id=self._run_id, state="COMPLETE", terminal_reason=final["terminal_reason"],
                         input_contract_hashes=attempt["input_contract_hashes"], planned_coverage=attempt["planned_coverage"],
                         processed_boundary=self._processed, persisted_boundary=self._persisted,

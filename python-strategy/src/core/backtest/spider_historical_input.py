@@ -13,7 +13,10 @@ import json
 import re
 from typing import Any, Callable, TypeVar, cast
 
-from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_canonical, historical_context
+from src.core.backtest.spider_run_artifacts import (
+    _HASHES, canonical_bytes, configuration_context, decode_canonical,
+    historical_context,
+)
 
 
 SCHEMA_ID = "SPIDER_HISTORICAL_RESEARCH_RUN_V1"
@@ -955,6 +958,62 @@ def decode_historical_run_input(raw: bytes) -> HistoricalRunInput:
     validate_historical_input(run)
     if encode_historical_run_input(run) != raw:
         raise HistoricalInputError("noncanonical historical run encoding")
+    return run
+
+
+def _validate_historical_run_link(
+    raw: bytes, attempt: dict[str, object], expected_run_id: str,
+) -> HistoricalRunInput:
+    """Decode and link exact persisted historical bytes to one validated P3 attempt."""
+    if type(raw) is not bytes:
+        raise HistoricalInputError("invalid historical input bytes")
+    run = decode_historical_run_input(raw)
+    if encode_historical_run_input(run) != raw:
+        raise HistoricalInputError("noncanonical historical input bytes")
+    semantic_hash = validate_historical_input(run)
+    configuration = decode_p2_configuration(
+        run.configuration_bytes, run.configuration_sha256, run.ordered_products,
+    )
+    expected_configuration = configuration_context(dict(
+        schema_version="spider_configuration_context_v1",
+        config_id=configuration["config_id"],
+        configuration_sha256=run.configuration_sha256,
+        products=list(run.ordered_products),
+    ))
+    expected_history = historical_context(historical_context_for_input(run))
+    account_key = attempt.get("account_key")
+    if (run.run_id != expected_run_id or attempt.get("run_id") != run.run_id
+            or attempt.get("run_contract_id") != SCHEMA_ID
+            or attempt.get("scenario_plan_id") != SCHEMA_ID
+            or attempt.get("requested_scenario_selector") != SCHEMA_ID
+            or attempt.get("scenario_plan_sha256") != semantic_hash
+            or attempt.get("policy_source_sha256") != run.policy_source_sha256
+            or attempt.get("configuration_context") is None
+            or configuration_context(attempt["configuration_context"]) != expected_configuration
+            or attempt.get("historical_context") != dict(
+                schema_version="spider_historical_context_v1",
+                research_classification="RESEARCH_ONLY",
+                historical_input_sha256=expected_history.historical_input_sha256,
+                path_pair_sha256=expected_history.path_pair_sha256,
+                source_sha256=expected_history.source_sha256,
+                model_sha256=expected_history.model_sha256,
+                assumption_sha256=expected_history.assumption_sha256,
+                coverage_sha256=expected_history.coverage_sha256,
+                model_id=expected_history.model_id,
+                model_version=expected_history.model_version,
+            )
+            or type(account_key) is not dict or account_key.get("account") != run.account_key
+            or attempt.get("planned_coverage") != historical_planned_coverage(run)):
+        raise HistoricalInputError("historical input does not match attempt")
+    hashes = attempt.get("input_contract_hashes")
+    if type(hashes) is not list or len(hashes) != len(_HASHES):
+        raise HistoricalInputError("historical input hashes do not match attempt")
+    hash_entries = cast(list[dict[str, object]], hashes)
+    for entry, name in zip(hash_entries, _HASHES, strict=True):
+        if type(entry) is not dict or entry.get("sha256") != attempt.get(name):
+            raise HistoricalInputError("historical input hashes do not match attempt")
+    if hash_entries[0]["sha256"] != semantic_hash:
+        raise HistoricalInputError("historical semantic hash does not match attempt")
     return run
 
 

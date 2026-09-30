@@ -8,15 +8,21 @@ from json import JSONDecodeError as _JSONDecodeError
 from typing import Any as _Any
 from typing import cast as _cast
 
-from src.core.backtest.spider_run_artifacts import canonical_bytes as _bytes, configuration_context as _validate_context, decode_jsonl as _decode_jsonl, validate_artifact as _artifact
-from src.core.backtest.spider_run_completion_schema import _ARTIFACTS, completion as _completion, report as _report
+from src.core.backtest.spider_run_artifacts import canonical_bytes as _bytes, configuration_context as _validate_context, decode_canonical as _decode_canonical, decode_jsonl as _decode_jsonl, historical_context as _validate_historical_context, validate_artifact as _artifact
+from src.core.backtest.spider_run_completion_schema import _ARTIFACTS, _P3_ARTIFACTS, completion as _completion, report as _report
 from src.core.backtest.spider_run_envelope_schema import endpoint as _endpoint, journal as _journal
 from src.core.backtest.spider_run_evidence import ReconciliationProjectionError as _ProjectionError, _context_chain, build_reconciliation as _build
 from src.core.backtest.spider_run_reconciliation_schema import reconciliation as _reconciliation
 from src.core.backtest.spider_scenario_plans import plan_bundle as _plan_bundle
+from src.core.backtest.spider_historical_input import (
+    HistoricalInputError as _HistoricalInputError,
+    _validate_historical_run_link,
+)
 
 _NAMES = tuple(name for name, _ in _ARTIFACTS)
 _ALL = (*_NAMES, "completion.json")
+_P3_NAMES = tuple(name for name, _ in _P3_ARTIFACTS)
+_P3_ALL = (*_P3_NAMES, "completion.json")
 _LIMIT = 16_777_216
 _POLICY = "eb6ab34d8685fb59e286f5ffda8af24cbecf3e5ab2c729c585ccdca797cac336"
 _P2_SELECTOR = "SPIDER_P2_CONFIGURED_SCALE_V1"
@@ -46,11 +52,12 @@ def _regular(directory: int, name: str) -> None:
         raise _Unsafe()
 
 
-def _capture(directory: int, name: str) -> bytes:
+def _capture(directory: int, name: str, *, exclusive: bool = False) -> bytes:
     _regular(directory, name)
     descriptor = _os.open(name, _os.O_RDONLY | _os.O_NOFOLLOW | _os.O_NONBLOCK, dir_fd=directory)
     try:
-        if not _stat.S_ISREG(_os.fstat(descriptor).st_mode):
+        info = _os.fstat(descriptor)
+        if not _stat.S_ISREG(info.st_mode) or (exclusive and info.st_nlink != 1):
             raise _Unsafe()
         chunks, count = [], 0
         while count <= _LIMIT:
@@ -129,8 +136,11 @@ def _admit(directory: int) -> dict[str, _Any]:
         _validate(_completion, manifest)
     except _Invalid:
         return _reject("INVALID_MANIFEST", ("completion.json",))
+    historical_manifest = "historical_context" in manifest
+    names = _P3_NAMES if historical_manifest else _NAMES
+    all_names = _P3_ALL if historical_manifest else _ALL
     unsafe = []
-    for name in _NAMES:
+    for name in names:
         try:
             _regular(directory, name)
         except _Unsafe:
@@ -140,9 +150,9 @@ def _admit(directory: int) -> dict[str, _Any]:
     if unsafe:
         return _reject("UNSAFE_ARTIFACT_PATH", tuple(unsafe))
     captured, bad = {}, []
-    for name in _NAMES:
+    for name in names:
         try:
-            captured[name] = _capture(directory, name)
+            captured[name] = _capture(directory, name, exclusive=name == "historical_input.json")
         except _Unsafe:
             unsafe.append(name)
         except (OSError, _Oversize):
@@ -156,8 +166,14 @@ def _admit(directory: int) -> dict[str, _Any]:
             continue
         data = captured[name]
         try:
-            value = _decode(data, name)
-            count = len(value) if name.endswith(".jsonl") else 1
+            if name == "historical_input.json":
+                value = _decode_canonical(data)
+                if type(value) is not dict:
+                    raise _Invalid()
+                count = 1
+            else:
+                value = _decode(data, name)
+                count = len(value) if name.endswith(".jsonl") else 1
             if len(data) != entry["byte_count"] or _sha256(data).hexdigest() != entry["sha256"] or count != entry["row_count"]:
                 raise _Invalid()
             digest_field = {"endpoint.json": "endpoint_state_digest", "reconciliation.json": "reconciliation_digest"}.get(name)
@@ -166,8 +182,14 @@ def _admit(directory: int) -> dict[str, _Any]:
             values[name] = value
         except _Invalid:
             bad.append(name)
+        except (_JSONDecodeError, UnicodeDecodeError):
+            bad.append(name)
+        except ValueError as error:
+            if error.args != ("INVALID_ARTIFACT",):
+                raise
+            bad.append(name)
     if bad:
-        return _reject("ARTIFACT_MISMATCH", tuple(name for name in _NAMES if name in bad))
+        return _reject("ARTIFACT_MISMATCH", tuple(name for name in names if name in bad))
     for name, value in values.items():
         rows = value if name.endswith(".jsonl") else [value]
         if any(not _run_id(row.get("run_id")) or row["run_id"] != manifest["run_id"] for row in rows):
@@ -175,18 +197,40 @@ def _admit(directory: int) -> dict[str, _Any]:
     if bad:
         return _reject("RUN_ID_MISMATCH", tuple(bad))
     validators = (_artifact, _artifact, _journal, _endpoint, _reconciliation, _report)
-    for (name, schema), validator in zip(_ARTIFACTS, validators, strict=True):
+    artifact_specs = _P3_ARTIFACTS if historical_manifest else _ARTIFACTS
+    selected_validators = (*validators, None) if historical_manifest else validators
+    for (name, schema), validator in zip(artifact_specs, selected_validators, strict=True):
         value = values[name]
         rows = value if name.endswith(".jsonl") else [value]
+        if name == "historical_input.json":
+            try:
+                if any(row.get("schema_version") != schema for row in rows):
+                    raise _Invalid()
+                _validate_historical_run_link(captured[name], values["attempt.json"], manifest["run_id"])
+            except (_Invalid, _HistoricalInputError, ValueError, TypeError, KeyError):
+                bad.append(name)
+            continue
         try:
             if any(row.get("schema_version") != schema for row in rows):
                 raise _Invalid()
+            assert validator is not None
             if name == "report.jsonl" and values["attempt.json"].get("run_contract_id") == "SPIDER_SYNTHETIC_P2_CONFIGURED_RUN_V1":
                 if not rows:
                     raise _Invalid()
                 try:
                     report_context = _validate_context(rows[0].get("configuration_context"))
                     _report(value, context=report_context)
+                except ValueError as error:
+                    if error.args != ("INVALID_ARTIFACT",):
+                        raise
+                    raise _Invalid() from error
+            elif name == "report.jsonl" and values["attempt.json"].get("run_contract_id") == "SPIDER_HISTORICAL_RESEARCH_RUN_V1":
+                if not rows:
+                    raise _Invalid()
+                try:
+                    report_context = _validate_context(values["attempt.json"].get("configuration_context"))
+                    report_history = _validate_historical_context(values["attempt.json"].get("historical_context"))
+                    _report(value, context=report_context, historical_context=report_history)
                 except ValueError as error:
                     if error.args != ("INVALID_ARTIFACT",):
                         raise
@@ -201,47 +245,62 @@ def _admit(directory: int) -> dict[str, _Any]:
     try:
         _context_chain(attempt, status, journal, endpoint, supplied, report, manifest)
     except _ProjectionError:
-        return _reject("ENDPOINT_RECONCILIATION_FAILED", _ALL)
+        return _reject("ENDPOINT_RECONCILIATION_FAILED", all_names)
     coverage = attempt["planned_coverage"]
     frontier = dict(ordinal=len(journal), journal_seq=len(journal), barrier_id=journal[-1]["barrier_id"]) if journal else None
-    if (status["state"] != "COMPLETE" or not coverage or not journal or manifest["planned_coverage"] != coverage
-            or coverage[-1]["ordinal"] != len(journal) or coverage[-1]["barrier_id"] != journal[-1]["barrier_id"]
-            or any(manifest[key] != status[key] or status[key] != frontier for key in ("processed_boundary", "persisted_boundary"))):
+    historical = attempt.get("run_contract_id") == "SPIDER_HISTORICAL_RESEARCH_RUN_V1"
+    frontier_valid = (bool(coverage) and bool(journal) and manifest["planned_coverage"] == coverage
+                      and all(manifest[key] == status[key] == frontier
+                              for key in ("processed_boundary", "persisted_boundary")))
+    if not historical:
+        frontier_valid = (frontier_valid and coverage[-1]["ordinal"] == len(journal)
+                          and coverage[-1]["barrier_id"] == journal[-1]["barrier_id"])
+    if status["state"] != "COMPLETE" or not frontier_valid:
         return _reject("INCOMPLETE_PERSISTENCE", _FRONTIER)
     if attempt["registration_state"] != "VALIDATED":
-        return _reject("ENDPOINT_RECONCILIATION_FAILED", _ALL)
-    try:
-        selected = _plan_bundle(attempt["scenario_plan_id"])
-    except ValueError as error:
-        if error.args != ("UNSUPPORTED_CONFIGURATION",):
-            raise
-        return _reject("ENDPOINT_RECONCILIATION_FAILED", _ALL)
-    configured = selected.get("schema_version") == "spider_scenario_plan_v2"
-    if configured:
-        if (attempt["scenario_plan_id"] != _P2_SELECTOR or attempt["run_contract_id"] != _P2_RUN_CONTRACT
-                or _sha256(_bytes(selected)).hexdigest() != attempt["scenario_plan_sha256"]):
+        return _reject("ENDPOINT_RECONCILIATION_FAILED", all_names)
+    if historical:
+        if (attempt["scenario_plan_id"] != "SPIDER_HISTORICAL_RESEARCH_RUN_V1"
+                or attempt["requested_scenario_selector"] != "SPIDER_HISTORICAL_RESEARCH_RUN_V1"
+                or attempt["run_contract_id"] != "SPIDER_HISTORICAL_RESEARCH_RUN_V1"
+                or attempt["terminal_policy"] != "MTM_PRESERVE_OPEN_V1"
+                or manifest["terminal_reason"] != "MTM_PRESERVE_OPEN_V1"):
+            return _reject("ENDPOINT_RECONCILIATION_FAILED", all_names)
+        selected_plan_sha256 = attempt["scenario_plan_sha256"]
+    else:
+        try:
+            selected = _plan_bundle(attempt["scenario_plan_id"])
+        except ValueError as error:
+            if error.args != ("UNSUPPORTED_CONFIGURATION",):
+                raise
             return _reject("ENDPOINT_RECONCILIATION_FAILED", _ALL)
-        configuration = _cast(dict[str, _Any], selected["configuration"])
-        context = _cast(dict[str, _Any], attempt["configuration_context"])
-        if (context["config_id"] != configuration["config_id"]
-                or context["configuration_sha256"] != selected["configuration_sha256"]
-                or context["products"] != selected["products"]):
+        configured = selected.get("schema_version") == "spider_scenario_plan_v2"
+        if configured:
+            if (attempt["scenario_plan_id"] != _P2_SELECTOR or attempt["run_contract_id"] != _P2_RUN_CONTRACT
+                    or _sha256(_bytes(selected)).hexdigest() != attempt["scenario_plan_sha256"]):
+                return _reject("ENDPOINT_RECONCILIATION_FAILED", _ALL)
+            configuration = _cast(dict[str, _Any], selected["configuration"])
+            context = _cast(dict[str, _Any], attempt["configuration_context"])
+            if (context["config_id"] != configuration["config_id"]
+                    or context["configuration_sha256"] != selected["configuration_sha256"]
+                    or context["products"] != selected["products"]):
+                return _reject("ENDPOINT_RECONCILIATION_FAILED", _ALL)
+        elif attempt["run_contract_id"] == _P2_RUN_CONTRACT:
             return _reject("ENDPOINT_RECONCILIATION_FAILED", _ALL)
-    elif attempt["run_contract_id"] == _P2_RUN_CONTRACT:
-        return _reject("ENDPOINT_RECONCILIATION_FAILED", _ALL)
+        selected_plan_sha256 = _sha256(_bytes(selected)).hexdigest() if configured else selected["plan_sha256"]
     hash_fields = ("scenario_plan_sha256", "program_sha256", "native_artifact_sha256", "policy_source_sha256")
-    selected_plan_sha256 = _sha256(_bytes(selected)).hexdigest() if configured else selected["plan_sha256"]
     if (attempt["requested_scenario_selector"] != attempt["scenario_plan_id"]
             or any(entry["sha256"] != attempt[key] for entry, key in zip(attempt["input_contract_hashes"], hash_fields, strict=True))
-            or attempt["policy_source_sha256"] != _POLICY or attempt["scenario_plan_sha256"] != selected_plan_sha256
+            or (not historical and attempt["policy_source_sha256"] != _POLICY)
+            or attempt["scenario_plan_sha256"] != selected_plan_sha256
             or manifest["input_contract_hashes"] != attempt["input_contract_hashes"] or manifest["terminal_reason"] != endpoint["terminal_reason"]):
-        return _reject("ENDPOINT_RECONCILIATION_FAILED", _ALL)
+        return _reject("ENDPOINT_RECONCILIATION_FAILED", all_names)
     try:
         computed = _build(manifest["run_id"], attempt, status, journal, endpoint, report)
     except _ProjectionError:
-        return _reject("ENDPOINT_RECONCILIATION_FAILED", _ALL)
+        return _reject("ENDPOINT_RECONCILIATION_FAILED", all_names)
     if computed["result"] != "OK" or any(row["result"] != "OK" for row in computed["checks"]) or _bytes(computed) != _bytes(supplied):
-        return _reject("ENDPOINT_RECONCILIATION_FAILED", _ALL)
+        return _reject("ENDPOINT_RECONCILIATION_FAILED", all_names)
     values["completion.json"] = manifest
     return dict(decision="ACCEPT", artifacts=values)
 

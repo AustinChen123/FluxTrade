@@ -372,7 +372,7 @@ def test_historical_registration_persists_input_and_dynamic_journal_frontier(tmp
     assert decode_jsonl((store._path / "journal.jsonl").read_bytes()) == rows
     assert (persisted["configuration_context"], persisted["historical_context"]) == (expected_config, expected_history)
     assert status["processed_boundary"] == status["persisted_boundary"] == boundary(rows[1])
-    with pytest.raises(module.SpiderRunStoreError, match="ENDPOINT_RECONCILIATION_FAILED"):
+    with pytest.raises(ValueError, match="INVALID_ARTIFACT"):
         store.finalize({}, {}, [])
     assert not any((store._path / name).exists() for name in ("endpoint.json", "reconciliation.json", "report.jsonl", "completion.json"))
 

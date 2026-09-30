@@ -366,6 +366,9 @@ def test_completion_coverage_kinds_are_historical_context_specific():
         historical_context=historical_context_row(),
         terminal_reason="MTM_PRESERVE_OPEN_V1",
     )
+    historical["artifacts"].append(dict(path="historical_input.json",
+                                         schema_version="spider_historical_research_run_v1",
+                                         sha256=HASH, byte_count=100, row_count=1))
     schema.completion(historical)
 
     legacy = manifest()
@@ -413,6 +416,9 @@ def test_reports_and_completion_bind_historical_context_pair_and_terminal():
     complete["planned_coverage"] = [
         {"ordinal": 1, "barrier_id": "P3_TIMER_86405000", "record_kind": "HISTORICAL_TIMER"}
     ]
+    complete["artifacts"].append(dict(path="historical_input.json",
+                                       schema_version="spider_historical_research_run_v1",
+                                       sha256=HASH, byte_count=100, row_count=1))
     schema.completion(complete)
     for invalid in (
         {**complete, "configuration_context": None},
