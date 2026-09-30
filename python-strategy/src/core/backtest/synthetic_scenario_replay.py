@@ -324,6 +324,30 @@ class _ReplayComposition:
         self._audit: dict[str, list] = {}
         self._evidence_callback = evidence_callback
 
+    @classmethod
+    def _from_historical_run(cls, run: object) -> "_ReplayComposition":
+        """Admit and project a P3 run fully before constructing its sole owner."""
+        from src.core.backtest.spider_historical_replay import (
+            _historical_market_item,
+            _prepare_historical_replay,
+            _restore_initial_policy,
+        )
+        from src.core.backtest.spider_historical_input import HistoricalRunInput
+
+        historical_run = cast(HistoricalRunInput, run)
+        prepared = _prepare_historical_replay(historical_run)
+        composition = cls(
+            "SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1",
+            prepared.account,
+            configuration=prepared.configuration,
+        )
+        _restore_initial_policy(composition, historical_run, prepared)
+        for sequence, snapshot in enumerate(prepared.snapshots):
+            result = composition._enqueue(_historical_market_item(snapshot, sequence))
+            if result["classification"] != "PENDING":
+                raise ValueError("INVALID_SCHEMA")
+        return composition
+
     def capture_owner_evidence(self, cutoff, trading_request, positions_request, open_orders_request):
         """Observe the owner and scheduler without dispatching or emitting a barrier."""
         _poll_check(type(cutoff) is int and 0 <= cutoff < 2**63)
@@ -361,7 +385,8 @@ class _ReplayComposition:
 
     @staticmethod
     def _queue_label(queue_class: int) -> str:
-        return ("SOURCE_GROUP", "SNAPSHOT_CAPTURE", "DELIVERY", "HISTORICAL_MARKET_STEP")[queue_class]
+        return ("SOURCE_GROUP", "SNAPSHOT_CAPTURE", "DELIVERY", "HISTORICAL_MARKET_STEP",
+                "HISTORICAL_MARKET_CACHE")[queue_class]
 
     def _evidence(self, kind, key, evidence):
         if self._evidence_callback is None:
@@ -411,6 +436,7 @@ class _ReplayComposition:
         try:
             kind = item.get("kind") if isinstance(item, dict) else None
             raw = 0
+            historical_cache_raw_time: int | None = None
             if kind == "SOURCE_GROUP":
                 row = cast(dict[str, Any], policy_protocol._event_object(item, "kind schedule_sequence group"))
                 group = row["group"]
@@ -446,6 +472,35 @@ class _ReplayComposition:
                     raise _ScheduleError("INVALID_SCHEMA") from exc
                 content = sequence_bytes + stable_bytes + node_bytes
                 account, cls = self._account, 3
+            elif kind == "HISTORICAL_MARKET_CACHE":
+                from src.core.backtest.spider_historical_replay import _ClosedMarketSnapshot
+
+                row = cast(dict[str, Any], policy_protocol._event_object(
+                    item, "kind schedule_sequence stable_id snapshot"
+                ))
+                sequence = row["schedule_sequence"]
+                stable = row["stable_id"]
+                sequence_bytes = policy_protocol._plan_sequence(sequence)
+                stable_bytes = policy_protocol._event_id(stable)
+                snapshot = row["snapshot"]
+                if type(snapshot) is not _ClosedMarketSnapshot:
+                    raise _ScheduleError("INVALID_SCHEMA")
+                if (type(snapshot.close_ms) is not int or not 0 <= snapshot.close_ms < 2**59
+                        or stable != f"MARKET_CLOSE_{snapshot.close_ms}"
+                        or tuple(market.product_id for market in snapshot.markets) != self._configured_product_ids):
+                    raise _ScheduleError("INVALID_SCHEMA")
+                at = snapshot.close_ms * 16 + 6
+                historical_cache_raw_time = snapshot.close_ms
+                for market in snapshot.markets:
+                    if (any(type(value) is not D or not value.is_finite() for value in (
+                            market.price, market.contract_value, market.lot_size, market.minimum_size,
+                            market.price_increment, market.high_low_ratio))
+                            or any(value <= 0 for value in (market.price, market.contract_value, market.lot_size,
+                                                            market.minimum_size, market.price_increment))
+                            or market.high_low_ratio < 0 or type(market.instrument_code) is not int):
+                        raise _ScheduleError("INVALID_SCHEMA")
+                content = sequence_bytes + stable_bytes + snapshot.content_bytes()
+                account, cls = self._account, 4
             else:
                 raise _ScheduleError("INVALID_SCHEMA")
             if policy_protocol._plan_account(account) != policy_protocol._plan_account(self._account):
@@ -453,6 +508,12 @@ class _ReplayComposition:
             if kind == "HISTORICAL_MARKET_STEP":
                 return dict(key=(at, cls, sequence, stable), content=content, item=deepcopy(item), plan=None,
                             raw_time_ms=raw,
+                            result=dict(kind=kind, stable_id=stable, classification="PENDING"))
+            if kind == "HISTORICAL_MARKET_CACHE":
+                if historical_cache_raw_time is None:
+                    raise _ScheduleError("INVALID_SCHEMA")
+                return dict(key=(at, cls, sequence, stable), content=content, item=deepcopy(item), plan=None,
+                            raw_time_ms=historical_cache_raw_time,
                             result=dict(kind=kind, stable_id=stable, classification="PENDING"))
             return dict(key=(at, cls, sequence, stable), content=content, item=deepcopy(item), plan=deepcopy(plan),
                         result=dict(kind=kind, stable_id=stable, classification="PENDING"))
@@ -502,10 +563,10 @@ class _ReplayComposition:
             return self._admit_set([(item, plan)])[0]
         except Exception as exc:
             kind = item.get("kind") if isinstance(item, dict) else "QUEUE"
-            kind = kind if isinstance(kind, str) and kind in ("SOURCE_GROUP", "SNAPSHOT_CAPTURE", "DELIVERY", "HISTORICAL_MARKET_STEP") else "QUEUE"
-            field, identity = {"SOURCE_GROUP": ("group", "group_id"), "SNAPSHOT_CAPTURE": ("request", "snapshot_id"), "DELIVERY": ("delivery", "delivery_id"), "HISTORICAL_MARKET_STEP": ("", "stable_id")}.get(kind or "", ("", ""))
+            kind = kind if isinstance(kind, str) and kind in ("SOURCE_GROUP", "SNAPSHOT_CAPTURE", "DELIVERY", "HISTORICAL_MARKET_STEP", "HISTORICAL_MARKET_CACHE") else "QUEUE"
+            field, identity = {"SOURCE_GROUP": ("group", "group_id"), "SNAPSHOT_CAPTURE": ("request", "snapshot_id"), "DELIVERY": ("delivery", "delivery_id"), "HISTORICAL_MARKET_STEP": ("", "stable_id"), "HISTORICAL_MARKET_CACHE": ("", "stable_id")}.get(kind or "", ("", ""))
             value = item.get(field) if isinstance(item, dict) else None
-            if kind == "HISTORICAL_MARKET_STEP":
+            if kind in ("HISTORICAL_MARKET_STEP", "HISTORICAL_MARKET_CACHE"):
                 value = item
             return self._stop_scheduler(exc, kind, value.get(identity) if isinstance(value, dict) else None)
 
@@ -628,7 +689,7 @@ class _ReplayComposition:
                     self._admit_set([(dict(kind="DELIVERY", delivery=delivery), plan)])
                 elif kind == "DELIVERY":
                     result["events"] = self._deliver_queued(record)
-                else:
+                elif kind == "HISTORICAL_MARKET_STEP":
                     historical_result = self._codec.historical_market_step(item["node"])
                     if (type(historical_result.get("raw_time_ms")) is not int
                             or historical_result["raw_time_ms"] != record["raw_time_ms"]
@@ -636,6 +697,10 @@ class _ReplayComposition:
                             or historical_result["effective_at"] != key[0]):
                         raise _ScheduleError("INVALID_SCHEMA")
                     result["historical_result"] = deepcopy(historical_result)
+                else:
+                    snapshot = item["snapshot"]
+                    self._policy.apply_market(snapshot.policy_markets())
+                    result["market_snapshot"] = snapshot.detached()
                 record["result"] = deepcopy(result)
             self._current_time = until
             return dict(kind="DISPATCH", stable_id=None, classification="SUCCESS")
