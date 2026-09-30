@@ -628,13 +628,38 @@ def test_historical_filled_market_append_failure_keeps_native_mutation_and_unper
     assert result == dict(run_id=value.run_id, outcome="FAILED", reason="PERSISTENCE_FAILED")
     assert len(failed_rows) == 1
     row = failed_rows[0]
-    assert any(product["fills"] for product in row["payload"]["result"]["products"])
-    assert row["payload"]["owner_inspection_after"]["account_version"] > row["payload"]["owner_inspection_before"]["account_version"]
-    assert mutated_owners and mutated_owners[-1][0].inspect_state() == mutated_owners[-1][1]
+    result = row["payload"]["result"]
+    fills = [fill for product in result["products"] for fill in product["fills"]]
     directory = tmp_path / value.run_id
-    status = read(tmp_path, value.run_id, "status.json")[0]
     journal = read(tmp_path, value.run_id, "journal.jsonl")
+    source_order = next(
+        order
+        for entry in journal
+        if entry["record_kind"] == "SOURCE_GROUP_RESULT"
+        for member in entry["payload"]["request"]["members"]
+        if member["kind"] == "INTENT"
+        and member["payload"]["client_order_id"] == "H03-ORDER-1"
+        for order in entry["payload"]["owner_evidence_after"]["open_orders_fact"][
+            "immutable_payload"
+        ]["rows"]
+        if order["client_order_id"] == "H03-ORDER-1"
+    )
+    assert [
+        (result["raw_time_ms"], fill["order_id"], Decimal(fill["quantity_contracts"]), Decimal(fill["price"]))
+        for fill in fills
+    ] == [(value.range_start_ms + 100_000, source_order["order_id"], Decimal("1"), Decimal("95"))]
+    assert source_order["client_order_id"] == "H03-ORDER-1"
+    assert row["payload"]["working_orders_snapshot"][0]["order_id"] == source_order["order_id"]
+    assert row["payload"]["owner_inspection_after"]["account_version"] > row["payload"]["owner_inspection_before"]["account_version"]
+    assert (
+        Decimal(row["payload"]["owner_inspection_after"]["cash"]),
+        Decimal(row["payload"]["owner_inspection_after"]["total_fees"]),
+        Decimal(row["payload"]["owner_inspection_after"]["gross_realized"]),
+    ) == (Decimal("999.905"), Decimal("0.095"), Decimal("0"))
+    assert mutated_owners and mutated_owners[-1][0].inspect_state() == mutated_owners[-1][1]
+    status = read(tmp_path, value.run_id, "status.json")[0]
     assert status["state"] == "FAILED" and status["failure_reason"] == "PERSISTENCE_FAILED"
+    assert status["primary_failure"] == dict(kind="PERSISTENCE", reason="ARTIFACT_WRITE_FAILED")
     assert status["processed_boundary"]["barrier_id"] == row["barrier_id"]
     assert status["processed_boundary"]["ordinal"] == len(journal) + 1
     assert (status["persisted_boundary"]["ordinal"] if status["persisted_boundary"] else 0) == len(journal)
@@ -666,8 +691,9 @@ def test_historical_completed_bundle_rejects_one_byte_truncated_endpoint(tmp_pat
     original = endpoint.read_bytes()
     endpoint.write_bytes(original[:-1])
     rejected = admit_spider_run(tmp_path / value.run_id)
-    assert rejected["decision"] == "REJECT"
-    assert rejected["reason"] in ("ARTIFACT_MISMATCH", "UNSUPPORTED_SCHEMA", "INVALID_MANIFEST")
+    assert rejected == dict(
+        decision="REJECT", reason="ARTIFACT_MISMATCH", evidence=("endpoint.json",),
+    )
 
 
 @pytest.mark.parametrize("selector", ["unknown", PLAN_IDS[2]])
