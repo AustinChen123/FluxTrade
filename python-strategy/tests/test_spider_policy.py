@@ -125,6 +125,38 @@ class Tests(unittest.TestCase):
         p.markets["C0"]["ctVal"] = "0.01"
         self.assertEqual(p.make_order("C0", "1", "buy", "", "1")["sz"], "100")
 
+    def test_h07_normalization_dedup_minimum_reset_and_new_tick(self):
+        p = fixture(n=1)
+        p.markets["C0"].update(price="100", increment=D("1"), lotSz=D("1"), minSz=D("1"))
+        long_1039 = p.make_order("C0", "H071", "buy", "103.9", "1")
+        long_1031 = p.make_order("C0", "H072", "buy", "103.1", "1")
+        self.assertEqual((long_1039["px"], long_1031["px"]), ("103", "103"))
+        p.transport("send", [long_1039, long_1031])
+        self.assertEqual([row["clOrdId"] for row in sent(p)], [long_1039["clOrdId"]])
+
+        p.events.clear()
+        p.rows[0].update({"歩差": "1", "單數": "1"})
+        p.capital.update(total="75", usdt="75", avail="75")
+        before_capital = p.capital.copy()
+        raw_orders = []
+        make_order = p.make_order
+
+        def capture_raw_order(name, suffix, side, price, quantity):
+            raw_orders.append((side, D(quantity)))
+            return make_order(name, suffix, side, price, quantity)
+
+        p.make_order = capture_raw_order
+        p.start_strategy("C0")
+        self.assertIn(("buy", D("0.5")), raw_orders)
+        self.assertNotEqual(p.rows[0]["歩差"], D("1"))
+        self.assertEqual(p.make_order("C0", "H073", "buy", "", "0.5")["sz"], "0")
+        self.assertIn(dict(at_ms=p.now_ms, kind="alert", reason="reset_step", name="C0"), p.events)
+        self.assertFalse(sent(p))
+        self.assertEqual(p.capital, before_capital)
+
+        p.markets["C0"]["increment"] = D("5")
+        self.assertEqual(p.make_order("C0", "H074", "buy", "103", "1")["px"], "100")
+
     def test_raise_zero_cap_inactive(self):
         p = fixture()
         p.rows[0]["leverage"] = "30"

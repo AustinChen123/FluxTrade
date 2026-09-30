@@ -155,7 +155,14 @@ impl ScenarioAccount {
                     cancel_request(e, &f.request);
                     e.hash(f.action_id);
                 }
-                cancel::State::MigrationEffective(id) if self.profile == ProfileContext::P1O03 => {
+                cancel::State::MigrationEffective(id)
+                    if self.profile == ProfileContext::P1O03
+                        || matches!(
+                            &self.profile,
+                            ProfileContext::BtcEthScenario { scenario, .. }
+                                if scenario.configured.is_some()
+                        ) =>
+                {
                     e.text("MIGRATION_EFFECTIVE");
                     e.hash(*id);
                 }

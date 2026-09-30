@@ -6,6 +6,7 @@ from decimal import Decimal as D
 from hashlib import sha256
 import json
 
+from src.core.backtest import synthetic_scenario_codec as wire
 from src.core.backtest.spider_historical_input import validate_historical_input
 from src.core.backtest.spider_run_artifacts import canonical_bytes
 from src.core.backtest.synthetic_scenario_replay import _ReplayComposition
@@ -440,6 +441,54 @@ def _snapshot(composition, kind, snapshot_id, captured_at):
         )
     )
     return fact["immutable_payload"]
+
+
+def _h07_configuration():
+    boundary = (EPOCH + 60_000) * 16
+    configuration = _p2_configuration()
+    configuration.update(config_id="P3_ORACLE_CONFIG_H07_V1", seed_effective_at=(EPOCH - 1) * 16,
+                         cash="1000", leverage="10")
+    configuration["orders"] = [dict(
+        intent_id="H07-INTENT-1", order_id="H07-ORDER-1", client_order_id="H07-CLIENT-1",
+        strategy_id="H07", product_id="A-USDT-SWAP", side="LONG", limit_price="103",
+        reduce_only=False, original_quantity_contracts="1", filled_quantity_contracts="0",
+        canceled_quantity_contracts="0", remaining_quantity_contracts="1", status="OPEN",
+    )]
+    for index, product in enumerate(configuration["products"]):
+        product["taker_fee_rate"] = "0.001"
+        product["liquidation_fee_rate"] = "0.00602"
+        spec = product["specs"][0]
+        spec.update(version="H07-SPEC-V1", valid_from=0, valid_to=None,
+                    contract_value="1", multiplier="1", price_tick="1",
+                    quantity_step="1", minimum_quantity="1")
+        if index == 0:
+            next_spec = {**spec, "version": "H07-SPEC-V2", "valid_from": boundary,
+                         "valid_to": None, "price_tick": "5"}
+            spec["valid_to"] = boundary
+            product["specs"].append(next_spec)
+        product["tiers"][0].update(valid_from=0, valid_to=None)
+        product["tiers"][0]["rows"][0].update(
+            maximum_contracts="1000", mmr="0.005", imr="0.1", max_leverage="10",
+        )
+        product["marks"] = [dict(valid_from=0, valid_to=2**63 - 1, mark="100")]
+    return configuration
+
+
+def _h07_node(codec, bar_open_ms, step_index, price):
+    bars = []
+    for index, product_id in enumerate(("A-USDT-SWAP", "B-USDT-SWAP")):
+        value = D(price if index == 0 else "100")
+        source_hash = sha256(f"H07:{product_id}:{bar_open_ms}:{step_index}".encode()).hexdigest()
+        ohlc = dict(open=value, high=value, low=value, close=value,
+                    confirmed=True, source_row_hash=source_hash)
+        bars.append(dict(product_id=product_id,
+                         trade={**ohlc, "volume_contracts": D("4")}, mark=dict(ohlc)))
+    return codec.historical_market_step(dict(
+        schema_version="historical_node_v1", model_id="OHLC4_OPEN_HIGH_LOW_CLOSE_V1",
+        model_version="1", run_contract_hash="a" * 64, bar_open_ms=bar_open_ms,
+        bar_duration_ms=60_000, step_index=step_index, market_slippage_bps=D("0"),
+        bars=bars, working_orders=codec.historical_working_orders(),
+    ))
 
 
 def _duplicate_execution_occurrence(composition, original_record):
@@ -1259,3 +1308,104 @@ def test_frozen_h09_named_ohlc_paths_preserve_execution_order_and_reports():
     assert reports[model_cases[0][0]]["cash"] == reports[model_cases[1][0]]["cash"]
     assert any("each_endpointE+60000,cash1009.8,flat,gross10,fees0.2,mark105,equity1009.8" in value for value in answer.values())
     assert any("both_journals_required" in value for value in answer.values())
+
+
+def test_h07_native_spec_migration_precedes_boundary_bar_and_rejects_raw_intent():
+    source = _record(INPUTS, INPUTS_SHA256, "H07")
+    answer = _record(ANSWERS, ANSWERS_SHA256, "H07")
+    config_identity = (
+        "P3_ORACLE_CONFIG_H07_V1|products=A-USDT-SWAP,B-USDT-SWAP|instIdCode=1,2|"
+        "ctVal=1,1|multiplier=1,1|tick=1->5,1|qstep=1,1|min=1,1|leverage=10|"
+        "fee=0.001|liqfee=0.00602|tier=0:1000:0.005:0.1:10|funding=DISABLED"
+    )
+    assert source["config"].endswith(sha256(config_identity.encode()).hexdigest())
+    assert source["pre_spec"] == "tick1,qstep1,min1"
+    assert source["activation"] == "E+60000"
+    assert source["post_spec"] == "tick5,qstep1,min1"
+    assert "no_retroactive_fill" in answer["preexisting103"]
+
+    account = dict(venue="okx-scenario", environment="test", account="H07")
+    codec = wire.ScenarioCodec(
+        "SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1", account, _h07_configuration()
+    )
+
+    def intent_group(identity, at, price):
+        return dict(
+            schema_version="scenario_group_v1", group_id=identity, account_key=account,
+            ordering_contract_id="S_order_v1", group_effective_at=at, declared_member_count=1,
+            members=[dict(
+                kind="INTENT",
+                stamp=dict(event_id=identity, effective_at=at, causal_parent_ids=[],
+                           ordering_contract_id="S_order_v1", scenario_ordinal=60),
+                payload=dict(intent_id=identity, client_order_id=identity, config_id="P3_ORACLE_CONFIG_H07_V1",
+                             product_id="A-USDT-SWAP", strategy_id="H07", side="LONG",
+                             order_type="LIMIT", quantity_contracts=D("1"), limit_price=D(price),
+                             reduce_only=False, requested_at=at),
+            )],
+        )
+
+    assert [(order["side"], order["limit_price"], order["accepted_at"])
+            for order in codec.historical_working_orders()] == [
+        ("LONG", D("103"), (EPOCH - 1) * 16),
+    ]
+    for step_index, (offset, phase) in enumerate(((0, 7), (20_000, 8), (40_000, 8))):
+        result = _h07_node(codec, EPOCH, step_index, "105")
+        assert (result["raw_time_ms"], result["effective_at"]) == (
+            EPOCH + offset, (EPOCH + offset) * 16 + phase,
+        )
+        assert all(not product["fills"] for product in result["products"])
+        assert result["owner_evidence"]["account_version"] == step_index + 1
+        assert [(order["order_id"], order["limit_price"])
+                for order in codec.historical_working_orders()] == [("H07-ORDER-1", D("103"))]
+
+    close = _h07_node(codec, EPOCH, 3, "105")
+    boundary = EPOCH + 60_000
+    assert (close["raw_time_ms"], close["effective_at"]) == (boundary, boundary * 16 + 4)
+    assert all(not product["fills"] for product in close["products"])
+    # One spec migration at phase 0, then the mark context at the phase-4 close.
+    assert close["owner_evidence"]["account_version"] == 5
+    assert codec.historical_working_orders() == []
+
+    opening = _h07_node(codec, boundary, 0, "110")
+    assert (opening["raw_time_ms"], opening["effective_at"]) == (boundary, boundary * 16 + 7)
+    assert all(not product["fills"] for product in opening["products"])
+    assert opening["owner_evidence"]["account_version"] == 6
+    for step_index in range(1, 4):
+        result = _h07_node(codec, EPOCH + 60_000, step_index, "110")
+        assert all(not product["fills"] for product in result["products"])
+    final = codec.inspect_state()
+    assert (final["cash"], final["gross_realized"], final["total_fees"]) == (
+        D("1000"), D("0"), D("0"),
+    )
+    assert codec.historical_working_orders() == []
+    trading = codec.capture_snapshot(dict(
+        schema_version="snapshot_request_v1", account_key=account,
+        snapshot_id="H07-TRADING-END", snapshot_kind="TRADING",
+        capture_mode="OWNER_CURRENT", captured_at=(EPOCH + 120_000) * 16 + 6,
+    ))["immutable_payload"]
+    assert (trading["equity"], trading["available_equity"]) == (D("1000"), D("1000"))
+
+    rejected_codec = wire.ScenarioCodec(
+        "SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1", account, _h07_configuration()
+    )
+    for step_index in range(3):
+        _h07_node(rejected_codec, EPOCH, step_index, "105")
+    _h07_node(rejected_codec, EPOCH, 3, "105")
+    before_rejection = rejected_codec.inspect_state()
+    rejected = rejected_codec.apply_group(
+        intent_group("H07-RAW-103", (EPOCH + 60_000) * 16 + 6, "103")
+    )
+    assert (rejected["classification"], rejected["failure"], rejected["gate_after"]) == (
+        "FAULT", "INVALID_BTC_INTENT", "FAILED",
+    )
+    after_rejection = rejected_codec.inspect_state()
+    assert (after_rejection["cash"], after_rejection["gross_realized"],
+            after_rejection["total_fees"], after_rejection["account_version"],
+            after_rejection["orders_digest"], after_rejection["positions_digest"],
+            after_rejection["reservations_digest"]) == (
+        before_rejection["cash"], before_rejection["gross_realized"],
+        before_rejection["total_fees"], before_rejection["account_version"],
+        before_rejection["orders_digest"], before_rejection["positions_digest"],
+        before_rejection["reservations_digest"],
+    )
+    assert rejected_codec.historical_working_orders() == []

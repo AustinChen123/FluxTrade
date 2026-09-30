@@ -3,7 +3,7 @@ use super::*;
 use execution::commit::tests::{at, input};
 
 #[test]
-fn o03_migration_inspection_is_profile_closed_and_binds_action_hash() {
+fn migration_inspection_is_limited_to_p1o03_and_configured_profiles() {
     let mut owner =
         super::super::wire::profiles::construct("SYNTHETIC_P1_O03_V1", fixture().0.key, None)
             .unwrap();
@@ -31,6 +31,48 @@ fn o03_migration_inspection_is_profile_closed_and_binds_action_hash() {
             ScenarioAccount::encode_orders
         ),
         Err("NATIVE_INVARIANT")
+    );
+}
+
+#[test]
+fn configured_btc_eth_migration_inspection_binds_action_hash() {
+    let (mut seed, products) = super::super::configured_tests::input(2);
+    let product = products[0].product.clone();
+    let prototype = fixture().0.orders[0].clone();
+    seed.orders.push(SeedOrder {
+        order_id: "H07-MIGRATION".into(),
+        intent_id: "H07-INTENT".into(),
+        client_id: "H07-CLIENT".into(),
+        product: ProfileProduct::BtcEth(product),
+        side: Side::Long,
+        price: d("103"),
+        reduce_only: false,
+        original: d("1"),
+        filled: Decimal::ZERO,
+        canceled: Decimal::ZERO,
+        remaining: d("1"),
+        status: "OPEN".into(),
+        ..prototype
+    });
+    let mut owner = ScenarioAccount::from_configured(&seed, d("10"), products).unwrap();
+    owner.orders.get_mut("H07-MIGRATION").unwrap().cancel =
+        cancel::State::MigrationEffective([1; 32]);
+    let first = owner
+        .component(
+            "SCENARIO_ORDERS_EVIDENCE_V1",
+            ScenarioAccount::encode_orders,
+        )
+        .unwrap();
+    owner.orders.get_mut("H07-MIGRATION").unwrap().cancel =
+        cancel::State::MigrationEffective([2; 32]);
+    assert_ne!(
+        first,
+        owner
+            .component(
+                "SCENARIO_ORDERS_EVIDENCE_V1",
+                ScenarioAccount::encode_orders
+            )
+            .unwrap()
     );
 }
 fn owners() -> Vec<ScenarioAccount> {

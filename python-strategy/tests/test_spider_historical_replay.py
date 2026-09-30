@@ -12,7 +12,7 @@ import pytest
 from src.core.backtest import synthetic_scenario_codec as wire
 from src.core.backtest.spider_run_admission import admit_spider_run
 from src.core.backtest.spider_historical_input import (
-    HistoricalInputError, HistoricalRunInput, decode_p2_configuration,
+    HistoricalInputError, HistoricalRunInput, admit_before_construction, decode_p2_configuration,
     encode_historical_run_input, historical_context_for_input,
     historical_planned_coverage, validate_historical_input,
 )
@@ -509,6 +509,48 @@ def test_configured_spec_exact_run_end_boundary_is_valid_and_uses_run_cache(monk
     for market in composition._policy.markets.values():
         assert (market["ctVal"], market["lotSz"], market["minSz"], market["increment"]) == (
             D("1"), D("0.001"), D("0.001"), D("0.01"))
+
+
+def test_h07_real_spec_crossing_remains_scenario_only_before_owner_or_store():
+    raw_inputs = INPUTS.read_bytes()
+    assert sha256(raw_inputs).hexdigest() == INPUTS_SHA256
+    h07 = next(line for line in raw_inputs.decode().splitlines() if line.startswith("H07|"))
+    fields = dict(part.split("=", 1) for part in h07.split("|")[1:] if "=" in part)
+    assert fields["config"].endswith("0915384c69cc5d2e2b16c59a024a436c19d79302c02b634f2894184a5786bc78")
+    assert fields["scenario_only"] == "true"
+
+    run = _extend_one_minute(_valid_run())
+    start, boundary, end = run.range_start_ms, run.range_start_ms + 60_000, run.range_end_ms
+    configuration = _p2_configuration()
+    for index, product in enumerate(configuration["products"]):
+        spec = product["specs"][0]
+        spec.update(version="H07-SPEC-V1", valid_from=0, valid_to=None,
+                    contract_value="1", multiplier="1", price_tick="1",
+                    quantity_step="1", minimum_quantity="1")
+        if index == 0:
+            spec["valid_to"] = boundary
+            product["specs"].append({**spec, "version": "H07-SPEC-V2", "valid_from": boundary,
+                                     "valid_to": None, "price_tick": "5"})
+        product["marks"][0]["valid_to"] = end
+    run = _run_with_configuration(run, configuration)
+    run = replace(
+        run,
+        spec_before=tuple(replace(spec, effective_at_ms=start, price_tick=D("1"),
+                                  quantity_step=D("1"), minimum_quantity=D("1"))
+                          for spec in run.spec_before),
+        spec_after=tuple(replace(spec, effective_at_ms=end,
+                                 price_tick=D("5") if spec.product_id == "A-USDT-SWAP" else D("1"),
+                                 quantity_step=D("1"), minimum_quantity=D("1"))
+                         for spec in run.spec_after),
+    )
+
+    calls = []
+    with pytest.raises(HistoricalInputError, match="spec/tier changed across run"):
+        admit_before_construction(
+            run, lambda digest: calls.append(("owner", digest)),
+            lambda digest: calls.append(("store", digest)),
+        )
+    assert calls == []
 
 
 def test_market_cache_uses_exact_1440_closed_bars_and_ignores_future_until_its_close():
