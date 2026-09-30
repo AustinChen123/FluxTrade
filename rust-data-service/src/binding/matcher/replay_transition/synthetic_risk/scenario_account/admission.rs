@@ -218,6 +218,99 @@ struct Reply {
 }
 
 impl ScenarioAccount {
+    /// Projects only owner-held working orders and proves historical admission identity.
+    pub(super) fn historical_working_orders(
+        &self,
+    ) -> Result<Vec<super::historical::WorkingOrderMeta>, Fault> {
+        const HISTORICAL: &str = "HISTORICAL_ORDER_V1";
+        if !matches!(self.profile, ProfileContext::BtcEthScenario { ref scenario, .. } if scenario.configured.is_some())
+            || !self.seed_orders.is_empty()
+            || !self.seed_intents.is_empty()
+        {
+            return Err("INVALID_HISTORICAL_ORDER_SNAPSHOT");
+        }
+        let mut projection = Vec::new();
+        for (order_id, order) in &self.orders {
+            if !order
+                .facts
+                .projects_remainder("INVALID_HISTORICAL_ORDER_SNAPSHOT")?
+                || matches!(
+                    order.cancel,
+                    risk_transition::cancel::State::EffectiveCanceled(_)
+                )
+            {
+                continue;
+            }
+            let facts = &order.facts;
+            let admission = self
+                .intent_results
+                .get(&facts.intent_id)
+                .ok_or("INVALID_HISTORICAL_ORDER_SNAPSHOT")?;
+            let accepted = admission
+                .accepted_order
+                .as_ref()
+                .ok_or("INVALID_HISTORICAL_ORDER_SNAPSHOT")?;
+            if admission.outcome != Outcome::Accepted
+                || admission.order_id.as_deref() != Some(order_id.as_str())
+                || accepted.intent_id != facts.intent_id
+                || accepted.order_id != facts.order_id
+                || accepted.client_id != facts.client_id
+                || accepted.product != facts.product
+                || accepted.side != facts.side
+                || accepted.price != facts.price
+                || accepted.original != facts.original
+            {
+                return Err("INVALID_HISTORICAL_ORDER_SNAPSHOT");
+            }
+            let event_id = &admission.created_at_event_id;
+            let (stamp, _) = self
+                .transition
+                .events
+                .get(event_id)
+                .ok_or("INVALID_HISTORICAL_ORDER_SNAPSHOT")?;
+            if stamp.event_id != *event_id
+                || stamp.ordering_contract_id != HISTORICAL
+                || self.transition.event_kinds.get(event_id) != Some(&source::Kind::Intent)
+                || stamp.source_sequence.is_none()
+                || stamp.effective_at != order.created_at
+            {
+                return Err("INVALID_HISTORICAL_ORDER_SNAPSHOT");
+            }
+            projection.push(super::historical::WorkingOrderMeta {
+                order_id: order_id.clone(),
+                product: facts.product.btc()?.clone(),
+                order_version: order.version,
+                status: facts.status.clone(),
+                remaining: facts.remaining,
+                accepted_at: order.created_at,
+                accepted_source_sequence: stamp
+                    .source_sequence
+                    .ok_or("INVALID_HISTORICAL_ORDER_SNAPSHOT")?,
+                kind: super::historical::OrderKind::Limit,
+                side: facts.side,
+                limit_price: Some(facts.price),
+                risk_cancel_pending: matches!(
+                    order.cancel,
+                    risk_transition::cancel::State::Requested(ref request)
+                        if matches!(request.reason, risk_transition::cancel::Reason::RiskShortfall | risk_transition::cancel::Reason::MmrBreach)
+                ),
+            });
+        }
+        projection.sort_by(|left, right| {
+            (
+                left.accepted_at,
+                left.accepted_source_sequence,
+                &left.order_id,
+            )
+                .cmp(&(
+                    right.accepted_at,
+                    right.accepted_source_sequence,
+                    &right.order_id,
+                ))
+        });
+        Ok(projection)
+    }
+
     pub(super) fn encode_inspection_intents(
         &self,
         e: &mut risk_transition::cancel::identity::Encoding,

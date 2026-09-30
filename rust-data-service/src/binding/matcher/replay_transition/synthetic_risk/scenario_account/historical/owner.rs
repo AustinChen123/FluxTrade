@@ -1,6 +1,53 @@
 use super::*;
 
 impl ScenarioAccount {
+    fn activate_historical_spec_boundary(&mut self, raw_time_ms: i64) -> Result<(), Fault> {
+        let effective_at = effective_time(raw_time_ms, 0)?;
+        let previous_at = self.transition.context_at.unwrap_or(self.seed_effective_at);
+        let (scenario, marks) = self.btc_context()?;
+        if scenario.configured.is_none() {
+            return Ok(());
+        }
+        let mut changes = Vec::new();
+        for product in scenario.products() {
+            let (old_spec, old_tier) = scenario.resolve(&product, previous_at)?;
+            let (spec, tier) = scenario.resolve(&product, effective_at)?;
+            if spec.interval.from != effective_at || old_spec == spec {
+                continue;
+            }
+            // P3C5B admits the normal spec boundary only; tier activation is a
+            // separate context transition and remains outside this slice.
+            if old_tier != tier {
+                return Err("UNSUPPORTED_CONTEXT_TRANSITION");
+            }
+            changes.push((
+                product,
+                old_spec.version.clone(),
+                spec.version.clone(),
+                effective_at,
+            ));
+        }
+        if changes.is_empty() {
+            return Ok(());
+        }
+        let after = owner_context_id(
+            scenario,
+            marks,
+            effective_at,
+            self.seed_effective_at,
+            &self.config_id,
+        )?;
+        let event_id = format!("P3-SPEC-ACTIVATION-{raw_time_ms}");
+        self.activate_context(&context::Input {
+            account_key: self.key.clone(),
+            stamp: source::stamp(&event_id, effective_at, 10),
+            expected_before: self.valuation_context_id,
+            expected_after: after,
+            rows: context::Rows::Specs(changes),
+        })?;
+        Ok(())
+    }
+
     /// Advances one admitted product-local OHLC4 segment through the existing owner.
     /// The metadata is only a matching snapshot; settlement and immediate risk remain
     /// exclusively in `execute_stamped`.
@@ -12,8 +59,10 @@ impl ScenarioAccount {
         if input.step_index > 3 || input.market_slippage_bps < Decimal::ZERO {
             return Err("INVALID_HISTORICAL_INPUT");
         }
-        let (scenario, _) = self.btc_context()?;
-        let products = scenario.products();
+        let products = {
+            let (scenario, _) = self.btc_context()?;
+            scenario.products()
+        };
         if input.bars.len() != products.len() {
             return Err("INVALID_HISTORICAL_INPUT");
         }
@@ -69,7 +118,19 @@ impl ScenarioAccount {
                 });
             }
         }
+        let segment_boundary = segment_start(
+            input
+                .bars
+                .first()
+                .ok_or("INVALID_HISTORICAL_INPUT")?
+                .bar_open_ms,
+            input.step_index,
+        )?;
         for (id, order) in &self.orders {
+            let eligible_at_start = match segment_boundary {
+                Some(boundary) => order.created_at <= boundary,
+                None => order.created_at < at,
+            };
             if order
                 .facts
                 .projects_remainder("INVALID_HISTORICAL_ORDER_SNAPSHOT")?
@@ -77,11 +138,19 @@ impl ScenarioAccount {
                     order.cancel,
                     risk_transition::cancel::State::EffectiveCanceled(_)
                 )
+                && eligible_at_start
                 && !seen.contains(id.as_str())
             {
                 return Err("INVALID_HISTORICAL_ORDER_SNAPSHOT");
             }
         }
+        let mut draft = self.clone();
+        // VERSION_ACTIVATION is phase 0; step 3 closes this raw boundary at
+        // phase 4. Apply only the configured spec transition due at this time.
+        if input.step_index == 3 {
+            draft.activate_historical_spec_boundary(raw_time_ms)?;
+        }
+        let (scenario, _) = draft.btc_context()?;
         let mut steps = Vec::with_capacity(products.len());
         for (ordinal, (bar, product)) in input.bars.iter().zip(&products).enumerate() {
             let (spec, _) = scenario.resolve(product, at)?;
@@ -95,14 +164,16 @@ impl ScenarioAccount {
                 input.step_index,
             )?);
         }
-        let old_at = self.transition.context_at.unwrap_or(self.seed_effective_at);
+        let old_at = draft
+            .transition
+            .context_at
+            .unwrap_or(draft.seed_effective_at);
         if at < old_at {
             return Err("UNSUPPORTED_CONTEXT_TRANSITION");
         }
 
         // Stage marks and context on a private owner draft. A failed admission never
         // publishes partial source or account state.
-        let mut draft = self.clone();
         let (_, current_marks) = draft.btc_context()?;
         if at == old_at
             && steps.iter().any(|step| {

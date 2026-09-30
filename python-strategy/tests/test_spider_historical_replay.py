@@ -221,7 +221,7 @@ def test_configured_spec_coherent_baseline_is_accepted():
     assert composition._policy.markets["A-USDT-SWAP"]["lotSz"] == "0.001"
 
 
-def test_configured_spec_exact_run_end_boundary_is_valid_and_drives_cache(monkeypatch):
+def test_configured_spec_exact_run_end_boundary_is_valid_and_uses_run_cache(monkeypatch):
     run = _valid_run()
     configuration = _p2_configuration()
     for product in configuration["products"]:
@@ -231,6 +231,9 @@ def test_configured_spec_exact_run_end_boundary_is_valid_and_drives_cache(monkey
                                  "valid_to": None})
         product["marks"][0]["valid_to"] = 200_000_000
     run = _run_with_configuration(run, configuration)
+    # Historical timers now perform real Policy polling; keep this cache test
+    # isolated from intentional grid-order acceptance.
+    run = replace(run, initial_policy_cache=_policy_cache(running=False))
     owner_calls = []
     original_native = wire._native._SyntheticScenarioReplaySession
 
@@ -241,8 +244,9 @@ def test_configured_spec_exact_run_end_boundary_is_valid_and_drives_cache(monkey
     monkeypatch.setattr(wire._native, "_SyntheticScenarioReplaySession", count_owner)
     composition = _composition(run)
     assert len(owner_calls) == 1
-    close_ms = run.range_start_ms + run.bar_duration_ms
-    assert composition._dispatch_due(close_ms * 16 + 6)["classification"] == "SUCCESS"
+    assert composition._dispatch_due(run.range_end_ms * 16 + 6)["classification"] == "SUCCESS"
+    final_close = composition._records[(3, f"P3_MARKET_{run.range_start_ms}_3")]
+    assert final_close["result"]["classification"] == "SUCCESS"
     for market in composition._policy.markets.values():
         assert (market["ctVal"], market["lotSz"], market["minSz"], market["increment"]) == (
             D("1"), D("0.001"), D("0.001"), D("0.01"))
@@ -318,8 +322,8 @@ def test_step3_cache_and_next_open_dispatch_in_frozen_phase_order(monkeypatch):
     for product in config["products"]:
         product["marks"][0]["valid_to"] = 200_000_000
     run = _run_with_configuration(run, config)
+    run = replace(run, initial_policy_cache=_policy_cache(running=False))
     composition = _composition(run)
-    composition._policy.running = False
     calls = []
     original_step = wire.ScenarioCodec.historical_market_step
     original_market = composition._policy.apply_market
@@ -335,13 +339,9 @@ def test_step3_cache_and_next_open_dispatch_in_frozen_phase_order(monkeypatch):
     monkeypatch.setattr(wire.ScenarioCodec, "historical_market_step", tracked_step)
     monkeypatch.setattr(composition._policy, "apply_market", tracked_market)
     close_ms = run.range_start_ms + 60_000
-    first_step = {"kind": "HISTORICAL_MARKET_STEP", "schedule_sequence": 0, "stable_id": "CLOSE", "node": _node(run, run.range_start_ms, 3)}
-    next_open = {"kind": "HISTORICAL_MARKET_STEP", "schedule_sequence": 1, "stable_id": "OPEN", "node": _node(run, close_ms, 0)}
-    assert composition._enqueue(first_step)["classification"] == "PENDING"
-    assert composition._enqueue(next_open)["classification"] == "PENDING"
     assert composition._dispatch_due(close_ms * 16 + 7)["classification"] == "SUCCESS"
-    assert [entry[0] for entry in calls] == ["STEP", "CACHE", "STEP"]
-    assert calls[0] == ("STEP", 3) and calls[2] == ("STEP", 0)
+    assert [entry[0] for entry in calls] == ["STEP", "STEP", "STEP", "STEP", "CACHE", "STEP"]
+    assert [entry[1] for entry in calls if entry[0] == "STEP"] == [0, 1, 2, 3, 0]
     assert composition._policy.events
     assert all(run.range_start_ms < event["at_ms"] < close_ms
                and (event["at_ms"] - run.range_start_ms) % 5_000 == 0
@@ -460,6 +460,136 @@ def test_historical_poll_sends_become_native_groups_only_after_acceptance_tick()
     assert all(action["status"] == "SUBMITTED" for action in actions if action["group_id"] is not None)
     assert composition._codec.inspect_state()["orders_digest"] != orders_before_accept
     assert all(record["key"][3] in {action["group_id"] for action in actions} for record in groups)
+
+
+def test_historical_chain_uses_frozen_owner_orders_and_commits_one_partial_fill():
+    run = _valid_run()
+    trade_rows = tuple(
+        replace(row, high=D("103"), low=D("98"), volume=D("0.1"))
+        if row.product_id == "A-USDT-SWAP" and row.bar_open_ms == run.range_start_ms else row
+        for row in run.trade_bars
+    )
+    run = _rehashed_run(run, trade_rows=trade_rows)
+    composition = _composition(run)
+    composition._policy.rows[1]["active"] = "false"
+    start = run.range_start_ms
+
+    steps = [record for record in composition._records.values()
+             if record["item"]["kind"] == "HISTORICAL_MARKET_STEP"]
+    assert len(steps) == 1
+    first_key = start * 16 + 7
+    assert steps[0]["key"][0] == first_key
+    assert composition._dispatch_due(first_key)["classification"] == "SUCCESS"
+    first_result = steps[0]["result"]["historical_result"]
+    assert all(not product["fills"] for product in first_result["products"])
+    assert steps[0]["result"]["working_orders_snapshot"] == []
+
+    parent_visible = (start + 5_020) * 16 + 6
+    assert composition._dispatch_due(parent_visible)["classification"] == "SUCCESS"
+    historical_groups = [record for record in composition._records.values()
+                         if record["item"]["kind"] == "SOURCE_GROUP"
+                         and record["item"]["group"].get("ordering_contract_id") == "HISTORICAL_ORDER_V1"]
+    assert len(historical_groups) == 4
+    assert all(record["result"]["classification"] == "PENDING" for record in historical_groups)
+    assert composition._dispatch_due(historical_groups[0]["key"][0]) ["classification"] == "SUCCESS"
+    assert all(record["result"]["group_result"]["classification"] == "COMMITTED"
+               for record in historical_groups)
+
+    step1_key = (start + 20_000) * 16 + 8
+    step1 = next(record for record in composition._records.values()
+                 if record["item"]["kind"] == "HISTORICAL_MARKET_STEP"
+                 and record["item"]["node"]["step_index"] == 1)
+    assert step1["key"][0] == step1_key
+    assert step1["item"]["node"]["working_orders"] == []
+    orders_before_step1 = composition._codec.inspect_state()["orders_digest"]
+    step1_dispatch = composition._dispatch_due(step1_key)
+    assert step1_dispatch["classification"] == "SUCCESS", step1_dispatch
+    step1_result = step1["result"]["historical_result"]
+    assert all(not product["fills"] for product in step1_result["products"])
+    assert step1["result"]["working_orders_snapshot"] == []
+    assert step1_result["owner_evidence"]["orders_digest"] == orders_before_step1
+
+    step2_key = (start + 40_000) * 16 + 8
+    step2 = next(record for record in composition._records.values()
+                 if record["item"]["kind"] == "HISTORICAL_MARKET_STEP"
+                 and record["item"]["node"]["step_index"] == 2)
+    frozen = step2["item"]["node"]["working_orders"]
+    assert len(frozen) == 4
+    assert [row["accepted_source_sequence"] for row in frozen] == [0, 1, 2, 3]
+    assert composition._dispatch_due(step2_key)["classification"] == "SUCCESS"
+    step2_result = step2["result"]["historical_result"]
+    fills = [fill for product in step2_result["products"] for fill in product["fills"]]
+    assert len(fills) == 1
+    fill = fills[0]
+    assert fill["quantity_contracts"] == D("0.025")
+    selected = next(row for row in frozen if row["order_id"] == fill["order_id"])
+    assert selected["side"] == "SHORT" and selected["limit_price"] == D("101")
+    assert fill["price"] == D("103")
+    assert len(fill["execution_id"]) == 64
+    owner_after = step2_result["owner_evidence"]
+    assert owner_after["account_version"] > first_result["owner_evidence"]["account_version"]
+    assert owner_after["orders_digest"] != first_result["owner_evidence"]["orders_digest"]
+    assert owner_after["total_fees"] > first_result["owner_evidence"]["total_fees"]
+    assert owner_after["cash"] < first_result["owner_evidence"]["cash"]
+    assert owner_after["positions_digest"] != first_result["owner_evidence"]["positions_digest"]
+
+    step3 = next(record for record in composition._records.values()
+                 if record["item"]["kind"] == "HISTORICAL_MARKET_STEP"
+                 and record["item"]["node"]["step_index"] == 3)
+    partial = next(row for row in step3["item"]["node"]["working_orders"]
+                   if row["order_id"] == fill["order_id"])
+    assert partial["order_version"] == 2
+    assert partial["status"] == "PARTIALLY_FILLED"
+    assert partial["remaining_quantity_contracts"] == frozen[
+        next(index for index, row in enumerate(frozen) if row["order_id"] == fill["order_id"])
+    ]["remaining_quantity_contracts"] - fill["quantity_contracts"]
+    positions = composition._codec.capture_snapshot(dict(
+        schema_version="snapshot_request_v1", account_key=composition._account,
+        snapshot_id="P3C5B_POSITIONS_AFTER_FILL", snapshot_kind="POSITIONS",
+        capture_mode="OWNER_CURRENT", captured_at=step2_key,
+    ))["immutable_payload"]["rows"]
+    a_position = next(row for row in positions if row["product_id"] == "A-USDT-SWAP")
+    assert a_position["position_contracts"] == -fill["quantity_contracts"]
+    step3_key = run.range_end_ms * 16 + 4
+    assert composition._dispatch_due(step3_key)["classification"] == "SUCCESS"
+    assert step3["result"]["classification"] == "SUCCESS"
+
+
+def test_historical_chain_runs_final_close_without_endpoint_next_open():
+    run = _valid_run()
+    composition = _composition(run)
+    end = run.range_end_ms
+    assert composition._dispatch_due(end * 16 + 6)["classification"] == "SUCCESS"
+    steps = [record for record in composition._records.values()
+             if record["item"]["kind"] == "HISTORICAL_MARKET_STEP"]
+    assert [(record["item"]["node"]["bar_open_ms"], record["item"]["node"]["step_index"])
+            for record in steps] == [(run.range_start_ms, 0), (run.range_start_ms, 1),
+                                     (run.range_start_ms, 2), (run.range_start_ms, 3)]
+    final = steps[-1]
+    assert final["key"][0] == end * 16 + 4
+    assert final["result"]["classification"] == "SUCCESS"
+    assert not any(record["item"]["node"]["bar_open_ms"] == end for record in steps)
+
+
+def test_private_future_bar_does_not_change_policy_prefix_before_its_close():
+    base = _extend_one_minute(_valid_run())
+    config = _p2_configuration()
+    for product in config["products"]:
+        product["marks"][0]["valid_to"] = 200_000_000
+    base = _run_with_configuration(base, config)
+    changed_rows = tuple(
+        replace(row, high=D("120"), low=D("80"), close=D("110"))
+        if row.product_id == "A-USDT-SWAP" and row.bar_open_ms == base.range_end_ms - 60_000 else row
+        for row in base.trade_bars
+    )
+    changed = _rehashed_run(base, trade_rows=changed_rows)
+    left, right = _composition(base), _composition(changed)
+    before_future_close = (base.range_end_ms - 60_000) * 16 + 9
+    assert left._dispatch_due(before_future_close)["classification"] == "SUCCESS"
+    assert right._dispatch_due(before_future_close)["classification"] == "SUCCESS"
+    assert left._policy.events == right._policy.events
+    assert left._policy.markets == right._policy.markets
+    assert all(event["at_ms"] < base.range_end_ms for event in left._policy.events)
 
 
 def test_historical_derived_ids_bind_contract_parent_and_ordinal_not_run_id():

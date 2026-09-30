@@ -328,6 +328,9 @@ class _ReplayComposition:
         self._historical_poll_issued_at: dict[str, int] = {}
         self._historical_order_contract: dict[str, Any] | None = None
         self._historical_order_sequence = 0
+        self._historical_run: object | None = None
+        self._historical_bars: dict[tuple[int, str], tuple[object, object]] = {}
+        self._historical_step_sequence = 0
 
     @classmethod
     def _from_historical_run(cls, run: object) -> "_ReplayComposition":
@@ -363,6 +366,12 @@ class _ReplayComposition:
             order_accept_delay_ms=historical_run.order_accept_delay_ms,
             range_end_ms=historical_run.range_end_ms,
         )
+        composition._historical_run = historical_run
+        marks = {(bar.bar_open_ms, bar.product_id): bar for bar in historical_run.mark_bars}
+        composition._historical_bars = {
+            (bar.bar_open_ms, bar.product_id): (bar, marks[(bar.bar_open_ms, bar.product_id)])
+            for bar in historical_run.trade_bars
+        }
         composition._current_time = historical_run.range_start_ms * 16
         for sequence, snapshot in enumerate(prepared.snapshots):
             result = composition._enqueue(_historical_market_item(snapshot, sequence))
@@ -374,7 +383,42 @@ class _ReplayComposition:
             result = composition._enqueue(item)
             if result["classification"] != "PENDING":
                 raise ValueError("INVALID_SCHEMA")
+        initial = composition._historical_node_item(
+            historical_run.range_start_ms, 0, 0, composition._codec.historical_working_orders()
+        )
+        result = composition._enqueue(initial)
+        if result["classification"] != "PENDING":
+            raise ValueError("INVALID_SCHEMA")
+        composition._historical_step_sequence = 1
         return composition
+
+    def _historical_node_item(
+        self, bar_open_ms: int, step_index: int, sequence: int, working_orders: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        from src.core.backtest.spider_historical_input import HistoricalRunInput
+
+        run = cast(HistoricalRunInput, self._historical_run)
+        bars = []
+        for product_id in run.ordered_products:
+            trade, mark = self._historical_bars[(bar_open_ms, product_id)]
+            bars.append(dict(
+                product_id=product_id,
+                trade=dict(open=trade.open, high=trade.high, low=trade.low, close=trade.close,
+                           volume_contracts=trade.volume, confirmed=True,
+                           source_row_hash=trade.source_row_hash),
+                mark=dict(open=mark.open, high=mark.high, low=mark.low, close=mark.close,
+                          confirmed=True, source_row_hash=mark.source_row_hash),
+            ))
+        return dict(
+            kind="HISTORICAL_MARKET_STEP",
+            schedule_sequence=sequence,
+            stable_id=f"P3_MARKET_{bar_open_ms}_{step_index}",
+            node=dict(schema_version="historical_node_v1", model_id=run.model_id, model_version="1",
+                      run_contract_hash=self._historical_order_contract["run_contract_hash"],
+                      bar_open_ms=bar_open_ms, bar_duration_ms=60_000, step_index=step_index,
+                      market_slippage_bps=run.market_slippage_bps, bars=bars,
+                      working_orders=deepcopy(working_orders)),
+        )
 
     def capture_owner_evidence(self, cutoff, trading_request, positions_request, open_orders_request):
         """Observe the owner and scheduler without dispatching or emitting a barrier."""
@@ -838,13 +882,33 @@ class _ReplayComposition:
                 elif kind == "DELIVERY":
                     result["events"] = self._deliver_queued(record)
                 elif kind == "HISTORICAL_MARKET_STEP":
-                    historical_result = self._codec.historical_market_step(item["node"])
+                    node = deepcopy(item["node"])
+                    working_orders = node["working_orders"] if self._historical_run is not None else None
+                    historical_result = self._codec.historical_market_step(node)
                     if (type(historical_result.get("raw_time_ms")) is not int
                             or historical_result["raw_time_ms"] != record["raw_time_ms"]
                             or type(historical_result.get("effective_at")) is not int
                             or historical_result["effective_at"] != key[0]):
                         raise _ScheduleError("INVALID_SCHEMA")
                     result["historical_result"] = deepcopy(historical_result)
+                    if working_orders is not None:
+                        result["working_orders_snapshot"] = deepcopy(working_orders)
+                        run = cast(Any, self._historical_run)
+                        open_ms, step = node["bar_open_ms"], node["step_index"]
+                        if step < 3:
+                            next_open, next_step = open_ms, step + 1
+                        else:
+                            next_open, next_step = open_ms + 60_000, 0
+                        if next_open < run.range_end_ms:
+                            next_working_orders = self._codec.historical_working_orders()
+                            following = self._historical_node_item(
+                                next_open, next_step, self._historical_step_sequence, next_working_orders
+                            )
+                            queued = self._enqueue(following)
+                            if queued["classification"] != "PENDING":
+                                record["result"] = deepcopy(self._terminal or queued)
+                                return deepcopy(record["result"])
+                            self._historical_step_sequence += 1
                 elif kind == "HISTORICAL_TIMER":
                     plan = self._historical_poll_plan(record["raw_time_ms"], key[2])
                     result = self._begin_poll(plan)

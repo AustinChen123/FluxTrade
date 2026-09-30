@@ -527,6 +527,9 @@ class ScenarioCodec:
     def historical_market_step(self, request: HistoricalNode) -> HistoricalNodeResult:
         return cast(HistoricalNodeResult, _decode(self._session.historical_market_step(_encode(request, preserve_null=True))))
 
+    def historical_working_orders(self) -> list[HistoricalWorkingOrder]:
+        return cast(list[HistoricalWorkingOrder], _decode(self._session._historical_working_orders()))
+
     def inspect_state(self) -> Inspection:
         return cast(Inspection, _decode(self._session.inspect_state()))
 

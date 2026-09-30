@@ -219,7 +219,60 @@ fn encode_result(
     .canonical()
 }
 
+fn encode_working_orders(
+    orders: &[super::super::historical::WorkingOrderMeta],
+) -> Result<String, Fault> {
+    let rows = orders
+        .iter()
+        .map(|order| {
+            Ok(wire::fields(vec![
+                ("order_id", wire::string(&order.order_id)),
+                ("product_id", wire::string(order.product.0.as_ref())),
+                ("order_version", wire::number(order.order_version)?),
+                ("status", wire::string(&order.status)),
+                (
+                    "remaining_quantity_contracts",
+                    wire::decimal(order.remaining),
+                ),
+                ("accepted_at", wire::number(order.accepted_at)?),
+                (
+                    "accepted_source_sequence",
+                    wire::number(order.accepted_source_sequence)?,
+                ),
+                ("order_kind", wire::string("LIMIT")),
+                (
+                    "side",
+                    wire::string(if order.side == Side::Long {
+                        "LONG"
+                    } else {
+                        "SHORT"
+                    }),
+                ),
+                (
+                    "limit_price",
+                    wire::decimal(order.limit_price.ok_or("NATIVE_INVARIANT")?),
+                ),
+                (
+                    "risk_cancel_pending",
+                    wire::Json::Bool(order.risk_cancel_pending),
+                ),
+            ]))
+        })
+        .collect::<Result<Vec<_>, Fault>>()?;
+    wire::Json::Array(rows).canonical()
+}
+
 impl Session {
+    pub(super) fn historical_working_orders(&mut self) -> Reply {
+        self.guarded(false, |session| {
+            let orders = session
+                .owner
+                .historical_working_orders()
+                .map_err(boundary)?;
+            encode_working_orders(&orders).map_err(|_| BoundaryError::Invariant)
+        })
+    }
+
     pub(super) fn historical_market_step(&mut self, request: &str) -> Reply {
         self.guarded(true, |session| {
             session.historical_market_step_inner(request)

@@ -213,6 +213,31 @@ def test_existing_p2_configuration_codec_and_identity_are_reused():
     assert decode_p2_configuration(configuration_bytes, P2_CONFIGURATION_SHA256, products) == configuration
 
 
+def test_endpoint_spec_activation_must_match_run_evidence_before_owner_construction():
+    run = _valid_run()
+    matching = _p2_configuration()
+    for product in matching["products"]:
+        first = product["specs"][0]
+        first["valid_to"] = run.range_end_ms
+        product["specs"].append({**first, "version": "spec-v2", "valid_from": run.range_end_ms,
+                                 "valid_to": None})
+    assert validate_historical_input(_run_with_configuration(run, matching))
+
+    mismatched = _p2_configuration()
+    for product in mismatched["products"]:
+        first = product["specs"][0]
+        first["valid_to"] = run.range_end_ms
+        product["specs"].append({**first, "version": "spec-v2", "valid_from": run.range_end_ms,
+                                 "valid_to": None, "price_tick": "0.02"})
+    calls = []
+    with pytest.raises(HistoricalInputError, match="endpoint configured spec differs from run evidence"):
+        admit_before_construction(
+            _run_with_configuration(run, mismatched),
+            lambda _: calls.append("owner"), lambda _: calls.append("store"),
+        )
+    assert calls == []
+
+
 @pytest.mark.parametrize("mutation", [
     lambda r: replace(r, schema_version="future"),
     lambda r: replace(r, model_id="UNKNOWN"),

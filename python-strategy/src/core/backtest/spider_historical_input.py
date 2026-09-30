@@ -609,6 +609,29 @@ def validate_historical_input(run: HistoricalRunInput) -> str:
                 raise HistoricalInputError("invalid product specification")
         if not _valid_hash(before.tier_hash) or not _valid_hash(after.tier_hash):
             raise HistoricalInputError("invalid tier evidence hash")
+    configuration = decode_p2_configuration(
+        run.configuration_bytes, run.configuration_sha256, run.ordered_products
+    )
+    for configured_product, evidence in zip(
+        cast(list[dict[str, object]], configuration["products"]), run.spec_after, strict=True
+    ):
+        specs = cast(list[object], configured_product["specs"])
+        endpoint_specs = [cast(dict[str, object], spec) for spec in specs
+                          if type(spec) is dict
+                          and cast(dict[str, object], spec).get("valid_from") == run.range_end_ms]
+        if endpoint_specs:
+            endpoint = endpoint_specs[0]
+            if any(not _decimal_string(endpoint.get(field)) or
+                Decimal(cast(str, endpoint[field])) != expected
+                for field, expected in (
+                    ("contract_value", evidence.contract_value),
+                    ("multiplier", evidence.multiplier),
+                    ("price_tick", evidence.price_tick),
+                    ("quantity_step", evidence.quantity_step),
+                    ("minimum_quantity", evidence.minimum_quantity),
+                )
+            ):
+                raise HistoricalInputError("endpoint configured spec differs from run evidence")
     semantic_input = asdict(run)
     semantic_input.pop("run_id")
     return _digest(semantic_input)

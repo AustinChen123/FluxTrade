@@ -83,6 +83,9 @@ impl PySession {
             .historical_market_step(&self.request(request)?)
             .map_err(error)
     }
+    fn _historical_working_orders(&mut self) -> PyResult<String> {
+        self.inner.historical_working_orders().map_err(error)
+    }
     fn inspect_state(&mut self) -> PyResult<String> {
         self.inner.inspect_state().map_err(error)
     }
