@@ -20,6 +20,8 @@ _TERMINALS = "SCHEDULED_MTM LEGAL_NATIVE_LIQUIDATION_FINAL_EVENT O03_NON_ATOMIC_
 _FAILURES = "UNSUPPORTED_CONFIGURATION PERSISTENCE_FAILED CALLBACK_FAILED NATIVE_FAULT NATIVE_POISONED SCHEDULER_FAILED ENDPOINT_RECONCILIATION_FAILED ARTIFACT_WRITE_FAILED PUBLICATION_FAILED PUBLICATION_DURABILITY_UNKNOWN UNEXPECTED_EXCEPTION".split()
 _P1_RUN_CONTRACT = "SPIDER_SYNTHETIC_P1_RUN_V1"
 _P2_RUN_CONTRACT = "SPIDER_SYNTHETIC_P2_CONFIGURED_RUN_V1"
+_P3_RUN_CONTRACT = "SPIDER_HISTORICAL_RESEARCH_RUN_V1"
+_P3_SELECTOR = "SPIDER_HISTORICAL_RESEARCH_RUN_V1"
 _HISTORICAL_MODELS = ("OHLC4_OPEN_HIGH_LOW_CLOSE_V1", "OHLC4_OPEN_LOW_HIGH_CLOSE_V1")
 
 
@@ -160,6 +162,12 @@ def _optional_context(row: dict[str, object]) -> dict[str, object] | None:
     return _configuration_context(row["configuration_context"])
 
 
+def _optional_historical_context(row: dict[str, object]) -> dict[str, object] | None:
+    if "historical_context" not in row:
+        return None
+    return _historical_context(row["historical_context"])
+
+
 def _decimal_text(value: object) -> str:
     text = _text(value, r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]*[1-9])?")
     _require(text != "-0")
@@ -233,33 +241,48 @@ def _boundary(value: object) -> None:
 
 
 def _attempt(row: dict[str, object]) -> None:
-    _object(row, "schema_version run_id run_contract_id registration_state requested_scenario_selector registration_failure input_contract_hashes planned_coverage " + " ".join(_IDENTITIES), "configuration_context")
+    _object(row, "schema_version run_id run_contract_id registration_state requested_scenario_selector registration_failure input_contract_hashes planned_coverage " + " ".join(_IDENTITIES), "configuration_context historical_context")
     context = _optional_context(row)
-    run_contract = _enum(row["run_contract_id"], [_P1_RUN_CONTRACT, _P2_RUN_CONTRACT])
+    historical = _optional_historical_context(row)
+    run_contract = _enum(row["run_contract_id"], [_P1_RUN_CONTRACT, _P2_RUN_CONTRACT, _P3_RUN_CONTRACT])
     _text(row["requested_scenario_selector"], r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
     state = _enum(row["registration_state"], ["VALIDATED", "REJECTED"])
     hashes, coverage = _list(row["input_contract_hashes"]), _list(row["planned_coverage"])
     if state == "REJECTED":
         _require(row["registration_failure"] == "UNSUPPORTED_CONFIGURATION")
         _require(all(row[key] is None for key in _IDENTITIES) and not hashes and not coverage)
+        _require(run_contract != _P3_RUN_CONTRACT and historical is None)
         _require(run_contract == _P2_RUN_CONTRACT or context is None)
         return
     _require(row["registration_failure"] is None)
     if run_contract == _P1_RUN_CONTRACT:
-        _require(context is None)
-    else:
+        _require(context is None and historical is None)
+    elif run_contract == _P2_RUN_CONTRACT:
         _require(context is not None)
+        _require(historical is None)
+    else:
+        _require(context is not None and historical is not None)
     for key in _IDENTITIES:
         if key != "account_key":
             _text(row[key])
     if run_contract == _P1_RUN_CONTRACT:
         _enum(row["profile_id"], ["SYNTHETIC_MIN_CASH_V1", "SYNTHETIC_P1_LIQUIDATION_V1", "SYNTHETIC_P1_O03_V1"])
-    else:
+    elif run_contract == _P2_RUN_CONTRACT:
         _require(row["profile_id"] == "SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1")
+    else:
+        _require(row["profile_id"] == "HISTORICAL_MARKET_SCENARIO_ACCOUNT_V1")
     account = _object(row["account_key"], "venue environment account", "subaccount")
     for key, value in account.items():
         if key != "subaccount" or value is not None:
             _text(value)
+    if run_contract == _P3_RUN_CONTRACT:
+        _require(account["venue"] == "SPIDER_HISTORICAL_RESEARCH")
+        _require(account["environment"] == "RESEARCH_ONLY")
+        _require("subaccount" not in account or account["subaccount"] is None)
+        assert historical is not None
+        _require(row["requested_scenario_selector"] == _P3_SELECTOR)
+        _require(row["scenario_plan_id"] == _P3_SELECTOR)
+        _require(row["scenario_plan_sha256"] == historical["historical_input_sha256"])
     for key in _HASHES:
         _text(row[key], "[0-9a-f]{64}")
     _require(len(hashes) == len(_HASH_NAMES))
@@ -267,12 +290,21 @@ def _attempt(row: dict[str, object]) -> None:
         entry = _object(item, "name sha256")
         _require(entry["name"] == name)
         _text(entry["sha256"], "[0-9a-f]{64}")
-    _require(row["ordering_contract_id"] == "S_order_v1")
-    _require(row["cost_contract_id"] == "SPIDER_SYNTHETIC_COSTS_V1")
-    expected_funding = "SYNTHETIC_P1_NO_FUNDING_INPUT_OR_CLAIM" if run_contract == _P1_RUN_CONTRACT else "SYNTHETIC_P2_NO_FUNDING_INPUT_OR_CLAIM"
+    expected_ordering = "HISTORICAL_ORDER_V1" if run_contract == _P3_RUN_CONTRACT else "S_order_v1"
+    expected_cost = "SPIDER_HISTORICAL_RESEARCH_COSTS_V1" if run_contract == _P3_RUN_CONTRACT else "SPIDER_SYNTHETIC_COSTS_V1"
+    _require(row["ordering_contract_id"] == expected_ordering)
+    _require(row["cost_contract_id"] == expected_cost)
+    expected_funding = (
+        "HISTORICAL_FUNDING_DISABLED" if run_contract == _P3_RUN_CONTRACT
+        else "SYNTHETIC_P1_NO_FUNDING_INPUT_OR_CLAIM" if run_contract == _P1_RUN_CONTRACT
+        else "SYNTHETIC_P2_NO_FUNDING_INPUT_OR_CLAIM"
+    )
     _require(row["funding_exclusion"] == expected_funding)
     _require(row["artifact_encoding"] == "artifact_encoding_v1")
-    _enum(row["terminal_policy"], _TERMINALS)
+    if run_contract == _P3_RUN_CONTRACT:
+        _require(row["terminal_policy"] == "MTM_PRESERVE_OPEN_V1")
+    else:
+        _enum(row["terminal_policy"], _TERMINALS)
     seen: set[str] = set()
     for ordinal, item in enumerate(coverage, 1):
         entry = _object(item, "ordinal barrier_id record_kind")
@@ -284,8 +316,10 @@ def _attempt(row: dict[str, object]) -> None:
 
 
 def _status(row: dict[str, object]) -> None:
-    _object(row, "schema_version run_id state processed_boundary persisted_boundary failure_reason primary_failure", "configuration_context")
-    _optional_context(row)
+    _object(row, "schema_version run_id state processed_boundary persisted_boundary failure_reason primary_failure", "configuration_context historical_context")
+    configuration = _optional_context(row)
+    historical = _optional_historical_context(row)
+    _require(historical is None or configuration is not None)
     state = _enum(row["state"], ["RUNNING", "FAILED", "COMPLETE"])
     _boundary(row["processed_boundary"])
     _boundary(row["persisted_boundary"])
@@ -314,6 +348,8 @@ def encode_artifact(value: object) -> bytes:
     row = cast(dict[str, object], value)
     if "configuration_context" in row:
         serialized = {**row, "configuration_context": _configuration_context(row["configuration_context"])}
+    if "historical_context" in row:
+        serialized = {**cast(dict[str, object], serialized), "historical_context": _historical_context(row["historical_context"])}
     return canonical_bytes(serialized) + b"\n"
 
 

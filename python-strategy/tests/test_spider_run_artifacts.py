@@ -110,6 +110,26 @@ def configured_attempt(products=None):
     return row
 
 
+def historical_attempt():
+    context = historical_context()
+    row = attempt()
+    row.update(
+        run_contract_id="SPIDER_HISTORICAL_RESEARCH_RUN_V1",
+        requested_scenario_selector="SPIDER_HISTORICAL_RESEARCH_RUN_V1",
+        profile_id="HISTORICAL_MARKET_SCENARIO_ACCOUNT_V1",
+        account_key={"venue": "SPIDER_HISTORICAL_RESEARCH", "environment": "RESEARCH_ONLY", "account": "research"},
+        scenario_plan_id="SPIDER_HISTORICAL_RESEARCH_RUN_V1",
+        scenario_plan_sha256=context["historical_input_sha256"],
+        ordering_contract_id="HISTORICAL_ORDER_V1",
+        cost_contract_id="SPIDER_HISTORICAL_RESEARCH_COSTS_V1",
+        funding_exclusion="HISTORICAL_FUNDING_DISABLED",
+        terminal_policy="MTM_PRESERVE_OPEN_V1",
+        configuration_context=configuration_context(),
+        historical_context=context,
+    )
+    return row
+
+
 def status() -> dict[str, object]:
     return dict(schema_version="spider_status_v1", run_id="r-1", state="RUNNING",
                 processed_boundary=None, persisted_boundary=None, failure_reason=None, primary_failure=None)
@@ -406,6 +426,82 @@ def test_attempt_p1_p2_validated_and_rejected_matrix():
         a.validate_artifact({**p2, "run_contract_id": "SPIDER_SYNTHETIC_P1_RUN_V1"})
     with pytest.raises(ValueError):
         a.validate_artifact({**p1, "run_contract_id": "SPIDER_SYNTHETIC_P2_CONFIGURED_RUN_V1"})
+
+
+def test_historical_validated_attempt_roundtrips_and_detaches_contexts():
+    row = historical_attempt()
+    row["historical_context"] = a.historical_context(row["historical_context"])
+    encoded = a.encode_artifact(row)
+    decoded = a.decode_artifact(encoded)
+    assert decoded["configuration_context"] == a._configuration_context(row["configuration_context"])
+    assert decoded["historical_context"] == historical_context()
+    assert a.encode_artifact(decoded) == encoded
+
+    running = status()
+    running.update(configuration_context=configuration_context(), historical_context=a.historical_context(historical_context()))
+    assert a.decode_artifact(a.encode_artifact(running)) == {
+        **status(), "configuration_context": configuration_context(), "historical_context": historical_context(),
+    }
+
+
+@pytest.mark.parametrize("mutation", [
+    "missing_configuration", "missing_historical", "null_historical", "bad_selector",
+    "bad_plan_id", "bad_plan_hash", "bad_profile", "bad_venue", "bad_environment",
+    "subaccount", "bad_ordering", "bad_cost", "bad_funding", "bad_terminal",
+    "bad_context_model", "rejected",
+])
+def test_historical_attempt_contract_is_closed(mutation):
+    row = historical_attempt()
+    if mutation == "missing_configuration":
+        del row["configuration_context"]
+    elif mutation == "missing_historical":
+        del row["historical_context"]
+    elif mutation == "null_historical":
+        row["historical_context"] = None
+    elif mutation == "bad_selector":
+        row["requested_scenario_selector"] = "other"
+    elif mutation == "bad_plan_id":
+        row["scenario_plan_id"] = "other"
+    elif mutation == "bad_plan_hash":
+        row["scenario_plan_sha256"] = "f" * 64
+    elif mutation == "bad_profile":
+        row["profile_id"] = "SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1"
+    elif mutation == "bad_venue":
+        row["account_key"] = {**row["account_key"], "venue": "OTHER"}
+    elif mutation == "bad_environment":
+        row["account_key"] = {**row["account_key"], "environment": "PAPER"}
+    elif mutation == "subaccount":
+        row["account_key"] = {**row["account_key"], "subaccount": "unexpected"}
+    elif mutation == "bad_ordering":
+        row["ordering_contract_id"] = "S_order_v1"
+    elif mutation == "bad_cost":
+        row["cost_contract_id"] = "SPIDER_SYNTHETIC_COSTS_V1"
+    elif mutation == "bad_funding":
+        row["funding_exclusion"] = "SYNTHETIC_P2_NO_FUNDING_INPUT_OR_CLAIM"
+    elif mutation == "bad_terminal":
+        row["terminal_policy"] = "SCHEDULED_MTM"
+    elif mutation == "bad_context_model":
+        row["historical_context"] = {**historical_context(), "model_id": "unknown"}
+    else:
+        row.update(registration_state="REJECTED", registration_failure="UNSUPPORTED_CONFIGURATION")
+        row.update(dict.fromkeys(NULL_IDENTITIES))
+        row["input_contract_hashes"] = []
+        row["planned_coverage"] = []
+    with pytest.raises(ValueError):
+        a.validate_artifact(row)
+
+
+def test_historical_context_is_forbidden_on_p1_p2_attempts_and_requires_configuration_on_status():
+    for row in (attempt(), configured_attempt()):
+        row["historical_context"] = historical_context()
+        with pytest.raises(ValueError):
+            a.validate_artifact(row)
+    row = status()
+    row["historical_context"] = historical_context()
+    with pytest.raises(ValueError):
+        a.validate_artifact(row)
+    row["configuration_context"] = configuration_context()
+    a.validate_artifact(row)
 
 
 def test_configured_validated_attempt_requires_context():
