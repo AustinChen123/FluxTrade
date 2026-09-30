@@ -80,7 +80,7 @@ pub(super) fn fixture_admit(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum OrderType {
+pub(super) enum OrderType {
     Limit,
     Market,
     Unsupported,
@@ -103,6 +103,32 @@ pub(super) struct OrderIntent {
 }
 
 impl OrderIntent {
+    #[cfg(test)]
+    pub(super) fn historical_market_fixture(
+        owner: &ScenarioAccount,
+        intent_id: String,
+        client_order_id: String,
+        product_id: &'static str,
+        side: Side,
+        quantity: Decimal,
+        limit_price: Option<Decimal>,
+    ) -> Self {
+        Self {
+            intent_id,
+            client_order_id,
+            account_key: owner.key.clone(),
+            config_id: owner.config_id.clone(),
+            product: ProfileProduct::BtcEth(Product(product_id.into())),
+            strategy_id: "historical-market-test".into(),
+            side,
+            order_type: OrderType::Market,
+            quantity,
+            limit_price,
+            reduce_only: false,
+            requested_at: 1_000,
+        }
+    }
+
     pub(super) fn wire_product(&self) -> &ProfileProduct {
         &self.product
     }
@@ -202,6 +228,7 @@ pub(super) struct AdmissionResult {
     reservation_after: Option<Evaluation>,
     evaluation: Evaluation,
     created_at_event_id: String,
+    order_type: OrderType,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -330,9 +357,13 @@ impl ScenarioAccount {
                 accepted_source_sequence: stamp
                     .source_sequence
                     .ok_or("INVALID_HISTORICAL_ORDER_SNAPSHOT")?,
-                kind: super::historical::OrderKind::Limit,
+                kind: match admission.order_type() {
+                    OrderType::Limit => super::historical::OrderKind::Limit,
+                    OrderType::Market => super::historical::OrderKind::Market,
+                    OrderType::Unsupported => return Err("INVALID_HISTORICAL_ORDER_SNAPSHOT"),
+                },
                 side: facts.side,
-                limit_price: Some(facts.price),
+                limit_price: (admission.order_type() == OrderType::Limit).then_some(facts.price),
                 risk_cancel_pending: matches!(
                     order.cancel,
                     risk_transition::cancel::State::Requested(ref request)
@@ -382,6 +413,9 @@ impl ScenarioAccount {
             e.text(&r.spec_version);
             e.text(&r.rule_data_version);
             e.text(&r.created_at_event_id);
+            if r.order_type == OrderType::Market {
+                e.text("MARKET");
+            }
             e.presence(r.accepted_order.is_some());
             if let Some(order) = &r.accepted_order {
                 order_facts(e, order)?;
@@ -456,9 +490,13 @@ impl ScenarioAccount {
         }
         self.source_boundary(stamp, envelope.intent.digest(), source::Kind::Intent)
             .map_err(|f| self.source_failure(f))?;
-        let prepared = catch_unwind(AssertUnwindSafe(|| self.prepare_admission(envelope, hook)))
-            .map_err(|_| "ADMISSION_PANIC")
-            .and_then(|result| result);
+        let historical = stamp.ordering_contract_id == "HISTORICAL_ORDER_V1"
+            && matches!(self.profile, ProfileContext::BtcEthScenario { ref scenario, .. } if scenario.configured.is_some());
+        let prepared = catch_unwind(AssertUnwindSafe(|| {
+            self.prepare_admission(envelope, historical, hook)
+        }))
+        .map_err(|_| "ADMISSION_PANIC")
+        .and_then(|result| result);
         let mut prepared = match prepared {
             Ok(prepared) => prepared,
             Err(fault) => {
@@ -492,6 +530,7 @@ impl ScenarioAccount {
     fn prepare_admission(
         &self,
         envelope: &Envelope<'_>,
+        historical: bool,
         mut hook: impl FnMut(PrepareStage) -> Result<(), Fault>,
     ) -> Result<Prepared, Fault> {
         let intent = envelope.intent;
@@ -521,10 +560,26 @@ impl ScenarioAccount {
             return Err("ORDER_ID_CONFLICT");
         }
         self.validate_context(envelope.effective_at)?;
-        if intent.order_type != OrderType::Limit {
+        if intent.order_type == OrderType::Unsupported
+            || (intent.order_type == OrderType::Market && !historical)
+        {
             return Err("UNSUPPORTED_ORDER_TYPE");
         }
-        let price = intent.limit_price.ok_or("LIMIT_PRICE_REQUIRED")?;
+        let price = match intent.order_type {
+            OrderType::Limit => intent.limit_price.ok_or("LIMIT_PRICE_REQUIRED")?,
+            OrderType::Market => {
+                if intent.limit_price.is_some() {
+                    return Err("INVALID_BTC_INTENT");
+                }
+                super::historical::admission_reference_price(
+                    self,
+                    intent.product.btc()?,
+                    intent.side,
+                    envelope.effective_at,
+                )?
+            }
+            OrderType::Unsupported => return Err("UNSUPPORTED_ORDER_TYPE"),
+        };
         let (spec_version, rule_data_version) = match &self.profile {
             ProfileContext::P1O03 => {
                 if intent.product != ProfileProduct::Pa
@@ -663,6 +718,7 @@ impl ScenarioAccount {
             reservation_after: accepted.then(|| evaluation.clone()),
             evaluation,
             created_at_event_id: envelope.event_id.into(),
+            order_type: intent.order_type,
         };
         draft
             .intent_results
@@ -673,10 +729,31 @@ impl ScenarioAccount {
 }
 
 impl AdmissionResult {
+    pub(super) fn order_type(&self) -> OrderType {
+        self.order_type
+    }
+
     pub(super) fn delivery_order(&self, event: &str) -> Option<&SeedOrder> {
         (self.created_at_event_id == event)
             .then_some(self.accepted_order.as_ref())
             .flatten()
+    }
+
+    pub(super) fn created_at_event_id(&self) -> &str {
+        &self.created_at_event_id
+    }
+
+    pub(super) fn order_id(&self) -> Option<&str> {
+        self.order_id.as_deref()
+    }
+}
+
+impl ScenarioAccount {
+    pub(super) fn admitted_order_type(&self, facts: &SeedOrder) -> OrderType {
+        self.intent_results
+            .get(&facts.intent_id)
+            .map(AdmissionResult::order_type)
+            .unwrap_or(OrderType::Limit)
     }
 }
 

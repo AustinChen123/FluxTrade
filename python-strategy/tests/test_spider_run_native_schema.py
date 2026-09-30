@@ -134,8 +134,12 @@ def test_all_graph_branches_are_closed_and_do_not_mutate(check, fixture):
                 check(mutated)
             mutated = deepcopy(fixture)
             at(mutated, path)[field] = None
-            with pytest.raises(ValueError):
+            if field == "limit_price":
+                # This required field is intentionally nullable for historical MARKET.
                 check(mutated)
+            else:
+                with pytest.raises(ValueError):
+                    check(mutated)
 
 
 @pytest.mark.parametrize("check,fixture", CASES)
@@ -346,6 +350,18 @@ def test_all_native_profile_and_ordering_tokens_remain_structurally_supported():
                     "SYNTHETIC_P1_LIQUIDATION_V1", "SYNTHETIC_P1_O03_V1"]:
         n.inspection({**INSPECTION, "profile_id": profile})
     n.group({**group(), "ordering_contract_id": "S_order_v1_reverse_execution_cancel_effective"})
+
+
+def test_market_order_and_execution_limits_are_required_but_nullable():
+    market_order = {**ORDER, "limit_price": None}
+    n.open_order(market_order)
+    with pytest.raises(ValueError):
+        n.open_order({key: value for key, value in market_order.items() if key != "limit_price"})
+
+    market_execution = {**EXECUTION, "limit_price": None}
+    n.execution_fact(market_execution)
+    with pytest.raises(ValueError):
+        n.execution_fact({key: value for key, value in market_execution.items() if key != "limit_price"})
 
 
 @pytest.mark.parametrize("product", CONFIGURED_PRODUCTS)

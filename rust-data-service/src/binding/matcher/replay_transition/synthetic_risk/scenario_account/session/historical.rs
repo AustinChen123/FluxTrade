@@ -241,7 +241,13 @@ fn encode_working_orders(
                     "accepted_source_sequence",
                     wire::number(order.accepted_source_sequence)?,
                 ),
-                ("order_kind", wire::string("LIMIT")),
+                (
+                    "order_kind",
+                    wire::string(match order.kind {
+                        OrderKind::Limit => "LIMIT",
+                        OrderKind::Market => "MARKET",
+                    }),
+                ),
                 (
                     "side",
                     wire::string(if order.side == Side::Long {
@@ -252,7 +258,10 @@ fn encode_working_orders(
                 ),
                 (
                     "limit_price",
-                    wire::decimal(order.limit_price.ok_or("NATIVE_INVARIANT")?),
+                    order
+                        .limit_price
+                        .map(wire::decimal)
+                        .unwrap_or(wire::Json::Null),
                 ),
                 (
                     "risk_cancel_pending",

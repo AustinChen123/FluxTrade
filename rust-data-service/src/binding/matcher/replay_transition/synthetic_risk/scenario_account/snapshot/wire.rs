@@ -138,7 +138,10 @@ impl Fact {
                                         }),
                                     ),
                                     ("side", string(delivery::side(o.side))),
-                                    ("limit_price", decimal(o.price)),
+                                    (
+                                        "limit_price",
+                                        r.limit_price.map(decimal).unwrap_or(Json::Null),
+                                    ),
                                     ("original_size_contracts", decimal(o.original)),
                                     ("cumulative_filled_size_contracts", decimal(o.filled)),
                                     ("created_at", number(r.created_at)?),

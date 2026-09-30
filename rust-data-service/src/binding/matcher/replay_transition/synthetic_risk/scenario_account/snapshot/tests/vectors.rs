@@ -22,7 +22,8 @@ fn check(payload: Payload, bytes: Vec<u8>) {
     expected.extend(bytes.clone());
     assert_eq!(
         actual.finish().as_slice(),
-        digest(&SHA256, &expected).as_ref()
+        digest(&SHA256, &expected).as_ref(),
+        "payload={payload:?} bytes={bytes:?}"
     );
     for version in [None, Some(7)] {
         let fact = Fact {
@@ -160,8 +161,41 @@ fn every_payload_variant_has_an_independent_typed_byte_vector() {
             vec![payload::OrderRow {
                 facts,
                 created_at: 600,
+                limit_price: Some(d("50000.1")),
             }]
         };
         check(Payload::OpenOrders(rows), b);
     }
+
+    let mut market_facts = seed.orders[0].clone();
+    market_facts.order_id = "MARKET-O1".into();
+    market_facts.client_id = "MARKET-C1".into();
+    market_facts.side = Side::Long;
+    market_facts.filled = Decimal::ZERO;
+    market_facts.status = "OPEN".into();
+    let mut market = Vec::new();
+    texts(&mut market, &["OPEN_ORDER_SNAPSHOT", "SUCCESS"]);
+    integer(&mut market, 1);
+    texts(
+        &mut market,
+        &[
+            "MARKET-O1",
+            "MARKET-C1",
+            "BTC-USDT-SWAP",
+            "live",
+            "buy",
+            "MARKET",
+            "2",
+            "0",
+        ],
+    );
+    integer(&mut market, 600);
+    check(
+        Payload::OpenOrders(vec![payload::OrderRow {
+            facts: market_facts,
+            created_at: 600,
+            limit_price: None,
+        }]),
+        market,
+    );
 }

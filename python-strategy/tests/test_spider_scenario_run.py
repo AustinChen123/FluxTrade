@@ -18,7 +18,7 @@ from src.core.backtest import spider_scenario_run as run, synthetic_scenario_cod
 from src.core.backtest import spider_configured_scale_input as scale
 from src.core.backtest import spider_policy as spider_policy
 from src.core.backtest import spider_run_store as storage
-from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_jsonl
+from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_canonical, decode_jsonl
 from src.core.backtest.spider_run_admission import admit_spider_run
 from src.core.backtest.spider_scenario_plans import PLAN_IDS, plan_bundle
 from src.core.backtest.spider_historical_input import encode_historical_run_input, historical_planned_coverage
@@ -331,6 +331,68 @@ def test_h06_frozen_policy_limits_run_through_public_admission(
              "effective_at": (value.range_start_ms + 5_021) * 16 + 3}
             for deferred_action in deferred
         ]
+
+
+def test_h06_policy_market_orders_cross_scheduler_native_and_notice_path(tmp_path):
+    _, value = _oracle_run("H06", h06_variant="A")
+    endpoint = value.range_start_ms + 5_022
+    value = replace(
+        value,
+        run_id="h06-market-vertical",
+        range_end_ms=endpoint,
+        spec_after=tuple(replace(spec, effective_at_ms=endpoint) for spec in value.spec_after),
+    )
+    policy_cache = decode_canonical(value.initial_policy_cache)
+    policy_cache["replies"] = {}
+    value = replace(value, initial_policy_cache=canonical_bytes(policy_cache))
+    value = _rehashed_run(value)
+    raw = encode_historical_run_input(value)
+    result = run.run_spider_scenario(str(tmp_path), value.run_id, run._P3_SELECTOR, raw)
+    assert result == dict(run_id=value.run_id, outcome="ADMITTED", reason=None)
+    admitted = admit_spider_run(tmp_path / value.run_id)
+    assert admitted["decision"] == "ACCEPT"
+    journal = admitted["artifacts"]["journal.jsonl"]
+    market_events = [
+        event
+        for row in journal if row["record_kind"] == "CALLBACK_RESULT"
+        for event in row["payload"]["policy_events"]
+        if event["kind"] == "send"
+        and any(order["ordType"] == "market" for order in event["orders"])
+    ]
+    assert len(market_events) == 1
+    market_groups = [
+        row for row in journal if row["record_kind"] == "SOURCE_GROUP_RESULT"
+        and any(member["kind"] == "INTENT" and member["payload"]["order_type"] == "MARKET"
+                for member in row["payload"]["request"]["members"])
+    ]
+    assert len(market_groups) == 2
+    assert all(group["payload"]["result"]["classification"] == "COMMITTED"
+               for group in market_groups)
+    market_clients = {
+        member["payload"]["client_order_id"]
+        for group in market_groups for member in group["payload"]["request"]["members"]
+    }
+    assert market_clients == {"000001xxxx", "000002xxxx"}
+    market_rows = [row for row in journal if row["record_kind"] == "HISTORICAL_MARKET_RESULT"]
+    assert len(market_rows) == 1
+    assert market_rows[0]["payload"]["result"]["raw_time_ms"] == value.range_start_ms
+    fills = [fill for product in market_rows[0]["payload"]["result"]["products"]
+             for fill in product["fills"]]
+    assert fills == []
+    final_orders = admitted["artifacts"]["endpoint.json"]["final_owner_evidence"][
+        "open_orders_fact"
+    ]["immutable_payload"]["rows"]
+    projected_market_orders = [
+        order for order in final_orders
+        if order["client_order_id"] in market_clients
+    ]
+    assert len(projected_market_orders) == 2
+    assert all(order["limit_price"] is None
+               for order in projected_market_orders)
+    notices = [row for row in journal if row["record_kind"] == "DELIVERY_ATTEMPT"
+               and row["payload"]["delivery"]["payload_kind"] == "TRANSPORT_ACK"
+               and row["payload"]["delivery"].get("occurrence_index") is not None]
+    assert notices == []
 
 
 @pytest.mark.parametrize("mutation", [

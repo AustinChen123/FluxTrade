@@ -103,6 +103,301 @@ fn node_input(
     }
 }
 
+fn market_intent(
+    owner: &ScenarioAccount,
+    id: &str,
+    product: &'static str,
+    side: Side,
+    quantity: Decimal,
+    limit_price: Option<Decimal>,
+) -> admission::OrderIntent {
+    admission::OrderIntent::historical_market_fixture(
+        owner,
+        format!("I-{id}"),
+        format!("C-{id}"),
+        product,
+        side,
+        quantity,
+        limit_price,
+    )
+}
+
+fn admit_market(owner: &mut ScenarioAccount, id: &str, side: Side) -> String {
+    admit_market_quantity(owner, id, side, d("0.5"))
+}
+
+fn admit_market_quantity(
+    owner: &mut ScenarioAccount,
+    id: &str,
+    side: Side,
+    quantity: Decimal,
+) -> String {
+    let intent = market_intent(owner, id, "A-USDT-SWAP", side, quantity, None);
+    let group = market_group(owner, id, intent);
+    let completion = owner.apply_group(&group).unwrap();
+    assert!(completion.failure.is_none());
+    assert!(completion.rejections.is_empty());
+    owner
+        .intent_results
+        .values()
+        .find(|result| result.created_at_event_id() == format!("E-{id}"))
+        .and_then(|result| result.order_id().map(str::to_owned))
+        .unwrap()
+}
+
+fn market_group(owner: &ScenarioAccount, id: &str, intent: admission::OrderIntent) -> group::Group {
+    let effective_at = 1_000 * 16 + 8;
+    let mut stamp = source::stamp(&format!("E-{id}"), effective_at, 60);
+    stamp.ordering_contract_id = "HISTORICAL_ORDER_V1".into();
+    stamp.source_sequence = Some(1);
+    group::Group {
+        group_id: format!("G-{id}"),
+        account_key: owner.key.clone(),
+        ordering_contract_id: "HISTORICAL_ORDER_V1".into(),
+        group_effective_at: effective_at,
+        declared_member_count: 1,
+        members: vec![group::Member {
+            stamp,
+            input: group::Input::Intent(intent),
+        }],
+    }
+}
+
+fn assert_market_failure_preserves_financial_state(
+    owner: &ScenarioAccount,
+    before: &ScenarioAccount,
+    fault: Fault,
+) {
+    assert_eq!(owner.gate, Gate::Failed(fault.into()));
+    assert_eq!(owner.cash, before.cash);
+    assert_eq!(owner.positions, before.positions);
+    assert_eq!(owner.orders, before.orders);
+    assert_eq!(owner.fees, before.fees);
+    assert_eq!(owner.gross_realized, before.gross_realized);
+    assert_eq!(owner.state_version, before.state_version);
+    assert_eq!(owner.execution_receipts, before.execution_receipts);
+    assert_eq!(owner.intent_results, before.intent_results);
+    assert_eq!(owner.reservation().unwrap(), before.reservation().unwrap());
+}
+
+#[test]
+fn configured_historical_market_order_keeps_kind_and_settles_only_on_later_capacity() {
+    for (id, side, expected_fill) in [
+        ("LONG", Side::Long, d("91")),
+        ("SHORT", Side::Short, d("89")),
+    ] {
+        let (seed, products) = configured_ab();
+        let mut products = products;
+        for product in &mut products {
+            for mark in &mut product.marks {
+                mark.valid_to = i64::MAX;
+            }
+        }
+        let mut seed = seed;
+        seed.effective_at = 0;
+        let mut owner = ScenarioAccount::from_configured(&seed, d("10"), products).unwrap();
+        let before_admission = node_input(
+            &owner,
+            NodeBar {
+                model: "OHLC4_OPEN_HIGH_LOW_CLOSE_V1",
+                bar_open_ms: 1_000,
+                step_index: 0,
+                a_ohlc: [d("100"), d("110"), d("90"), d("105")],
+                a_volume: "4",
+                a_mark: [d("105"), d("115"), d("95"), d("110")],
+            },
+            &[],
+        );
+        assert!(owner
+            .historical_market_step(&before_admission)
+            .unwrap()
+            .products[0]
+            .fills
+            .is_empty());
+        let order_id = admit_market(&mut owner, id, side);
+        assert_eq!(
+            owner.admitted_order_type(&owner.orders[&order_id].facts),
+            admission::OrderType::Market
+        );
+        assert_eq!(owner.orders[&order_id].facts.price, d("105"));
+        let projection = owner.historical_working_orders().unwrap();
+        assert_eq!(projection.len(), 1);
+        assert_eq!(projection[0].order_id, order_id);
+        assert_eq!(projection[0].kind, historical::OrderKind::Market);
+        assert_eq!(projection[0].limit_price, None);
+
+        let mut same_segment = node_input(
+            &owner,
+            NodeBar {
+                model: "OHLC4_OPEN_HIGH_LOW_CLOSE_V1",
+                bar_open_ms: 1_000,
+                step_index: 1,
+                a_ohlc: [d("100"), d("110"), d("90"), d("105")],
+                a_volume: "4",
+                a_mark: [d("105"), d("115"), d("95"), d("110")],
+            },
+            &[],
+        );
+        same_segment.working_orders = projection.clone();
+        same_segment.market_slippage_bps = d("10");
+        assert!(owner
+            .historical_market_step(&same_segment)
+            .unwrap()
+            .products[0]
+            .fills
+            .is_empty());
+        assert_eq!(owner.orders[&order_id].facts.remaining, d("0.5"));
+
+        let mut zero_owner = owner.clone();
+        let mut zero_capacity = node_input(
+            &owner,
+            NodeBar {
+                model: "OHLC4_OPEN_HIGH_LOW_CLOSE_V1",
+                bar_open_ms: 1_000,
+                step_index: 2,
+                a_ohlc: [d("100"), d("110"), d("90"), d("105")],
+                a_volume: "0",
+                a_mark: [d("100"), d("110"), d("90"), d("105")],
+            },
+            &[],
+        );
+        zero_capacity.working_orders = projection.clone();
+        zero_capacity.market_slippage_bps = d("10");
+        let before = zero_owner.clone();
+        let zero = zero_owner.historical_market_step(&zero_capacity).unwrap();
+        assert!(zero.products[0].fills.is_empty());
+        assert_eq!(zero_owner.orders, before.orders);
+        assert_eq!(zero_owner.cash, before.cash);
+        assert_eq!(zero_owner.fees, before.fees);
+        assert_eq!(zero_owner.gross_realized, before.gross_realized);
+
+        let mut input = node_input(
+            &owner,
+            NodeBar {
+                model: "OHLC4_OPEN_HIGH_LOW_CLOSE_V1",
+                bar_open_ms: 1_000,
+                step_index: 2,
+                a_ohlc: [d("100"), d("110"), d("90"), d("105")],
+                a_volume: "4",
+                a_mark: [d("100"), d("110"), d("90"), d("105")],
+            },
+            &[],
+        );
+        input.working_orders = projection;
+        input.market_slippage_bps = d("10");
+        let result = owner.historical_market_step(&input).unwrap();
+        assert_eq!(result.raw_time_ms, 41_000);
+        assert_eq!(result.products[0].fills.len(), 1);
+        assert_eq!(result.products[0].fills[0].order_id, order_id);
+        assert_eq!(result.products[0].fills[0].quantity, d("0.5"));
+        assert_eq!(result.products[0].fills[0].price, expected_fill);
+        let fill = &result.products[0].fills[0];
+        let settled_cash = owner.cash.clone();
+        let settled_fees = owner.fees;
+        let settled_gross = owner.gross_realized;
+        let settled_version = owner.state_version;
+        let duplicate = execution::historical_candidate(
+            &owner,
+            &order_id,
+            fill.price,
+            fill.quantity,
+            result.effective_at,
+            fill.execution_id,
+        )
+        .unwrap();
+        let duplicate_stamp = source::stamp(&fill.source_event_id, result.effective_at, 30);
+        assert!(matches!(
+            owner.execute_stamped(&duplicate, &duplicate_stamp, |_| Ok(())),
+            Ok(execution::commit::Reply::Duplicate(_))
+        ));
+        assert_eq!(owner.cash, settled_cash);
+        assert_eq!(owner.fees, settled_fees);
+        assert_eq!(owner.gross_realized, settled_gross);
+        assert_eq!(owner.state_version, settled_version);
+        let receipt = owner.execution_receipts.values().next().unwrap();
+        assert_eq!(receipt.order_type(), admission::OrderType::Market);
+        assert!(receipt
+            .delivery_json(&format!("C-{id}"))
+            .unwrap()
+            .canonical()
+            .unwrap()
+            .contains("\"limit_price\":null"));
+        assert_eq!(owner.orders[&order_id].facts.status, "FILLED");
+        assert_eq!(owner.orders[&order_id].facts.filled, d("0.5"));
+    }
+}
+
+#[test]
+fn historical_market_admission_rejections_do_not_publish_account_mutations() {
+    let (seed, mut products) = configured_ab();
+    for product in &mut products {
+        for mark in &mut product.marks {
+            mark.valid_to = i64::MAX;
+        }
+    }
+
+    let mut limited = ScenarioAccount::from_configured(&seed, d("10"), products.clone()).unwrap();
+    let before = limited.clone();
+    let intent = market_intent(
+        &limited,
+        "LIMITED-MARKET",
+        "A-USDT-SWAP",
+        Side::Long,
+        d("0.5"),
+        Some(d("100")),
+    );
+    let completion = limited
+        .apply_group(&market_group(&limited, "LIMITED-MARKET", intent))
+        .unwrap();
+    let error = completion.failure.unwrap();
+    assert_eq!(error, "INVALID_BTC_INTENT");
+    assert_market_failure_preserves_financial_state(&limited, &before, error);
+
+    let (seed, products) = configured_ab(); // Fixture mark ends at 3000, before admission at 16008.
+    let mut uncovered = ScenarioAccount::from_configured(&seed, d("10"), products).unwrap();
+    let before = uncovered.clone();
+    let intent = market_intent(
+        &uncovered,
+        "UNCOVERED-MARKET",
+        "A-USDT-SWAP",
+        Side::Short,
+        d("0.5"),
+        None,
+    );
+    let completion = uncovered
+        .apply_group(&market_group(&uncovered, "UNCOVERED-MARKET", intent))
+        .unwrap();
+    let error = completion.failure.unwrap();
+    assert_eq!(error, "UNSUPPORTED_CONTEXT_TRANSITION");
+    assert_market_failure_preserves_financial_state(&uncovered, &before, error);
+}
+
+#[test]
+fn historical_market_reference_admission_rounds_adversely_and_receipts_fix_price() {
+    for (id, side, expected) in [
+        ("ROUND-LONG", Side::Long, d("106")),
+        ("ROUND-SHORT", Side::Short, d("105")),
+    ] {
+        let (seed, mut products) = configured_ab();
+        products[0].specs[0].tick = d("1");
+        products[0].marks[0].price = d("105.3");
+        for product in &mut products {
+            for mark in &mut product.marks {
+                mark.valid_to = i64::MAX;
+            }
+        }
+        let mut owner = ScenarioAccount::from_configured(&seed, d("10"), products).unwrap();
+        let order_id = admit_market(&mut owner, id, side);
+        let receipt = &owner.intent_results[&format!("I-{id}")];
+        assert_eq!(receipt.order_type(), admission::OrderType::Market);
+        assert_eq!(
+            receipt.delivery_order(&format!("E-{id}")).unwrap().price,
+            expected
+        );
+        assert_eq!(owner.orders[&order_id].facts.price, expected);
+    }
+}
+
 #[test]
 fn historical_step_commits_through_the_existing_execution_owner() {
     let (seed, config, mut marks) = fixture();
@@ -157,7 +452,7 @@ fn historical_step_commits_through_the_existing_execution_owner() {
     market.working_orders[0].limit_price = None;
     assert_eq!(
         owner.historical_market_step(&market),
-        Err("HISTORICAL_MARKET_OWNER_UNSUPPORTED")
+        Err("INVALID_HISTORICAL_ORDER_SNAPSHOT")
     );
     assert_eq!(owner, before);
     let mut spec_crossing = input.clone();
@@ -382,6 +677,240 @@ fn h04_owner_steps_honor_pending_cancel_then_effect_and_exact_settlement() {
         .facts
         .projects_remainder("INVALID_ORDER")
         .is_ok_and(|working| !working));
+}
+
+#[test]
+fn historical_market_partial_keeps_null_limit_and_settles_remaining_capacity_once() {
+    let (mut seed, mut products) = configured_ab();
+    seed.effective_at = 0;
+    for product in &mut products {
+        for mark in &mut product.marks {
+            mark.valid_to = i64::MAX;
+        }
+    }
+    let a = products[0].product.clone();
+    let mut owner = ScenarioAccount::from_configured(&seed, d("10"), products).unwrap();
+    let order_id = admit_market_quantity(&mut owner, "PARTIAL-MARKET", Side::Long, d("1.5"));
+    assert_eq!(owner.orders[&order_id].facts.price, d("105"));
+
+    let mut first = node_input(
+        &owner,
+        NodeBar {
+            model: "OHLC4_OPEN_HIGH_LOW_CLOSE_V1",
+            bar_open_ms: 1_000,
+            step_index: 2,
+            a_ohlc: [d("100"), d("110"), d("90"), d("105")],
+            a_volume: "4",
+            a_mark: [d("100"), d("110"), d("90"), d("105")],
+        },
+        &[],
+    );
+    first.working_orders = owner.historical_working_orders().unwrap();
+    let first = owner.historical_market_step(&first).unwrap();
+    assert_eq!(first.raw_time_ms, 41_000);
+    assert_eq!(first.products[0].fills.len(), 1);
+    assert_eq!(
+        (
+            first.products[0].fills[0].order_id.as_str(),
+            first.products[0].fills[0].quantity,
+            first.products[0].fills[0].price
+        ),
+        (order_id.as_str(), d("1"), d("90"))
+    );
+    let remaining = owner.historical_working_orders().unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].order_id, order_id);
+    assert_eq!(remaining[0].kind, historical::OrderKind::Market);
+    assert_eq!(remaining[0].limit_price, None);
+    assert_eq!(remaining[0].remaining, d("0.5"));
+    let first_receipt = owner
+        .execution_receipts
+        .values()
+        .find(|receipt| receipt.historical_order_id() == order_id)
+        .unwrap();
+    assert_eq!(first_receipt.order_type(), admission::OrderType::Market);
+    assert!(first_receipt
+        .delivery_json("C-PARTIAL-MARKET")
+        .unwrap()
+        .canonical()
+        .unwrap()
+        .contains("\"limit_price\":null"));
+
+    let mut second = node_input(
+        &owner,
+        NodeBar {
+            model: "OHLC4_OPEN_HIGH_LOW_CLOSE_V1",
+            bar_open_ms: 1_000,
+            step_index: 3,
+            a_ohlc: [d("100"), d("110"), d("90"), d("105")],
+            a_volume: "4",
+            a_mark: [d("100"), d("110"), d("90"), d("105")],
+        },
+        &[],
+    );
+    second.working_orders = owner.historical_working_orders().unwrap();
+    let second = owner.historical_market_step(&second).unwrap();
+    assert_eq!(second.raw_time_ms, 61_000);
+    assert_eq!(second.products[0].fills.len(), 1);
+    assert_eq!(
+        (
+            second.products[0].fills[0].quantity,
+            second.products[0].fills[0].price
+        ),
+        (d("0.5"), d("105"))
+    );
+    assert_eq!(owner.orders[&order_id].facts.status, "FILLED");
+    assert_eq!(owner.orders[&order_id].facts.remaining, Decimal::ZERO);
+    assert_eq!(
+        (owner.cash, owner.fees, owner.gross_realized),
+        (d("121.0575"), d("0.1425"), d("0"))
+    );
+    assert_eq!(owner.positions.btc().unwrap()[&a].contracts, d("1.5"));
+    assert_eq!(owner.execution_receipts.len(), 2);
+    assert_eq!(owner.gate, Gate::Running);
+
+    let settled = (
+        owner.cash,
+        owner.fees,
+        owner.gross_realized,
+        owner.state_version,
+    );
+    for fill in [&first.products[0].fills[0], &second.products[0].fills[0]] {
+        let duplicate = execution::historical_candidate(
+            &owner,
+            &order_id,
+            fill.price,
+            fill.quantity,
+            if fill.execution_id == first.products[0].fills[0].execution_id {
+                first.effective_at
+            } else {
+                second.effective_at
+            },
+            fill.execution_id,
+        )
+        .unwrap();
+        let effective_at = if fill.execution_id == first.products[0].fills[0].execution_id {
+            first.effective_at
+        } else {
+            second.effective_at
+        };
+        let stamp = source::stamp(&fill.source_event_id, effective_at, 30);
+        assert!(matches!(
+            owner.execute_stamped(&duplicate, &stamp, |_| Ok(())),
+            Ok(execution::commit::Reply::Duplicate(_))
+        ));
+    }
+    assert_eq!(
+        (
+            owner.cash,
+            owner.fees,
+            owner.gross_realized,
+            owner.state_version
+        ),
+        settled
+    );
+    assert_eq!(owner.execution_receipts.len(), 2);
+    assert_eq!(owner.gate, Gate::Running);
+}
+
+#[test]
+fn historical_gap_crossing_settles_both_eligible_limit_orders_without_terminal_gate() {
+    let (mut seed, mut products) = configured_ab();
+    seed.cash = d("1000");
+    seed.effective_at = 0;
+    products[0].taker_fee = d("0.001");
+    for mark in &mut products[0].marks {
+        mark.valid_to = i64::MAX;
+    }
+    let a = products[0].product.clone();
+    seed.orders = [
+        ("GAP-ORDER-1", Side::Long, "105"),
+        ("GAP-ORDER-2", Side::Long, "95"),
+    ]
+    .into_iter()
+    .map(|(id, side, price)| SeedOrder {
+        intent_id: format!("{id}-INTENT"),
+        order_id: id.into(),
+        client_id: format!("{id}-CLIENT"),
+        strategy_id: "GAP-STRATEGY".into(),
+        product: ProfileProduct::BtcEth(a.clone()),
+        side,
+        price: d(price),
+        reduce_only: false,
+        original: d("1"),
+        filled: Decimal::ZERO,
+        canceled: Decimal::ZERO,
+        remaining: d("1"),
+        status: "OPEN".into(),
+    })
+    .collect();
+    let mut owner = ScenarioAccount::from_configured(&seed, d("10"), products).unwrap();
+    let input = node_input(
+        &owner,
+        NodeBar {
+            model: "OHLC4_OPEN_HIGH_LOW_CLOSE_V1",
+            bar_open_ms: 1_000,
+            step_index: 2,
+            a_ohlc: [d("100"), d("110"), d("90"), d("105")],
+            a_volume: "8",
+            a_mark: [d("100"); 4],
+        },
+        &[("GAP-ORDER-1", 1), ("GAP-ORDER-2", 2)],
+    );
+
+    let result = owner.historical_market_step(&input).unwrap();
+    let fills = &result.products[0].fills;
+    assert_eq!(
+        fills
+            .iter()
+            .map(|fill| (fill.order_id.as_str(), fill.quantity, fill.price))
+            .collect::<Vec<_>>(),
+        [
+            ("GAP-ORDER-1", d("1"), d("105")),
+            ("GAP-ORDER-2", d("1"), d("95")),
+        ]
+    );
+    assert_eq!(owner.execution_receipts.len(), 2);
+    assert_eq!(
+        (owner.cash, owner.fees, owner.gross_realized),
+        (d("999.8"), d("0.2"), d("0"))
+    );
+    assert_eq!(owner.positions.btc().unwrap()[&a].contracts, d("2"));
+    assert_eq!(owner.gate, Gate::Running);
+
+    let settled = (
+        owner.cash,
+        owner.fees,
+        owner.gross_realized,
+        owner.state_version,
+    );
+    for fill in fills {
+        let duplicate = execution::historical_candidate(
+            &owner,
+            &fill.order_id,
+            fill.price,
+            fill.quantity,
+            result.effective_at,
+            fill.execution_id,
+        )
+        .unwrap();
+        let stamp = source::stamp(&fill.source_event_id, result.effective_at, 30);
+        assert!(matches!(
+            owner.execute_stamped(&duplicate, &stamp, |_| Ok(())),
+            Ok(execution::commit::Reply::Duplicate(_))
+        ));
+    }
+    assert_eq!(
+        (
+            owner.cash,
+            owner.fees,
+            owner.gross_realized,
+            owner.state_version
+        ),
+        settled
+    );
+    assert_eq!(owner.execution_receipts.len(), 2);
+    assert_eq!(owner.gate, Gate::Running);
 }
 
 #[test]

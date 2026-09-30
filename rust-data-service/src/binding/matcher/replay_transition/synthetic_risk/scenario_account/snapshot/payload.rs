@@ -11,6 +11,7 @@ pub(super) struct PositionRow {
 pub(super) struct OrderRow {
     pub facts: SeedOrder,
     pub created_at: i64,
+    pub limit_price: Option<Decimal>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Payload {
@@ -98,7 +99,12 @@ impl Payload {
                     ] {
                         e.text(s);
                     }
-                    for v in [o.price, o.original, o.filled] {
+                    if let Some(limit_price) = r.limit_price {
+                        decimal(e, limit_price);
+                    } else {
+                        e.text("MARKET");
+                    }
+                    for v in [o.original, o.filled] {
                         decimal(e, v);
                     }
                     e.integer(r.created_at);
@@ -204,6 +210,9 @@ pub(super) fn current(owner: &ScenarioAccount, kind: Kind) -> Result<Payload, Fa
                     rows.push(OrderRow {
                         facts: order.facts.clone(),
                         created_at: order.created_at,
+                        limit_price: (owner.admitted_order_type(&order.facts)
+                            == admission::OrderType::Limit)
+                            .then_some(order.facts.price),
                     });
                 }
             }

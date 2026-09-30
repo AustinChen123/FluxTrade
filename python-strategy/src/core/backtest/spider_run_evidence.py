@@ -109,7 +109,11 @@ def _historical_snapshot_matches(owner: dict[str, _Any], cutoff: int,
                 else:
                     for field in ("order_id", "client_order_id", "product_id", "state", "side"):
                         text(row[field])
-                    for field in ("limit_price", "original_size_contracts", "cumulative_filled_size_contracts"):
+                    if row["limit_price"] is None:
+                        text("MARKET")
+                    else:
+                        decimal(row["limit_price"])
+                    for field in ("original_size_contracts", "cumulative_filled_size_contracts"):
                         decimal(row[field])
                     integer(row["created_at"])
         return _sha256(encoded).hexdigest()

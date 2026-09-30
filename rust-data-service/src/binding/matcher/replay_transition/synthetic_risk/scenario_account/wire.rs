@@ -183,7 +183,7 @@ impl Json {
     }
     pub(super) fn canonical(&self) -> Result<String, Fault> {
         Ok(match self {
-            Self::Null => return Err("NATIVE_INVARIANT"),
+            Self::Null => "null".into(),
             Self::Bool(b) => b.to_string(),
             Self::Number(_) => self
                 .integer(false)

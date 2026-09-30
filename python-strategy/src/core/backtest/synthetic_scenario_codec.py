@@ -231,7 +231,7 @@ class ExecutionFact(TypedDict):
     product_id: Product
     state: Literal["partially_filled", "filled"]
     side: ObservedSide
-    limit_price: Decimal
+    limit_price: Decimal | None
     fill_price: Decimal
     original_size_contracts: Decimal
     cumulative_filled_size_contracts: Decimal
@@ -288,7 +288,7 @@ class OpenOrder(TypedDict):
     product_id: str
     state: Literal["live", "partially_filled"]
     side: ObservedSide
-    limit_price: Decimal
+    limit_price: Decimal | None
     original_size_contracts: Decimal
     cumulative_filled_size_contracts: Decimal
     created_at: int

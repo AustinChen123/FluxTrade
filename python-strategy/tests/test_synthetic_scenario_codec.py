@@ -343,7 +343,7 @@ def test_historical_codec_commits_a_then_b_fills_in_configured_order():
     assert result["owner_evidence"]["total_fees"] == Decimal("0.001")
 
 
-def test_historical_codec_bad_product_time_snapshot_and_market_reject_without_mutation():
+def test_historical_codec_bad_product_time_and_unowned_market_snapshot_reject_without_mutation():
     configuration = _configured_input(2)
     configuration["orders"] = [_seeded_working_order()]
     codec = c.ScenarioCodec("SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1", KEY, configuration)
@@ -366,7 +366,7 @@ def test_historical_codec_bad_product_time_snapshot_and_market_reject_without_mu
     stale_snapshot["working_orders"][0]["order_version"] = 1
     with pytest.raises(ValueError, match="^INVALID_HISTORICAL_ORDER_SNAPSHOT$"):
         codec.historical_market_step(stale_snapshot)
-    with pytest.raises(ValueError, match="^HISTORICAL_MARKET_OWNER_UNSUPPORTED$"):
+    with pytest.raises(ValueError, match="^INVALID_HISTORICAL_ORDER_SNAPSHOT$"):
         codec.historical_market_step(market)
     assert codec.inspect_state() == before
     invalid = _historical_node(configuration)

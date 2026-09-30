@@ -126,6 +126,7 @@ impl ScenarioAccount {
     ) -> Result<CommittedExecution, Fault> {
         let template = &candidate.template;
         let order = self.target_order(&template.order_id)?;
+        let order_type = self.admitted_order_type(&order.facts);
         let order_version_before = order.version;
         let (product, before_reservation, position_before, settled) =
             if matches!(self.profile, ProfileContext::EventLimit(_)) {
@@ -306,6 +307,7 @@ impl ScenarioAccount {
             rule_data_version: candidate.rule_data_version.clone(),
             risk_state_after: risk,
             pending_action_ids: Vec::new(),
+            order_type,
         })
     }
 }

@@ -223,6 +223,7 @@ pub(super) struct CommittedExecution {
     rule_data_version: String,
     risk_state_after: ProfileRisk,
     pending_action_ids: Vec<String>,
+    order_type: admission::OrderType,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -235,6 +236,9 @@ enum Preparation<'a> {
 impl CommittedExecution {
     pub(super) fn historical_order_id(&self) -> &str {
         &self.order_id
+    }
+    pub(super) fn order_type(&self) -> admission::OrderType {
+        self.order_type
     }
     pub(super) fn historical_fill(&self) -> (Decimal, Decimal, Hash) {
         (self.quantity, self.price, self.execution_id)
@@ -273,13 +277,12 @@ impl CommittedExecution {
         ] {
             e.text(s);
         }
-        for v in [
-            o.price,
-            self.price,
-            o.original,
-            o.filled,
-            self.contract_value,
-        ] {
+        if self.order_type == admission::OrderType::Market {
+            e.text("MARKET");
+        } else {
+            e.text(&o.price.normalize().to_string());
+        }
+        for v in [self.price, o.original, o.filled, self.contract_value] {
             e.text(&v.normalize().to_string());
         }
         e.integer(self.execution_effective_at);
@@ -475,10 +478,11 @@ impl ScenarioAccount {
             || !aligned(template.quantity, spec.lot)
             || template.price <= Decimal::ZERO
             || !aligned(template.price, spec.tick)
-            || match facts.side {
-                Side::Long => template.price > facts.price,
-                Side::Short => template.price < facts.price,
-            }
+            || (self.admitted_order_type(facts) == admission::OrderType::Limit
+                && match facts.side {
+                    Side::Long => template.price > facts.price,
+                    Side::Short => template.price < facts.price,
+                })
         {
             return Err("UNSUPPORTED_EXECUTION");
         }

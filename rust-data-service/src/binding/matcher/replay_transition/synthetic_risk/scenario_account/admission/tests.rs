@@ -18,6 +18,14 @@ fn event_limit_profile_never_admits_an_intent() {
     assert_eq!(owner, expected);
 }
 
+#[test]
+fn ordinary_s_order_market_intent_remains_unsupported() {
+    let (owner, mut intent) = setup(capacity::Program::CapacityV1);
+    intent.order_type = OrderType::Market;
+    intent.limit_price = None;
+    assert_fatal(owner, &intent, 500, "UNSUPPORTED_ORDER_TYPE");
+}
+
 fn setup(program: capacity::Program) -> (ScenarioAccount, OrderIntent) {
     let (mut seed, _, _) = fixture();
     seed.positions.clear();
@@ -326,7 +334,7 @@ fn invalid_input_context_and_seed_identity_precedence_are_atomic() {
 fn preparation_faults_panics_and_dropped_drafts_never_publish() {
     let (owner, intent) = setup(capacity::Program::CapacityV1);
     let prepared = owner
-        .prepare_admission(&event(&intent), |_| Ok(()))
+        .prepare_admission(&event(&intent), false, |_| Ok(()))
         .unwrap();
     assert_eq!(prepared.draft.orders.len(), 1);
     drop(prepared);

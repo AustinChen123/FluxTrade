@@ -1,10 +1,13 @@
+import json
 from copy import deepcopy
 from decimal import Decimal as D
 from typing import cast
 
 import pytest
 
+from src.core.backtest import spider_run_native_schema as native_schema
 from src.core.backtest import synthetic_scenario_codec as wire
+from src.core.backtest.spider_run_artifacts import configuration_context
 from src.core.backtest.synthetic_scenario_replay import _ReplayComposition
 from test_synthetic_scenario_codec import _configured_input, _historical_node, _seeded_working_order
 
@@ -138,7 +141,60 @@ def test_scheduler_commits_limit_fill_via_native_owner_once(monkeypatch):
     assert result["owner_evidence"]["total_fees"] == D("0.0005")
 
 
-def test_scheduler_preserves_native_market_owner_rejection_without_mutation():
+def test_market_deliveries_map_null_limit_to_empty_policy_price():
+    configuration = _configured_input(2)
+    owner = _ReplayComposition(PROFILE, ACCOUNT, configuration=configuration)
+    context = configuration_context({
+        "schema_version": "spider_configuration_context_v1",
+        "config_id": configuration["config_id"],
+        "configuration_sha256": "f" * 64,
+        "products": [product["product_id"] for product in configuration["products"]],
+    })
+    execution = {
+        "order_id": "market-order", "owner_client_order_id": "owner-client",
+        "policy_client_order_id": "policy-client", "product_id": "WIRE-Z",
+        "state": "partially_filled", "side": "buy", "limit_price": None,
+        "fill_price": "90", "original_size_contracts": "1.5",
+        "cumulative_filled_size_contracts": "1", "contract_value": "1",
+        "execution_effective_at": 41_000 * 16 + 5, "commit_account_version": 2,
+        "spec_version": "s1", "rule_data_version": "s1",
+    }
+    open_orders = {"outcome": "SUCCESS", "rows": [{
+        "order_id": "market-order", "client_order_id": "policy-client",
+        "product_id": "WIRE-Z", "state": "partially_filled", "side": "buy",
+        "limit_price": None, "original_size_contracts": "1.5",
+        "cumulative_filled_size_contracts": "1", "created_at": 16_008,
+    }]}
+    expected_replies = [
+        {"market-order": {
+            "instId": "WIRE-Z", "side": "buy", "px": "", "clOrdId": "policy-client",
+            "state": "partially_filled", "sz": "1.5", "accFillSz": "1",
+            "cTime": str(41_000 * 16 + 5),
+        }},
+        {"market-order": {
+            "clOrdId": "policy-client", "instId": "WIRE-Z", "state": "partially_filled",
+            "side": "buy", "px": "", "sz": "1.5", "accFillSz": "1",
+            "cTime": "16008",
+        }},
+    ]
+    for sequence, ((kind, payload), expected) in enumerate(zip(
+        [("EXECUTION_FACT", execution), ("OPEN_ORDER_SNAPSHOT", open_orders)],
+        expected_replies,
+        strict=True,
+    )):
+        delivery = {
+            "account_key": ACCOUNT, "delivery_id": f"delivery-{sequence}",
+            "source_fact_id": f"fact-{sequence}", "source_namespace": "SOURCE",
+            "payload_kind": kind, "occurrence_index": 0, "schedule_sequence": sequence,
+            "immutable_payload": payload, "payload_digest": "e" * 64, "visible_at": 50_000,
+        }
+        native_schema.delivery(delivery, context=context)
+        runtime_delivery = cast(wire.Delivery, wire._decode(json.dumps(delivery)))
+        owner._apply_payload(runtime_delivery)
+        assert owner._policy.replies == expected
+
+
+def test_scheduler_rejects_market_metadata_not_proven_by_native_admission():
     owner = _owner(with_order=True)
     before = owner._codec.inspect_state()
     node = _historical_node(_configured_input(2), bar_open_ms=60, volume=D("1"), working_orders=[{
@@ -150,5 +206,5 @@ def test_scheduler_preserves_native_market_owner_rejection_without_mutation():
     assert owner._enqueue(_item(node))["classification"] == "PENDING"
     rejected = owner._dispatch_due(967)
     assert rejected["classification"] == "TERMINAL"
-    assert rejected["reason"] == "HISTORICAL_MARKET_OWNER_UNSUPPORTED"
+    assert rejected["reason"] == "INVALID_HISTORICAL_ORDER_SNAPSHOT"
     assert owner._codec.inspect_state() == before

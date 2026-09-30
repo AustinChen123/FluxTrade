@@ -135,6 +135,7 @@ fn receipt_fixture(owner: &ScenarioAccount, candidate: &ExecutionCandidate) -> C
         rule_data_version: candidate.rule_data_version.clone(),
         risk_state_after: ProfileRisk::BtcEth(MaintenanceState::Safe),
         pending_action_ids: Vec::new(),
+        order_type: admission::OrderType::Limit,
     }
 }
 

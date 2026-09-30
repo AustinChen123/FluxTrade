@@ -1,14 +1,24 @@
 use super::*;
 
 impl ScenarioAccount {
-    fn historical_meta_matches(meta: &WorkingOrderMeta, facts: &SeedOrder) -> Result<bool, Fault> {
+    fn historical_meta_matches(
+        &self,
+        meta: &WorkingOrderMeta,
+        facts: &SeedOrder,
+    ) -> Result<bool, Fault> {
+        let (kind, limit_price) = match self.admitted_order_type(facts) {
+            admission::OrderType::Limit => (OrderKind::Limit, Some(facts.price)),
+            admission::OrderType::Market => (OrderKind::Market, None),
+            admission::OrderType::Unsupported => return Err("INVALID_HISTORICAL_ORDER_SNAPSHOT"),
+        };
         Ok(
             facts.projects_remainder("INVALID_HISTORICAL_ORDER_SNAPSHOT")?
                 && meta.status == facts.status
                 && meta.remaining == facts.remaining
                 && meta.side == facts.side
                 && meta.product == *facts.product.btc()?
-                && meta.limit_price == Some(facts.price),
+                && meta.kind == kind
+                && meta.limit_price == limit_price,
         )
     }
 
@@ -28,11 +38,11 @@ impl ScenarioAccount {
         };
         match &order.cancel {
             State::None => Ok(order.version == meta.order_version
-                && Self::historical_meta_matches(meta, &order.facts)?
+                && self.historical_meta_matches(meta, &order.facts)?
                 && !meta.risk_cancel_pending),
             State::Requested(request) => Ok((order.version == meta.order_version
                 || order.version == meta.order_version.saturating_add(1))
-                && Self::historical_meta_matches(meta, &order.facts)?
+                && self.historical_meta_matches(meta, &order.facts)?
                 && meta.risk_cancel_pending == cancel_pending(request.reason)),
             State::EffectiveCanceled(effect) => {
                 let Some(receipt) = self
@@ -47,7 +57,7 @@ impl ScenarioAccount {
                         && receipt.order_version_after == order.version
                         && receipt.order_version_before >= meta.order_version
                         && receipt.order_version_before <= meta.order_version.saturating_add(1)
-                        && Self::historical_meta_matches(meta, &receipt.before)?
+                        && self.historical_meta_matches(meta, &receipt.before)?
                         && meta.risk_cancel_pending == cancel_pending(receipt.reason)
                         && receipt.after == order.facts,
                 )
@@ -149,13 +159,8 @@ impl ScenarioAccount {
             if meta.accepted_source_sequence < 0
                 || meta.accepted_at != order.created_at
                 || !self.historical_cancel_projection_matches(meta, order)?
-                || meta.kind == OrderKind::Market
             {
-                return Err(if meta.kind == OrderKind::Market {
-                    "HISTORICAL_MARKET_OWNER_UNSUPPORTED"
-                } else {
-                    "INVALID_HISTORICAL_ORDER_SNAPSHOT"
-                });
+                return Err("INVALID_HISTORICAL_ORDER_SNAPSHOT");
             }
         }
         let segment_boundary = segment_start(
@@ -321,7 +326,7 @@ impl ScenarioAccount {
                         accepted_source_sequence: meta.accepted_source_sequence,
                         kind: meta.kind,
                         side: order.facts.side,
-                        limit_price: Some(order.facts.price),
+                        limit_price: meta.limit_price,
                         risk_cancel_pending: matches!(
                             order.cancel,
                             risk_transition::cancel::State::Requested(ref request)

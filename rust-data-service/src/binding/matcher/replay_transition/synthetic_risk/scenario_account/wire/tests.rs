@@ -74,7 +74,7 @@ fn canonical_unicode_and_all_control_bytes_are_independent_literals() {
     assert_eq!(decode(expected).unwrap(), text(&controls));
     assert_eq!(decode(r#""\b\t\n\f\r""#).unwrap(), text("\u{8}\t\n\u{c}\r"));
     assert_ne!(text("é").canonical(), text("e\u{301}").canonical());
-    assert_eq!(Json::Null.canonical(), Err("NATIVE_INVARIANT"));
+    assert_eq!(Json::Null.canonical(), Ok("null".into()));
 }
 
 #[test]

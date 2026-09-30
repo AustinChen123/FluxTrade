@@ -359,6 +359,29 @@ fn round_to_tick(value: Decimal, tick: Decimal, upward: bool) -> Result<Decimal,
         .map_err(|_| "DECIMAL_OVERFLOW")
 }
 
+pub(super) fn admission_reference_price(
+    owner: &ScenarioAccount,
+    product: &Product,
+    side: Side,
+    effective_at: i64,
+) -> Result<Decimal, Fault> {
+    let (scenario, marks) = owner.btc_context()?;
+    let mark = marks
+        .iter()
+        .find(|mark| {
+            mark.product == *product
+                && mark.valid_from <= effective_at
+                && effective_at < mark.valid_to
+        })
+        .ok_or("MARK_COVERAGE_MISSING")?;
+    let (spec, _) = scenario.resolve(product, effective_at)?;
+    let reference = round_to_tick(mark.price, spec.tick, side == Side::Long)?;
+    if reference <= Decimal::ZERO {
+        return Err("INVALID_BTC_INTENT");
+    }
+    Ok(reference)
+}
+
 fn derived_execution_id(
     run_contract_hash: Hash,
     model: Model,

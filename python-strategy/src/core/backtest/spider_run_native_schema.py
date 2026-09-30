@@ -212,7 +212,8 @@ def open_order(value: object, *, context: ConfigurationContext | None = None) ->
     _product_id(row["product_id"], context, None)
     _enum(row["state"], ["live", "partially_filled"])
     _enum(row["side"], ["buy", "sell"])
-    _fields(row, "limit_price original_size_contracts cumulative_filled_size_contracts", _decimal_text)
+    _optional(row, "limit_price", _decimal_text, nullable=True)
+    _fields(row, "original_size_contracts cumulative_filled_size_contracts", _decimal_text)
     _integer(row["created_at"])
 
 
@@ -255,7 +256,8 @@ def execution_fact(value: object, *, context: ConfigurationContext | None = None
     _product_id(row["product_id"], context, _PRODUCTS)
     _enum(row["state"], ["partially_filled", "filled"])
     _enum(row["side"], ["buy", "sell"])
-    _fields(row, "limit_price fill_price original_size_contracts cumulative_filled_size_contracts contract_value", _decimal_text)
+    _optional(row, "limit_price", _decimal_text, nullable=True)
+    _fields(row, "fill_price original_size_contracts cumulative_filled_size_contracts contract_value", _decimal_text)
     _fields(row, "execution_effective_at commit_account_version", _integer)
 
 

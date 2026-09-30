@@ -47,7 +47,14 @@ impl CommittedExecution {
             ("product_id", string(o.product.canonical_id())),
             ("state", string(state)),
             ("side", string(delivery::side(o.side))),
-            ("limit_price", decimal(o.price)),
+            (
+                "limit_price",
+                if self.order_type() == admission::OrderType::Market {
+                    Json::Null
+                } else {
+                    decimal(o.price)
+                },
+            ),
             ("fill_price", decimal(self.price)),
             ("original_size_contracts", decimal(o.original)),
             ("cumulative_filled_size_contracts", decimal(o.filled)),
