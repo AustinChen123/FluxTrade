@@ -13,7 +13,7 @@ import json
 import re
 from typing import Any, Callable, TypeVar, cast
 
-from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_canonical
+from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_canonical, historical_context
 
 
 SCHEMA_ID = "SPIDER_HISTORICAL_RESEARCH_RUN_V1"
@@ -647,10 +647,78 @@ def validate_historical_input(run: HistoricalRunInput) -> str:
                 )
             ):
                 raise HistoricalInputError("endpoint configured spec differs from run evidence")
-    semantic_input = asdict(run)
-    semantic_input.pop("run_id")
-    semantic_input["parameters"] = _parameter_projection(run.parameters)
-    return _digest(semantic_input)
+    return _digest(_semantic_input_projection(run))
+
+
+def _semantic_input_projection(run: HistoricalRunInput, *, model_id: str | None = None) -> dict[str, object]:
+    projection = asdict(run)
+    projection.pop("run_id")
+    projection["parameters"] = _parameter_projection(run.parameters)
+    if model_id is not None:
+        projection["model_id"] = model_id
+    return projection
+
+
+def historical_context_for_input(run: HistoricalRunInput) -> dict[str, object]:
+    """Build detached, category-specific identity hashes for validated historical evidence."""
+    input_hash = validate_historical_input(run)
+    source_hash = _digest({
+        "trade_manifest": asdict(run.trade_manifest),
+        "mark_manifest": asdict(run.mark_manifest),
+        "spec_before": [asdict(spec) for spec in run.spec_before],
+        "spec_after": [asdict(spec) for spec in run.spec_after],
+    })
+    model_hash = _digest({"model_id": run.model_id, "model_version": run.model_version})
+    assumption_hash = _digest({
+        "parameters": _parameter_projection(run.parameters),
+        "policy_id": run.policy_id, "policy_version": run.policy_version,
+        "policy_source_sha256": run.policy_source_sha256,
+        "strategy_identity": run.strategy_identity,
+        "configuration_sha256": run.configuration_sha256,
+        "market_slippage_bps": run.market_slippage_bps,
+        "execution_fee_provenance": run.execution_fee_provenance,
+        "funding_mode": run.funding_mode,
+        "timer_period_ms": run.timer_period_ms, "first_timer_ms": run.first_timer_ms,
+        "local_clock_zone": run.local_clock_zone,
+        "order_accept_delay_ms": run.order_accept_delay_ms,
+        "cancel_effect_delay_ms": run.cancel_effect_delay_ms,
+        "order_notice_delay_ms": run.order_notice_delay_ms,
+        "cancel_ack_delay_ms": run.cancel_ack_delay_ms,
+        "poll_profile": run.poll_profile, "endpoint_policy_id": run.endpoint_policy_id,
+        "initial_policy_cache_sha256": sha256(run.initial_policy_cache).hexdigest(),
+        "initial_account_state_sha256": sha256(run.initial_account_state).hexdigest(),
+    })
+    coverage_hash = _digest({
+        "ordered_products": run.ordered_products,
+        "warmup_start_ms": run.warmup_start_ms,
+        "range_start_ms": run.range_start_ms, "range_end_ms": run.range_end_ms,
+        "bar_duration_ms": run.bar_duration_ms,
+        "trade": _manifest_coverage(run.trade_manifest),
+        "mark": _manifest_coverage(run.mark_manifest),
+    })
+    path_pair_hash = _digest(_semantic_input_projection(run, model_id="OHLC4_PATH_PAIR_V1"))
+    return historical_context({
+        "schema_version": "spider_historical_context_v1",
+        "research_classification": "RESEARCH_ONLY",
+        "historical_input_sha256": input_hash,
+        "path_pair_sha256": path_pair_hash,
+        "source_sha256": source_hash,
+        "model_sha256": model_hash,
+        "assumption_sha256": assumption_hash,
+        "coverage_sha256": coverage_hash,
+        "model_id": run.model_id,
+        "model_version": run.model_version,
+    })._asdict()
+
+
+def _manifest_coverage(manifest: SourceManifest) -> dict[str, object]:
+    return {
+        "canonical_rows_sha256": manifest.canonical_rows_sha256,
+        "source_row_count": manifest.source_row_count,
+        "normalized_row_count": manifest.normalized_row_count,
+        "first_source_timestamp_ms": manifest.first_source_timestamp_ms,
+        "last_source_timestamp_ms": manifest.last_source_timestamp_ms,
+    }
 
 
 _RUN_INPUT_KEYS = frozenset({

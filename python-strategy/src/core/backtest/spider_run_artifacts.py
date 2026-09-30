@@ -20,6 +20,7 @@ _TERMINALS = "SCHEDULED_MTM LEGAL_NATIVE_LIQUIDATION_FINAL_EVENT O03_NON_ATOMIC_
 _FAILURES = "UNSUPPORTED_CONFIGURATION PERSISTENCE_FAILED CALLBACK_FAILED NATIVE_FAULT NATIVE_POISONED SCHEDULER_FAILED ENDPOINT_RECONCILIATION_FAILED ARTIFACT_WRITE_FAILED PUBLICATION_FAILED PUBLICATION_DURABILITY_UNKNOWN UNEXPECTED_EXCEPTION".split()
 _P1_RUN_CONTRACT = "SPIDER_SYNTHETIC_P1_RUN_V1"
 _P2_RUN_CONTRACT = "SPIDER_SYNTHETIC_P2_CONFIGURED_RUN_V1"
+_HISTORICAL_MODELS = ("OHLC4_OPEN_HIGH_LOW_CLOSE_V1", "OHLC4_OPEN_LOW_HIGH_CLOSE_V1")
 
 
 class ConfigurationContext(NamedTuple):
@@ -27,6 +28,19 @@ class ConfigurationContext(NamedTuple):
     config_id: str
     configuration_sha256: str
     products: tuple[str, ...]
+
+
+class HistoricalContext(NamedTuple):
+    schema_version: str
+    research_classification: str
+    historical_input_sha256: str
+    path_pair_sha256: str
+    source_sha256: str
+    model_sha256: str
+    assumption_sha256: str
+    coverage_sha256: str
+    model_id: str
+    model_version: int
 
 
 def _require(condition: bool) -> None:
@@ -109,6 +123,35 @@ def _configuration_context(value: object) -> dict[str, object]:
         "configuration_sha256": context.configuration_sha256,
         "products": list(context.products),
     }
+
+
+def historical_context(value: object) -> HistoricalContext:
+    """Validate and detach the frozen historical evidence identity context."""
+    if type(value) is HistoricalContext:
+        context = cast(HistoricalContext, value)
+        row: dict[str, object] = context._asdict()
+    else:
+        row = _object(value, "schema_version research_classification historical_input_sha256 path_pair_sha256 source_sha256 model_sha256 assumption_sha256 coverage_sha256 model_id model_version")
+    _enum(row["schema_version"], ["spider_historical_context_v1"])
+    _enum(row["research_classification"], ["RESEARCH_ONLY"])
+    for field in ("historical_input_sha256", "path_pair_sha256", "source_sha256", "model_sha256", "assumption_sha256", "coverage_sha256"):
+        _text(row[field], r"[0-9a-f]{64}")
+    model_id = _enum(row["model_id"], _HISTORICAL_MODELS)
+    model_version = row["model_version"]
+    _require(type(model_version) is int and model_version == 1)
+    if type(value) is HistoricalContext:
+        return value
+    return HistoricalContext(
+        cast(str, row["schema_version"]), cast(str, row["research_classification"]),
+        cast(str, row["historical_input_sha256"]), cast(str, row["path_pair_sha256"]),
+        cast(str, row["source_sha256"]), cast(str, row["model_sha256"]),
+        cast(str, row["assumption_sha256"]), cast(str, row["coverage_sha256"]),
+        model_id, cast(int, model_version),
+    )
+
+
+def _historical_context(value: object) -> dict[str, object]:
+    return historical_context(value)._asdict()
 
 
 def _optional_context(row: dict[str, object]) -> dict[str, object] | None:

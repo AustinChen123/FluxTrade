@@ -57,6 +57,47 @@ def configuration_context(products=None, config_id="configured-v1"):
     }
 
 
+def historical_context():
+    return {
+        "schema_version": "spider_historical_context_v1",
+        "research_classification": "RESEARCH_ONLY",
+        "historical_input_sha256": "1" * 64,
+        "path_pair_sha256": "2" * 64,
+        "source_sha256": "3" * 64,
+        "model_sha256": "4" * 64,
+        "assumption_sha256": "5" * 64,
+        "coverage_sha256": "6" * 64,
+        "model_id": "OHLC4_OPEN_HIGH_LOW_CLOSE_V1",
+        "model_version": 1,
+    }
+
+
+def test_historical_context_is_strict_and_detached():
+    original = historical_context()
+    context = a.historical_context(original)
+    assert type(context) is a.HistoricalContext
+    assert a._historical_context(context) == original
+    for key in original:
+        row = deepcopy(original)
+        del row[key]
+        with pytest.raises(ValueError):
+            a.historical_context(row)
+    with pytest.raises(ValueError):
+        a.historical_context({**original, "extra": None})
+    for field, value in (
+        ("schema_version", "spider_historical_context_v2"),
+        ("research_classification", "ADMITTED"),
+        ("historical_input_sha256", "A" * 64),
+        ("path_pair_sha256", "x" * 64),
+        ("model_id", "unknown"),
+        ("model_version", True),
+    ):
+        row = deepcopy(original)
+        row[field] = value
+        with pytest.raises(ValueError):
+            a.historical_context(row)
+
+
 def configured_attempt(products=None):
     row = attempt()
     row.update(

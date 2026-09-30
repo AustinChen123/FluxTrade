@@ -9,7 +9,7 @@ from typing import cast
 import pytest
 
 from src.core.backtest import spider_configured_scale_input as scale
-from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_canonical
+from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_canonical, historical_context
 from src.core.backtest.spider_historical_input import (
     BAR_DURATION_MS,
     SCHEMA_ID,
@@ -23,6 +23,7 @@ from src.core.backtest.spider_historical_input import (
     decode_historical_run_input,
     decode_p2_configuration,
     encode_historical_run_input,
+    historical_context_for_input,
     validate_historical_input,
 )
 
@@ -218,6 +219,58 @@ def test_parameter_type_is_part_of_semantic_hash_and_survives_codec_roundtrip():
     assert validate_historical_input(replace(decimal_run, run_id="another-transport-id")) == decimal_hash
     assert validate_historical_input(decode_historical_run_input(encode_historical_run_input(decimal_run))) == decimal_hash
     assert validate_historical_input(decode_historical_run_input(encode_historical_run_input(string_run))) == string_hash
+
+
+def test_historical_context_pairs_models_and_ignores_transport_run_id():
+    first = _valid_run()
+    second = replace(first, model_id="OHLC4_OPEN_LOW_HIGH_CLOSE_V1")
+    first_context = historical_context_for_input(first)
+    second_context = historical_context_for_input(second)
+    assert historical_context(first_context).model_id == first.model_id
+    assert first_context["schema_version"] == "spider_historical_context_v1"
+    assert first_context["research_classification"] == "RESEARCH_ONLY"
+    assert first_context["path_pair_sha256"] == second_context["path_pair_sha256"]
+    for field in ("source_sha256", "assumption_sha256", "coverage_sha256"):
+        assert first_context[field] == second_context[field]
+    assert first_context["historical_input_sha256"] != second_context["historical_input_sha256"]
+    assert first_context["model_sha256"] != second_context["model_sha256"]
+    assert first_context["model_id"] != second_context["model_id"]
+    assert historical_context_for_input(replace(first, run_id="other-transport")) == first_context
+    assert canonical_bytes(first_context) == canonical_bytes(historical_context_for_input(first))
+
+
+def test_historical_context_projection_categories_track_only_their_inputs():
+    run = _valid_run()
+    baseline = historical_context_for_input(run)
+
+    source_changed = replace(run, trade_manifest=replace(run.trade_manifest, raw_sha256="1" * 64))
+    source_context = historical_context_for_input(source_changed)
+    assert source_context["source_sha256"] != baseline["source_sha256"]
+    assert source_context["historical_input_sha256"] != baseline["historical_input_sha256"]
+    assert source_context["path_pair_sha256"] != baseline["path_pair_sha256"]
+    for field in ("model_sha256", "assumption_sha256", "coverage_sha256"):
+        assert source_context[field] == baseline[field]
+
+    assumption_changed = replace(run, parameters=(("defaultN", Decimal("2")),))
+    assumption_context = historical_context_for_input(assumption_changed)
+    assert assumption_context["assumption_sha256"] != baseline["assumption_sha256"]
+    assert assumption_context["historical_input_sha256"] != baseline["historical_input_sha256"]
+    assert assumption_context["path_pair_sha256"] != baseline["path_pair_sha256"]
+    for field in ("source_sha256", "model_sha256", "coverage_sha256"):
+        assert assumption_context[field] == baseline[field]
+
+    changed_trade = tuple(
+        replace(row, open=Decimal("101"), high=Decimal("101"), low=Decimal("101"), close=Decimal("101"))
+        if row.product_id == "A-USDT-SWAP" and row.bar_open_ms == run.range_start_ms else row
+        for row in run.trade_bars
+    )
+    coverage_changed = historical_context_for_input(_rehashed_run(run, trade_rows=changed_trade))
+    assert coverage_changed["coverage_sha256"] != baseline["coverage_sha256"]
+    assert coverage_changed["source_sha256"] != baseline["source_sha256"]
+    assert coverage_changed["historical_input_sha256"] != baseline["historical_input_sha256"]
+    assert coverage_changed["path_pair_sha256"] != baseline["path_pair_sha256"]
+    for field in ("model_sha256", "assumption_sha256"):
+        assert coverage_changed[field] == baseline[field]
 
 
 @pytest.mark.parametrize("model_id", ["OHLC4_OPEN_HIGH_LOW_CLOSE_V1", "OHLC4_OPEN_LOW_HIGH_CLOSE_V1"])
