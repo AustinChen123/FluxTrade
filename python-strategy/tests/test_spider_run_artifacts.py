@@ -98,6 +98,15 @@ def test_historical_context_is_strict_and_detached():
             a.historical_context(row)
 
 
+def test_historical_attempt_uses_the_existing_configured_native_profile():
+    row = historical_attempt()
+    a.validate_artifact(row)
+    assert row["profile_id"] == "SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1"
+    row["profile_id"] = "HISTORICAL_MARKET_SCENARIO_ACCOUNT_V1"
+    with pytest.raises(ValueError):
+        a.validate_artifact(row)
+
+
 def configured_attempt(products=None):
     row = attempt()
     row.update(
@@ -116,7 +125,7 @@ def historical_attempt():
     row.update(
         run_contract_id="SPIDER_HISTORICAL_RESEARCH_RUN_V1",
         requested_scenario_selector="SPIDER_HISTORICAL_RESEARCH_RUN_V1",
-        profile_id="HISTORICAL_MARKET_SCENARIO_ACCOUNT_V1",
+        profile_id="SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1",
         account_key={"venue": "SPIDER_HISTORICAL_RESEARCH", "environment": "RESEARCH_ONLY", "account": "research"},
         scenario_plan_id="SPIDER_HISTORICAL_RESEARCH_RUN_V1",
         scenario_plan_sha256=context["historical_input_sha256"],
@@ -467,7 +476,7 @@ def test_historical_attempt_contract_is_closed(mutation):
     elif mutation == "bad_plan_hash":
         row["scenario_plan_sha256"] = "f" * 64
     elif mutation == "bad_profile":
-        row["profile_id"] = "SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1"
+        row["profile_id"] = "HISTORICAL_MARKET_SCENARIO_ACCOUNT_V1"
     elif mutation == "bad_venue":
         row["account_key"] = {**row["account_key"], "venue": "OTHER"}
     elif mutation == "bad_environment":

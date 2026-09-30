@@ -9,9 +9,16 @@ from typing import cast
 import pytest
 
 from src.core.backtest import synthetic_scenario_codec as wire
-from src.core.backtest.spider_historical_input import HistoricalInputError, HistoricalRunInput, validate_historical_input
+from src.core.backtest.spider_historical_input import (
+    HistoricalInputError, HistoricalRunInput, decode_p2_configuration,
+    encode_historical_run_input, historical_context_for_input,
+    historical_planned_coverage, validate_historical_input,
+)
 from src.core.backtest.spider_historical_replay import _ClosedMarketSnapshot
-from src.core.backtest.synthetic_scenario_replay import _ReplayComposition
+from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_canonical, decode_jsonl
+from src.core.backtest.spider_run_envelope_schema import journal_record
+from src.core.backtest.spider_run_store import SpiderRunStore, SpiderRunStoreError
+from src.core.backtest.synthetic_scenario_replay import ReplayPersistenceError, _ReplayComposition
 from test_spider_historical_input import (
     ANSWERS,
     ANSWERS_SHA256,
@@ -25,6 +32,7 @@ from test_spider_historical_input import (
     _run_with_configuration,
     _valid_run,
 )
+from test_spider_run_artifacts import historical_attempt
 
 
 _P3_ORACLE_EPOCH_MS = 1_790_640_000_000
@@ -200,8 +208,10 @@ def _node(run: HistoricalRunInput, open_ms: int, step: int) -> wire.HistoricalNo
     }
 
 
-def _composition(run: HistoricalRunInput) -> _ReplayComposition:
-    return _ReplayComposition._from_historical_run(run)
+def _composition(run: HistoricalRunInput, evidence_callback=None) -> _ReplayComposition:
+    composition = _ReplayComposition._from_historical_run(run)
+    composition._evidence_callback = evidence_callback
+    return composition
 
 
 def _extend_one_minute(run: HistoricalRunInput) -> HistoricalRunInput:
@@ -943,7 +953,7 @@ def test_seed_limit_projection_is_ranked_and_fills_only_after_seed_effective_at(
     ]
 
 
-def test_historical_chain_uses_frozen_owner_orders_and_commits_one_partial_fill():
+def test_historical_chain_uses_frozen_owner_orders_and_commits_one_partial_fill(tmp_path):
     run = _valid_run()
     trade_rows = tuple(
         replace(row, high=D("103"), low=D("98"), volume=D("0.1"))
@@ -951,7 +961,78 @@ def test_historical_chain_uses_frozen_owner_orders_and_commits_one_partial_fill(
         for row in run.trade_bars
     )
     run = _rehashed_run(run, trade_rows=trade_rows)
-    composition = _composition(run)
+    raw_input = encode_historical_run_input(run)
+    configuration = decode_p2_configuration(
+        run.configuration_bytes, run.configuration_sha256, run.ordered_products
+    )
+    config_context = dict(
+        schema_version="spider_configuration_context_v1",
+        config_id=configuration["config_id"],
+        configuration_sha256=run.configuration_sha256,
+        products=list(run.ordered_products),
+    )
+    history_context = historical_context_for_input(run)
+    attempt = historical_attempt()
+    attempt.update(
+        run_id=run.run_id,
+        account_key={"venue": "SPIDER_HISTORICAL_RESEARCH", "environment": "RESEARCH_ONLY",
+                     "account": run.account_key},
+        scenario_plan_sha256=history_context["historical_input_sha256"],
+        policy_source_sha256=run.policy_source_sha256,
+        configuration_context=config_context,
+        historical_context=history_context,
+        planned_coverage=historical_planned_coverage(run),
+    )
+    for item, key in zip(
+        attempt["input_contract_hashes"],
+        ("scenario_plan_sha256", "program_sha256", "native_artifact_sha256", "policy_source_sha256"),
+        strict=True,
+    ):
+        item["sha256"] = attempt[key]
+    store = SpiderRunStore.create(str(tmp_path), run.run_id)
+    store.register(attempt, historical_input=raw_input)
+    evidence = []
+    existing_notices_at_evidence = []
+    composition = None
+
+    def persist(kind, key, payload):
+        if kind == "HISTORICAL_MARKET_RESULT":
+            ordinal = len(decode_jsonl((store._path / "journal.jsonl").read_bytes())) + 1
+            detached_payload = decode_canonical(canonical_bytes(payload))
+            row = dict(
+                schema_version="spider_journal_record_v1",
+                run_id=run.run_id,
+                journal_seq=ordinal,
+                barrier_id=key["stable_id"],
+                record_kind=kind,
+                scheduler_key=key,
+                causal_parent_ids=[],
+                effective_at=payload["result"]["effective_at"],
+                visible_at=key["visible_at"],
+                account_version_before=payload["owner_inspection_before"]["account_version"],
+                account_version_after=payload["owner_inspection_after"]["account_version"],
+                payload=detached_payload,
+                configuration_context=config_context,
+                historical_context=history_context,
+            )
+            store.mark_processed(
+                dict(ordinal=ordinal, journal_seq=ordinal, barrier_id=key["stable_id"]),
+                record_kind=kind,
+            )
+            store.append_journal(row)
+            source_ids = {
+                fill["source_event_id"]
+                for product in payload["result"]["products"]
+                for fill in product["fills"]
+            }
+            existing_notices_at_evidence.append(any(
+                record["item"].get("kind") == "DELIVERY"
+                and record["item"]["delivery"].get("source_fact_id") in source_ids
+                for record in composition._records.values()
+            ))
+        evidence.append((kind, key, payload))
+
+    composition = _composition(run, persist)
     composition._policy.rows[1]["active"] = "false"
     start = run.range_start_ms
 
@@ -1009,6 +1090,153 @@ def test_historical_chain_uses_frozen_owner_orders_and_commits_one_partial_fill(
     assert len(fill["execution_id"]) == 64
     assert fill["source_event_id"]
     assert fill["occurrence_index"] == 0
+    step2_evidence = [item for kind, key, item in evidence
+                      if kind == "HISTORICAL_MARKET_RESULT" and key["stable_id"] == step2["item"]["stable_id"]]
+    assert len(step2_evidence) == 1
+    captured = step2_evidence[0]
+    assert captured["request"] == step2["item"]["node"]
+    assert captured["working_orders_snapshot"] == frozen
+    assert captured["result"] == step2_result
+    assert captured["owner_inspection_after"] == step2_result["owner_evidence"]
+    assert existing_notices_at_evidence[-1] is False
+    configuration = decode_p2_configuration(
+        run.configuration_bytes, run.configuration_sha256, run.ordered_products
+    )
+    row = decode_canonical(canonical_bytes(dict(
+        schema_version="spider_journal_record_v1",
+        run_id=run.run_id,
+        journal_seq=1,
+        barrier_id=step2["item"]["stable_id"],
+        record_kind="HISTORICAL_MARKET_RESULT",
+        scheduler_key=evidence[-1][1],
+        causal_parent_ids=[],
+        effective_at=step2_result["effective_at"],
+        visible_at=evidence[-1][1]["visible_at"],
+        account_version_before=captured["owner_inspection_before"]["account_version"],
+        account_version_after=captured["owner_inspection_after"]["account_version"],
+        payload=captured,
+        configuration_context=dict(
+            schema_version="spider_configuration_context_v1",
+            config_id=configuration["config_id"],
+            configuration_sha256=run.configuration_sha256,
+            products=list(run.ordered_products),
+        ),
+        historical_context=historical_context_for_input(run),
+    )))
+    journal_record(row)
+    captured["result"]["products"][0]["fills"].clear()
+    assert step2["result"]["historical_result"] == step2_result
+    persisted = decode_jsonl((store._path / "journal.jsonl").read_bytes())
+    persisted_step2 = next(row for row in persisted if row["barrier_id"] == step2["item"]["stable_id"])
+    assert persisted_step2["record_kind"] == "HISTORICAL_MARKET_RESULT"
+    assert persisted_step2["payload"]["result"]["products"][0]["fills"]
+    assert sum(row["barrier_id"] == step2["item"]["stable_id"] for row in persisted) == 1
+    invalid_rows = []
+    changed = deepcopy(persisted_step2)
+    changed["payload"]["request"]["step_index"] = 1
+    invalid_rows.append(changed)
+    changed = deepcopy(persisted_step2)
+    changed["payload"]["request"]["model_id"] = "OHLC4_OPEN_LOW_HIGH_CLOSE_V1"
+    invalid_rows.append(changed)
+    changed = deepcopy(persisted_step2)
+    changed["payload"]["request"]["bars"][0]["trade"]["open"] = "0"
+    invalid_rows.append(changed)
+    changed = deepcopy(persisted_step2)
+    changed["payload"]["working_orders_snapshot"].clear()
+    invalid_rows.append(changed)
+    changed = deepcopy(persisted_step2)
+    changed["payload"]["account_key"]["account"] = "different-account"
+    invalid_rows.append(changed)
+    changed = deepcopy(persisted_step2)
+    changed["payload"]["result"]["products"][0]["fills"][0]["quantity_contracts"] = "-1"
+    invalid_rows.append(changed)
+    changed = deepcopy(persisted_step2)
+    changed["payload"]["result"]["products"][0]["fills"][0]["order_id"] = "missing-order"
+    invalid_rows.append(changed)
+    changed = deepcopy(persisted_step2)
+    del changed["historical_context"]
+    invalid_rows.append(changed)
+    for field in ("effective_at", "visible_at"):
+        changed = deepcopy(persisted_step2)
+        changed[field] += 1
+        invalid_rows.append(changed)
+    changed = deepcopy(persisted_step2)
+    changed["scheduler_key"]["visible_at"] += 1
+    invalid_rows.append(changed)
+    changed = deepcopy(persisted_step2)
+    changed["effective_at"] += 1
+    changed["visible_at"] += 1
+    changed["scheduler_key"]["visible_at"] += 1
+    invalid_rows.append(changed)
+    for field in ("account_version_before", "account_version_after"):
+        changed = deepcopy(persisted_step2)
+        changed[field] += 1
+        invalid_rows.append(changed)
+    for invalid_row in invalid_rows:
+        with pytest.raises(ValueError, match="INVALID_ARTIFACT"):
+            journal_record(invalid_row)
+    guarded_root = tmp_path / "account_guard"
+    guarded_root.mkdir()
+    guarded_store = SpiderRunStore.create(str(guarded_root), run.run_id)
+    guarded_store.register(attempt, historical_input=raw_input)
+    foreign_account_row = deepcopy(persisted[0])
+    foreign_account = deepcopy(foreign_account_row["payload"]["account_key"])
+    foreign_account["account"] = "other-account"
+    foreign_account_row["payload"]["account_key"] = foreign_account
+    for key in ("owner_inspection_before", "owner_inspection_after"):
+        foreign_account_row["payload"][key]["account_key"] = deepcopy(foreign_account)
+    foreign_account_row["payload"]["result"]["owner_evidence"]["account_key"] = deepcopy(foreign_account)
+    guarded_store.mark_processed(
+        dict(ordinal=1, journal_seq=1, barrier_id=foreign_account_row["barrier_id"]),
+        record_kind="HISTORICAL_MARKET_RESULT",
+    )
+    journal_path = guarded_store._path / "journal.jsonl"
+    status_path = guarded_store._path / "status.json"
+    before = journal_path.read_bytes(), status_path.read_bytes()
+    with pytest.raises(SpiderRunStoreError, match="ENDPOINT_RECONCILIATION_FAILED"):
+        guarded_store.append_journal(foreign_account_row)
+    assert (journal_path.read_bytes(), status_path.read_bytes()) == before
+    for index, field in enumerate(("effective_at", "visible_at", "scheduler_visible_at",
+                                   "account_version_before", "account_version_after")):
+        root = tmp_path / f"result_guard_{index}"
+        root.mkdir()
+        result_store = SpiderRunStore.create(str(root), run.run_id)
+        result_store.register(attempt, historical_input=raw_input)
+        invalid_result = deepcopy(persisted[0])
+        if field == "scheduler_visible_at":
+            invalid_result["scheduler_key"]["visible_at"] += 1
+        else:
+            invalid_result[field] += 1
+        result_store.mark_processed(
+            dict(ordinal=1, journal_seq=1, barrier_id=invalid_result["barrier_id"]),
+            record_kind="HISTORICAL_MARKET_RESULT",
+        )
+        result_journal = result_store._path / "journal.jsonl"
+        result_status = result_store._path / "status.json"
+        unchanged = result_journal.read_bytes(), result_status.read_bytes()
+        with pytest.raises(ValueError, match="INVALID_ARTIFACT"):
+            result_store.append_journal(invalid_result)
+        assert (result_journal.read_bytes(), result_status.read_bytes()) == unchanged
+    combined_root = tmp_path / "combined_result_guard"
+    combined_root.mkdir()
+    combined_store = SpiderRunStore.create(str(combined_root), run.run_id)
+    combined_store.register(attempt, historical_input=raw_input)
+    combined_invalid = deepcopy(persisted[0])
+    combined_invalid["effective_at"] += 1
+    combined_invalid["visible_at"] += 1
+    combined_invalid["scheduler_key"]["visible_at"] += 1
+    combined_store.mark_processed(
+        dict(ordinal=1, journal_seq=1, barrier_id=combined_invalid["barrier_id"]),
+        record_kind="HISTORICAL_MARKET_RESULT",
+    )
+    combined_journal = combined_store._path / "journal.jsonl"
+    combined_status = combined_store._path / "status.json"
+    combined_files = combined_journal.read_bytes(), combined_status.read_bytes()
+    combined_frontier = deepcopy(combined_store._processed), combined_store._processed_kind
+    with pytest.raises(ValueError, match="INVALID_ARTIFACT"):
+        combined_store.append_journal(combined_invalid)
+    assert (combined_journal.read_bytes(), combined_status.read_bytes()) == combined_files
+    assert (combined_store._processed, combined_store._processed_kind) == combined_frontier
     notice = next(record for record in composition._records.values()
                   if record["item"]["kind"] == "DELIVERY"
                   and record["item"]["delivery"]["source_fact_id"] == fill["source_event_id"])
@@ -1061,6 +1289,29 @@ def test_historical_chain_uses_frozen_owner_orders_and_commits_one_partial_fill(
     step3_key = run.range_end_ms * 16 + 4
     assert composition._dispatch_due(step3_key)["classification"] == "SUCCESS"
     assert step3["result"]["classification"] == "SUCCESS"
+
+
+def test_historical_market_evidence_failure_stops_before_derived_events():
+    run = _valid_run()
+    calls = []
+
+    def fail_persistence(kind, key, payload):
+        calls.append((kind, key, payload))
+        raise ReplayPersistenceError()
+
+    composition = _composition(run, fail_persistence)
+    start = run.range_start_ms
+    initial = next(record for record in composition._records.values()
+                   if record["item"]["kind"] == "HISTORICAL_MARKET_STEP")
+    terminal = composition._dispatch_due(start * 16 + 7)
+    assert terminal["classification"] == "TERMINAL"
+    assert terminal["reason"] == "PERSISTENCE_FAILED"
+    assert len(calls) == 1 and calls[0][0] == "HISTORICAL_MARKET_RESULT"
+    steps = [record for record in composition._records.values()
+             if record["item"]["kind"] == "HISTORICAL_MARKET_STEP"]
+    assert steps == [initial]
+    assert not any(record["item"]["kind"] == "DELIVERY"
+                   for record in composition._records.values())
 
 
 def test_historical_full_execution_notice_derives_native_cancel_and_replacements():

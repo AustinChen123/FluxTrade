@@ -287,7 +287,7 @@ def _attempt(row: dict[str, object]) -> None:
     elif run_contract == _P2_RUN_CONTRACT:
         _require(row["profile_id"] == "SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1")
     else:
-        _require(row["profile_id"] == "HISTORICAL_MARKET_SCENARIO_ACCOUNT_V1")
+        _require(row["profile_id"] == "SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1")
     account = _object(row["account_key"], "venue environment account", "subaccount")
     for key, value in account.items():
         if key != "subaccount" or value is not None:

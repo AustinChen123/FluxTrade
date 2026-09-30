@@ -204,7 +204,8 @@ class SpiderRunStore:
         historical = self._attempt["run_contract_id"] == _P3_RUN_CONTRACT
         coverage = self._attempt["planned_coverage"]
         if historical:
-            valid_kind = record_kind in ("SOURCE_GROUP_RESULT", "SNAPSHOT_FACT", "DELIVERY_ATTEMPT", "CALLBACK_RESULT")
+            valid_kind = record_kind in ("SOURCE_GROUP_RESULT", "SNAPSHOT_FACT", "DELIVERY_ATTEMPT",
+                                         "CALLBACK_RESULT", "HISTORICAL_MARKET_RESULT")
             invalid = (not valid_kind or boundary["ordinal"] != ordinal or boundary["journal_seq"] != ordinal
                        or boundary["barrier_id"] in self._historical_barrier_ids)
         else:
@@ -227,6 +228,9 @@ class SpiderRunStore:
             raise RuntimeError("INVALID_STORE_OPERATION")
         try:
             _context_chain(self._attempt, row)
+            if (historical and row["record_kind"] == "HISTORICAL_MARKET_RESULT"
+                    and row["payload"]["account_key"] != self._attempt["account_key"]):
+                raise ReconciliationProjectionError()
         except ReconciliationProjectionError as error:
             raise SpiderRunStoreError("ENDPOINT_RECONCILIATION_FAILED") from error
         try:

@@ -287,7 +287,8 @@ def test_architecture_is_pure_and_does_not_import_native():
     source = Path(n.__file__).read_text()
     imports = [node for node in ast.walk(ast.parse(source)) if isinstance(node, (ast.Import, ast.ImportFrom))]
     assert all(isinstance(node, ast.ImportFrom) and node.module in {
-        "collections.abc", "typing", "src.core.backtest.spider_run_artifacts"
+        "collections.abc", "decimal", "typing", "src.core.backtest.spider_historical_input",
+        "src.core.backtest.spider_run_artifacts"
     } for node in imports)
     assert not any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                    and node.func.id in {"open", "eval", "exec", "__import__"} for node in ast.walk(ast.parse(source)))

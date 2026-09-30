@@ -1067,6 +1067,7 @@ class _ReplayComposition:
                 elif kind == "HISTORICAL_MARKET_STEP":
                     node = deepcopy(item["node"])
                     working_orders = node["working_orders"] if self._historical_run is not None else None
+                    owner_inspection_before = self._codec.inspect_state() if working_orders is not None else None
                     historical_result = self._codec.historical_market_step(node)
                     if (type(historical_result.get("raw_time_ms")) is not int
                             or historical_result["raw_time_ms"] != record["raw_time_ms"]
@@ -1076,6 +1077,14 @@ class _ReplayComposition:
                     result["historical_result"] = deepcopy(historical_result)
                     if working_orders is not None:
                         result["working_orders_snapshot"] = deepcopy(working_orders)
+                        self._evidence("HISTORICAL_MARKET_RESULT", key, dict(
+                            account_key=self._account,
+                            request=node,
+                            result=historical_result,
+                            working_orders_snapshot=working_orders,
+                            owner_inspection_before=owner_inspection_before,
+                            owner_inspection_after=historical_result["owner_evidence"],
+                        ))
                         run = cast(Any, self._historical_run)
                         derived: list[tuple[dict[str, Any], Any]] = []
                         for product in historical_result["products"]:

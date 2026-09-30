@@ -5,11 +5,12 @@ from typing import cast
 from src.core.backtest import spider_run_native_schema as native
 from src.core.backtest.spider_run_artifacts import (
     ConfigurationContext, _artifact_contexts, _boolean, _boundary, _decimal_text,
-    _enum, _integer, _list, _object, _require, _terminal_policy, _text,
+    _enum, _historical_context, _integer, _list, _object, _require, _terminal_policy, _text,
 )
 
 _CLASSES = ["SOURCE_GROUP", "SNAPSHOT_CAPTURE", "DELIVERY"]
 _KINDS = ["SOURCE_GROUP_RESULT", "SNAPSHOT_FACT", "DELIVERY_ATTEMPT", "CALLBACK_RESULT"]
+_P3_KIND = "HISTORICAL_MARKET_RESULT"
 
 
 def _string(value: object) -> None:
@@ -110,9 +111,10 @@ def owner_evidence(value: object, *, context: ConfigurationContext | None = None
         _require(request["snapshot_kind"] == fact["snapshot_kind"] == name.upper())
 
 
-def scheduler_key(value: object) -> tuple[int, int, int, str]:
+def scheduler_key(value: object, *, historical_market_step: bool = False) -> tuple[int, int, int, str]:
     row = _object(value, "visible_at queue_class schedule_sequence stable_id")
-    return (_integer(row["visible_at"]), _CLASSES.index(_enum(row["queue_class"], _CLASSES)),
+    classes = [*_CLASSES, "HISTORICAL_MARKET_STEP"] if historical_market_step else _CLASSES
+    return (_integer(row["visible_at"]), classes.index(_enum(row["queue_class"], classes)),
             _integer(row["schedule_sequence"]), _text(row["stable_id"]))
 
 
@@ -157,18 +159,22 @@ def journal_record(value: object) -> None:
     _text(row["run_id"], "[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
     _require(_integer(row["journal_seq"]) > 0)
     _text(row["barrier_id"])
-    kind = _enum(row["record_kind"], _KINDS)
-    key = scheduler_key(row["scheduler_key"])
-    _require(key[1] == (0 if kind == "SOURCE_GROUP_RESULT" else 1 if kind == "SNAPSHOT_FACT" else 2))
+    kind = _enum(row["record_kind"], [*_KINDS, _P3_KIND])
+    _, historical = _artifact_contexts(row)
+    _require(kind != _P3_KIND or historical is not None)
+    key = scheduler_key(row["scheduler_key"], historical_market_step=kind == _P3_KIND)
+    expected_queue = (0 if kind == "SOURCE_GROUP_RESULT" else 1 if kind == "SNAPSHOT_FACT"
+                      else 3 if kind == _P3_KIND else 2)
+    _require(key[1] == expected_queue)
     parents = [_text(item) for item in _list(row["causal_parent_ids"])]
     _require(len(parents) == len(set(parents)))
     _integer(row["effective_at"])
     _integer(row["visible_at"])
-    for key in ("account_version_before", "account_version_after"):
-        if kind == "SOURCE_GROUP_RESULT":
-            _integer(row[key])
+    for version_field in ("account_version_before", "account_version_after"):
+        if kind in ("SOURCE_GROUP_RESULT", _P3_KIND):
+            _integer(row[version_field])
         else:
-            _require(row[key] is None)
+            _require(row[version_field] is None)
     if kind == "SOURCE_GROUP_RESULT":
         payload = _object(row["payload"], "request result owner_evidence_before owner_evidence_after")
         native.group(payload["request"], context=context)
@@ -185,6 +191,24 @@ def journal_record(value: object) -> None:
         native.delivery(payload["delivery"], context=context)
         if payload["emission_plan_digest"] is not None:
             _text(payload["emission_plan_digest"], "[0-9a-f]{64}")
+    elif kind == _P3_KIND:
+        _require(context is not None and historical is not None)
+        payload = cast(dict[str, object], row["payload"])
+        native.historical_market_result(
+            payload, context=context, historical_context=_historical_context(historical),
+        )
+        result = cast(dict[str, object], payload["result"])
+        inspection_before = cast(dict[str, object], payload["owner_inspection_before"])
+        inspection_after = cast(dict[str, object], payload["owner_inspection_after"])
+        result_at = _integer(result["effective_at"])
+        _require(key[0] == _integer(row["effective_at"]) == _integer(row["visible_at"]) == result_at
+                 and _integer(row["account_version_before"])
+                 == _integer(inspection_before["account_version"])
+                 and _integer(row["account_version_after"])
+                 == _integer(inspection_after["account_version"])
+                 and _integer(row["account_version_after"]) >= _integer(row["account_version_before"]))
+        request = cast(dict[str, object], payload["request"])
+        _require(key[3] == f"P3_MARKET_{request['bar_open_ms']}_{request['step_index']}")
     else:
         callback_result(row["payload"])
 

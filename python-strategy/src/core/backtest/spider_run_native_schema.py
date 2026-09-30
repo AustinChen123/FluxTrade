@@ -1,6 +1,7 @@
 """Closed structural validation of persisted native DTOs; no runtime owner."""
 
 from collections.abc import Callable
+from decimal import Decimal
 from typing import cast
 
 from src.core.backtest.spider_run_artifacts import (
@@ -15,6 +16,7 @@ from src.core.backtest.spider_run_artifacts import (
     _text,
     configuration_context,
 )
+from src.core.backtest.spider_historical_input import historical_market_step_clock
 
 _PRODUCTS = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "P_A"]
 _KINDS = ["MARKET", "EARN", "TRADING", "POSITIONS", "OPEN_ORDERS"]
@@ -22,6 +24,7 @@ _ORDERING = ["S_order_v1", "S_order_v1_reverse_execution_cancel_effective"]
 _LIFECYCLES = ["RISK_STABLE", "AWAITING_CANCEL_EFFECTIVE", "LIQUIDATED_FLAT", "LIQUIDATED_INSOLVENT"]
 _PROFILES = ["SYNTHETIC_BTC_ETH_V1", "SYNTHETIC_GOLDEN_CANCEL_V1", "SYNTHETIC_MIN_CASH_V1", "SYNTHETIC_P1_LIQUIDATION_V1", "SYNTHETIC_P1_O03_V1"]
 _CONFIGURED_PROFILE = "SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1"
+_HISTORICAL_MODELS = ["OHLC4_OPEN_HIGH_LOW_CLOSE_V1", "OHLC4_OPEN_LOW_HIGH_CLOSE_V1"]
 
 
 def _fields(row: dict[str, object], names: str, check: Callable[[object], object]) -> None:
@@ -311,3 +314,109 @@ def inspection(value: object, *, context: ConfigurationContext | None = None) ->
     _enum(row["lifecycle"], _LIFECYCLES)
     _fields(row, "cash gross_realized total_fees", _decimal_text)
     _optional(row, "gate_failure", _reason)
+
+
+def historical_market_result(
+    value: object,
+    *,
+    context: ConfigurationContext | None,
+    historical_context: object,
+) -> None:
+    context = _context(context)
+    _require(context is not None)
+    configured = cast(ConfigurationContext, context)
+    historical = _object(
+        historical_context,
+        "schema_version research_classification historical_input_sha256 path_pair_sha256 source_sha256 model_sha256 assumption_sha256 coverage_sha256 model_id model_version",
+    )
+    row = _object(value, "account_key request result working_orders_snapshot owner_inspection_before owner_inspection_after")
+    account(row["account_key"])
+    account_key = cast(dict[str, object], row["account_key"])
+    _require(account_key["venue"] == "SPIDER_HISTORICAL_RESEARCH"
+             and account_key["environment"] == "RESEARCH_ONLY")
+    request = _object(
+        row["request"],
+        "schema_version model_id model_version run_contract_hash bar_open_ms bar_duration_ms step_index market_slippage_bps bars working_orders",
+    )
+    model = _enum(request["model_id"], _HISTORICAL_MODELS)
+    _require(model == historical["model_id"] and request["model_version"] == str(historical["model_version"]))
+    _require(request["schema_version"] == "historical_node_v1")
+    _require(_text(request["run_contract_hash"], r"[0-9a-f]{64}") == historical["historical_input_sha256"])
+    raw_open = _integer(request["bar_open_ms"])
+    _require(raw_open < 2**59 and request["bar_duration_ms"] == 60_000)
+    step = _integer(request["step_index"])
+    _require(step <= 3)
+    raw_time, effective_at = historical_market_step_clock(raw_open, step)
+    slippage = Decimal(_decimal_text(request["market_slippage_bps"]))
+    _require(slippage >= 0)
+    bars = _list(request["bars"])
+    _require(len(bars) == len(configured.products))
+    for product, item in zip(configured.products, bars, strict=True):
+        bar = _object(item, "product_id trade mark")
+        _require(bar["product_id"] == product)
+        for field, trade in (("trade", True), ("mark", False)):
+            values = _object(bar[field], "open high low close" + (" volume_contracts confirmed source_row_hash" if trade else " confirmed source_row_hash"))
+            _require(values["confirmed"] is True)
+            _text(values["source_row_hash"], r"[0-9a-f]{64}")
+            prices = [Decimal(_decimal_text(values[name])) for name in ("open", "high", "low", "close")]
+            _require(all(price > 0 for price in prices)
+                     and prices[1] >= max(prices[0], prices[3])
+                     and prices[2] <= min(prices[0], prices[3]))
+            if trade:
+                _require(Decimal(_decimal_text(values["volume_contracts"])) >= 0)
+    working = _list(request["working_orders"])
+    _require(row["working_orders_snapshot"] == request["working_orders"])
+    orders: dict[str, tuple[str, Decimal]] = {}
+    for item in working:
+        order = _object(item, "order_id product_id order_version status remaining_quantity_contracts accepted_at accepted_source_sequence order_kind side limit_price risk_cancel_pending")
+        order_id = _text(order["order_id"])
+        product = _product_id(order["product_id"], configured, None)
+        _require(order_id not in orders)
+        _fields(order, "order_version accepted_at accepted_source_sequence", _integer)
+        quantity = Decimal(_decimal_text(order["remaining_quantity_contracts"]))
+        _require(quantity > 0)
+        _enum(order["status"], ["OPEN", "PARTIALLY_FILLED"])
+        _enum(order["order_kind"], ["LIMIT", "MARKET"])
+        _enum(order["side"], ["LONG", "SHORT"])
+        _optional(order, "limit_price", _decimal_text, nullable=True)
+        if order["limit_price"] is not None:
+            _require(Decimal(_decimal_text(order["limit_price"])) > 0)
+        _boolean(order["risk_cancel_pending"])
+        orders[order_id] = (product, quantity)
+    result = _object(row["result"], "schema_version raw_time_ms effective_at products owner_evidence")
+    _require(result["schema_version"] == "historical_node_result_v1"
+             and result["raw_time_ms"] == raw_time and result["effective_at"] == effective_at)
+    products = _list(result["products"])
+    _require(len(products) == len(configured.products))
+    filled: dict[str, Decimal] = {}
+    executions: set[str] = set()
+    sources: set[str] = set()
+    for product, item in zip(configured.products, products, strict=True):
+        outcome = _object(item, "product_id capacity discarded_volume fills")
+        _require(outcome["product_id"] == product)
+        _require(Decimal(_decimal_text(outcome["capacity"])) >= 0
+                 and Decimal(_decimal_text(outcome["discarded_volume"])) >= 0)
+        for fill_value in _list(outcome["fills"]):
+            fill = _object(fill_value, "order_id quantity_contracts price execution_id source_event_id occurrence_index")
+            order_id = _text(fill["order_id"])
+            quantity = Decimal(_decimal_text(fill["quantity_contracts"]))
+            _require(order_id in orders and orders[order_id][0] == product and quantity > 0
+                     and Decimal(_decimal_text(fill["price"])) > 0)
+            _text(fill["execution_id"], r"[0-9a-f]{64}")
+            source = _text(fill["source_event_id"])
+            _require(fill["execution_id"] not in executions and source not in sources)
+            executions.add(cast(str, fill["execution_id"]))
+            sources.add(source)
+            _integer(fill["occurrence_index"])
+            filled[order_id] = filled.get(order_id, Decimal(0)) + quantity
+    _require(all(quantity <= orders[order_id][1] for order_id, quantity in filled.items()))
+    before = row["owner_inspection_before"]
+    after = row["owner_inspection_after"]
+    for inspection_value in (before, after):
+        inspection(inspection_value, context=context)
+        inspection_row = cast(dict[str, object], inspection_value)
+        _require(inspection_row["account_key"] == account_key
+                 and inspection_row["profile_id"] == _CONFIGURED_PROFILE)
+    _require(result["owner_evidence"] == after)
+    before_row, after_row = cast(dict[str, object], before), cast(dict[str, object], after)
+    _require(_integer(after_row["account_version"]) >= _integer(before_row["account_version"]))
