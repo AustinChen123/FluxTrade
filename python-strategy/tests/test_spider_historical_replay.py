@@ -2174,13 +2174,13 @@ def test_historical_noon_rollover_refreshes_on_repeated_completed_five_second_ti
     second_noon_tick = first_noon_tick + 5_000
     composition._historical_poll_range = (first_noon_tick, second_noon_tick + 1)
     _complete_poll_through_native_deliveries(composition, first_noon_tick)
-    assert composition._policy.capital["day_ago"] == composition._policy.capital["total"]
+    assert composition._policy.capital["day_ago"] == D("1000")
 
     _complete_poll_through_native_deliveries(
         composition, second_noon_tick,
-        before_final=lambda: composition._policy.capital.__setitem__("total", D("777")),
+        before_final=lambda: composition._policy.capital.__setitem__("total", D("1100")),
     )
-    assert composition._policy.capital["day_ago"] == D("777")
+    assert composition._policy.capital["day_ago"] == D("1100")
 
 
 def test_historical_timer_preserves_poll_start_terminal_and_stops_queue(monkeypatch):

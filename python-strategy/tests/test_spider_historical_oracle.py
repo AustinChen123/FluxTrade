@@ -6,6 +6,8 @@ from decimal import Decimal as D
 from hashlib import sha256
 import json
 
+import pytest
+
 from src.core.backtest import synthetic_scenario_codec as wire
 from src.core.backtest.spider_historical_input import validate_historical_input
 from src.core.backtest.spider_run_artifacts import canonical_bytes
@@ -43,6 +45,9 @@ ORDERS = {
         ("H10-ORDER-1", "A-USDT-SWAP", "LONG", "49900", "1", "H10-CLIENT-1"),
         ("H10-ORDER-2", "A-USDT-SWAP", "LONG", "49900", "1", "H10-CLIENT-2"),
     ],
+    "H08": [
+        ("H08-ORDER-1", "A-USDT-SWAP", "LONG", "99", "1", "H08-ORDER-1"),
+    ],
     "H09": [
         ("H09-LONG", "A-USDT-SWAP", "LONG", "95", "1", "MANL"),
         ("H09-SHORT", "A-USDT-SWAP", "SHORT", "105", "1", "MANS"),
@@ -78,7 +83,7 @@ def _oracle_run(case, *, model_id=None, h06_variant="A"):
     end_offset = {
         "H02": 20_002, "H03": 100_001, "H04": 100_001,
         "H05": 20_004, "H09": 60_000, "H10": 1,
-        "H06": 5_020,
+        "H06": 5_020, "H08": 60_000,
     }[case]
     end = start + end_offset
     delta = start - base.range_start_ms
@@ -129,6 +134,9 @@ def _oracle_run(case, *, model_id=None, h06_variant="A"):
     for entry in source["bars"].split(";"):
         if ":" in entry:
             label, entry = entry.split(":", 1)
+            if label in ("future_X=A", "future_Y=A"):
+                continue
+            assert set(label.split("/")) <= ids.keys(), f"unexpected frozen bar label: {label}"
             products = [ids[item] for item in label.split("/")]
         offset, raw_values = entry.split("=", 1)
         timestamp = start + (0 if offset == "E" else int(offset.removeprefix("E+")))
@@ -160,7 +168,7 @@ def _oracle_run(case, *, model_id=None, h06_variant="A"):
     config = _p2_configuration()
     config["config_id"] = config_id
     config["seed_effective_at"] = start - 1
-    cash = {"H02": "1000", "H03": "1000", "H04": "1000", "H05": "20.15", "H06": "10000", "H09": "1000", "H10": "2001"}[case]
+    cash = {"H02": "1000", "H03": "1000", "H04": "1000", "H05": "20.15", "H06": "10000", "H08": "1000", "H09": "1000", "H10": "2001"}[case]
     config["cash"] = cash
     config["leverage"] = "1000" if case == "H10" else "10"
     seed_orders = []
@@ -203,7 +211,7 @@ def _oracle_run(case, *, model_id=None, h06_variant="A"):
     )
     for row in policy_state["rows"]:
         row.update(
-            active="false" if case == "H09" else "true",
+            active="false" if case in ("H08", "H09") else "true",
             leverage="1000" if case == "H10" else "10" if case == "H05" else "1",
             歩差="1",
             單數="1",
@@ -217,6 +225,7 @@ def _oracle_run(case, *, model_id=None, h06_variant="A"):
         "H04": {"A-USDT-SWAP": ("1", "1", "0.5", "0.5", "0.5"), "B-USDT-SWAP": ("1", "1", "1", "1", "1")},
         "H05": {"A-USDT-SWAP": ("2", "1", "1", "1", "1"), "B-USDT-SWAP": ("0.5", "1", "1", "1", "1")},
         "H06": {"A-USDT-SWAP": ("1", "1", "1", "1", "1"), "B-USDT-SWAP": ("1", "1", "1", "1", "1")},
+        "H08": {"A-USDT-SWAP": ("1", "1", "1", "1", "1"), "B-USDT-SWAP": ("1", "1", "1", "1", "1")},
         "H09": {"A-USDT-SWAP": ("1", "1", "1", "1", "1"), "B-USDT-SWAP": ("1", "1", "1", "1", "1")},
         "H10": {"A-USDT-SWAP": ("0.01", "1", "1", "1", "1"), "B-USDT-SWAP": ("1", "1", "1", "1", "1")},
     }
@@ -276,7 +285,7 @@ def _oracle_run(case, *, model_id=None, h06_variant="A"):
     if case == "H04":
         policy_state["rows"][0].update(歩差="0.5")
         policy_state["markets"][0]["price"] = "105"
-    elif case == "H03":
+    elif case in ("H03", "H08"):
         policy_state["markets"][0]["price"] = "100"
     elif case in ("H05", "H10"):
         policy_state["capital"].update(total=cash, usdt=cash, avail=cash)
@@ -353,6 +362,16 @@ def _oracle_run(case, *, model_id=None, h06_variant="A"):
                            strategy_id="SPIDER_GRID_ORIGINAL_V1", quantity_contracts=quantity,
                            entry_price="100")],
             ))
+    if case == "H08":
+        positions = [dict(
+            product_id="A-USDT-SWAP", side="LONG", quantity_contracts="1",
+            lots=[dict(seed_execution_id="H08-SEED-EXECUTION", seed_sequence=0,
+                       strategy_id="SPIDER_GRID_ORIGINAL_V1", quantity_contracts="1",
+                       entry_price="100")],
+        )]
+        policy_state["capital"].update(position="100")
+        policy_state["rows"][0]["hold"] = "100"
+        policy_state["markets"][0]["price"] = "100"
     config["positions"] = positions
     config_bytes_run = _run_with_configuration(base, config)
     run = replace(
@@ -441,6 +460,226 @@ def _snapshot(composition, kind, snapshot_id, captured_at):
         )
     )
     return fact["immutable_payload"]
+
+
+def _h08_frozen_timeline(source, start, visibility):
+    root_id, root_offset = source["poll_root"].split("@E+")
+    root = (root_id, start + int(root_offset))
+    requests = {}
+    for item in source["snapshot_requests"].split(";"):
+        request, parent = item.split(":parent")
+        request_id, offset = request.split("@E+")
+        requests[request_id] = dict(
+            request_id=request_id,
+            issued_at_ms=start + int(offset),
+            parent_request_id=parent,
+        )
+    captures = {}
+    for item in source["captures"].split(";"):
+        capture_id, as_of = item.split(":asofE+")
+        captures[capture_id] = start + int(as_of)
+    assert set(requests) == {"H08-OLD-REQUEST", "H08-NEW-REQUEST"}
+    assert set(captures) == {"H08-OLD-POSITIONS", "H08-NEW-POSITIONS"}
+    for request_id, capture_id in (
+        ("H08-OLD-REQUEST", "H08-OLD-POSITIONS"),
+        ("H08-NEW-REQUEST", "H08-NEW-POSITIONS"),
+    ):
+        requests[request_id]["capture_id"] = capture_id
+        requests[request_id]["capture_at_ms"] = captures[capture_id]
+    visibility_offsets = {
+        "ordered": {"OLD": 20_007, "NEW": 20_008},
+        "reversed": {"OLD": 20_008, "NEW": 20_007},
+    }[visibility]
+    for label, request_id in (("OLD", "H08-OLD-REQUEST"), ("NEW", "H08-NEW-REQUEST")):
+        requests[request_id]["visible_at_ms"] = start + visibility_offsets[label]
+    return root, requests
+
+
+def _h08_expected_driver_trace(source, start, visibility):
+    root_id, root_clock = source["poll_root"].split("@")
+    root_ms = start + int(root_clock.removeprefix("E+"))
+    requests = {}
+    for item in source["snapshot_requests"].split(";"):
+        identity, parent = item.split(":parent")
+        request_id, clock = identity.split("@")
+        requests[request_id] = (start + int(clock.removeprefix("E+")), parent)
+    captures = {}
+    for item in source["captures"].split(";"):
+        capture_id, clock = item.split(":asof")
+        captures[capture_id] = start + int(clock.removeprefix("E+"))
+    visibility_ms = {
+        "ordered": {"OLD": start + 20_007, "NEW": start + 20_008},
+        "reversed": {"OLD": start + 20_008, "NEW": start + 20_007},
+    }[visibility]
+    old_at, old_parent = requests["H08-OLD-REQUEST"]
+    new_at, new_parent = requests["H08-NEW-REQUEST"]
+    assert old_parent == new_parent == root_id
+    assert old_at < captures["H08-OLD-POSITIONS"]
+    assert new_at < captures["H08-NEW-POSITIONS"]
+    return [
+        ("POLL", root_id, root_ms, None),
+        ("SNAPSHOT", "H08-OLD-REQUEST", old_at, old_parent),
+        ("CAPTURE", "H08-OLD-POSITIONS", captures["H08-OLD-POSITIONS"], "H08-OLD-REQUEST", visibility_ms["OLD"]),
+        ("SNAPSHOT", "H08-NEW-REQUEST", new_at, new_parent),
+        ("CAPTURE", "H08-NEW-POSITIONS", captures["H08-NEW-POSITIONS"], "H08-NEW-REQUEST", visibility_ms["NEW"]),
+    ]
+
+
+class _H08RequestDriver:
+    def __init__(self, composition, frozen_root, frozen_requests):
+        self.composition = composition
+        self.root = frozen_root
+        self.expected = frozen_requests
+        self.issued = {}
+        self.trace = []
+
+    def issue_poll_root(self):
+        request_id, issued_at_ms = self.root
+        self._observe_issue_clock(issued_at_ms)
+        assert request_id not in self.issued
+        self.issued[request_id] = dict(request_id=request_id, issued_at_ms=issued_at_ms)
+        self.trace.append(("POLL", request_id, issued_at_ms, None))
+
+    def issue_snapshot_request(self, request_id):
+        expected = self.expected[request_id]
+        parent_id = expected["parent_request_id"]
+        assert parent_id in self.issued
+        assert request_id not in self.issued
+        assert expected["issued_at_ms"] < expected["capture_at_ms"]
+        self._observe_issue_clock(expected["issued_at_ms"])
+        request = dict(expected)
+        self.issued[request_id] = request
+        self.trace.append(("SNAPSHOT", request_id, request["issued_at_ms"], parent_id))
+
+    def _observe_issue_clock(self, issued_at_ms):
+        observed_until = issued_at_ms * 16 + 4
+        assert self.composition._dispatch_due(observed_until)["classification"] == "SUCCESS"
+        assert self.composition._current_time >= observed_until
+
+    def capture(self, request_id, sequence):
+        assert request_id in self.issued
+        issued = self.issued[request_id]
+        capture_at_ms = issued["capture_at_ms"]
+        assert self.composition._current_time < capture_at_ms * 16 + 5
+        item = _h08_position_capture(self.composition, issued, sequence)
+        assert self.composition._dispatch_due(capture_at_ms * 16 + 4)["classification"] == "SUCCESS"
+        _h08_prepare_empty_delivery_plan(self.composition, item)
+        assert self.composition._enqueue(item)["classification"] == "PENDING"
+        assert self.composition._dispatch_due(capture_at_ms * 16 + 5)["classification"] == "SUCCESS"
+        self.trace.append(("CAPTURE", issued["capture_id"], capture_at_ms, request_id, issued["visible_at_ms"]))
+        return item
+
+
+def _h08_position_capture(composition, issued_request, sequence):
+    capture_id = issued_request["capture_id"]
+    request = dict(
+        schema_version="snapshot_request_v1", account_key=composition._account,
+        snapshot_id=capture_id, snapshot_kind="POSITIONS",
+        capture_mode="OWNER_CURRENT", captured_at=issued_request["capture_at_ms"] * 16 + 5,
+    )
+    projection = dict(
+        schema_version="delivery_projection_v1",
+        reference=dict(namespace="SNAPSHOT", fact_id=request["snapshot_id"]),
+        payload_kind="POSITION_SNAPSHOT", occurrence_index=sequence,
+        schedule_sequence=sequence, visible_at=issued_request["visible_at_ms"] * 16 + 6,
+    )
+    return dict(
+        kind="SNAPSHOT_CAPTURE", capture_sequence=sequence,
+        request=request, delivery_projection=projection,
+    )
+
+
+def _h08_prepare_empty_delivery_plan(composition, item):
+    fact = composition._codec.capture_snapshot(item["request"])
+    projection = deepcopy(item["delivery_projection"])
+    projection["reference"] = fact["reference"]
+    delivery = composition._codec.build_delivery(projection)
+    delivery_id = delivery["delivery_id"]
+    composition._callback_plans[delivery_id] = dict(
+        delivery_id=delivery_id, expected_policy_events=[], financial_items=[], market_requests=[],
+    )
+
+
+def test_h08_request_driver_rejects_broken_request_causality():
+    source = _record(INPUTS, INPUTS_SHA256, "H08")
+    root, expected = _h08_frozen_timeline(source, EPOCH, "ordered")
+    driver = _H08RequestDriver(None, root, deepcopy(expected))
+    driver.issued[root[0]] = dict(request_id=root[0], issued_at_ms=root[1])
+    driver.expected["H08-OLD-REQUEST"]["parent_request_id"] = "MISSING-PARENT"
+    with pytest.raises(AssertionError):
+        driver.issue_snapshot_request("H08-OLD-REQUEST")
+
+    driver.expected = deepcopy(expected)
+    driver.expected["H08-OLD-REQUEST"]["issued_at_ms"] = driver.expected[
+        "H08-OLD-REQUEST"
+    ]["capture_at_ms"]
+    with pytest.raises(AssertionError):
+        driver.issue_snapshot_request("H08-OLD-REQUEST")
+
+    driver.expected = deepcopy(expected)
+    driver.issued["H08-OLD-REQUEST"] = driver.expected["H08-OLD-REQUEST"]
+    with pytest.raises(AssertionError):
+        driver.issue_snapshot_request("H08-OLD-REQUEST")
+    with pytest.raises(KeyError):
+        driver.issue_snapshot_request("H08-WRONG-REQUEST")
+
+
+def _h08_future_bar(source, future_label):
+    entry = next(
+        value for value in source["bars"].split(";")
+        if value.startswith(f"{future_label}=")
+    ).partition("=")[2]
+    product, separator, row = entry.partition(":")
+    offset, separator2, values = row.partition("=")
+    assert (product, separator, offset, separator2) == ("A", ":", "E+60000", "=")
+    opening, high, low, close, volume = (D(value) for value in values.split("/"))
+    return opening, high, low, close, volume
+
+
+def _h08_future_trace(run, future_bar):
+    opening, high, low, future_close, volume = future_bar
+    start = run.range_start_ms
+    prefix_end = run.range_end_ms
+    extended_end = prefix_end + 60_000
+    configuration = json.loads(run.configuration_bytes)
+    for product in configuration["products"]:
+        product["marks"][0]["valid_to"] = extended_end + 60_000
+    run = _run_with_configuration(run, configuration)
+    run = replace(
+        run, range_end_ms=extended_end,
+        spec_after=tuple(replace(spec, effective_at_ms=extended_end) for spec in run.spec_after),
+    )
+    trade_rows = list(run.trade_bars)
+    mark_rows = list(run.mark_bars)
+    for product_id, values, bar_volume in (
+        ("A-USDT-SWAP", (opening, high, low, future_close), volume),
+        ("B-USDT-SWAP", (D("100"),) * 4, D("4")),
+    ):
+        trade_template = next(row for row in trade_rows
+                              if row.product_id == product_id and row.bar_open_ms == start)
+        mark_template = next(row for row in mark_rows
+                             if row.product_id == product_id and row.bar_open_ms == start)
+        trade_rows.append(replace(
+            trade_template, bar_open_ms=prefix_end, open=values[0], high=values[1],
+            low=values[2], close=values[3], volume=bar_volume,
+            source_sequence=max(row.source_sequence for row in trade_rows
+                                if row.product_id == product_id) + 1,
+        ))
+        mark_rows.append(replace(
+            mark_template, bar_open_ms=prefix_end, open=values[0], high=values[1],
+            low=values[2], close=values[3], volume=None,
+            source_sequence=max(row.source_sequence for row in mark_rows
+                                if row.product_id == product_id) + 1,
+        ))
+    trade_rows, mark_rows = tuple(trade_rows), tuple(mark_rows)
+    updated = _rehashed_run(run, trade_rows=trade_rows, mark_rows=mark_rows)
+    updated = replace(
+        updated,
+        trade_manifest=_manifest(updated.trade_manifest.source_id, updated.trade_bars, trade=True),
+        mark_manifest=_manifest(updated.mark_manifest.source_id, updated.mark_bars, trade=False),
+    )
+    assert validate_historical_input(updated)
+    return updated
 
 
 def _h07_configuration():
@@ -745,6 +984,265 @@ def test_frozen_h02_partial_duplicate_then_full_notice_closes_exactly():
     assert (
         answer["S4"] == "full_execution1@100,cash/equity999.8,fees0.2,positionLONG2@100"
     )
+
+
+@pytest.mark.parametrize(
+    "visibility,expected_hold",
+    [("ordered", D("198")), ("reversed", D("99"))],
+)
+def test_frozen_h08_independent_position_snapshots_follow_delivery_order(visibility, expected_hold):
+    source, run = _oracle_run("H08", model_id="OHLC4_OPEN_LOW_HIGH_CLOSE_V1")
+    assert source["case"] == "H08"
+    assert source["policy"] == (
+        "SPIDER_GRID_ORIGINAL_V1@1:sha256:"
+        "4dbf2bdbee87d4100004fe5b14a93f597e64a9bca6525ed2902afd3476ee40ec"
+    )
+    assert source["config"] == (
+        "P3_ORACLE_CONFIG_BASE_V1:sha256:"
+        "e4198c375c41c8c3e9b0a6d8aa7f836f4f5545e8f2b5abc712851c3b556009dd"
+    )
+    assert source["poll_root"] == "H08-POLL-ROOT@E+19997"
+    assert source["snapshot_requests"] == (
+        "H08-OLD-REQUEST@E+19998:parentH08-POLL-ROOT;"
+        "H08-NEW-REQUEST@E+20000:parentH08-POLL-ROOT"
+    )
+    assert source["captures"] == (
+        "H08-OLD-POSITIONS:asofE+19999;H08-NEW-POSITIONS:asofE+20001"
+    )
+    answer = _case_answer("H08")
+    assert answer["market_fill"] == (
+        "E+20000,H08-ORDER-1_LONG1@99,owner_contractsA1->2,"
+        "execution_noticeE+20002_updates_policy_cache_mark99"
+    )
+    composition = _ReplayComposition._from_historical_run(run)
+    start = run.range_start_ms
+    timeline_root, expected_requests = _h08_frozen_timeline(source, start, visibility)
+    driver = _H08RequestDriver(composition, timeline_root, expected_requests)
+    driver.issue_poll_root()
+    driver.issue_snapshot_request("H08-OLD-REQUEST")
+    driver.capture("H08-OLD-REQUEST", sequence=100)
+    driver.issue_snapshot_request("H08-NEW-REQUEST")
+    driver.capture("H08-NEW-REQUEST", sequence=101)
+    assert driver.trace == _h08_expected_driver_trace(source, start, visibility)
+    timeline = [driver.issued["H08-OLD-REQUEST"], driver.issued["H08-NEW-REQUEST"]]
+    old_visible = timeline[0]["visible_at_ms"] - start
+    new_visible = timeline[1]["visible_at_ms"] - start
+    owner_after_fill_and_capture = composition._codec.inspect_state()
+    capture_records = {
+        row["request_id"]: composition._records[(1, row["capture_id"])]
+        for row in timeline
+    }
+    assert {
+        request_id: (record["item"]["request"]["snapshot_id"],
+                     (record["key"][0] - 5) // 16)
+        for request_id, record in capture_records.items()
+    } == {
+        row["request_id"]: (row["capture_id"], row["capture_at_ms"])
+        for row in timeline
+    }
+    fill_records = [
+        (record, product, fill)
+        for record in composition._records.values()
+        if record["item"]["kind"] == "HISTORICAL_MARKET_STEP"
+        for product in record["result"].get("historical_result", {}).get("products", [])
+        for fill in product["fills"]
+        if fill["order_id"] == "H08-ORDER-1"
+    ]
+    assert len(fill_records) == 1
+    fill_record, fill_product, fill = fill_records[0]
+    notice = next(
+        record for record in composition._records.values()
+        if record["item"]["kind"] == "DELIVERY"
+        and record["item"]["delivery"]["source_fact_id"] == fill["source_event_id"]
+    )
+    notice_delivery = notice["item"]["delivery"]
+    assert (fill_product["product_id"], fill["quantity_contracts"], fill["price"]) == (
+        "A-USDT-SWAP", D("1"), D("99"),
+    )
+    assert fill_record["result"]["historical_result"]["raw_time_ms"] == start + 20_000
+    assert notice_delivery["source_fact_id"] == fill["source_event_id"]
+    assert notice_delivery["immutable_payload"]["order_id"] == "H08-ORDER-1"
+    assert notice_delivery["immutable_payload"]["fill_price"] == D("99")
+    assert notice_delivery["visible_at"] == (start + 20_002) * 16 + 6
+    assert D(str(composition._policy.markets["A-USDT-SWAP"]["price"])) == D("100")
+    assert notice["result"]["classification"] == "PENDING"
+    assert composition._dispatch_due(notice["key"][0] - 1)["classification"] == "SUCCESS"
+    assert D(str(composition._policy.markets["A-USDT-SWAP"]["price"])) == D("100")
+    assert composition._dispatch_due(notice["key"][0])["classification"] == "SUCCESS"
+    assert composition._records[(2, notice_delivery["delivery_id"])]["result"]["classification"] == "SUCCESS"
+    assert composition._policy.markets["A-USDT-SWAP"]["price"] == D("99")
+    first_snapshot_visible = min(old_visible, new_visible)
+    assert composition._dispatch_due((start + first_snapshot_visible) * 16 + 6)["classification"] == "SUCCESS"
+    expected_first_hold = D("99") if first_snapshot_visible == old_visible else D("198")
+    assert composition._policy.rows[0]["hold"] == expected_first_hold
+    second_snapshot_visible = max(old_visible, new_visible)
+    assert composition._dispatch_due((start + second_snapshot_visible) * 16 + 6)["classification"] == "SUCCESS"
+    assert composition._policy.rows[0]["hold"] == expected_hold
+    assert composition._policy.markets["A-USDT-SWAP"]["price"] == D("99")
+    boundary_owner = composition._codec.inspect_state()
+    assert boundary_owner["account_version"] == owner_after_fill_and_capture["account_version"]
+    boundary_positions = _snapshot(
+        composition, "POSITIONS", f"H08-{visibility}-BOUNDARY", (start + 20_008) * 16 + 6
+    )["rows"]
+    assert [(row["product_id"], row["position_contracts"]) for row in boundary_positions] == [
+        ("A-USDT-SWAP", D("2")),
+    ]
+    assert composition._dispatch_due(run.range_end_ms * 16 + 6)["classification"] == "SUCCESS"
+    assert composition._policy.rows[0]["hold"] == D("198")
+    endpoint_owner = composition._codec.inspect_state()
+    endpoint_positions = _snapshot(
+        composition, "POSITIONS", f"H08-{visibility}-ENDPOINT", run.range_end_ms * 16 + 6
+    )["rows"]
+    assert [(row["product_id"], row["position_contracts"]) for row in endpoint_positions] == [
+        ("A-USDT-SWAP", D("2")),
+    ]
+    assert endpoint_owner["account_version"] >= boundary_owner["account_version"]
+    assert endpoint_owner["cash"] == boundary_owner["cash"]
+
+    snapshot_deliveries = {
+        record["item"]["delivery"]["source_fact_id"]: record
+        for record in composition._records.values()
+        if record["item"]["kind"] == "DELIVERY"
+        and record["item"]["delivery"]["source_fact_id"] in {
+            "H08-OLD-POSITIONS", "H08-NEW-POSITIONS",
+        }
+    }
+    for row in timeline:
+        delivery_record = snapshot_deliveries[row["capture_id"]]
+        delivery = delivery_record["item"]["delivery"]
+        assert delivery["visible_at"] == row["visible_at_ms"] * 16 + 6
+        assert delivery["snapshot_as_of"] == row["capture_at_ms"] * 16 + 5
+        assert delivery_record["result"]["classification"] == "SUCCESS"
+        expected_contracts = D("1") if row["capture_id"] == "H08-OLD-POSITIONS" else D("2")
+        assert delivery["immutable_payload"]["rows"][0]["position_contracts"] == expected_contracts
+    assert composition._codec.inspect_state()["account_version"] > 0
+    assert composition._policy.rows[0]["active"] == "false"
+    assert composition._policy.rows[0]["hold"] == D("198")
+    control = _ReplayComposition._from_historical_run(run)
+    assert control._dispatch_due(run.range_end_ms * 16 + 6)["classification"] == "SUCCESS"
+    assert composition._policy.events == control._policy.events
+
+
+def test_frozen_h08_models_share_policy_prefix_and_timer_schedule():
+    models = (
+        ("OHLC4_OPEN_LOW_HIGH_CLOSE_V1", 20_000),
+        ("OHLC4_OPEN_HIGH_LOW_CLOSE_V1", 40_000),
+    )
+    prefixes = []
+    traces = []
+    for model_id, fill_offset in models:
+        _, run = _oracle_run("H08", model_id=model_id)
+        composition = _ReplayComposition._from_historical_run(run)
+        start = run.range_start_ms
+        assert composition._dispatch_due((start + 20_001) * 16 + 5)["classification"] == "SUCCESS"
+        prefixes.append(deepcopy(composition._policy.events))
+        assert D(str(composition._policy.markets["A-USDT-SWAP"]["price"])) == D("100")
+        assert composition._dispatch_due(run.range_end_ms * 16 + 6)["classification"] == "SUCCESS"
+        timers = sorted(
+            (record["raw_time_ms"], record["result"]["classification"])
+            for record in composition._records.values()
+            if record["item"]["kind"] == "HISTORICAL_TIMER"
+        )
+        assert timers == [
+            (start + offset, "SUCCESS") for offset in range(5_000, 60_000, 5_000)
+        ]
+        fills = [
+            (record["result"]["historical_result"]["raw_time_ms"], fill["order_id"],
+             fill["quantity_contracts"], fill["price"])
+            for record in composition._records.values()
+            if record["item"]["kind"] == "HISTORICAL_MARKET_STEP"
+            for product in record["result"].get("historical_result", {}).get("products", [])
+            for fill in product["fills"]
+        ]
+        assert fills == [(start + fill_offset, "H08-ORDER-1", D("1"), D("99"))]
+        final_positions = _snapshot(
+            composition, "POSITIONS", f"H08-{model_id}-END", run.range_end_ms * 16 + 6
+        )["rows"]
+        assert [(row["product_id"], row["position_contracts"]) for row in final_positions] == [
+            ("A-USDT-SWAP", D("2")),
+        ]
+        traces.append(composition)
+    assert prefixes[0] == prefixes[1]
+    assert traces[0]._policy.events == traces[1]._policy.events
+
+
+def test_frozen_h08_future_x_y_bars_do_not_change_closed_interval_prefix():
+    source, base = _oracle_run("H08", model_id="OHLC4_OPEN_LOW_HIGH_CLOSE_V1")
+    future_x = _h08_future_trace(base, _h08_future_bar(source, "future_X"))
+    future_y = _h08_future_trace(base, _h08_future_bar(source, "future_Y"))
+    end = base.range_end_ms
+    trade_prefix_x = tuple(row for row in future_x.trade_bars if row.bar_open_ms < end)
+    trade_prefix_y = tuple(row for row in future_y.trade_bars if row.bar_open_ms < end)
+    mark_prefix_x = tuple(row for row in future_x.mark_bars if row.bar_open_ms < end)
+    mark_prefix_y = tuple(row for row in future_y.mark_bars if row.bar_open_ms < end)
+    assert trade_prefix_x == trade_prefix_y
+    assert mark_prefix_x == mark_prefix_y
+    x_future = next(row for row in future_x.trade_bars
+                    if row.product_id == "A-USDT-SWAP" and row.bar_open_ms == end)
+    y_future = next(row for row in future_y.trade_bars
+                    if row.product_id == "A-USDT-SWAP" and row.bar_open_ms == end)
+    assert (x_future.open, x_future.high, x_future.low, x_future.close) == (
+        D("100"), D("101"), D("99"), D("101"),
+    )
+    assert (y_future.open, y_future.high, y_future.low, y_future.close) == (
+        D("100"), D("101"), D("99"), D("99"),
+    )
+    assert (x_future.open, x_future.high, x_future.low, x_future.volume) == (
+        y_future.open, y_future.high, y_future.low, y_future.volume,
+    )
+    assert x_future.close != y_future.close
+    for rows_x, rows_y in (
+        (future_x.trade_bars, future_y.trade_bars),
+        (future_x.mark_bars, future_y.mark_bars),
+    ):
+        by_key_x = {(row.product_id, row.bar_open_ms): row for row in rows_x}
+        by_key_y = {(row.product_id, row.bar_open_ms): row for row in rows_y}
+        assert by_key_x.keys() == by_key_y.keys()
+        assert all(
+            by_key_x[key] == by_key_y[key]
+            for key in by_key_x
+            if key != ("A-USDT-SWAP", end)
+        )
+
+    compositions = [
+        _ReplayComposition._from_historical_run(run) for run in (future_x, future_y)
+    ]
+    for composition in compositions:
+        assert composition._dispatch_due(end * 16 + 6)["classification"] == "SUCCESS"
+        future_steps = [
+            record for record in composition._records.values()
+            if record["item"]["kind"] == "HISTORICAL_MARKET_STEP"
+            and record["item"]["node"]["bar_open_ms"] == end
+        ]
+        assert len(future_steps) == 1
+        assert future_steps[0]["result"]["classification"] == "PENDING"
+    def normalized_steps(composition):
+        return [
+            (record["result"]["historical_result"]["raw_time_ms"],
+             record["item"]["node"]["step_index"],
+             tuple((bar["product_id"],
+                    tuple((name, bar["trade"][name]) for name in ("open", "high", "low", "close", "volume_contracts")),
+                    tuple((name, bar["mark"][name]) for name in ("open", "high", "low", "close")))
+                   for bar in record["item"]["node"]["bars"]),
+             tuple((product["product_id"], tuple(
+                 (fill["order_id"], fill["quantity_contracts"], fill["price"])
+                 for fill in product["fills"]
+             )) for product in record["result"]["historical_result"]["products"]))
+            for record in sorted(composition._records.values(), key=lambda item: item["key"])
+            if (record["item"]["kind"] == "HISTORICAL_MARKET_STEP"
+                    and "historical_result" in record["result"])
+        ]
+    assert normalized_steps(compositions[0]) == normalized_steps(compositions[1])
+    assert compositions[0]._policy.events == compositions[1]._policy.events
+    for composition in compositions:
+        successful_timers = sorted(
+            record["raw_time_ms"] for record in composition._records.values()
+            if record["item"]["kind"] == "HISTORICAL_TIMER"
+            and record["result"]["classification"] == "SUCCESS"
+        )
+        assert successful_timers == [
+            future_x.range_start_ms + offset for offset in range(5_000, 60_000, 5_000)
+        ]
 
 
 def test_execution_notice_occurrence_rejects_forged_native_delivery_identity():
