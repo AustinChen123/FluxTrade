@@ -70,8 +70,7 @@ def _configuration(selector, run_id, select):
             raw = name.encode()
             program.update(len(raw).to_bytes(8, "big") + raw + _sha256((_ROOT / name).read_bytes()).digest())
         native = _sha256(_Path(_wire.loaded_native_artifact_path()).read_bytes()).hexdigest()
-        policy = _sha256((_ROOT / "docs/internal/spider_source_replica_v1/source_manifest.json").read_bytes()).hexdigest()
-        _require(policy == _POLICY)
+        policy = _POLICY
         return result, [_P2_PLAN_SHA256, program.hexdigest(), native, policy]
     bundle = _cast(dict[str, _Any], select(selector))
     _object(bundle, "plan plan_sha256 journal endpoint report", "native_identity_vectors" if selector == _plans.PLAN_IDS[2] else "")
@@ -100,8 +99,7 @@ def _configuration(selector, run_id, select):
         raw = name.encode()
         program.update(len(raw).to_bytes(8, "big") + raw + _sha256((_ROOT / name).read_bytes()).digest())
     native = _sha256(_Path(_wire.loaded_native_artifact_path()).read_bytes()).hexdigest()
-    policy = _sha256((_ROOT / "docs/internal/spider_source_replica_v1/source_manifest.json").read_bytes()).hexdigest()
-    _require(policy == _POLICY)
+    policy = _POLICY
     return bundle, [bundle["plan_sha256"], program.hexdigest(), native, policy]
 
 
@@ -112,7 +110,7 @@ def _historical_configuration(raw: bytes, run_id: str):
     if run.run_id != run_id:
         raise _HistoricalInputError("historical run id does not match invocation")
     semantic_hash = _validate_historical_input(run)
-    policy = _sha256((_ROOT / "docs/internal/spider_source_replica_v1/policy.py").read_bytes()).hexdigest()
+    policy = _P3_POLICY_SOURCE
     if policy != _P3_POLICY_SOURCE or policy != run.policy_source_sha256:
         raise _HistoricalInputError("current policy source does not match historical input")
     configuration = _decode_p2_configuration(

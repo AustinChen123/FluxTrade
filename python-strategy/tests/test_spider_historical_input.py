@@ -32,9 +32,9 @@ from src.core.backtest.spider_historical_input import (
 
 
 ROOT = Path(__file__).parents[1]
-CONTRACTS = ROOT.parent / "docs/internal/spider_engineering_requirements_v1/p3"
-INPUTS = CONTRACTS / "P3_ORACLE_INPUTS_V1.txt"
-ANSWERS = CONTRACTS / "P3_ORACLE_ANSWERS_V1.txt"
+FIXTURES = Path(__file__).parent / "fixtures/spider_p3"
+INPUTS = FIXTURES / "P3_ORACLE_INPUTS_V1.txt"
+ANSWERS = FIXTURES / "P3_ORACLE_ANSWERS_V1.txt"
 HASH = "0" * 64
 INPUTS_SHA256 = "f0ef34464e3ccefd4cc7ea21485698e3f6398a0f323354bb7ac41156e4c3dd51"
 ANSWERS_SHA256 = "30f412b0c1ddd1ae6ac779cb6c821efbef96f410f751781add33bc02991b1d5e"

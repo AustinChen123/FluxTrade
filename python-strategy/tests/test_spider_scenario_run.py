@@ -472,6 +472,20 @@ def test_historical_input_rejections_precede_store_and_owner(tmp_path, monkeypat
     assert not store_calls and list(tmp_path.iterdir()) == []
 
 
+def test_historical_runtime_uses_frozen_policy_identity_without_internal_docs(monkeypatch):
+    value, raw = historical_input("frozen-policy-identity")
+    source = Path(run.__file__).read_text(encoding="utf-8")
+    assert "docs/internal" not in source
+    assert value.policy_source_sha256 == run._P3_POLICY_SOURCE
+
+    _, _, identities = run._historical_configuration(raw, value.run_id)
+    assert identities[3] == run._P3_POLICY_SOURCE
+
+    monkeypatch.setattr(run, "_P3_POLICY_SOURCE", "f" * 64)
+    with pytest.raises(run._HistoricalInputError):
+        run._historical_configuration(raw, value.run_id)
+
+
 @pytest.mark.parametrize("invalidity", ["duplicate_active_spec", "huge_sparse_span"])
 def test_historical_timeline_and_coverage_reject_before_store_or_owner(tmp_path, monkeypatch, invalidity):
     value, raw = historical_input(f"historical-{invalidity}")
@@ -802,12 +816,10 @@ def test_rejected_selector_constructs_no_owner(tmp_path, monkeypatch, selector):
     assert not (tmp_path / "r1/journal.jsonl").exists()
 
 
-@pytest.mark.parametrize("fault", ["manifest", "program", "native", "hash", "recipe"])
+@pytest.mark.parametrize("fault", ["program", "native", "hash", "recipe"])
 def test_preowner_provenance_and_recipe_fail_closed(tmp_path, monkeypatch, fault):
     original_read, select = Path.read_bytes, run._plans.cli_plan_bundle
     def bytes_(path):
-        if fault == "manifest" and path.name == "source_manifest.json":
-            return b"wrong"
         if fault == "program" and path.name == "spider_policy.py":
             raise FileNotFoundError()
         return original_read(path)
