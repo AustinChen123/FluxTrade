@@ -2056,17 +2056,21 @@ def _queue_policy_order_children(run, *, client_order_id="CLIENT-SEND", price="5
     composition._last_popped = None
     composition._historical_order_sequence = 0
     product_id = run.ordered_products[0]
-    send = dict(kind="send", operation="send", route="REST", at_ms=run.range_start_ms + 1_000,
-                orders=[dict(instId=product_id, instIdCode=1, tdMode="cross", clOrdId=client_order_id,
-                             tag="test", side="buy", ordType="limit", px=price, sz=quantity)])
-    policy_events = [send]
+    send: dict[str, Any] = dict(
+        kind="send", operation="send", route="REST", at_ms=run.range_start_ms + 1_000,
+        orders=[dict(instId=product_id, instIdCode=1, tdMode="cross", clOrdId=client_order_id,
+                     tag="test", side="buy", ordType="limit", px=price, sz=quantity)],
+    )
+    policy_events: list[dict[str, Any]] = [send]
     if include_cancel:
         policy_events.append(dict(
             kind="cancel", operation="cancel", route="REST", at_ms=run.range_start_ms + 1_000,
             orders=[dict(ordId=client_order_id, instId=product_id, instIdCode=1)],
         ))
-    audit_events = [dict(event=deepcopy(event), actions=[dict(group_id=None, status="UNSUBMITTED")])
-                    for event in policy_events]
+    audit_events: list[dict[str, Any]] = [
+        dict(event=deepcopy(event), actions=[dict(group_id=None, status="UNSUBMITTED")])
+        for event in policy_events
+    ]
     delivery_id = "SYNTHETIC-POLICY-DELIVERY"
     visible_at = (run.range_start_ms + 1_000) * 16 + 6
     record = dict(item=dict(delivery=dict(delivery_id=delivery_id, visible_at=visible_at)))
