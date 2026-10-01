@@ -12,6 +12,7 @@ from typing import Any, cast
 import pytest
 
 from examples import run_spider_scenario_replay as cli
+from src.core import backtest_runner as full
 from src.core.backtest import spider_formal_runner as formal
 from src.core.backtest import spider_scenario_run as run
 from src.core.backtest.spider_historical_input import (
@@ -487,16 +488,24 @@ def test_h09_cli_and_bridge_produce_exact_p02_projection(
 ):
     _, oracle_input = _oracle_run("H09", model_id=model_id)
     cli_run_id = f"cli-h09-{suffix}"
-    bridge_run_id = f"formal-bridge-h09-{suffix}-different-length"
-    assert len(cli_run_id) != len(bridge_run_id)
+    research_run_id = f"research-h09-{suffix}-different-length"
+    full_run_id = f"full-h09-{suffix}-third-distinct-length"
+    assert len({len(cli_run_id), len(research_run_id), len(full_run_id)}) == 3
     assert oracle_input.model_id == model_id
     assert validate_historical_input(oracle_input) == expected_input_hash
 
     cli_input = replace(oracle_input, run_id=cli_run_id)
-    bridge_input = replace(oracle_input, run_id=bridge_run_id)
+    research_input = replace(oracle_input, run_id=research_run_id)
+    full_input = replace(oracle_input, run_id=full_run_id)
     cli_raw = encode_historical_run_input(cli_input)
-    bridge_raw = encode_historical_run_input(bridge_input)
-    assert validate_historical_input(cli_input) == validate_historical_input(bridge_input) == expected_input_hash
+    research_raw = encode_historical_run_input(research_input)
+    full_raw = encode_historical_run_input(full_input)
+    assert (
+        validate_historical_input(cli_input)
+        == validate_historical_input(research_input)
+        == validate_historical_input(full_input)
+        == expected_input_hash
+    )
 
     input_path = tmp_path / f"{cli_run_id}-historical-input.json"
     input_path.write_bytes(cli_raw)
@@ -509,15 +518,36 @@ def test_h09_cli_and_bridge_produce_exact_p02_projection(
     assert (cli_code, captured.err) == (0, "")
     assert json.loads(captured.out) == dict(run_id=cli_run_id, outcome="ADMITTED", reason=None)
     cli_projection = formal.project_admitted_spider_run(tmp_path / cli_run_id)
-    bridge_result = research.ResearchBacktestRunner.run_spider_historical(
-        output_root=str(tmp_path), run_id=bridge_run_id, historical_input=bridge_raw,
+    research_result = research.ResearchBacktestRunner.run_spider_historical(
+        output_root=str(tmp_path), run_id=research_run_id, historical_input=research_raw,
+    )
+    full_result = full.BacktestRunner.run_spider_historical(
+        output_root=str(tmp_path), run_id=full_run_id, historical_input=full_raw,
     )
 
     assert cli_projection is not None
-    assert bridge_result.outcome == "ADMITTED" and bridge_result.projection is not None
-    assert bridge_result.runner_kind == "research"
-    assert cli_projection.canonical_json == bridge_result.projection.canonical_json
-    assert cli_projection.sha256 == bridge_result.projection.sha256
+    assert research_result.outcome == "ADMITTED" and research_result.projection is not None
+    assert full_result.outcome == "ADMITTED" and full_result.projection is not None
+    assert research_result.runner_kind == "research"
+    assert full_result.runner_kind == "full"
+    for projection in (research_result.projection, full_result.projection):
+        assert cli_projection.canonical_json == projection.canonical_json
+        assert cli_projection.sha256 == projection.sha256
+
+    admitted_artifacts = admit_spider_run(tmp_path / full_run_id)["artifacts"]
+    original_rows = admitted_artifacts["report.jsonl"]
+    assert full_result.report_rows == original_rows
+    assert all(row["run_id"] == full_run_id for row in full_result.report_rows or [])
+    normalized_rows = deepcopy(original_rows)
+    for row in normalized_rows:
+        row.pop("run_id")
+    assert full_result.projection.report_rows == normalized_rows
+
+    detached_rows = full_result.report_rows
+    assert detached_rows is not None
+    detached_rows[0]["account_cash"] = "mutated-detached-copy"
+    assert full_result.report_rows == original_rows
+    assert admitted_artifacts["report.jsonl"] == original_rows
 
 
 def test_research_runner_static_formal_entry_delegates_once_without_candle_lifecycle(
@@ -550,4 +580,43 @@ def test_research_runner_static_formal_entry_delegates_once_without_candle_lifec
     assert calls == [dict(
         output_root="formal-output", run_id="formal-run", historical_input=b"frozen-input",
         runner_kind="research",
+    )]
+
+
+def test_full_runner_static_formal_entry_delegates_once_without_full_lifecycle(
+    monkeypatch,
+):
+    expected = formal.SpiderFormalRunResult(
+        "full", "returned", "REJECTED", "delegated-reason", None, None,
+    )
+    calls = []
+
+    def delegate(**kwargs):
+        calls.append(kwargs)
+        return expected
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("formal Spider entry entered the ordinary full-runner lifecycle")
+
+    monkeypatch.setattr(full, "_invoke_spider_historical", delegate)
+    for owner in (
+        "StrategyEngine", "SimulatedAdapter", "SessionLocal", "BacktestAccountService",
+        "get_candles_generator", "_write_csv_trades", "_write_equity_curve",
+        "_write_flow_neutral_curve", "_write_journal", "_write_markdown_report",
+        "_sessionlocal_context",
+    ):
+        monkeypatch.setattr(full, owner, forbidden)
+    monkeypatch.setattr(full.BacktestRunner, "__init__", forbidden)
+    monkeypatch.setattr(full.BacktestRunner, "run", forbidden)
+    monkeypatch.setattr(full.BacktestRunner, "_export_reports", forbidden)
+    monkeypatch.setattr(BaseStrategy, "on_candle", forbidden)
+
+    result = full.BacktestRunner.run_spider_historical(
+        output_root="formal-output", run_id="formal-run-full", historical_input=b"frozen-input",
+    )
+
+    assert result is expected
+    assert calls == [dict(
+        output_root="formal-output", run_id="formal-run-full", historical_input=b"frozen-input",
+        runner_kind="full",
     )]
