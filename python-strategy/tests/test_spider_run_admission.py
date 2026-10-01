@@ -156,7 +156,7 @@ def test_absent_completion_diagnostic_and_only_needed_opens(tmp_path, persisted,
     assert opened == [str(tmp_path), "status.json", "journal.jsonl"]
 
 
-@pytest.mark.parametrize("mutation", ["bytes", "sha256", "byte_count", "row_count", "semantic_digest", "oversize"])
+@pytest.mark.parametrize("mutation", ["bytes", "sha256", "byte_count", "row_count", "semantic_digest", "oversize", "oversize_journal"])
 def test_actual_file_metadata_is_not_trusted(tmp_path, mutation):
     values = bundle(tmp_path)
     manifest = values["completion.json"]
@@ -164,12 +164,86 @@ def test_actual_file_metadata_is_not_trusted(tmp_path, mutation):
         (tmp_path / "endpoint.json").write_bytes(b"{}\n")
     elif mutation == "oversize":
         (tmp_path / "endpoint.json").write_bytes(b" " * (16_777_216 + 1))
+    elif mutation == "oversize_journal":
+        (tmp_path / "journal.jsonl").write_bytes(b" " * (16_777_216 + 1))
     elif mutation == "semantic_digest":
         manifest["endpoint_state_digest"] = "f" * 64
     else:
         manifest["artifacts"][3][mutation] = "f" * 64 if mutation == "sha256" else 0
     (tmp_path / "completion.json").write_bytes(framed(manifest, "completion.json"))
-    rejected(tmp_path, "ARTIFACT_MISMATCH", ("endpoint.json",))
+    rejected(tmp_path, "ARTIFACT_MISMATCH", ("journal.jsonl",) if mutation == "oversize_journal" else ("endpoint.json",))
+
+
+def test_valid_p3_manifest_widens_only_journal_capture(tmp_path, monkeypatch):
+    from src.core.backtest.spider_historical_input import historical_context_for_input
+    from test_spider_scenario_run import historical_input
+
+    historical, _ = historical_input("limit-routing")
+    values = bundle(tmp_path)
+    manifest = values["completion.json"]
+    manifest.update(
+        terminal_reason="MTM_PRESERVE_OPEN_V1",
+        configuration_context=configuration_context(),
+        historical_context=historical_context_for_input(historical),
+        planned_coverage=[dict(ordinal=1, barrier_id="P3_MARKET_1", record_kind="HISTORICAL_MARKET_STEP")],
+        processed_boundary=dict(ordinal=1, journal_seq=1, barrier_id="P3_MARKET_1"),
+        persisted_boundary=dict(ordinal=1, journal_seq=1, barrier_id="P3_MARKET_1"),
+    )
+    manifest["artifacts"].append(dict(
+        path="historical_input.json", schema_version="spider_historical_research_run_v1",
+        sha256="f" * 64, byte_count=1, row_count=1,
+    ))
+    (tmp_path / "completion.json").write_bytes(framed(manifest, "completion.json"))
+    admission._completion(manifest)
+
+    original_capture = admission._capture
+    limits = {}
+
+    def observe_capture(directory, name, **kwargs):
+        limits[name] = kwargs.get("limit", 16_777_216)
+        return original_capture(directory, name, **kwargs)
+
+    monkeypatch.setattr(admission, "_capture", observe_capture)
+    admitted = admission.admit_spider_run(tmp_path)
+    assert admitted == dict(decision="REJECT", reason="ARTIFACT_MISMATCH", evidence=("historical_input.json",))
+    assert limits == {
+        "completion.json": 16_777_216,
+        "attempt.json": 16_777_216,
+        "status.json": 16_777_216,
+        "journal.jsonl": 33_554_432,
+        "endpoint.json": 16_777_216,
+        "reconciliation.json": 16_777_216,
+        "report.jsonl": 16_777_216,
+        "historical_input.json": 16_777_216,
+    }
+
+
+def test_invalid_historical_manifest_rejects_before_artifact_capture(tmp_path, monkeypatch):
+    values = bundle(tmp_path)
+    values["completion.json"]["historical_context"] = []
+    (tmp_path / "completion.json").write_bytes(framed(values["completion.json"], "completion.json"))
+    original_capture = admission._capture
+    captures = []
+
+    def observe_capture(directory, name, **kwargs):
+        captures.append((name, kwargs.get("limit", 16_777_216)))
+        return original_capture(directory, name, **kwargs)
+
+    monkeypatch.setattr(admission, "_capture", observe_capture)
+    rejected(tmp_path, "INVALID_MANIFEST", ("completion.json",))
+    assert captures == [("completion.json", 16_777_216)]
+
+
+def test_capture_honors_explicit_limit(tmp_path):
+    path = tmp_path / "journal.jsonl"
+    path.write_bytes(b"12345")
+    directory = os.open(tmp_path, os.O_RDONLY)
+    try:
+        assert admission._capture(directory, path.name, limit=5) == b"12345"
+        with pytest.raises(admission._Oversize):
+            admission._capture(directory, path.name, limit=4)
+    finally:
+        os.close(directory)
 
 
 @pytest.mark.parametrize("mutation,reason,tokens", [

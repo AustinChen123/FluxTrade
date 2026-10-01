@@ -24,6 +24,7 @@ _ALL = (*_NAMES, "completion.json")
 _P3_NAMES = tuple(name for name, _ in _P3_ARTIFACTS)
 _P3_ALL = (*_P3_NAMES, "completion.json")
 _LIMIT = 16_777_216
+_P3_JOURNAL_LIMIT = 33_554_432
 _POLICY = "eb6ab34d8685fb59e286f5ffda8af24cbecf3e5ab2c729c585ccdca797cac336"
 _P2_SELECTOR = "SPIDER_P2_CONFIGURED_SCALE_V1"
 _P2_RUN_CONTRACT = "SPIDER_SYNTHETIC_P2_CONFIGURED_RUN_V1"
@@ -52,7 +53,7 @@ def _regular(directory: int, name: str) -> None:
         raise _Unsafe()
 
 
-def _capture(directory: int, name: str, *, exclusive: bool = False) -> bytes:
+def _capture(directory: int, name: str, *, exclusive: bool = False, limit: int = _LIMIT) -> bytes:
     _regular(directory, name)
     descriptor = _os.open(name, _os.O_RDONLY | _os.O_NOFOLLOW | _os.O_NONBLOCK, dir_fd=directory)
     try:
@@ -60,8 +61,8 @@ def _capture(directory: int, name: str, *, exclusive: bool = False) -> bytes:
         if not _stat.S_ISREG(info.st_mode) or (exclusive and info.st_nlink != 1):
             raise _Unsafe()
         chunks, count = [], 0
-        while count <= _LIMIT:
-            chunk = _os.read(descriptor, min(65536, _LIMIT + 1 - count))
+        while count <= limit:
+            chunk = _os.read(descriptor, min(65536, limit + 1 - count))
             if not chunk:
                 return b"".join(chunks)
             chunks.append(chunk)
@@ -157,7 +158,8 @@ def _admit(directory: int) -> dict[str, _Any]:
     captured, bad = {}, []
     for name in names:
         try:
-            captured[name] = _capture(directory, name, exclusive=name == "historical_input.json")
+            limit = _P3_JOURNAL_LIMIT if historical_manifest and name == "journal.jsonl" else _LIMIT
+            captured[name] = _capture(directory, name, exclusive=name == "historical_input.json", limit=limit)
         except _Unsafe:
             unsafe.append(name)
         except (OSError, _Oversize):
