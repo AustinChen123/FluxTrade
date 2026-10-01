@@ -274,6 +274,32 @@ fn encode_working_orders(
 }
 
 impl Session {
+    pub(super) fn historical_order_binding(
+        &mut self,
+        event_id: &str,
+        source_sequence: i64,
+    ) -> Reply {
+        self.guarded(false, |session| {
+            let Some((client_order_id, order_id, product_id, strategy_id)) = session
+                .owner
+                .historical_order_binding(event_id, source_sequence)
+                .map_err(boundary)?
+            else {
+                return wire::Json::Null
+                    .canonical()
+                    .map_err(|_| BoundaryError::Invariant);
+            };
+            wire::fields(vec![
+                ("client_order_id", wire::string(&client_order_id)),
+                ("order_id", wire::string(&order_id)),
+                ("product_id", wire::string(&product_id)),
+                ("strategy_id", wire::string(&strategy_id)),
+            ])
+            .canonical()
+            .map_err(|_| BoundaryError::Invariant)
+        })
+    }
+
     pub(super) fn historical_working_orders(&mut self) -> Reply {
         self.guarded(false, |session| {
             let orders = session

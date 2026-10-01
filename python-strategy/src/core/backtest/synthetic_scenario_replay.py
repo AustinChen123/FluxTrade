@@ -345,6 +345,8 @@ class _ReplayComposition:
         self._p3_execution_notice_delivered_facts: set[str] = set()
         self._p3_cancel_ack_deliveries: set[str] = set()
         self._historical_cancel_effects: dict[str, dict[str, Any]] = {}
+        self._historical_send_dependencies: dict[str, dict[str, Any]] = {}
+        self._historical_send_by_client: dict[str, dict[str, Any]] = {}
         self._historical_endpoint_action_times: dict[tuple[str, int, int], int] = {}
         self._historical_run: object | None = None
         self._historical_bars: dict[tuple[int, str], tuple[HistoricalBar, HistoricalBar]] = {}
@@ -914,6 +916,11 @@ class _ReplayComposition:
                         limit_price=D(order["px"]) if order["ordType"] == "limit" else None,
                         reduce_only=False, requested_at=parent_raw,
                     )
+                    dependency = dict(
+                        client_order_id=order["clOrdId"], product_id=product_id,
+                        strategy_id=contract["strategy_identity"], group_id=None,
+                        event_id=None, state="PENDING", binding=None,
+                    )
                 else:
                     if event["kind"] != "cancel" or not order.get("ordId"):
                         raise _ScheduleError("INVALID_SCHEMA")
@@ -921,7 +928,8 @@ class _ReplayComposition:
                     scenario_ordinal = _historical_order_ordinal(kind)
                     group_identity = "CANCEL_REQUEST_GROUP"
                     event_identity = "CANCEL_REQUEST_EVENT"
-                    payload = dict(targets=[dict(target_order_id=order["ordId"], reason="EXPLICIT_SCENARIO")])
+                    target_order_id = order["ordId"]
+                    payload = dict(targets=[dict(target_order_id=target_order_id, reason="EXPLICIT_SCENARIO")])
                 group_id = policy_protocol._historical_child_id(
                     contract["run_contract_hash"], delivery["delivery_id"], group_identity, ordinal
                 )
@@ -943,6 +951,14 @@ class _ReplayComposition:
                 policy_protocol._plan_group(group, self._configured_product_ids)
                 audit_events[event_index]["actions"][order_index]["group_id"] = group_id
                 groups.append((dict(kind="SOURCE_GROUP", schedule_sequence=sequence, group=group), None))
+                if kind == "INTENT":
+                    client_id = dependency["client_order_id"]
+                    if client_id in self._historical_send_by_client:
+                        raise _ScheduleError("DUPLICATE_SEND_DEPENDENCY")
+                    dependency["group_id"] = group_id
+                    dependency["event_id"] = event_id
+                    self._historical_send_dependencies[group_id] = dependency
+                    self._historical_send_by_client[client_id] = dependency
                 if kind == "CANCEL_REQUEST":
                     effect_event_id = policy_protocol._historical_child_id(
                         contract["run_contract_hash"], delivery["delivery_id"],
@@ -955,11 +971,84 @@ class _ReplayComposition:
                     self._historical_cancel_effects[group_id] = dict(
                         parent_raw=parent_raw, request_event_id=event_id,
                         effect_event_id=effect_event_id, effect_group_id=effect_group_id,
-                        target_order_id=order["ordId"], reason="EXPLICIT_SCENARIO",
+                        target_order_id=target_order_id, product_id=order["instId"],
+                        strategy_id=contract["strategy_identity"], reason="EXPLICIT_SCENARIO",
                     )
                 sequence += 1
         self._historical_order_sequence = sequence
         return groups
+
+    def _resolve_historical_cancel_target(self, target_order_id, product_id, strategy_id):
+        if not isinstance(target_order_id, str):
+            raise _ScheduleError("INVALID_SCHEMA")
+        if any(
+            dependency.get("binding", {}).get("order_id") == target_order_id
+            for dependency in self._historical_send_by_client.values()
+            if isinstance(dependency.get("binding"), dict)
+        ):
+            return target_order_id
+        dependency = self._historical_send_by_client.get(target_order_id)
+        if dependency is None:
+            return target_order_id
+        if dependency["state"] == "PENDING":
+            raise _ScheduleError("DEPENDENCY_NOT_READY")
+        if dependency["state"] == "REJECTED":
+            raise _ScheduleError("SEND_REJECTED_BEFORE_CANCEL")
+        binding = dependency.get("binding")
+        if (dependency["state"] != "COMMITTED" or not isinstance(binding, dict)
+                or binding["product_id"] != product_id or binding["strategy_id"] != strategy_id):
+            raise _ScheduleError("DEPENDENCY_BINDING_CONFLICT")
+        return binding["order_id"]
+
+    def _resolve_historical_cancel_group(self, group_id, group):
+        spec = self._historical_cancel_effects.get(group_id)
+        if spec is None:
+            raise _ScheduleError("INVALID_SCHEMA")
+        members = group.get("members")
+        if (group.get("ordering_contract_id") != "HISTORICAL_ORDER_V1"
+                or group.get("group_id") != group_id
+                or not isinstance(members, list) or len(members) != 1
+                or not isinstance(members[0], dict)
+                or members[0].get("kind") != "CANCEL_REQUEST"):
+            raise _ScheduleError("INVALID_SCHEMA")
+        member = members[0]
+        stamp = member.get("stamp")
+        payload = member.get("payload")
+        targets = payload.get("targets") if isinstance(payload, dict) else None
+        if (not isinstance(stamp, dict) or stamp.get("event_id") != spec["request_event_id"]
+                or not isinstance(targets, list) or len(targets) != 1
+                or not isinstance(targets[0], dict)
+                or targets[0].get("reason") != spec["reason"]
+                or targets[0].get("target_order_id") != spec["target_order_id"]):
+            raise _ScheduleError("DEPENDENCY_BINDING_CONFLICT")
+        resolved = self._resolve_historical_cancel_target(
+            spec["target_order_id"], spec["product_id"], spec["strategy_id"]
+        )
+        # Both causal records are admitted from this exact resolved value.
+        targets[0]["target_order_id"] = resolved
+        spec["target_order_id"] = resolved
+
+    def _commit_historical_send_binding(self, dependency, binding):
+        expected = {
+            "client_order_id": dependency["client_order_id"],
+            "product_id": dependency["product_id"],
+            "strategy_id": dependency["strategy_id"],
+        }
+        if (not isinstance(binding, dict)
+                or any(binding.get(field) != value for field, value in expected.items())
+                or not isinstance(binding.get("order_id"), str)
+                or not binding["order_id"]):
+            raise _ScheduleError("DEPENDENCY_BINDING_CONFLICT")
+        if any(
+            prior is not dependency
+            and isinstance(prior.get("binding"), dict)
+            and (prior["binding"] == binding
+                 or prior["binding"]["order_id"] == binding["order_id"])
+            for prior in self._historical_send_by_client.values()
+        ):
+            raise _ScheduleError("DUPLICATE_SEND_BINDING")
+        dependency["binding"] = deepcopy(binding)
+        dependency["state"] = "COMMITTED"
 
     def _historical_cancel_effect_item(self, group_id: str):
         spec = self._historical_cancel_effects.pop(group_id, None)
@@ -1041,6 +1130,12 @@ class _ReplayComposition:
                 item, kind = record["item"], record["item"]["kind"]
                 result = dict(kind=kind, stable_id=key[3], classification="SUCCESS")
                 if kind == "SOURCE_GROUP":
+                    group = item["group"]
+                    members = group.get("members")
+                    if (group.get("ordering_contract_id") == "HISTORICAL_ORDER_V1"
+                            and isinstance(members, list) and len(members) == 1
+                            and members[0].get("kind") == "CANCEL_REQUEST"):
+                        self._resolve_historical_cancel_group(key[3], group)
                     actions = [a for events in self._audit.values() for e in events for a in e.get("actions", []) if a["group_id"] == key[3]]
                     for action in actions:
                         action["status"] = "SUBMITTED"
@@ -1060,6 +1155,19 @@ class _ReplayComposition:
                     if group["classification"] == "FAULT":
                         record["result"] = self._stop_scheduler(_ScheduleError(cast(str, group.get("failure"))), kind, key[3], group=group)
                         return deepcopy(record["result"])
+                    dependency = self._historical_send_dependencies.get(key[3])
+                    if dependency is not None:
+                        classification = group.get("classification")
+                        if classification == "COMMITTED":
+                            stamp = item["group"]["members"][0]["stamp"]
+                            binding = self._codec.historical_order_binding(
+                                stamp["event_id"], stamp["source_sequence"]
+                            )
+                            self._commit_historical_send_binding(dependency, binding)
+                        elif classification == "REJECTED":
+                            dependency["state"] = "REJECTED"
+                        else:
+                            raise _ScheduleError("DEPENDENCY_BINDING_CONFLICT")
                     is_historical_request = (
                         item["group"]["ordering_contract_id"] == "HISTORICAL_ORDER_V1"
                         and item["group"]["members"][0]["kind"] == "CANCEL_REQUEST"
@@ -1187,6 +1295,11 @@ class _ReplayComposition:
         except Exception as exc:
             result = self._stop_scheduler(exc, record["item"]["kind"] if record else "DISPATCH", record["key"][3] if record else None)
             if record is not None:
+                previous = record.get("result")
+                if isinstance(previous, dict) and "group_result" in previous:
+                    result["group_result"] = deepcopy(previous["group_result"])
+                    if self._terminal is not None:
+                        self._terminal["group_result"] = deepcopy(previous["group_result"])
                 record["result"] = deepcopy(result)
             return result
 
