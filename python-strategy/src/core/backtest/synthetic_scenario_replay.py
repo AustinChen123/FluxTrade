@@ -884,6 +884,8 @@ class _ReplayComposition:
             for order_index, order in enumerate(event["orders"]):
                 ordinal = child_ordinal
                 child_ordinal += 1
+                dependency: dict[str, Any] | None = None
+                target_order_id: str | None = None
                 acceptance_raw = parent_raw + delay
                 if acceptance_raw >= end:
                     if self._historical_run is not None:
@@ -952,6 +954,8 @@ class _ReplayComposition:
                 audit_events[event_index]["actions"][order_index]["group_id"] = group_id
                 groups.append((dict(kind="SOURCE_GROUP", schedule_sequence=sequence, group=group), None))
                 if kind == "INTENT":
+                    if dependency is None:
+                        raise _ScheduleError("INVALID_SCHEMA")
                     client_id = dependency["client_order_id"]
                     if client_id in self._historical_send_by_client:
                         raise _ScheduleError("DUPLICATE_SEND_DEPENDENCY")
@@ -960,6 +964,8 @@ class _ReplayComposition:
                     self._historical_send_dependencies[group_id] = dependency
                     self._historical_send_by_client[client_id] = dependency
                 if kind == "CANCEL_REQUEST":
+                    if target_order_id is None:
+                        raise _ScheduleError("INVALID_SCHEMA")
                     effect_event_id = policy_protocol._historical_child_id(
                         contract["run_contract_hash"], delivery["delivery_id"],
                         "CANCEL_EFFECT_EVENT", ordinal,
