@@ -31,3 +31,17 @@ regexes = [
   '''^\s*replace\(value\.intent\.key, execution_scope_id="other"\)\s*$''',
   '''^\s*replace\(key, execution_scope_id="other"\)\s*$''',
 ]
+
+[[allowlists]]
+description = "Ignore one symbolic Spider fixture key in two exact tests"
+targetRules = ["generic-api-key"]
+condition = "AND"
+regexTarget = "line"
+paths = [
+  '''^python-strategy/tests/test_spider_callback_plan_digest\.py$''',
+  '''^python-strategy/tests/test_spider_emission_pairing\.py$''',
+]
+regexes = [
+  '''^\s*\*\*\(dict\(fixture_key="MARKET_GOLDEN_V1", continuation_id="q"\) if present else \{\}\)\)$''',
+  '''^\s*fixture_key="MARKET_GOLDEN_V1", captured_at=501\),$''',
+]
