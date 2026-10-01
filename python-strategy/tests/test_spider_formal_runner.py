@@ -19,6 +19,8 @@ from src.core.backtest.spider_historical_input import (
 )
 from src.core.backtest.spider_run_admission import admit_spider_run
 from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_jsonl
+from src.core import research_backtest_runner as research
+from src.strategies.base import BaseStrategy
 from test_spider_historical_oracle import _oracle_run
 from test_spider_scenario_run import historical_input
 
@@ -507,12 +509,45 @@ def test_h09_cli_and_bridge_produce_exact_p02_projection(
     assert (cli_code, captured.err) == (0, "")
     assert json.loads(captured.out) == dict(run_id=cli_run_id, outcome="ADMITTED", reason=None)
     cli_projection = formal.project_admitted_spider_run(tmp_path / cli_run_id)
-    bridge_result = formal._invoke_spider_historical(
+    bridge_result = research.ResearchBacktestRunner.run_spider_historical(
         output_root=str(tmp_path), run_id=bridge_run_id, historical_input=bridge_raw,
-        runner_kind="research",
     )
 
     assert cli_projection is not None
     assert bridge_result.outcome == "ADMITTED" and bridge_result.projection is not None
+    assert bridge_result.runner_kind == "research"
     assert cli_projection.canonical_json == bridge_result.projection.canonical_json
     assert cli_projection.sha256 == bridge_result.projection.sha256
+
+
+def test_research_runner_static_formal_entry_delegates_once_without_candle_lifecycle(
+    monkeypatch,
+):
+    expected = formal.SpiderFormalRunResult(
+        "research", "returned", "REJECTED", "delegated-reason", None, None,
+    )
+    calls = []
+
+    def delegate(**kwargs):
+        calls.append(kwargs)
+        return expected
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("formal Spider entry entered the ordinary research lifecycle")
+
+    monkeypatch.setattr(research, "_invoke_spider_historical", delegate)
+    monkeypatch.setattr(research, "SimulatedAdapter", forbidden)
+    monkeypatch.setattr(research, "get_candles_generator", forbidden)
+    monkeypatch.setattr(research, "invoke_strategy_on_candle", forbidden)
+    monkeypatch.setattr(research.ResearchBacktestRunner, "run", forbidden)
+    monkeypatch.setattr(BaseStrategy, "on_candle", forbidden)
+
+    result = research.ResearchBacktestRunner.run_spider_historical(
+        output_root="formal-output", run_id="formal-run", historical_input=b"frozen-input",
+    )
+
+    assert result is expected
+    assert calls == [dict(
+        output_root="formal-output", run_id="formal-run", historical_input=b"frozen-input",
+        runner_kind="research",
+    )]
