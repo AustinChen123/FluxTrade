@@ -21,7 +21,11 @@ from src.core.backtest import spider_run_store as storage
 from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_canonical, decode_jsonl
 from src.core.backtest.spider_run_admission import admit_spider_run
 from src.core.backtest.spider_scenario_plans import PLAN_IDS, plan_bundle
-from src.core.backtest.spider_historical_input import encode_historical_run_input, historical_planned_coverage
+from src.core.backtest.spider_historical_input import (
+    _canonical as _historical_canonical,
+    encode_historical_run_input,
+    historical_planned_coverage,
+)
 from test_spider_historical_input import _rehashed_run, _valid_run
 from test_spider_historical_oracle import _case_answer, _enqueue_policy_order, _oracle_run
 
@@ -463,6 +467,30 @@ def test_historical_input_rejections_precede_store_and_owner(tmp_path, monkeypat
     result = run.run_spider_scenario(str(tmp_path), value.run_id, selector, supplied)
     assert result == dict(run_id=value.run_id, outcome="REJECTED", reason="UNSUPPORTED_CONFIGURATION")
     assert not store_calls and list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("invalidity", ["duplicate_active_spec", "huge_sparse_span"])
+def test_historical_timeline_and_coverage_reject_before_store_or_owner(tmp_path, monkeypatch, invalidity):
+    value, raw = historical_input(f"historical-{invalidity}")
+    encoded = cast(dict[str, object], decode_canonical(raw))
+    if invalidity == "duplicate_active_spec":
+        configuration = cast(dict[str, object], decode_canonical(value.configuration_bytes))
+        for product in cast(list[dict[str, object]], configuration["products"]):
+            specs = cast(list[dict[str, object]], product["specs"])
+            specs.append(dict(specs[0]))
+        raw_configuration = canonical_bytes(configuration)
+        encoded["configuration_bytes"] = raw_configuration.hex()
+        encoded["configuration_sha256"] = sha256(raw_configuration).hexdigest()
+    else:
+        encoded["range_end_ms"] = 1 << 58
+    raw = _historical_canonical(encoded)
+    store_calls = []
+    monkeypatch.setattr(run._Store, "create", lambda *args, **kwargs: store_calls.append(args))
+    monkeypatch.setattr(run, "_ReplayComposition", lambda *a, **k: pytest.fail("owner created before preflight"))
+    result = run.run_spider_scenario(str(tmp_path), value.run_id, run._P3_SELECTOR, raw)
+    assert result == dict(run_id=value.run_id, outcome="REJECTED", reason="UNSUPPORTED_CONFIGURATION")
+    assert store_calls == []
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_historical_persistence_failure_is_terminal_and_unadmitted(tmp_path, monkeypatch):

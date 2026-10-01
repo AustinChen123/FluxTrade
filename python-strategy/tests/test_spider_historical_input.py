@@ -210,6 +210,38 @@ def test_valid_input_hash_is_deterministic_and_excludes_transport_run_id():
     assert all(validate_historical_input(change) != original for change in changes)
 
 
+def test_supported_timestamp_ceiling_preserves_exact_bar_coverage_semantics():
+    original = _valid_run()
+    end = ((1 << 59) - 1) // BAR_DURATION_MS * BAR_DURATION_MS
+    start = end - BAR_DURATION_MS
+    warmup = start - 86_400_000
+    shift = warmup - original.warmup_start_ms
+    moved = _rehashed_run(
+        original,
+        trade_rows=tuple(replace(row, bar_open_ms=row.bar_open_ms + shift) for row in original.trade_bars),
+        mark_rows=tuple(replace(row, bar_open_ms=row.bar_open_ms + shift) for row in original.mark_bars),
+    )
+    moved = replace(
+        moved, range_start_ms=start, range_end_ms=end, warmup_start_ms=warmup,
+        first_timer_ms=start + 5000,
+        trade_manifest=replace(moved.trade_manifest,
+                               first_source_timestamp_ms=moved.trade_manifest.first_source_timestamp_ms + shift,
+                               last_source_timestamp_ms=moved.trade_manifest.last_source_timestamp_ms + shift),
+        mark_manifest=replace(moved.mark_manifest,
+                             first_source_timestamp_ms=moved.mark_manifest.first_source_timestamp_ms + shift,
+                             last_source_timestamp_ms=moved.mark_manifest.last_source_timestamp_ms + shift),
+        spec_before=tuple(replace(spec, effective_at_ms=start) for spec in moved.spec_before),
+        spec_after=tuple(replace(spec, effective_at_ms=end) for spec in moved.spec_after),
+    )
+    configuration = cast(dict[str, object], decode_canonical(moved.configuration_bytes))
+    for product in cast(list[dict[str, object]], configuration["products"]):
+        cast(list[dict[str, object]], product["marks"])[0]["valid_to"] = end
+    moved = _run_with_configuration(moved, configuration)
+    assert validate_historical_input(moved) == validate_historical_input(
+        decode_historical_run_input(encode_historical_run_input(moved))
+    )
+
+
 def test_optional_shared_elapsed_cache_state_is_hashed_and_defaults_without_byte_drift():
     run = _valid_run()
     baseline_state = decode_canonical(run.initial_policy_cache)

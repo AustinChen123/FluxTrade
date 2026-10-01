@@ -10,6 +10,7 @@ from src.core.backtest.spider_historical_input import (
     HistoricalBar,
     HistoricalInputError,
     HistoricalRunInput,
+    _validate_configured_spec_timeline,
     _canonical,
     decode_p2_configuration,
     validate_historical_input,
@@ -81,59 +82,12 @@ def _policy_cache(raw: bytes) -> dict[str, object]:
     return cast(dict[str, object], value)
 
 
-def _active_configured_specs(
-    run: HistoricalRunInput, product_configuration: dict[str, dict[str, object]]
-) -> dict[str, tuple[Decimal, Decimal, Decimal, Decimal, Decimal]]:
-    active: dict[str, tuple[Decimal, Decimal, Decimal, Decimal, Decimal]] = {}
-    last_open = run.range_end_ms - BAR_DURATION_MS
-    for product_id in run.ordered_products:
-        rows = product_configuration[product_id].get("specs")
-        if type(rows) is not list or not rows:
-            raise HistoricalInputError("missing configured product spec")
-        intervals: list[tuple[dict[str, object], int, int | None]] = []
-        for row in rows:
-            if (type(row) is not dict or type(row.get("valid_from")) is not int
-                    or (row.get("valid_to") is not None and type(row.get("valid_to")) is not int)):
-                raise HistoricalInputError("invalid configured product spec interval")
-            intervals.append((cast(dict[str, object], row), cast(int, row["valid_from"]),
-                              cast(int | None, row["valid_to"])))
-        starts_active = [entry for entry in intervals
-                         if entry[1] <= run.range_start_ms
-                         and (entry[2] is None or run.range_start_ms < entry[2])]
-        if len(starts_active) != 1:
-            raise HistoricalInputError("run does not have one configured active product spec")
-        selected, valid_from, valid_to = starts_active[0]
-        if valid_from > run.range_start_ms or (valid_to is not None and last_open >= valid_to):
-            raise HistoricalInputError("configured product spec does not cover run")
-        if any(row is not selected and begin <= last_open and (end is None or run.range_start_ms < end)
-               for row, begin, end in intervals):
-            raise HistoricalInputError("configured product spec changes during run")
-        values: list[Decimal] = []
-        for field in ("contract_value", "multiplier", "price_tick", "quantity_step", "minimum_quantity"):
-            raw = selected.get(field)
-            try:
-                value = Decimal(raw) if type(raw) is str else None
-            except (ValueError, ArithmeticError):
-                value = None
-            if value is None or not value.is_finite() or value <= 0:
-                raise HistoricalInputError("invalid configured product spec value")
-            values.append(value)
-        expected = tuple(values)
-        for evidence in (run.spec_before[run.ordered_products.index(product_id)],
-                         run.spec_after[run.ordered_products.index(product_id)]):
-            if (evidence.contract_value, evidence.multiplier, evidence.price_tick,
-                    evidence.quantity_step, evidence.minimum_quantity) != expected:
-                raise HistoricalInputError("configured product spec differs from run evidence")
-        active[product_id] = cast(tuple[Decimal, Decimal, Decimal, Decimal, Decimal], expected)
-    return active
-
-
 def _closed_market_snapshots(
     run: HistoricalRunInput, configuration: dict[str, object]
 ) -> tuple[_ClosedMarketSnapshot, ...]:
     products = cast(list[dict[str, object]], configuration["products"])
     product_configuration = {cast(str, row["product_id"]): row for row in products}
-    active_specs = _active_configured_specs(run, product_configuration)
+    active_specs = _validate_configured_spec_timeline(run, configuration)
     trade_by_product: dict[str, tuple[HistoricalBar, ...]] = {
         product: tuple(row for row in run.trade_bars if row.product_id == product)
         for product in run.ordered_products

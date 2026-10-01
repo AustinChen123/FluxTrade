@@ -627,7 +627,7 @@ def validate_historical_input(run: HistoricalRunInput) -> str:
         if manifest.first_source_timestamp_ms > manifest.last_source_timestamp_ms:
             raise HistoricalInputError("invalid manifest timestamp range")
 
-    expected_times = tuple(range(run.warmup_start_ms, run.range_end_ms, BAR_DURATION_MS))
+    expected_count = (run.range_end_ms - run.warmup_start_ms + BAR_DURATION_MS - 1) // BAR_DURATION_MS
     for rows in (run.trade_bars, run.mark_bars):
         keys: list[tuple[int, int]] = []
         for row in rows:
@@ -654,9 +654,15 @@ def validate_historical_input(run: HistoricalRunInput) -> str:
             keys.append((row.bar_open_ms, run.ordered_products.index(row.product_id)))
         if keys != sorted(keys) or len(keys) != len(set(keys)):
             raise HistoricalInputError("duplicate, out-of-order, or conflicting rows")
-        by_product = {product: tuple(row.bar_open_ms for row in rows if row.product_id == product) for product in run.ordered_products}
-        if any(by_product[product] != expected_times for product in run.ordered_products):
-            raise HistoricalInputError("warmup/run coverage gap")
+        for product in run.ordered_products:
+            product_rows = (row for row in rows if row.product_id == product)
+            count = 0
+            for count, row in enumerate(product_rows, 1):
+                expected_at = run.warmup_start_ms + (count - 1) * BAR_DURATION_MS
+                if row.bar_open_ms != expected_at:
+                    raise HistoricalInputError("warmup/run coverage gap")
+            if count != expected_count:
+                raise HistoricalInputError("warmup/run coverage gap")
 
     if (type(run.spec_before) is not tuple or type(run.spec_after) is not tuple
             or any(type(item) is not InstrumentSpecEvidence for item in run.spec_before + run.spec_after)
@@ -685,6 +691,7 @@ def validate_historical_input(run: HistoricalRunInput) -> str:
     configuration = decode_p2_configuration(
         run.configuration_bytes, run.configuration_sha256, run.ordered_products
     )
+    _validate_configured_spec_timeline(run, cast(dict[str, object], configuration))
     for configured_product, evidence in zip(
         cast(list[dict[str, object]], configuration["products"]), run.spec_after, strict=True
     ):
@@ -706,6 +713,56 @@ def validate_historical_input(run: HistoricalRunInput) -> str:
             ):
                 raise HistoricalInputError("endpoint configured spec differs from run evidence")
     return _digest(_semantic_input_projection(run))
+
+
+def _validate_configured_spec_timeline(
+    run: HistoricalRunInput, configuration: dict[str, object]
+) -> dict[str, tuple[Decimal, Decimal, Decimal, Decimal, Decimal]]:
+    """Validate the unique configured product spec spanning the replay range."""
+    active: dict[str, tuple[Decimal, Decimal, Decimal, Decimal, Decimal]] = {}
+    last_open = run.range_end_ms - BAR_DURATION_MS
+    products = cast(list[dict[str, object]], configuration["products"])
+    product_configuration = {cast(str, row["product_id"]): row for row in products}
+    for product_id in run.ordered_products:
+        rows = product_configuration[product_id].get("specs")
+        if type(rows) is not list or not rows:
+            raise HistoricalInputError("missing configured product spec")
+        intervals: list[tuple[dict[str, object], int, int | None]] = []
+        for row in rows:
+            if (type(row) is not dict or type(row.get("valid_from")) is not int
+                    or (row.get("valid_to") is not None and type(row.get("valid_to")) is not int)):
+                raise HistoricalInputError("invalid configured product spec interval")
+            intervals.append((cast(dict[str, object], row), cast(int, row["valid_from"]),
+                              cast(int | None, row["valid_to"])))
+        starts_active = [entry for entry in intervals
+                         if entry[1] <= run.range_start_ms
+                         and (entry[2] is None or run.range_start_ms < entry[2])]
+        if len(starts_active) != 1:
+            raise HistoricalInputError("run does not have one configured active product spec")
+        selected, valid_from, valid_to = starts_active[0]
+        if valid_from > run.range_start_ms or (valid_to is not None and last_open >= valid_to):
+            raise HistoricalInputError("configured product spec does not cover run")
+        if any(row is not selected and begin <= last_open and (end is None or run.range_start_ms < end)
+               for row, begin, end in intervals):
+            raise HistoricalInputError("configured product spec changes during run")
+        values: list[Decimal] = []
+        for field in ("contract_value", "multiplier", "price_tick", "quantity_step", "minimum_quantity"):
+            raw = selected.get(field)
+            try:
+                value = Decimal(raw) if type(raw) is str else None
+            except (ValueError, ArithmeticError):
+                value = None
+            if value is None or not value.is_finite() or value <= 0:
+                raise HistoricalInputError("invalid configured product spec value")
+            values.append(value)
+        expected = tuple(values)
+        for evidence in (run.spec_before[run.ordered_products.index(product_id)],
+                         run.spec_after[run.ordered_products.index(product_id)]):
+            if (evidence.contract_value, evidence.multiplier, evidence.price_tick,
+                    evidence.quantity_step, evidence.minimum_quantity) != expected:
+                raise HistoricalInputError("configured product spec differs from run evidence")
+        active[product_id] = cast(tuple[Decimal, Decimal, Decimal, Decimal, Decimal], expected)
+    return active
 
 
 def _semantic_input_projection(run: HistoricalRunInput, *, model_id: str | None = None) -> dict[str, object]:
