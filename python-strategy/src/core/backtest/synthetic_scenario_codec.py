@@ -366,6 +366,7 @@ class _NativeSession(Protocol):
     def build_delivery(self, request: str) -> str: ...
     def historical_market_step(self, request: str) -> str: ...
     def _historical_working_orders(self) -> str: ...
+    def _historical_order_binding(self, event_id: str, source_sequence: int) -> str: ...
     def inspect_state(self) -> str: ...
 
 
@@ -549,6 +550,9 @@ class ScenarioCodec:
 
     def historical_market_step(self, request: HistoricalNode) -> HistoricalNodeResult:
         return cast(HistoricalNodeResult, _decode(self._session.historical_market_step(_encode(request, preserve_null=True))))
+
+    def historical_order_binding(self, event_id: str, source_sequence: int) -> dict[str, str] | None:
+        return cast(dict[str, str] | None, _decode(self._session._historical_order_binding(event_id, source_sequence)))
 
     def historical_working_orders(self) -> list[HistoricalWorkingOrder]:
         return cast(list[HistoricalWorkingOrder], _decode(self._session._historical_working_orders()))

@@ -22,7 +22,7 @@ from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_canon
 from src.core.backtest.spider_run_envelope_schema import journal_record
 from src.core.backtest.spider_run_store import SpiderRunStore, SpiderRunStoreError
 from src.core.backtest.spider_run_evidence import build_endpoint_artifacts, build_reconciliation
-from src.core.backtest.synthetic_scenario_replay import ReplayPersistenceError, _ReplayComposition
+from src.core.backtest.synthetic_scenario_replay import ReplayPersistenceError, _ReplayComposition, _ScheduleError
 from test_spider_historical_input import (
     ANSWERS,
     ANSWERS_SHA256,
@@ -1884,6 +1884,19 @@ def test_historical_full_execution_notice_derives_native_cancel_and_replacements
                and record["item"]["group"]["members"][0]["kind"] == "CANCEL_EFFECT"]
     assert len(requests) == len(effects) == 1
     target = requests[0]["item"]["group"]["members"][0]["payload"]["targets"][0]["target_order_id"]
+    request_group_id = requests[0]["key"][3]
+    cancel_event = next(event for event in cancels
+                        if any(action["group_id"] == request_group_id for action in event["actions"]))
+    cancel_ordinal = next(index for index, action in enumerate(cancel_event["actions"])
+                          if action["group_id"] == request_group_id)
+    policy_target = cancel_event["event"]["orders"][cancel_ordinal]["ordId"]
+    dependency = next(dependency for dependency in composition._historical_send_by_client.values()
+                      if (dependency.get("binding") or {}).get("order_id") == policy_target)
+    assert dependency["state"] == "COMMITTED"
+    assert dependency["binding"]["order_id"] == policy_target == target
+    assert dependency["binding"]["product_id"] == cancel_event["event"]["orders"][cancel_ordinal]["instId"]
+    assert dependency["binding"]["strategy_id"] == run.strategy_identity
+    assert target == dependency["binding"]["order_id"]
     for request in requests:
         request_member = request["item"]["group"]["members"][0]
         request_event = request_member["stamp"]["event_id"]
@@ -2003,6 +2016,194 @@ def test_historical_full_execution_notice_derives_native_cancel_and_replacements
     assert all(fill["order_id"] != target
                for product in close_node["result"]["historical_result"]["products"]
                for fill in product["fills"])
+
+
+def test_historical_cancel_target_resolution_covers_dependency_states():
+    composition = _ReplayComposition.__new__(_ReplayComposition)
+    binding = dict(client_order_id="CLIENT", order_id="NATIVE", product_id="A-USDT-SWAP",
+                   strategy_id="spider")
+    dependency = dict(client_order_id="CLIENT", product_id="A-USDT-SWAP", strategy_id="spider",
+                      state="COMMITTED", binding=binding)
+    composition._historical_send_by_client = {"CLIENT": dependency}
+    assert composition._resolve_historical_cancel_target("NATIVE", "A-USDT-SWAP", "spider") == "NATIVE"
+    assert composition._resolve_historical_cancel_target("CLIENT", "A-USDT-SWAP", "spider") == "NATIVE"
+    assert composition._resolve_historical_cancel_target("UNKNOWN", "A-USDT-SWAP", "spider") == "UNKNOWN"
+    with pytest.raises(_ScheduleError, match="^DEPENDENCY_BINDING_CONFLICT$"):
+        composition._resolve_historical_cancel_target("CLIENT", "B-USDT-SWAP", "spider")
+    dependency["state"] = "PENDING"
+    with pytest.raises(_ScheduleError, match="^DEPENDENCY_NOT_READY$"):
+        composition._resolve_historical_cancel_target("CLIENT", "A-USDT-SWAP", "spider")
+    dependency["state"] = "REJECTED"
+    with pytest.raises(_ScheduleError, match="^SEND_REJECTED_BEFORE_CANCEL$"):
+        composition._resolve_historical_cancel_target("CLIENT", "A-USDT-SWAP", "spider")
+    with pytest.raises(_ScheduleError, match="^DEPENDENCY_BINDING_CONFLICT$"):
+        composition._commit_historical_send_binding(dependency, dict(binding, strategy_id="other"))
+    duplicate = dict(client_order_id="OTHER", product_id="A-USDT-SWAP", strategy_id="spider",
+                     state="PENDING", binding=None)
+    composition._historical_send_by_client["OTHER"] = duplicate
+    duplicate_binding = dict(binding, client_order_id="OTHER")
+    with pytest.raises(_ScheduleError, match="^DUPLICATE_SEND_BINDING$"):
+        composition._commit_historical_send_binding(duplicate, duplicate_binding)
+
+
+def _queue_policy_order_children(run, *, client_order_id="CLIENT-SEND", price="50", quantity="1",
+                                 include_cancel=True, evidence_callback=None):
+    composition = _composition(run, evidence_callback)
+    composition._queue.clear()
+    composition._records.clear()
+    composition._audit.clear()
+    composition._current_time = 500
+    composition._last_popped = None
+    composition._historical_order_sequence = 0
+    product_id = run.ordered_products[0]
+    send: dict[str, Any] = dict(
+        kind="send", operation="send", route="REST", at_ms=run.range_start_ms + 1_000,
+        orders=[dict(instId=product_id, instIdCode=1, tdMode="cross", clOrdId=client_order_id,
+                     tag="test", side="buy", ordType="limit", px=price, sz=quantity)],
+    )
+    policy_events: list[dict[str, Any]] = [send]
+    if include_cancel:
+        policy_events.append(dict(
+            kind="cancel", operation="cancel", route="REST", at_ms=run.range_start_ms + 1_000,
+            orders=[dict(ordId=client_order_id, instId=product_id, instIdCode=1)],
+        ))
+    audit_events: list[dict[str, Any]] = [
+        dict(event=deepcopy(event), actions=[dict(group_id=None, status="UNSUBMITTED")])
+        for event in policy_events
+    ]
+    delivery_id = "SYNTHETIC-POLICY-DELIVERY"
+    visible_at = (run.range_start_ms + 1_000) * 16 + 6
+    record = dict(item=dict(delivery=dict(delivery_id=delivery_id, visible_at=visible_at)))
+    composition._audit[delivery_id] = audit_events
+    groups = composition._historical_order_children(record, policy_events, audit_events)
+    composition._admit_set(groups)
+    return composition, groups, policy_events, audit_events, visible_at
+
+
+def test_same_callback_client_cancel_resolves_at_dispatch_and_preserves_causal_targets(monkeypatch):
+    run = _valid_run()
+    evidence = []
+    composition, groups, policy_events, audit_events, visible_at = _queue_policy_order_children(
+        run, evidence_callback=lambda kind, key, payload: evidence.append((kind, key, payload))
+    )
+    assert len(groups) == 2
+    send_group, cancel_group = [item[0]["group"] for item in groups]
+    client_id = send_group["members"][0]["payload"]["client_order_id"]
+    request_member = cancel_group["members"][0]
+    request_event_id = request_member["stamp"]["event_id"]
+    source_sequence = request_member["stamp"]["source_sequence"]
+    assert request_member["payload"]["targets"][0]["target_order_id"] == client_id
+    assert audit_events[1]["event"]["orders"][0]["ordId"] == client_id
+
+    effect_group_id = composition._historical_cancel_effects[cancel_group["group_id"]]["effect_group_id"]
+    submitted = []
+    original_apply = wire.ScenarioCodec.apply_group
+
+    def capture_apply(codec, group):
+        submitted.append(deepcopy(group))
+        return original_apply(codec, group)
+
+    monkeypatch.setattr(wire.ScenarioCodec, "apply_group", capture_apply)
+    acceptance_at = ((visible_at - 6) // 16 + run.order_accept_delay_ms) * 16 + 3
+    assert composition._dispatch_due(acceptance_at)["classification"] == "SUCCESS"
+    native_send = composition._historical_send_by_client[client_id]["binding"]
+    native_id = native_send["order_id"]
+    request_group = next(group for group in submitted
+                         if group["members"][0]["kind"] == "CANCEL_REQUEST")
+    request_target = request_group["members"][0]["payload"]["targets"][0]["target_order_id"]
+    assert request_target == native_id
+    assert request_group["members"][0]["stamp"]["event_id"] == request_event_id
+    assert request_group["members"][0]["stamp"]["source_sequence"] == source_sequence == 1
+    assert request_group["members"][0]["stamp"]["effective_at"] == acceptance_at
+    assert audit_events[1]["event"]["orders"][0]["ordId"] == client_id
+
+    cancel_record = composition._records[(0, cancel_group["group_id"])]
+    request_evidence = [row for row in evidence if row[0] == "SOURCE_GROUP_RESULT"
+                        and row[2]["request"]["group_id"] == cancel_group["group_id"]]
+    assert len(request_evidence) == 1
+    assert request_evidence[0][2]["request"]["members"][0]["payload"]["targets"][0]["target_order_id"] == native_id
+    assert cancel_record["result"]["group_result"]["classification"] == "COMMITTED"
+    effect_raw = (visible_at - 6) // 16 + run.cancel_effect_delay_ms
+    effect_at = effect_raw * 16 + 2
+    assert composition._dispatch_due(effect_at)["classification"] == "SUCCESS"
+    effect_record = composition._records[(0, effect_group_id)]
+    effect_target = effect_record["item"]["group"]["members"][0]["payload"]["effects"][0]["target_order_id"]
+    assert effect_target == native_id
+    assert effect_record["item"]["group"]["members"][0]["stamp"]["causal_parent_ids"] == [request_event_id]
+    assert composition._dispatch_due((effect_at // 16 + run.cancel_ack_delay_ms) * 16 + 6)["classification"] == "SUCCESS"
+
+
+def test_rejected_send_client_cancel_stops_before_native_cancel_apply(monkeypatch):
+    run = _valid_run()
+    evidence = []
+    composition, groups, _, _, visible_at = _queue_policy_order_children(
+        run, client_order_id="CLIENT-REJECTED", price="100", quantity="100",
+        evidence_callback=lambda kind, key, payload: evidence.append((kind, key, payload)),
+    )
+    calls = []
+    original_apply = wire.ScenarioCodec.apply_group
+
+    def capture_apply(codec, group):
+        calls.append(group["members"][0]["kind"])
+        return original_apply(codec, group)
+
+    monkeypatch.setattr(wire.ScenarioCodec, "apply_group", capture_apply)
+    acceptance_at = ((visible_at - 6) // 16 + run.order_accept_delay_ms) * 16 + 3
+    result = composition._dispatch_due(acceptance_at)
+    send_record = next(record for record in composition._records.values()
+                       if record["item"]["group"]["members"][0]["kind"] == "INTENT")
+    assert send_record["result"]["group_result"]["classification"] == "REJECTED"
+    assert result["reason"] == "SEND_REJECTED_BEFORE_CANCEL"
+    assert calls == ["INTENT"]
+    assert [row[2]["request"]["members"][0]["kind"] for row in evidence
+            if row[0] == "SOURCE_GROUP_RESULT"] == ["INTENT"]
+    assert groups[1][0]["group"]["members"][0]["payload"]["targets"][0]["target_order_id"] == "CLIENT-REJECTED"
+
+
+def test_native_intent_fault_is_persisted_before_binding_follow_up():
+    run = _valid_run()
+    composition, groups, _, actions, visible_at = _queue_policy_order_children(
+        run, client_order_id="CLIENT-FAULT", price="50.003", include_cancel=False
+    )
+    composition._policy.markets[run.ordered_products[0]]["increment"] = "0.003"
+    evidence = []
+    composition._evidence_callback = lambda kind, key, payload: evidence.append((kind, key, payload))
+    acceptance_at = ((visible_at - 6) // 16 + run.order_accept_delay_ms) * 16 + 3
+    result = composition._dispatch_due(acceptance_at)
+    group_record = next(iter(composition._records.values()))
+    native_result = group_record["result"]["group_result"]
+    assert result["reason"] == "INVALID_BTC_INTENT"
+    assert native_result["classification"] == "FAULT"
+    assert native_result["failure"] == "INVALID_BTC_INTENT"
+    assert group_record["result"]["group_result"] == native_result
+    assert actions[0]["actions"][0]["group_result"] == native_result
+    source_rows = [row for row in evidence if row[0] == "SOURCE_GROUP_RESULT"]
+    assert len(source_rows) == 1
+    assert source_rows[0][2]["request"] == group_record["item"]["group"]
+    assert source_rows[0][2]["result"] == native_result
+
+
+def test_binding_lookup_failure_retains_committed_group_result_and_evidence(monkeypatch):
+    run = _valid_run()
+    evidence = []
+    composition, _, _, actions, visible_at = _queue_policy_order_children(
+        run, client_order_id="CLIENT-LOOKUP-FAIL", include_cancel=False,
+        evidence_callback=lambda kind, key, payload: evidence.append((kind, key, payload)),
+    )
+    monkeypatch.setattr(wire.ScenarioCodec, "historical_order_binding", lambda codec, event_id, source_sequence: None)
+    acceptance_at = ((visible_at - 6) // 16 + run.order_accept_delay_ms) * 16 + 3
+    result = composition._dispatch_due(acceptance_at)
+    group_record = next(iter(composition._records.values()))
+    native_result = group_record["result"]["group_result"]
+    assert result["reason"] == "DEPENDENCY_BINDING_CONFLICT"
+    assert native_result["classification"] == "COMMITTED"
+    assert group_record["result"]["group_result"] == native_result
+    assert result["group_result"] == native_result
+    assert actions[0]["actions"][0]["group_result"] == native_result
+    source_rows = [row for row in evidence if row[0] == "SOURCE_GROUP_RESULT"]
+    assert len(source_rows) == 1
+    assert source_rows[0][2]["request"] == group_record["item"]["group"]
+    assert source_rows[0][2]["result"] == native_result
 
 
 def test_historical_cancel_ack_after_endpoint_remains_pending_without_extending_run():

@@ -86,6 +86,15 @@ impl PySession {
     fn _historical_working_orders(&mut self) -> PyResult<String> {
         self.inner.historical_working_orders().map_err(error)
     }
+    fn _historical_order_binding(
+        &mut self,
+        event_id: &Bound<'_, PyAny>,
+        source_sequence: i64,
+    ) -> PyResult<String> {
+        self.inner
+            .historical_order_binding(&text(event_id)?, source_sequence)
+            .map_err(error)
+    }
     fn inspect_state(&mut self) -> PyResult<String> {
         self.inner.inspect_state().map_err(error)
     }

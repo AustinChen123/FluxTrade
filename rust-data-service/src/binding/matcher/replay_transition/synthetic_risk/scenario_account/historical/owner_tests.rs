@@ -51,6 +51,7 @@ fn historical_orders(
         .collect()
 }
 
+#[derive(Clone, Copy)]
 struct NodeBar<'a> {
     model: &'a str,
     bar_open_ms: i64,
@@ -1014,6 +1015,93 @@ fn historical_gap_crossing_settles_both_eligible_limit_orders_without_terminal_g
     );
     assert_eq!(owner.execution_receipts.len(), 2);
     assert_eq!(owner.gate, Gate::Running);
+}
+
+#[test]
+fn terminal_historical_market_nodes_validate_but_do_not_mutate_the_owner() {
+    for lifecycle in [
+        risk_transition::Lifecycle::LiquidatedFlat,
+        risk_transition::Lifecycle::LiquidatedInsolvent,
+    ] {
+        let (mut seed, products) = configured_ab();
+        seed.cash = d("1000");
+        seed.effective_at = 0;
+        seed.orders.push(SeedOrder {
+            intent_id: "TERMINAL-INTENT".into(),
+            order_id: "TERMINAL-ORDER".into(),
+            client_id: "TERMINAL-CLIENT".into(),
+            strategy_id: "TERMINAL-STRATEGY".into(),
+            product: ProfileProduct::BtcEth(products[0].product.clone()),
+            side: Side::Long,
+            price: d("105"),
+            reduce_only: false,
+            original: d("1"),
+            filled: Decimal::ZERO,
+            canceled: Decimal::ZERO,
+            remaining: d("1"),
+            status: "OPEN".into(),
+        });
+        let bar = NodeBar {
+            model: "OHLC4_OPEN_HIGH_LOW_CLOSE_V1",
+            bar_open_ms: 1_000,
+            step_index: 2,
+            a_ohlc: [d("100"), d("110"), d("90"), d("105")],
+            a_volume: "8",
+            a_mark: [d("100"); 4],
+        };
+        let mut control =
+            ScenarioAccount::from_configured(&seed, d("10"), products.clone()).unwrap();
+        let control_input = node_input(&control, bar, &[("TERMINAL-ORDER", 1)]);
+        let control_result = control.historical_market_step(&control_input).unwrap();
+        assert_eq!(control_result.products[0].fills.len(), 1);
+        let mut owner = ScenarioAccount::from_configured(&seed, d("10"), products).unwrap();
+        owner.transition.lifecycle = lifecycle;
+        let before = owner.inspect_state().unwrap();
+        let before_version = owner.state_version;
+        let mut input = node_input(&owner, bar, &[("TERMINAL-ORDER", 1)]);
+        let result = owner.historical_market_step(&input).unwrap();
+        assert_eq!(result.products.len(), 2);
+        assert!(result
+            .products
+            .iter()
+            .all(|product| product.fills.is_empty()));
+        assert!(result
+            .products
+            .iter()
+            .any(|product| product.capacity > Decimal::ZERO));
+        assert_eq!(
+            result
+                .products
+                .iter()
+                .map(|product| (
+                    &product.product_id,
+                    product.capacity,
+                    product.discarded_volume
+                ))
+                .collect::<Vec<_>>(),
+            control_result
+                .products
+                .iter()
+                .map(|product| (
+                    &product.product_id,
+                    product.capacity,
+                    product.discarded_volume
+                ))
+                .collect::<Vec<_>>()
+        );
+        assert!(owner.execution_receipts.is_empty());
+        assert_eq!(owner.state_version, before_version);
+        assert_eq!(owner.inspect_state().unwrap(), before);
+        assert_eq!(owner.historical_market_step(&input).unwrap(), result);
+
+        input.bars[0].confirmed = false;
+        assert_eq!(
+            owner.historical_market_step(&input),
+            Err("INVALID_HISTORICAL_INPUT")
+        );
+        assert_eq!(owner.state_version, before_version);
+        assert_eq!(owner.inspect_state().unwrap(), before);
+    }
 }
 
 #[test]

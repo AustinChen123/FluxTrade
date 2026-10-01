@@ -1,6 +1,54 @@
 use super::*;
 
 impl ScenarioAccount {
+    pub(in crate::binding::matcher::replay_transition::synthetic_risk::scenario_account) fn historical_order_binding(
+        &self,
+        event_id: &str,
+        source_sequence: i64,
+    ) -> Result<Option<(String, String, String, String)>, Fault> {
+        const HISTORICAL: &str = "HISTORICAL_ORDER_V1";
+        if !matches!(self.profile, ProfileContext::BtcEthScenario { ref scenario, .. } if scenario.configured.is_some())
+        {
+            return Err("INVALID_HISTORICAL_ORDER_SNAPSHOT");
+        }
+        let Some((stamp, _)) = self.transition.events.get(event_id) else {
+            return Ok(None);
+        };
+        if stamp.event_id != event_id
+            || stamp.ordering_contract_id != HISTORICAL
+            || stamp.source_sequence != Some(source_sequence)
+            || self.transition.event_kinds.get(event_id) != Some(&source::Kind::Intent)
+        {
+            return Err("INVALID_HISTORICAL_ORDER_SNAPSHOT");
+        }
+        let mut matches = self
+            .intent_results
+            .values()
+            .filter(|result| result.created_at_event_id() == event_id);
+        let Some(result) = matches.next() else {
+            return Err("INVALID_HISTORICAL_ORDER_SNAPSHOT");
+        };
+        if matches.next().is_some() {
+            return Err("INVALID_HISTORICAL_ORDER_SNAPSHOT");
+        }
+        let Some(order) = result.delivery_order(event_id) else {
+            return Ok(None);
+        };
+        let order_id = result
+            .order_id()
+            .ok_or("INVALID_HISTORICAL_ORDER_SNAPSHOT")?;
+        if order.order_id != order_id || order.client_id.is_empty() || order.strategy_id.is_empty()
+        {
+            return Err("INVALID_HISTORICAL_ORDER_SNAPSHOT");
+        }
+        Ok(Some((
+            order.client_id.clone(),
+            order.order_id.clone(),
+            order.product.canonical_id().to_owned(),
+            order.strategy_id.clone(),
+        )))
+    }
+
     fn historical_meta_matches(
         &self,
         meta: &WorkingOrderMeta,
@@ -192,7 +240,7 @@ impl ScenarioAccount {
         let mut draft = self.clone();
         // VERSION_ACTIVATION is phase 0; step 3 closes this raw boundary at
         // phase 4. Apply only the configured spec transition due at this time.
-        if input.step_index == 3 {
+        if input.step_index == 3 && !self.is_terminal() {
             draft.activate_historical_spec_boundary(raw_time_ms)?;
         }
         let (scenario, _) = draft.btc_context()?;
@@ -208,6 +256,22 @@ impl ScenarioAccount {
                 spec.minimum,
                 input.step_index,
             )?);
+        }
+        if self.is_terminal() {
+            let raw_time_ms = steps.first().ok_or("INVALID_HISTORICAL_INPUT")?.raw_time_ms;
+            return Ok(StepResult {
+                raw_time_ms,
+                effective_at: at,
+                products: steps
+                    .into_iter()
+                    .map(|step| ProductStepResult {
+                        product_id: product_id(&step.product).into(),
+                        capacity: step.capacity,
+                        discarded_volume: step.discarded_volume,
+                        fills: Vec::new(),
+                    })
+                    .collect(),
+            });
         }
         let old_at = draft
             .transition
