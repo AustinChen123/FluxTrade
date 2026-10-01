@@ -12,13 +12,19 @@ impl ScenarioAccount {
         let t = &candidate.template;
         if t.key.account != self.key
             || t.key.product != ProfileProduct::Pa
-            || t.side != Side::Long
+            || t.key.product != order.facts.product
+            || t.side != order.facts.side
             || !identity(&t.key.namespace)
             || !identity(&t.key.external_id)
             || !identity(&candidate.candidate_id)
             || !identity(&candidate.event_id)
             || !order.facts.projects_remainder("UNSUPPORTED_EXECUTION")?
             || t.price != Decimal::TEN
+            || (self.admitted_order_type(&order.facts) == admission::OrderType::Limit
+                && match order.facts.side {
+                    Side::Long => t.price > order.facts.price,
+                    Side::Short => t.price < order.facts.price,
+                })
             || t.quantity < Decimal::ONE
             || t.quantity > order.facts.remaining
             || !aligned(t.quantity, Decimal::ONE)

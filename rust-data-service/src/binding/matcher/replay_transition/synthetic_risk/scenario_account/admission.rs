@@ -34,7 +34,10 @@ pub(super) fn fixture_intent(
         client_order_id: "client".into(),
         account_key: owner.key.clone(),
         config_id: owner.config_id.clone(),
-        product: if matches!(owner.profile, ProfileContext::GoldenCancel(_)) {
+        product: if matches!(
+            owner.profile,
+            ProfileContext::GoldenCancel(_) | ProfileContext::P1O03
+        ) {
             ProfileProduct::Pa
         } else {
             ProfileProduct::BtcEth(Product::Btc)

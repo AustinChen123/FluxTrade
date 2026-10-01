@@ -144,12 +144,15 @@ impl ScenarioAccount {
                 PositionState::GoldenCancel(position),
             ) = (&self.profile, &self.positions)
             {
-                let opening = hypothetical_settlement::OpeningIdentity {
-                    source_id: format!("runtime:{execution_id:02x?}"),
-                    strategy_id: order.facts.strategy_id.clone(),
-                    execution_id,
-                    sequence: self.commit_sequence,
-                };
+                let opening = position
+                    .as_ref()
+                    .is_none_or(|p| p.side == template.side)
+                    .then(|| hypothetical_settlement::OpeningIdentity {
+                        source_id: format!("runtime:{execution_id:02x?}"),
+                        strategy_id: order.facts.strategy_id.clone(),
+                        execution_id,
+                        sequence: self.commit_sequence,
+                    });
                 let (context, fee) = match &self.profile {
                     ProfileContext::GoldenCancel(config) => (
                         hypothetical_settlement::Context::GoldenCancel(config),
@@ -171,7 +174,7 @@ impl ScenarioAccount {
                         template.price,
                         context,
                         fee,
-                        Some(&opening),
+                        opening.as_ref(),
                     )?,
                 )
             } else {

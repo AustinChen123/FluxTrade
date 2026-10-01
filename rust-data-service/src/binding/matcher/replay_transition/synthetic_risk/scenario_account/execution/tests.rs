@@ -55,6 +55,190 @@ pub(super) fn fixture_candidate() -> (ScenarioAccount, ExecutionCandidate) {
     )
 }
 
+fn p1o03_owner() -> ScenarioAccount {
+    let (seed, _, _) = fixture();
+    super::super::wire::profiles::construct("SYNTHETIC_P1_O03_V1", seed.key, None).unwrap()
+}
+
+fn admit_p1o03_order(
+    owner: &mut ScenarioAccount,
+    intent_id: &str,
+    side: Side,
+    quantity: Decimal,
+    limit: Decimal,
+) -> String {
+    let intent = admission::fixture_intent(owner, intent_id, side, quantity, limit);
+    let (kind, result) = admission::fixture_admit(owner, intent_id, 601, &intent).unwrap();
+    assert_eq!(kind, "accepted");
+    result.order_id().unwrap().to_owned()
+}
+
+fn p1o03_candidate(
+    owner: &ScenarioAccount,
+    order_id: &str,
+    side: Side,
+    quantity: Decimal,
+    execution_id: &str,
+) -> ExecutionCandidate {
+    let (_, mut candidate) = fixture_candidate();
+    candidate.template.key.account = owner.key.clone();
+    candidate.template.key.product = ProfileProduct::Pa;
+    candidate.template.key.external_id = execution_id.into();
+    candidate.template.order_id = order_id.into();
+    candidate.template.side = side;
+    candidate.template.price = d("10");
+    candidate.template.quantity = quantity;
+    candidate.template.matching_effective_at = 602;
+    candidate.event_id = execution_id.into();
+    candidate.expected_account_version = owner.state_version;
+    candidate.expected_order_version = owner.orders[order_id].version;
+    candidate.spec_version = "gt03-spec-v1".into();
+    candidate.rule_data_version = "gt03-rule-v1".into();
+    candidate
+}
+
+#[test]
+fn p1o03_execution_must_match_resting_order_side_product_and_limit() {
+    for incompatible in ["side", "long_limit", "short_limit"] {
+        let mut owner = p1o03_owner();
+        let (order_side, limit, execution_side) = match incompatible {
+            "side" => (Side::Short, "10", Side::Long),
+            "long_limit" => (Side::Long, "1", Side::Long),
+            _ => (Side::Short, "11", Side::Short),
+        };
+        let order_id = admit_p1o03_order(&mut owner, incompatible, order_side, d("1"), d(limit));
+        let candidate = p1o03_candidate(
+            &owner,
+            &order_id,
+            execution_side,
+            Decimal::ONE,
+            &format!("O03-{incompatible}"),
+        );
+        let before = owner.clone();
+        assert_eq!(
+            owner.prepare_execution(&candidate),
+            Err("UNSUPPORTED_EXECUTION"),
+            "incompatible {incompatible} must not be eligible"
+        );
+        assert_eq!(
+            owner, before,
+            "incompatible {incompatible} changed owner state"
+        );
+        assert_eq!(owner.gate, Gate::Running);
+
+        let mut expected_failure = before;
+        expected_failure.gate = Gate::Failed("UNSUPPORTED_EXECUTION");
+        assert_eq!(
+            owner.execute(&candidate),
+            Err("UNSUPPORTED_EXECUTION"),
+            "incompatible {incompatible} execution must fail closed"
+        );
+        assert_eq!(owner, expected_failure, "only the fault gate may change");
+    }
+
+    let mut owner = p1o03_owner();
+    let order_id = admit_p1o03_order(
+        &mut owner,
+        "wrong-product",
+        Side::Long,
+        Decimal::ONE,
+        d("10"),
+    );
+    owner.orders.get_mut(&order_id).unwrap().facts.product = ProfileProduct::BtcEth(Product::Btc);
+    let candidate = p1o03_candidate(
+        &owner,
+        &order_id,
+        Side::Long,
+        Decimal::ONE,
+        "O03-WRONG-PRODUCT",
+    );
+    let before = owner.clone();
+    assert_eq!(
+        owner.prepare_execution(&candidate),
+        Err("UNSUPPORTED_EXECUTION")
+    );
+    assert_eq!(owner, before);
+}
+
+#[test]
+fn p1o03_execution_limit_eligibility_preserves_both_sides() {
+    for (side, limit) in [
+        (Side::Long, "10"),
+        (Side::Long, "11"),
+        (Side::Short, "9"),
+        (Side::Short, "10"),
+    ] {
+        let mut owner = p1o03_owner();
+        let order_id = admit_p1o03_order(&mut owner, "eligible", side, d("5"), d(limit));
+        let candidate = p1o03_candidate(&owner, &order_id, side, Decimal::ONE, "O03-ELIGIBLE");
+        let before = owner.clone();
+        assert!(matches!(
+            owner.prepare_execution(&candidate),
+            Ok(Preparation::Eligible { .. })
+        ));
+        assert_eq!(owner, before, "preparation must remain read-only");
+        let commit::Reply::Committed { receipt, .. } = owner.execute(&candidate).unwrap() else {
+            panic!("compatible P1O03 execution must commit");
+        };
+        assert_eq!(receipt.price, Decimal::TEN);
+        assert_eq!(owner.orders[&order_id].facts.filled, Decimal::ONE);
+        assert_eq!(owner.gate, Gate::Running);
+    }
+}
+
+#[test]
+fn p1o03_admitted_short_reduces_then_closes_without_opening_identity() {
+    let mut owner = p1o03_owner();
+    let order_id = admit_p1o03_order(&mut owner, "short-close", Side::Short, d("5"), d("10"));
+
+    let partial = p1o03_candidate(&owner, &order_id, Side::Short, d("2"), "O03-SHORT-PARTIAL");
+    owner.execute(&partial).unwrap();
+    let PositionState::GoldenCancel(Some(position)) = &owner.positions else {
+        panic!("partial reduction must retain the long position");
+    };
+    assert_eq!(position.side, Side::Long);
+    assert_eq!(position.contracts, d("3"));
+    assert_eq!(owner.orders[&order_id].facts.remaining, d("3"));
+    assert_eq!(owner.execution_receipts.len(), 1);
+    assert_eq!(owner.gate, Gate::Running);
+
+    let mut close = p1o03_candidate(&owner, &order_id, Side::Short, d("3"), "O03-SHORT-CLOSE");
+    close.template.matching_effective_at = 603;
+    owner.execute(&close).unwrap();
+    assert_eq!(owner.positions, PositionState::GoldenCancel(None));
+    assert_eq!(owner.orders[&order_id].facts.remaining, Decimal::ZERO);
+    assert_eq!(owner.orders[&order_id].facts.status, "FILLED");
+    assert_eq!(owner.execution_receipts.len(), 2);
+    assert_eq!(owner.gate, Gate::Running);
+}
+
+#[test]
+fn p1o03_admitted_short_cannot_cross_zero() {
+    let mut owner = p1o03_owner();
+    let order_id = admit_p1o03_order(&mut owner, "short-cross-zero", Side::Short, d("6"), d("10"));
+    let candidate = p1o03_candidate(
+        &owner,
+        &order_id,
+        Side::Short,
+        d("6"),
+        "O03-SHORT-CROSS-ZERO",
+    );
+    assert!(matches!(
+        owner.prepare_execution(&candidate),
+        Ok(Preparation::Eligible { .. })
+    ));
+    let mut expected_failure = owner.clone();
+    expected_failure.gate = Gate::Failed("CROSS_ZERO_OR_UNEXPECTED_OPENING_IDENTITY");
+    assert_eq!(
+        owner.execute(&candidate),
+        Err("CROSS_ZERO_OR_UNEXPECTED_OPENING_IDENTITY")
+    );
+    assert_eq!(
+        owner, expected_failure,
+        "cross-zero failure must only fail the gate"
+    );
+}
+
 #[test]
 fn every_identity_axis_and_financial_field_is_canonical() {
     let (_, candidate) = fixture_candidate();
