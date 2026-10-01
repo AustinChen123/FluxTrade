@@ -10,7 +10,7 @@ import pytest
 
 from src.core.backtest import spider_run_completion_schema as schema
 from src.core.backtest.spider_run_artifacts import (
-    ConfigurationContext, canonical_bytes, configuration_context, decode_canonical,
+    ConfigurationContext, HistoricalContext, canonical_bytes, configuration_context, decode_canonical,
     decode_jsonl, encode_jsonl,
 )
 
@@ -41,13 +41,11 @@ def configured_context(products=None, config_id="configured-v1") -> dict[str, An
     }
 
 
-def historical_context_row() -> dict[str, Any]:
-    return dict(
-        schema_version="spider_historical_context_v1", research_classification="RESEARCH_ONLY",
-        historical_input_sha256="1" * 64, path_pair_sha256="2" * 64,
-        source_sha256="3" * 64, model_sha256="4" * 64,
-        assumption_sha256="5" * 64, coverage_sha256="6" * 64,
-        model_id="OHLC4_OPEN_HIGH_LOW_CLOSE_V1", model_version=1,
+def historical_context_row() -> HistoricalContext:
+    return HistoricalContext(
+        "spider_historical_context_v1", "RESEARCH_ONLY", "1" * 64, "2" * 64,
+        "3" * 64, "4" * 64, "5" * 64, "6" * 64,
+        "OHLC4_OPEN_HIGH_LOW_CLOSE_V1", 1,
     )
 
 
@@ -363,7 +361,7 @@ def test_completion_coverage_kinds_are_historical_context_specific():
     historical.update(
         planned_coverage=coverage,
         configuration_context=configured_context(),
-        historical_context=historical_context_row(),
+        historical_context=historical_context_row()._asdict(),
         terminal_reason="MTM_PRESERVE_OPEN_V1",
     )
     historical["artifacts"].append(dict(path="historical_input.json",
@@ -396,10 +394,11 @@ def test_embedded_artifact_contexts_remain_dict_only():
 def test_reports_and_completion_bind_historical_context_pair_and_terminal():
     config = configured_context()
     historical = historical_context_row()
+    historical_payload = historical._asdict()
     context = configuration_context(config)
     rows = configured_report_rows(config)
     for row in rows:
-        row.update(historical_context=deepcopy(historical), terminal_reason="MTM_PRESERVE_OPEN_V1")
+        row.update(historical_context=deepcopy(historical_payload), terminal_reason="MTM_PRESERVE_OPEN_V1")
     schema.report(rows, context=context, historical_context=historical)
     for changed in (
         [*rows[:1], {**rows[1], "historical_context": None}, *rows[2:]],
@@ -411,7 +410,7 @@ def test_reports_and_completion_bind_historical_context_pair_and_terminal():
         schema.report(rows, context=context)
 
     complete = manifest()
-    complete.update(configuration_context=config, historical_context=deepcopy(historical),
+    complete.update(configuration_context=config, historical_context=deepcopy(historical_payload),
                     terminal_reason="MTM_PRESERVE_OPEN_V1")
     complete["planned_coverage"] = [
         {"ordinal": 1, "barrier_id": "P3_TIMER_86405000", "record_kind": "HISTORICAL_TIMER"}

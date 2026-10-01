@@ -478,11 +478,17 @@ def test_historical_attempt_contract_is_closed(mutation):
     elif mutation == "bad_profile":
         row["profile_id"] = "HISTORICAL_MARKET_SCENARIO_ACCOUNT_V1"
     elif mutation == "bad_venue":
-        row["account_key"] = {**row["account_key"], "venue": "OTHER"}
+        account_key = row["account_key"]
+        assert isinstance(account_key, dict)
+        row["account_key"] = {**account_key, "venue": "OTHER"}
     elif mutation == "bad_environment":
-        row["account_key"] = {**row["account_key"], "environment": "PAPER"}
+        account_key = row["account_key"]
+        assert isinstance(account_key, dict)
+        row["account_key"] = {**account_key, "environment": "PAPER"}
     elif mutation == "subaccount":
-        row["account_key"] = {**row["account_key"], "subaccount": "unexpected"}
+        account_key = row["account_key"]
+        assert isinstance(account_key, dict)
+        row["account_key"] = {**account_key, "subaccount": "unexpected"}
     elif mutation == "bad_ordering":
         row["ordering_contract_id"] = "S_order_v1"
     elif mutation == "bad_cost":

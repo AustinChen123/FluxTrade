@@ -148,7 +148,10 @@ def test_market_deliveries_map_null_limit_to_empty_policy_price():
         "schema_version": "spider_configuration_context_v1",
         "config_id": configuration["config_id"],
         "configuration_sha256": "f" * 64,
-        "products": [product["product_id"] for product in configuration["products"]],
+        "products": [
+            product["product_id"]
+            for product in cast(list[dict[str, object]], configuration["products"])
+        ],
     })
     execution = {
         "order_id": "market-order", "owner_client_order_id": "owner-client",

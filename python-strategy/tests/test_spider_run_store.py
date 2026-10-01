@@ -73,7 +73,7 @@ def historical_registration():
     )
     attempt["policy_source_sha256"] = run.policy_source_sha256
     for item, key in zip(
-        attempt["input_contract_hashes"],
+        cast(list[dict[str, object]], attempt["input_contract_hashes"]),
         ("scenario_plan_sha256", "program_sha256", "native_artifact_sha256", "policy_source_sha256"),
         strict=True,
     ):
@@ -385,9 +385,13 @@ def test_historical_registration_persists_input_and_dynamic_journal_frontier(tmp
 def test_historical_registration_rejects_input_or_attempt_mismatch_before_attempt_publish(tmp_path, case):
     run, raw, attempt = historical_registration()
     if case == "wrong_context":
-        attempt["historical_context"]["source_sha256"] = "f" * 64
+        historical = attempt["historical_context"]
+        assert isinstance(historical, dict)
+        historical["source_sha256"] = "f" * 64
     elif case == "wrong_coverage":
-        attempt["planned_coverage"].pop()
+        coverage = attempt["planned_coverage"]
+        assert isinstance(coverage, list)
+        coverage.pop()
     elif case == "wrong_run_id":
         attempt["run_id"] = "other-run"
     store = module.SpiderRunStore.create(str(tmp_path), run.run_id)
@@ -404,10 +408,10 @@ def test_historical_registration_rejects_identity_mismatch_without_publishing(tm
     run, raw, attempt = historical_registration()
     if case == "policy_source":
         attempt["policy_source_sha256"] = "f" * 64
-        attempt["input_contract_hashes"][3]["sha256"] = "f" * 64
+        cast(list[dict[str, object]], attempt["input_contract_hashes"])[3]["sha256"] = "f" * 64
     else:
         index = int(case[-1])
-        attempt["input_contract_hashes"][index]["sha256"] = "f" * 64
+        cast(list[dict[str, object]], attempt["input_contract_hashes"])[index]["sha256"] = "f" * 64
     store = module.SpiderRunStore.create(str(tmp_path), run.run_id)
     with pytest.raises(ValueError, match="INVALID_ARTIFACT"):
         store.register(attempt, historical_input=raw)

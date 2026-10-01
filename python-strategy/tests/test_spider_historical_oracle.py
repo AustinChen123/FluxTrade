@@ -5,11 +5,12 @@ from copy import deepcopy
 from decimal import Decimal as D
 from hashlib import sha256
 import json
+from typing import Literal, cast, overload
 
 import pytest
 
 from src.core.backtest import synthetic_scenario_codec as wire
-from src.core.backtest.spider_historical_input import validate_historical_input
+from src.core.backtest.spider_historical_input import HistoricalRunInput, validate_historical_input
 from src.core.backtest.spider_run_artifacts import canonical_bytes
 from src.core.backtest.synthetic_scenario_replay import _ReplayComposition
 from test_spider_historical_input import (
@@ -55,7 +56,7 @@ ORDERS = {
 }
 
 
-def _record(path, digest, case):
+def _record(path, digest: str, case: str) -> dict[str, str]:
     raw = path.read_bytes()
     assert sha256(raw).hexdigest() == digest
     line = next(
@@ -76,7 +77,9 @@ def _record(path, digest, case):
     return fields
 
 
-def _oracle_run(case, *, model_id=None, h06_variant="A"):
+def _oracle_run(
+    case: str, *, model_id: str | None = None, h06_variant: str = "A"
+) -> tuple[dict[str, str], HistoricalRunInput]:
     source = _record(INPUTS, INPUTS_SHA256, case)
     base = _valid_run()
     start = EPOCH
@@ -444,22 +447,53 @@ def _oracle_run(case, *, model_id=None, h06_variant="A"):
     return source, run
 
 
-def _case_answer(case):
+def _case_answer(case: str) -> dict[str, str]:
     return _record(ANSWERS, ANSWERS_SHA256, case)
 
 
-def _snapshot(composition, kind, snapshot_id, captured_at):
+@overload
+def _snapshot(
+    composition: _ReplayComposition, kind: Literal["TRADING"], snapshot_id: str, captured_at: int
+) -> wire.Trading: ...
+
+
+@overload
+def _snapshot(
+    composition: _ReplayComposition, kind: Literal["POSITIONS"], snapshot_id: str, captured_at: int
+) -> wire.Positions: ...
+
+
+@overload
+def _snapshot(
+    composition: _ReplayComposition, kind: Literal["OPEN_ORDERS"], snapshot_id: str, captured_at: int
+) -> wire.OpenOrders: ...
+
+
+def _snapshot(
+    composition: _ReplayComposition,
+    kind: Literal["TRADING", "POSITIONS", "OPEN_ORDERS"],
+    snapshot_id: str,
+    captured_at: int,
+) -> wire.Trading | wire.Positions | wire.OpenOrders:
     fact = composition._codec.capture_snapshot(
-        dict(
+        cast(wire.SnapshotRequest, dict(
             schema_version="snapshot_request_v1",
             account_key=composition._account,
             snapshot_id=snapshot_id,
             snapshot_kind=kind,
             capture_mode="OWNER_CURRENT",
             captured_at=captured_at,
-        )
+        ))
     )
-    return fact["immutable_payload"]
+    payload = cast(wire.Trading | wire.Positions | wire.OpenOrders, fact["immutable_payload"])
+    if kind == "TRADING":
+        assert payload["outcome"] == "SUCCESS"
+        return cast(wire.Trading, payload)
+    if kind == "POSITIONS":
+        assert payload["outcome"] == "SUCCESS"
+        return cast(wire.Positions, payload)
+    assert payload["outcome"] == "SUCCESS"
+    return cast(wire.OpenOrders, payload)
 
 
 def _h08_frozen_timeline(source, start, visibility):
@@ -968,8 +1002,8 @@ def test_frozen_h02_partial_duplicate_then_full_notice_closes_exactly():
         (
             row["product_id"],
             row["position_contracts"],
-            row["last_price"],
-            row["notional_usd"],
+            row.get("last_price"),
+            row.get("notional_usd"),
         )
         for row in positions
     ] == [("A-USDT-SWAP", D("2"), D("100"), D("200"))]
@@ -1264,14 +1298,14 @@ def test_execution_notice_occurrence_rejects_forged_native_delivery_identity():
             and record["item"]["delivery"]["payload_kind"] == "EXECUTION_FACT"
         )
         duplicate = composition._codec.build_delivery(
-            dict(
+            cast(wire.Projection, dict(
                 schema_version="delivery_projection_v1",
                 reference=dict(namespace="SOURCE", fact_id=original["source_fact_id"]),
                 payload_kind="EXECUTION_FACT",
                 occurrence_index=1,
                 schedule_sequence=original["schedule_sequence"] + 1,
                 visible_at=original["visible_at"],
-            )
+            ))
         )
         forged = deepcopy(duplicate)
         forged[field] = value
@@ -1361,8 +1395,8 @@ def test_frozen_h03_preaccept_crossing_does_not_backfill_and_later_bar_fills():
         (
             row["product_id"],
             row["position_contracts"],
-            row["last_price"],
-            row["notional_usd"],
+            row.get("last_price"),
+            row.get("notional_usd"),
         )
         for row in positions
     ] == [("A-USDT-SWAP", D("1"), D("94"), D("94"))]
@@ -1525,8 +1559,8 @@ def test_frozen_h04_fill_then_cancel_request_effect_ack_and_later_exclusion():
         (
             row["product_id"],
             row["position_contracts"],
-            row["last_price"],
-            row["notional_usd"],
+            row.get("last_price"),
+            row.get("notional_usd"),
         )
         for row in positions
     ] == [("A-USDT-SWAP", D("-2.5"), D("110"), D("275"))]
@@ -1552,7 +1586,7 @@ def test_frozen_h04_fill_then_cancel_request_effect_ack_and_later_exclusion():
     configured_tier = json.loads(run.configuration_bytes)["products"][0]["tiers"][0][
         "rows"
     ][0]
-    maintenance_margin = positions[0]["notional_usd"] * D(configured_tier["mmr"])
+    maintenance_margin = cast(D, positions[0].get("notional_usd")) * D(configured_tier["mmr"])
     assert (basis, unrealized, maintenance_margin) == (
         D("262.5"),
         D("-12.5"),
@@ -1685,7 +1719,7 @@ def test_frozen_h10_first_candidate_triggers_immediate_risk_transition():
     }
     positions = _snapshot(composition, "POSITIONS", "H10-END-POSITIONS", endpoint)
     assert [
-        (row["product_id"], row["position_contracts"], row["notional_usd"])
+        (row["product_id"], row["position_contracts"], row.get("notional_usd"))
         for row in positions["rows"]
     ] == [("A-USDT-SWAP", D("1000"), D("499000"))]
     assert _snapshot(composition, "OPEN_ORDERS", "H10-END-ORDERS", endpoint)["rows"] == []
@@ -1855,7 +1889,7 @@ def test_h07_native_spec_migration_precedes_boundary_bar_and_rejects_raw_intent(
     assert source["post_spec"] == "tick5,qstep1,min1"
     assert "no_retroactive_fill" in answer["preexisting103"]
 
-    account = dict(venue="okx-scenario", environment="test", account="H07")
+    account: wire.Account = {"venue": "okx-scenario", "environment": "test", "account": "H07"}
     codec = wire.ScenarioCodec(
         "SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1", account, _h07_configuration()
     )
@@ -1909,12 +1943,13 @@ def test_h07_native_spec_migration_precedes_boundary_bar_and_rejects_raw_intent(
         D("1000"), D("0"), D("0"),
     )
     assert codec.historical_working_orders() == []
-    trading = codec.capture_snapshot(dict(
+    trading = codec.capture_snapshot(cast(wire.SnapshotRequest, dict(
         schema_version="snapshot_request_v1", account_key=account,
         snapshot_id="H07-TRADING-END", snapshot_kind="TRADING",
         capture_mode="OWNER_CURRENT", captured_at=(EPOCH + 120_000) * 16 + 6,
-    ))["immutable_payload"]
-    assert (trading["equity"], trading["available_equity"]) == (D("1000"), D("1000"))
+    )))
+    trading_payload = cast(wire.Trading, trading["immutable_payload"])
+    assert (trading_payload["equity"], trading_payload["available_equity"]) == (D("1000"), D("1000"))
 
     rejected_codec = wire.ScenarioCodec(
         "SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1", account, _h07_configuration()
@@ -1924,9 +1959,9 @@ def test_h07_native_spec_migration_precedes_boundary_bar_and_rejects_raw_intent(
     _h07_node(rejected_codec, EPOCH, 3, "105")
     before_rejection = rejected_codec.inspect_state()
     rejected = rejected_codec.apply_group(
-        intent_group("H07-RAW-103", (EPOCH + 60_000) * 16 + 6, "103")
+        cast(wire.Group, intent_group("H07-RAW-103", (EPOCH + 60_000) * 16 + 6, "103"))
     )
-    assert (rejected["classification"], rejected["failure"], rejected["gate_after"]) == (
+    assert (rejected["classification"], rejected.get("failure"), rejected["gate_after"]) == (
         "FAULT", "INVALID_BTC_INTENT", "FAILED",
     )
     after_rejection = rejected_codec.inspect_state()

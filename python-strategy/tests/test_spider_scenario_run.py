@@ -10,7 +10,7 @@ from decimal import Decimal
 from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, Callable, cast
 
 import pytest
 
@@ -20,7 +20,9 @@ from src.core.backtest import spider_policy as spider_policy
 from src.core.backtest import spider_run_store as storage
 from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_canonical, decode_jsonl
 from src.core.backtest.spider_run_admission import admit_spider_run
+from src.core.backtest.spider_run_store import SpiderRunStore
 from src.core.backtest.spider_scenario_plans import PLAN_IDS, plan_bundle
+from src.core.backtest.spider_historical_input import HistoricalRunInput
 from src.core.backtest.spider_historical_input import (
     _canonical as _historical_canonical,
     encode_historical_run_input,
@@ -71,7 +73,7 @@ def frozen_h03_input(run_id):
     return value, encode_historical_run_input(value)
 
 
-def queue_frozen_h03_order(composition, value):
+def queue_frozen_h03_order(composition: run._ReplayComposition, value: HistoricalRunInput) -> None:
     start = value.range_start_ms
     return _enqueue_policy_order(
         composition,
@@ -88,10 +90,10 @@ def queue_frozen_h03_order(composition, value):
     )
 
 
-def frozen_h03_factory(original):
-    def with_frozen_order(historical_run):
-        composition = original(historical_run)
-        queue_frozen_h03_order(composition, historical_run)
+def frozen_h03_factory(original: Callable[[object], run._ReplayComposition]):
+    def with_frozen_order(run: object) -> run._ReplayComposition:
+        composition = original(run)
+        queue_frozen_h03_order(composition, cast(HistoricalRunInput, run))
         return composition
 
     return with_frozen_order
@@ -109,13 +111,13 @@ def _kill_child_after_filled_market_marker(output_root, run_id, raw, connection)
     original_append = storage.SpiderRunStore.append_journal
     original_factory = run._ReplayComposition._from_historical_run
     run._ReplayComposition._from_historical_run = staticmethod(frozen_h03_factory(original_factory))
-    def block_before_append(store, row):
+    def block_before_append(self: SpiderRunStore, row: dict[str, Any]) -> None:
         fills = [fill for product in row.get("payload", {}).get("result", {}).get("products", [])
                  for fill in product.get("fills", [])]
         if row["record_kind"] == "HISTORICAL_MARKET_RESULT" and fills:
             connection.send(("MARKED", row["barrier_id"], row["journal_seq"], len(fills)))
             connection.recv()
-        return original_append(store, row)
+        return original_append(self, row)
     storage.SpiderRunStore.append_journal = block_before_append
     try:
         result = run.run_spider_scenario(output_root, run_id, run._P3_SELECTOR, raw)
@@ -162,7 +164,7 @@ def test_invalid_transport_never_creates(tmp_path, field, value):
     args = [str(tmp_path), "r1", PLAN_IDS[0]]
     args[field] = value
     with pytest.raises(ValueError, match="^INVALID_INVOCATION$"):
-        run.run_spider_scenario(*args)
+        cast(Callable[..., object], run.run_spider_scenario)(*args)
     assert list(tmp_path.iterdir()) == []
 
 
@@ -347,6 +349,7 @@ def test_h06_policy_market_orders_cross_scheduler_native_and_notice_path(tmp_pat
         spec_after=tuple(replace(spec, effective_at_ms=endpoint) for spec in value.spec_after),
     )
     policy_cache = decode_canonical(value.initial_policy_cache)
+    assert isinstance(policy_cache, dict)
     policy_cache["replies"] = {}
     value = replace(value, initial_policy_cache=canonical_bytes(policy_cache))
     value = _rehashed_run(value)
@@ -637,6 +640,7 @@ def test_historical_sigkill_after_durable_market_marker_then_clean_new_run(tmp_p
         assert not any(row["barrier_id"] == barrier_id for row in journal)
         assert not (failed_directory / "completion.json").exists()
 
+        assert process.pid is not None
         os.kill(process.pid, signal.SIGKILL)
         process.join(10)
         assert process.exitcode == -signal.SIGKILL
@@ -680,6 +684,7 @@ def test_historical_sigkill_after_durable_market_marker_then_clean_new_run(tmp_p
         assert baseline_attempt["input_contract_hashes"] == clean_attempt["input_contract_hashes"]
     finally:
         if process.is_alive():
+            assert process.pid is not None
             os.kill(process.pid, signal.SIGKILL)
             process.join(10)
         parent.close()

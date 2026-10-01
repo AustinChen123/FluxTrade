@@ -244,7 +244,7 @@ def test_supported_timestamp_ceiling_preserves_exact_bar_coverage_semantics():
 
 def test_optional_shared_elapsed_cache_state_is_hashed_and_defaults_without_byte_drift():
     run = _valid_run()
-    baseline_state = decode_canonical(run.initial_policy_cache)
+    baseline_state = cast(dict[str, object], decode_canonical(run.initial_policy_cache))
     assert "shared_elapsed_ms" not in baseline_state
     baseline_bytes = run.initial_policy_cache
     baseline_hash = validate_historical_input(run)
@@ -260,7 +260,7 @@ def test_optional_shared_elapsed_cache_state_is_hashed_and_defaults_without_byte
 @pytest.mark.parametrize("elapsed", [-1, True, "12000"])
 def test_optional_shared_elapsed_cache_state_rejects_invalid_values(elapsed):
     run = _valid_run()
-    state = decode_canonical(run.initial_policy_cache)
+    state = cast(dict[str, object], decode_canonical(run.initial_policy_cache))
     state["shared_elapsed_ms"] = elapsed
     with pytest.raises(HistoricalInputError, match="shared cooldown"):
         validate_historical_input(replace(run, initial_policy_cache=canonical_bytes(state)))

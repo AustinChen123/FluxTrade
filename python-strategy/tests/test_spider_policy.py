@@ -127,7 +127,7 @@ class Tests(unittest.TestCase):
 
     def test_h07_normalization_dedup_minimum_reset_and_new_tick(self):
         p = fixture(n=1)
-        p.markets["C0"].update(price="100", increment=D("1"), lotSz=D("1"), minSz=D("1"))
+        p.markets["C0"].update(price="100", increment="1", lotSz="1", minSz="1")
         long_1039 = p.make_order("C0", "H071", "buy", "103.9", "1")
         long_1031 = p.make_order("C0", "H072", "buy", "103.1", "1")
         self.assertEqual((long_1039["px"], long_1031["px"]), ("103", "103"))
@@ -154,7 +154,7 @@ class Tests(unittest.TestCase):
         self.assertFalse(sent(p))
         self.assertEqual(p.capital, before_capital)
 
-        p.markets["C0"]["increment"] = D("5")
+        p.markets["C0"]["increment"] = "5"
         self.assertEqual(p.make_order("C0", "H074", "buy", "103", "1")["px"], "100")
 
     def test_raise_zero_cap_inactive(self):

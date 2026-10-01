@@ -4,8 +4,9 @@ from decimal import Decimal as D
 from hashlib import sha256
 import json
 import os
+from pathlib import Path
 import re
-from typing import cast
+from typing import Any, Literal, Protocol, TypedDict, cast, overload
 
 import pytest
 
@@ -39,6 +40,23 @@ from test_spider_run_artifacts import historical_attempt
 
 
 _P3_ORACLE_EPOCH_MS = 1_790_640_000_000
+
+
+class _HistoricalOwnerCapture(TypedDict):
+    owner_evidence: dict[str, object]
+    scheduler_observation: dict[str, object]
+
+
+class _HistoricalInitialEvidenceAccess(Protocol):
+    _historical_initial_cache_evidence: dict[str, object]
+
+
+class _HistoricalOrderContractAccess(Protocol):
+    _historical_order_contract: dict[str, object]
+
+
+class _HistoricalPollRangeAccess(Protocol):
+    _historical_poll_range: tuple[int, int]
 
 
 def _frozen_h01_input() -> dict[str, str]:
@@ -94,11 +112,13 @@ def _h01_run(record: dict[str, str]) -> HistoricalRunInput:
     # The input record is the only source of the changed market path.
     bars: dict[tuple[str, int], tuple[D, D, D, D, D]] = {}
     product = None
-    product_ids = dict(zip(("A", "B"), products, strict=True))
+    product_ids: dict[str, str] = dict(zip(("A", "B"), products, strict=True))
     for segment in record["bars"].split(";"):
-        if ":" in segment:
-            label, segment = segment.split(":", 1)
+        label, separator, remainder = segment.partition(":")
+        if separator:
+            assert label in product_ids
             product = product_ids[label]
+            segment = remainder
         assert product is not None
         offset, values = segment.split("=", 1)
         raw_open = start + (0 if offset == "E" else int(offset.removeprefix("E+")))
@@ -189,15 +209,15 @@ def _node(run: HistoricalRunInput, open_ms: int, step: int) -> wire.HistoricalNo
     bars = []
     for product in run.ordered_products:
         t, m = trade[(product, open_ms)], marks[(product, open_ms)]
-        bars.append({
+        bars.append(cast(wire.HistoricalProductBars, {
             "product_id": product,
             "trade": {"open": t.open, "high": t.high, "low": t.low, "close": t.close,
                       "volume_contracts": cast(D, t.volume), "confirmed": True,
                       "source_row_hash": t.source_row_hash},
             "mark": {"open": m.open, "high": m.high, "low": m.low, "close": m.close,
                      "confirmed": True, "source_row_hash": m.source_row_hash},
-        })
-    return {
+        }))
+    return cast(wire.HistoricalNode, {
         "schema_version": "historical_node_v1",
         "model_id": run.model_id,
         "model_version": "1",
@@ -208,7 +228,7 @@ def _node(run: HistoricalRunInput, open_ms: int, step: int) -> wire.HistoricalNo
         "market_slippage_bps": run.market_slippage_bps,
         "bars": bars,
         "working_orders": [],
-    }
+    })
 
 
 def _composition(run: HistoricalRunInput, evidence_callback=None) -> _ReplayComposition:
@@ -236,13 +256,63 @@ def _historical_snapshot_requests(composition, cutoff, prefix):
             for kind in ("TRADING", "POSITIONS", "OPEN_ORDERS")]
 
 
-def _capture_historical_owner(composition, cutoff, prefix):
-    return decode_canonical(canonical_bytes(composition.capture_owner_evidence(
+def _capture_historical_owner(
+    composition: _ReplayComposition, cutoff: int, prefix: str
+) -> _HistoricalOwnerCapture:
+    return cast(_HistoricalOwnerCapture, decode_canonical(canonical_bytes(composition.capture_owner_evidence(
         cutoff, *_historical_snapshot_requests(composition, cutoff, prefix),
+    ))))
+
+
+@overload
+def _capture_snapshot(composition: _ReplayComposition, kind: Literal["TRADING"], snapshot_id: str, captured_at: int) -> wire.Trading: ...
+
+
+@overload
+def _capture_snapshot(composition: _ReplayComposition, kind: Literal["POSITIONS"], snapshot_id: str, captured_at: int) -> wire.Positions: ...
+
+
+@overload
+def _capture_snapshot(composition: _ReplayComposition, kind: Literal["OPEN_ORDERS"], snapshot_id: str, captured_at: int) -> wire.OpenOrders: ...
+
+
+def _capture_snapshot(
+    composition: _ReplayComposition,
+    kind: Literal["TRADING", "POSITIONS", "OPEN_ORDERS"],
+    snapshot_id: str,
+    captured_at: int,
+) -> wire.Trading | wire.Positions | wire.OpenOrders:
+    fact = composition._codec.capture_snapshot(cast(wire.SnapshotRequest, dict(
+        schema_version="snapshot_request_v1",
+        account_key=composition._account,
+        snapshot_id=snapshot_id,
+        snapshot_kind=kind,
+        capture_mode="OWNER_CURRENT",
+        captured_at=captured_at,
     )))
+    payload = cast(wire.Trading | wire.Positions | wire.OpenOrders, fact["immutable_payload"])
+    if kind == "TRADING":
+        return cast(wire.Trading, payload)
+    if kind == "POSITIONS":
+        return cast(wire.Positions, payload)
+    return cast(wire.OpenOrders, payload)
 
 
-def _historical_endpoint_case(tmp_path, *, partial_fill, return_store=False):
+@overload
+def _historical_endpoint_case(
+    tmp_path: Path, *, partial_fill: bool, return_store: Literal[False] = False
+) -> tuple[HistoricalRunInput, dict[str, Any], dict[str, Any], list[dict[str, Any]], dict[str, Any], _ReplayComposition]: ...
+
+
+@overload
+def _historical_endpoint_case(
+    tmp_path: Path, *, partial_fill: bool, return_store: Literal[True]
+) -> tuple[HistoricalRunInput, dict[str, Any], dict[str, Any], list[dict[str, Any]], dict[str, Any], _ReplayComposition, SpiderRunStore]: ...
+
+
+def _historical_endpoint_case(
+    tmp_path: Path, *, partial_fill: bool, return_store: bool = False
+):
     run = _valid_run()
     if partial_fill:
         trade_rows = tuple(
@@ -265,13 +335,13 @@ def _historical_endpoint_case(tmp_path, *, partial_fill, return_store=False):
                    policy_source_sha256=run.policy_source_sha256,
                    configuration_context=config_context, historical_context=history_context,
                    planned_coverage=historical_planned_coverage(run))
-    for item, key in zip(attempt["input_contract_hashes"],
+    for item, key in zip(cast(list[dict[str, Any]], attempt["input_contract_hashes"]),
                          ("scenario_plan_sha256", "program_sha256", "native_artifact_sha256", "policy_source_sha256"),
                          strict=True):
         item["sha256"] = attempt[key]
     store = SpiderRunStore.create(str(tmp_path), run.run_id)
     store.register(attempt, historical_input=raw_input)
-    composition = None
+    composition: _ReplayComposition | None = None
     previous_owner = None
 
     def persist(kind, key, payload):
@@ -279,9 +349,10 @@ def _historical_endpoint_case(tmp_path, *, partial_fill, return_store=False):
         if kind == "DELIVERY_ATTEMPT":
             return
         ordinal = len(decode_jsonl((store._path / "journal.jsonl").read_bytes())) + 1
-        payload = decode_canonical(canonical_bytes(payload))
+        payload = cast(dict[str, Any], decode_canonical(canonical_bytes(payload)))
         before_version = after_version = None
         if kind == "SOURCE_GROUP_RESULT":
+            assert composition is not None
             if previous_owner is None:
                 raise AssertionError("source group precedes initial owner evidence")
             payload["owner_evidence_before"] = previous_owner
@@ -292,6 +363,7 @@ def _historical_endpoint_case(tmp_path, *, partial_fill, return_store=False):
             after_version = payload["result"]["account_version_after"]
             previous_owner = after
         elif kind == "HISTORICAL_MARKET_RESULT":
+            assert composition is not None
             before_version = payload["owner_inspection_before"]["account_version"]
             after_version = payload["owner_inspection_after"]["account_version"]
             capture_at = payload["result"]["effective_at"]
@@ -300,7 +372,7 @@ def _historical_endpoint_case(tmp_path, *, partial_fill, return_store=False):
             effective = payload["request"].get("group_effective_at", payload["request"].get("captured_at"))
         else:
             effective = key["visible_at"]
-        row = dict(schema_version="spider_journal_record_v1", run_id=run.run_id, journal_seq=ordinal,
+        row: dict[str, Any] = dict(schema_version="spider_journal_record_v1", run_id=run.run_id, journal_seq=ordinal,
                    barrier_id=key["stable_id"], record_kind=kind, scheduler_key=key, causal_parent_ids=[],
                    effective_at=effective, visible_at=key["visible_at"], account_version_before=before_version,
                    account_version_after=after_version, payload=payload,
@@ -381,11 +453,12 @@ def test_historical_bootstrap_restores_policy_cache_and_keeps_detached_order_pos
     assert policy.capital["total"] == "1200" and policy.replies == {"A-USDT-SWAP": {"reply": "kept"}}
     assert policy.last_filled_price == {"A-USDT-SWAP": {"buy": "1.25", "sell": "0"}}
     assert policy.parameters["defaultN"] == D("1")
-    assert composition._historical_initial_cache_evidence == {
+    evidence = cast(_HistoricalInitialEvidenceAccess, composition)._historical_initial_cache_evidence
+    assert evidence == {
         "orders": {"A-USDT-SWAP": {"order_id": "evidence-only"}},
         "positions": {"B-USDT-SWAP": {"quantity": "evidence-only"}},
     }
-    assert composition._historical_initial_cache_evidence["orders"] is not cast(dict, decode_cache(run))["orders"]
+    assert evidence["orders"] is not cast(dict[str, object], decode_cache(run))["orders"]
 
 
 def decode_cache(run: HistoricalRunInput) -> dict[str, object]:
@@ -810,11 +883,7 @@ def test_frozen_h01_runs_policy_poll_native_fill_notice_and_endpoint_oracle():
         ("B-USDT-SWAP", "LONG", D("50"), D("1")),
         ("B-USDT-SWAP", "SHORT", D("200"), D("1")),
     ]
-    accept_snapshot = composition._codec.capture_snapshot(dict(
-        schema_version="snapshot_request_v1", account_key=composition._account,
-        snapshot_id="H01_ACCEPT_TRADING", snapshot_kind="TRADING",
-        capture_mode="OWNER_CURRENT", captured_at=accepted_at,
-    ))["immutable_payload"]
+    accept_snapshot = _capture_snapshot(composition, "TRADING", "H01_ACCEPT_TRADING", accepted_at)
 
     # Every intervening completed poll sees the same four native orders and emits no repair.
     for offset in range(10_000, 60_000, 5_000):
@@ -889,23 +958,11 @@ def test_frozen_h01_runs_policy_poll_native_fill_notice_and_endpoint_oracle():
     endpoint_inspection = composition._codec.inspect_state()
     assert (endpoint_inspection["cash"], endpoint_inspection["gross_realized"],
             endpoint_inspection["total_fees"]) == (D("999.955"), D("0"), D("0.045"))
-    trading = composition._codec.capture_snapshot(dict(
-        schema_version="snapshot_request_v1", account_key=composition._account,
-        snapshot_id="H01_ENDPOINT_TRADING", snapshot_kind="TRADING",
-        capture_mode="OWNER_CURRENT", captured_at=endpoint * 16 + 6,
-    ))["immutable_payload"]
-    positions = composition._codec.capture_snapshot(dict(
-        schema_version="snapshot_request_v1", account_key=composition._account,
-        snapshot_id="H01_ENDPOINT_POSITIONS", snapshot_kind="POSITIONS",
-        capture_mode="OWNER_CURRENT", captured_at=endpoint * 16 + 6,
-    ))["immutable_payload"]["rows"]
-    open_orders = composition._codec.capture_snapshot(dict(
-        schema_version="snapshot_request_v1", account_key=composition._account,
-        snapshot_id="H01_ENDPOINT_ORDERS", snapshot_kind="OPEN_ORDERS",
-        capture_mode="OWNER_CURRENT", captured_at=endpoint * 16 + 6,
-    ))["immutable_payload"]["rows"]
+    trading = _capture_snapshot(composition, "TRADING", "H01_ENDPOINT_TRADING", endpoint * 16 + 6)
+    positions = _capture_snapshot(composition, "POSITIONS", "H01_ENDPOINT_POSITIONS", endpoint * 16 + 6)["rows"]
+    open_orders = _capture_snapshot(composition, "OPEN_ORDERS", "H01_ENDPOINT_ORDERS", endpoint * 16 + 6)["rows"]
     assert trading["equity"] == D("999.955")
-    assert [(row["product_id"], row["position_contracts"], row["last_price"], row["notional_usd"])
+    assert [(row["product_id"], row["position_contracts"], row.get("last_price"), row.get("notional_usd"))
             for row in positions] == [("A-USDT-SWAP", D("1"), D("45"), D("45"))]
     actual_open = [(row["product_id"], "LONG" if row["side"] == "buy" else "SHORT",
                     row["original_size_contracts"], row["limit_price"])
@@ -921,7 +978,9 @@ def test_frozen_h01_runs_policy_poll_native_fill_notice_and_endpoint_oracle():
     expected_source = []
     for product_row in answer["source_orders"].split(";"):
         label, orders = product_row.split(":", 1)
-        product = dict(zip(("A", "B"), run.ordered_products, strict=True))[label]
+        assert label in ("A", "B")
+        product_by_label: dict[str, str] = dict(zip(("A", "B"), run.ordered_products, strict=True))
+        product = product_by_label[label]
         for encoded in orders.split(","):
             match = re.fullmatch(r"(LONG|SHORT)([0-9.]+)@([0-9.]+)", encoded)
             assert match is not None
@@ -933,7 +992,9 @@ def test_frozen_h01_runs_policy_poll_native_fill_notice_and_endpoint_oracle():
     assert open_match is not None
     assert (selected["side"], fill["quantity_contracts"], fill["price"]) == (
         "LONG", D(open_match.group(4)), D(open_match.group(5)))
-    expected_accept = int(re.search(r"E\+(\d+)", answer["accepts"]).group(1))
+    accept_match = re.search(r"E\+(\d+)", answer["accepts"])
+    assert accept_match is not None
+    expected_accept = int(accept_match.group(1))
     assert accepted_at == (start + expected_accept) * 16 + 3
     expected_equity = D(open_match.group(7))
     expected_fee = D(open_match.group(6))
@@ -1120,7 +1181,7 @@ def test_historical_chain_uses_frozen_owner_orders_and_commits_one_partial_fill(
         planned_coverage=historical_planned_coverage(run),
     )
     for item, key in zip(
-        attempt["input_contract_hashes"],
+        cast(list[dict[str, Any]], attempt["input_contract_hashes"]),
         ("scenario_plan_sha256", "program_sha256", "native_artifact_sha256", "policy_source_sha256"),
         strict=True,
     ):
@@ -1133,6 +1194,7 @@ def test_historical_chain_uses_frozen_owner_orders_and_commits_one_partial_fill(
 
     def persist(kind, key, payload):
         if kind == "HISTORICAL_MARKET_RESULT":
+            assert composition is not None
             ordinal = len(decode_jsonl((store._path / "journal.jsonl").read_bytes())) + 1
             detached_payload = decode_canonical(canonical_bytes(payload))
             row = dict(
@@ -1262,7 +1324,7 @@ def test_historical_chain_uses_frozen_owner_orders_and_commits_one_partial_fill(
     journal_record(row)
     captured["result"]["products"][0]["fills"].clear()
     assert step2["result"]["historical_result"] == step2_result
-    persisted = decode_jsonl((store._path / "journal.jsonl").read_bytes())
+    persisted = cast(list[dict[str, Any]], decode_jsonl((store._path / "journal.jsonl").read_bytes()))
     persisted_step2 = next(row for row in persisted if row["barrier_id"] == step2["item"]["stable_id"])
     assert persisted_step2["record_kind"] == "HISTORICAL_MARKET_RESULT"
     assert persisted_step2["payload"]["result"]["products"][0]["fills"]
@@ -1387,14 +1449,14 @@ def test_historical_chain_uses_frozen_owner_orders_and_commits_one_partial_fill(
         assert owner_after_notice[field] == owner_before_notice[field]
     policy_events_after_notice = deepcopy(composition._policy.events)
     delivered_notice = notice["item"]["delivery"]
-    assert composition._codec.build_delivery(dict(
+    assert composition._codec.build_delivery(cast(wire.Projection, dict(
         schema_version="delivery_projection_v1",
         reference=dict(namespace=delivered_notice["source_namespace"], fact_id=delivered_notice["source_fact_id"]),
         payload_kind=delivered_notice["payload_kind"],
         occurrence_index=delivered_notice["occurrence_index"],
         schedule_sequence=delivered_notice["schedule_sequence"],
         visible_at=delivered_notice["visible_at"],
-    )) == delivered_notice
+    ))) == delivered_notice
     duplicate = composition._enqueue(dict(kind="DELIVERY", delivery=delivered_notice))
     assert duplicate["classification"] == "SUCCESS"
     assert composition._policy.events == policy_events_after_notice
@@ -1415,11 +1477,7 @@ def test_historical_chain_uses_frozen_owner_orders_and_commits_one_partial_fill(
     assert partial["remaining_quantity_contracts"] == frozen[
         next(index for index, row in enumerate(frozen) if row["order_id"] == fill["order_id"])
     ]["remaining_quantity_contracts"] - fill["quantity_contracts"]
-    positions = composition._codec.capture_snapshot(dict(
-        schema_version="snapshot_request_v1", account_key=composition._account,
-        snapshot_id="P3C5B_POSITIONS_AFTER_FILL", snapshot_kind="POSITIONS",
-        capture_mode="OWNER_CURRENT", captured_at=step2_key,
-    ))["immutable_payload"]["rows"]
+    positions = _capture_snapshot(composition, "POSITIONS", "P3C5B_POSITIONS_AFTER_FILL", step2_key)["rows"]
     a_position = next(row for row in positions if row["product_id"] == "A-USDT-SWAP")
     assert a_position["position_contracts"] == -fill["quantity_contracts"]
     step3_key = run.range_end_ms * 16 + 4
@@ -1480,7 +1538,7 @@ def test_historical_store_finalize_and_admission_accept_real_native_bundle(tmp_p
     assert store.finalize(artifacts["endpoint"], artifacts["reconciliation"], artifacts["report"]) == "COMPLETE_PUBLISHED"
     raw_input = (store._path / "historical_input.json").read_bytes()
     assert raw_input == encode_historical_run_input(run)
-    manifest = decode_canonical((store._path / "completion.json").read_bytes().rstrip(b"\n"))
+    manifest = cast(dict[str, Any], decode_canonical((store._path / "completion.json").read_bytes().rstrip(b"\n")))
     input_metadata = manifest["artifacts"][-1]
     assert input_metadata == dict(
         path="historical_input.json", schema_version="spider_historical_research_run_v1",
@@ -1504,7 +1562,7 @@ def test_historical_admission_rejects_mutated_finalized_bundle(tmp_path, mutatio
     store.finalize(artifacts["endpoint"], artifacts["reconciliation"], artifacts["report"])
     path = store._path
     completion_path = path / "completion.json"
-    manifest = decode_canonical(completion_path.read_bytes().rstrip(b"\n"))
+    manifest = cast(dict[str, Any], decode_canonical(completion_path.read_bytes().rstrip(b"\n")))
 
     def write_object(name, value):
         raw = canonical_bytes(value) + b"\n"
@@ -1519,7 +1577,7 @@ def test_historical_admission_rejects_mutated_finalized_bundle(tmp_path, mutatio
     elif mutation == "truncated_input":
         historical_path.write_bytes(historical_path.read_bytes()[:24])
     elif mutation == "changed_input":
-        changed = decode_canonical(historical_path.read_bytes())
+        changed = cast(dict[str, Any], decode_canonical(historical_path.read_bytes()))
         changed["run_id"] = "other-run"
         historical_path.write_bytes(canonical_bytes(changed))
     elif mutation in ("symlink_input", "hardlink_input"):
@@ -1530,19 +1588,19 @@ def test_historical_admission_rejects_mutated_finalized_bundle(tmp_path, mutatio
             os.link(path / "attempt.json", historical_path)
     elif mutation == "context_mismatch":
         attempt_path = path / "attempt.json"
-        attempt = decode_canonical(attempt_path.read_bytes().rstrip(b"\n"))
+        attempt = cast(dict[str, Any], decode_canonical(attempt_path.read_bytes().rstrip(b"\n")))
         attempt["historical_context"]["source_sha256"] = "f" * 64
         write_object("attempt.json", attempt)
     elif mutation == "hash_mismatch":
         next(row for row in manifest["artifacts"] if row["path"] == "historical_input.json")["sha256"] = "f" * 64
     elif mutation == "incomplete_frontier":
         status_path = path / "status.json"
-        status = decode_canonical(status_path.read_bytes().rstrip(b"\n"))
+        status = cast(dict[str, Any], decode_canonical(status_path.read_bytes().rstrip(b"\n")))
         status["state"] = "RUNNING"
         write_object("status.json", status)
     else:
         reconciliation_path = path / "reconciliation.json"
-        reconciliation = decode_canonical(reconciliation_path.read_bytes().rstrip(b"\n"))
+        reconciliation = cast(dict[str, Any], decode_canonical(reconciliation_path.read_bytes().rstrip(b"\n")))
         reconciliation["result"] = "FAILED"
         write_object("reconciliation.json", reconciliation)
         manifest["reconciliation_digest"] = sha256(canonical_bytes(reconciliation)).hexdigest()
@@ -1560,7 +1618,7 @@ def test_historical_admission_rejects_canonical_non_object_input(tmp_path, encod
     raw = canonical_bytes(encoded_value)
     (store._path / "historical_input.json").write_bytes(raw)
     manifest_path = store._path / "completion.json"
-    manifest = decode_canonical(manifest_path.read_bytes().rstrip(b"\n"))
+    manifest = cast(dict[str, Any], decode_canonical(manifest_path.read_bytes().rstrip(b"\n")))
     metadata = next(row for row in manifest["artifacts"] if row["path"] == "historical_input.json")
     metadata.update(sha256=sha256(raw).hexdigest(), byte_count=len(raw), row_count=1)
     manifest_path.write_bytes(canonical_bytes(manifest) + b"\n")
@@ -1650,13 +1708,17 @@ def test_historical_endpoint_rejects_native_cross_account_snapshot_transplant(tm
     cutoff = foreign.range_end_ms * 16 + 6
     assert foreign_composition._dispatch_due(cutoff)["classification"] == "SUCCESS"
     owner = _capture_historical_owner(foreign_composition, cutoff, "FINAL")["owner_evidence"]
-    original = artifacts["endpoint"]["final_owner_evidence"]["trading_fact"]
-    transplanted = owner["trading_fact"]
+    original = cast(wire.SnapshotFact, artifacts["endpoint"]["final_owner_evidence"]["trading_fact"])
+    transplanted = cast(wire.SnapshotFact, owner["trading_fact"])
     assert original["reference"] == transplanted["reference"]
+    assert "captured_account_version" in original
+    assert "captured_account_version" in transplanted
     assert original["captured_account_version"] == transplanted["captured_account_version"]
     assert original["snapshot_as_of"] == transplanted["snapshot_as_of"]
     assert original["request_digest"] != transplanted["request_digest"]
-    assert original["immutable_payload"]["equity"] != transplanted["immutable_payload"]["equity"]
+    original_trading = cast(wire.Trading, original["immutable_payload"])
+    transplanted_trading = cast(wire.Trading, transplanted["immutable_payload"])
+    assert original_trading["equity"] != transplanted_trading["equity"]
 
     final = deepcopy(artifacts["endpoint"]["final_owner_evidence"])
     final["trading_fact"] = transplanted
@@ -1821,10 +1883,10 @@ def test_historical_full_execution_notice_derives_native_cancel_and_replacements
                if record["item"]["kind"] == "SOURCE_GROUP"
                and record["item"]["group"]["members"][0]["kind"] == "CANCEL_EFFECT"]
     assert len(requests) == len(effects) == 1
+    target = requests[0]["item"]["group"]["members"][0]["payload"]["targets"][0]["target_order_id"]
     for request in requests:
         request_member = request["item"]["group"]["members"][0]
         request_event = request_member["stamp"]["event_id"]
-        target = request_member["payload"]["targets"][0]["target_order_id"]
         matching_effect = next(record for record in effects
                                if record["item"]["group"]["members"][0]["payload"]["effects"][0]["detecting_event_id"]
                                == request_event)
@@ -1920,14 +1982,14 @@ def test_historical_full_execution_notice_derives_native_cancel_and_replacements
     assert pending_repeats and post_effect_repeats
     policy_events_after_full = deepcopy(composition._policy.events)
     delivered_notice = notice["item"]["delivery"]
-    assert composition._codec.build_delivery(dict(
+    assert composition._codec.build_delivery(cast(wire.Projection, dict(
         schema_version="delivery_projection_v1",
         reference=dict(namespace=delivered_notice["source_namespace"], fact_id=delivered_notice["source_fact_id"]),
         payload_kind=delivered_notice["payload_kind"],
         occurrence_index=delivered_notice["occurrence_index"],
         schedule_sequence=delivered_notice["schedule_sequence"],
         visible_at=delivered_notice["visible_at"],
-    )) == delivered_notice
+    ))) == delivered_notice
     duplicate = composition._enqueue(dict(kind="DELIVERY", delivery=delivered_notice))
     assert duplicate["classification"] == "SUCCESS"
     assert composition._policy.events == policy_events_after_full
@@ -2057,18 +2119,10 @@ def test_historical_chain_runs_final_close_without_endpoint_next_open():
     assert not any(record["item"]["node"]["bar_open_ms"] == end for record in steps)
     assert all(not product["fills"] for step in steps
                for product in step["result"]["historical_result"]["products"])
-    trading = composition._codec.capture_snapshot(dict(
-        schema_version="snapshot_request_v1", account_key=composition._account,
-        snapshot_id="FINAL_CLOSE_TRADING", snapshot_kind="TRADING",
-        capture_mode="OWNER_CURRENT", captured_at=end * 16 + 6,
-    ))["immutable_payload"]
-    positions = composition._codec.capture_snapshot(dict(
-        schema_version="snapshot_request_v1", account_key=composition._account,
-        snapshot_id="FINAL_CLOSE_POSITIONS", snapshot_kind="POSITIONS",
-        capture_mode="OWNER_CURRENT", captured_at=end * 16 + 6,
-    ))["immutable_payload"]["rows"]
+    trading = _capture_snapshot(composition, "TRADING", "FINAL_CLOSE_TRADING", end * 16 + 6)
+    positions = _capture_snapshot(composition, "POSITIONS", "FINAL_CLOSE_POSITIONS", end * 16 + 6)["rows"]
     assert trading["equity"] == D("10600")
-    assert [(row["product_id"], row["position_contracts"], row["last_price"])
+    assert [(row["product_id"], row["position_contracts"], row.get("last_price"))
             for row in positions] == [
                 ("A-USDT-SWAP", D("80"), D("105")),
                 ("B-USDT-SWAP", D("40"), D("105")),
@@ -2117,7 +2171,7 @@ def test_historical_send_at_endpoint_stays_unsubmitted_without_native_group():
     composition._policy.rows[1]["active"] = "false"
     parent_raw = run.range_start_ms + 5_020
     accepted_raw = parent_raw + run.order_accept_delay_ms
-    composition._historical_order_contract["range_end_ms"] = accepted_raw
+    cast(_HistoricalOrderContractAccess, composition)._historical_order_contract["range_end_ms"] = accepted_raw
     assert composition._dispatch_due(parent_raw * 16 + 6)["classification"] == "SUCCESS"
     assert not any(record["item"]["kind"] == "SOURCE_GROUP"
                    and record["item"]["group"].get("ordering_contract_id") == "HISTORICAL_ORDER_V1"
@@ -2178,7 +2232,7 @@ def test_historical_noon_rollover_refreshes_on_repeated_completed_five_second_ti
 
 def test_historical_timer_preserves_poll_start_terminal_and_stops_queue(monkeypatch):
     composition = _composition(_valid_run())
-    first_raw = composition._historical_poll_range[0] + 5_000
+    first_raw = cast(_HistoricalPollRangeAccess, composition)._historical_poll_range[0] + 5_000
     original_plan = composition._historical_poll_plan
 
     def invalid_plan(raw_at, sequence):
@@ -2193,6 +2247,7 @@ def test_historical_timer_preserves_poll_start_terminal_and_stops_queue(monkeypa
     timer = composition._records[(5, f"P3_TIMER_{first_raw}")]
     assert result["classification"] == timer["result"]["classification"] == "TERMINAL"
     assert result["reason"] == timer["result"]["reason"] == "INVALID_SCHEMA"
+    assert composition._terminal is not None
     assert composition._terminal["classification"] == "TERMINAL"
     assert composition._last_popped == timer["key"]
     later_raw = first_raw + 5_000
