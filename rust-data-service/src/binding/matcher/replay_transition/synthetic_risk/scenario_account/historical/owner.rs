@@ -240,7 +240,7 @@ impl ScenarioAccount {
         let mut draft = self.clone();
         // VERSION_ACTIVATION is phase 0; step 3 closes this raw boundary at
         // phase 4. Apply only the configured spec transition due at this time.
-        if input.step_index == 3 {
+        if input.step_index == 3 && !self.is_terminal() {
             draft.activate_historical_spec_boundary(raw_time_ms)?;
         }
         let (scenario, _) = draft.btc_context()?;
@@ -256,6 +256,22 @@ impl ScenarioAccount {
                 spec.minimum,
                 input.step_index,
             )?);
+        }
+        if self.is_terminal() {
+            let raw_time_ms = steps.first().ok_or("INVALID_HISTORICAL_INPUT")?.raw_time_ms;
+            return Ok(StepResult {
+                raw_time_ms,
+                effective_at: at,
+                products: steps
+                    .into_iter()
+                    .map(|step| ProductStepResult {
+                        product_id: product_id(&step.product).into(),
+                        capacity: step.capacity,
+                        discarded_volume: step.discarded_volume,
+                        fills: Vec::new(),
+                    })
+                    .collect(),
+            });
         }
         let old_at = draft
             .transition
