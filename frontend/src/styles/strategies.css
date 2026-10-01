@@ -21,8 +21,9 @@
 }
 
 .strategy-intro > button,
-.strategy-action button {
-  min-height: 38px;
+.strategy-action button,
+.strategy-safety button {
+  min-height: 44px;
   padding: 0 14px;
   cursor: pointer;
 }
@@ -75,7 +76,7 @@
 
 .strategy-list > li {
   display: grid;
-  grid-template-columns: minmax(190px, 0.75fr) minmax(360px, 1.5fr) minmax(170px, 0.65fr);
+  grid-template-columns: minmax(0, 1fr);
   align-items: center;
   gap: 20px;
   min-height: 88px;
@@ -99,16 +100,15 @@
 }
 
 .strategy-identity strong {
-  overflow: hidden;
+  overflow-wrap: anywhere;
   font-family: "SFMono-Regular", "Roboto Mono", monospace;
-  font-size: 0.78rem;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  font-size: 0.9rem;
 }
 
 .strategy-identity span:last-child {
   color: var(--muted);
-  font-size: 0.72rem;
+  font-size: 0.9rem;
+  font-weight: 600;
 }
 
 .strategy-status {
@@ -132,7 +132,7 @@
 }
 
 .status-stopped {
-  background: var(--grid);
+  background: var(--warning);
 }
 
 .strategy-list > li > dl {
@@ -180,5 +180,74 @@
 @keyframes pulse {
   to {
     opacity: 0.35;
+  }
+}
+
+.strategy-card-header,
+.strategy-safety {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-width: 0;
+}
+
+.strategy-safety {
+  padding: 18px;
+  border: 1px solid var(--warning);
+  background: var(--panel);
+}
+
+.strategy-safety > div {
+  flex: 1 1 280px;
+  min-width: 0;
+}
+
+.strategy-safety h3 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font-size: 1rem;
+}
+
+.strategy-safety svg {
+  flex-shrink: 0;
+  color: var(--warning);
+}
+
+.strategy-safety p,
+.strategy-control-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.85rem;
+  line-height: 1.6;
+}
+
+.strategy-safety p {
+  margin-top: 8px;
+}
+
+.strategy-safety button:disabled {
+  cursor: not-allowed;
+  opacity: 0.65;
+}
+
+.strategy-card-header .strategy-action {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+@media (max-width: 640px) {
+  .strategy-card-header {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .strategy-card-header .strategy-action button,
+  .strategy-safety button {
+    flex: 1 1 auto;
   }
 }

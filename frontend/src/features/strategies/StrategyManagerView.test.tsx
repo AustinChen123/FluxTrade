@@ -50,7 +50,7 @@ describe("StrategyManagerView", () => {
     expect(screen.getByText("active-strategy")).toBeTruthy();
     expect(screen.getAllByText("—")).toHaveLength(2);
     fireEvent.click(screen.getByRole("button", { name: "重新整理狀態" }));
-    fireEvent.click(screen.getByRole("button", { name: "停止" }));
+    fireEvent.click(screen.getByRole("button", { name: "停止策略" }));
     expect(refresh).toHaveBeenCalledTimes(1);
     expect(submit).toHaveBeenCalledWith(active, "STOP");
   });
@@ -159,4 +159,20 @@ describe("StrategyManagerView", () => {
     expect(screen.getByText(title)).toBeTruthy();
     expect(screen.getByText(body)).toBeTruthy();
   });
+});
+
+
+it.each(["en", "zh-TW"])("keeps recovery unavailable even with no strategies in %s", async (locale) => {
+  await i18n.changeLanguage(locale);
+  const submit = vi.fn();
+  render(<StrategyManagerView strategies={[]} loading={false} error={null} notice=""
+    pendingStrategyId={null} awaitingStrategies={new Map()} locale={locale as "en" | "zh-TW"}
+    t={i18n.t} refresh={vi.fn()} submit={submit} />);
+  const unlock = screen.getByRole("button", { name: i18n.t("strategies.unlockLockdown") }) as HTMLButtonElement;
+  expect(unlock.disabled).toBe(true);
+  expect(document.getElementById(unlock.getAttribute("aria-describedby")! )?.textContent)
+    .toBe(i18n.t("strategies.recoveryUnavailable"));
+  fireEvent.click(unlock);
+  expect(submit).not.toHaveBeenCalled();
+  expect(screen.getByText(i18n.t("strategies.emptyTitle"))).toBeTruthy();
 });

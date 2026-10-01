@@ -47,6 +47,7 @@ describe("useStrategyManager", () => {
     api.ensureBrowserSession.mockResolvedValue({
       actor: "operator@example.com",
       capabilities: [],
+      permissions: { can_mutate: true, can_step_up: true },
       csrf_token: "csrf-token",
       expires_at: "2026-07-29T12:00:00Z",
       step_up_expires_at: "2026-07-29T11:00:00Z"
@@ -62,6 +63,17 @@ describe("useStrategyManager", () => {
   afterEach(() => {
     cleanup();
     vi.restoreAllMocks();
+  });
+
+  it.each([
+    [false, false, "STOP"], [false, true, "RESUME"], [true, false, "RESUME"]
+  ] as const)("rejects direct submit without permission %s/%s/%s", async (can_mutate, can_step_up, command) => {
+    api.ensureBrowserSession.mockResolvedValue({ permissions: { can_mutate, can_step_up } });
+    const { result } = renderHook(() => useStrategyManager(i18n.t));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    await act(() => result.current.submit(strategy(command === "STOP" ? "ACTIVE" : "STOPPED"), command));
+    expect(window.confirm).not.toHaveBeenCalled();
+    expect(api.sendStrategyCommand).not.toHaveBeenCalled();
   });
 
   it("restores the exact persisted lock before one owner setup refresh", async () => {
@@ -164,6 +176,11 @@ describe("useStrategyManager", () => {
 
   it.each([
     [new ApiError("bad_request", 400), false, "command"],
+    [new ApiError("unauthorized", 401), false, "command"],
+    [new ApiError("forbidden", 403), false, "command"],
+    [new ApiError("stale_version", 409), false, "command"],
+    [new ApiError("strategy_engine_listener_unavailable", 503), false, "command"],
+    [new Error("invalid_response"), true, "unknown"],
     [new ApiError("request_timeout", 408), true, "unknown"],
     [new ApiError("server_failure", 503), true, "unknown"],
     [new TypeError("Failed to fetch"), true, "unknown"]
@@ -185,4 +202,27 @@ describe("useStrategyManager", () => {
       expect(result.current.pendingStrategyId).toBeNull();
     }
   );
+});
+
+
+it("blocks direct submit after an accepted command's snapshot refresh fails", async () => {
+  vi.resetAllMocks();
+  window.sessionStorage.clear();
+  api.ensureBrowserSession.mockResolvedValue({ permissions: { can_mutate: true, can_step_up: true } });
+  api.loadStrategyStates.mockResolvedValueOnce([strategy()]).mockRejectedValueOnce(new Error("invalid_response"));
+  api.sendStrategyCommand.mockResolvedValue(undefined);
+  const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+  try {
+    const { result } = renderHook(() => useStrategyManager(i18n.t));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    await act(() => result.current.submit(strategy(), "STOP"));
+    await act(() => result.current.submit({ ...strategy(), strategy_id: "other" }, "STOP"));
+    expect(result.current.readOnly).toBe(true);
+    expect(result.current.awaitingStrategies.has("active-strategy")).toBe(true);
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(api.sendStrategyCommand).toHaveBeenCalledTimes(1);
+  } finally {
+    cleanup();
+    vi.restoreAllMocks();
+  }
 });

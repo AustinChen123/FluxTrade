@@ -167,11 +167,11 @@ describe("ResearchPage", () => {
     ],
     [
       { type: "service", status: 503, message: "service unavailable" },
-      "資料服務回覆 503：service unavailable"
+      "資料服務回覆 503。請確認服務狀態後重試。"
     ],
     [
       { type: "unexpected", message: "unexpected failure" },
-      "無法讀取 GA 資料：unexpected failure"
+      "無法讀取 GA 資料。請確認連線後重試。"
     ],
     [{ type: "fallback" }, "無法讀取 GA 資料"]
   ] satisfies readonly (readonly [ResearchError, string])[])(

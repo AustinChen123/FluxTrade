@@ -810,3 +810,269 @@ for (const scenario of SCENARIO_IDS) {
     }
   });
 }
+
+// Deterministic CI evidence only: these responses never represent a real proxy.
+for (const view of ["strategies", "research"] as const) {
+  for (const scenario of ["read-only", "operator", "401", "403", "network", "503", "schema", "session-denied"] as const) {
+    test(`${view} ${scenario} remains bounded and read-only`, async ({ page }) => {
+      const mutations: string[] = [];
+      const unsafeHeaders: string[] = [];
+      const failures: string[] = [];
+      page.on("pageerror", () => failures.push("pageerror"));
+      await page.route("**/*", async (route) => {
+        const request = route.request();
+        const path = new URL(request.url()).pathname;
+        if (!/^\/(api\/|strategy-states|evolution-epochs|genes)/.test(path)) {
+          await route.continue();
+          return;
+        }
+        const headers = await request.allHeaders();
+        for (const name of ["authorization", "cookie", "tailscale-user-login", "tailscale-app-capabilities"]) {
+          if (name in headers) unsafeHeaders.push(name);
+        }
+        if (request.method() !== "GET" && path !== "/api/v1/auth/session") {
+          mutations.push(path);
+          await route.abort();
+          return;
+        }
+        const session = path === "/api/v1/auth/session";
+        const entry = path === (view === "strategies" ? "/strategy-states" : "/evolution-epochs");
+        if ((session && scenario === "session-denied") || (entry && ["401", "403", "503"].includes(scenario))) {
+          await route.fulfill({ status: session ? 403 : Number(scenario), json: { error: "SENSITIVE_SENTINEL" } });
+        } else if (entry && scenario === "network") {
+          await route.abort("failed");
+        } else if (entry && scenario === "schema") {
+          await route.fulfill({ json: view === "strategies" ? { ...STRATEGY_PAGE, states: [null] } : { epochs: null } });
+        } else {
+          const body = session
+            ? { ...BROWSER_SESSION, permissions: { can_mutate: scenario === "operator", can_step_up: false } }
+            : path === "/strategy-states" ? STRATEGY_PAGE
+            : path === "/evolution-epochs" ? { total: 1, limit: 100, offset: 0, epochs: [EPOCH_A] }
+            : path.endsWith("/generations") ? { generations: [GENERATION_A] }
+            : { total: 1, limit: 10000, offset: 0, genes: [GENE_A] };
+          await route.fulfill({ json: body });
+        }
+      });
+      await page.goto(`http://127.0.0.1:4174/?view=${view}`);
+      const success = scenario === "read-only" || scenario === "operator";
+      if (success) {
+        await expect(page.getByText(view === "strategies" ? "active-strategy" : "candidate-a", { exact: true }).first()).toBeVisible();
+      } else {
+        await expect(page.getByRole("alert")).toBeVisible();
+      }
+      for (const locale of ["en", "zh-TW"]) {
+        await page.locator("#language").selectOption(locale);
+        if (!success) {
+          await expect(page.getByRole("alert")).not.toContainText("SENSITIVE_SENTINEL");
+          expect((await page.getByRole("alert").innerText()).length).toBeLessThan(350);
+          if (["401", "403", "session-denied"].includes(scenario)) {
+            await expect(page.getByRole("alert")).toContainText(locale === "en" ? "This session cannot" : "目前工作階段沒有");
+          }
+        } else if (view === "strategies") {
+          if (scenario === "read-only") {
+            await expect(page.getByRole("status")).toContainText(locale === "en" ? "Read-only session" : "唯讀工作階段");
+          }
+        }
+        await expect(page.locator(".strategy-action button")).toHaveCount(view === "strategies" && scenario === "operator" ? 1 : 0);
+      }
+      expect(mutations).toEqual([]);
+      expect(unsafeHeaders).toEqual([]);
+      expect(failures).toEqual([]);
+    });
+  }
+}
+
+
+for (const roster of ["empty", "single", "multiple"] as const) {
+  test(`strategy controls target cards with ${roster} roster`, async ({ page }, testInfo) => {
+    const commands: { path: string; body: unknown }[] = [];
+    const states = roster === "empty" ? [] : [STRATEGY_PAGE.states[0],
+      ...(roster === "multiple" ? [{ ...STOPPED_STRATEGY_PAGE.states[0], strategy_id: "portfolio-parent" }] : [])];
+    await page.route("**/*", async (route) => {
+      const req = route.request();
+      const path = new URL(req.url()).pathname;
+      if (path === "/api/v1/auth/session") return route.fulfill({ json: BROWSER_SESSION });
+      if (path === "/strategy-states") return route.fulfill({ json: { ...STRATEGY_PAGE, total: states.length, states } });
+      if (req.method() !== "GET") {
+        commands.push({ path, body: req.postDataJSON() });
+        return route.fulfill({ json: { status: "accepted" } });
+      }
+      return route.continue();
+    });
+    await page.goto("http://127.0.0.1:4174/?view=strategies");
+    await page.locator("#language").selectOption("en");
+    await expect(page.locator(".strategy-list > li")).toHaveCount(states.length);
+    const safety = page.getByRole("region", { name: "LOCKDOWN status unavailable" });
+    await expect(safety).toBeVisible();
+    await expect(safety.getByRole("button", { name: "Unlock LOCKDOWN" })).toBeDisabled();
+    if (states.length === 0) await expect(page.getByText("No strategy state yet")).toBeVisible();
+    for (const row of await page.locator(".strategy-list > li").all()) {
+      const header = row.locator(".strategy-card-header");
+      await expect(header.getByRole("button")).toBeVisible();
+      expect(await header.evaluate((node) => Boolean(node.compareDocumentPosition(node.parentElement!.querySelector("dl")!) & Node.DOCUMENT_POSITION_FOLLOWING))).toBe(true);
+      const button = header.getByRole("button");
+      await button.focus();
+      await expect(button).toBeFocused();
+      expect(await button.evaluate((node) => getComputedStyle(node).outlineStyle)).not.toBe("none");
+      expect((await button.boundingBox())!.height).toBeGreaterThanOrEqual(44);
+    }
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+    if (states.length) {
+      expect(await safety.evaluate((node) => Boolean(node.compareDocumentPosition(document.querySelector(".strategy-list")!) & Node.DOCUMENT_POSITION_FOLLOWING))).toBe(true);
+      const target = roster === "multiple" ? "portfolio-parent" : "active-strategy";
+      const row = page.locator(".strategy-list > li").filter({ hasText: target });
+      const dialogMessages: string[] = [];
+      page.once("dialog", async (dialog) => { dialogMessages.push(dialog.message()); await dialog.accept(); });
+      await row.getByRole("button").press("Enter");
+      await expect(row.getByRole("button")).toBeDisabled();
+      await expect(page.locator(".strategy-notice")).toContainText("Awaiting state confirmation");
+      expect(dialogMessages).toEqual([`Run “${roster === "multiple" ? "Resume strategy" : "Stop strategy"}” for ${target}?`]);
+      expect(commands).toEqual([{ path: `/strategies/${target}/commands`, body: {
+        command: roster === "multiple" ? "RESUME" : "STOP", expected_version: states[states.length - 1].version
+      } }]);
+      if (roster === "multiple") await expect(page.getByRole("button", { name: "Stop strategy", exact: true })).toBeEnabled();
+      await page.reload();
+      await expect(page.locator(".strategy-list > li").filter({ hasText: target }).getByRole("button")).toBeDisabled();
+      expect(commands).toHaveLength(1);
+    }
+    await page.screenshot({ path: testInfo.outputPath(`strategy-${roster}.png`), fullPage: true });
+    await page.locator("#language").selectOption("zh-TW");
+    await expect(page.getByRole("region", { name: "LOCKDOWN 狀態未接通" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "解除 LOCKDOWN" })).toBeDisabled();
+    await expect(page.getByText("停止策略不代表撤單或平倉。", { exact: true })).toHaveCount(states.length);
+    if (roster === "multiple") await expect(page.getByRole("button", { name: "停止策略", exact: true })).toBeVisible();
+    if (roster === "empty") await expect(page.getByText("尚無策略狀態")).toBeVisible();
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+    await page.screenshot({ path: testInfo.outputPath(`strategy-${roster}-zh.png`), fullPage: true });
+  });
+}
+
+for (const failure of [401, 403, 409, 408, 503, "listener", "network", "malformed", "refresh"] as const) {
+  test(`strategy command failure ${failure} preserves lock semantics`, async ({ page }) => {
+    let sent = 0;
+    await page.route("**/*", async (route) => {
+      const path = new URL(route.request().url()).pathname;
+      if (path === "/api/v1/auth/session") return route.fulfill({ json: BROWSER_SESSION });
+      if (path === "/strategy-states") {
+        if (failure === "refresh" && sent > 0) return route.fulfill({ status: 503, json: { error: "unavailable" } });
+        return route.fulfill({ json: { ...STRATEGY_PAGE, total: 2, states: [STRATEGY_PAGE.states[0], { ...STRATEGY_PAGE.states[0], strategy_id: "other-strategy" }] } });
+      }
+      if (route.request().method() !== "GET") {
+        expect(path).toBe("/strategies/active-strategy/commands");
+        sent += 1;
+        if (failure === "network") return route.abort();
+        if (failure === "malformed") return route.fulfill({ status: 200, body: "{" });
+        if (failure === "refresh") return route.fulfill({ json: { status: "accepted" } });
+        return route.fulfill({ status: failure === "listener" ? 503 : failure, json: { error: failure === "listener" ? "strategy_engine_listener_unavailable" : "SENSITIVE_SENTINEL" } });
+      }
+      return route.continue();
+    });
+    await page.goto("http://127.0.0.1:4174/?view=strategies");
+    await page.locator("#language").selectOption("en");
+    const active = page.locator(".strategy-list > li").filter({ hasText: "active-strategy" });
+    page.once("dialog", (dialog) => void dialog.accept());
+    await active.getByRole("button").click();
+    await expect(page.getByRole("alert")).toBeVisible();
+    await expect(page.getByRole("alert")).not.toContainText("SENSITIVE_SENTINEL");
+    const definite = [401, 403, 409, "listener"].includes(failure);
+    if (failure === "refresh") {
+      await expect(page.locator(".strategy-action button")).toHaveCount(0);
+      await expect(page.locator(".strategy-notice")).toContainText("Awaiting state confirmation");
+      await expect(page.getByText("Last-known strategy state. Refresh is required before using controls.")).toBeVisible();
+    } else {
+      if (definite) await expect(active.getByRole("button")).toBeEnabled();
+      else await expect(active.getByRole("button")).toBeDisabled();
+      await expect(page.locator(".strategy-list > li").filter({ hasText: "other-strategy" }).getByRole("button")).toBeEnabled();
+    }
+    await expect(page.getByRole("button", { name: "Unlock LOCKDOWN" })).toBeDisabled();
+    expect(sent).toBe(1);
+  });
+}
+
+
+for (const sessionCase of ["missing-permissions", "malformed-permissions", "expired-bootstrap", "expired-rejected"] as const) {
+  test(`strategy session ${sessionCase} keeps command access explicit`, async ({ page }) => {
+    const sessionMethods: string[] = [];
+    const mutations: string[] = [];
+    const faults: string[] = [];
+    page.on("pageerror", () => faults.push("pageerror"));
+    await page.route("**/*", async (route) => {
+      const req = route.request();
+      const path = new URL(req.url()).pathname;
+      if (path === "/api/v1/auth/session") {
+        sessionMethods.push(req.method());
+        if (sessionCase.startsWith("expired") && req.method() === "GET") {
+          return route.fulfill({ status: 401, json: { error: "session_expired" } });
+        }
+        if (sessionCase === "expired-rejected") return route.fulfill({ status: 403, json: { error: "denied" } });
+        const session = sessionCase === "missing-permissions"
+          ? { ...BROWSER_SESSION, permissions: undefined }
+          : sessionCase === "malformed-permissions"
+            ? { ...BROWSER_SESSION, permissions: { can_mutate: "true", can_step_up: true } }
+            : BROWSER_SESSION;
+        return route.fulfill({ json: session });
+      }
+      if (req.method() !== "GET") { mutations.push(path); return route.abort(); }
+      if (path === "/strategy-states") return route.fulfill({ json: STRATEGY_PAGE });
+      return route.continue();
+    });
+    await page.goto("http://127.0.0.1:4174/?view=strategies");
+    for (const locale of ["en", "zh-TW"]) {
+      await page.locator("#language").selectOption(locale);
+      await expect(page.getByRole("button", { name: locale === "en" ? "Unlock LOCKDOWN" : "解除 LOCKDOWN" })).toBeDisabled();
+      if (sessionCase === "expired-rejected") {
+        await expect(page.getByRole("alert")).toBeVisible();
+        await expect(page.locator(".strategy-action button")).toHaveCount(0);
+      } else if (sessionCase === "expired-bootstrap") {
+        await expect(page.getByRole("button", { name: locale === "en" ? "Stop strategy" : "停止策略", exact: true })).toBeEnabled();
+      } else {
+        await expect(page.getByRole("status")).toContainText(locale === "en" ? "Read-only session" : "唯讀工作階段");
+        await expect(page.locator(".strategy-action button")).toHaveCount(0);
+      }
+    }
+    expect(sessionMethods).toEqual(sessionCase.startsWith("expired") ? ["GET", "POST"] : ["GET"]);
+    expect(mutations).toEqual([]);
+    expect(faults).toEqual([]);
+  });
+}
+
+for (const snapshot of ["unchanged", "status-only", "version-only", "missing"] as const) {
+  test(`strategy snapshot ${snapshot} reconciles only its target`, async ({ page }) => {
+    let sent = 0;
+    let refreshes = 0;
+    await page.route("**/*", async (route) => {
+      const path = new URL(route.request().url()).pathname;
+      if (path === "/api/v1/auth/session") return route.fulfill({ json: BROWSER_SESSION });
+      if (path === "/strategy-states") {
+        refreshes += 1;
+        const initial = STRATEGY_PAGE.states[0];
+        const target = sent === 0 ? initial : snapshot === "missing" ? null
+          : snapshot === "status-only" ? { ...initial, status: "STOPPED", available_commands: ["RESUME"] }
+          : snapshot === "version-only" ? { ...initial, version: initial.version + 1 } : initial;
+        const states = [...(target ? [target] : []), { ...initial, strategy_id: "other-strategy" }];
+        return route.fulfill({ json: { ...STRATEGY_PAGE, total: states.length, states } });
+      }
+      if (route.request().method() !== "GET") {
+        expect(path).toBe("/strategies/active-strategy/commands");
+        sent += 1;
+        return route.fulfill({ json: { status: "accepted" } });
+      }
+      return route.continue();
+    });
+    await page.goto("http://127.0.0.1:4174/?view=strategies");
+    await page.locator("#language").selectOption("en");
+    const target = page.locator(".strategy-list > li").filter({ hasText: "active-strategy" });
+    page.once("dialog", (dialog) => void dialog.accept());
+    await target.getByRole("button").click();
+    await expect.poll(() => refreshes).toBe(2);
+    const locked = snapshot === "unchanged" || snapshot === "missing";
+    await expect.poll(() => page.evaluate(() => JSON.parse(sessionStorage.getItem("fluxtrade.strategy.awaiting") ?? "[]").length)).toBe(locked ? 1 : 0);
+    if (snapshot === "missing") await expect(target).toHaveCount(0);
+    else if (locked) await expect(target.getByRole("button")).toBeDisabled();
+    else await expect(target.getByRole("button")).toBeEnabled();
+    await expect(page.locator(".strategy-list > li").filter({ hasText: "other-strategy" }).getByRole("button")).toBeEnabled();
+    await expect(page.locator(".strategy-notice")).toContainText("Awaiting state confirmation");
+    await expect(page.getByRole("button", { name: "Unlock LOCKDOWN" })).toBeDisabled();
+    expect(sent).toBe(1);
+  });
+}

@@ -34,6 +34,7 @@ export const CASE_IDS = {
 export const BROWSER_SESSION = {
   actor: "frontend-smoke@example.invalid",
   capabilities: [],
+  permissions: { can_mutate: true, can_step_up: true },
   csrf_token: "csrf-browser-smoke",
   expires_at: "2026-08-24T12:00:00Z",
   step_up_expires_at: null

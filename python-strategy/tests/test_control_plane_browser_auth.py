@@ -783,3 +783,76 @@ def test_browser_auth_environment_requires_explicit_complete_trust_config(
         match="operator and step-up capabilities must be distinct",
     ):
         control_plane_main.build_browser_session_auth_from_env()
+
+
+@pytest.mark.parametrize(
+    ("capabilities", "elapsed", "expected"),
+    [
+        ((), 0, {"can_mutate": False, "can_step_up": False}),
+        ((OPERATOR_CAPABILITY,), 0, {"can_mutate": True, "can_step_up": False}),
+        ((OPERATOR_CAPABILITY, STEP_UP_CAPABILITY), 0,
+         {"can_mutate": True, "can_step_up": True}),
+        ((OPERATOR_CAPABILITY, STEP_UP_CAPABILITY), 300,
+         {"can_mutate": True, "can_step_up": False}),
+        ((STEP_UP_CAPABILITY,), 0, {"can_mutate": False, "can_step_up": True}),
+    ],
+)
+def test_session_permissions_preserve_capabilities_and_step_up_deadline(
+    capabilities, elapsed, expected,
+):
+    now = [1_000.0]
+    app = ControlPlaneApp(
+        BacktestJobExecutor(run_inline=True),
+        api_key="service-secret",
+        browser_auth=_browser_auth(clock=lambda: now[0]),
+    )
+    created = app.handle(
+        "POST", "/api/v1/auth/session", headers=_session_headers(*capabilities),
+    )
+    assert created.status_code == 201
+    assert created.body["permissions"] == {
+        "can_mutate": OPERATOR_CAPABILITY in capabilities,
+        "can_step_up": STEP_UP_CAPABILITY in capabilities,
+    }
+    cookie = dict(created.headers)["Set-Cookie"].split(";", 1)[0]
+    now[0] += elapsed
+    current = app.handle(
+        "GET", "/api/v1/auth/session",
+        headers=_browser_request_headers(cookie, None, *capabilities),
+    )
+    assert current.status_code == 200
+    assert current.body["permissions"] == expected
+    for response in (created, current):
+        assert response.body["capabilities"] == sorted(capabilities)
+        assert set(response.body) == {
+            "actor", "capabilities", "permissions", "csrf_token",
+            "expires_at", "step_up_expires_at",
+        }
+    assert {key: value for key, value in current.body.items() if key != "permissions"} == {
+        key: value for key, value in created.body.items() if key != "permissions"
+    }
+
+
+def test_session_permissions_follow_revocation_and_proxy_bypass_fails_closed():
+    strategy_control = MagicMock()
+    app = ControlPlaneApp(
+        BacktestJobExecutor(run_inline=True), api_key="service-secret",
+        strategy_control=strategy_control, browser_auth=_browser_auth(),
+    )
+    cookie, csrf = _create_session(app, OPERATOR_CAPABILITY, STEP_UP_CAPABILITY)
+    revoked = app.handle(
+        "GET", "/api/v1/auth/session", headers=_browser_request_headers(cookie),
+    )
+    assert revoked.body["permissions"] == {"can_mutate": False, "can_step_up": False}
+    assert revoked.body["capabilities"] == []
+    bypass = app.handle("GET", "/api/v1/auth/session", headers={"Cookie": cookie})
+    assert bypass.status_code == 401
+    for command in ("STOP", "START", "RESUME", "FORCE_RECOVER"):
+        denied = app.handle(
+            "POST", "/strategies/s1/commands",
+            json.dumps({"command": command, "expected_version": 1}),
+            headers=_browser_request_headers(cookie, csrf),
+        )
+        assert denied.status_code == 403
+        assert denied.body == {"error": "operator_capability_required"}
+    strategy_control.submit_command.assert_not_called()

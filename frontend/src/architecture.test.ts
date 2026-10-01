@@ -2385,7 +2385,7 @@ describe("frontend architecture ratchet", () => {
       /@charset|@import|url\(/
     );
     await expect(sha256(payload)).resolves.toBe(
-      "9171580172458b2ab20e97024f2ef987996990c50e1492f9d51575a9ba61b44d"
+      "1a87740528436b8b090145d6035e550bf46ffaed580be91580a467da38232340"
     );
   });
 

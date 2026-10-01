@@ -140,6 +140,34 @@ schema. Browser kill-switch requests require a unique `Idempotency-Key` header
 in addition to confirmation. API-key authentication remains available for CLI
 and service clients; never place that key in browser code.
 
+### Browser validation
+
+Browser session create/get responses include `permissions.can_mutate` and
+`permissions.can_step_up`, computed by the server from current grants and the
+step-up deadline. Existing session fields remain unchanged. The console
+intersects these permissions with state-derived `available_commands`; absent
+permissions remain read-only. Backend authorization is authoritative on every
+mutation request.
+
+Deterministic checks use the Node version in `frontend/.node-version`:
+`npm ci`, `npm run lint`, `npm test`, `npm run build`, and
+`npm run test:browser` from `frontend/`. Browser tests mock API responses and
+require neither a VPN nor a private hostname. Run
+`uv run --no-sync pytest tests/test_control_plane_browser_auth.py -q` from
+`python-strategy/` with the project PyO3 extension installed.
+
+Real Tailscale validation is a separate, manual opt-in check. If an existing
+HTTPS Serve URL and authenticated browser session are unavailable, record
+“environment evidence pending”; deterministic tests are not remote evidence.
+Using that existing entry, inspect Strategy and Research read-only pages and
+the session request's success status. Verify the displayed permission state
+without clicking any lifecycle command, even for an operator. Never inject
+trusted-proxy headers, export cookies/storage state, or change Serve/ACL,
+deployment, or live controls to make this check pass. Record only pass/fail
+and sanitized error categories; omit hostname, actor, grants, cookie values,
+raw requests, screenshots, and traces. An HttpOnly session cookie is expected
+on authenticated same-origin requests; it is not a browser-bundled API key.
+
 ### Manual Setup
 
 Requires: Python 3.12+, Rust stable, PostgreSQL 15, Redis

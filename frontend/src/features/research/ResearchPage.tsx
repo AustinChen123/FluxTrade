@@ -47,12 +47,11 @@ function errorMessage(error: ResearchError, translate: Translate): string {
   }
   if (error.type === "service") {
     return translate("error.service", {
-      status: error.status,
-      message: error.message
+      status: error.status
     });
   }
   return error.type === "unexpected"
-    ? translate("error.unexpected", { message: error.message })
+    ? translate("error.unexpected")
     : translate("error.fallback");
 }
 

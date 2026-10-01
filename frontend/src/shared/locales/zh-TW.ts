@@ -68,6 +68,14 @@ export const zhTW = {
       "paginationUnavailable": "尚未連接後續交易頁面。"
     },
     "strategies": {
+      "awaitingExplanation": "可重新整理確認進度；權威狀態更新前，此策略維持操作鎖定。",
+      "stopExplanation": "停止策略不代表撤單或平倉。",
+      "pendingExplanation": "命令送出中，暫時無法操作策略。",
+      "lastKnownState": "目前顯示上次取得的策略狀態；重新整理成功後才能操作。",
+      "lockdownUnavailable": "LOCKDOWN 狀態未接通",
+      "recoveryUnavailable": "解除功能尚未接通，需由後端恢復流程處理；策略狀態不代表 LOCKDOWN 狀態。",
+      "unlockLockdown": "解除 LOCKDOWN",
+      "readOnly": "目前為唯讀工作階段；策略命令需要 operator 權限。",
       "kicker": "運行控制",
       "title": "策略管理",
       "body": "查看權威運行狀態，並對單一策略送出受控生命週期命令。",
@@ -93,19 +101,19 @@ export const zhTW = {
       "pending": "送出中",
       "awaitingState": "等待狀態更新",
       "confirm": "確定要對 {{strategyId}} 執行「{{command}}」？",
-      "accepted": "已接受 {{strategyId}} 的「{{command}}」命令。",
+      "accepted": "已受理 {{strategyId}} 的「{{command}}」命令，等待狀態確認。",
       "status": {
         "DISCOVERED": "已發現",
         "READY": "準備就緒",
         "WARNING": "警告",
         "ACTIVE": "運行中",
-        "STOPPED": "已停止",
+        "STOPPED": "策略已停止",
         "ERROR": "錯誤"
       },
       "command": {
         "START": "啟動",
-        "STOP": "停止",
-        "RESUME": "恢復",
+        "STOP": "停止策略",
+        "RESUME": "恢復策略",
         "FORCE_RECOVER": "強制恢復"
       }
     },
@@ -148,9 +156,9 @@ export const zhTW = {
     "error": {
       "title": "研究資料未載入",
       "unauthorized": "目前工作階段沒有讀取研究結果的權限。請從受信任的 Tailscale 入口重新開啟。",
-      "service": "資料服務回覆 {{status}}：{{message}}",
+      "service": "資料服務回覆 {{status}}。請確認服務狀態後重試。",
       "fallback": "無法讀取 GA 資料",
-      "unexpected": "無法讀取 GA 資料：{{message}}",
+      "unexpected": "無法讀取 GA 資料。請確認連線後重試。",
       "retry": "重新讀取"
     },
     "empty": {
