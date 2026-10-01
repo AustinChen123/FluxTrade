@@ -25,8 +25,8 @@ pub(super) fn settle_fill(
     }
 
     update_position(engine, order, fill_price);
-    let charged_fee = std::cmp::min(calculated_fee, engine.balance);
-    engine.balance -= charged_fee;
+    let charged_fee = std::cmp::min(calculated_fee, engine.account.balance);
+    engine.account.balance -= charged_fee;
     Ok(calculated_fee)
 }
 
@@ -41,7 +41,7 @@ pub(super) fn calculate_fee(
     } else {
         engine.maker_fee
     };
-    if let Some(ledger) = &engine.spot_ledger {
+    if let Some(ledger) = &engine.account.spot_ledger {
         return match ledger.fee_asset {
             SpotFeeAsset::Base => quantity * fee,
             SpotFeeAsset::Quote => price * quantity * fee,
@@ -76,6 +76,7 @@ fn settle_spot_order(
     }
     if settlement_order.side == "SHORT" {
         let ledger = engine
+            .account
             .spot_ledger
             .as_ref()
             .ok_or_else(|| "cash_spot ledger is unavailable".to_string())?;
@@ -91,6 +92,7 @@ fn settle_spot_order(
             };
         let position_key = position_key(&order.strategy_id, &order.product_id);
         let available_position = engine
+            .account
             .positions
             .get(&position_key)
             .filter(|position| position.side == "LONG")
@@ -102,6 +104,7 @@ fn settle_spot_order(
         }
     }
     engine
+        .account
         .spot_ledger
         .as_mut()
         .ok_or_else(|| "cash_spot ledger is unavailable".to_string())?
@@ -115,7 +118,7 @@ fn update_spot_position(
     settlement: CashSpotSettlement,
 ) {
     let key = position_key(&order.strategy_id, &order.product_id);
-    let mut position = engine.positions.remove(&key).unwrap_or(Position {
+    let mut position = engine.account.positions.remove(&key).unwrap_or(Position {
         product_id: order.product_id.clone(),
         strategy_id: order.strategy_id.clone(),
         side: "FLAT".to_string(),
@@ -131,19 +134,19 @@ fn update_spot_position(
         position.side = "LONG".to_string();
         position.quantity = new_quantity;
         position.entry_price = (prior_cost + acquired_cost) / new_quantity;
-        engine.spot_cost_basis += acquired_cost;
-        engine.positions.insert(key, position);
+        engine.account.spot_cost_basis += acquired_cost;
+        engine.account.positions.insert(key, position);
         return;
     }
 
     let reduction = -settlement.base_delta;
     let removed_cost = position.entry_price * reduction;
     let proceeds = settlement.quote_delta;
-    engine.spot_cost_basis -= removed_cost;
-    engine.spot_realized_pnl += proceeds - removed_cost;
+    engine.account.spot_cost_basis -= removed_cost;
+    engine.account.spot_realized_pnl += proceeds - removed_cost;
     position.quantity -= reduction;
     if position.quantity > Decimal::ZERO {
-        engine.positions.insert(key, position);
+        engine.account.positions.insert(key, position);
     }
 
     debug_assert!(fill_price > Decimal::ZERO);
@@ -155,7 +158,7 @@ pub(super) fn position_key(strategy_id: &str, product_id: &str) -> String {
 
 fn update_position(engine: &mut PyMatchingEngine, order: &Order, fill_price: Decimal) {
     let key = position_key(&order.strategy_id, &order.product_id);
-    let mut position = engine.positions.remove(&key).unwrap_or(Position {
+    let mut position = engine.account.positions.remove(&key).unwrap_or(Position {
         product_id: order.product_id.clone(),
         strategy_id: order.strategy_id.clone(),
         side: "FLAT".to_string(),
@@ -176,7 +179,7 @@ fn update_position(engine: &mut PyMatchingEngine, order: &Order, fill_price: Dec
     }
 
     if position.quantity > Decimal::ZERO && position.side != "FLAT" {
-        engine.positions.insert(key, position);
+        engine.account.positions.insert(key, position);
     }
 }
 
@@ -197,7 +200,7 @@ fn close_position(
         position.entry_price - fill_price
     };
     let realized_pnl = price_difference * close_quantity * engine.contract_multiplier;
-    engine.balance += realized_pnl;
+    engine.account.balance += realized_pnl;
 
     let remaining = position.quantity - close_quantity;
     if remaining > Decimal::ZERO {
@@ -232,7 +235,7 @@ fn apply_position_change(
             position.entry_price - fill_price
         };
         let realized_pnl = price_difference * close_quantity * engine.contract_multiplier;
-        engine.balance += realized_pnl;
+        engine.account.balance += realized_pnl;
 
         let remaining = position.quantity - close_quantity;
         let excess = order.quantity - close_quantity;

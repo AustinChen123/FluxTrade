@@ -55,6 +55,10 @@ from src.core.backtest.run_evidence import (
     canonical_fill_records,
     strategy_configuration_contract,
 )
+from src.core.backtest.spider_formal_runner import (
+    SpiderFormalRunResult,
+    _invoke_spider_historical,
+)
 from src.core.analytics import (
     ClosedTrade,
     InitialBalanceInput,
@@ -324,6 +328,18 @@ def _write_markdown_report(
 
 
 class BacktestRunner:
+    @staticmethod
+    def run_spider_historical(
+        *, output_root: str, run_id: str, historical_input: bytes,
+    ) -> SpiderFormalRunResult:
+        """Run the shared formal Spider lifecycle without the candle runner."""
+        return _invoke_spider_historical(
+            output_root=output_root,
+            run_id=run_id,
+            historical_input=historical_input,
+            runner_kind="full",
+        )
+
     def __init__(
         self,
         start_time: int,

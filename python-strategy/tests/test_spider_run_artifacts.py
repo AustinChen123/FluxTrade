@@ -1,0 +1,665 @@
+from copy import deepcopy
+from decimal import Decimal, localcontext
+from typing import Protocol, cast
+
+import pytest
+
+from src.core.backtest import spider_run_artifacts as a
+
+
+class _WritableConfigId(Protocol):
+    config_id: str
+
+
+def attempt() -> dict[str, object]:
+    return {
+        "schema_version": "spider_attempt_v1", "run_id": "r-1",
+        "run_contract_id": "SPIDER_SYNTHETIC_P1_RUN_V1",
+        "registration_state": "VALIDATED", "requested_scenario_selector": "bounded.future",
+        "registration_failure": None, "profile_id": "SYNTHETIC_MIN_CASH_V1",
+        "account_key": {"venue": "venue", "environment": "test", "account": "A"},
+        "scenario_plan_id": "not-a-protocol-equality-check",
+        "scenario_plan_sha256": "1" * 64, "program_sha256": "2" * 64,
+        "native_artifact_sha256": "3" * 64, "policy_source_sha256": "4" * 64,
+        "input_contract_hashes": [
+            {"name": name, "sha256": "f" * 64}
+            for name in ["SCENARIO_PLAN", "PROGRAM", "NATIVE_ARTIFACT", "POLICY_SOURCE_MANIFEST"]
+        ],
+        "ordering_contract_id": "S_order_v1", "cost_contract_id": "SPIDER_SYNTHETIC_COSTS_V1",
+        "funding_exclusion": "SYNTHETIC_P1_NO_FUNDING_INPUT_OR_CLAIM",
+        "terminal_policy": "SCHEDULED_MTM", "artifact_encoding": "artifact_encoding_v1",
+        "planned_coverage": [{"ordinal": 1, "barrier_id": "SOURCE_GROUP:x", "record_kind": "SOURCE_GROUP_RESULT"}],
+    }
+
+
+NULL_IDENTITIES = (
+    "profile_id account_key scenario_plan_id scenario_plan_sha256 program_sha256 "
+    "native_artifact_sha256 policy_source_sha256 ordering_contract_id cost_contract_id "
+    "funding_exclusion terminal_policy artifact_encoding"
+).split()
+
+
+def rejected() -> dict[str, object]:
+    row = attempt()
+    row.update(registration_state="REJECTED", registration_failure="UNSUPPORTED_CONFIGURATION",
+               input_contract_hashes=[], planned_coverage=[])
+    row.update(dict.fromkeys(NULL_IDENTITIES))
+    return row
+
+
+def configuration_context(products=None, config_id="configured-v1"):
+    products = ["CFG-FIRST", "CFG-MIDDLE", "CFG-LAST"] if products is None else products
+    return {
+        "schema_version": "spider_configuration_context_v1",
+        "config_id": config_id,
+        "configuration_sha256": "a" * 64,
+        "products": list(products),
+    }
+
+
+def historical_context():
+    return {
+        "schema_version": "spider_historical_context_v1",
+        "research_classification": "RESEARCH_ONLY",
+        "historical_input_sha256": "1" * 64,
+        "path_pair_sha256": "2" * 64,
+        "source_sha256": "3" * 64,
+        "model_sha256": "4" * 64,
+        "assumption_sha256": "5" * 64,
+        "coverage_sha256": "6" * 64,
+        "model_id": "OHLC4_OPEN_HIGH_LOW_CLOSE_V1",
+        "model_version": 1,
+    }
+
+
+def test_historical_context_is_strict_and_detached():
+    original = historical_context()
+    context = a.historical_context(original)
+    assert type(context) is a.HistoricalContext
+    assert a._historical_context(context) == original
+    for key in original:
+        row = deepcopy(original)
+        del row[key]
+        with pytest.raises(ValueError):
+            a.historical_context(row)
+    with pytest.raises(ValueError):
+        a.historical_context({**original, "extra": None})
+    for field, value in (
+        ("schema_version", "spider_historical_context_v2"),
+        ("research_classification", "ADMITTED"),
+        ("historical_input_sha256", "A" * 64),
+        ("path_pair_sha256", "x" * 64),
+        ("model_id", "unknown"),
+        ("model_version", True),
+    ):
+        row = deepcopy(original)
+        row[field] = value
+        with pytest.raises(ValueError):
+            a.historical_context(row)
+
+
+def test_historical_attempt_uses_the_existing_configured_native_profile():
+    row = historical_attempt()
+    a.validate_artifact(row)
+    assert row["profile_id"] == "SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1"
+    row["profile_id"] = "HISTORICAL_MARKET_SCENARIO_ACCOUNT_V1"
+    with pytest.raises(ValueError):
+        a.validate_artifact(row)
+
+
+def configured_attempt(products=None):
+    row = attempt()
+    row.update(
+        run_contract_id="SPIDER_SYNTHETIC_P2_CONFIGURED_RUN_V1",
+        profile_id="SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1",
+        scenario_plan_id="SPIDER_P2_CONFIGURED_SCALE_V1",
+        funding_exclusion="SYNTHETIC_P2_NO_FUNDING_INPUT_OR_CLAIM",
+        configuration_context=configuration_context(products),
+    )
+    return row
+
+
+def historical_attempt():
+    context = historical_context()
+    row = attempt()
+    row.update(
+        run_contract_id="SPIDER_HISTORICAL_RESEARCH_RUN_V1",
+        requested_scenario_selector="SPIDER_HISTORICAL_RESEARCH_RUN_V1",
+        profile_id="SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1",
+        account_key={"venue": "SPIDER_HISTORICAL_RESEARCH", "environment": "RESEARCH_ONLY", "account": "research"},
+        scenario_plan_id="SPIDER_HISTORICAL_RESEARCH_RUN_V1",
+        scenario_plan_sha256=context["historical_input_sha256"],
+        ordering_contract_id="HISTORICAL_ORDER_V1",
+        cost_contract_id="SPIDER_HISTORICAL_RESEARCH_COSTS_V1",
+        funding_exclusion="HISTORICAL_FUNDING_DISABLED",
+        terminal_policy="MTM_PRESERVE_OPEN_V1",
+        configuration_context=configuration_context(),
+        historical_context=context,
+        planned_coverage=[{"ordinal": 1, "barrier_id": "P3_MARKET_86400000_0",
+                           "record_kind": "HISTORICAL_MARKET_STEP"}],
+    )
+    return row
+
+
+def status() -> dict[str, object]:
+    return dict(schema_version="spider_status_v1", run_id="r-1", state="RUNNING",
+                processed_boundary=None, persisted_boundary=None, failure_reason=None, primary_failure=None)
+
+
+@pytest.mark.parametrize("factory", [attempt, rejected, status])
+def test_roundtrip_and_every_top_level_field_is_required(factory):
+    original = factory()
+    before = deepcopy(original)
+    assert a.decode_artifact(a.encode_artifact(original)) == original
+    assert original == before
+    for key in original:
+        row = deepcopy(original)
+        del row[key]
+        with pytest.raises(ValueError):
+            a.validate_artifact(row)
+    with pytest.raises(ValueError):
+        a.validate_artifact({**original, "extra": None})
+
+
+def test_canonical_decimal_and_order_are_context_independent():
+    with localcontext() as context:
+        context.prec = 2
+        assert a.canonical_bytes({"z": Decimal("1E+4"), "a": [Decimal("-0"), Decimal("123.4500")]}) == b'{"a":["0","123.45"],"z":"10000"}'
+    assert a.canonical_bytes({"unicode": "é"}) == b'{"unicode":"\\u00e9"}'
+    assert a.decode_canonical(b'{"a":[true,null,-1]}') == {"a": [True, None, -1]}
+
+
+@pytest.mark.parametrize("value", [1.5, Decimal("NaN"), Decimal("Infinity"), (1,), {1: "x"}, {"x": [1.5]}])
+def test_encoder_rejects_non_json_or_nonfinite_values(value):
+    with pytest.raises(ValueError):
+        a.canonical_bytes(value)
+
+
+@pytest.mark.parametrize("raw", [
+    b'{"a":1,"a":2}', b'{"x":{"a":1,"a":1}}', b'\xef\xbb\xbf{}', b'{ "a":1}',
+    b'{"z":1,"a":2}', b'{"a":1.0}', b'{"a":NaN}', b'{"a":Infinity}', b'{"a":-0}',
+    b'{"a":"\\u0061"}', b'{"a":"\xc3\xa9"}', b'{}\n', b'[] ', b'\xff',
+])
+def test_decoder_rejects_noncanonical_or_ambiguous_bytes(raw):
+    with pytest.raises(ValueError):
+        a.decode_canonical(raw)
+
+
+@pytest.mark.parametrize("raw", [b'{}', b'{}\n\n', b'\n', b'{}\r\n', b'{}\n{', b'[]\n'])
+def test_jsonl_framing_rejects_blank_partial_or_non_object_rows(raw):
+    with pytest.raises(ValueError):
+        a.decode_jsonl(raw)
+
+
+def test_jsonl_is_only_a_framing_codec_not_artifact_admission():
+    rows: list[object] = [{"arbitrary key": 1}, {}]
+    assert a.decode_jsonl(a.encode_jsonl(rows)) == rows
+    assert a.decode_jsonl(b"") == []
+    with pytest.raises(ValueError):
+        a.encode_jsonl([1])
+    for raw in [b"", b"{}\n", a.encode_artifact(status()) * 2]:
+        with pytest.raises(ValueError):
+            a.decode_artifact(raw)
+
+
+@pytest.mark.parametrize("field", NULL_IDENTITIES)
+def test_rejected_cross_population_and_validated_partial_identity_reject(field):
+    row = rejected()
+    row[field] = attempt()[field]
+    with pytest.raises(ValueError):
+        a.validate_artifact(row)
+    row = attempt()
+    row[field] = None
+    with pytest.raises(ValueError):
+        a.validate_artifact(row)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("registration_failure", None), ("registration_failure", "OTHER"),
+    ("profile_id", "UNKNOWN"), ("scenario_plan_sha256", "UNKNOWN"),
+    ("input_contract_hashes", [{"name": "SCENARIO_PLAN", "sha256": "f" * 64}]),
+    ("planned_coverage", [{"ordinal": 1, "barrier_id": "x", "record_kind": "SOURCE_GROUP_RESULT"}]),
+])
+def test_rejected_exact_union(field, value):
+    row = rejected()
+    row[field] = value
+    with pytest.raises(ValueError):
+        a.validate_artifact(row)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("run_id", "../bad"), ("run_id", "a" * 65), ("run_id", "é"),
+    ("requested_scenario_selector", "x/y"), ("requested_scenario_selector", "x" * 129),
+    ("registration_state", "UNKNOWN"), ("registration_failure", "UNSUPPORTED_CONFIGURATION"),
+    ("profile_id", "UNKNOWN"), ("program_sha256", "F" * 64),
+    ("ordering_contract_id", "UNKNOWN"), ("cost_contract_id", "UNKNOWN"),
+    ("funding_exclusion", "UNKNOWN"), ("artifact_encoding", "UNKNOWN"),
+    ("terminal_policy", "UNKNOWN"), ("account_key", {"venue": "v", "environment": "t"}),
+    ("planned_coverage", ()), ("input_contract_hashes", {}),
+])
+def test_validated_structural_mutations(field, value):
+    row = attempt()
+    row[field] = value
+    with pytest.raises(ValueError):
+        a.validate_artifact(row)
+
+
+def test_hash_list_order_and_closed_entries():
+    names = ["SCENARIO_PLAN", "PROGRAM", "NATIVE_ARTIFACT", "POLICY_SOURCE_MANIFEST"]
+    variants = [names[::-1], names[:-1], names + names[:1], [names[0]] * 4]
+    for order in variants:
+        row = attempt()
+        row["input_contract_hashes"] = [{"name": name, "sha256": "a" * 64} for name in order]
+        with pytest.raises(ValueError):
+            a.validate_artifact(row)
+
+
+@pytest.mark.parametrize("coverage", [
+    [{"ordinal": True, "barrier_id": "x", "record_kind": "SOURCE_GROUP_RESULT"}],
+    [{"ordinal": 2, "barrier_id": "x", "record_kind": "SOURCE_GROUP_RESULT"}],
+    [{"ordinal": 1, "barrier_id": "x", "record_kind": "OTHER"}],
+    [{"ordinal": 1, "barrier_id": "x", "record_kind": "SOURCE_GROUP_RESULT", "extra": 0}],
+    [{"ordinal": n, "barrier_id": "x", "record_kind": "SOURCE_GROUP_RESULT"} for n in (1, 2)],
+])
+def test_coverage_structure_order_and_identity_uniqueness(coverage):
+    row = attempt()
+    row["planned_coverage"] = coverage
+    with pytest.raises(ValueError):
+        a.validate_artifact(row)
+
+
+@pytest.mark.parametrize("state", ["RUNNING", "COMPLETE", "FAILED"])
+def test_status_failure_state_matrix(state):
+    for failure in [None, "PERSISTENCE_FAILED", "UNKNOWN"]:
+        for primary in [None, {"kind": "NATIVE", "reason": "NATIVE_INVARIANT"}]:
+            row = status()
+            row.update(state=state, failure_reason=failure, primary_failure=primary)
+            valid = failure == "PERSISTENCE_FAILED" if state == "FAILED" else failure is None and primary is None
+            if valid:
+                a.validate_artifact(row)
+            else:
+                with pytest.raises(ValueError):
+                    a.validate_artifact(row)
+
+
+@pytest.mark.parametrize("boundary", [
+    {"ordinal": True, "barrier_id": "x", "journal_seq": 1},
+    {"ordinal": 0, "barrier_id": "x", "journal_seq": 1},
+    {"ordinal": 1, "barrier_id": "x", "journal_seq": -1},
+    {"ordinal": 1, "barrier_id": "", "journal_seq": 1},
+    {"ordinal": 1, "barrier_id": "x"},
+])
+def test_bad_boundary_rejects(boundary):
+    row = status()
+    row["processed_boundary"] = boundary
+    with pytest.raises(ValueError):
+        a.validate_artifact(row)
+
+
+@pytest.mark.parametrize("reason", ["", "Exception('oops')", "lowercase", "A" * 129, "A\n"])
+def test_primary_reason_is_bounded_code(reason):
+    row = status()
+    row.update(state="FAILED", failure_reason="NATIVE_FAULT", primary_failure={"kind": "NATIVE", "reason": reason})
+    with pytest.raises(ValueError):
+        a.validate_artifact(row)
+
+
+@pytest.mark.parametrize("value", ["-0", "1.0", "1e2", "+1", "01", "NaN", True, 1])
+def test_decimal_text_primitive_rejects_noncanonical(value):
+    with pytest.raises(ValueError):
+        a._decimal_text(value)
+
+
+def test_scalar_primitives():
+    assert a._decimal_text("-0.01") == "-0.01"
+    assert a._integer(0) == 0
+    assert a._boolean(False) is False
+    for value in [True, -1, "1", 1.0]:
+        with pytest.raises(ValueError):
+            a._integer(value)
+    for value in [0, 1, "true", None]:
+        with pytest.raises(ValueError):
+            a._boolean(value)
+
+
+@pytest.mark.parametrize("reason", [
+    "UNSUPPORTED_CONFIGURATION", "PERSISTENCE_FAILED", "CALLBACK_FAILED", "NATIVE_FAULT",
+    "NATIVE_POISONED", "SCHEDULER_FAILED", "ENDPOINT_RECONCILIATION_FAILED",
+    "ARTIFACT_WRITE_FAILED", "PUBLICATION_FAILED", "PUBLICATION_DURABILITY_UNKNOWN", "UNEXPECTED_EXCEPTION",
+])
+def test_every_closed_failure_reason_and_valid_frontier(reason):
+    row = status()
+    row.update(state="FAILED", failure_reason=reason,
+               processed_boundary={"ordinal": 3, "barrier_id": "SOURCE_GROUP:c", "journal_seq": 3},
+               persisted_boundary={"ordinal": 2, "barrier_id": "SOURCE_GROUP:b", "journal_seq": 2})
+    assert a.decode_artifact(a.encode_artifact(row)) == row
+
+
+def test_nested_objects_have_no_missing_or_extra_fields():
+    cases = [
+        ("account_key", {"venue": "v", "environment": "test", "account": "A"}, attempt),
+        ("processed_boundary", {"ordinal": 1, "barrier_id": "x", "journal_seq": 1}, status),
+    ]
+    for field, nested, factory in cases:
+        variants = [{**nested, "extra": 1}]
+        variants.extend({key: value for key, value in nested.items() if key != absent} for absent in nested)
+        for variant in variants:
+            row = factory()
+            row[field] = variant
+            with pytest.raises(ValueError):
+                a.validate_artifact(row)
+    for malformed in [{"name": "SCENARIO_PLAN"}, {"name": "SCENARIO_PLAN", "sha256": "f" * 64, "extra": 0}]:
+        row = attempt()
+        row["input_contract_hashes"] = [malformed] + [
+            {"name": name, "sha256": "a" * 64}
+            for name in ["PROGRAM", "NATIVE_ARTIFACT", "POLICY_SOURCE_MANIFEST"]
+        ]
+        with pytest.raises(ValueError):
+            a.validate_artifact(row)
+
+
+@pytest.mark.parametrize("primary", [
+    {"kind": "OTHER", "reason": "CODE"}, {"kind": "NATIVE"},
+    {"kind": "NATIVE", "reason": "CODE", "extra": None}, True,
+])
+def test_primary_failure_closed_structure(primary):
+    row = status()
+    row.update(state="FAILED", failure_reason="NATIVE_FAULT", primary_failure=primary)
+    with pytest.raises(ValueError):
+        a.validate_artifact(row)
+
+
+def test_nonprotocol_values_do_not_claim_semantic_validation():
+    row = attempt()
+    row["planned_coverage"] = []
+    a.validate_artifact(row)
+    for subaccount in [None, "sub"]:
+        row["account_key"] = {"venue": "v", "environment": "test", "account": "A", "subaccount": subaccount}
+        a.validate_artifact(row)
+    for value in [None, [], {"run_id": "r", "schema_version": "spider_completion_v1"}]:
+        with pytest.raises(ValueError):
+            a.validate_artifact(value)
+
+
+def test_configuration_context_is_exact_detached_and_immutable():
+    source = configuration_context()
+    context = a.configuration_context(source)
+    assert context.schema_version == "spider_configuration_context_v1"
+    assert context.config_id == "configured-v1"
+    assert context.configuration_sha256 == "a" * 64
+    assert context.products == ("CFG-FIRST", "CFG-MIDDLE", "CFG-LAST")
+    source["config_id"] = "mutated"
+    source["configuration_sha256"] = "b" * 64
+    source["products"][1] = "MUTATED"
+    assert context.config_id == "configured-v1"
+    assert context.configuration_sha256 == "a" * 64
+    assert context.products == ("CFG-FIRST", "CFG-MIDDLE", "CFG-LAST")
+    with pytest.raises(AttributeError):
+        cast(_WritableConfigId, context).config_id = "changed"
+
+
+@pytest.mark.parametrize(
+    "update",
+    [
+        {"schema_version": "other"},
+        {"config_id": ""},
+        {"configuration_sha256": "A" * 64},
+        {"configuration_sha256": "a" * 63},
+        {"products": []},
+        {"products": ["CFG", "CFG"]},
+        {"products": ["CFG", ""]},
+        {"extra": 1},
+    ],
+)
+def test_configuration_context_rejects_invalid_identity(update):
+    with pytest.raises(ValueError):
+        a.configuration_context({**configuration_context(), **update})
+
+
+def test_attempt_p1_p2_validated_and_rejected_matrix():
+    p1 = attempt()
+    p2 = configured_attempt()
+    p1_rejected = rejected()
+    p2_rejected_without_context = rejected()
+    p2_rejected_without_context["run_contract_id"] = "SPIDER_SYNTHETIC_P2_CONFIGURED_RUN_V1"
+    p2_rejected_with_context = deepcopy(p2_rejected_without_context)
+    p2_rejected_with_context["configuration_context"] = configuration_context()
+
+    for row in (p1, p2, p1_rejected, p2_rejected_without_context, p2_rejected_with_context):
+        a.validate_artifact(row)
+        assert a.decode_artifact(a.encode_artifact(row)) == row
+
+    with pytest.raises(ValueError):
+        a.validate_artifact({**p1, "configuration_context": configuration_context()})
+    with pytest.raises(ValueError):
+        a.validate_artifact({**p2, "configuration_context": None})
+    with pytest.raises(ValueError):
+        a.validate_artifact({**p2, "run_contract_id": "SPIDER_SYNTHETIC_P1_RUN_V1"})
+    with pytest.raises(ValueError):
+        a.validate_artifact({**p1, "run_contract_id": "SPIDER_SYNTHETIC_P2_CONFIGURED_RUN_V1"})
+
+
+def test_historical_validated_attempt_roundtrips_and_detaches_contexts():
+    row = historical_attempt()
+    row["historical_context"] = a.historical_context(row["historical_context"])
+    encoded = a.encode_artifact(row)
+    decoded = a.decode_artifact(encoded)
+    assert decoded["configuration_context"] == a._configuration_context(row["configuration_context"])
+    assert decoded["historical_context"] == historical_context()
+    assert a.encode_artifact(decoded) == encoded
+
+    running = status()
+    running.update(configuration_context=configuration_context(), historical_context=a.historical_context(historical_context()))
+    assert a.decode_artifact(a.encode_artifact(running)) == {
+        **status(), "configuration_context": configuration_context(), "historical_context": historical_context(),
+    }
+
+
+@pytest.mark.parametrize("mutation", [
+    "missing_configuration", "missing_historical", "null_historical", "bad_selector",
+    "bad_plan_id", "bad_plan_hash", "bad_profile", "bad_venue", "bad_environment",
+    "subaccount", "bad_ordering", "bad_cost", "bad_funding", "bad_terminal",
+    "bad_context_model", "rejected",
+])
+def test_historical_attempt_contract_is_closed(mutation):
+    row = historical_attempt()
+    if mutation == "missing_configuration":
+        del row["configuration_context"]
+    elif mutation == "missing_historical":
+        del row["historical_context"]
+    elif mutation == "null_historical":
+        row["historical_context"] = None
+    elif mutation == "bad_selector":
+        row["requested_scenario_selector"] = "other"
+    elif mutation == "bad_plan_id":
+        row["scenario_plan_id"] = "other"
+    elif mutation == "bad_plan_hash":
+        row["scenario_plan_sha256"] = "f" * 64
+    elif mutation == "bad_profile":
+        row["profile_id"] = "HISTORICAL_MARKET_SCENARIO_ACCOUNT_V1"
+    elif mutation == "bad_venue":
+        account_key = row["account_key"]
+        assert isinstance(account_key, dict)
+        row["account_key"] = {**account_key, "venue": "OTHER"}
+    elif mutation == "bad_environment":
+        account_key = row["account_key"]
+        assert isinstance(account_key, dict)
+        row["account_key"] = {**account_key, "environment": "PAPER"}
+    elif mutation == "subaccount":
+        account_key = row["account_key"]
+        assert isinstance(account_key, dict)
+        row["account_key"] = {**account_key, "subaccount": "unexpected"}
+    elif mutation == "bad_ordering":
+        row["ordering_contract_id"] = "S_order_v1"
+    elif mutation == "bad_cost":
+        row["cost_contract_id"] = "SPIDER_SYNTHETIC_COSTS_V1"
+    elif mutation == "bad_funding":
+        row["funding_exclusion"] = "SYNTHETIC_P2_NO_FUNDING_INPUT_OR_CLAIM"
+    elif mutation == "bad_terminal":
+        row["terminal_policy"] = "SCHEDULED_MTM"
+    elif mutation == "bad_context_model":
+        row["historical_context"] = {**historical_context(), "model_id": "unknown"}
+    else:
+        row.update(registration_state="REJECTED", registration_failure="UNSUPPORTED_CONFIGURATION")
+        row.update(dict.fromkeys(NULL_IDENTITIES))
+        row["input_contract_hashes"] = []
+        row["planned_coverage"] = []
+    with pytest.raises(ValueError):
+        a.validate_artifact(row)
+
+
+def test_historical_context_is_forbidden_on_p1_p2_attempts_and_requires_configuration_on_status():
+    for row in (attempt(), configured_attempt()):
+        row["historical_context"] = historical_context()
+        with pytest.raises(ValueError):
+            a.validate_artifact(row)
+    row = status()
+    row["historical_context"] = historical_context()
+    with pytest.raises(ValueError):
+        a.validate_artifact(row)
+    row["configuration_context"] = configuration_context()
+    a.validate_artifact(row)
+
+
+def test_planned_coverage_kinds_are_run_contract_specific():
+    historical = historical_attempt()
+    a.validate_artifact(historical)
+    for base in (attempt(), configured_attempt()):
+        base["planned_coverage"] = [
+            {"ordinal": 1, "barrier_id": "P3_TIMER_86405000", "record_kind": "HISTORICAL_TIMER"}
+        ]
+        with pytest.raises(ValueError):
+            a.validate_artifact(base)
+
+
+def test_configured_validated_attempt_requires_context():
+    row = configured_attempt()
+    del row["configuration_context"]
+    with pytest.raises(ValueError):
+        a.validate_artifact(row)
+
+
+def test_rejected_p1_attempt_forbids_valid_configuration_context():
+    row = rejected()
+    row["configuration_context"] = configuration_context()
+    with pytest.raises(ValueError):
+        a.validate_artifact(row)
+
+
+def test_configured_context_is_serialized_as_detached_ordered_list_data():
+    source = configuration_context(["CFG-LAST", "CFG-MIDDLE", "CFG-FIRST"])
+    immutable = a.configuration_context(source)
+    row = configured_attempt()
+    row["configuration_context"] = immutable
+
+    encoded = a.encode_artifact(row)
+    decoded = a.decode_artifact(encoded)
+    assert decoded["configuration_context"] == {
+        **source,
+        "products": ["CFG-LAST", "CFG-MIDDLE", "CFG-FIRST"],
+    }
+    assert b'"products":["CFG-LAST","CFG-MIDDLE","CFG-FIRST"]' in encoded
+    source["products"][0] = "MUTATED"
+    decoded_context = cast(dict[str, object], decoded["configuration_context"])
+    assert decoded_context["products"] == [
+        "CFG-LAST", "CFG-MIDDLE", "CFG-FIRST"
+    ]
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("run_contract_id", "SPIDER_SYNTHETIC_P1_RUN_V1"),
+        ("registration_state", "UNKNOWN"),
+        ("profile_id", None),
+        ("account_key", None),
+        ("scenario_plan_id", None),
+        ("scenario_plan_sha256", "F" * 64),
+        ("program_sha256", None),
+        ("native_artifact_sha256", None),
+        ("policy_source_sha256", None),
+        ("ordering_contract_id", None),
+        ("cost_contract_id", None),
+        ("funding_exclusion", "SYNTHETIC_P1_NO_FUNDING_INPUT_OR_CLAIM"),
+        ("terminal_policy", None),
+        ("artifact_encoding", None),
+        ("input_contract_hashes", []),
+        ("planned_coverage", [{"ordinal": 2, "barrier_id": "x", "record_kind": "SOURCE_GROUP_RESULT"}]),
+        ("registration_failure", "UNSUPPORTED_CONFIGURATION"),
+        ("requested_scenario_selector", "invalid/selector"),
+    ],
+)
+def test_configured_validated_attempt_mutations_reject(field, value):
+    row = configured_attempt()
+    row[field] = value
+    with pytest.raises(ValueError):
+        a.validate_artifact(row)
+
+
+def test_rejected_configured_attempt_context_is_optional_but_not_fabricated():
+    rejected_p2 = rejected()
+    rejected_p2["run_contract_id"] = "SPIDER_SYNTHETIC_P2_CONFIGURED_RUN_V1"
+    for update in [
+        {"configuration_context": None},
+        {"configuration_context": {**configuration_context(), "products": []}},
+        {"configuration_context": configuration_context(), "scenario_plan_id": "P2"},
+        {"configuration_context": configuration_context(), "input_contract_hashes": attempt()["input_contract_hashes"]},
+        {"configuration_context": configuration_context(), "planned_coverage": attempt()["planned_coverage"]},
+        {"configuration_context": configuration_context(), "registration_failure": None},
+        {"configuration_context": configuration_context(), "requested_scenario_selector": "bad/selector"},
+    ]:
+        with pytest.raises(ValueError):
+            a.validate_artifact({**rejected_p2, **update})
+
+
+@pytest.mark.parametrize("field", NULL_IDENTITIES)
+def test_rejected_configured_attempt_keeps_every_identity_null(field):
+    row = rejected()
+    row["run_contract_id"] = "SPIDER_SYNTHETIC_P2_CONFIGURED_RUN_V1"
+    row["configuration_context"] = configuration_context()
+    row[field] = attempt()[field]
+    with pytest.raises(ValueError):
+        a.validate_artifact(row)
+
+
+@pytest.mark.parametrize("state", ["RUNNING", "FAILED", "COMPLETE"])
+def test_status_optional_configuration_context_preserves_order(state):
+    row = status()
+    row["state"] = state
+    if state == "FAILED":
+        row.update(failure_reason="NATIVE_FAULT", primary_failure=None)
+    products = ["CFG-LAST", "CFG-MIDDLE", "CFG-FIRST"]
+    row["configuration_context"] = configuration_context(products)
+    encoded = a.encode_artifact(row)
+    assert a.decode_artifact(encoded) == row
+    assert b'"products":["CFG-LAST","CFG-MIDDLE","CFG-FIRST"]' in encoded
+    products.reverse()
+    assert row["configuration_context"]["products"] == ["CFG-LAST", "CFG-MIDDLE", "CFG-FIRST"]
+
+
+def test_p1_attempt_and_status_bytes_remain_exact_without_context():
+    assert a.encode_artifact(attempt()) == (
+        b'{"account_key":{"account":"A","environment":"test","venue":"venue"},'
+        b'"artifact_encoding":"artifact_encoding_v1","cost_contract_id":"SPIDER_SYNTHETIC_COSTS_V1",'
+        b'"funding_exclusion":"SYNTHETIC_P1_NO_FUNDING_INPUT_OR_CLAIM","input_contract_hashes":'
+        b'[{"name":"SCENARIO_PLAN","sha256":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"},'
+        b'{"name":"PROGRAM","sha256":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"},'
+        b'{"name":"NATIVE_ARTIFACT","sha256":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"},'
+        b'{"name":"POLICY_SOURCE_MANIFEST","sha256":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}],'
+        b'"native_artifact_sha256":"3333333333333333333333333333333333333333333333333333333333333333",'
+        b'"ordering_contract_id":"S_order_v1","planned_coverage":[{"barrier_id":"SOURCE_GROUP:x",'
+        b'"ordinal":1,"record_kind":"SOURCE_GROUP_RESULT"}],"policy_source_sha256":'
+        b'"4444444444444444444444444444444444444444444444444444444444444444",'
+        b'"profile_id":"SYNTHETIC_MIN_CASH_V1","program_sha256":'
+        b'"2222222222222222222222222222222222222222222222222222222222222222",'
+        b'"registration_failure":null,"registration_state":"VALIDATED",'
+        b'"requested_scenario_selector":"bounded.future","run_contract_id":"SPIDER_SYNTHETIC_P1_RUN_V1",'
+        b'"run_id":"r-1","scenario_plan_id":"not-a-protocol-equality-check",'
+        b'"scenario_plan_sha256":"1111111111111111111111111111111111111111111111111111111111111111",'
+        b'"schema_version":"spider_attempt_v1","terminal_policy":"SCHEDULED_MTM"}\n'
+    )
+    assert a.encode_artifact(status()) == (
+        b'{"failure_reason":null,"persisted_boundary":null,"primary_failure":null,'
+        b'"processed_boundary":null,"run_id":"r-1","schema_version":"spider_status_v1",'
+        b'"state":"RUNNING"}\n'
+    )

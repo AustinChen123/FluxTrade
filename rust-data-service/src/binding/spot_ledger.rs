@@ -38,7 +38,7 @@ pub(crate) struct CashSpotSettlement {
     pub(crate) quote_delta: Decimal,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct CashSpotLedger {
     pub(crate) base_asset: String,
     pub(crate) quote_asset: String,

@@ -16,6 +16,7 @@ _ORM_FREE_APPLICATION_MODULES = frozenset(
         "src.core.execution_conditional_orders",
         "src.core.execution_order_cancellation",
         "src.core.execution_verified_net_reduction",
+        "src.core.replay_contract",
     }
 )
 _FORBIDDEN_APPLICATION_IMPORTS = frozenset(
@@ -67,6 +68,22 @@ _LEGACY_PROVIDER_IMPORTS = frozenset(
             "src.validation.portfolio_paper_lifecycle",
             "src.core.adapters.simulated",
         ),
+    }
+)
+_FORBIDDEN_SPIDER_OWNER_IMPORT_ROOTS = (
+    "src.core.backtest_runner",
+    "src.core.research_backtest_runner",
+    "examples",
+    "src.core.adapters",
+    "src.core.data_sources",
+    "src.core.data_provider",
+    "src.strategies",
+)
+_SPIDER_BRIDGE_OWNERS = frozenset(
+    {
+        "src.core.backtest.spider_scenario_run",
+        "src.core.backtest.spider_run_admission",
+        "src.core.backtest.spider_run_artifacts",
     }
 )
 
@@ -142,7 +159,8 @@ def _static_imports(
 
 
 def _dynamic_imports(tree: ast.AST) -> set[str]:
-    direct_names = {"__import__"}
+    builtin_names = {"__import__"}
+    import_module_names: set[str] = set()
     qualified_names: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -152,7 +170,7 @@ def _dynamic_imports(tree: ast.AST) -> set[str]:
                 if alias.name == "importlib"
             )
         elif isinstance(node, ast.ImportFrom) and node.module == "importlib":
-            direct_names.update(
+            import_module_names.update(
                 alias.asname or alias.name
                 for alias in node.names
                 if alias.name == "import_module"
@@ -162,14 +180,17 @@ def _dynamic_imports(tree: ast.AST) -> set[str]:
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
-        direct = isinstance(node.func, ast.Name) and node.func.id in direct_names
+        builtin = isinstance(node.func, ast.Name) and node.func.id in builtin_names
+        imported_import_module = (
+            isinstance(node.func, ast.Name) and node.func.id in import_module_names
+        )
         qualified = (
             isinstance(node.func, ast.Attribute)
             and node.func.attr == "import_module"
             and isinstance(node.func.value, ast.Name)
             and node.func.value.id in qualified_names
         )
-        if not (direct or qualified):
+        if not (builtin or imported_import_module or qualified):
             continue
         target_node = (
             node.args[0]
@@ -185,15 +206,21 @@ def _dynamic_imports(tree: ast.AST) -> set[str]:
         if not isinstance(target, str):
             continue
         if target.startswith("."):
-            package = next(
+            package_node = next(
                 (
-                    keyword.value.value
+                    keyword.value
                     for keyword in node.keywords
                     if keyword.arg == "package"
-                    and isinstance(keyword.value, ast.Constant)
-                    and isinstance(keyword.value.value, str)
                 ),
                 None,
+            )
+            if package_node is None and not builtin and len(node.args) > 1:
+                package_node = node.args[1]
+            package = (
+                package_node.value
+                if isinstance(package_node, ast.Constant)
+                and isinstance(package_node.value, str)
+                else None
             )
             if package is None:
                 continue
@@ -275,6 +302,45 @@ def _is_forbidden_orm_free_import(importer: str, target: str) -> bool:
     )
 
 
+def _is_forbidden_spider_owner_import(target: str) -> bool:
+    return any(
+        target == root or target.startswith(f"{root}.")
+        for root in _FORBIDDEN_SPIDER_OWNER_IMPORT_ROOTS
+    )
+
+
+def _spider_owner_import_violations(
+    sources: dict[str, str],
+    package_modules: frozenset[str],
+) -> frozenset[tuple[str, str]]:
+    tracked_modules = frozenset(sources)
+    owners = {
+        module
+        for module in tracked_modules
+        if module.startswith("src.core.backtest.spider_")
+        and module != "src.core.backtest.spider_formal_runner"
+    } | {
+        module
+        for module in tracked_modules
+        if module
+        in {
+            "src.core.backtest.synthetic_scenario_codec",
+            "src.core.backtest.synthetic_scenario_replay",
+        }
+    }
+    violations: set[tuple[str, str]] = set()
+    for owner in owners:
+        tree = ast.parse(sources[owner])
+        imports = _static_imports(owner, tree, tracked_modules, package_modules)
+        imports.update(_dynamic_imports(tree))
+        violations.update(
+            (owner, target)
+            for target in imports
+            if _is_forbidden_spider_owner_import(target)
+        )
+    return frozenset(violations)
+
+
 def test_tracked_production_provider_imports_match_exact_baseline() -> None:
     sources, packages = _tracked_production_sources()
     assert (
@@ -290,6 +356,128 @@ def test_tracked_production_orm_free_port_imports_match_exact_baseline() -> None
     sources, packages = _tracked_production_sources()
     assert (
         _orm_free_pairs(sources, package_modules=packages) == _LEGACY_PORT_ORM_IMPORTS
+    )
+
+
+def test_spider_bridge_and_owners_keep_formal_dependency_direction() -> None:
+    sources, packages = _tracked_production_sources()
+    tracked = frozenset(sources)
+
+    def imports(module: str) -> set[str]:
+        tree = ast.parse(sources[module])
+        found = _static_imports(module, tree, tracked, packages)
+        found.update(_dynamic_imports(tree))
+        return found
+
+    bridge = "src.core.backtest.spider_formal_runner"
+    bridge_imports = imports(bridge)
+    spider_bridge_imports = {
+        target
+        for target in bridge_imports
+        if target.startswith("src.core.backtest.spider_")
+    }
+    assert _SPIDER_BRIDGE_OWNERS <= spider_bridge_imports
+    assert not any(
+        _is_forbidden_spider_owner_import(target) for target in bridge_imports
+    )
+
+    assert _spider_owner_import_violations(sources, packages) == frozenset()
+
+
+@pytest.mark.parametrize(
+    ("source", "target"),
+    [
+        (
+            'import importlib; importlib.import_module("src.core.backtest_runner")',
+            "src.core.backtest_runner",
+        ),
+        (
+            'from importlib import import_module as load; load("examples.run_spider_scenario_replay")',
+            "examples.run_spider_scenario_replay",
+        ),
+        ('__import__("src.core.adapters.simulated")', "src.core.adapters.simulated"),
+    ],
+)
+def test_spider_owner_ratchet_catches_literal_dynamic_imports(
+    source: str, target: str
+) -> None:
+    assert target in _dynamic_imports(ast.parse(source))
+    assert _is_forbidden_spider_owner_import(target)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "from src.core.data_sources.yahoo import YahooFinanceDataSource",
+        'import importlib; importlib.import_module("src.core.data_sources.yahoo")',
+    ],
+)
+def test_spider_owner_whole_ratchet_blocks_actual_provider_package(source: str) -> None:
+    owner = "src.core.backtest.spider_run_store"
+    assert _spider_owner_import_violations(
+        {owner: source, "src.core.data_sources.yahoo": ""},
+        frozenset(),
+    ) == frozenset({(owner, "src.core.data_sources.yahoo")})
+
+
+def test_spider_owner_whole_ratchet_resolves_import_module_positional_package() -> None:
+    owner = "src.core.backtest.spider_run_store"
+    source = (
+        "from importlib import import_module; "
+        'import_module("..backtest_runner", "src.core.backtest")'
+    )
+    assert "src.core.backtest_runner" in _dynamic_imports(ast.parse(source))
+    assert _spider_owner_import_violations({owner: source}, frozenset()) == frozenset(
+        {(owner, "src.core.backtest_runner")}
+    )
+
+
+def test_builtin_import_second_argument_is_not_a_package() -> None:
+    source = '__import__("..backtest_runner", {"__package__": "src.core.backtest"})'
+    assert "src.core.backtest_runner" not in _dynamic_imports(ast.parse(source))
+
+
+def test_spider_owner_whole_ratchet_allows_client_order_id_but_blocks_cli() -> None:
+    owner = "src.core.backtest.spider_run_store"
+    allowed = {
+        owner: "from src.core.client_order_id import ClientOrderId",
+        "src.core.client_order_id": "",
+    }
+    assert _spider_owner_import_violations(allowed, frozenset()) == frozenset()
+
+    cli_module = "examples.run_spider_scenario_replay"
+    blocked = {
+        owner: f"from {cli_module} import main",
+        cli_module: "",
+    }
+    assert _spider_owner_import_violations(blocked, frozenset()) == frozenset(
+        {(owner, cli_module)}
+    )
+
+
+def test_replay_contract_is_provider_and_orm_free_before_staging() -> None:
+    importer = "src.core.replay_contract"
+    source = (_PYTHON_ROOT / "src/core/replay_contract.py").read_text()
+    sources, packages = _tracked_production_sources()
+    sources[importer] = source
+    assert (
+        _provider_pairs(sources, package_modules=packages) == _LEGACY_PROVIDER_IMPORTS
+    )
+    assert (
+        _orm_free_pairs(sources, package_modules=packages) == _LEGACY_PORT_ORM_IMPORTS
+    )
+    assert (importer, "src.core.adapters.live_binance") in _provider_pairs(
+        sources
+        | {importer: "from src.core.adapters.live_binance import LiveBinanceAdapter"},
+        package_modules=packages,
+    )
+    assert (importer, "src.core.adapters") in _provider_pairs(
+        sources | {importer: "from src.core import adapters"},
+        package_modules=packages,
+    )
+    assert (importer, "src.core.orm_models.Order") in _orm_free_pairs(
+        sources | {importer: "from src.core.orm_models import Order"},
+        package_modules=packages,
     )
 
 
