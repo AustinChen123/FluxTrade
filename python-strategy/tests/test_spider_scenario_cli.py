@@ -26,6 +26,14 @@ ROOT = Path(__file__).parents[1]
 CLI = ROOT / "examples/run_spider_scenario_replay.py"
 
 
+def subprocess_env():
+    pythonpath = [str(ROOT), str(ROOT / "src")]
+    inherited_pythonpath = os.environ.get("PYTHONPATH")
+    if inherited_pythonpath:
+        pythonpath.append(inherited_pythonpath)
+    return dict(os.environ, PYTHONPATH=os.pathsep.join(pythonpath))
+
+
 class InvocationSubclass(ValueError):
     pass
 
@@ -36,7 +44,13 @@ def args(root, name="r1", selector=CLI_PLAN_IDS[0]):
 
 def command(root, name="r1", selector=CLI_PLAN_IDS[0]):
     return subprocess.run([sys.executable, str(CLI), *args(root, name, selector)], cwd=root,
-        env=dict(os.environ, PYTHONPATH=str(ROOT)), capture_output=True, text=True, encoding="utf-8", timeout=20)
+        env=subprocess_env(), capture_output=True, text=True, encoding="utf-8", timeout=20)
+
+
+def test_subprocess_environment_includes_repository_and_src_paths(monkeypatch):
+    monkeypatch.setenv("PYTHONPATH", "existing-path")
+    paths = subprocess_env()["PYTHONPATH"].split(os.pathsep)
+    assert paths == [str(ROOT), str(ROOT / "src"), "existing-path"]
 
 
 @pytest.mark.parametrize("outcome,reason,code", [("ADMITTED", None, 0), ("REJECTED", "UNSUPPORTED_CONFIGURATION", 2),
@@ -124,7 +138,7 @@ def test_actual_historical_cli_admits_native_input(tmp_path, partial_fill):
         [sys.executable, str(CLI), "--output-root", str(tmp_path), "--run-id", name,
          "--scenario-selector", "SPIDER_HISTORICAL_RESEARCH_RUN_V1",
          "--historical-input", str(input_path)],
-        cwd=ROOT, env=dict(os.environ, PYTHONPATH=str(ROOT)), capture_output=True,
+        cwd=ROOT, env=subprocess_env(), capture_output=True,
         text=True, encoding="utf-8", timeout=30,
     )
     assert (result.returncode, result.stderr) == (0, "")
