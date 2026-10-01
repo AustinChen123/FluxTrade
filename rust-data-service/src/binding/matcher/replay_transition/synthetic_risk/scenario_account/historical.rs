@@ -468,7 +468,10 @@ fn product_candidates(
             break;
         }
         let quantity = order.remaining.min(remaining_capacity);
-        if quantity < step.minimum_quantity || !aligned(quantity, step.quantity_step) {
+        if step.minimum_quantity <= Decimal::ZERO
+            || quantity <= Decimal::ZERO
+            || !aligned(quantity, step.quantity_step)
+        {
             continue;
         }
         let fill_index = cumulative_fill_index(&order.order_id)?;

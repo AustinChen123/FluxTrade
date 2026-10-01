@@ -101,7 +101,7 @@ fn validate_position(
             || !sources.insert(&facts.seed_execution_id)
             || !ids.insert(lot.execution_id)
             || previous.is_some_and(|seq| seq >= facts.seed_sequence)
-            || facts.contracts < spec.minimum
+            || facts.contracts <= Decimal::ZERO
             || !aligned(facts.contracts, spec.lot)
             || facts.entry <= Decimal::ZERO
             || !aligned(facts.entry, spec.tick)
@@ -135,7 +135,7 @@ pub(super) fn calculate<'a>(
 ) -> Result<Draft, Fault> {
     let context = context.into();
     let spec = context.active(fee_policy)?;
-    if quantity < spec.minimum
+    if quantity <= Decimal::ZERO
         || !aligned(quantity, spec.lot)
         || price <= Decimal::ZERO
         || !aligned(price, spec.tick)

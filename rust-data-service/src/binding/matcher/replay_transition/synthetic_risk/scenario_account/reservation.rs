@@ -87,7 +87,7 @@ pub(super) fn calculate(
             .iter()
             .filter(|o| matches!(&o.product, ProfileProduct::BtcEth(p) if p == &product))
         {
-            if order.remaining < spec.minimum
+            if order.remaining <= Decimal::ZERO
                 || order.original < spec.minimum
                 || order.filled < Decimal::ZERO
                 || [order.remaining, order.original, order.filled]

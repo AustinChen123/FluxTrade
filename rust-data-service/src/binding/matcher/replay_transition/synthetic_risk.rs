@@ -109,7 +109,6 @@ impl FrozenScenario {
             let (spec, tier_version) = self.resolve(&position.product, input.effective_at)?;
             if position.contracts <= Decimal::ZERO
                 || position.lots.is_empty()
-                || position.contracts < spec.minimum
                 || position.contracts.checked_rem(spec.lot) != Some(Decimal::ZERO)
             {
                 return Err("INVALID_POSITION");

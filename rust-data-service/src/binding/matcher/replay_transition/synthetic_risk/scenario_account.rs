@@ -605,7 +605,7 @@ impl ScenarioAccount {
                 || order.price <= Decimal::ZERO
                 || !aligned(order.price, spec.tick)
                 || order.original < spec.minimum
-                || order.remaining < spec.minimum
+                || order.remaining <= Decimal::ZERO
                 || order.filled < Decimal::ZERO
                 || order.canceled != Decimal::ZERO
                 || [order.original, order.filled, order.remaining]

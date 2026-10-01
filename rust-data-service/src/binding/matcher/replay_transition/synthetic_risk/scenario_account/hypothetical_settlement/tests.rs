@@ -23,6 +23,66 @@ fn closed_fee_policies_have_exact_rates_and_amounts() {
 }
 
 #[test]
+fn configured_minimum_does_not_reject_positive_aligned_partial_execution_or_lots() {
+    let (mut seed, mut products) = super::super::configured_tests::input(1);
+    seed.effective_at = 0;
+    products[0].specs[0].minimum = d("1");
+    for mark in &mut products[0].marks {
+        mark.valid_to = i64::MAX;
+    }
+    let owner = ScenarioAccount::from_configured(&seed, d("10"), products.clone()).unwrap();
+    let (scenario, _) = owner.btc_context().unwrap();
+    let product = &products[0].product;
+    let (spec, tier) = scenario.resolve(product, 0).unwrap();
+    let context = Context::Configured(scenario, product, spec, tier, 0);
+    let first = calculate(
+        None,
+        Side::Long,
+        d("0.5"),
+        d("100"),
+        context,
+        FeePolicy::ConfiguredTaker(d("0.001")),
+        Some(&opening(0)),
+    )
+    .unwrap();
+    let same_side = calculate(
+        first.position.as_ref(),
+        Side::Long,
+        d("0.5"),
+        d("100"),
+        context,
+        FeePolicy::ConfiguredTaker(d("0.001")),
+        Some(&opening(1)),
+    )
+    .unwrap();
+    let reduced = calculate(
+        same_side.position.as_ref(),
+        Side::Short,
+        d("0.5"),
+        d("100"),
+        context,
+        FeePolicy::ConfiguredTaker(d("0.001")),
+        None,
+    )
+    .unwrap();
+    assert_eq!(reduced.position.unwrap().contracts, d("0.5"));
+    for invalid in [Decimal::ZERO, d("0.25")] {
+        assert_eq!(
+            calculate(
+                None,
+                Side::Long,
+                invalid,
+                d("100"),
+                context,
+                FeePolicy::ConfiguredTaker(d("0.001")),
+                Some(&opening(2)),
+            ),
+            Err("INVALID_HYPOTHETICAL_EXECUTION")
+        );
+    }
+}
+
+#[test]
 fn origin_spec_preserves_fractional_fifo_under_active_v2_for_both_fee_policies() {
     let (_, config, _) = fixture();
     let (v1, _) = config.resolve(&Product::Btc, 1999).unwrap();

@@ -276,6 +276,65 @@ fn configured_empty_owners_preserve_order_and_shared_cash() {
 }
 
 #[test]
+fn configured_seed_partially_filled_order_allows_subminimum_remainder_only() {
+    let (mut seed, mut products) = input(1);
+    seed.effective_at = 0;
+    products[0].specs[0].lot = d("0.5");
+    products[0].specs[0].minimum = d("1");
+    products[0].marks[0].valid_to = i64::MAX;
+    seed.orders.push(SeedOrder {
+        intent_id: "SUBMIN-INTENT".into(),
+        order_id: "SUBMIN-ORDER".into(),
+        client_id: "SUBMIN-CLIENT".into(),
+        strategy_id: "SUBMIN-STRATEGY".into(),
+        product: ProfileProduct::BtcEth(products[0].product.clone()),
+        side: Side::Long,
+        price: d("100"),
+        reduce_only: false,
+        original: d("1"),
+        filled: d("0.5"),
+        canceled: Decimal::ZERO,
+        remaining: d("0.5"),
+        status: "PARTIALLY_FILLED".into(),
+    });
+
+    let owner = ScenarioAccount::from_configured(&seed, d("10"), products.clone()).unwrap();
+    assert_eq!(owner.orders["SUBMIN-ORDER"].facts.remaining, d("0.5"));
+    assert_eq!(
+        owner.reservation().unwrap().orders[0].remaining_contracts,
+        d("0.5")
+    );
+
+    for mutate in [
+        |order: &mut SeedOrder| {
+            order.original = d("0.5");
+            order.filled = Decimal::ZERO;
+            order.remaining = d("0.5");
+            order.status = "OPEN".into();
+        },
+        |order: &mut SeedOrder| {
+            order.filled = d("1");
+            order.remaining = Decimal::ZERO;
+        },
+        |order: &mut SeedOrder| {
+            order.filled = d("1.5");
+            order.remaining = d("-0.5");
+        },
+        |order: &mut SeedOrder| {
+            order.filled = d("0.75");
+            order.remaining = d("0.25");
+        },
+    ] {
+        let mut invalid = seed.clone();
+        mutate(&mut invalid.orders[0]);
+        assert_eq!(
+            ScenarioAccount::from_configured(&invalid, d("10"), products.clone()).unwrap_err(),
+            "INVALID_SEED_ORDER"
+        );
+    }
+}
+
+#[test]
 fn configured_shape_deviations_never_expose_owner() {
     let (seed, products) = input(2);
     type Mutation = fn(&mut ConfiguredProduct);

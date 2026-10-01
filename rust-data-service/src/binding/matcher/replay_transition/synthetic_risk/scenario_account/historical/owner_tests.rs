@@ -814,6 +814,109 @@ fn historical_market_partial_keeps_null_limit_and_settles_remaining_capacity_onc
 }
 
 #[test]
+fn subminimum_segment_fills_allow_completion_and_cancellation_of_dust() {
+    for market in [true, false] {
+        let (mut seed, mut products) = configured_ab();
+        seed.effective_at = 0;
+        seed.cash = d("1000");
+        products[0].specs[0].lot = d("0.5");
+        products[0].specs[0].minimum = d("1");
+        for product in &mut products {
+            for mark in &mut product.marks {
+                mark.valid_to = i64::MAX;
+            }
+        }
+        if !market {
+            seed.orders.push(SeedOrder {
+                intent_id: "DUST-LIMIT-INTENT".into(),
+                order_id: "DUST-LIMIT".into(),
+                client_id: "DUST-LIMIT-CLIENT".into(),
+                strategy_id: "DUST-LIMIT-STRATEGY".into(),
+                product: ProfileProduct::BtcEth(products[0].product.clone()),
+                side: Side::Long,
+                price: d("110"),
+                reduce_only: false,
+                original: d("1.5"),
+                filled: Decimal::ZERO,
+                canceled: Decimal::ZERO,
+                remaining: d("1.5"),
+                status: "OPEN".into(),
+            });
+        }
+        let mut owner = ScenarioAccount::from_configured(&seed, d("10"), products).unwrap();
+        let order_id = if market {
+            admit_market_quantity(&mut owner, "DUST-MARKET", Side::Long, d("1.5"))
+        } else {
+            "DUST-LIMIT".into()
+        };
+
+        let fill_segment = |owner: &mut ScenarioAccount, bar_open_ms| {
+            let mut input = node_input(
+                owner,
+                NodeBar {
+                    model: "OHLC4_OPEN_HIGH_LOW_CLOSE_V1",
+                    bar_open_ms,
+                    step_index: 1,
+                    a_ohlc: [d("100"), d("110"), d("90"), d("105")],
+                    a_volume: "2",
+                    a_mark: [d("100"), d("110"), d("90"), d("105")],
+                },
+                &[],
+            );
+            input.working_orders = owner.historical_working_orders().unwrap();
+            owner.historical_market_step(&input).unwrap()
+        };
+        let first = fill_segment(&mut owner, 2_000);
+        assert_eq!(first.products[0].fills.len(), 1);
+        assert_eq!(first.products[0].fills[0].quantity, d("0.5"));
+        assert_eq!(owner.orders[&order_id].facts.remaining, d("1"));
+        assert_eq!(
+            owner.reservation().unwrap().orders[0].remaining_contracts,
+            d("1")
+        );
+
+        let second = fill_segment(&mut owner, 4_000);
+        assert_eq!(second.products[0].fills.len(), 1);
+        assert_eq!(second.products[0].fills[0].quantity, d("0.5"));
+        assert_eq!(owner.orders[&order_id].facts.remaining, d("0.5"));
+        assert_eq!(
+            owner.reservation().unwrap().orders[0].remaining_contracts,
+            d("0.5")
+        );
+
+        let mut canceled_dust = owner.clone();
+        canceled_dust
+            .request_cancel(&risk_transition::cancel::RequestInput {
+                stamp: source::stamp("DUST-CANCEL-REQUEST", 70_000 * 16 + 10, 40),
+                targets: vec![(
+                    order_id.clone(),
+                    risk_transition::cancel::Reason::ExplicitScenario,
+                )],
+            })
+            .unwrap();
+        canceled_dust
+            .effect_cancel(&risk_transition::cancel::EffectInput {
+                stamp: source::stamp("DUST-CANCEL-EFFECT", 70_000 * 16 + 11, 50),
+                effects: vec![(
+                    "DUST-CANCEL-REQUEST".into(),
+                    order_id.clone(),
+                    risk_transition::cancel::Reason::ExplicitScenario,
+                )],
+            })
+            .unwrap();
+        assert_eq!(canceled_dust.orders[&order_id].facts.status, "CANCELED");
+        assert!(canceled_dust.reservation().unwrap().orders.is_empty());
+
+        let third = fill_segment(&mut owner, 6_000);
+        assert_eq!(third.products[0].fills.len(), 1);
+        assert_eq!(third.products[0].fills[0].quantity, d("0.5"));
+        assert_eq!(owner.orders[&order_id].facts.status, "FILLED");
+        assert_eq!(owner.orders[&order_id].facts.remaining, Decimal::ZERO);
+        assert_eq!(owner.gate, Gate::Running);
+    }
+}
+
+#[test]
 fn historical_gap_crossing_settles_both_eligible_limit_orders_without_terminal_gate() {
     let (mut seed, mut products) = configured_ab();
     seed.cash = d("1000");
