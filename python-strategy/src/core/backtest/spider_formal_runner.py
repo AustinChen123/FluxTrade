@@ -6,10 +6,12 @@ import json
 from dataclasses import dataclass, field
 from hashlib import sha256
 from os import PathLike
+from pathlib import Path
 from typing import Any, Literal, cast
 
 from src.core.backtest.spider_run_admission import admit_spider_run
 from src.core.backtest.spider_run_artifacts import canonical_bytes
+from src.core.backtest import spider_scenario_run
 
 _PROJECTION_SCHEMA = "spider_p02_projection_v1"
 _P3_CONTRACT = "SPIDER_HISTORICAL_RESEARCH_RUN_V1"
@@ -162,6 +164,19 @@ def _projection_value(artifacts: dict[str, Any]) -> dict[str, object]:
     }
 
 
+def _projection_from_admitted_artifacts(artifacts: object) -> SpiderP02Projection:
+    if type(artifacts) is not dict:
+        raise SpiderProjectionIntegrityError
+    try:
+        value = _projection_value(cast(dict[str, Any], artifacts))
+        encoded = canonical_bytes(value)
+    except (KeyError, TypeError, ValueError) as error:
+        if isinstance(error, SpiderProjectionIntegrityError):
+            raise
+        raise SpiderProjectionIntegrityError from error
+    return SpiderP02Projection(encoded, sha256(encoded).hexdigest())
+
+
 def project_admitted_spider_run(
     directory: str | PathLike[str],
 ) -> SpiderP02Projection | None:
@@ -173,14 +188,39 @@ def project_admitted_spider_run(
     admission = admit_spider_run(directory)
     if admission.get("decision") != "ACCEPT":
         return None
+    return _projection_from_admitted_artifacts(admission.get("artifacts"))
+
+
+def _invoke_spider_historical(
+    *, output_root: str, run_id: str, historical_input: bytes,
+    runner_kind: Literal["full", "research"],
+) -> SpiderFormalRunResult:
+    """Run the shared P3 lifecycle once, then expose only admitted evidence."""
+    run_result = spider_scenario_run.run_spider_scenario(
+        output_root, run_id, "SPIDER_HISTORICAL_RESEARCH_RUN_V1", historical_input,
+    )
+    outcome = cast(Literal["ADMITTED", "REJECTED", "FAILED", "DURABILITY_UNKNOWN"], run_result["outcome"])
+    reason = cast(str | None, run_result["reason"])
+    if outcome != "ADMITTED":
+        return SpiderFormalRunResult(runner_kind, run_id, outcome, reason, None, None)
+
+    admission = admit_spider_run(Path(output_root) / run_id)
+    if admission.get("decision") != "ACCEPT":
+        return SpiderFormalRunResult(
+            runner_kind, run_id, "FAILED", cast(str | None, admission.get("reason")), None, None,
+        )
     artifacts = admission.get("artifacts")
-    if type(artifacts) is not dict:
-        raise SpiderProjectionIntegrityError
     try:
-        value = _projection_value(cast(dict[str, Any], artifacts))
-        encoded = canonical_bytes(value)
+        projection = _projection_from_admitted_artifacts(artifacts)
+        if type(artifacts) is not dict:
+            raise SpiderProjectionIntegrityError
+        report_rows_json = canonical_bytes(cast(dict[str, Any], artifacts)["report.jsonl"])
     except (KeyError, TypeError, ValueError) as error:
         if isinstance(error, SpiderProjectionIntegrityError):
-            raise
-        raise SpiderProjectionIntegrityError from error
-    return SpiderP02Projection(encoded, sha256(encoded).hexdigest())
+            reason = str(error)
+        else:
+            reason = "FORMAL_PROJECTION_INTEGRITY_FAILED"
+        return SpiderFormalRunResult(runner_kind, run_id, "FAILED", reason, None, None)
+    return SpiderFormalRunResult(
+        runner_kind, run_id, "ADMITTED", None, "ACCEPT", projection, report_rows_json,
+    )

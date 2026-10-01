@@ -4,16 +4,22 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
+from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
 
+from examples import run_spider_scenario_replay as cli
 from src.core.backtest import spider_formal_runner as formal
 from src.core.backtest import spider_scenario_run as run
+from src.core.backtest.spider_historical_input import (
+    encode_historical_run_input, validate_historical_input,
+)
 from src.core.backtest.spider_run_admission import admit_spider_run
 from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_jsonl
+from test_spider_historical_oracle import _oracle_run
 from test_spider_scenario_run import historical_input
 
 
@@ -302,3 +308,211 @@ def test_projection_bytes_are_sensitive_to_each_retained_semantic_class(
     changed = canonical_bytes(formal._projection_value(changed_artifacts))
     assert changed != baseline
     assert sha256(changed).digest() != sha256(baseline).digest()
+
+
+@pytest.mark.parametrize("outcome", ["REJECTED", "FAILED", "DURABILITY_UNKNOWN"])
+def test_shared_failure_outcomes_pass_through_without_admission_or_projection(
+    monkeypatch, tmp_path, outcome, admitted_p3_artifacts,
+):
+    calls = []
+    monkeypatch.setattr(
+        formal.spider_scenario_run,
+        "run_spider_scenario",
+        lambda *args: (calls.append(("run", args)), dict(run_id="requested", outcome=outcome, reason="existing-reason"))[1],
+    )
+    monkeypatch.setattr(
+        formal, "admit_spider_run", lambda *_: pytest.fail("non-admitted run must not be admitted again"),
+    )
+    monkeypatch.setattr(
+        formal, "_projection_from_admitted_artifacts",
+        lambda *_: pytest.fail("non-admitted run must not be projected"),
+    )
+
+    result = formal._invoke_spider_historical(
+        output_root=str(tmp_path), run_id="requested", historical_input=b"input",
+        runner_kind="research",
+    )
+
+    assert result.outcome == outcome
+    assert result.reason == "existing-reason"
+    assert result.admission is None and result.projection is None and result.report_rows is None
+    assert calls == [("run", (str(tmp_path), "requested", run._P3_SELECTOR, b"input"))]
+
+
+@pytest.mark.parametrize("error", [ValueError("INVALID_INVOCATION"), RuntimeError("unexpected")])
+def test_scenario_exceptions_propagate_unchanged_without_admission(monkeypatch, tmp_path, error):
+    def raise_exactly(*_args):
+        raise error
+
+    monkeypatch.setattr(formal.spider_scenario_run, "run_spider_scenario", raise_exactly)
+    monkeypatch.setattr(
+        formal, "admit_spider_run", lambda *_: pytest.fail("scenario exception must propagate"),
+    )
+    with pytest.raises(type(error)) as raised:
+        formal._invoke_spider_historical(
+            output_root=str(tmp_path), run_id="requested", historical_input=b"input",
+            runner_kind="full",
+        )
+    assert raised.value is error
+    assert str(raised.value) == str(error)
+
+
+def test_admitted_run_with_rejected_recheck_preserves_admission_reason(
+    monkeypatch, tmp_path, admitted_p3_artifacts,
+):
+    monkeypatch.setattr(
+        formal.spider_scenario_run,
+        "run_spider_scenario",
+        lambda *_: dict(run_id="requested", outcome="ADMITTED", reason=None),
+    )
+    monkeypatch.setattr(
+        formal, "admit_spider_run",
+        lambda path: dict(decision="REJECT", reason="ENDPOINT_RECONCILIATION_FAILED", evidence=("endpoint.json",)),
+    )
+    monkeypatch.setattr(
+        formal, "_projection_from_admitted_artifacts",
+        lambda *_: pytest.fail("rejected recheck cannot project"),
+    )
+
+    result = formal._invoke_spider_historical(
+        output_root=str(tmp_path), run_id="requested", historical_input=b"input",
+        runner_kind="full",
+    )
+
+    assert result.outcome == "FAILED"
+    assert result.reason == "ENDPOINT_RECONCILIATION_FAILED"
+    assert result.admission is None and result.projection is None and result.report_rows is None
+
+
+def test_projection_integrity_failure_after_acceptance_maps_to_failed_without_mutation(
+    monkeypatch, tmp_path, admitted_p3_artifacts,
+):
+    before = deepcopy(admitted_p3_artifacts)
+    calls = []
+    monkeypatch.setattr(
+        formal.spider_scenario_run,
+        "run_spider_scenario",
+        lambda *_: dict(run_id="p4-projection-causality", outcome="ADMITTED", reason=None),
+    )
+    monkeypatch.setattr(
+        formal, "admit_spider_run",
+        lambda path: (calls.append(path), dict(decision="ACCEPT", artifacts=admitted_p3_artifacts))[1],
+    )
+    monkeypatch.setattr(
+        formal, "_projection_from_admitted_artifacts",
+        lambda *_: (_ for _ in ()).throw(formal.SpiderProjectionIntegrityError()),
+    )
+
+    result = formal._invoke_spider_historical(
+        output_root=str(tmp_path), run_id="p4-projection-causality", historical_input=b"input",
+        runner_kind="research",
+    )
+
+    assert result.outcome == "FAILED"
+    assert result.reason == "FORMAL_PROJECTION_INTEGRITY_FAILED"
+    assert result.admission is None and result.projection is None and result.report_rows is None
+    assert calls == [tmp_path / "p4-projection-causality"]
+    assert admitted_p3_artifacts == before
+
+
+def test_invocation_admits_and_projects_once_then_returns_detached_original_report_rows(
+    monkeypatch, tmp_path, admitted_p3_artifacts,
+):
+    before = deepcopy(admitted_p3_artifacts)
+    order = []
+    original_projection = formal._projection_from_admitted_artifacts
+
+    def scenario(*args):
+        order.append(("scenario", args))
+        return dict(run_id="p4-projection-causality", outcome="ADMITTED", reason=None)
+
+    def admission(path):
+        order.append(("admission", path))
+        return dict(decision="ACCEPT", artifacts=admitted_p3_artifacts)
+
+    def projection(artifacts):
+        order.append(("projection", artifacts))
+        return original_projection(artifacts)
+
+    monkeypatch.setattr(formal.spider_scenario_run, "run_spider_scenario", scenario)
+    monkeypatch.setattr(formal, "admit_spider_run", admission)
+    monkeypatch.setattr(formal, "_projection_from_admitted_artifacts", projection)
+
+    result = formal._invoke_spider_historical(
+        output_root=str(tmp_path), run_id="p4-projection-causality", historical_input=b"input",
+        runner_kind="full",
+    )
+
+    original_rows = admitted_p3_artifacts["report.jsonl"]
+    assert result.outcome == "ADMITTED" and result.reason is None and result.admission == "ACCEPT"
+    assert result.projection is not None
+    assert result.report_rows == original_rows
+    assert all(row["run_id"] == "p4-projection-causality" for row in result.report_rows or [])
+    normalized = deepcopy(original_rows)
+    for row in normalized:
+        row.pop("run_id")
+    assert result.projection.report_rows == normalized
+    first_copy = result.report_rows
+    assert first_copy is not None
+    first_copy[0]["account_cash"] = "tampered-copy"
+    assert result.report_rows == original_rows
+    assert admitted_p3_artifacts == before
+    assert [entry[0] for entry in order] == ["scenario", "admission", "projection"]
+    assert order[0][1] == (
+        str(tmp_path), "p4-projection-causality", run._P3_SELECTOR, b"input",
+    )
+    assert order[1][1] == tmp_path / "p4-projection-causality"
+    assert order[2][1] is admitted_p3_artifacts
+
+
+@pytest.mark.parametrize(
+    ("model_id", "expected_input_hash", "suffix"),
+    [
+        (
+            "OHLC4_OPEN_HIGH_LOW_CLOSE_V1",
+            "13f1f7f904777d482a69b46b5515ba91ea7c65a4471da1555381a07e283a6252",
+            "high-low",
+        ),
+        (
+            "OHLC4_OPEN_LOW_HIGH_CLOSE_V1",
+            "f6682a54d8bc1694387d0655e3d79ce05c9e1b0a3dbaef1ce44eecf292f9d2a2",
+            "low-high",
+        ),
+    ],
+)
+def test_h09_cli_and_bridge_produce_exact_p02_projection(
+    tmp_path, capsys, model_id, expected_input_hash, suffix,
+):
+    _, oracle_input = _oracle_run("H09", model_id=model_id)
+    cli_run_id = f"cli-h09-{suffix}"
+    bridge_run_id = f"formal-bridge-h09-{suffix}-different-length"
+    assert len(cli_run_id) != len(bridge_run_id)
+    assert oracle_input.model_id == model_id
+    assert validate_historical_input(oracle_input) == expected_input_hash
+
+    cli_input = replace(oracle_input, run_id=cli_run_id)
+    bridge_input = replace(oracle_input, run_id=bridge_run_id)
+    cli_raw = encode_historical_run_input(cli_input)
+    bridge_raw = encode_historical_run_input(bridge_input)
+    assert validate_historical_input(cli_input) == validate_historical_input(bridge_input) == expected_input_hash
+
+    input_path = tmp_path / f"{cli_run_id}-historical-input.json"
+    input_path.write_bytes(cli_raw)
+    cli_code = cli.main([
+        "--output-root", str(tmp_path), "--run-id", cli_run_id,
+        "--scenario-selector", "SPIDER_HISTORICAL_RESEARCH_RUN_V1",
+        "--historical-input", str(input_path),
+    ])
+    captured = capsys.readouterr()
+    assert (cli_code, captured.err) == (0, "")
+    assert json.loads(captured.out) == dict(run_id=cli_run_id, outcome="ADMITTED", reason=None)
+    cli_projection = formal.project_admitted_spider_run(tmp_path / cli_run_id)
+    bridge_result = formal._invoke_spider_historical(
+        output_root=str(tmp_path), run_id=bridge_run_id, historical_input=bridge_raw,
+        runner_kind="research",
+    )
+
+    assert cli_projection is not None
+    assert bridge_result.outcome == "ADMITTED" and bridge_result.projection is not None
+    assert cli_projection.canonical_json == bridge_result.projection.canonical_json
+    assert cli_projection.sha256 == bridge_result.projection.sha256
