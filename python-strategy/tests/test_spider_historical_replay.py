@@ -1,6 +1,6 @@
 from copy import deepcopy
 from dataclasses import replace
-from decimal import Decimal as D
+from decimal import Decimal as D, localcontext
 from hashlib import sha256
 import json
 import os
@@ -12,6 +12,7 @@ import pytest
 
 from src.core.backtest import synthetic_scenario_codec as wire
 from src.core.backtest.spider_run_admission import admit_spider_run
+from src.core.backtest.spider_policy import DEFAULTS
 from src.core.backtest.spider_historical_input import (
     HistoricalInputError, HistoricalRunInput, admit_before_construction, decode_p2_configuration,
     encode_historical_run_input, historical_context_for_input,
@@ -663,7 +664,7 @@ def test_market_cache_uses_exact_1440_closed_bars_and_ignores_future_until_its_c
     assert [(row["ctVal"], row["lotSz"], row["minSz"], row["increment"]) for row in rows] == [
         (D("1"), D("0.001"), D("0.001"), D("0.01")),
         (D("1"), D("0.001"), D("0.001"), D("0.01"))]
-    assert rows[0]["ratioHL"] == D("100")
+    assert rows[0]["ratioHL"] == D("1")
     assert rows[1]["ratioHL"] == D("0")
     assert rows[0]["price"] == D("100")
     later = common.range_end_ms * 16 + 6
@@ -672,6 +673,64 @@ def test_market_cache_uses_exact_1440_closed_bars_and_ignores_future_until_its_c
     assert left._policy.markets["A-USDT-SWAP"]["price"] == D("100")
     assert right._policy.markets["A-USDT-SWAP"]["price"] == D("150")
     assert right._policy.markets["A-USDT-SWAP"]["ratioHL"] > left._policy.markets["A-USDT-SWAP"]["ratioHL"]
+
+
+@pytest.mark.parametrize(
+    ("high", "expected_ratio"),
+    (("100", D("0")), ("103", D("0.03")), ("200", D("1")),
+     ("300", D("2")), ("301", D("2.01"))),
+)
+def test_initial_and_closed_market_cache_use_raw_ratio_for_policy_gate(high, expected_ratio):
+    base = _extend_one_minute(_valid_run())
+    included_open = base.range_start_ms - 86_340_000
+    altered = tuple(
+        replace(row, high=D(high), low=D("100"))
+        if row.product_id == "A-USDT-SWAP" and row.bar_open_ms == included_open
+        else row
+        for row in base.trade_bars
+    )
+    run = _rehashed_run(base, trade_rows=altered)
+
+    # The admitted initial cache is the same pre-window source history consumed
+    # by the first strategy timer; keep its raw units without projecting future bars.
+    state = cast(dict[str, object], decode_canonical(run.initial_policy_cache))
+    markets = cast(list[dict[str, object]], state["markets"])
+    initial_history = tuple(
+        row for row in run.trade_bars
+        if row.product_id == "A-USDT-SWAP"
+        and run.range_start_ms - 86_400_000 <= row.bar_open_ms < run.range_start_ms
+    )
+    assert len(initial_history) == 1440
+    with localcontext() as context:
+        context.prec = 50
+        initial_ratio = max(row.high for row in initial_history) / min(row.low for row in initial_history) - 1
+    assert initial_ratio == expected_ratio
+    next(row for row in markets if row["product_id"] == "A-USDT-SWAP")["ratioHL"] = str(initial_ratio)
+    run = replace(run, initial_policy_cache=canonical_bytes(state))
+    composition = _composition(run)
+    target = "A-USDT-SWAP"
+    next(row for row in composition._policy.rows if row["name"] == target)["active"] = "false"
+
+    first_raw = run.range_start_ms + 5_000
+    first_timer = first_raw * 16 + 9
+    assert composition._dispatch_due(first_timer)["classification"] == "SUCCESS"
+    timer_result = composition._records[(5, f"P3_TIMER_{first_raw}")]["result"]
+    assert timer_result["events"] == ({"at_ms": first_raw, "kind": "request_earn"},)
+    assert D(str(composition._policy.markets[target]["ratioHL"])) == initial_ratio
+
+    close_ms = run.range_start_ms + 60_000
+    assert composition._dispatch_due(close_ms * 16 + 6)["classification"] == "SUCCESS"
+    assert D(str(composition._policy.markets[target]["ratioHL"])) == expected_ratio
+    next(row for row in composition._policy.rows if row["name"] == target)["active"] = "true"
+    composition._policy.compare_reply()
+    target_orders = [
+        order
+        for event in composition._policy.events
+        if event["kind"] == "send"
+        for order in event["orders"]
+        if order["instId"] == target
+    ]
+    assert bool(target_orders) is (expected_ratio <= D(DEFAULTS["hlLimit"]))
 
 
 def test_market_cache_duplicates_conflicts_and_out_of_order_are_terminal_before_policy_mutation():
