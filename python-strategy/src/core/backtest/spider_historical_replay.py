@@ -115,7 +115,7 @@ def _closed_market_snapshots(
                 raise HistoricalInputError("invalid configured instrument code")
             with localcontext() as context:
                 context.prec = 50
-                ratio = (max(row.high for row in history) / min(row.low for row in history) - 1) * 100
+                ratio = max(row.high for row in history) / min(row.low for row in history) - 1
             rows.append(_MarketRow(
                 product_id=product_id,
                 price=current.close,
