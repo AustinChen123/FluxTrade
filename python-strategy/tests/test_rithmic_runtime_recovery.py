@@ -1,16 +1,22 @@
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
 
 import pytest
 
+from src.core.adapters.rithmic_ledger_recovery import (
+    RithmicLedgerRecoveryService,
+)
 from src.core.adapters.rithmic_runtime_recovery import (
     RithmicRuntimeRecoveryService,
     rithmic_maintenance_active,
 )
+from src.core.risk_manager import AccountService
+from src.core.runtime_environment import RuntimeEnvironment
 
 
 def _service(
@@ -438,18 +444,173 @@ def test_success_resets_failure_backoff_and_throttles_healthy_queries() -> None:
     assert service.run_once() is False
     now[0] = 900.0
     assert service.run_once() is True
-    now[0] = 4_499.0
+    now[0] = 1_199.0
     assert service.run_once() is True
     assert dependencies.reconcile_owned_orders.call_count == 2
-    now[0] = 4_500.0
+    now[0] = 1_200.0
     assert service.run_once() is False
-    now[0] = 5_399.0
+    now[0] = 2_099.0
     assert service.run_once() is False
     assert dependencies.reconcile_owned_orders.call_count == 3
-    now[0] = 5_400.0
+    now[0] = 2_100.0
     dependencies.reconcile_owned_orders.side_effect = RuntimeError("still down")
     assert service.run_once() is False
     assert dependencies.reconcile_owned_orders.call_count == 4
+
+
+def test_successful_cycles_keep_actual_account_service_snapshot_fresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    epoch_seconds = 1_800_000_000
+    now = [0.0]
+    hashes: dict[str, dict[str, str]] = {}
+
+    class MemoryRedis:
+        def ping(self) -> bool:
+            return True
+
+        def hset(self, name: str, mapping: dict[str, str]) -> int:
+            hashes.setdefault(name, {}).update(mapping)
+            return len(mapping)
+
+        def hgetall(self, name: str) -> dict[str, str]:
+            return hashes.get(name, {}).copy()
+
+    redis = MemoryRedis()
+    monkeypatch.setattr(
+        "src.core.risk_manager.create_redis_client", lambda: redis
+    )
+    monkeypatch.setattr(
+        "src.core.risk_manager.time.time", lambda: epoch_seconds + now[0]
+    )
+    account = AccountService()
+    environment = RuntimeEnvironment("test")
+    account.configure_authoritative_balance(
+        venue="rithmic",
+        account_id="ACCOUNT",
+        max_age_seconds=600.0,
+        runtime_environment=environment,
+    )
+    summary = {
+        "recoverable_count": 0,
+        "auto_resume_safe": True,
+        "ledger_verification": {
+            "account_id": "ACCOUNT",
+            "account_currency": "USD",
+            "verification_blocked": False,
+            "account_summary": {
+                "account_balance": Decimal("50000.25"),
+                "day_pnl": Decimal("-12.50"),
+                "timestamp_ms": epoch_seconds * 1000,
+            },
+        },
+    }
+    ledger = RithmicLedgerRecoveryService(
+        profile="profile",
+        account_id="ACCOUNT",
+        reconcile_owned_orders=lambda *_: summary,
+        now_seconds=lambda: epoch_seconds + now[0],
+        publish_authoritative_balance=account.replace_authoritative_balance,
+        logger=MagicMock(),
+        maintenance_active=lambda: False,
+    )
+    runtime, dependencies = _service(now=now)
+    dependencies.reconcile_owned_orders.side_effect = lambda *_: summary
+    runtime._publish_authoritative_summary = ledger.publish_authoritative_summary
+
+    for timestamp in (0.0, 300.0, 600.0, 900.0, 1_200.0):
+        now[0] = timestamp
+        assert runtime.run_once() is True
+        assert dependencies.reconcile_owned_orders.call_count == (
+            int(timestamp // 300.0) + 1
+        )
+        assert account.get_balance() == Decimal("50000.25")
+
+    assert dependencies.reconcile_owned_orders.call_count == 5
+    assert hashes["fluxtrade:test:account:rithmic:ACCOUNT"]["observed_at_ms"] == str(
+        int((epoch_seconds + 1_200.0) * 1000)
+    )
+
+
+def test_failed_cycle_preserves_observation_time_and_failure_cooldown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    epoch_seconds = 1_800_000_000
+    now = [0.0]
+    hashes: dict[str, dict[str, str]] = {}
+
+    class MemoryRedis:
+        def ping(self) -> bool:
+            return True
+
+        def hset(self, name: str, mapping: dict[str, str]) -> int:
+            hashes.setdefault(name, {}).update(mapping)
+            return len(mapping)
+
+        def hgetall(self, name: str) -> dict[str, str]:
+            return hashes.get(name, {}).copy()
+
+    redis = MemoryRedis()
+    monkeypatch.setattr(
+        "src.core.risk_manager.create_redis_client", lambda: redis
+    )
+    monkeypatch.setattr(
+        "src.core.risk_manager.time.time", lambda: epoch_seconds + now[0]
+    )
+    account = AccountService()
+    account.configure_authoritative_balance(
+        venue="rithmic",
+        account_id="ACCOUNT",
+        max_age_seconds=600.0,
+        runtime_environment=RuntimeEnvironment("test"),
+    )
+    summary = {
+        "recoverable_count": 0,
+        "auto_resume_safe": True,
+        "ledger_verification": {
+            "account_id": "ACCOUNT",
+            "account_currency": "USD",
+            "verification_blocked": False,
+            "account_summary": {
+                "account_balance": Decimal("50000.25"),
+                "day_pnl": Decimal("0"),
+                "timestamp_ms": epoch_seconds * 1000,
+            },
+        },
+    }
+    ledger = RithmicLedgerRecoveryService(
+        profile="profile",
+        account_id="ACCOUNT",
+        reconcile_owned_orders=lambda *_: summary,
+        now_seconds=lambda: epoch_seconds + now[0],
+        publish_authoritative_balance=account.replace_authoritative_balance,
+        logger=MagicMock(),
+        maintenance_active=lambda: False,
+    )
+    runtime, dependencies = _service(now=now)
+    dependencies.reconcile_owned_orders.side_effect = [
+        summary,
+        RuntimeError("down"),
+        RuntimeError("still down"),
+    ]
+    runtime._publish_authoritative_summary = ledger.publish_authoritative_summary
+
+    assert runtime.run_once() is True
+    original_observed_at = hashes["fluxtrade:test:account:rithmic:ACCOUNT"][
+        "observed_at_ms"
+    ]
+    now[0] = 300.0
+    assert runtime.run_once() is False
+    assert hashes["fluxtrade:test:account:rithmic:ACCOUNT"][
+        "observed_at_ms"
+    ] == original_observed_at
+    now[0] = 900.0
+    with pytest.raises(RuntimeError, match="authoritative_balance_snapshot_stale"):
+        account.get_balance()
+
+    now[0] = 1_199.0
+    assert runtime.run_once() is False
+    assert dependencies.reconcile_owned_orders.call_count == 2
 
 
 @pytest.mark.parametrize(
