@@ -9,14 +9,18 @@ from urllib.parse import quote
 import pytest
 
 from src.control_plane.backtest_result_http_contract import (
+    CandlesCursorBinding,
     CandlesCursor,
     IndexCursor,
+    IndexCursorBinding,
     InvalidBacktestResultHttpRequest,
+    TradesCursorBinding,
     TradesCursor,
     encode_result_cursor,
     format_utc_milliseconds,
     parse_job_id,
     parse_result_query,
+    verify_result_cursor,
     wire_decimal,
 )
 
@@ -157,3 +161,87 @@ def test_signed_cursor_canonical_route_payload_and_exact_signature():
 def test_signed_cursor_rejects_invalid_key_or_payload(key, payload):
     with pytest.raises(InvalidBacktestResultHttpRequest):
         encode_result_cursor(key, payload)
+
+
+def test_signed_cursor_roundtrips_and_binds_route_result_and_filter():
+    key = bytes(range(32))
+    cases = (
+        (IndexCursor(1000, "job:1"), IndexCursorBinding()),
+        (TradesCursor("%2F", "a" * 64, 4), TradesCursorBinding("%2F", "a" * 64)),
+        (
+            CandlesCursor("job:1", "b" * 64, 100, 200, 150),
+            CandlesCursorBinding("job:1", "b" * 64, 100, 200),
+        ),
+    )
+    for payload, binding in cases:
+        token = encode_result_cursor(key, payload)
+        assert verify_result_cursor(key, token, binding) == payload
+        if isinstance(payload, TradesCursor):
+            assert (
+                parse_result_query(
+                    "trades", ("limit=7&cursor=" + token).encode()
+                ).cursor
+                == token
+            )
+    failures = (
+        (
+            bytes(reversed(range(32))),
+            encode_result_cursor(key, cases[1][0]),
+            cases[1][1],
+        ),
+        (key, encode_result_cursor(key, cases[1][0])[:-1] + "0", cases[1][1]),
+        (
+            key,
+            encode_result_cursor(key, cases[1][0]),
+            TradesCursorBinding("other", "a" * 64),
+        ),
+        (
+            key,
+            encode_result_cursor(key, cases[1][0]),
+            TradesCursorBinding("%2F", "b" * 64),
+        ),
+        (
+            key,
+            encode_result_cursor(key, cases[2][0]),
+            CandlesCursorBinding("job:1", "b" * 64, 0, 200),
+        ),
+        (
+            key,
+            encode_result_cursor(key, cases[2][0]),
+            CandlesCursorBinding("job:1", "b" * 64, 100, 201),
+        ),
+        (
+            key,
+            encode_result_cursor(key, cases[2][0]),
+            cast(Callable[..., CandlesCursorBinding], CandlesCursorBinding)(
+                "job:1", "b" * 64, True, 200
+            ),
+        ),
+        (key, encode_result_cursor(key, cases[1][0]), IndexCursorBinding()),
+    )
+    for bad_key, token, binding in failures:
+        with pytest.raises(InvalidBacktestResultHttpRequest) as caught:
+            verify_result_cursor(bad_key, token, binding)
+        assert (
+            str(caught.value) == "validation_error" and caught.value.__cause__ is None
+        )
+
+
+def test_signed_cursor_rejects_authenticated_noncanonical_or_invalid_json():
+    key = bytes(32)
+    raw_values = (
+        b'{"completed_at":1,"job_id":"job","route":"index","x":1}',
+        b'{ "completed_at":1,"job_id":"job","route":"index"}',
+        b'{"completed_at":1,"job_id":"job","route":"index","route":"index"}',
+        b'{"completed_at":true,"job_id":"job","route":"index"}',
+        b'{"completed_at":1.0,"job_id":"job","route":"index"}',
+        b'{"completed_at":NaN,"job_id":"job","route":"index"}',
+    )
+    for raw in raw_values:
+        encoded = base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+        signature = hmac.new(key, encoded.encode(), hashlib.sha256).hexdigest()
+        with pytest.raises(InvalidBacktestResultHttpRequest):
+            verify_result_cursor(key, encoded + "." + signature, IndexCursorBinding())
+    signature = hmac.new(key, b"a", hashlib.sha256).hexdigest()
+    with pytest.raises(InvalidBacktestResultHttpRequest):
+        verify_result_cursor(key, "a." + signature, IndexCursorBinding())

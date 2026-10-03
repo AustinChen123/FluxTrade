@@ -62,6 +62,28 @@ class CandlesCursor:
 ResultCursor = IndexCursor | TradesCursor | CandlesCursor
 
 
+@dataclass(frozen=True, slots=True)
+class IndexCursorBinding:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class TradesCursorBinding:
+    job_id: str
+    result_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class CandlesCursorBinding:
+    job_id: str
+    result_digest: str
+    start: int
+    end: int
+
+
+ResultCursorBinding = IndexCursorBinding | TradesCursorBinding | CandlesCursorBinding
+
+
 def _decode_component(raw: bytes, *, form_encoded: bool = False) -> str:
     if re.search(rb"%(?![0-9A-Fa-f]{2})", raw):
         raise ValueError
@@ -246,5 +268,111 @@ def encode_result_cursor(key: bytes, payload: ResultCursor) -> str:
         encoded = base64.urlsafe_b64encode(canonical).rstrip(b"=").decode("ascii")
         signature = hmac.new(key, encoded.encode("ascii"), hashlib.sha256).hexdigest()
         return f"{encoded}.{signature}"
+    except (TypeError, ValueError, UnicodeError):
+        raise InvalidBacktestResultHttpRequest() from None
+
+
+def _cursor_from_fields(fields: object) -> ResultCursor:
+    if type(fields) is not dict or type(fields.get("route")) is not str:
+        raise ValueError
+    route = fields["route"]
+    if route == "index" and fields.keys() == {"route", "completed_at", "job_id"}:
+        payload: ResultCursor = IndexCursor(fields["completed_at"], fields["job_id"])
+    elif route == "trades" and fields.keys() == {
+        "route",
+        "job_id",
+        "result_digest",
+        "sequence",
+    }:
+        payload = TradesCursor(
+            fields["job_id"], fields["result_digest"], fields["sequence"]
+        )
+    elif route == "candles" and fields.keys() == {
+        "route",
+        "job_id",
+        "result_digest",
+        "start",
+        "end",
+        "timestamp",
+    }:
+        payload = CandlesCursor(
+            fields["job_id"],
+            fields["result_digest"],
+            fields["start"],
+            fields["end"],
+            fields["timestamp"],
+        )
+    else:
+        raise ValueError
+    _cursor_fields(payload)
+    return payload
+
+
+def _cursor_matches_binding(
+    payload: ResultCursor, binding: ResultCursorBinding
+) -> bool:
+    if type(payload) is IndexCursor:
+        return type(binding) is IndexCursorBinding
+    if type(payload) is TradesCursor:
+        return (
+            type(binding) is TradesCursorBinding
+            and _valid_job_id(binding.job_id)
+            and _valid_digest(binding.result_digest)
+            and (
+                binding.job_id,
+                binding.result_digest,
+            )
+            == (payload.job_id, payload.result_digest)
+        )
+    return (
+        type(payload) is CandlesCursor
+        and type(binding) is CandlesCursorBinding
+        and _valid_job_id(binding.job_id)
+        and _valid_digest(binding.result_digest)
+        and _valid_utc_ms(binding.start)
+        and _valid_utc_ms(binding.end)
+        and binding.start < binding.end
+        and (binding.job_id, binding.result_digest, binding.start, binding.end)
+        == (payload.job_id, payload.result_digest, payload.start, payload.end)
+    )
+
+
+def verify_result_cursor(
+    key: bytes, token: str, binding: ResultCursorBinding
+) -> ResultCursor:
+    """Authenticate canonical cursor JSON and enforce its route/filter binding."""
+    try:
+        if type(key) is not bytes or len(key) != 32 or type(token) is not str:
+            raise ValueError
+        if type(binding) not in (
+            IndexCursorBinding,
+            TradesCursorBinding,
+            CandlesCursorBinding,
+        ):
+            raise ValueError
+        encoded, separator, supplied_signature = token.partition(".")
+        if (
+            not separator
+            or "." in supplied_signature
+            or re.fullmatch(r"[A-Za-z0-9_-]+", encoded) is None
+            or re.fullmatch(r"[0-9a-f]{64}", supplied_signature) is None
+        ):
+            raise ValueError
+        expected_signature = hmac.new(
+            key, encoded.encode("ascii"), hashlib.sha256
+        ).hexdigest()
+        if not hmac.compare_digest(expected_signature, supplied_signature):
+            raise ValueError
+        padded = encoded + "=" * (-len(encoded) % 4)
+        canonical = base64.urlsafe_b64decode(padded.encode("ascii"))
+        if base64.urlsafe_b64encode(canonical).rstrip(b"=").decode("ascii") != encoded:
+            raise ValueError
+        fields = json.loads(canonical.decode("utf-8", "strict"))
+        payload = _cursor_from_fields(fields)
+        if _canonical_cursor_json(_cursor_fields(payload)) != canonical:
+            raise ValueError
+        if not _cursor_matches_binding(payload, binding):
+            raise ValueError
+        return payload
     except (TypeError, ValueError, UnicodeError):
         raise InvalidBacktestResultHttpRequest() from None
