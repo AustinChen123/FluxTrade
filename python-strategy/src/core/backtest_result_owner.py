@@ -1,4 +1,4 @@
-"""Canonical immutable input identity for completed backtest results."""
+"""Canonical result values and input identity for completed backtests."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import json
 from dataclasses import dataclass, fields
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import NamedTuple
 
 from src.core.decimal_math import canonical_decimal_text
 from src.core.product_registry import CapitalModel, FeeModel, InstrumentSpec, MarketType
@@ -187,3 +188,61 @@ def canonical_input_digest(identity: BacktestResultRunIdentity) -> str:
         allow_nan=False,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+class BacktestResultSummaryValues(NamedTuple):
+    initial_balance: Decimal
+    total_pnl: Decimal
+    net_pnl: Decimal
+    return_pct: Decimal
+    max_drawdown: Decimal
+    sharpe: Decimal
+    sortino: Decimal
+    calmar: Decimal
+
+
+class EquitySampleValues(NamedTuple):
+    sequence: int
+    timestamp: int
+    equity: Decimal
+    drawdown: Decimal
+
+
+class ClosedTradeValues(NamedTuple):
+    sequence: int
+    entry_time: int
+    exit_time: int
+    side: str
+    quantity: Decimal
+    entry_price: Decimal
+    exit_price: Decimal
+    fee: Decimal
+    pnl: Decimal
+
+
+class MonthlyReturnValues(NamedTuple):
+    month: str
+    return_pct: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class PnlDistributionValues:
+    sequence: int
+    lower: Decimal | None
+    upper: Decimal | None
+    count: int
+
+
+@dataclass(frozen=True, slots=True)
+class BacktestResultProjection:
+    identity: BacktestResultRunIdentity
+    completed_at: int
+    summary: BacktestResultSummaryValues
+    equity: tuple[EquitySampleValues, ...]
+    closed_trades: tuple[ClosedTradeValues, ...]
+    monthly_returns: tuple[MonthlyReturnValues, ...]
+    pnl_distribution: tuple[PnlDistributionValues, ...]
+    input_digest: str
+    result_digest: str
+    input_payload_json: str
+    result_payload_json: str
