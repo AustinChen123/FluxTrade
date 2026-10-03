@@ -27,6 +27,7 @@ from src.control_plane import (
     StrategyControlService,
     StrategyStateQueryService,
 )
+from src.control_plane.evaluation_data import RequestEvaluationDataSourceProvider
 from src.control_plane.jobs import JobStore
 from src.control_plane.ops_status_query import OpsStatusQuery
 from src.control_plane.profile_http_query import ProfileQueryService
@@ -111,13 +112,19 @@ def build_control_plane_app(
         )
     recover_interrupted = isinstance(job_store, SqliteJobStore)
     if parameter_search_evaluator is None:
+        evaluation_data_provider = RequestEvaluationDataSourceProvider(
+            session_factory=db_session_factory
+        )
         parameter_search_evaluator = ParameterSearchEvaluatorRegistry(
             {
                 "csv_signal": CsvSignalBacktestParameterEvaluator(
                     db_session_factory=db_session_factory
                 ),
-                "golden_cross": GoldenCrossResearchParameterEvaluator(),
-            }
+                "golden_cross": GoldenCrossResearchParameterEvaluator(
+                    data_source_provider=evaluation_data_provider
+                ),
+            },
+            data_source_provider=evaluation_data_provider,
         )
     ops_status_query: OpsStatusQuery | None
     try:
