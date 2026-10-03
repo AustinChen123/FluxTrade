@@ -111,6 +111,21 @@ def _loader(
 _DEFAULT_ARTIFACT = _strategy_class()
 
 
+def _resolve(
+    session_factory,
+    *,
+    request: FullStrategyBacktestRequest | None = None,
+    loader=None,
+):
+    from src.control_plane.full_backtest import resolve_full_backtest
+
+    return resolve_full_backtest(
+        request or _request(),
+        strategy_loader=(lambda: _loader()) if loader is None else loader,
+        session_factory=session_factory,
+    )
+
+
 def _assert_error(error: FullBacktestResolutionError, expected_code: str) -> None:
     assert error.code == expected_code
     assert str(error) == expected_code
@@ -171,3 +186,146 @@ def test_subject_resolution_rejects_missing_and_failed_catalogs():
     with pytest.raises(FullBacktestResolutionError) as failed:
         _resolve_subject(_request(), failed_loader)
     _assert_error(failed.value, "browser_result_subject_unavailable")
+
+
+@pytest.fixture
+def sealed_dataset(stored_dataset):
+    return stored_dataset[0]
+
+
+def test_valid_subject_and_sealed_data_resolve_to_fresh_runtime_instances(
+    sealed_dataset,
+):
+    resolved = _resolve(sealed_dataset)
+    again = _resolve(sealed_dataset)
+
+    assert resolved.strategy is not again.strategy
+    assert resolved.strategy.strategy_id == STRATEGY_ID
+    assert resolved.strategy.product_id == PRODUCT
+    assert resolved.dataset.id == DATASET
+    assert resolved.dataset.product_id == PRODUCT
+    assert resolved.dataset.timeframe == TIMEFRAME
+    assert resolved.source_range == (START, END)
+    assert resolved.decision_timeframe == TIMEFRAME
+    assert resolved.execution_timeframe is None
+    assert resolved.catalog_sha256 == CATALOG_SHA256
+
+
+@pytest.mark.parametrize("dataset_state", ["absent", "unsealed"])
+def test_missing_or_unsealed_dataset_is_dataset_unavailable(
+    sealed_dataset, dataset_state
+):
+    if dataset_state == "unsealed":
+        from src.core.orm_models import ResearchDataset
+
+        with sealed_dataset() as session:
+            row = session.get(ResearchDataset, DATASET)
+            assert row is not None
+            row.lifecycle_state = "importing"
+            row.sealed_at = None
+            session.commit()
+        request = _request()
+    else:
+        request = _request().model_copy(update={"dataset_id": "absent"})
+
+    with pytest.raises(FullBacktestResolutionError) as captured:
+        _resolve(sealed_dataset, request=request)
+    _assert_error(captured.value, "browser_result_dataset_unavailable")
+
+
+def test_sqlalchemy_failure_is_backend_unavailable_without_raw_details():
+    from sqlalchemy.exc import SQLAlchemyError
+
+    def broken_factory():
+        raise SQLAlchemyError("private database URL and credentials")
+
+    with pytest.raises(FullBacktestResolutionError) as captured:
+        _resolve(broken_factory)
+    _assert_error(captured.value, "browser_result_backend_unavailable")
+
+
+def test_dataset_product_must_match_the_requested_instrument(sealed_dataset):
+    request = _request(
+        product_id="BINANCE:ETHUSDT-PERP",
+        symbol="ETH/USDT:USDT",
+        base="ETH",
+    )
+    strategy = _strategy_class()
+    with pytest.raises(FullBacktestResolutionError) as captured:
+        _resolve(
+            sealed_dataset,
+            request=request,
+            loader=lambda: {STRATEGY_ID: strategy},
+        )
+    _assert_error(captured.value, "browser_result_dataset_unavailable")
+
+
+@pytest.mark.parametrize(
+    ("backtest_request", "timeframe", "expected_code"),
+    [
+        (_request().model_copy(update={"start": START - 1}), TIMEFRAME, "dataset"),
+        (_request().model_copy(update={"end": END + 1}), TIMEFRAME, "dataset"),
+        (_request(execution_timeframe="5m"), "5m", "dataset"),
+        (_request(), "5m", "dataset"),
+        (_request(execution_timeframe="1m"), "1m", "dataset"),
+        (_request(execution_timeframe="1m"), "30s", "dataset"),
+    ],
+)
+def test_dataset_identity_and_inclusive_coverage_are_enforced(
+    sealed_dataset, backtest_request, timeframe, expected_code
+):
+    strategy = _strategy_class(timeframe=timeframe)
+    with pytest.raises(FullBacktestResolutionError) as captured:
+        _resolve(
+            sealed_dataset,
+            request=backtest_request,
+            loader=lambda: {STRATEGY_ID: strategy},
+        )
+    _assert_error(captured.value, f"browser_result_{expected_code}_unavailable")
+
+
+@pytest.mark.parametrize(
+    ("decision_timeframe", "execution_timeframe"),
+    [("5m", "1m"), ("90s", "1m")],
+)
+def test_finer_execution_timeframe_must_match_source_and_divide_decisions(
+    sealed_dataset, decision_timeframe, execution_timeframe
+):
+    strategy = _strategy_class(timeframe=decision_timeframe)
+    request = _request(execution_timeframe=execution_timeframe)
+    if decision_timeframe == "5m":
+        resolved = _resolve(
+            sealed_dataset,
+            request=request,
+            loader=lambda: {STRATEGY_ID: strategy},
+        )
+        assert resolved.decision_timeframe == "5m"
+        assert resolved.execution_timeframe == "1m"
+        return
+
+    with pytest.raises(FullBacktestResolutionError) as captured:
+        _resolve(
+            sealed_dataset,
+            request=request,
+            loader=lambda: {STRATEGY_ID: strategy},
+        )
+    _assert_error(captured.value, "browser_result_dataset_unavailable")
+
+
+def test_get_available_range_remains_authoritative(sealed_dataset, monkeypatch):
+    from src.core.data_sources.research_database import ResearchDatabaseDataSource
+
+    called: list[tuple[str, str]] = []
+    original = ResearchDatabaseDataSource.get_available_range
+
+    def narrowed(source, product_id: str, timeframe: str):
+        called.append((product_id, timeframe))
+        available = original(source, product_id, timeframe)
+        assert available is not None
+        return (available[0] + 60_000, available[1])
+
+    monkeypatch.setattr(ResearchDatabaseDataSource, "get_available_range", narrowed)
+    with pytest.raises(FullBacktestResolutionError) as captured:
+        _resolve(sealed_dataset)
+    _assert_error(captured.value, "browser_result_dataset_unavailable")
+    assert called == [(PRODUCT, TIMEFRAME)]
