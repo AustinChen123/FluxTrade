@@ -7,6 +7,8 @@ import {
   loadGenerationSummaries,
   loadGenerationGenes,
   sendStrategyCommand,
+  loadKillSwitchStatus,
+  clearKillSwitch,
   type BrowserSession,
   type StrategyState
 } from "./api";
@@ -47,6 +49,19 @@ const strategy: StrategyState = {
 describe("strategy control API", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
+  });
+
+  it("validates no-store kill-switch status and sends the confirmed CSRF clear shape", async () => {
+    const fetch = vi.fn()
+      .mockResolvedValueOnce(response(200, { state: "LOCKDOWN", redis_state: "LOCKDOWN", durable_state: "OK", listener_available: true }))
+      .mockResolvedValueOnce(response(202, { status: "accepted" }));
+    vi.stubGlobal("fetch", fetch);
+    await expect(loadKillSwitchStatus()).resolves.toMatchObject({ state: "LOCKDOWN" });
+    await clearKillSwitch("csrf-token");
+    expect(fetch).toHaveBeenNthCalledWith(1, "/ops/kill-switch", expect.objectContaining({ cache: "no-store", credentials: "include" }));
+    expect(fetch).toHaveBeenNthCalledWith(2, "/ops/kill-switch/clear", expect.objectContaining({
+      method: "POST", headers: expect.objectContaining({ "X-CSRF-Token": "csrf-token" }), body: JSON.stringify({ confirm: true })
+    }));
   });
 
   it("returns an existing browser session", async () => {

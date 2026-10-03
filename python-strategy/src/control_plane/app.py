@@ -35,6 +35,7 @@ from src.control_plane.strategy_control import (
 )
 from src.control_plane.strategy_state_query import StrategyStateQueryService
 from src.control_plane.profile_http_query import ProfileQueryService
+from src.control_plane.ops_status_query import OpsStatusQuery
 from src.control_plane.profile_http_contract import ProfileHttpError
 
 
@@ -72,6 +73,7 @@ class ControlPlaneApp:
         browser_auth: BrowserAuthProvider | None = None,
         readiness_probe: Callable[[], None] | None = None,
         profile_query_service: ProfileQueryService | None = None,
+        ops_status_query: OpsStatusQuery | None = None,
     ) -> None:
         if api_key == "":
             raise ValueError("api_key must be non-empty when provided")
@@ -85,6 +87,7 @@ class ControlPlaneApp:
         self.browser_auth = browser_auth
         self.readiness_probe = readiness_probe
         self.profile_query_service = profile_query_service
+        self.ops_status_query = ops_status_query
 
     def shutdown(self, timeout: float) -> bool:
         """Stop accepting queued work and wait up to ``timeout`` for active jobs."""
@@ -135,7 +138,7 @@ class ControlPlaneApp:
 
         identity = self._authorize(headers)
         if isinstance(identity, HttpResponse):
-            if clean_path == "/api/v1/auth/session":
+            if clean_path in {"/api/v1/auth/session", "/ops/kill-switch"}:
                 return HttpResponse(
                     identity.status_code,
                     identity.body,
@@ -150,6 +153,8 @@ class ControlPlaneApp:
             identity.browser_principal,
         )
         if browser_policy_response is not None:
+            if clean_path == "/ops/kill-switch":
+                return HttpResponse(browser_policy_response.status_code, browser_policy_response.body, headers=(("Cache-Control", "no-store"),))
             return browser_policy_response
 
         if method == "GET" and clean_path == "/api/v1/market-data/volume-profiles":
@@ -249,6 +254,14 @@ class ControlPlaneApp:
                 )
             return self._command_response(result)
 
+        if method == "GET" and clean_path == "/ops/kill-switch":
+            if self.ops_status_query is None:
+                return HttpResponse(503, {"error": "ops_status_unavailable"}, headers=(("Cache-Control", "no-store"),))
+            try:
+                return HttpResponse(200, self.ops_status_query.read(), headers=(("Cache-Control", "no-store"),))
+            except Exception:
+                return HttpResponse(503, {"error": "ops_status_unavailable"}, headers=(("Cache-Control", "no-store"),))
+
         if method == "GET" and clean_path == "/strategies/health":
             if self.strategy_control is None:
                 return HttpResponse(503, {"error": "strategy_control_unavailable"})
@@ -280,6 +293,13 @@ class ControlPlaneApp:
             return HttpResponse(200, {"job": self._job_payload(job)})
 
         if method == "POST" and clean_path == "/ops/kill-switch/clear":
+            if identity.browser_principal is not None:
+                try:
+                    confirmation = self._parse_json_body(body)
+                except (json.JSONDecodeError, ValueError):
+                    confirmation = {}
+                if confirmation.get("confirm") is not True:
+                    return HttpResponse(403, {"error": "confirmation_required"})
             return self._publish_ops_command(
                 {
                     "command": "CLEAR_KILL_SWITCH",

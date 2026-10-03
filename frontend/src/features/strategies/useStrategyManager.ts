@@ -1,12 +1,15 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { useTranslation } from "react-i18next";
 
 import {
   ApiError,
+  clearKillSwitch,
   ensureBrowserSession,
+  loadKillSwitchStatus,
   loadStrategyStates,
   sendStrategyCommand,
   type BrowserSession,
+  type KillSwitchStatus,
   type StrategyCommand,
   type StrategyState
 } from "../../api";
@@ -87,6 +90,44 @@ export function useStrategyManager(t: Translate) {
   const [pendingStrategyId, setPendingStrategyId] = useState<string | null>(null);
   const [awaitingStrategies, setAwaitingStrategies] =
     useState<AwaitingStrategies>(loadAwaitingStrategies);
+  const [killSwitchStatus, setKillSwitchStatus] = useState<KillSwitchStatus | null>(null);
+  const [killSwitchReadError, setKillSwitchReadError] = useState(false);
+  const [killSwitchPending, setKillSwitchPending] = useState(false);
+  const [killSwitchReadPending, setKillSwitchReadPending] = useState(false);
+  const killSwitchPendingRef = useRef(false);
+  const killSwitchReadPendingRef = useRef(false);
+  const killSwitchReadPromiseRef = useRef<Promise<KillSwitchStatus | null> | null>(null);
+
+  const readKillSwitchStatus = useCallback(() => {
+    if (killSwitchReadPromiseRef.current !== null) {
+      return killSwitchReadPromiseRef.current;
+    }
+    killSwitchReadPendingRef.current = true;
+    setKillSwitchReadPending(true);
+    const request = (async (): Promise<KillSwitchStatus | null> => {
+      try {
+        const status = await loadKillSwitchStatus();
+        setKillSwitchStatus(status);
+        setKillSwitchReadError(false);
+        return status;
+      } catch {
+        setKillSwitchStatus(null);
+        setKillSwitchReadError(true);
+        return null;
+      } finally {
+        killSwitchReadPendingRef.current = false;
+        killSwitchReadPromiseRef.current = null;
+        setKillSwitchReadPending(false);
+      }
+    })();
+    killSwitchReadPromiseRef.current = request;
+    return request;
+  }, []);
+
+  const refreshKillSwitch = useCallback(() => {
+    if (killSwitchPendingRef.current) return Promise.resolve(null);
+    return readKillSwitchStatus();
+  }, [readKillSwitchStatus]);
 
   const applyStrategyStates = useCallback((items: StrategyState[]) => {
     setStrategies(items);
@@ -104,6 +145,8 @@ export function useStrategyManager(t: Translate) {
     setError(null);
     try {
       const browserSession = await ensureBrowserSession();
+      setKillSwitchStatus(null);
+      await refreshKillSwitch();
       const items = await loadStrategyStates();
       applyStrategyStates(items);
       setSession(browserSession);
@@ -112,7 +155,7 @@ export function useStrategyManager(t: Translate) {
     } finally {
       setLoading(false);
     }
-  }, [applyStrategyStates]);
+  }, [applyStrategyStates, refreshKillSwitch]);
 
   useEffect(() => {
     void refresh();
@@ -124,7 +167,7 @@ export function useStrategyManager(t: Translate) {
 
   const submit = useCallback(
     async (strategy: StrategyState, command: StrategyCommand) => {
-      if (!permittedCommands(strategy, session).includes(command)) return;
+      if (killSwitchPendingRef.current || !permittedCommands(strategy, session).includes(command)) return;
       if (
         !window.confirm(
           t("strategies.confirm", {
@@ -202,6 +245,33 @@ export function useStrategyManager(t: Translate) {
     [applyStrategyStates, awaitingStrategies, session, t]
   );
 
+  const unlockKillSwitch = useCallback(async () => {
+    if (killSwitchPendingRef.current || killSwitchReadPendingRef.current || loading || pendingStrategyId !== null ||
+        killSwitchStatus?.state !== "LOCKDOWN" || !killSwitchStatus.listener_available ||
+        session?.permissions?.can_mutate !== true || session.permissions.can_step_up !== true) return;
+    const confirmed = window.confirm(t("strategies.killSwitchConfirm"));
+    if (!confirmed) return;
+    killSwitchPendingRef.current = true;
+    setKillSwitchPending(true);
+    setNotice("");
+    try {
+      await clearKillSwitch(session.csrf_token);
+      setNotice(t("strategies.killSwitchAccepted"));
+      const observed = await readKillSwitchStatus();
+      setNotice(observed?.state === "OK"
+        ? t("strategies.killSwitchObserved")
+        : t("strategies.killSwitchAcceptedAwaiting"));
+    } catch (reason) {
+      const definite = reason instanceof ApiError &&
+        ([400, 401, 403, 404, 405, 409, 422].includes(reason.status) ||
+          (reason.status === 503 && ["kill_switch_no_listener", "redis_unavailable"].includes(reason.message)));
+      setNotice(definite ? t("strategies.killSwitchRejected") : t("strategies.killSwitchUnknown"));
+    } finally {
+      killSwitchPendingRef.current = false;
+      setKillSwitchPending(false);
+    }
+  }, [killSwitchStatus, loading, pendingStrategyId, readKillSwitchStatus, session, t]);
+
   return {
     strategies: strategies.map((strategy) => ({
       ...strategy, available_commands: permittedCommands(strategy, session)
@@ -215,6 +285,12 @@ export function useStrategyManager(t: Translate) {
     pendingStrategyId,
     awaitingStrategies,
     refresh,
-    submit
+    submit,
+    killSwitchStatus,
+    killSwitchReadError,
+    killSwitchPending,
+    killSwitchReadPending,
+    refreshKillSwitch,
+    unlockKillSwitch
   };
 }

@@ -22,13 +22,17 @@ from src.control_plane.server import make_handler
 ORIGIN = "https://fluxtrade.example.ts.net"
 OPERATOR_CAPABILITY = "example.com/cap/fluxtrade-operator"
 STEP_UP_CAPABILITY = "example.com/cap/fluxtrade-step-up"
+OWNER_LOGIN = "owner@example.com"
 
 
-def _browser_auth(*, clock=lambda: 1_000.0) -> BrowserSessionAuth:
+def _browser_auth(
+    *, clock=lambda: 1_000.0, owner_login: str | None = None
+) -> BrowserSessionAuth:
     return BrowserSessionAuth(
         allowed_origin=ORIGIN,
         operator_capability=OPERATOR_CAPABILITY,
         step_up_capability=STEP_UP_CAPABILITY,
+        owner_login=owner_login,
         clock=clock,
     )
 
@@ -64,9 +68,10 @@ def _browser_request_headers(
     cookie: str,
     csrf_token: str | None = None,
     *capabilities: str,
+    actor: str = "operator@example.com",
 ) -> dict[str, str]:
     headers = {
-        **_session_headers(*capabilities),
+        **_session_headers(*capabilities, actor=actor),
         "Cookie": cookie,
     }
     if csrf_token is not None:
@@ -346,6 +351,10 @@ def test_browser_clear_requires_live_step_up_and_uses_trusted_actor():
         OPERATOR_CAPABILITY,
         STEP_UP_CAPABILITY,
     )
+    missing_confirmation = app.handle(
+        "POST", "/ops/kill-switch/clear",
+        headers=_browser_request_headers(step_cookie, step_csrf, OPERATOR_CAPABILITY, STEP_UP_CAPABILITY),
+    )
     revoked = app.handle(
         "POST",
         "/ops/kill-switch/clear",
@@ -358,6 +367,7 @@ def test_browser_clear_requires_live_step_up_and_uses_trusted_actor():
     accepted = app.handle(
         "POST",
         "/ops/kill-switch/clear",
+        body='{"confirm":true}',
         headers=_browser_request_headers(
             step_cookie,
             step_csrf,
@@ -379,10 +389,51 @@ def test_browser_clear_requires_live_step_up_and_uses_trusted_actor():
 
     assert rejected.body == {"error": "step_up_required"}
     assert revoked.body == {"error": "step_up_required"}
+    assert missing_confirmation.body == {"error": "confirmation_required"}
     assert accepted.status_code == 202
     _, raw_payload = redis.publish.call_args.args
     assert json.loads(raw_payload)["params"]["actor"] == "operator@example.com"
+    assert json.loads(raw_payload)["command"] == "CLEAR_KILL_SWITCH"
+    assert json.loads(raw_payload)["params"] == {"actor": "operator@example.com"}
     assert expired.body == {"error": "step_up_required"}
+
+
+def test_browser_kill_switch_status_is_authenticated_no_store_and_sanitized():
+    auth = _browser_auth()
+    query = MagicMock()
+    query.read.return_value = {
+        "state": "LOCKDOWN", "redis_state": "LOCKDOWN",
+        "durable_state": "OK", "listener_available": True,
+    }
+    app = ControlPlaneApp(
+        BacktestJobExecutor(run_inline=True), browser_auth=auth,
+        ops_status_query=query,
+    )
+    anonymous = app.handle("GET", "/ops/kill-switch")
+    cookie, csrf = _create_session(app, OPERATOR_CAPABILITY)
+    response = app.handle("GET", "/ops/kill-switch", headers=_browser_request_headers(cookie, csrf, OPERATOR_CAPABILITY))
+    assert anonymous.status_code == 401
+    assert response.status_code == 200
+    assert dict(response.headers)["Cache-Control"] == "no-store"
+    assert response.body == query.read.return_value
+    query.read.side_effect = RuntimeError("must not leak this")
+    failed = app.handle("GET", "/ops/kill-switch", headers=_browser_request_headers(cookie, csrf, OPERATOR_CAPABILITY))
+    assert failed.status_code == 503
+    assert failed.body == {"error": "ops_status_unavailable"}
+    assert dict(failed.headers)["Cache-Control"] == "no-store"
+
+
+def test_api_key_clear_keeps_legacy_no_body_payload():
+    redis = MagicMock()
+    redis.publish.return_value = 1
+    app = ControlPlaneApp(
+        BacktestJobExecutor(run_inline=True), api_key="service-secret", redis_client=redis,
+    )
+    response = app.handle("POST", "/ops/kill-switch/clear", headers={"X-API-Key": "service-secret"})
+    assert response.status_code == 202
+    assert json.loads(redis.publish.call_args.args[1]) == {
+        "command": "CLEAR_KILL_SWITCH", "params": {"actor": "api_key"}
+    }
 
 
 def test_browser_gene_promotion_ignores_body_actor():
@@ -747,6 +798,7 @@ def test_browser_auth_environment_requires_explicit_complete_trust_config(
 ):
     from src.control_plane import main as control_plane_main
 
+    monkeypatch.delenv("CONTROL_PLANE_OWNER_LOGIN", raising=False)
     monkeypatch.setenv("CONTROL_PLANE_BROWSER_ORIGIN", ORIGIN)
     with pytest.raises(
         ValueError,
@@ -773,6 +825,12 @@ def test_browser_auth_environment_requires_explicit_complete_trust_config(
 
     assert auth is not None
     assert auth.allowed_origin == ORIGIN
+    assert auth.owner_login is None
+
+    monkeypatch.setenv("CONTROL_PLANE_OWNER_LOGIN", OWNER_LOGIN)
+    owner_auth = control_plane_main.build_browser_session_auth_from_env()
+    assert owner_auth is not None
+    assert owner_auth.owner_login == OWNER_LOGIN
 
     monkeypatch.setenv(
         "CONTROL_PLANE_STEP_UP_CAPABILITY",
@@ -782,6 +840,21 @@ def test_browser_auth_environment_requires_explicit_complete_trust_config(
         ValueError,
         match="operator and step-up capabilities must be distinct",
     ):
+        control_plane_main.build_browser_session_auth_from_env()
+
+
+def test_browser_auth_owner_login_is_rejected_without_trusted_proxy_auth(
+    monkeypatch,
+):
+    from src.control_plane import main as control_plane_main
+
+    monkeypatch.setenv("CONTROL_PLANE_TRUSTED_PROXY_AUTH", "false")
+    monkeypatch.delenv("CONTROL_PLANE_BROWSER_ORIGIN", raising=False)
+    monkeypatch.delenv("CONTROL_PLANE_OPERATOR_CAPABILITY", raising=False)
+    monkeypatch.delenv("CONTROL_PLANE_STEP_UP_CAPABILITY", raising=False)
+    monkeypatch.setenv("CONTROL_PLANE_OWNER_LOGIN", OWNER_LOGIN)
+
+    with pytest.raises(ValueError, match="require CONTROL_PLANE_TRUSTED_PROXY_AUTH=true"):
         control_plane_main.build_browser_session_auth_from_env()
 
 
@@ -831,6 +904,132 @@ def test_session_permissions_preserve_capabilities_and_step_up_deadline(
     assert {key: value for key, value in current.body.items() if key != "permissions"} == {
         key: value for key, value in created.body.items() if key != "permissions"
     }
+
+
+@pytest.mark.parametrize(
+    ("actor", "capabilities", "expected"),
+    [
+        (OWNER_LOGIN, (), {"can_mutate": True, "can_step_up": True}),
+        ("Owner@example.com", (), {"can_mutate": False, "can_step_up": False}),
+        ("owner@example.com.attacker", (), {"can_mutate": False, "can_step_up": False}),
+        ("operator@example.com", (OPERATOR_CAPABILITY,), {"can_mutate": True, "can_step_up": False}),
+        ("other@example.com", (STEP_UP_CAPABILITY,), {"can_mutate": False, "can_step_up": True}),
+    ],
+)
+def test_owner_capability_classification_is_exact_and_preserves_nonowner_policy(
+    actor, capabilities, expected,
+):
+    app = ControlPlaneApp(
+        BacktestJobExecutor(run_inline=True),
+        browser_auth=_browser_auth(owner_login=OWNER_LOGIN),
+    )
+
+    created = app.handle(
+        "POST", "/api/v1/auth/session", headers=_session_headers(*capabilities, actor=actor),
+    )
+    cookie = dict(created.headers)["Set-Cookie"].split(";", 1)[0]
+    current = app.handle(
+        "GET", "/api/v1/auth/session",
+        headers=_browser_request_headers(cookie, None, *capabilities, actor=actor),
+    )
+
+    assert created.status_code == 201
+    assert current.status_code == 200
+    assert current.body["permissions"] == expected
+    expected_capabilities = set(capabilities)
+    if actor == OWNER_LOGIN:
+        expected_capabilities.update({OPERATOR_CAPABILITY, STEP_UP_CAPABILITY})
+    assert current.body["capabilities"] == sorted(expected_capabilities)
+
+
+def test_owner_step_up_ends_at_existing_session_expiry_not_legacy_ttl():
+    now = [1_000.0]
+    auth = BrowserSessionAuth(
+        allowed_origin=ORIGIN,
+        operator_capability=OPERATOR_CAPABILITY,
+        step_up_capability=STEP_UP_CAPABILITY,
+        owner_login=OWNER_LOGIN,
+        session_ttl_seconds=600,
+        step_up_ttl_seconds=300,
+        clock=lambda: now[0],
+    )
+    principal = auth.issue(_session_headers(actor=OWNER_LOGIN))
+    headers = _browser_request_headers(
+        f"__Host-fluxtrade_session={principal.session_token}",
+        actor=OWNER_LOGIN,
+    )
+
+    now[0] += 301
+    authenticated = auth.authenticate(headers)
+    assert authenticated is not None
+    assert auth.has_step_up(authenticated)
+    assert authenticated.expires_at == 1_600.0
+    assert authenticated.step_up_expires_at == authenticated.expires_at
+
+    now[0] = authenticated.expires_at
+    assert auth.authenticate(headers) is None
+
+
+def test_owner_clear_keeps_same_origin_csrf_and_confirmation_guards():
+    now = [1_000.0]
+    redis = MagicMock()
+    redis.publish.return_value = 1
+    app = ControlPlaneApp(
+        BacktestJobExecutor(run_inline=True),
+        redis_client=redis,
+        browser_auth=BrowserSessionAuth(
+            allowed_origin=ORIGIN,
+            operator_capability=OPERATOR_CAPABILITY,
+            step_up_capability=STEP_UP_CAPABILITY,
+            owner_login=OWNER_LOGIN,
+            clock=lambda: now[0],
+        ),
+    )
+    created = app.handle(
+        "POST", "/api/v1/auth/session", headers=_session_headers(actor=OWNER_LOGIN),
+    )
+    cookie = dict(created.headers)["Set-Cookie"].split(";", 1)[0]
+    csrf = created.body["csrf_token"]
+    no_csrf = app.handle(
+        "POST", "/ops/kill-switch/clear", '{"confirm":true}',
+        headers=_browser_request_headers(cookie, actor=OWNER_LOGIN),
+    )
+    no_confirmation = app.handle(
+        "POST", "/ops/kill-switch/clear", headers=_browser_request_headers(
+            cookie, csrf, actor=OWNER_LOGIN,
+        ),
+    )
+    wrong_origin_headers = _browser_request_headers(cookie, csrf, actor=OWNER_LOGIN)
+    wrong_origin_headers["Origin"] = "https://attacker.example"
+    wrong_origin = app.handle(
+        "POST", "/ops/kill-switch/clear", '{"confirm":true}',
+        headers=wrong_origin_headers,
+    )
+    now[0] += 301
+    accepted = app.handle(
+        "POST", "/ops/kill-switch/clear", '{"confirm":true}',
+        headers=_browser_request_headers(cookie, csrf, actor=OWNER_LOGIN),
+    )
+
+    assert no_csrf.body == {"error": "csrf_rejected"}
+    assert no_confirmation.body == {"error": "confirmation_required"}
+    assert wrong_origin.body == {"error": "origin_rejected"}
+    assert accepted.status_code == 202
+    assert json.loads(redis.publish.call_args.args[1])["params"]["actor"] == OWNER_LOGIN
+
+
+@pytest.mark.parametrize(
+    "owner_login",
+    ["", " owner@example.com", "owner@example.com ", "owner\n@example.com", "x" * 65],
+)
+def test_browser_auth_rejects_invalid_configured_owner_login(owner_login):
+    with pytest.raises(ValueError, match="owner_login must be a valid trusted login"):
+        BrowserSessionAuth(
+            allowed_origin=ORIGIN,
+            operator_capability=OPERATOR_CAPABILITY,
+            step_up_capability=STEP_UP_CAPABILITY,
+            owner_login=owner_login,
+        )
 
 
 def test_session_permissions_follow_revocation_and_proxy_bypass_fails_closed():

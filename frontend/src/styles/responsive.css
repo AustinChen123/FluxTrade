@@ -59,8 +59,15 @@
   }
 
   .epoch-control select,
-  .language-control select {
+  .language-control select,
+  .theme-control {
     width: 100%;
+  }
+
+  .language-control select,
+  .theme-control,
+  .console-nav button {
+    min-height: 44px;
   }
 
   .run-strip dl {
@@ -167,8 +174,13 @@
   }
 
   .strategy-list > li {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
     gap: 14px;
+  }
+
+  .strategy-list > li > *,
+  .strategy-list > li > dl > div {
+    min-width: 0;
   }
 
   .strategy-list > li > dl {

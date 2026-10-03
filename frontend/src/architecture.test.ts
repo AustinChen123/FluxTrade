@@ -425,6 +425,7 @@ const expectedRelativeImportLedger = [
   "features/strategies/StrategyManagerView.tsx|../../shared/time/presentation|value|shared/time/presentation.ts",
   "features/strategies/StrategyManagerView.tsx|./strategyCommandState|type-only|features/strategies/strategyCommandState.ts",
   "features/strategies/useStrategyManager.test.ts|../../api|type-only|api.ts",
+  "features/strategies/useStrategyManager.test.ts|../../api|type-only|api.ts",
   "features/strategies/useStrategyManager.test.ts|../../api|value|api.ts",
   "features/strategies/useStrategyManager.test.ts|../../shared/i18n|value|shared/i18n.ts",
   "features/strategies/useStrategyManager.test.ts|./strategyCommandState|value|features/strategies/strategyCommandState.ts",
@@ -482,6 +483,7 @@ const expectedPolicyGlobalLedger = [
   "app/App.tsx|window.location.href",
   "app/App.tsx|window.location.search",
   "features/research/FitnessSurface3D.tsx|window.devicePixelRatio",
+  "features/strategies/useStrategyManager.ts|window.confirm()",
   "features/strategies/useStrategyManager.ts|window.confirm()",
   "features/strategies/useStrategyManager.ts|window.crypto.randomUUID()",
   "features/strategies/useStrategyManager.ts|window.sessionStorage.getItem()",
@@ -2385,7 +2387,7 @@ describe("frontend architecture ratchet", () => {
       /@charset|@import|url\(/
     );
     await expect(sha256(payload)).resolves.toBe(
-      "1a87740528436b8b090145d6035e550bf46ffaed580be91580a467da38232340"
+      "22720fa1639594fe3110447adb83239ef24bd4d262e344abbc474640146bc0a9"
     );
   });
 

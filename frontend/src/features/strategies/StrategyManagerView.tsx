@@ -13,6 +13,10 @@ import type {
   StrategyManagerError,
   StrategyRecord
 } from "./strategyCommandState";
+type KillSwitchStatus = {
+  state: "LOCKDOWN" | "OK" | "UNKNOWN";
+  listener_available: boolean;
+};
 
 type Translate = ReturnType<typeof useTranslation>["t"];
 
@@ -32,6 +36,12 @@ export interface StrategyManagerViewProps {
     strategy: StrategyRecord,
     command: StrategyCommandName
   ) => Promise<void>;
+  killSwitchStatus?: KillSwitchStatus | null;
+  killSwitchReadError?: boolean;
+  killSwitchPending?: boolean;
+  killSwitchReadPending?: boolean;
+  refreshKillSwitch?: () => Promise<unknown>;
+  unlockKillSwitch?: () => Promise<void>;
 }
 
 function commandLabel(command: StrategyCommandName, t: Translate): string {
@@ -66,6 +76,8 @@ export function StrategyManagerView({
   t,
   refresh,
   submit
+  ,killSwitchStatus = null, killSwitchReadError = false, killSwitchPending = false, killSwitchReadPending = false,
+  refreshKillSwitch = async () => undefined, unlockKillSwitch = async () => undefined
 }: StrategyManagerViewProps) {
   const counts = useMemo(() => {
     const totals: Partial<Record<StrategyRecord["status"], number>> = {};
@@ -129,11 +141,16 @@ export function StrategyManagerView({
               <path d="M12 3 3 7v5c0 5 9 9 9 9s9-4 9-9V7Z" />
               <path d="M12 8v5m0 3v1" />
             </svg>
-            {t("strategies.lockdownUnavailable")}
+            {t("strategies.killSwitchTitle")}
           </h3>
-          <p id="strategy-recovery-unavailable">{t("strategies.recoveryUnavailable")}</p>
+          <p>{t("strategies.killSwitchStatus", { state: killSwitchReadError ? t("strategies.killSwitchUnavailable") : (killSwitchStatus?.state ?? t("strategies.killSwitchLoading")) })}</p>
+          <p id="strategy-recovery-unavailable">{t(killSwitchPending || killSwitchReadPending || pendingStrategyId !== null ? "strategies.killSwitchPending" : killSwitchReadError ? "strategies.killSwitchReadError" : loading || killSwitchStatus === null ? "strategies.killSwitchLoadingReason" : killSwitchStatus.state === "UNKNOWN" ? "strategies.killSwitchUnknownStatus" : killSwitchStatus.state === "OK" ? "strategies.killSwitchGateOnly" : !killSwitchStatus.listener_available ? "strategies.killSwitchNoListener" : readOnly || stepUpRequired ? "strategies.killSwitchPermission" : "strategies.killSwitchRecoveryWarning")}</p>
         </div>
-        <button type="button" disabled aria-describedby="strategy-recovery-unavailable">
+        <button type="button" onClick={() => void refreshKillSwitch()} disabled={loading || killSwitchPending || killSwitchReadPending}>{t("strategies.killSwitchRefresh")}</button>
+        <button type="button" onClick={() => void unlockKillSwitch()} disabled={
+          loading || killSwitchPending || killSwitchReadPending || pendingStrategyId !== null || killSwitchReadError ||
+          killSwitchStatus?.state !== "LOCKDOWN" || !killSwitchStatus.listener_available || readOnly || stepUpRequired
+        } aria-describedby="strategy-recovery-unavailable">
           {t("strategies.unlockLockdown")}
         </button>
       </section>
@@ -198,7 +215,7 @@ export function StrategyManagerView({
                             key={command}
                             type="button"
                             className={command === "STOP" ? "danger-action" : ""}
-                            disabled={pendingStrategyId !== null || awaitingState}
+                            disabled={pendingStrategyId !== null || awaitingState || killSwitchPending}
                             onClick={() => void submit(strategy, command)}
                           >
                             {pending
