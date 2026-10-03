@@ -1,15 +1,17 @@
 from __future__ import annotations
 
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from src.control_plane.evaluation_data import (
+    CsvEvaluationDataSourceProvider,
     DatabaseEvaluationDataSourceProvider,
 )
-from src.control_plane.models import ParameterSearchJobRequest
+from src.control_plane.models import ParameterCandidate, ParameterSearchJobRequest
+from src.control_plane.parameter_evaluation import ResearchBacktestParameterEvaluator
 from src.core.orm_models import (
     Base,
     Exchange,
@@ -23,6 +25,8 @@ from src.core.research_datasets import (
     ResearchDatasetSpec,
 )
 from src.core.data_sources.research_database import ResearchDatabaseDataSource
+from src.strategies.base import BaseStrategy, StrategyRequirements
+from src.core.models import Signal, SignalType
 
 PRODUCT = "BINANCE:BTCUSDT-PERP"
 TIMEFRAME = "1m"
@@ -92,6 +96,39 @@ def _request(
             "candidates": [{"candidate_id": "a", "param_pack": {}}],
         }
     )
+
+
+class _AlternatingStrategy(BaseStrategy):
+    def __init__(self, strategy_id, product_id):
+        super().__init__(strategy_id, product_id)
+        self._index = 0
+
+    @property
+    def requirements(self):
+        return StrategyRequirements(self.product_id, TIMEFRAME, 1)
+
+    def on_candle(self, candle, context=None):
+        self._index += 1
+        signal_type = (
+            SignalType.LONG
+            if self._index in {1, 5}
+            else SignalType.SHORT
+            if self._index in {3, 7}
+            else SignalType.NO_SIGNAL
+        )
+        return Signal(
+            strategy_id=self.strategy_id,
+            product_id=self.product_id,
+            timeframe=TIMEFRAME,
+            timestamp=candle.timestamp,
+            type=signal_type,
+            value=candle.close,
+            quantity=Decimal("1") if signal_type != SignalType.NO_SIGNAL else None,
+        )
+
+
+def _factory(strategy_id, product_id, timeframe, param_pack):
+    return _AlternatingStrategy(strategy_id, product_id)
 
 
 def test_bound_provider_reads_sealed_decimal_rows_and_inclusive_single_point(
@@ -200,3 +237,58 @@ def test_provider_cache_key_is_bound_to_dataset_and_inclusive_range(stored_datas
     ).cache_key(request) != provider.cache_key(request)
     with pytest.raises(ValueError, match="dataset_id"):
         DatabaseEvaluationDataSourceProvider(" ", session_factory=factory)
+
+
+def test_research_evaluator_preloads_once_and_matches_csv_evaluation(
+    stored_dataset, monkeypatch
+):
+    factory, csv_path = stored_dataset
+    db_provider = DatabaseEvaluationDataSourceProvider(DATASET, session_factory=factory)
+    csv_provider = CsvEvaluationDataSourceProvider()
+    calls = 0
+    original = ResearchDatabaseDataSource.get_candles
+
+    def counted(source, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        yield from original(source, *args, **kwargs)
+
+    monkeypatch.setattr(ResearchDatabaseDataSource, "get_candles", counted)
+    db_evaluator = ResearchBacktestParameterEvaluator(
+        _factory, data_source_provider=db_provider
+    )
+    csv_evaluator = ResearchBacktestParameterEvaluator(
+        _factory, data_source_provider=csv_provider
+    )
+    request = _request(csv_path=csv_path)
+    first = ParameterCandidate(candidate_id="a", param_pack={})
+    second = ParameterCandidate(candidate_id="b", param_pack={})
+
+    db_result = db_evaluator.evaluate(request, first)
+    db_evaluator.evaluate(request, second)
+    csv_result = csv_evaluator.evaluate(request, first)
+
+    assert calls == 1
+    assert db_result.score_total != 0
+    assert db_result.metrics["closed_trade_count"] > 0
+    assert db_result.score_total == csv_result.score_total
+    assert db_result.max_drawdown == csv_result.max_drawdown
+    _assert_decimal_tree_equal(db_result.metrics, csv_result.metrics)
+
+
+def _assert_decimal_tree_equal(left, right):
+    if isinstance(left, dict):
+        assert left.keys() == right.keys()
+        for key in left:
+            _assert_decimal_tree_equal(left[key], right[key])
+    elif isinstance(left, list):
+        assert len(left) == len(right)
+        for left_item, right_item in zip(left, right):
+            _assert_decimal_tree_equal(left_item, right_item)
+    elif isinstance(left, str) and isinstance(right, str):
+        try:
+            assert Decimal(left) == Decimal(right)
+        except InvalidOperation:
+            assert left == right
+    else:
+        assert left == right
