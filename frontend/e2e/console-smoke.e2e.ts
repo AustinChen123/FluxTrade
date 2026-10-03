@@ -956,6 +956,100 @@ for (const roster of ["empty", "single", "multiple"] as const) {
   });
 }
 
+const WARMUP_DIAGNOSTIC =
+  "warmup_insufficient_candles: strategy_id=mnq_triad_one_v1 available=0 required=288";
+const LONG_STRATEGY_ID = `mnq_triad_one_v1_${"unbrokenid".repeat(8)}`;
+
+test("strategy diagnostics and identifiers reflow without clipping", async ({ page }, testInfo) => {
+  await page.addInitScript(() => {
+    localStorage.setItem("fluxtrade.locale", "en");
+    localStorage.setItem("fluxtrade.theme", "light");
+  });
+  await page.route("**/*", async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (path === "/api/v1/auth/session" && request.method() === "GET") {
+      return route.fulfill({ json: BROWSER_SESSION });
+    }
+    if (path === "/ops/kill-switch" && request.method() === "GET") {
+      return route.fulfill({ json: { state: "OK", redis_state: "OK", durable_state: "OK", listener_available: true } });
+    }
+    if (path === "/strategy-states" && request.method() === "GET") {
+      return route.fulfill({
+        json: {
+          ...STRATEGY_PAGE,
+          states: [{
+            ...STRATEGY_PAGE.states[0],
+            strategy_id: LONG_STRATEGY_ID,
+            last_error_message: WARMUP_DIAGNOSTIC
+          }]
+        }
+      });
+    }
+    if (/^\/(api\/|ops\/|strateg)/.test(path)) {
+      throw new Error(`unexpected_api_request:${request.method()}:${path}`);
+    }
+    return route.continue();
+  });
+
+  for (const width of [375, 390, 1440]) {
+    await page.setViewportSize({ width, height: width < 500 ? 844 : 900 });
+    await page.goto("http://127.0.0.1:4174/?view=strategies");
+    await expect(page.locator(".strategy-list > li")).toHaveCount(1);
+    await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+    await expect(page.locator("#language")).toHaveValue("en");
+
+    for (const locale of ["en", "zh-TW"] as const) {
+      await page.locator("#language").selectOption(locale);
+      for (const theme of ["light", "dark"] as const) {
+        const activeTheme = await page.locator("html").getAttribute("data-theme");
+        if (activeTheme !== theme) await page.locator(".theme-control").click();
+        await expect(page.locator("html")).toHaveAttribute("data-theme", theme);
+        await expect(page.locator(".strategy-action p")).toHaveText(WARMUP_DIAGNOSTIC);
+        await expect(page.locator(".strategy-action p")).toBeVisible();
+        await expect(page.locator(".strategy-identity strong")).toHaveText(LONG_STRATEGY_ID);
+
+        const layout = await page.evaluate((viewportWidth) => {
+          const diagnostic = document.querySelector<HTMLElement>(".strategy-action p")!;
+          const strategyId = document.querySelector<HTMLElement>(".strategy-identity strong")!;
+          const theme = document.querySelector<HTMLElement>(".theme-control")!;
+          const box = theme.getBoundingClientRect();
+          return {
+            documentFits: document.documentElement.scrollWidth <= document.documentElement.clientWidth,
+            diagnosticFits: diagnostic.scrollWidth <= diagnostic.clientWidth && diagnostic.scrollHeight <= diagnostic.clientHeight + 1,
+            diagnosticWidth: diagnostic.clientWidth,
+            strategyIdFits: strategyId.scrollWidth <= strategyId.clientWidth,
+            themeWidth: box.width,
+            themeHeight: box.height,
+            mobileControlsMeetTarget: viewportWidth >= 500 || [
+              ...document.querySelectorAll<HTMLElement>(".console-nav button, #language, .theme-control")
+            ].every((control) => control.getBoundingClientRect().height >= 44)
+          };
+        }, width);
+        expect(layout.documentFits).toBe(true);
+        expect(layout.diagnosticFits).toBe(true);
+        expect(layout.diagnosticWidth).toBeGreaterThan(0);
+        expect(layout.strategyIdFits).toBe(true);
+        expect(layout.mobileControlsMeetTarget).toBe(true);
+        if (width === 1440) {
+          expect(layout.themeWidth).toBe(118);
+          expect(layout.themeHeight).toBe(38);
+        }
+      }
+    }
+
+    if (width < 500) {
+      await expect.poll(
+        () => page.locator("body").evaluate((body) => getComputedStyle(body).backgroundColor)
+      ).toBe("rgb(17, 25, 29)");
+      await page.screenshot({
+        path: testInfo.outputPath(`strategy-diagnostic-${width}-${testInfo.project.name}.png`),
+        fullPage: true
+      });
+    }
+  }
+});
+
 for (const failure of [401, 403, 409, 408, 503, "listener", "network", "malformed", "refresh"] as const) {
   test(`strategy command failure ${failure} preserves lock semantics`, async ({ page }) => {
     let sent = 0;

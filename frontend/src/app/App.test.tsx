@@ -640,6 +640,15 @@ describe("GA visualization state", () => {
     expect(document.documentElement.lang).toBe("en");
   });
 
+  it.each(["light", "dark"])("keeps the theme icon geometry stable in %s mode", async (mode) => {
+    window.localStorage.setItem("fluxtrade-theme", mode);
+    render(<App />);
+    const icon = document.querySelector(".theme-control-icon") as SVGSVGElement;
+    expect(icon.getAttribute("viewBox")).toBe("0 0 24 24");
+    expect(icon.getAttribute("aria-hidden")).toBe("true");
+    expect(icon.querySelector("path, circle")).not.toBeNull();
+  });
+
   it("switches between saved light and dark themes", async () => {
     api.loadGenerationSummaries.mockResolvedValue([summary]);
     api.loadGenerationGenes.mockResolvedValue([gene("epoch-a")]);
