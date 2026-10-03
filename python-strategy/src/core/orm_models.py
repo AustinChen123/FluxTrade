@@ -569,6 +569,56 @@ class BacktestClosedTrade(Base):
     pnl: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
 
 
+class BacktestMonthlyReturn(Base):
+    __tablename__ = "backtest_monthly_return"
+    __table_args__ = (
+        CheckConstraint(
+            "return_pct NOT IN ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric)",
+            name="ck_backtest_monthly_return_finite",
+        ).ddl_if(dialect="postgresql"),
+    )
+
+    summary_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey(
+            "backtest_result_summary.id",
+            name="fk_backtest_monthly_return_summary",
+        ),
+        primary_key=True,
+    )
+    month: Mapped[str] = mapped_column(String(7), primary_key=True)
+    return_pct: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+
+
+class BacktestPnlDistribution(Base):
+    __tablename__ = "backtest_pnl_distribution"
+    __table_args__ = (
+        CheckConstraint("sequence >= 0", name="ck_backtest_pnl_distribution_sequence"),
+        CheckConstraint("count >= 0", name="ck_backtest_pnl_distribution_count"),
+        *(
+            CheckConstraint(
+                f"{field} IS NULL OR {field} NOT IN "
+                "('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric)",
+                name=f"ck_backtest_pnl_distribution_{field}_finite",
+            ).ddl_if(dialect="postgresql")
+            for field in ("lower", "upper")
+        ),
+    )
+
+    summary_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey(
+            "backtest_result_summary.id",
+            name="fk_backtest_pnl_distribution_summary",
+        ),
+        primary_key=True,
+    )
+    sequence: Mapped[int] = mapped_column(Integer, primary_key=True)
+    lower: Mapped[Decimal | None] = mapped_column(Numeric, nullable=True)
+    upper: Mapped[Decimal | None] = mapped_column(Numeric, nullable=True)
+    count: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
 class BacktestTradeLog(Base):
     __tablename__ = "backtest_trade_log"
     id: Mapped[str] = mapped_column(String, primary_key=True)
