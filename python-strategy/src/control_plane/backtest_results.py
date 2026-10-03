@@ -10,6 +10,8 @@ from sqlalchemy.orm import Session
 
 from src.control_plane.backtest_result_http_contract import (
     BacktestResultQuery,
+    CandlesCursor,
+    CandlesCursorBinding,
     IndexCursor,
     IndexCursorBinding,
     InvalidBacktestResultHttpRequest,
@@ -22,6 +24,9 @@ from src.control_plane.backtest_result_http_contract import (
     verify_result_cursor,
     wire_decimal,
 )
+from src.core.data_provider import timeframe_to_ms
+from src.core.data_sources.research_database import ResearchDatabaseDataSource
+from src.core.models import Candlestick
 from src.core.orm_models import (
     BacktestClosedTrade,
     BacktestEquitySample,
@@ -53,6 +58,7 @@ _FORMAL_DECIMAL_FIELDS = (
     "sortino",
     "calmar",
 )
+_MAX_CANDLE_RANGE_ROWS = 10_000
 
 
 class BacktestResultsIndexItem(TypedDict):
@@ -87,6 +93,21 @@ class BacktestResultsTrade(TypedDict):
 
 class BacktestResultsTradesPage(TypedDict):
     items: list[BacktestResultsTrade]
+    next_cursor: str | None
+    revision: Literal[1]
+
+
+class BacktestResultsCandle(TypedDict):
+    timestamp: str
+    open: str
+    high: str
+    low: str
+    close: str
+    volume: str
+
+
+class BacktestResultsCandlesPage(TypedDict):
+    items: list[BacktestResultsCandle]
     next_cursor: str | None
     revision: Literal[1]
 
@@ -288,6 +309,35 @@ def _distribution_item(
         "upper": None if row.upper is None else wire_decimal(row.upper),
         "count": row.count,
     }
+
+
+def _candle_item(
+    candle: Candlestick,
+    *,
+    product_id: str,
+    timeframe: str,
+    start: int,
+    end: int,
+) -> tuple[int, BacktestResultsCandle]:
+    timestamp = getattr(candle, "timestamp", None)
+    if (
+        type(timestamp) is not int
+        or not start <= timestamp < end
+        or type(candle.product_id) is not str
+        or candle.product_id != product_id
+        or type(candle.timeframe) is not str
+        or candle.timeframe != timeframe
+    ):
+        raise ValueError
+    item: BacktestResultsCandle = {
+        "timestamp": format_utc_milliseconds(timestamp),
+        "open": wire_decimal(candle.open),
+        "high": wire_decimal(candle.high),
+        "low": wire_decimal(candle.low),
+        "close": wire_decimal(candle.close),
+        "volume": wire_decimal(candle.volume),
+    }
+    return timestamp, item
 
 
 class BacktestResultsQueryService:
@@ -533,6 +583,132 @@ class BacktestResultsQueryService:
                 BacktestResultsTradesPage,
                 {"items": items, "next_cursor": next_cursor, "revision": 1},
             )
+        except (
+            BacktestResultsUnavailable,
+            BacktestResultsNotFound,
+            InvalidBacktestResultHttpRequest,
+        ):
+            raise
+        except Exception:
+            raise BacktestResultsReadUnavailable() from None
+
+    def list_candles(
+        self, job_id: str, query: BacktestResultQuery
+    ) -> BacktestResultsCandlesPage:
+        if not _valid_job_id(job_id) or type(query) is not BacktestResultQuery:
+            raise InvalidBacktestResultHttpRequest() from None
+        limit = 100 if query.limit is None else query.limit
+        if (
+            type(limit) is not int
+            or not 1 <= limit <= 500
+            or type(query.start_ms) is not int
+            or type(query.end_ms) is not int
+            or query.start_ms >= query.end_ms
+            or (
+                query.cursor is not None
+                and (type(query.cursor) is not str or not query.cursor.strip())
+            )
+        ):
+            raise InvalidBacktestResultHttpRequest() from None
+        start = query.start_ms
+        end = query.end_ms
+        try:
+            format_utc_milliseconds(start)
+            format_utc_milliseconds(end)
+        except ValueError:
+            raise InvalidBacktestResultHttpRequest() from None
+
+        try:
+            with self._session_factory() as session:
+                summary = self._qualified_summary(session, job_id)
+                identity = _index_item(summary)
+                digest = identity["result_digest"]
+                after = None
+                if query.cursor is not None:
+                    after = verify_result_cursor(
+                        self._cursor_key,
+                        query.cursor,
+                        CandlesCursorBinding(job_id, digest, start, end),
+                    )
+                    if type(after) is not CandlesCursor:
+                        raise InvalidBacktestResultHttpRequest() from None
+
+                source = ResearchDatabaseDataSource(
+                    identity["dataset_id"], session_factory=self._session_factory
+                )
+                metadata = source.get_dataset_metadata()
+                source_timeframe_ms = timeframe_to_ms(metadata.timeframe)
+                if (
+                    type(metadata.id) is not str
+                    or metadata.id != identity["dataset_id"]
+                    or type(metadata.product_id) is not str
+                    or metadata.product_id != identity["product_id"]
+                    or type(metadata.timeframe) is not str
+                    or not metadata.timeframe.strip()
+                    or source_timeframe_ms <= 0
+                    or type(metadata.start_time) is not int
+                    or type(metadata.end_time) is not int
+                    or metadata.start_time > metadata.end_time
+                ):
+                    raise ValueError
+                format_utc_milliseconds(metadata.start_time)
+                format_utc_milliseconds(metadata.end_time)
+                if (
+                    not metadata.start_time
+                    <= start
+                    < end
+                    <= (metadata.end_time + source_timeframe_ms)
+                ):
+                    raise InvalidBacktestResultHttpRequest() from None
+
+                candle_generator = source.get_candles(
+                    metadata.product_id,
+                    metadata.timeframe,
+                    start,
+                    end - 1,
+                )
+                rows: list[tuple[int, BacktestResultsCandle]] = []
+                previous_timestamp: int | None = None
+                try:
+                    for candle in candle_generator:
+                        if len(rows) == _MAX_CANDLE_RANGE_ROWS:
+                            raise InvalidBacktestResultHttpRequest() from None
+                        timestamp, item = _candle_item(
+                            candle,
+                            product_id=metadata.product_id,
+                            timeframe=metadata.timeframe,
+                            start=start,
+                            end=end,
+                        )
+                        if (
+                            previous_timestamp is not None
+                            and timestamp <= previous_timestamp
+                        ):
+                            raise ValueError
+                        previous_timestamp = timestamp
+                        rows.append((timestamp, item))
+                finally:
+                    close = getattr(candle_generator, "close", None)
+                    if callable(close):
+                        close()
+
+                page_candidates = [
+                    row for row in rows if after is None or row[0] > after.timestamp
+                ]
+                has_more = len(page_candidates) > limit
+                page_rows = page_candidates[:limit]
+                next_cursor = None
+                if has_more:
+                    next_cursor = encode_result_cursor(
+                        self._cursor_key,
+                        CandlesCursor(job_id, digest, start, end, page_rows[-1][0]),
+                    )
+                items = [item for _, item in page_rows]
+            return {
+                "items": items,
+                "next_cursor": next_cursor,
+                "revision": 1,
+            }
         except (
             BacktestResultsUnavailable,
             BacktestResultsNotFound,
