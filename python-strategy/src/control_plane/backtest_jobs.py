@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor, wait as wait_futures
 from contextlib import AbstractContextManager
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from decimal import Decimal
 from threading import Lock
 from typing import Any, Callable
@@ -220,4 +220,9 @@ def _json_safe(value: Any) -> Any:
         return [_json_safe(v) for v in value]
     if hasattr(value, "model_dump"):
         return _json_safe(value.model_dump(mode="json"))
+    if is_dataclass(value) and not isinstance(value, type):
+        return {
+            field.name: _json_safe(getattr(value, field.name))
+            for field in fields(value)
+        }
     return value
