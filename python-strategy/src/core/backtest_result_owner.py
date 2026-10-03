@@ -8,7 +8,10 @@ from dataclasses import dataclass, fields
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from fractions import Fraction
-from typing import NamedTuple
+from time import time_ns
+from typing import Callable, NamedTuple
+
+from sqlalchemy.orm import Session
 
 from src.core.backtest_result_persistence import FullBacktestOutcome
 from src.core.decimal_math import (
@@ -18,6 +21,13 @@ from src.core.decimal_math import (
     exact_decimal_subtract,
 )
 from src.core.models import PositionSide
+from src.core.orm_models import (
+    BacktestClosedTrade,
+    BacktestEquitySample,
+    BacktestMonthlyReturn,
+    BacktestPnlDistribution,
+    BacktestResultSummary,
+)
 from src.core.product_registry import CapitalModel, FeeModel, InstrumentSpec, MarketType
 
 
@@ -479,3 +489,116 @@ def _result_payload(
             for row in distribution
         ],
     }
+
+
+@dataclass(frozen=True, slots=True)
+class BacktestResultPersistenceReceipt:
+    job_id: str
+    input_digest: str
+    result_digest: str
+
+
+class BacktestResultPersistenceError(RuntimeError):
+    """Fixed failure surface for any rejected completed-result write."""
+
+
+class BacktestResultPersistenceOwner:
+    def __init__(
+        self,
+        session_factory: Callable[[], Session],
+        *,
+        clock_ns: Callable[[], int] = time_ns,
+    ) -> None:
+        self._session_factory = session_factory
+        self._clock_ns = clock_ns
+
+    def persist(
+        self,
+        identity: BacktestResultRunIdentity,
+        outcome: FullBacktestOutcome,
+    ) -> BacktestResultPersistenceReceipt:
+        try:
+            completed_at = self._clock_ns() // 1_000_000
+            projection = _project_result(identity, outcome, completed_at=completed_at)
+            with self._session_factory() as session:
+                with session.begin():
+                    summary = BacktestResultSummary(
+                        strategy_id=identity.strategy_id,
+                        start_time=identity.start,
+                        end_time=identity.end,
+                        total_pnl=projection.summary.total_pnl,
+                        metrics_json=None,
+                        job_id=identity.job_id,
+                        dataset_id=identity.dataset_id,
+                        subject_kind="STRATEGY_ARTIFACT",
+                        subject_id=f"{identity.strategy_id}:{identity.artifact_version}",
+                        input_digest=projection.input_digest,
+                        result_digest=projection.result_digest,
+                        product_id=identity.product_id,
+                        timeframe=identity.timeframe,
+                        currency=identity.currency,
+                        completed_at=projection.completed_at,
+                        initial_balance=projection.summary.initial_balance,
+                        net_pnl=projection.summary.net_pnl,
+                        return_pct=projection.summary.return_pct,
+                        max_drawdown=projection.summary.max_drawdown,
+                        sharpe=projection.summary.sharpe,
+                        sortino=projection.summary.sortino,
+                        calmar=projection.summary.calmar,
+                    )
+                    session.add(summary)
+                    session.flush()
+                    summary_id = summary.id
+                    session.add_all(
+                        [
+                            BacktestEquitySample(
+                                summary_id=summary_id,
+                                sequence=row.sequence,
+                                timestamp=row.timestamp,
+                                equity=row.equity,
+                                drawdown=row.drawdown,
+                            )
+                            for row in projection.equity
+                        ]
+                        + [
+                            BacktestClosedTrade(
+                                summary_id=summary_id,
+                                sequence=row.sequence,
+                                entry_time=row.entry_time,
+                                exit_time=row.exit_time,
+                                side=row.side,
+                                quantity=row.quantity,
+                                entry_price=row.entry_price,
+                                exit_price=row.exit_price,
+                                fee=row.fee,
+                                pnl=row.pnl,
+                            )
+                            for row in projection.closed_trades
+                        ]
+                        + [
+                            BacktestMonthlyReturn(
+                                summary_id=summary_id,
+                                month=row.month,
+                                return_pct=row.return_pct,
+                            )
+                            for row in projection.monthly_returns
+                        ]
+                        + [
+                            BacktestPnlDistribution(
+                                summary_id=summary_id,
+                                sequence=row.sequence,
+                                lower=row.lower,
+                                upper=row.upper,
+                                count=row.count,
+                            )
+                            for row in projection.pnl_distribution
+                        ]
+                    )
+                    session.flush()
+            return BacktestResultPersistenceReceipt(
+                identity.job_id, projection.input_digest, projection.result_digest
+            )
+        except Exception:
+            raise BacktestResultPersistenceError(
+                "browser_result_persistence_failed"
+            ) from None
