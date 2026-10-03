@@ -28,11 +28,13 @@ from src.control_plane import (
     StrategyStateQueryService,
 )
 from src.control_plane.jobs import JobStore
+from src.control_plane.ops_status_query import OpsStatusQuery
 from src.control_plane.profile_http_query import ProfileQueryService
 from src.core.market_data.profiles.read_repository import ProfileReadRepository
 from src.control_plane.server import serve
 from src.core.db import SessionLocal, get_engine
 from src.core.redis_factory import create_redis_client
+from src.core.runtime_environment import RuntimeEnvironment
 
 
 logger = logging.getLogger(__name__)
@@ -117,6 +119,13 @@ def build_control_plane_app(
                 "golden_cross": GoldenCrossResearchParameterEvaluator(),
             }
         )
+    ops_status_query: OpsStatusQuery | None
+    try:
+        ops_status_query = OpsStatusQuery(
+            redis_client, db_session_factory, RuntimeEnvironment.from_env()
+        )
+    except ValueError:
+        ops_status_query = None
     return ControlPlaneApp(
         BacktestJobExecutor(
             store=job_store,
@@ -137,6 +146,7 @@ def build_control_plane_app(
         redis_client=redis_client,
         browser_auth=browser_auth,
         profile_query_service=profile_query_service,
+        ops_status_query=ops_status_query,
         readiness_probe=(
             readiness_probe
             if readiness_probe is not None

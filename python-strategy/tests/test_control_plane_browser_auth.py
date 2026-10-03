@@ -346,6 +346,10 @@ def test_browser_clear_requires_live_step_up_and_uses_trusted_actor():
         OPERATOR_CAPABILITY,
         STEP_UP_CAPABILITY,
     )
+    missing_confirmation = app.handle(
+        "POST", "/ops/kill-switch/clear",
+        headers=_browser_request_headers(step_cookie, step_csrf, OPERATOR_CAPABILITY, STEP_UP_CAPABILITY),
+    )
     revoked = app.handle(
         "POST",
         "/ops/kill-switch/clear",
@@ -358,6 +362,7 @@ def test_browser_clear_requires_live_step_up_and_uses_trusted_actor():
     accepted = app.handle(
         "POST",
         "/ops/kill-switch/clear",
+        body='{"confirm":true}',
         headers=_browser_request_headers(
             step_cookie,
             step_csrf,
@@ -379,10 +384,51 @@ def test_browser_clear_requires_live_step_up_and_uses_trusted_actor():
 
     assert rejected.body == {"error": "step_up_required"}
     assert revoked.body == {"error": "step_up_required"}
+    assert missing_confirmation.body == {"error": "confirmation_required"}
     assert accepted.status_code == 202
     _, raw_payload = redis.publish.call_args.args
     assert json.loads(raw_payload)["params"]["actor"] == "operator@example.com"
+    assert json.loads(raw_payload)["command"] == "CLEAR_KILL_SWITCH"
+    assert json.loads(raw_payload)["params"] == {"actor": "operator@example.com"}
     assert expired.body == {"error": "step_up_required"}
+
+
+def test_browser_kill_switch_status_is_authenticated_no_store_and_sanitized():
+    auth = _browser_auth()
+    query = MagicMock()
+    query.read.return_value = {
+        "state": "LOCKDOWN", "redis_state": "LOCKDOWN",
+        "durable_state": "OK", "listener_available": True,
+    }
+    app = ControlPlaneApp(
+        BacktestJobExecutor(run_inline=True), browser_auth=auth,
+        ops_status_query=query,
+    )
+    anonymous = app.handle("GET", "/ops/kill-switch")
+    cookie, csrf = _create_session(app, OPERATOR_CAPABILITY)
+    response = app.handle("GET", "/ops/kill-switch", headers=_browser_request_headers(cookie, csrf, OPERATOR_CAPABILITY))
+    assert anonymous.status_code == 401
+    assert response.status_code == 200
+    assert dict(response.headers)["Cache-Control"] == "no-store"
+    assert response.body == query.read.return_value
+    query.read.side_effect = RuntimeError("must not leak this")
+    failed = app.handle("GET", "/ops/kill-switch", headers=_browser_request_headers(cookie, csrf, OPERATOR_CAPABILITY))
+    assert failed.status_code == 503
+    assert failed.body == {"error": "ops_status_unavailable"}
+    assert dict(failed.headers)["Cache-Control"] == "no-store"
+
+
+def test_api_key_clear_keeps_legacy_no_body_payload():
+    redis = MagicMock()
+    redis.publish.return_value = 1
+    app = ControlPlaneApp(
+        BacktestJobExecutor(run_inline=True), api_key="service-secret", redis_client=redis,
+    )
+    response = app.handle("POST", "/ops/kill-switch/clear", headers={"X-API-Key": "service-secret"})
+    assert response.status_code == 202
+    assert json.loads(redis.publish.call_args.args[1]) == {
+        "command": "CLEAR_KILL_SWITCH", "params": {"actor": "api_key"}
+    }
 
 
 def test_browser_gene_promotion_ignores_body_actor():
