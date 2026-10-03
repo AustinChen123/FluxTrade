@@ -28,6 +28,10 @@ from src.control_plane.models import (
 )
 from src.control_plane.parameter_search import ParameterSearchJobExecutor
 from src.control_plane.parameter_evaluation import UnsupportedParameterSearchError
+from src.control_plane.evaluation_data import (
+    SealedDatasetBackendUnavailableError,
+    SealedDatasetRejectedError,
+)
 from src.control_plane.presets import GoldenCrossParameterSearchPreset
 from src.control_plane.strategy_control import (
     StrategyControlService,
@@ -359,6 +363,11 @@ class ControlPlaneApp:
 
         try:
             job = self.parameter_search_executor.submit_search(request)
+        except (
+            SealedDatasetRejectedError,
+            SealedDatasetBackendUnavailableError,
+        ) as exc:
+            return _sealed_dataset_error_response(exc)
         except UnsupportedParameterSearchError as exc:
             return HttpResponse(
                 422,
@@ -392,6 +401,11 @@ class ControlPlaneApp:
 
         try:
             job = self.parameter_search_executor.submit_search(request)
+        except (
+            SealedDatasetRejectedError,
+            SealedDatasetBackendUnavailableError,
+        ) as exc:
+            return _sealed_dataset_error_response(exc)
         except UnsupportedParameterSearchError as exc:
             return HttpResponse(
                 422,
@@ -445,6 +459,11 @@ class ControlPlaneApp:
                     job = self.parameter_search_executor.retry_search(job_id)
                 else:
                     job = self.backtest_executor.retry_backtest(job_id)
+            except (
+                SealedDatasetRejectedError,
+                SealedDatasetBackendUnavailableError,
+            ) as exc:
+                return _sealed_dataset_error_response(exc)
             except ValueError as exc:
                 return HttpResponse(409, {"error": "job_action_rejected", "detail": str(exc)})
             except KeyError:
@@ -1031,6 +1050,14 @@ def _requires_step_up(path: str) -> bool:
     return path == "/ops/kill-switch/clear" or (
         path.startswith("/genes/") and path.endswith("/promote")
     )
+
+
+def _sealed_dataset_error_response(
+    error: SealedDatasetRejectedError | SealedDatasetBackendUnavailableError,
+) -> HttpResponse:
+    if isinstance(error, SealedDatasetRejectedError):
+        return HttpResponse(422, {"error": "sealed_dataset_rejected"})
+    return HttpResponse(503, {"error": "sealed_dataset_backend_unavailable"})
 
 
 def _utc_iso(value: float | None) -> str | None:
