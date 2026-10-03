@@ -1,0 +1,188 @@
+"""Bounded SQL readers for immutable browser result projections."""
+
+from collections.abc import Callable
+from decimal import Decimal
+from typing import Literal, TypedDict, cast
+
+from sqlalchemy import and_, or_, select
+from sqlalchemy.orm import Session
+
+from src.control_plane.backtest_result_http_contract import (
+    BacktestResultQuery,
+    IndexCursor,
+    IndexCursorBinding,
+    InvalidBacktestResultHttpRequest,
+    _valid_digest,
+    _valid_job_id,
+    encode_result_cursor,
+    format_utc_milliseconds,
+    verify_result_cursor,
+)
+from src.core.orm_models import BacktestResultSummary
+
+_NONFINITE = (Decimal("NaN"), Decimal("Infinity"), Decimal("-Infinity"))
+_FORMAL_TEXT_FIELDS = (
+    "job_id",
+    "strategy_id",
+    "dataset_id",
+    "subject_id",
+    "input_digest",
+    "result_digest",
+    "product_id",
+    "timeframe",
+    "currency",
+)
+_FORMAL_TIME_FIELDS = ("start_time", "end_time", "completed_at")
+_FORMAL_DECIMAL_FIELDS = (
+    "total_pnl",
+    "initial_balance",
+    "net_pnl",
+    "return_pct",
+    "max_drawdown",
+    "sharpe",
+    "sortino",
+    "calmar",
+)
+
+
+class BacktestResultsIndexItem(TypedDict):
+    job_id: str
+    subject_id: str
+    dataset_id: str
+    product_id: str
+    timeframe: str
+    started_at: str
+    ended_at: str
+    completed_at: str
+    result_digest: str
+
+
+class BacktestResultsIndexPage(TypedDict):
+    items: list[BacktestResultsIndexItem]
+    next_cursor: str | None
+    revision: Literal[1]
+
+
+class BacktestResultsReadUnavailable(RuntimeError):
+    """Sanitized SQL or stored-projection failure for the read service."""
+
+    def __init__(self) -> None:
+        super().__init__("browser_result_backend_unavailable")
+
+
+def _formal_result_qualification():
+    """The sole SQL qualification classifier matching formal ORM constraints."""
+    fields = (
+        BacktestResultSummary.strategy_id,
+        BacktestResultSummary.start_time,
+        BacktestResultSummary.end_time,
+        *(getattr(BacktestResultSummary, name) for name in _FORMAL_TEXT_FIELDS),
+        *(getattr(BacktestResultSummary, name) for name in _FORMAL_TIME_FIELDS),
+        *(getattr(BacktestResultSummary, name) for name in _FORMAL_DECIMAL_FIELDS),
+    )
+    finite = tuple(
+        getattr(BacktestResultSummary, name).not_in(_NONFINITE)
+        for name in _FORMAL_DECIMAL_FIELDS
+    )
+    return and_(
+        *(field.is_not(None) for field in fields),
+        BacktestResultSummary.subject_kind == "STRATEGY_ARTIFACT",
+        BacktestResultSummary.initial_balance > 0,
+        BacktestResultSummary.max_drawdown >= 0,
+        *finite,
+    )
+
+
+def _index_item(row: BacktestResultSummary) -> BacktestResultsIndexItem:
+    if (
+        not _valid_job_id(row.job_id)
+        or not _valid_digest(row.result_digest)
+        or any(
+            type(value) is not str or not value.strip()
+            for value in (
+                row.subject_id,
+                row.dataset_id,
+                row.product_id,
+                row.timeframe,
+            )
+        )
+        or type(row.start_time) is not int
+        or type(row.end_time) is not int
+        or type(row.completed_at) is not int
+        or row.start_time > row.end_time
+    ):
+        raise ValueError
+    return {
+        "job_id": cast(str, row.job_id),
+        "subject_id": cast(str, row.subject_id),
+        "dataset_id": cast(str, row.dataset_id),
+        "product_id": cast(str, row.product_id),
+        "timeframe": cast(str, row.timeframe),
+        "started_at": format_utc_milliseconds(row.start_time),
+        "ended_at": format_utc_milliseconds(row.end_time),
+        "completed_at": format_utc_milliseconds(row.completed_at),
+        "result_digest": cast(str, row.result_digest),
+    }
+
+
+class BacktestResultsQueryService:
+    """Own SQL sessions and return only approved plain index wire values."""
+
+    def __init__(self, session_factory: Callable[[], Session], *, cursor_key: bytes):
+        if type(cursor_key) is not bytes or len(cursor_key) != 32:
+            raise ValueError("cursor_key must be exactly 32 bytes")
+        self._session_factory = session_factory
+        self._cursor_key = cursor_key
+
+    def list_index(self, query: BacktestResultQuery) -> BacktestResultsIndexPage:
+        if type(query) is not BacktestResultQuery:
+            raise InvalidBacktestResultHttpRequest() from None
+        limit = 100 if query.limit is None else query.limit
+        if type(limit) is not int or not 1 <= limit <= 500:
+            raise InvalidBacktestResultHttpRequest() from None
+        after = None
+        if query.cursor is not None:
+            after = verify_result_cursor(
+                self._cursor_key, query.cursor, IndexCursorBinding()
+            )
+            if type(after) is not IndexCursor:
+                raise InvalidBacktestResultHttpRequest() from None
+
+        try:
+            statement = select(BacktestResultSummary).where(
+                _formal_result_qualification()
+            )
+            if after is not None:
+                statement = statement.where(
+                    or_(
+                        BacktestResultSummary.completed_at < after.completed_at,
+                        and_(
+                            BacktestResultSummary.completed_at == after.completed_at,
+                            BacktestResultSummary.job_id < after.job_id,
+                        ),
+                    )
+                )
+            statement = statement.order_by(
+                BacktestResultSummary.completed_at.desc(),
+                BacktestResultSummary.job_id.desc(),
+            ).limit(limit + 1)
+            with self._session_factory() as session:
+                rows = session.scalars(statement).all()
+                has_more = len(rows) > limit
+                page_rows = rows[:limit]
+                items = [_index_item(row) for row in page_rows]
+                next_cursor = None
+                if has_more:
+                    last = page_rows[-1]
+                    next_cursor = encode_result_cursor(
+                        self._cursor_key,
+                        IndexCursor(
+                            cast(int, last.completed_at), cast(str, last.job_id)
+                        ),
+                    )
+            return cast(
+                BacktestResultsIndexPage,
+                {"items": items, "next_cursor": next_cursor, "revision": 1},
+            )
+        except Exception:
+            raise BacktestResultsReadUnavailable() from None
