@@ -26,6 +26,7 @@ from src.core.analytics import (
 )
 from src.core.backtest_runner import BacktestRunner
 from src.core.backtest.external_funding import ExternalFundingEvent
+from src.core.backtest_result_persistence import FullBacktestOutcome
 from src.core.backtest.run_evidence import canonical_decision_snapshot
 from src.core.capital_allocator import CapitalAllocator
 from src.core.data_sources.memory import MemoryDataSource
@@ -1366,6 +1367,210 @@ def test_research_backtest_matches_full_runner_core_metrics(
     assert research_result["total_pnl"] == full_result["total_pnl"]
     assert research_result["profit_factor"] == full_result["profit_factor"]
     assert research_result["closed_trades"] == full_closed_trades
+
+
+def test_opt_in_completed_outcome_preserves_native_runner_results_and_audit(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = _sqlite_backtest_session_factory(tmp_path)
+    candles = make_candle_series(count=81)
+
+    def make_runner(capture: bool) -> BacktestRunner:
+        runner = BacktestRunner(
+            start_time=candles[0].timestamp,
+            end_time=candles[-1].timestamp,
+            product_id=PRODUCT_ID,
+            timeframe=TIMEFRAME,
+            initial_balance=Decimal("10000"),
+            max_drawdown_limit=None,
+            data_source=MemoryDataSource(candles),
+            fee_config={"maker": Decimal("0.0002"), "taker": Decimal("0.0006")},
+            report_config={
+                "csv_trades": False,
+                "markdown_report": False,
+                "equity_curve": False,
+                "journal_export": False,
+            },
+            db_session_factory=session_factory,
+            capture_completed_outcome=capture,
+        )
+        runner.add_strategy(
+            CallableStrategy(
+                "completed_outcome_probe",
+                _signal_factory("completed_outcome_probe", candles),
+                PRODUCT_ID,
+                TIMEFRAME,
+            )
+        )
+        return runner
+
+    default_runner = make_runner(False)
+    default_result = default_runner.run()
+    captured_runner = make_runner(True)
+    captured_result = captured_runner.run()
+
+    assert default_result is not None and captured_result is not None
+    assert default_runner.completed_outcome is None
+    outcome = captured_runner.completed_outcome
+    assert isinstance(outcome, FullBacktestOutcome)
+    assert default_result.keys() == captured_result.keys()
+    assert "completed_outcome" not in captured_result
+    assert default_result["fill_records"] == captured_result["fill_records"]
+    assert default_result["closed_trades"] == captured_result["closed_trades"]
+    assert default_result["provenance"] == captured_result["provenance"]
+    for name in (
+        "mark_to_market_pnl",
+        "max_drawdown",
+        "trade_sharpe",
+        "sortino_ratio",
+        "calmar_ratio",
+    ):
+        assert outcome.__getattribute__(name) == captured_result[name]
+    assert len(outcome.equity_samples) == len(candles)
+    assert len(outcome.closed_trades) == len(captured_result["closed_trades"])
+    assert tuple(
+        (
+            trade.entry_time,
+            trade.exit_time,
+            trade.entry_price,
+            trade.exit_price,
+            trade.side,
+            trade.quantity,
+            trade.pnl,
+            trade.fee,
+        )
+        for trade in outcome.closed_trades
+    ) == tuple(
+        (
+            trade.entry_time,
+            trade.exit_time,
+            trade.entry_price,
+            trade.exit_price,
+            trade.side,
+            trade.quantity,
+            trade.pnl,
+            trade.fee,
+        )
+        for trade in captured_result["closed_trades"]
+    )
+
+    with session_factory() as session:
+        summaries = list(
+            session.scalars(
+                select(BacktestResultSummary).order_by(BacktestResultSummary.id)
+            )
+        )
+        fills_by_session = {
+            summary.id: list(
+                session.scalars(
+                    select(BacktestTradeLog)
+                    .where(BacktestTradeLog.session_id == summary.id)
+                    .order_by(
+                        BacktestTradeLog.timestamp,
+                        BacktestTradeLog.fill_sequence,
+                        BacktestTradeLog.id,
+                    )
+                )
+            )
+            for summary in summaries
+        }
+    assert len(summaries) == 2
+    assert summaries[0].total_pnl == summaries[1].total_pnl
+    assert summaries[0].metrics_json == summaries[1].metrics_json
+    assert [
+        (fill.timestamp, fill.fill_sequence, fill.side, fill.price, fill.quantity)
+        for fill in fills_by_session[summaries[0].id]
+    ] == [
+        (fill.timestamp, fill.fill_sequence, fill.side, fill.price, fill.quantity)
+        for fill in fills_by_session[summaries[1].id]
+    ]
+
+    def fail_replay(*_args, **_kwargs):
+        raise RuntimeError("injected replay failure")
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(captured_runner, "_process_candles", fail_replay)
+        with pytest.raises(RuntimeError, match="injected replay failure"):
+            captured_runner.run()
+    assert captured_runner.completed_outcome is None
+
+    def fail_reports(*_args, **_kwargs):
+        raise RuntimeError("injected report failure")
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(captured_runner, "_export_reports", fail_reports)
+        with pytest.raises(RuntimeError, match="injected report failure"):
+            captured_runner.run()
+    assert captured_runner.completed_outcome is None
+
+    assert captured_runner.run() is not None
+    assert captured_runner.completed_outcome is not None
+
+    def fail_capture(_cls, **_kwargs):
+        raise ValueError("injected capture failure")
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(
+            FullBacktestOutcome,
+            "from_completed_result",
+            classmethod(fail_capture),
+        )
+        with pytest.raises(ValueError, match="injected capture failure"):
+            captured_runner.run()
+    assert captured_runner.completed_outcome is None
+
+
+def test_opt_in_zero_trade_outcome_keeps_real_equity_and_empty_trades(tmp_path):
+    session_factory = _sqlite_backtest_session_factory(tmp_path)
+    candles = make_candle_series(count=1)
+    runner = BacktestRunner(
+        start_time=candles[0].timestamp,
+        end_time=candles[-1].timestamp,
+        product_id=PRODUCT_ID,
+        timeframe=TIMEFRAME,
+        initial_balance=Decimal("10000"),
+        max_drawdown_limit=None,
+        data_source=MemoryDataSource(candles),
+        report_config={
+            "csv_trades": False,
+            "markdown_report": False,
+            "equity_curve": False,
+            "journal_export": False,
+        },
+        db_session_factory=session_factory,
+        capture_completed_outcome=True,
+    )
+    runner.add_strategy(
+        CallableStrategy(
+            "zero_trade_outcome_probe",
+            _signal_factory("zero_trade_outcome_probe", candles),
+            PRODUCT_ID,
+            TIMEFRAME,
+        )
+    )
+
+    result = runner.run()
+
+    assert result is not None
+    assert result["closed_trades"] == []
+    assert runner.completed_outcome is not None
+    assert runner.completed_outcome.equity_samples
+    assert runner.completed_outcome.closed_trades == ()
+
+
+def test_opt_in_runner_without_strategy_has_no_completed_outcome(tmp_path):
+    runner = BacktestRunner(
+        start_time=0,
+        end_time=0,
+        product_id=PRODUCT_ID,
+        timeframe=TIMEFRAME,
+        db_session_factory=_sqlite_backtest_session_factory(tmp_path),
+        capture_completed_outcome=True,
+    )
+
+    assert runner.run() is None
+    assert runner.completed_outcome is None
 
 
 @pytest.mark.parametrize(
