@@ -18,6 +18,7 @@ from src.control_plane.evolution import (
     initial_population,
     next_population,
 )
+from src.control_plane.evaluation_data import SealedDatasetRejectedError
 from src.control_plane.evolution_persistence import (
     _ensure_evolution_epoch,
     _load_evolution_checkpoint,
@@ -40,6 +41,7 @@ from src.control_plane.parameter_evaluation import (
     GoldenCrossFastFitnessParameterEvaluator as GoldenCrossFastFitnessParameterEvaluator,
     GoldenCrossResearchParameterEvaluator as GoldenCrossResearchParameterEvaluator,
     ParameterSearchEvaluator,
+    ParameterSearchEvaluatorRegistry,
     ParameterSearchRequestValidator,
     ResearchBacktestParameterEvaluator as ResearchBacktestParameterEvaluator,
     WalkForwardWarmupEvaluator,
@@ -94,6 +96,13 @@ class ParameterSearchJobExecutor:
         self._db_session_factory = db_session_factory
 
     def submit_search(self, request: ParameterSearchJobRequest) -> JobRecord:
+        if request.market_data is not None and not isinstance(
+            self.evaluator,
+            ParameterSearchEvaluatorRegistry,
+        ):
+            raise SealedDatasetRejectedError(
+                "sealed dataset requires an explicitly configured evaluator registry"
+            )
         if isinstance(self.evaluator, ParameterSearchRequestValidator):
             self.evaluator.validate_request(request)
         if request.evolution is not None and request.evolution.epoch_id is None:

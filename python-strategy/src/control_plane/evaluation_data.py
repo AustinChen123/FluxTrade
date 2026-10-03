@@ -5,10 +5,21 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Hashable, Protocol
 
+from sqlalchemy.exc import SQLAlchemyError
+
 from src.control_plane.models import ParameterSearchJobRequest
 from src.core.data_sources.csv_source import CsvDataSource
 from src.core.data_sources.research_database import ResearchDatabaseDataSource
 from src.core.interfaces.data_source import IDataSource
+from src.core.research_datasets import ResearchDatasetIntegrityError
+
+
+class SealedDatasetRejectedError(ValueError):
+    """A sealed dataset is missing, invalid, or incompatible with the request."""
+
+
+class SealedDatasetBackendUnavailableError(RuntimeError):
+    """The sealed dataset catalog could not be queried."""
 
 
 class EvaluationDataSourceProvider(Protocol):
@@ -108,3 +119,14 @@ class RequestEvaluationDataSourceProvider:
             request.market_data.dataset_id,
             session_factory=self._session_factory,
         )
+
+    def validate_sealed_request(self, request: ParameterSearchJobRequest) -> None:
+        """Check a sealed request's catalog identity without loading candles."""
+        if request.market_data is None:
+            return
+        try:
+            self.cache_key(request)
+        except SQLAlchemyError as exc:
+            raise SealedDatasetBackendUnavailableError from exc
+        except (ResearchDatasetIntegrityError, ValueError) as exc:
+            raise SealedDatasetRejectedError from exc
