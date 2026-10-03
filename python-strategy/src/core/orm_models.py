@@ -502,6 +502,73 @@ class BacktestResultSummary(Base):
     calmar: Mapped[Decimal | None] = mapped_column(Numeric, nullable=True)
 
 
+class BacktestEquitySample(Base):
+    __tablename__ = "backtest_equity_sample"
+    __table_args__ = (
+        CheckConstraint("sequence >= 0", name="ck_backtest_equity_sample_sequence"),
+        CheckConstraint(
+            "drawdown >= 0", name="ck_backtest_equity_sample_drawdown_nonnegative"
+        ),
+        CheckConstraint(
+            "equity NOT IN ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric)",
+            name="ck_backtest_equity_sample_equity_finite",
+        ).ddl_if(dialect="postgresql"),
+        CheckConstraint(
+            "drawdown NOT IN ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric)",
+            name="ck_backtest_equity_sample_drawdown_finite",
+        ).ddl_if(dialect="postgresql"),
+    )
+
+    summary_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey(
+            "backtest_result_summary.id",
+            name="fk_backtest_equity_sample_summary",
+        ),
+        primary_key=True,
+    )
+    sequence: Mapped[int] = mapped_column(Integer, primary_key=True)
+    timestamp: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    equity: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+    drawdown: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+
+
+class BacktestClosedTrade(Base):
+    __tablename__ = "backtest_closed_trade"
+    __table_args__ = (
+        CheckConstraint("sequence >= 0", name="ck_backtest_closed_trade_sequence"),
+        CheckConstraint("side IN ('LONG', 'SHORT')", name="ck_backtest_closed_trade_side"),
+        CheckConstraint(
+            "quantity > 0", name="ck_backtest_closed_trade_quantity_positive"
+        ),
+        *(
+            CheckConstraint(
+                f"{field} NOT IN ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric)",
+                name=f"ck_backtest_closed_trade_{field}_finite",
+            ).ddl_if(dialect="postgresql")
+            for field in ("quantity", "entry_price", "exit_price", "fee", "pnl")
+        ),
+    )
+
+    summary_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey(
+            "backtest_result_summary.id",
+            name="fk_backtest_closed_trade_summary",
+        ),
+        primary_key=True,
+    )
+    sequence: Mapped[int] = mapped_column(Integer, primary_key=True)
+    entry_time: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    exit_time: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    side: Mapped[str] = mapped_column(String(5), nullable=False)
+    quantity: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+    entry_price: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+    exit_price: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+    fee: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+    pnl: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+
+
 class BacktestTradeLog(Base):
     __tablename__ = "backtest_trade_log"
     id: Mapped[str] = mapped_column(String, primary_key=True)
