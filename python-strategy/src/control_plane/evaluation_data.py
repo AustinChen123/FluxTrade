@@ -83,3 +83,28 @@ class DatabaseEvaluationDataSourceProvider:
             or request.end_time > available_range[1]
         ):
             raise ValueError("requested range is outside sealed dataset coverage")
+
+
+class RequestEvaluationDataSourceProvider:
+    """Select the explicitly requested sealed source or legacy CSV source."""
+
+    def __init__(self, session_factory=None) -> None:
+        self._session_factory = session_factory
+        self._csv_provider = CsvEvaluationDataSourceProvider()
+
+    def create(self, request: ParameterSearchJobRequest) -> IDataSource:
+        return self._provider_for(request).create(request)
+
+    def cache_key(self, request: ParameterSearchJobRequest) -> Hashable:
+        return self._provider_for(request).cache_key(request)
+
+    def _provider_for(
+        self,
+        request: ParameterSearchJobRequest,
+    ) -> EvaluationDataSourceProvider:
+        if request.market_data is None:
+            return self._csv_provider
+        return DatabaseEvaluationDataSourceProvider(
+            request.market_data.dataset_id,
+            session_factory=self._session_factory,
+        )
