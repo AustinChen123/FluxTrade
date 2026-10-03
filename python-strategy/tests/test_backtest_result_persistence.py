@@ -14,6 +14,7 @@ from src.core.models import PositionSide
 
 def _result() -> dict[str, object]:
     return {
+        "total_pnl": Decimal("-2.3400"),
         "mark_to_market_pnl": Decimal("1.2300"),
         "max_drawdown": Decimal("0.50"),
         "trade_sharpe": Decimal("0.25"),
@@ -47,6 +48,7 @@ def test_completed_outcome_copies_final_result_and_equity_values() -> None:
     source_trades = cast(list[object], result["closed_trades"])
     trade = cast(ClosedTrade, source_trades[0])
     assert outcome.initial_balance == Decimal("100")
+    assert outcome.total_pnl == Decimal("-2.3400")
     assert outcome.mark_to_market_pnl == Decimal("1.2300")
     assert outcome.max_drawdown == Decimal("0.50")
     assert outcome.trade_sharpe == Decimal("0.25")
@@ -79,6 +81,9 @@ def test_completed_outcome_copies_final_result_and_equity_values() -> None:
 @pytest.mark.parametrize(
     ("field", "value", "error"),
     [
+        ("total_pnl", None, ValueError),
+        ("total_pnl", 1.0, TypeError),
+        ("total_pnl", Decimal("NaN"), ValueError),
         ("mark_to_market_pnl", None, ValueError),
         ("mark_to_market_pnl", 1.0, TypeError),
         ("max_drawdown", Decimal("NaN"), ValueError),

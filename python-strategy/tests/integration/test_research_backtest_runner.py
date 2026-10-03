@@ -1420,6 +1420,7 @@ def test_opt_in_completed_outcome_preserves_native_runner_results_and_audit(
     assert default_result["closed_trades"] == captured_result["closed_trades"]
     assert default_result["provenance"] == captured_result["provenance"]
     for name in (
+        "total_pnl",
         "mark_to_market_pnl",
         "max_drawdown",
         "trade_sharpe",
@@ -1485,6 +1486,40 @@ def test_opt_in_completed_outcome_preserves_native_runner_results_and_audit(
         (fill.timestamp, fill.fill_sequence, fill.side, fill.price, fill.quantity)
         for fill in fills_by_session[summaries[1].id]
     ]
+
+    open_candles = make_candle_series(count=12)
+    open_runner = BacktestRunner(
+        start_time=open_candles[0].timestamp,
+        end_time=open_candles[-1].timestamp,
+        product_id=PRODUCT_ID,
+        timeframe=TIMEFRAME,
+        initial_balance=Decimal("10000"),
+        max_drawdown_limit=None,
+        data_source=MemoryDataSource(open_candles),
+        report_config={
+            "csv_trades": False,
+            "markdown_report": False,
+            "equity_curve": False,
+            "journal_export": False,
+        },
+        db_session_factory=session_factory,
+        capture_completed_outcome=True,
+    )
+    open_runner.add_strategy(
+        CallableStrategy(
+            "completed_outcome_open_position_probe",
+            _signal_factory("completed_outcome_open_position_probe", open_candles),
+            PRODUCT_ID,
+            TIMEFRAME,
+        )
+    )
+    open_result = open_runner.run()
+    assert open_result is not None
+    open_outcome = open_runner.completed_outcome
+    assert isinstance(open_outcome, FullBacktestOutcome)
+    assert open_outcome.total_pnl == open_result["total_pnl"]
+    assert open_outcome.mark_to_market_pnl == open_result["mark_to_market_pnl"]
+    assert open_outcome.total_pnl != open_outcome.mark_to_market_pnl
 
     def fail_replay(*_args, **_kwargs):
         raise RuntimeError("injected replay failure")

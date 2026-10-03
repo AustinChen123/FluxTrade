@@ -56,6 +56,7 @@ class ClosedTradeSnapshot:
 @dataclass(frozen=True, slots=True)
 class FullBacktestOutcome:
     initial_balance: Decimal
+    total_pnl: Decimal
     mark_to_market_pnl: Decimal
     max_drawdown: Decimal
     trade_sharpe: Decimal
@@ -67,6 +68,7 @@ class FullBacktestOutcome:
     def __post_init__(self) -> None:
         for name in (
             "initial_balance",
+            "total_pnl",
             "mark_to_market_pnl",
             "max_drawdown",
             "trade_sharpe",
@@ -99,6 +101,7 @@ class FullBacktestOutcome:
         if not isinstance(result, Mapping):
             raise TypeError("completed result must be a mapping")
         metric_names = (
+            "total_pnl",
             "mark_to_market_pnl",
             "max_drawdown",
             "trade_sharpe",
