@@ -1,7 +1,8 @@
-"""Strict DTOs for full-strategy backtests, before CSV dispatch is added."""
+"""Strict wire DTO and dispatch parser for full-strategy backtests."""
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from decimal import Decimal, InvalidOperation
 from typing import Literal
 
@@ -9,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from src.control_plane.models import (
     BacktestInstrumentConfig,
+    BacktestJobRequest,
     _require_dated_future_rules,
 )
 from src.core.product_registry import (
@@ -223,3 +225,13 @@ class FullStrategyBacktestRequest(_StrictRequestModel):
         if self.start > self.end:
             raise ValueError("start must be less than or equal to end")
         return self
+
+
+BacktestRequest = BacktestJobRequest | FullStrategyBacktestRequest
+
+
+def parse_backtest_request(payload: object) -> BacktestRequest:
+    """Parse one existing CSV request or the strict full-strategy request."""
+    if isinstance(payload, Mapping) and payload.get("kind") == "full_strategy_backtest":
+        return FullStrategyBacktestRequest.model_validate(payload)
+    return BacktestJobRequest.model_validate(payload)
