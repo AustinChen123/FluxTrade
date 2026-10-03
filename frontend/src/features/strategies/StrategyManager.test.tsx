@@ -9,6 +9,8 @@ import { StrategyManager } from "./StrategyManager";
 
 const api = vi.hoisted(() => ({
   ensureBrowserSession: vi.fn(),
+  loadKillSwitchStatus: vi.fn(),
+  clearKillSwitch: vi.fn(),
   loadStrategyStates: vi.fn(),
   sendStrategyCommand: vi.fn()
 }));
@@ -68,6 +70,8 @@ describe("strategy management", () => {
       expires_at: "2026-07-29T12:00:00Z",
       step_up_expires_at: "2026-07-29T11:00:00Z"
     });
+    api.loadKillSwitchStatus.mockResolvedValue({ state: "OK", redis_state: "OK", durable_state: "OK", listener_available: true });
+    api.clearKillSwitch.mockResolvedValue(undefined);
     api.loadStrategyStates.mockResolvedValue([
       strategy("active-strategy", "ACTIVE"),
       strategy("stopped-strategy", "STOPPED"),

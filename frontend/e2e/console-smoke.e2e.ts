@@ -216,7 +216,10 @@ async function installApiFixtures(
     let routeId: RouteId | null = null;
     let body: unknown;
 
-    if (url.pathname === "/api/v1/auth/session" && url.search === "") {
+    if (method === "GET" && url.pathname === "/ops/kill-switch" && url.search === "") {
+      await route.fulfill({ json: { state: "OK", redis_state: "OK", durable_state: "OK", listener_available: true } });
+      return;
+    } else if (url.pathname === "/api/v1/auth/session" && url.search === "") {
       if (method === "GET") {
         routeId = "S";
         body = BROWSER_SESSION;
@@ -281,7 +284,8 @@ async function installApiFixtures(
       url.pathname.startsWith("/api/") ||
       url.pathname.startsWith("/evolution-") ||
       url.pathname.startsWith("/genes") ||
-      url.pathname.startsWith("/strateg");
+      url.pathname.startsWith("/strateg") ||
+      url.pathname.startsWith("/ops/");
     if (apiLike && url.origin !== expectedOrigin) {
       throw new Error(`unexpected_api_origin:${url.origin}`);
     }
@@ -822,7 +826,11 @@ for (const view of ["strategies", "research"] as const) {
       await page.route("**/*", async (route) => {
         const request = route.request();
         const path = new URL(request.url()).pathname;
-        if (!/^\/(api\/|strategy-states|evolution-epochs|genes)/.test(path)) {
+        if (path === "/ops/kill-switch" && request.method() === "GET") {
+          await route.fulfill({ json: { state: "OK", redis_state: "OK", durable_state: "OK", listener_available: true } });
+          return;
+        }
+        if (!/^\/(api\/|strategy-states|evolution-epochs|genes|ops\/)/.test(path)) {
           await route.continue();
           return;
         }
@@ -891,6 +899,7 @@ for (const roster of ["empty", "single", "multiple"] as const) {
     await page.route("**/*", async (route) => {
       const req = route.request();
       const path = new URL(req.url()).pathname;
+      if (path === "/ops/kill-switch" && req.method() === "GET") return route.fulfill({ json: { state: "OK", redis_state: "OK", durable_state: "OK", listener_available: true } });
       if (path === "/api/v1/auth/session") return route.fulfill({ json: BROWSER_SESSION });
       if (path === "/strategy-states") return route.fulfill({ json: { ...STRATEGY_PAGE, total: states.length, states } });
       if (req.method() !== "GET") {
@@ -952,6 +961,7 @@ for (const failure of [401, 403, 409, 408, 503, "listener", "network", "malforme
     let sent = 0;
     await page.route("**/*", async (route) => {
       const path = new URL(route.request().url()).pathname;
+      if (path === "/ops/kill-switch" && route.request().method() === "GET") return route.fulfill({ json: { state: "OK", redis_state: "OK", durable_state: "OK", listener_available: true } });
       if (path === "/api/v1/auth/session") return route.fulfill({ json: BROWSER_SESSION });
       if (path === "/strategy-states") {
         if (failure === "refresh" && sent > 0) return route.fulfill({ status: 503, json: { error: "unavailable" } });
@@ -999,6 +1009,7 @@ for (const sessionCase of ["missing-permissions", "malformed-permissions", "expi
     await page.route("**/*", async (route) => {
       const req = route.request();
       const path = new URL(req.url()).pathname;
+      if (path === "/ops/kill-switch" && req.method() === "GET") return route.fulfill({ json: { state: "OK", redis_state: "OK", durable_state: "OK", listener_available: true } });
       if (path === "/api/v1/auth/session") {
         sessionMethods.push(req.method());
         if (sessionCase.startsWith("expired") && req.method() === "GET") {
@@ -1042,6 +1053,7 @@ for (const snapshot of ["unchanged", "status-only", "version-only", "missing"] a
     let refreshes = 0;
     await page.route("**/*", async (route) => {
       const path = new URL(route.request().url()).pathname;
+      if (path === "/ops/kill-switch" && route.request().method() === "GET") return route.fulfill({ json: { state: "OK", redis_state: "OK", durable_state: "OK", listener_available: true } });
       if (path === "/api/v1/auth/session") return route.fulfill({ json: BROWSER_SESSION });
       if (path === "/strategy-states") {
         refreshes += 1;

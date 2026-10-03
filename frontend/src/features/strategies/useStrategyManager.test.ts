@@ -3,13 +3,15 @@
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { ApiError, type StrategyState } from "../../api";
+import { ApiError, type KillSwitchStatus, type StrategyState } from "../../api";
 import i18n from "../../shared/i18n";
 import { AWAITING_STORAGE_KEY } from "./strategyCommandState";
 import { useStrategyManager } from "./useStrategyManager";
 
 const api = vi.hoisted(() => ({
   ensureBrowserSession: vi.fn(),
+  loadKillSwitchStatus: vi.fn(),
+  clearKillSwitch: vi.fn(),
   loadStrategyStates: vi.fn(),
   sendStrategyCommand: vi.fn()
 }));
@@ -52,6 +54,8 @@ describe("useStrategyManager", () => {
       expires_at: "2026-07-29T12:00:00Z",
       step_up_expires_at: "2026-07-29T11:00:00Z"
     });
+    api.loadKillSwitchStatus.mockResolvedValue({ state: "OK", redis_state: "OK", durable_state: "OK", listener_available: true });
+    api.clearKillSwitch.mockResolvedValue(undefined);
     api.loadStrategyStates.mockResolvedValue([strategy()]);
     api.sendStrategyCommand.mockResolvedValue(undefined);
     vi.spyOn(window, "confirm").mockReturnValue(true);
@@ -63,6 +67,7 @@ describe("useStrategyManager", () => {
   afterEach(() => {
     cleanup();
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
   });
 
   it.each([
@@ -111,6 +116,131 @@ describe("useStrategyManager", () => {
     await waitFor(() => expect(result.current.loading).toBe(false));
     expect(result.current.strategies).toEqual([strategy()]);
     expect([...result.current.awaitingStrategies]).toEqual([]);
+  });
+
+  it("requires known lockdown and confirmation, guards duplicate clears, and reports accepted-but-still-locked", async () => {
+    api.loadKillSwitchStatus
+      .mockResolvedValueOnce({ state: "LOCKDOWN", redis_state: "LOCKDOWN", durable_state: "OK", listener_available: true })
+      .mockResolvedValueOnce({ state: "LOCKDOWN", redis_state: "LOCKDOWN", durable_state: "OK", listener_available: true });
+    let resolveClear!: () => void;
+    api.clearKillSwitch.mockImplementation(() => new Promise<void>((resolve) => { resolveClear = resolve; }));
+    const { result } = renderHook(() => useStrategyManager(i18n.t));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    await waitFor(() => expect(result.current.killSwitchStatus?.state).toBe("LOCKDOWN"));
+    vi.mocked(window.confirm).mockReturnValueOnce(false);
+    await act(() => result.current.unlockKillSwitch());
+    expect(api.clearKillSwitch).not.toHaveBeenCalled();
+    vi.mocked(window.confirm).mockReturnValue(true);
+    let first!: Promise<void>;
+    act(() => { first = result.current.unlockKillSwitch(); });
+    await waitFor(() => expect(result.current.killSwitchPending).toBe(true));
+    await act(() => result.current.unlockKillSwitch());
+    expect(api.clearKillSwitch).toHaveBeenCalledTimes(1);
+    await act(async () => { resolveClear(); await first; });
+    expect(result.current.notice).toBe(i18n.t("strategies.killSwitchAcceptedAwaiting"));
+    expect(api.loadKillSwitchStatus).toHaveBeenCalledTimes(2);
+  });
+
+  it("leaves a failed gate read unavailable without breaking the strategy load", async () => {
+    api.loadKillSwitchStatus.mockRejectedValue(new Error("network"));
+    const { result } = renderHook(() => useStrategyManager(i18n.t));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.strategies).toHaveLength(1);
+    expect(result.current.killSwitchReadError).toBe(true);
+    expect(result.current.killSwitchStatus).toBeNull();
+  });
+
+  it.each([
+    [{ state: "OK", listener_available: true }, true, true],
+    [{ state: "LOCKDOWN", listener_available: false }, true, true],
+    [{ state: "LOCKDOWN", listener_available: true }, false, true],
+    [{ state: "LOCKDOWN", listener_available: true }, true, false]
+  ] as const)("keeps direct unlock unavailable for status/listener/session gate %j", async (status, canMutate, canStepUp) => {
+    api.loadKillSwitchStatus.mockResolvedValue({ ...status, redis_state: null, durable_state: null });
+    api.ensureBrowserSession.mockResolvedValue({ permissions: { can_mutate: canMutate, can_step_up: canStepUp } });
+    const { result } = renderHook(() => useStrategyManager(i18n.t));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    await waitFor(() => expect(result.current.killSwitchStatus?.state).toBe(status.state));
+    await act(() => result.current.unlockKillSwitch());
+    expect(window.confirm).not.toHaveBeenCalled();
+    expect(api.clearKillSwitch).not.toHaveBeenCalled();
+  });
+
+  it("reports observed OK only after the follow-up read", async () => {
+    api.loadKillSwitchStatus
+      .mockResolvedValueOnce({ state: "LOCKDOWN", redis_state: "LOCKDOWN", durable_state: "OK", listener_available: true })
+      .mockResolvedValueOnce({ state: "OK", redis_state: "OK", durable_state: "OK", listener_available: true });
+    const { result } = renderHook(() => useStrategyManager(i18n.t));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    await waitFor(() => expect(result.current.killSwitchStatus?.state).toBe("LOCKDOWN"));
+    await act(() => result.current.unlockKillSwitch());
+    expect(api.clearKillSwitch).toHaveBeenCalledTimes(1);
+    expect(api.loadKillSwitchStatus).toHaveBeenCalledTimes(2);
+    expect(result.current.notice).toBe(i18n.t("strategies.killSwitchObserved"));
+  });
+
+  it("single-flights manual status refreshes and blocks clear while the read is pending", async () => {
+    api.loadKillSwitchStatus.mockResolvedValueOnce({ state: "LOCKDOWN", redis_state: "LOCKDOWN", durable_state: "OK", listener_available: true });
+    const deferredStatus = (() => {
+      let resolve!: (value: KillSwitchStatus) => void;
+      const promise = new Promise<KillSwitchStatus>((done) => { resolve = done; });
+      return { promise, resolve };
+    })();
+    api.loadKillSwitchStatus.mockReturnValueOnce(deferredStatus.promise);
+    const { result } = renderHook(() => useStrategyManager(i18n.t));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    await waitFor(() => expect(result.current.killSwitchStatus?.state).toBe("LOCKDOWN"));
+    let first!: Promise<unknown>;
+    let second!: Promise<unknown>;
+    act(() => {
+      first = result.current.refreshKillSwitch();
+      second = result.current.refreshKillSwitch();
+    });
+    expect(first).toBe(second);
+    expect(api.loadKillSwitchStatus).toHaveBeenCalledTimes(2);
+    expect(result.current.killSwitchReadPending).toBe(true);
+    await act(() => result.current.unlockKillSwitch());
+    expect(api.clearKillSwitch).not.toHaveBeenCalled();
+    await act(async () => {
+      deferredStatus.resolve({ state: "LOCKDOWN", redis_state: "LOCKDOWN", durable_state: "OK", listener_available: true });
+      await first;
+    });
+    expect(result.current.killSwitchReadPending).toBe(false);
+  });
+
+  it.each([
+    [new ApiError("redis_publish_failed", 503), "strategies.killSwitchUnknown"],
+    [new ApiError("kill_switch_no_listener", 503), "strategies.killSwitchRejected"]
+  ] as const)("distinguishes ambiguous clear outcome from definite backend rejection", async (failure, messageKey) => {
+    api.loadKillSwitchStatus.mockResolvedValue({ state: "LOCKDOWN", redis_state: "LOCKDOWN", durable_state: "OK", listener_available: true });
+    api.clearKillSwitch.mockRejectedValue(failure);
+    const { result } = renderHook(() => useStrategyManager(i18n.t));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    await waitFor(() => expect(result.current.killSwitchStatus?.state).toBe("LOCKDOWN"));
+    await act(() => result.current.unlockKillSwitch());
+    expect(result.current.notice).toBe(i18n.t(messageKey));
+  });
+
+  it.each([
+    [200, { status: "accepted" }, "strategies.killSwitchUnknown"],
+    [408, { error: "request_timeout" }, "strategies.killSwitchUnknown"],
+    [403, { error: "operator_capability_required" }, "strategies.killSwitchRejected"]
+  ] as const)("classifies actual clear API HTTP %i outcomes causally", async (status, body, messageKey) => {
+    api.loadKillSwitchStatus.mockResolvedValue({ state: "LOCKDOWN", redis_state: "LOCKDOWN", durable_state: "OK", listener_available: true });
+    const actualApi = await vi.importActual<typeof import("../../api")>("../../api");
+    api.clearKillSwitch.mockImplementation(actualApi.clearKillSwitch);
+    const fetch = vi.fn().mockResolvedValue({
+      ok: status >= 200 && status < 300, status, statusText: "",
+      json: async () => body
+    });
+    vi.stubGlobal("fetch", fetch);
+    const { result } = renderHook(() => useStrategyManager(i18n.t));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    await waitFor(() => expect(result.current.killSwitchStatus?.state).toBe("LOCKDOWN"));
+    await act(() => result.current.unlockKillSwitch());
+    expect(result.current.notice).toBe(i18n.t(messageKey));
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(fetch.mock.calls[0][0]).toBe("/ops/kill-switch/clear");
   });
 
   it.each([

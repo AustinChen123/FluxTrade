@@ -73,6 +73,13 @@ export type StrategyState = {
   available_commands: StrategyCommand[];
 };
 
+export type KillSwitchStatus = {
+  state: "LOCKDOWN" | "OK" | "UNKNOWN";
+  redis_state: "LOCKDOWN" | "OK" | null;
+  durable_state: "LOCKDOWN" | "OK" | null;
+  listener_available: boolean;
+};
+
 type Page<TName extends string, T> = {
   total: number;
   limit: number;
@@ -117,8 +124,14 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
         : response.statusText;
     throw new ApiError(reason, response.status);
   }
+  if (path === "/ops/kill-switch/clear" && response.status !== 202) {
+    throw new ApiError("invalid_response", response.status);
+  }
   if (path.startsWith("/strategy-states?") && !validPage(body, "states", validStrategy)) {
     throw new Error("invalid_response");
+  }
+  if (path === "/ops/kill-switch" && !validKillSwitchStatus(body)) {
+    throw new ApiError("invalid_response", response.status);
   }
   if (path.startsWith("/evolution-epochs?") && !validPage(body, "epochs", validEpoch)) {
     throw new Error("invalid_response");
@@ -131,6 +144,25 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     throw new Error("invalid_response");
   }
   return body as T;
+}
+
+function validKillSwitchStatus(value: unknown): value is KillSwitchStatus {
+  return record(value) && ["LOCKDOWN", "OK", "UNKNOWN"].includes(value.state as string) &&
+    [null, "LOCKDOWN", "OK"].includes(value.redis_state as string | null) &&
+    [null, "LOCKDOWN", "OK"].includes(value.durable_state as string | null) &&
+    typeof value.listener_available === "boolean";
+}
+
+export function loadKillSwitchStatus(): Promise<KillSwitchStatus> {
+  return request<KillSwitchStatus>("/ops/kill-switch", { cache: "no-store" });
+}
+
+export async function clearKillSwitch(csrfToken: string): Promise<void> {
+  const response = await request<{ status: string }>("/ops/kill-switch/clear", {
+    method: "POST", headers: { "Content-Type": "application/json", "X-CSRF-Token": csrfToken },
+    body: JSON.stringify({ confirm: true })
+  });
+  if (response.status !== "accepted") throw new Error("invalid_response");
 }
 
 export async function ensureBrowserSession(): Promise<BrowserSession | null> {
