@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
 import sqlalchemy as sa
-from sqlalchemy import select
+from sqlalchemy import event, select
 from sqlalchemy.orm import sessionmaker
 
 from src.control_plane import backtest_jobs
@@ -26,12 +27,14 @@ from src.core.orm_models import (
     BacktestMonthlyReturn,
     BacktestPnlDistribution,
     BacktestResultSummary,
+    BacktestTradeLog,
     ResearchCandlestick,
     ResearchDataset,
     Strategy,
 )
 from src.core.research_datasets import ResearchDatasetImporter, ResearchDatasetSpec
 from src.core.strategy_loader import StrategyLoader
+from src.strategies.base import BaseStrategy
 from test_migrations import _target_url, _upgrade, fresh_pg_db as _fresh_pg_db
 from test_full_backtest_resolution import _request as _request_template
 from test_strategy_loader import _read_only_tree, _write_catalog
@@ -105,7 +108,7 @@ def _write_candles(path: Path) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def test_verified_catalog_sealed_pg_native_executor_owner_success(
+def test_verified_catalog_sealed_pg_native_executor_owner_and_retry(
     fresh_pg_db: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _upgrade(fresh_pg_db, "head")
@@ -151,37 +154,46 @@ def test_verified_catalog_sealed_pg_native_executor_owner_success(
                 Decimal("100.0000000000000000001"),
                 Decimal("1"),
             )
+            assert isinstance(candle.close, Decimal)
             session.add(Strategy(id=_STRATEGY, name="Catalog Signal Strategy"))
             session.commit()
 
         with _read_only_tree(catalog_root):
-            loaded_catalog_sha = getattr(
-                StrategyLoader.scan_production_sources(str(catalog_root))[_STRATEGY],
-                "__fluxtrade_catalog_sha256__",
-            )
+            catalog = StrategyLoader.scan_production_sources(str(catalog_root))
+            artifact = catalog[_STRATEGY]
+            assert isinstance(artifact, type)
+            loaded_version = getattr(artifact, "__fluxtrade_artifact_version__")
+            loaded_catalog_sha = getattr(artifact, "__fluxtrade_catalog_sha256__")
+            assert loaded_version == artifact_version
+            assert len(loaded_catalog_sha) == 64
+
+            loader_calls = 0
 
             def production_loader():
+                nonlocal loader_calls
+                loader_calls += 1
                 return StrategyLoader.scan_production_sources(str(catalog_root))
 
-            identities: dict[str, BacktestResultRunIdentity] = {}
-            outcomes: dict[str, FullBacktestOutcome] = {}
+            strategies: list[BaseStrategy] = []
+            identity_outcomes: dict[
+                str, tuple[BacktestResultRunIdentity, FullBacktestOutcome]
+            ] = {}
             receipts: dict[str, BacktestResultPersistenceReceipt] = {}
-            run_outcomes: list[FullBacktestOutcome] = []
             original_run = backtest_jobs.run_full_backtest
             original_persist = BacktestResultPersistenceOwner.persist
 
             def capture_run(resolved, *, session_factory):
-                outcome = original_run(resolved, session_factory=session_factory)
-                run_outcomes.append(outcome)
-                return outcome
+                strategies.append(resolved.strategy)
+                result = original_run(resolved, session_factory=session_factory)
+                return result
 
             def capture_persist(owner, identity, outcome):
                 current = store.get(identity.job_id)
                 assert current is not None and current.status == JobStatus.RUNNING
-                identities[identity.job_id] = identity
-                receipts[identity.job_id] = original_persist(owner, identity, outcome)
-                outcomes[identity.job_id] = outcome
-                return receipts[identity.job_id]
+                identity_outcomes[identity.job_id] = (identity, outcome)
+                receipt = original_persist(owner, identity, outcome)
+                receipts[identity.job_id] = receipt
+                return receipt
 
             monkeypatch.setattr(backtest_jobs, "run_full_backtest", capture_run)
             monkeypatch.setattr(
@@ -210,81 +222,188 @@ def test_verified_catalog_sealed_pg_native_executor_owner_success(
             )
             from src.core.backtest_runner import BacktestRunner
 
-            assert BacktestRunner.__module__ == "src.core.backtest_runner"
+            assert (
+                Path(inspect.getsourcefile(BacktestRunner) or "").resolve()
+                == (Path(__file__).parents[2] / "src/core/backtest_runner.py").resolve()
+            )
 
             def fail_if_report_directory_created(*_args, **_kwargs):
                 raise AssertionError("disabled reports must not touch the filesystem")
 
             monkeypatch.setattr(Path, "mkdir", fail_if_report_directory_created)
-            job = executor.submit_backtest(request)
-            assert job.status == JobStatus.SUCCEEDED
-            assert job.error is None and job.result is not None
-            assert set(job.result) == {"job_id", "input_digest", "result_digest"}
-            assert job.result["job_id"] == job.id
 
-            identity = identities[job.id]
-            outcome = outcomes[job.id]
-            assert run_outcomes == [outcome]
-            receipt = receipts[job.id]
-            assert identity.dataset_checksum_sha256 == imported.checksum_sha256
-            assert identity.catalog_sha256 == loaded_catalog_sha
-            assert identity.dataset_id == _DATASET
-            assert identity.artifact_version == artifact_version
-            assert (identity.product_id, identity.timeframe) == (_PRODUCT, "1m")
-            assert (identity.start, identity.end) == (_START, _START + 420_000)
-            assert identity.initial_balance == Decimal("10000.0000000000000000000001")
-            assert (identity.maker_fee, identity.taker_fee) == (
-                Decimal("0.0002"),
-                Decimal("0.0006"),
-            )
-            assert outcome.closed_trades and any(
-                trade.fee > 0 for trade in outcome.closed_trades
-            )
-            assert job.result == {
-                "job_id": receipt.job_id,
-                "input_digest": receipt.input_digest,
-                "result_digest": receipt.result_digest,
-            }
+            def fail_closed_trade_insert(mapper, connection, target) -> None:
+                raise RuntimeError("injected persistence failure")
 
+            event.listen(BacktestClosedTrade, "before_insert", fail_closed_trade_insert)
+            try:
+                failed = executor.submit_backtest(request)
+            finally:
+                event.remove(
+                    BacktestClosedTrade, "before_insert", fail_closed_trade_insert
+                )
+
+            assert failed.status == JobStatus.FAILED
+            assert failed.error == "browser_result_persistence_failed"
+            assert failed.result is None
+            assert failed.request["dataset_id"] == _DATASET
+            assert failed.request["initial_balance"] == "10000.0000000000000000000001"
+            assert failed.id not in receipts
             with session_factory() as session:
-                summary = session.scalars(
-                    select(BacktestResultSummary).where(
-                        BacktestResultSummary.job_id == job.id
-                    )
-                ).one()
-                assert summary.completed_at is not None
-                projection = _project_result(
-                    identity, outcome, completed_at=summary.completed_at
-                )
                 assert (
-                    summary.dataset_id,
-                    summary.input_digest,
-                    summary.result_digest,
-                ) == (
-                    _DATASET,
-                    projection.input_digest,
-                    projection.result_digest,
-                )
-                counts = tuple(
                     session.scalar(
                         select(sa.func.count())
-                        .select_from(model)
-                        .where(model.summary_id == summary.id)
+                        .select_from(BacktestResultSummary)
+                        .where(BacktestResultSummary.job_id == failed.id)
                     )
-                    for model in (
+                    == 0
+                )
+                assert all(
+                    session.scalar(select(sa.func.count()).select_from(table)) == 0
+                    for table in (
                         BacktestEquitySample,
                         BacktestClosedTrade,
                         BacktestMonthlyReturn,
                         BacktestPnlDistribution,
                     )
                 )
-            assert counts == (
-                len(projection.equity),
-                len(projection.closed_trades),
-                len(projection.monthly_returns),
-                len(projection.pnl_distribution),
-            )
-            assert all(count is not None and count > 0 for count in counts)
+                audit_rows = session.scalar(
+                    select(sa.func.count())
+                    .select_from(BacktestTradeLog)
+                    .where(BacktestTradeLog.strategy_id == _STRATEGY)
+                )
+                assert audit_rows is not None and audit_rows > 0
+
+            retried = executor.retry_backtest(failed.id)
+            assert retried.id != failed.id
+            assert retried.status == JobStatus.SUCCEEDED
+            assert retried.error is None
+            assert retried.result is not None
+            assert set(retried.result) == {"job_id", "input_digest", "result_digest"}
+            assert retried.result["job_id"] == retried.id
+
+            repeated = executor.submit_backtest(request)
+            assert repeated.status == JobStatus.SUCCEEDED
+            assert repeated.id != retried.id
+            assert repeated.result is not None
+            assert repeated.result["input_digest"] == retried.result["input_digest"]
+            assert repeated.result["result_digest"] == retried.result["result_digest"]
+            assert len(strategies) == 3
+            assert len({id(strategy) for strategy in strategies}) == 3
+            assert loader_calls == 3
+
+            for job in (retried, repeated):
+                identity, outcome = identity_outcomes[job.id]
+                receipt = receipts[job.id]
+                assert job.result == {
+                    "job_id": receipt.job_id,
+                    "input_digest": receipt.input_digest,
+                    "result_digest": receipt.result_digest,
+                }
+                assert identity.dataset_checksum_sha256 == imported.checksum_sha256
+                assert identity.catalog_sha256 == loaded_catalog_sha
+                assert outcome.closed_trades
+                assert any(trade.fee > 0 for trade in outcome.closed_trades)
+                with session_factory() as session:
+                    summary = session.scalars(
+                        select(BacktestResultSummary).where(
+                            BacktestResultSummary.job_id == job.id
+                        )
+                    ).one()
+                    assert summary.completed_at is not None
+                    projection = _project_result(
+                        identity, outcome, completed_at=summary.completed_at
+                    )
+                    equity = session.scalars(
+                        select(BacktestEquitySample)
+                        .where(BacktestEquitySample.summary_id == summary.id)
+                        .order_by(BacktestEquitySample.sequence)
+                    ).all()
+                    trades = session.scalars(
+                        select(BacktestClosedTrade)
+                        .where(BacktestClosedTrade.summary_id == summary.id)
+                        .order_by(BacktestClosedTrade.sequence)
+                    ).all()
+                    monthly = session.scalars(
+                        select(BacktestMonthlyReturn).where(
+                            BacktestMonthlyReturn.summary_id == summary.id
+                        )
+                    ).all()
+                    distribution = session.scalars(
+                        select(BacktestPnlDistribution)
+                        .where(BacktestPnlDistribution.summary_id == summary.id)
+                        .order_by(BacktestPnlDistribution.sequence)
+                    ).all()
+                    audit_count = session.scalar(
+                        select(sa.func.count())
+                        .select_from(BacktestTradeLog)
+                        .where(BacktestTradeLog.strategy_id == _STRATEGY)
+                    )
+                assert (
+                    summary.initial_balance,
+                    summary.total_pnl,
+                    summary.net_pnl,
+                    summary.return_pct,
+                    summary.max_drawdown,
+                    summary.sharpe,
+                    summary.sortino,
+                    summary.calmar,
+                ) == tuple(projection.summary)
+                assert summary.metrics_json is None
+                assert (
+                    summary.job_id,
+                    summary.dataset_id,
+                    summary.subject_kind,
+                    summary.subject_id,
+                    summary.input_digest,
+                    summary.result_digest,
+                    summary.product_id,
+                    summary.timeframe,
+                    summary.currency,
+                    summary.start_time,
+                    summary.end_time,
+                ) == (
+                    job.id,
+                    _DATASET,
+                    "STRATEGY_ARTIFACT",
+                    f"{_STRATEGY}:{artifact_version}",
+                    projection.input_digest,
+                    projection.result_digest,
+                    _PRODUCT,
+                    "1m",
+                    "USDT",
+                    _START,
+                    _START + 420_000,
+                )
+                assert [
+                    (row.sequence, row.timestamp, row.equity, row.drawdown)
+                    for row in equity
+                ] == [tuple(row) for row in projection.equity]
+                assert [
+                    (
+                        row.sequence,
+                        row.entry_time,
+                        row.exit_time,
+                        row.side,
+                        row.quantity,
+                        row.entry_price,
+                        row.exit_price,
+                        row.fee,
+                        row.pnl,
+                    )
+                    for row in trades
+                ] == [tuple(row) for row in projection.closed_trades]
+                assert [(row.month, row.return_pct) for row in monthly] == [
+                    tuple(row) for row in projection.monthly_returns
+                ]
+                assert [
+                    (row.sequence, row.lower, row.upper, row.count)
+                    for row in distribution
+                ] == [
+                    (row.sequence, row.lower, row.upper, row.count)
+                    for row in projection.pnl_distribution
+                ]
+                assert audit_count and len(trades) == len(outcome.closed_trades)
             assert executor.shutdown()
     finally:
         engine.dispose()
