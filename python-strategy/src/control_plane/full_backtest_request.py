@@ -1,8 +1,9 @@
-"""Strict instrument DTOs for full-strategy backtests."""
+"""Strict DTOs for full-strategy backtests, before CSV dispatch is added."""
 
 from __future__ import annotations
 
 from decimal import Decimal, InvalidOperation
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
@@ -16,6 +17,8 @@ from src.core.product_registry import (
     InstrumentSpec,
     MarketType,
 )
+
+_MAX_UTC_MILLISECOND = 253_402_300_799_999
 
 
 def _strict_text(value: object, name: str, *, path_free: bool = False) -> str:
@@ -161,3 +164,62 @@ class FullBacktestInstrument(_StrictRequestModel):
             session_calendar_id=self.session_calendar_id,
             market_type=self.market_type,
         )
+
+
+class FullStrategyBacktestRequest(_StrictRequestModel):
+    kind: Literal["full_strategy_backtest"]
+    dataset_id: str
+    strategy_id: str
+    artifact_version: str
+    start: int
+    end: int
+    initial_balance: Decimal
+    instrument: FullBacktestInstrument
+    fees: FullBacktestFees
+    drawdown_limit: Decimal | None
+    execution_timeframe: str | None = None
+
+    @field_validator("dataset_id", "strategy_id", "artifact_version", mode="before")
+    @classmethod
+    def parse_identity_text(cls, value: object, info) -> str:
+        return _strict_text(value, info.field_name, path_free=True)
+
+    @field_validator("start", "end", mode="before")
+    @classmethod
+    def parse_timestamp(cls, value: object, info) -> int:
+        if type(value) is not int or not 0 <= value <= _MAX_UTC_MILLISECOND:
+            raise ValueError(
+                f"{info.field_name} must be a UTC millisecond in the supported range"
+            )
+        return value
+
+    @field_validator("initial_balance", mode="before")
+    @classmethod
+    def parse_initial_balance(cls, value: object) -> Decimal:
+        balance = _decimal_input(value, "initial_balance")
+        if balance <= 0:
+            raise ValueError("initial_balance must be positive")
+        return balance
+
+    @field_validator("drawdown_limit", mode="before")
+    @classmethod
+    def parse_drawdown_limit(cls, value: object) -> Decimal | None:
+        if value is None:
+            return None
+        limit = _decimal_input(value, "drawdown_limit")
+        if limit < 0:
+            raise ValueError("drawdown_limit must be nonnegative")
+        return limit
+
+    @field_validator("execution_timeframe", mode="before")
+    @classmethod
+    def parse_execution_timeframe(cls, value: object) -> str | None:
+        if value is None:
+            return None
+        return _strict_text(value, "execution_timeframe")
+
+    @model_validator(mode="after")
+    def validate_range_and_currency(self) -> FullStrategyBacktestRequest:
+        if self.start > self.end:
+            raise ValueError("start must be less than or equal to end")
+        return self
