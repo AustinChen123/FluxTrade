@@ -1,0 +1,105 @@
+from datetime import UTC, datetime
+from decimal import Decimal, localcontext
+from typing import Callable, cast
+from urllib.parse import quote
+
+import pytest
+
+from src.control_plane.backtest_result_http_contract import (
+    InvalidBacktestResultHttpRequest,
+    format_utc_milliseconds,
+    parse_job_id,
+    parse_result_query,
+    wire_decimal,
+)
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "raw", "expected"),
+    [
+        ("index", b"", (100, None, None, None)),
+        ("index", b"limit=000500&cursor=next%2Bpage", (500, "next+page", None, None)),
+        ("index", b"cursor=a+b", (100, "a b", None, None)),
+        ("index", b"limit=" + b"0" * 100 + b"1", (1, None, None, None)),
+        ("index", b"limit=" + b"0" * 4100 + b"1", (1, None, None, None)),
+        ("trades", b"limit=1", (1, None, None, None)),
+        ("candles", b"start=0000&end=1&limit=2&cursor=c", (2, "c", 0, 1)),
+        ("detail", b"", (None, None, None, None)),
+    ],
+)
+def test_parse_route_queries(endpoint, raw, expected):
+    query = parse_result_query(endpoint, raw)
+    assert (query.limit, query.cursor, query.start_ms, query.end_ms) == expected
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "raw"),
+    [
+        ("index", b"limit=0"),
+        ("index", b"limit=501"),
+        ("index", b"limit=+1"),
+        ("index", b"limit=%201"),
+        ("index", b"limit=1.0"),
+        ("index", b"limit=1e2"),
+        ("index", b"limit=1&limit=2"),
+        ("index", b"cursor="),
+        ("index", b"cursor=%GG"),
+        ("index", b"unknown=x"),
+        ("index", b"limit"),
+        ("index", b"=x"),
+        ("index", b"limit=1&"),
+        ("index", b"limit=%ff"),
+        ("detail", b"cursor=x"),
+        ("candles", b"start=0&end=0"),
+        ("candles", b"start=2&end=1"),
+        ("candles", b"start=253402300800000&end=253402300800001"),
+        ("candles", b"start=0&end=1&cursor=x&extra=1"),
+    ],
+)
+def test_invalid_route_queries_have_fixed_error(endpoint, raw):
+    with pytest.raises(InvalidBacktestResultHttpRequest) as caught:
+        parse_result_query(endpoint, raw)
+    assert str(caught.value) == "validation_error"
+    assert caught.value.__cause__ is None
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [b"", b"%2e", b".", b"..", b"a%2fb", b"a%5cb", b"a%00b", b"a%0ab", b"%ff"],
+)
+def test_job_id_decodes_then_rejects_blank_path_or_control_text(raw):
+    with pytest.raises(InvalidBacktestResultHttpRequest):
+        parse_job_id(raw)
+
+
+def test_job_id_is_decoded_utf8_path_free_text():
+    assert parse_job_id(b"job%3Aone") == "job:one"
+    assert parse_job_id(quote("資料", safe="").encode()) == "資料"
+    assert parse_job_id(b"a+b") == "a+b"
+    assert parse_job_id(b"a%2Bb") == "a+b"
+    assert parse_job_id(b"a%20b") == "a b"
+    assert parse_job_id(b"a+b") != parse_job_id(b"a%20b")
+    assert parse_job_id(b"x" * 4100) == "x" * 4100
+
+
+def test_utc_milliseconds_use_exact_utc_epoch_conversion():
+    assert format_utc_milliseconds(0) == "1970-01-01T00:00:00.000Z"
+    assert format_utc_milliseconds(1) == "1970-01-01T00:00:00.001Z"
+    assert format_utc_milliseconds(253402300799999) == "9999-12-31T23:59:59.999Z"
+    assert datetime.fromtimestamp(0, UTC).isoformat() == "1970-01-01T00:00:00+00:00"
+    for invalid in (-1, 253402300800000, True, 1.0):
+        with pytest.raises(ValueError):
+            cast(Callable[..., str], format_utc_milliseconds)(invalid)
+
+
+def test_wire_decimal_reuses_exact_canonical_owner_across_contexts():
+    for precision in (2, 50):
+        with localcontext() as context:
+            context.prec = precision
+            assert wire_decimal(Decimal("-0.000")) == "0"
+            assert wire_decimal(Decimal("12345678901234567890.1200")) == (
+                "12345678901234567890.12"
+            )
+    for invalid in (1.25, True, Decimal("NaN"), Decimal("Infinity")):
+        with pytest.raises(ValueError):
+            cast(Callable[..., str], wire_decimal)(invalid)
