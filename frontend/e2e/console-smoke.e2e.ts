@@ -911,7 +911,7 @@ for (const roster of ["empty", "single", "multiple"] as const) {
     await page.goto("http://127.0.0.1:4174/?view=strategies");
     await page.locator("#language").selectOption("en");
     await expect(page.locator(".strategy-list > li")).toHaveCount(states.length);
-    const safety = page.getByRole("region", { name: "LOCKDOWN status unavailable" });
+    const safety = page.getByRole("region", { name: "Kill-switch gate" });
     await expect(safety).toBeVisible();
     await expect(safety.getByRole("button", { name: "Unlock LOCKDOWN" })).toBeDisabled();
     if (states.length === 0) await expect(page.getByText("No strategy state yet")).toBeVisible();
@@ -946,7 +946,7 @@ for (const roster of ["empty", "single", "multiple"] as const) {
     }
     await page.screenshot({ path: testInfo.outputPath(`strategy-${roster}.png`), fullPage: true });
     await page.locator("#language").selectOption("zh-TW");
-    await expect(page.getByRole("region", { name: "LOCKDOWN 狀態未接通" })).toBeVisible();
+    await expect(page.getByRole("region", { name: "Kill-switch 閘門" })).toBeVisible();
     await expect(page.getByRole("button", { name: "解除 LOCKDOWN" })).toBeDisabled();
     await expect(page.getByText("停止策略不代表撤單或平倉。", { exact: true })).toHaveCount(states.length);
     if (roster === "multiple") await expect(page.getByRole("button", { name: "停止策略", exact: true })).toBeVisible();
