@@ -16,6 +16,8 @@ from src.core.data_sources.research_database import (
     ResearchDatabaseDataSource,
     ResearchDatasetMetadata,
 )
+from src.core.backtest_result_persistence import FullBacktestOutcome
+from src.core.backtest_runner import BacktestRunner
 from src.core.research_datasets import ResearchDatasetIntegrityError
 from src.strategies.base import BaseStrategy, StrategyRequirements
 
@@ -37,6 +39,13 @@ class FullBacktestResolutionError(RuntimeError):
     def __init__(self, code: ResolutionErrorCode) -> None:
         self.code = code
         super().__init__(code)
+
+
+class FullBacktestExecutionError(RuntimeError):
+    code = "browser_result_execution_failed"
+
+    def __init__(self) -> None:
+        super().__init__(self.code)
 
 
 def _resolve_subject(
@@ -157,3 +166,44 @@ def resolve_full_backtest(
         source_range=source_range,
         catalog_sha256=catalog_sha256,
     )
+
+
+def run_full_backtest(
+    resolved: ResolvedFullBacktest,
+    *,
+    session_factory: Callable[[], Session],
+) -> FullBacktestOutcome:
+    """Run one resolved request through the shared native backtest runner."""
+    try:
+        request = resolved.request
+        source = ResearchDatabaseDataSource(
+            resolved.dataset.id, session_factory=session_factory
+        )
+        runner = BacktestRunner(
+            start_time=request.start,
+            end_time=request.end,
+            product_id=request.instrument.product_id,
+            timeframe=resolved.decision_timeframe,
+            initial_balance=request.initial_balance,
+            max_drawdown_limit=request.drawdown_limit,
+            data_source=source,
+            fee_config={"maker": request.fees.maker, "taker": request.fees.taker},
+            report_config={
+                "csv_trades": False,
+                "markdown_report": False,
+                "equity_curve": False,
+                "journal_export": False,
+            },
+            db_session_factory=session_factory,
+            instrument_spec=request.instrument.to_instrument_spec(),
+            execution_timeframe=resolved.execution_timeframe,
+            capture_completed_outcome=True,
+        )
+        runner.add_strategy(resolved.strategy)
+        runner.run()
+        outcome = runner.completed_outcome
+        if type(outcome) is not FullBacktestOutcome:
+            raise TypeError("runner did not publish a completed outcome")
+        return outcome
+    except Exception:
+        raise FullBacktestExecutionError() from None

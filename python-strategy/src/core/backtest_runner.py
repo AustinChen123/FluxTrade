@@ -348,7 +348,7 @@ class BacktestRunner:
         product_id: str,
         timeframe: str,
         initial_balance: InitialBalanceInput = Decimal("10000"),
-        max_drawdown_limit: Optional[float] = 0.20,
+        max_drawdown_limit: Decimal | float | None = 0.20,
         data_source: Optional[IDataSource] = None,
         fee_config: Mapping[str, Decimal | float] | None = None,
         report_config: Optional[Dict] = None,
