@@ -19,8 +19,8 @@ from src.control_plane.browser_auth import (
     BrowserPrincipal,
 )
 from src.control_plane.gene_control import GeneControlService
+from src.control_plane.full_backtest_request import parse_backtest_request
 from src.control_plane.models import (
-    BacktestJobRequest,
     GenePromotionRequest,
     JobRecord,
     ParameterSearchJobRequest,
@@ -203,7 +203,9 @@ class ControlPlaneApp:
             return self._logout_browser_session(identity.browser_principal)
 
         if method == "POST" and clean_path == "/jobs/backtests":
-            return self._submit_backtest(body)
+            return self._submit_backtest(
+                body, browser_principal=identity.browser_principal
+            )
 
         if method == "POST" and clean_path == "/jobs/parameter-searches":
             return self._submit_parameter_search(body)
@@ -336,13 +338,26 @@ class ControlPlaneApp:
 
         return HttpResponse(404, {"error": "not_found"})
 
-    def _submit_backtest(self, body: str | bytes | None) -> HttpResponse:
+    def _submit_backtest(
+        self,
+        body: str | bytes | None,
+        *,
+        browser_principal: BrowserPrincipal | None = None,
+    ) -> HttpResponse:
+        full_strategy = False
         try:
             payload = self._parse_json_body(body)
-            request = BacktestJobRequest.model_validate(payload)
+            full_strategy = payload.get("kind") == "full_strategy_backtest"
+            if full_strategy and browser_principal is not None:
+                return HttpResponse(
+                    403, {"error": "browser_backtest_controls_unavailable"}
+                )
+            request = parse_backtest_request(payload)
         except json.JSONDecodeError as exc:
             return HttpResponse(400, {"error": "invalid_json", "detail": str(exc)})
         except ValidationError as exc:
+            if full_strategy:
+                return HttpResponse(422, {"error": "validation_error"})
             return HttpResponse(
                 422,
                 {
@@ -444,6 +459,13 @@ class ControlPlaneApp:
                 existing = self.backtest_executor.store.get(job_id)
                 if existing is None:
                     return HttpResponse(404, {"error": "job_not_found"})
+                if (
+                    existing.kind == "full_strategy_backtest"
+                    and browser_principal is not None
+                ):
+                    return HttpResponse(
+                        403, {"error": "browser_backtest_controls_unavailable"}
+                    )
                 if existing.kind == "parameter_search" and browser_principal is not None:
                     return HttpResponse(403, {"error": "browser_ga_controls_unavailable"})
                 payload = self._parse_json_body(body) if body not in (None, "") else {}
@@ -472,6 +494,13 @@ class ControlPlaneApp:
                 existing = self.backtest_executor.store.get(job_id)
                 if existing is None:
                     return HttpResponse(404, {"error": "job_not_found"})
+                if (
+                    existing.kind == "full_strategy_backtest"
+                    and browser_principal is not None
+                ):
+                    return HttpResponse(
+                        403, {"error": "browser_backtest_controls_unavailable"}
+                    )
                 if existing.kind == "parameter_search" and browser_principal is not None:
                     return HttpResponse(403, {"error": "browser_ga_controls_unavailable"})
                 if existing.kind == "parameter_search":
