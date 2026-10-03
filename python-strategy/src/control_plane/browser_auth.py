@@ -162,6 +162,7 @@ class BrowserSessionAuth:
         allowed_origin: str,
         operator_capability: str,
         step_up_capability: str,
+        owner_login: str | None = None,
         session_ttl_seconds: int = 28_800,
         step_up_ttl_seconds: int = 300,
         clock: Callable[[], float] = time.time,
@@ -174,12 +175,18 @@ class BrowserSessionAuth:
             raise ValueError("step_up_capability must be non-empty")
         if operator_capability == step_up_capability:
             raise ValueError("operator and step-up capabilities must be distinct")
+        if owner_login is not None:
+            try:
+                owner_login = _validate_actor(owner_login)
+            except BrowserAuthRejected as exc:
+                raise ValueError("owner_login must be a valid trusted login") from exc
         if session_ttl_seconds <= 0:
             raise ValueError("session_ttl_seconds must be positive")
         if step_up_ttl_seconds <= 0 or step_up_ttl_seconds > 300:
             raise ValueError("step_up_ttl_seconds must be between 1 and 300")
         self.operator_capability = operator_capability
         self.step_up_capability = step_up_capability
+        self.owner_login = owner_login
         self.session_ttl_seconds = session_ttl_seconds
         self.step_up_ttl_seconds = step_up_ttl_seconds
         self._clock = clock
@@ -196,22 +203,29 @@ class BrowserSessionAuth:
             normalized.get(TAILSCALE_LOGIN_HEADER),
             missing_reason="trusted_identity_missing",
         )
-        capabilities = _parse_capabilities(
+        now = self._clock()
+        supplied_capabilities = _parse_capabilities(
             normalized.get(TAILSCALE_CAPABILITIES_HEADER)
         )
-        now = self._clock()
+        expires_at = now + self.session_ttl_seconds
+        capabilities, step_up_expires_at = self._classify_capabilities(
+            actor,
+            supplied_capabilities,
+            session_expires_at=expires_at,
+            existing_step_up_expires_at=(
+                now + self.step_up_ttl_seconds
+                if self.step_up_capability in supplied_capabilities
+                else None
+            ),
+        )
         token = secrets.token_urlsafe(32)
         principal = BrowserPrincipal(
             actor=actor,
             capabilities=capabilities,
             csrf_token=secrets.token_urlsafe(32),
             session_token=token,
-            expires_at=now + self.session_ttl_seconds,
-            step_up_expires_at=(
-                now + self.step_up_ttl_seconds
-                if self.step_up_capability in capabilities
-                else None
-            ),
+            expires_at=expires_at,
+            step_up_expires_at=step_up_expires_at,
         )
         self._session_store.put(principal, now=now)
         return principal
@@ -234,10 +248,36 @@ class BrowserSessionAuth:
         )
         if actor != principal.actor:
             raise BrowserAuthRejected("trusted_identity_mismatch")
-        capabilities = _parse_capabilities(
+        supplied_capabilities = _parse_capabilities(
             normalized.get(TAILSCALE_CAPABILITIES_HEADER)
         )
-        return replace(principal, capabilities=capabilities)
+        capabilities, step_up_expires_at = self._classify_capabilities(
+            actor,
+            supplied_capabilities,
+            session_expires_at=principal.expires_at,
+            existing_step_up_expires_at=principal.step_up_expires_at,
+        )
+        return replace(
+            principal,
+            capabilities=capabilities,
+            step_up_expires_at=step_up_expires_at,
+        )
+
+    def _classify_capabilities(
+        self,
+        actor: str,
+        supplied_capabilities: frozenset[str],
+        *,
+        session_expires_at: float,
+        existing_step_up_expires_at: float | None,
+    ) -> tuple[frozenset[str], float | None]:
+        if self.owner_login is not None and actor == self.owner_login:
+            return (
+                supplied_capabilities
+                | {self.operator_capability, self.step_up_capability},
+                session_expires_at,
+            )
+        return supplied_capabilities, existing_step_up_expires_at
 
     def revoke(self, principal: BrowserPrincipal) -> None:
         self._session_store.delete(principal.session_token)
@@ -319,8 +359,13 @@ def _trusted_actor(value: str | None, *, missing_reason: str) -> str:
     actor = _decode_header_value(value)
     if not actor:
         raise BrowserAuthRejected(missing_reason)
+    return _validate_actor(actor)
+
+
+def _validate_actor(actor: str) -> str:
     if (
-        actor != actor.strip()
+        not actor
+        or actor != actor.strip()
         or len(actor) > MAX_ACTOR_LENGTH
         or _contains_control_character(actor)
     ):

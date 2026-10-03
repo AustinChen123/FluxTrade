@@ -176,8 +176,9 @@ def build_browser_session_auth_from_env() -> BrowserSessionAuth | None:
             "",
         ),
     }
+    owner_login = os.getenv("CONTROL_PLANE_OWNER_LOGIN")
     if trusted_proxy_auth == "false":
-        if any(browser_values.values()):
+        if any(browser_values.values()) or owner_login is not None:
             raise ValueError(
                 "browser auth settings require CONTROL_PLANE_TRUSTED_PROXY_AUTH=true"
             )
@@ -190,6 +191,7 @@ def build_browser_session_auth_from_env() -> BrowserSessionAuth | None:
         allowed_origin=browser_values["allowed_origin"],
         operator_capability=browser_values["operator_capability"],
         step_up_capability=browser_values["step_up_capability"],
+        owner_login=owner_login,
         session_ttl_seconds=_positive_env_int(
             "CONTROL_PLANE_SESSION_TTL_SECONDS",
             28_800,
