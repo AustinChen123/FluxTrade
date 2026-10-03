@@ -1,12 +1,19 @@
 from datetime import UTC, datetime
 from decimal import Decimal, localcontext
+import base64
+import hashlib
+import hmac
 from typing import Callable, cast
 from urllib.parse import quote
 
 import pytest
 
 from src.control_plane.backtest_result_http_contract import (
+    CandlesCursor,
+    IndexCursor,
     InvalidBacktestResultHttpRequest,
+    TradesCursor,
+    encode_result_cursor,
     format_utc_milliseconds,
     parse_job_id,
     parse_result_query,
@@ -103,3 +110,50 @@ def test_wire_decimal_reuses_exact_canonical_owner_across_contexts():
     for invalid in (1.25, True, Decimal("NaN"), Decimal("Infinity")):
         with pytest.raises(ValueError):
             cast(Callable[..., str], wire_decimal)(invalid)
+
+
+def test_signed_cursor_canonical_route_payload_and_exact_signature():
+    key = bytes(range(32))
+    cases = (
+        (
+            IndexCursor(1000, "job:1"),
+            b'{"completed_at":1000,"job_id":"job:1","route":"index"}',
+        ),
+        (
+            TradesCursor("資料", "a" * 64, 4),
+            f'{{"job_id":"資料","result_digest":"{"a" * 64}","route":"trades","sequence":4}}'.encode(),
+        ),
+        (
+            CandlesCursor("job:1", "b" * 64, 100, 200, 150),
+            b'{"end":200,"job_id":"job:1","result_digest":"'
+            + b"b" * 64
+            + b'","route":"candles","start":100,"timestamp":150}',
+        ),
+    )
+    for payload, expected_json in cases:
+        token = encode_result_cursor(key, payload)
+        encoded, signature = token.split(".")
+        assert token == encode_result_cursor(key, payload)
+        assert (
+            base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+            == expected_json
+        )
+        assert signature == hmac.new(key, encoded.encode(), hashlib.sha256).hexdigest()
+
+
+@pytest.mark.parametrize(
+    ("key", "payload"),
+    [
+        (b"short", IndexCursor(1, "job")),
+        (bytes(32), IndexCursor(True, "job")),
+        (bytes(32), cast(Callable[..., IndexCursor], IndexCursor)(1.0, "job")),
+        (bytes(32), IndexCursor(-1, "job")),
+        (bytes(32), IndexCursor(1, "../job")),
+        (bytes(32), TradesCursor("job", "A" * 64, 0)),
+        (bytes(32), TradesCursor("job", "a" * 64, True)),
+        (bytes(32), CandlesCursor("job", "a" * 64, 1, 2, 2)),
+    ],
+)
+def test_signed_cursor_rejects_invalid_key_or_payload(key, payload):
+    with pytest.raises(InvalidBacktestResultHttpRequest):
+        encode_result_cursor(key, payload)

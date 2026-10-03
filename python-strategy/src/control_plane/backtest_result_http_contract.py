@@ -1,8 +1,12 @@
 """Pure request and wire rules for the backtest-results HTTP projections."""
 
 from dataclasses import dataclass
+import base64
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+import hashlib
+import hmac
+import json
 import re
 import unicodedata
 from urllib.parse import unquote_to_bytes
@@ -31,6 +35,31 @@ class BacktestResultQuery:
     cursor: str | None = None
     start_ms: int | None = None
     end_ms: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class IndexCursor:
+    completed_at: int
+    job_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class TradesCursor:
+    job_id: str
+    result_digest: str
+    sequence: int
+
+
+@dataclass(frozen=True, slots=True)
+class CandlesCursor:
+    job_id: str
+    result_digest: str
+    start: int
+    end: int
+    timestamp: int
+
+
+ResultCursor = IndexCursor | TradesCursor | CandlesCursor
 
 
 def _decode_component(raw: bytes, *, form_encoded: bool = False) -> str:
@@ -109,7 +138,7 @@ def parse_job_id(raw_segment: bytes) -> str:
         if type(raw_segment) is not bytes or not raw_segment:
             raise ValueError
         value = _decode_component(raw_segment)
-        if value in (".", "..") or "/" in value or "\\" in value:
+        if not _valid_job_id(value):
             raise ValueError
         return value
     except (UnicodeDecodeError, ValueError):
@@ -131,3 +160,91 @@ def wire_decimal(value: Decimal) -> str:
     if type(value) is not Decimal or not value.is_finite():
         raise ValueError("value must be a finite exact Decimal") from None
     return canonical_decimal_text(value)
+
+
+def _valid_job_id(value: object) -> bool:
+    return (
+        type(value) is str
+        and bool(value)
+        and bool(value.strip())
+        and value not in (".", "..")
+        and "/" not in value
+        and "\\" not in value
+        and not any(unicodedata.category(char) == "Cc" for char in value)
+    )
+
+
+def _valid_digest(value: object) -> bool:
+    return type(value) is str and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def _valid_utc_ms(value: object) -> bool:
+    return type(value) is int and 0 <= value <= _MAX_UTC_MS
+
+
+def _cursor_fields(payload: ResultCursor) -> dict[str, str | int]:
+    if type(payload) is IndexCursor:
+        if not _valid_utc_ms(payload.completed_at) or not _valid_job_id(payload.job_id):
+            raise ValueError
+        return {
+            "route": "index",
+            "completed_at": payload.completed_at,
+            "job_id": payload.job_id,
+        }
+    if type(payload) is TradesCursor:
+        if (
+            not _valid_job_id(payload.job_id)
+            or not _valid_digest(payload.result_digest)
+            or type(payload.sequence) is not int
+            or payload.sequence < 0
+        ):
+            raise ValueError
+        return {
+            "route": "trades",
+            "job_id": payload.job_id,
+            "result_digest": payload.result_digest,
+            "sequence": payload.sequence,
+        }
+    if type(payload) is CandlesCursor:
+        if (
+            not _valid_job_id(payload.job_id)
+            or not _valid_digest(payload.result_digest)
+            or not _valid_utc_ms(payload.start)
+            or not _valid_utc_ms(payload.end)
+            or payload.start >= payload.end
+            or not _valid_utc_ms(payload.timestamp)
+            or not payload.start <= payload.timestamp < payload.end
+        ):
+            raise ValueError
+        return {
+            "route": "candles",
+            "job_id": payload.job_id,
+            "result_digest": payload.result_digest,
+            "start": payload.start,
+            "end": payload.end,
+            "timestamp": payload.timestamp,
+        }
+    raise ValueError
+
+
+def _canonical_cursor_json(fields: dict[str, str | int]) -> bytes:
+    return json.dumps(
+        fields,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def encode_result_cursor(key: bytes, payload: ResultCursor) -> str:
+    """Sign one closed route-specific cursor payload with an explicit 32-byte key."""
+    try:
+        if type(key) is not bytes or len(key) != 32:
+            raise ValueError
+        canonical = _canonical_cursor_json(_cursor_fields(payload))
+        encoded = base64.urlsafe_b64encode(canonical).rstrip(b"=").decode("ascii")
+        signature = hmac.new(key, encoded.encode("ascii"), hashlib.sha256).hexdigest()
+        return f"{encoded}.{signature}"
+    except (TypeError, ValueError, UnicodeError):
+        raise InvalidBacktestResultHttpRequest() from None
