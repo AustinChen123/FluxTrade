@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from dataclasses import FrozenInstanceError, fields
 from decimal import Decimal, InvalidOperation
 
 import pytest
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session, sessionmaker
 
 from src.control_plane.evaluation_data import (
     CsvEvaluationDataSourceProvider,
@@ -24,7 +26,10 @@ from src.core.research_datasets import (
     ResearchDatasetIntegrityError,
     ResearchDatasetSpec,
 )
-from src.core.data_sources.research_database import ResearchDatabaseDataSource
+from src.core.data_sources.research_database import (
+    ResearchDatabaseDataSource,
+    ResearchDatasetMetadata,
+)
 from src.strategies.base import BaseStrategy, StrategyRequirements
 from src.core.models import Signal, SignalType
 
@@ -292,3 +297,100 @@ def _assert_decimal_tree_equal(left, right):
             assert left == right
     else:
         assert left == right
+
+
+def test_dataset_metadata_is_exact_frozen_and_orm_free(stored_dataset):
+    factory, _ = stored_dataset
+    with factory() as session:
+        row = session.get(ResearchDataset, DATASET)
+        assert row is not None
+        expected = (
+            row.id,
+            row.product_id,
+            row.timeframe,
+            row.checksum_sha256,
+            row.start_time,
+            row.end_time,
+        )
+
+    metadata = ResearchDatabaseDataSource(
+        DATASET, session_factory=factory
+    ).get_dataset_metadata()
+
+    assert isinstance(metadata, ResearchDatasetMetadata)
+    assert not isinstance(metadata, ResearchDataset)
+    assert tuple(field.name for field in fields(metadata)) == (
+        "id",
+        "product_id",
+        "timeframe",
+        "checksum_sha256",
+        "start_time",
+        "end_time",
+    )
+    assert (
+        tuple(getattr(metadata, field.name) for field in fields(metadata)) == expected
+    )
+    with pytest.raises(FrozenInstanceError):
+        setattr(metadata, "id", "changed")
+
+
+@pytest.mark.parametrize("dataset_state", ["absent", "unsealed", "unvalidated"])
+def test_dataset_metadata_uses_seal_classifier(
+    dataset_state, stored_dataset, monkeypatch
+):
+    factory, _ = stored_dataset
+    dataset_id = "missing" if dataset_state == "absent" else DATASET
+    if dataset_state != "absent":
+        with factory() as session:
+            row = session.get(ResearchDataset, DATASET)
+            assert row is not None
+            if dataset_state == "unsealed":
+                row.lifecycle_state = "importing"
+                row.sealed_at = None
+            else:
+                session.connection().exec_driver_sql(
+                    "PRAGMA ignore_check_constraints=ON"
+                )
+                row.quality_status = "pending"
+            session.commit()
+
+    close_calls = 0
+    original_close = Session.close
+
+    def track_close(session):
+        nonlocal close_calls
+        close_calls += 1
+        original_close(session)
+
+    monkeypatch.setattr(Session, "close", track_close)
+    with pytest.raises(ResearchDatasetIntegrityError, match="integrity validation"):
+        ResearchDatabaseDataSource(
+            dataset_id, session_factory=factory
+        ).get_dataset_metadata()
+    assert close_calls == 1
+
+
+def test_dataset_metadata_closes_session_after_success_and_database_error(
+    stored_dataset, monkeypatch
+):
+    factory, _ = stored_dataset
+    close_calls = 0
+    original_close = Session.close
+
+    def track_close(session):
+        nonlocal close_calls
+        close_calls += 1
+        original_close(session)
+
+    monkeypatch.setattr(Session, "close", track_close)
+    source = ResearchDatabaseDataSource(DATASET, session_factory=factory)
+    source.get_dataset_metadata()
+    assert close_calls == 1
+
+    def fail_get(session, entity, ident, **kwargs):
+        raise SQLAlchemyError("synthetic database failure")
+
+    monkeypatch.setattr(Session, "get", fail_get)
+    with pytest.raises(SQLAlchemyError, match="synthetic database failure"):
+        source.get_dataset_metadata()
+    assert close_calls == 2
