@@ -12,13 +12,16 @@ from src.control_plane.backtest_result_http_contract import (
     IndexCursor,
     IndexCursorBinding,
     InvalidBacktestResultHttpRequest,
+    TradesCursor,
+    TradesCursorBinding,
     _valid_digest,
     _valid_job_id,
     encode_result_cursor,
     format_utc_milliseconds,
     verify_result_cursor,
+    wire_decimal,
 )
-from src.core.orm_models import BacktestResultSummary
+from src.core.orm_models import BacktestClosedTrade, BacktestResultSummary
 
 _NONFINITE = (Decimal("NaN"), Decimal("Infinity"), Decimal("-Infinity"))
 _FORMAL_TEXT_FIELDS = (
@@ -63,11 +66,43 @@ class BacktestResultsIndexPage(TypedDict):
     revision: Literal[1]
 
 
+class BacktestResultsTrade(TypedDict):
+    id: str
+    entry_time: str
+    exit_time: str
+    entry_price: str
+    exit_price: str
+    side: str
+    quantity: str
+    pnl: str
+    fee: str
+
+
+class BacktestResultsTradesPage(TypedDict):
+    items: list[BacktestResultsTrade]
+    next_cursor: str | None
+    revision: Literal[1]
+
+
 class BacktestResultsReadUnavailable(RuntimeError):
     """Sanitized SQL or stored-projection failure for the read service."""
 
     def __init__(self) -> None:
         super().__init__("browser_result_backend_unavailable")
+
+
+class BacktestResultsUnavailable(RuntimeError):
+    """A job or linked summary exists without a qualifying formal result."""
+
+    def __init__(self) -> None:
+        super().__init__("result_unavailable")
+
+
+class BacktestResultsNotFound(RuntimeError):
+    """Neither a qualifying result nor an existing job is present."""
+
+    def __init__(self) -> None:
+        super().__init__("result_not_found")
 
 
 def _formal_result_qualification():
@@ -125,14 +160,48 @@ def _index_item(row: BacktestResultSummary) -> BacktestResultsIndexItem:
     }
 
 
+def _trade_item(job_id: str, row: BacktestClosedTrade) -> BacktestResultsTrade:
+    if (
+        not _valid_job_id(job_id)
+        or type(row.sequence) is not int
+        or row.sequence < 0
+        or type(row.side) is not str
+        or row.side not in ("LONG", "SHORT")
+        or type(row.entry_time) is not int
+        or type(row.exit_time) is not int
+        or row.entry_time > row.exit_time
+        or type(row.quantity) is not Decimal
+        or row.quantity <= 0
+    ):
+        raise ValueError
+    return {
+        "id": f"{job_id}:{row.sequence}",
+        "entry_time": format_utc_milliseconds(row.entry_time),
+        "exit_time": format_utc_milliseconds(row.exit_time),
+        "entry_price": wire_decimal(row.entry_price),
+        "exit_price": wire_decimal(row.exit_price),
+        "side": row.side,
+        "quantity": wire_decimal(row.quantity),
+        "pnl": wire_decimal(row.pnl),
+        "fee": wire_decimal(row.fee),
+    }
+
+
 class BacktestResultsQueryService:
     """Own SQL sessions and return only approved plain index wire values."""
 
-    def __init__(self, session_factory: Callable[[], Session], *, cursor_key: bytes):
+    def __init__(
+        self,
+        session_factory: Callable[[], Session],
+        *,
+        cursor_key: bytes,
+        job_lookup: Callable[[str], object | None] | None = None,
+    ):
         if type(cursor_key) is not bytes or len(cursor_key) != 32:
             raise ValueError("cursor_key must be exactly 32 bytes")
         self._session_factory = session_factory
         self._cursor_key = cursor_key
+        self._job_lookup = job_lookup
 
     def list_index(self, query: BacktestResultQuery) -> BacktestResultsIndexPage:
         if type(query) is not BacktestResultQuery:
@@ -184,5 +253,82 @@ class BacktestResultsQueryService:
                 BacktestResultsIndexPage,
                 {"items": items, "next_cursor": next_cursor, "revision": 1},
             )
+        except Exception:
+            raise BacktestResultsReadUnavailable() from None
+
+    def list_trades(
+        self, job_id: str, query: BacktestResultQuery
+    ) -> BacktestResultsTradesPage:
+        if not _valid_job_id(job_id) or type(query) is not BacktestResultQuery:
+            raise InvalidBacktestResultHttpRequest() from None
+        limit = 100 if query.limit is None else query.limit
+        if type(limit) is not int or not 1 <= limit <= 500:
+            raise InvalidBacktestResultHttpRequest() from None
+
+        try:
+            with self._session_factory() as session:
+                summary = session.scalars(
+                    select(BacktestResultSummary).where(
+                        _formal_result_qualification(),
+                        BacktestResultSummary.job_id == job_id,
+                    )
+                ).one_or_none()
+                if summary is None:
+                    linked_summary = session.scalars(
+                        select(BacktestResultSummary.id)
+                        .where(BacktestResultSummary.job_id == job_id)
+                        .limit(1)
+                    ).first()
+                    if linked_summary is not None or (
+                        self._job_lookup is not None
+                        and self._job_lookup(job_id) is not None
+                    ):
+                        raise BacktestResultsUnavailable()
+                    raise BacktestResultsNotFound()
+
+                digest = summary.result_digest
+                if not _valid_job_id(summary.job_id) or not _valid_digest(digest):
+                    raise ValueError
+                after = None
+                if query.cursor is not None:
+                    after = verify_result_cursor(
+                        self._cursor_key,
+                        query.cursor,
+                        TradesCursorBinding(job_id, cast(str, digest)),
+                    )
+                    if type(after) is not TradesCursor:
+                        raise InvalidBacktestResultHttpRequest() from None
+
+                statement = select(BacktestClosedTrade).where(
+                    BacktestClosedTrade.summary_id == summary.id
+                )
+                if after is not None:
+                    statement = statement.where(
+                        BacktestClosedTrade.sequence > after.sequence
+                    )
+                rows = session.scalars(
+                    statement.order_by(BacktestClosedTrade.sequence.asc()).limit(
+                        limit + 1
+                    )
+                ).all()
+                has_more = len(rows) > limit
+                page_rows = rows[:limit]
+                items = [_trade_item(job_id, row) for row in page_rows]
+                next_cursor = None
+                if has_more:
+                    next_cursor = encode_result_cursor(
+                        self._cursor_key,
+                        TradesCursor(job_id, cast(str, digest), page_rows[-1].sequence),
+                    )
+            return cast(
+                BacktestResultsTradesPage,
+                {"items": items, "next_cursor": next_cursor, "revision": 1},
+            )
+        except (
+            BacktestResultsUnavailable,
+            BacktestResultsNotFound,
+            InvalidBacktestResultHttpRequest,
+        ):
+            raise
         except Exception:
             raise BacktestResultsReadUnavailable() from None
