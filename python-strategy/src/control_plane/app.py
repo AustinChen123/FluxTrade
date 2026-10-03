@@ -161,6 +161,17 @@ class ControlPlaneApp:
                 return HttpResponse(browser_policy_response.status_code, browser_policy_response.body, headers=(("Cache-Control", "no-store"),))
             return browser_policy_response
 
+        if (
+            identity.browser_principal is not None
+            and method == "POST"
+            and clean_path
+            in {
+                "/jobs/parameter-searches",
+                "/jobs/parameter-search-presets/golden-cross",
+            }
+        ):
+            return HttpResponse(403, {"error": "browser_ga_controls_unavailable"})
+
         if method == "GET" and clean_path == "/api/v1/market-data/volume-profiles":
             if body is not None and not (
                 type(body) is bytes and body == b"" or type(body) is str and body == ""
@@ -204,7 +215,11 @@ class ControlPlaneApp:
             return self._submit_golden_cross_parameter_search_preset(body)
 
         if method == "POST" and clean_path.startswith("/jobs/"):
-            return self._handle_job_action(clean_path, body)
+            return self._handle_job_action(
+                clean_path,
+                body,
+                browser_principal=identity.browser_principal,
+            )
 
         if method == "POST" and clean_path.startswith("/genes/"):
             return self._submit_gene_action(clean_path, body, actor=identity.actor)
@@ -418,6 +433,8 @@ class ControlPlaneApp:
         self,
         path: str,
         body: str | bytes | None,
+        *,
+        browser_principal: BrowserPrincipal | None = None,
     ) -> HttpResponse:
         if path.endswith("/cancel"):
             job_id = path.removeprefix("/jobs/")[: -len("/cancel")]
@@ -427,6 +444,8 @@ class ControlPlaneApp:
                 existing = self.backtest_executor.store.get(job_id)
                 if existing is None:
                     return HttpResponse(404, {"error": "job_not_found"})
+                if existing.kind == "parameter_search" and browser_principal is not None:
+                    return HttpResponse(403, {"error": "browser_ga_controls_unavailable"})
                 payload = self._parse_json_body(body) if body not in (None, "") else {}
                 reason = payload.get("reason")
                 if reason is not None and not isinstance(reason, str):
@@ -453,6 +472,8 @@ class ControlPlaneApp:
                 existing = self.backtest_executor.store.get(job_id)
                 if existing is None:
                     return HttpResponse(404, {"error": "job_not_found"})
+                if existing.kind == "parameter_search" and browser_principal is not None:
+                    return HttpResponse(403, {"error": "browser_ga_controls_unavailable"})
                 if existing.kind == "parameter_search":
                     if self.parameter_search_executor is None:
                         return HttpResponse(503, {"error": "parameter_search_unavailable"})
