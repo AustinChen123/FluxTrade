@@ -5,7 +5,7 @@ import os
 import signal
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.pool import NullPool
@@ -36,9 +36,11 @@ from src.control_plane.server import serve
 from src.core.db import SessionLocal, get_engine
 from src.core.redis_factory import create_redis_client
 from src.core.runtime_environment import RuntimeEnvironment
+from src.core.strategy_loader import StrategyLoader
 
 
 logger = logging.getLogger(__name__)
+_DEFAULT_STRATEGY_ARTIFACTS_PATH = "/app/strategy_artifacts"
 
 
 def _utc_ms() -> int:
@@ -96,12 +98,22 @@ def build_control_plane_app(
     browser_auth: BrowserAuthProvider | None = None,
     readiness_probe: Callable[[], None] | None = None,
     profile_query_service: ProfileQueryService | None = None,
+    strategy_loader: Callable[[], Mapping[str, object]] | None = None,
 ) -> ControlPlaneApp:
     if redis_client is None:
         redis_client = create_redis_client()
     if job_store is None:
         job_db_path = os.getenv("CONTROL_PLANE_JOB_DB_PATH")
         job_store = SqliteJobStore(job_db_path) if job_db_path else InMemoryJobStore()
+    if strategy_loader is None:
+        strategy_artifacts_path = os.getenv(
+            "STRATEGY_ARTIFACTS_PATH", _DEFAULT_STRATEGY_ARTIFACTS_PATH
+        )
+
+        def load_strategy_catalog() -> Mapping[str, object]:
+            return StrategyLoader.scan_production_sources(strategy_artifacts_path)
+
+        strategy_loader = load_strategy_catalog
 
     state_query = StrategyStateQueryService(db_session_factory)
     if profile_query_service is None:
@@ -138,6 +150,7 @@ def build_control_plane_app(
             store=job_store,
             db_session_factory=db_session_factory,
             recover_interrupted=recover_interrupted,
+            strategy_loader=strategy_loader,
         ),
         parameter_search_executor=ParameterSearchJobExecutor(
             parameter_search_evaluator,

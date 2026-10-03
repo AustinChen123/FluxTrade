@@ -3,8 +3,11 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import time
+from collections.abc import Mapping
 from decimal import Decimal
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 import sqlalchemy as sa
@@ -14,6 +17,7 @@ from sqlalchemy.orm import sessionmaker
 from src.control_plane import backtest_jobs
 from src.control_plane.backtest_jobs import BacktestJobExecutor
 from src.control_plane.jobs import JobStatus, SqliteJobStore
+from src.control_plane.main import build_control_plane_app
 from src.core.backtest_result_owner import (
     BacktestResultPersistenceOwner,
     BacktestResultPersistenceReceipt,
@@ -108,8 +112,26 @@ def _write_candles(path: Path) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def wait_for_job(store: SqliteJobStore, job_id: str):
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        job = store.get(job_id)
+        if job is not None and job.status in {
+            JobStatus.SUCCEEDED,
+            JobStatus.FAILED,
+            JobStatus.CANCELLED,
+        }:
+            return job
+        time.sleep(0.01)
+    raise AssertionError(f"job {job_id} did not reach a terminal state")
+
+
+@pytest.mark.parametrize("through_http", [False, True])
 def test_verified_catalog_sealed_pg_native_executor_owner_and_retry(
-    fresh_pg_db: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    fresh_pg_db: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    through_http: bool,
 ) -> None:
     _upgrade(fresh_pg_db, "head")
     engine = sa.create_engine(_target_url(fresh_pg_db))
@@ -120,6 +142,8 @@ def test_verified_catalog_sealed_pg_native_executor_owner_and_retry(
     artifact_version = _write_native_catalog(catalog_root)
     candles_csv = tmp_path / "sealed.csv"
     _write_candles(candles_csv)
+    app = None
+    executor: BacktestJobExecutor | None = None
     try:
         imported = ResearchDatasetImporter(session_factory).import_csv(
             candles_csv,
@@ -158,22 +182,46 @@ def test_verified_catalog_sealed_pg_native_executor_owner_and_retry(
             session.add(Strategy(id=_STRATEGY, name="Catalog Signal Strategy"))
             session.commit()
 
-        with _read_only_tree(catalog_root):
-            catalog = StrategyLoader.scan_production_sources(str(catalog_root))
-            artifact = catalog[_STRATEGY]
-            assert isinstance(artifact, type)
-            loaded_version = getattr(artifact, "__fluxtrade_artifact_version__")
-            loaded_catalog_sha = getattr(artifact, "__fluxtrade_catalog_sha256__")
-            assert loaded_version == artifact_version
-            assert len(loaded_catalog_sha) == 64
+        monkeypatch.setenv("STRATEGY_ARTIFACTS_PATH", str(catalog_root))
+        loaded_catalogs: list[Mapping[str, object]] = []
+        scanned_paths: list[str] = []
+        original_scan = StrategyLoader.scan_production_sources
 
-            loader_calls = 0
+        def capture_scan(path: str, *, break_glass_path: str | None = None):
+            scanned_paths.append(path)
+            result = original_scan(path, break_glass_path=break_glass_path)
+            loaded_catalogs.append(result)
+            return result
+
+        monkeypatch.setattr(StrategyLoader, "scan_production_sources", capture_scan)
+        if through_http:
+            app = build_control_plane_app(
+                redis_client=MagicMock(),
+                db_session_factory=session_factory,
+                job_store=store,
+                api_key="operator-key",
+                readiness_probe=lambda: None,
+                profile_query_service=MagicMock(),
+            )
+        else:
 
             def production_loader():
-                nonlocal loader_calls
-                loader_calls += 1
                 return StrategyLoader.scan_production_sources(str(catalog_root))
 
+            executor = BacktestJobExecutor(
+                store,
+                db_session_factory=session_factory,
+                run_inline=True,
+                strategy_loader=production_loader,
+            )
+        assert scanned_paths == []
+        if through_http:
+            monkeypatch.setenv("STRATEGY_ARTIFACTS_PATH", str(tmp_path / "wrong_path"))
+            assert app is not None
+            executor = app.backtest_executor
+        assert executor is not None
+
+        with _read_only_tree(catalog_root):
             strategies: list[BaseStrategy] = []
             identity_outcomes: dict[
                 str, tuple[BacktestResultRunIdentity, FullBacktestOutcome]
@@ -181,11 +229,18 @@ def test_verified_catalog_sealed_pg_native_executor_owner_and_retry(
             receipts: dict[str, BacktestResultPersistenceReceipt] = {}
             original_run = backtest_jobs.run_full_backtest
             original_persist = BacktestResultPersistenceOwner.persist
+            original_mkdir = Path.mkdir
+
+            def fail_if_report_directory_created(*_args, **_kwargs):
+                raise AssertionError("disabled reports must not touch the filesystem")
 
             def capture_run(resolved, *, session_factory):
                 strategies.append(resolved.strategy)
-                result = original_run(resolved, session_factory=session_factory)
-                return result
+                monkeypatch.setattr(Path, "mkdir", fail_if_report_directory_created)
+                try:
+                    return original_run(resolved, session_factory=session_factory)
+                finally:
+                    monkeypatch.setattr(Path, "mkdir", original_mkdir)
 
             def capture_persist(owner, identity, outcome):
                 current = store.get(identity.job_id)
@@ -198,12 +253,6 @@ def test_verified_catalog_sealed_pg_native_executor_owner_and_retry(
             monkeypatch.setattr(backtest_jobs, "run_full_backtest", capture_run)
             monkeypatch.setattr(
                 BacktestResultPersistenceOwner, "persist", capture_persist
-            )
-            executor = BacktestJobExecutor(
-                store,
-                db_session_factory=session_factory,
-                run_inline=True,
-                strategy_loader=production_loader,
             )
             template = _request_template()
             request = template.model_copy(
@@ -227,17 +276,35 @@ def test_verified_catalog_sealed_pg_native_executor_owner_and_retry(
                 == (Path(__file__).parents[2] / "src/core/backtest_runner.py").resolve()
             )
 
-            def fail_if_report_directory_created(*_args, **_kwargs):
-                raise AssertionError("disabled reports must not touch the filesystem")
-
-            monkeypatch.setattr(Path, "mkdir", fail_if_report_directory_created)
-
             def fail_closed_trade_insert(mapper, connection, target) -> None:
                 raise RuntimeError("injected persistence failure")
 
             event.listen(BacktestClosedTrade, "before_insert", fail_closed_trade_insert)
             try:
-                failed = executor.submit_backtest(request)
+                if through_http:
+                    assert app is not None
+                    failed_response = app.handle(
+                        "POST",
+                        "/jobs/backtests",
+                        body=request.model_dump_json(exclude_none=False),
+                        headers={"Authorization": "Bearer operator-key"},
+                    )
+                    assert failed_response.status_code == 202
+                    failed_job_id = failed_response.body["job"]["id"]
+                    failed = wait_for_job(store, failed_job_id)
+                    failed_http = app.handle(
+                        "GET",
+                        f"/jobs/{failed_job_id}",
+                        headers={"Authorization": "Bearer operator-key"},
+                    )
+                    assert failed_http.status_code == 200
+                    assert failed_http.body["job"]["status"] == JobStatus.FAILED.value
+                    assert (
+                        failed_http.body["job"]["error"]
+                        == "browser_result_persistence_failed"
+                    )
+                else:
+                    failed = executor.submit_backtest(request)
             finally:
                 event.remove(
                     BacktestClosedTrade, "before_insert", fail_closed_trade_insert
@@ -274,7 +341,17 @@ def test_verified_catalog_sealed_pg_native_executor_owner_and_retry(
                 )
                 assert audit_rows is not None and audit_rows > 0
 
-            retried = executor.retry_backtest(failed.id)
+            if through_http:
+                assert app is not None
+                retry_response = app.handle(
+                    "POST",
+                    f"/jobs/{failed.id}/retry",
+                    headers={"Authorization": "Bearer operator-key"},
+                )
+                assert retry_response.status_code == 202
+                retried = wait_for_job(store, retry_response.body["job"]["id"])
+            else:
+                retried = executor.retry_backtest(failed.id)
             assert retried.id != failed.id
             assert retried.status == JobStatus.SUCCEEDED
             assert retried.error is None
@@ -282,7 +359,18 @@ def test_verified_catalog_sealed_pg_native_executor_owner_and_retry(
             assert set(retried.result) == {"job_id", "input_digest", "result_digest"}
             assert retried.result["job_id"] == retried.id
 
-            repeated = executor.submit_backtest(request)
+            if through_http:
+                assert app is not None
+                repeated_response = app.handle(
+                    "POST",
+                    "/jobs/backtests",
+                    body=request.model_dump_json(exclude_none=False),
+                    headers={"Authorization": "Bearer operator-key"},
+                )
+                assert repeated_response.status_code == 202
+                repeated = wait_for_job(store, repeated_response.body["job"]["id"])
+            else:
+                repeated = executor.submit_backtest(request)
             assert repeated.status == JobStatus.SUCCEEDED
             assert repeated.id != retried.id
             assert repeated.result is not None
@@ -290,7 +378,24 @@ def test_verified_catalog_sealed_pg_native_executor_owner_and_retry(
             assert repeated.result["result_digest"] == retried.result["result_digest"]
             assert len(strategies) == 3
             assert len({id(strategy) for strategy in strategies}) == 3
-            assert loader_calls == 3
+            assert scanned_paths == [str(catalog_root)] * 3
+            assert len(loaded_catalogs) == 3
+            if through_http:
+                assert app is not None
+                for job in (retried, repeated):
+                    result_http = app.handle(
+                        "GET",
+                        f"/jobs/{job.id}",
+                        headers={"Authorization": "Bearer operator-key"},
+                    )
+                    assert result_http.status_code == 200
+                    assert result_http.body["job"]["result"] == job.result
+            artifact = loaded_catalogs[0][_STRATEGY]
+            assert isinstance(artifact, type)
+            loaded_version = getattr(artifact, "__fluxtrade_artifact_version__")
+            loaded_catalog_sha = getattr(artifact, "__fluxtrade_catalog_sha256__")
+            assert loaded_version == artifact_version
+            assert len(loaded_catalog_sha) == 64
 
             for job in (retried, repeated):
                 identity, outcome = identity_outcomes[job.id]
@@ -404,6 +509,9 @@ def test_verified_catalog_sealed_pg_native_executor_owner_and_retry(
                     for row in projection.pnl_distribution
                 ]
                 assert audit_count and len(trades) == len(outcome.closed_trades)
-            assert executor.shutdown()
     finally:
+        if app is not None:
+            assert app.shutdown(timeout=10)
+        elif executor is not None:
+            assert executor.shutdown()
         engine.dispose()
