@@ -26,9 +26,8 @@ from src.core.orm_models import (
     Strategy,
 )
 from src.strategies.base import BaseStrategy, StrategyRequirements
+from test_database_evaluation_data import stored_dataset as stored_dataset
 from test_full_backtest_request import _payload
-
-pytest_plugins = ["test_database_evaluation_data"]
 
 
 @compiles(JSONB, "sqlite")
@@ -209,7 +208,8 @@ class _NativeSignalStrategy(BaseStrategy):
 
 
 def test_real_sealed_data_uses_native_runner_and_returns_fee_bearing_outcome(
-    stored_dataset, monkeypatch
+    stored_dataset,  # noqa: F811
+    monkeypatch,
 ):
     from src.core.backtest_runner import BacktestRunner
 

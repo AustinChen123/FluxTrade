@@ -18,9 +18,8 @@ from test_database_evaluation_data import (
     PRODUCT,
     START,
     TIMEFRAME,
+    stored_dataset as stored_dataset,
 )
-
-pytest_plugins = ["test_database_evaluation_data"]
 
 STRATEGY_ID = "catalog::ResolutionStrategy"
 ARTIFACT_VERSION = "v1.2.3"
@@ -189,7 +188,7 @@ def test_subject_resolution_rejects_missing_and_failed_catalogs():
 
 
 @pytest.fixture
-def sealed_dataset(stored_dataset):
+def sealed_dataset(stored_dataset):  # noqa: F811
     return stored_dataset[0]
 
 
