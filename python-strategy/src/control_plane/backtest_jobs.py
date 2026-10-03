@@ -18,15 +18,19 @@ from src.control_plane.models import (
     JobStatus,
 )
 from src.control_plane.full_backtest import (
+    FullBacktestExecutionError,
     FullBacktestResolutionError,
     ResolvedFullBacktest,
     resolve_full_backtest,
     run_full_backtest,
 )
 from src.control_plane.full_backtest_request import (
+    BacktestRequest,
     FullStrategyBacktestRequest,
+    parse_backtest_request,
 )
 from src.core.backtest_result_owner import (
+    BacktestResultPersistenceError,
     BacktestResultPersistenceOwner,
     BacktestResultRunIdentity,
 )
@@ -83,7 +87,7 @@ class BacktestJobExecutor:
         self._futures_lock = Lock()
         self._closed = False
 
-    def submit_backtest(self, request: BacktestJobRequest) -> JobRecord:
+    def submit_backtest(self, request: BacktestRequest) -> JobRecord:
         with self._futures_lock:
             if self._closed:
                 raise RuntimeError("backtest executor is shut down")
@@ -123,12 +127,14 @@ class BacktestJobExecutor:
         job = self.store.get(job_id)
         if job is None:
             raise KeyError(job_id)
-        if job.kind != "csv_signal_backtest":
+        if job.kind not in {"csv_signal_backtest", "full_strategy_backtest"}:
             raise ValueError(f"unsupported job kind: {job.kind}")
         if job.status not in {JobStatus.FAILED, JobStatus.CANCELLED}:
             raise ValueError(f"{job.status.value.lower()} jobs cannot be retried")
 
-        request = BacktestJobRequest.model_validate(job.request)
+        request = parse_backtest_request(job.request)
+        if request.kind != job.kind:
+            raise ValueError(f"unsupported job kind: {job.kind}")
         return self.submit_backtest(request)
 
     def shutdown(
@@ -155,16 +161,32 @@ class BacktestJobExecutor:
         self._executor.shutdown(wait=True)
         return True
 
-    def _run_job(self, job_id: str, request: BacktestJobRequest) -> JobRecord:
+    def _run_job(self, job_id: str, request: BacktestRequest) -> JobRecord:
         try:
             current = self.store.get(job_id)
             if current is not None and current.status == JobStatus.CANCELLED:
                 return current
             self.store.mark_running(job_id)
-            try:
-                result = self.run_backtest_request(request)
-            except Exception as exc:
-                return self.store.mark_failed(job_id, str(exc))
+            if isinstance(request, FullStrategyBacktestRequest):
+                try:
+                    result = self._run_full_strategy_request(job_id, request)
+                except FullBacktestResolutionError as exc:
+                    return self.store.mark_failed(job_id, exc.code)
+                except FullBacktestExecutionError as exc:
+                    return self.store.mark_failed(job_id, exc.code)
+                except BacktestResultPersistenceError:
+                    return self.store.mark_failed(
+                        job_id, "browser_result_persistence_failed"
+                    )
+                except Exception:
+                    return self.store.mark_failed(
+                        job_id, "browser_result_execution_failed"
+                    )
+            else:
+                try:
+                    result = self.run_backtest_request(request)
+                except Exception as exc:
+                    return self.store.mark_failed(job_id, str(exc))
             return self.store.mark_succeeded(job_id, result)
         finally:
             with self._futures_lock:
