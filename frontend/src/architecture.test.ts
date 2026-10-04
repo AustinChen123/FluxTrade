@@ -63,6 +63,7 @@ type ArchitectureRole =
   | "research-io"
   | "strategy-io"
   | "results-io"
+  | "trades-io"
   | "feature-owner"
   | "feature-presentation"
   | "feature-model"
@@ -166,6 +167,8 @@ const expectedInventory = [
   "features/trades/tradeCharts.ts",
   "features/trades/tradeModel.test.ts",
   "features/trades/tradeModel.ts",
+  "features/trades/useBacktestTrades.test.ts",
+  "features/trades/useBacktestTrades.ts",
   "main.tsx",
   "shared/charts/EChart.test.tsx",
   "shared/charts/EChart.tsx",
@@ -298,6 +301,9 @@ const expectedBareImportLedger = [
   "features/trades/TradeChartView.tsx|react-i18next|value",
   "features/trades/TradeChartView.tsx|react|value",
   "features/trades/tradeModel.test.ts|vitest|value",
+  "features/trades/useBacktestTrades.test.ts|@testing-library/react|value",
+  "features/trades/useBacktestTrades.test.ts|vitest|value",
+  "features/trades/useBacktestTrades.ts|react|value",
   "main.tsx|react-dom/client|value",
   "main.tsx|react|value",
   "shared/charts/EChart.test.tsx|@testing-library/react|value",
@@ -482,6 +488,12 @@ const expectedRelativeImportLedger = [
   "features/trades/tradeModel.ts|../../shared/trading/closedTrade|type-only|shared/trading/closedTrade.ts",
   "features/trades/tradeModel.ts|../../shared/trading/closedTradePage|type-only|shared/trading/closedTradePage.ts",
   "features/trades/tradeModel.ts|../../shared/trading/closedTradePage|value|shared/trading/closedTradePage.ts",
+  "features/trades/useBacktestTrades.test.ts|../../api|type-only|api.ts",
+  "features/trades/useBacktestTrades.test.ts|./useBacktestTrades|value|features/trades/useBacktestTrades.ts",
+  "features/trades/useBacktestTrades.ts|../../api|value|api.ts",
+  "features/trades/useBacktestTrades.ts|../../shared/trading/closedTradePage|value|shared/trading/closedTradePage.ts",
+  "features/trades/useBacktestTrades.ts|../../shared/trading/useTradePagination|value|shared/trading/useTradePagination.ts",
+  "features/trades/useBacktestTrades.ts|./tradeModel|value|features/trades/tradeModel.ts",
   "main.tsx|./app/App|value|app/App.tsx",
   "main.tsx|./shared/i18n|value|shared/i18n.ts",
   "main.tsx|./shared/theme|value|shared/theme.ts",
@@ -1069,6 +1081,7 @@ function architectureRole(importer: string): ArchitectureRole {
     return "strategy-io";
   }
   if (importer === "features/results/useBacktestResults.ts") return "results-io";
+  if (importer === "features/trades/useBacktestTrades.ts") return "trades-io";
   if (importer === "shared/trading/useTradePagination.ts") {
     return "shared-trading-pager";
   }
@@ -1218,6 +1231,7 @@ function assertBareEdge(edge: ImportEdge, role: ArchitectureRole): void {
         "features/strategies/useStrategyManager.test.ts",
         "features/trades/CandlestickChart.test.tsx",
         "features/trades/TradeChartView.test.tsx",
+        "features/trades/useBacktestTrades.test.ts",
         "shared/charts/EChart.test.tsx"
       ]).has(edge.importer)
     ) {
@@ -1238,6 +1252,7 @@ function assertBareEdge(edge: ImportEdge, role: ArchitectureRole): void {
     "research-io": new Set(["react|value"]),
     "strategy-io": new Set(["react|value", "react-i18next|type-only"]),
     "results-io": new Set(["react|value"]),
+    "trades-io": new Set(["react|value"]),
     "feature-owner": new Set([
       "react|value",
       "react-i18next|type-only",
@@ -1384,6 +1399,17 @@ function assertRepositoryEdge(edge: ImportEdge, role: ArchitectureRole): void {
       denyEdge(edge);
     }
     return;
+  }
+  if (role === "trades-io") {
+    if (
+      edge.resolved === "api.ts" ||
+      edge.resolved === "features/trades/tradeModel.ts" ||
+      edge.resolved === "shared/trading/closedTradePage.ts" ||
+      edge.resolved === "shared/trading/useTradePagination.ts"
+    ) {
+      return;
+    }
+    denyEdge(edge);
   }
   if (role === "feature-model") {
     if (edge.resolved === "api.ts") {
@@ -2190,6 +2216,7 @@ describe("frontend architecture ratchet", () => {
     ["features/research/useResearchWorkspace.ts", "research-io"],
     ["features/strategies/useStrategyManager.ts", "strategy-io"],
     ["features/results/useBacktestResults.ts", "results-io"],
+    ["features/trades/useBacktestTrades.ts", "trades-io"],
     ["features/research/ResearchRoute.tsx", "feature-owner"],
     ["features/research/ResearchPage.tsx", "feature-presentation"],
     ["features/research/gaDomain.ts", "feature-model"],
@@ -2256,6 +2283,26 @@ describe("frontend architecture ratchet", () => {
       "features/results/useBacktestResults.ts",
       "./resultsModel",
       "features/results/resultsModel.ts"
+    ),
+    architectureEdge(
+      "features/trades/useBacktestTrades.ts",
+      "../../api",
+      "api.ts"
+    ),
+    architectureEdge(
+      "features/trades/useBacktestTrades.ts",
+      "../../shared/trading/closedTradePage",
+      "shared/trading/closedTradePage.ts"
+    ),
+    architectureEdge(
+      "features/trades/useBacktestTrades.ts",
+      "../../shared/trading/useTradePagination",
+      "shared/trading/useTradePagination.ts"
+    ),
+    architectureEdge(
+      "features/trades/useBacktestTrades.ts",
+      "./tradeModel",
+      "features/trades/tradeModel.ts"
     ),
     architectureEdge(
       "features/results/BacktestResultsView.tsx",
@@ -2367,6 +2414,7 @@ describe("frontend architecture ratchet", () => {
     architectureEdge("features/research/useResearchWorkspace.ts", "../results/resultsModel", "features/results/resultsModel.ts"),
     architectureEdge("features/strategies/useStrategyManager.ts", "../trades/tradeModel", "features/trades/tradeModel.ts"),
     architectureEdge("features/results/useBacktestResults.ts", "./BacktestResultsView", "features/results/BacktestResultsView.tsx"),
+    architectureEdge("features/trades/useBacktestTrades.ts", "../results/resultsModel", "features/results/resultsModel.ts"),
     architectureEdge("features/results/BacktestResultsView.tsx", "../../api", "api.ts"),
     architectureEdge("features/research/ResearchPage.tsx", "../../api", "api.ts", "type-only"),
     architectureEdge("features/research/ResearchPage.tsx", "echarts/core", "echarts/core", "type-only"),
