@@ -127,6 +127,42 @@ describe("BacktestResultsView", () => {
     );
   });
 
+  it("formats production raw ratios as percentages and preserves legacy points", () => {
+    const ratio = render(
+      <BacktestResultsView
+        demoMode={false}
+        theme="light"
+        snapshot={{
+          ...zeroTradeSnapshot,
+          returnPctUnit: "ratio",
+          metrics: { ...zeroTradeSnapshot.metrics, returnPct: "0.125" },
+          monthlyReturns: [{ month: "2026-01", returnPct: "-0.0000136" }]
+        }}
+      />
+    );
+
+    expect(ratio.container.querySelector(".metric-primary small")?.textContent)
+      .toBe("12.50%");
+    expect(ratio.container.querySelector(".monthly-grid strong")?.textContent)
+      .toBe("-0.0014%");
+
+    ratio.rerender(
+      <BacktestResultsView
+        demoMode={false}
+        theme="light"
+        snapshot={{
+          ...zeroTradeSnapshot,
+          metrics: { ...zeroTradeSnapshot.metrics, returnPct: "1.36" },
+          monthlyReturns: [{ month: "2026-01", returnPct: "1.36" }]
+        }}
+      />
+    );
+    expect(ratio.container.querySelector(".metric-primary small")?.textContent)
+      .toBe("1.36%");
+    expect(ratio.container.querySelector(".monthly-grid strong")?.textContent)
+      .toBe("1.36%");
+  });
+
   it("uses the same internally consistent trades as candle inspection", () => {
     expect(demoBacktestSnapshot.tradePage.items).toBe(demoTrades);
     const tradePnl = demoBacktestSnapshot.tradePage.items.reduce(

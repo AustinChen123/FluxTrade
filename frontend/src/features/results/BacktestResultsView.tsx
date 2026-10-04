@@ -157,7 +157,18 @@ export function BacktestResultsView({
     // ECMA-402 preserves validated decimal strings; the ES2022 type only accepts numbers.
     return formatter.format(value as unknown as number);
   };
-  const percent = (value: string | null) => {
+  const percent = (
+    value: string | null,
+    unit: BacktestResultSnapshot["returnPctUnit"]
+  ) => {
+    if (unit === "ratio") {
+      const formatter = new Intl.NumberFormat(locale, {
+        style: "percent",
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 4
+      });
+      return decimal(value, formatter);
+    }
     const formatted = decimal(value);
     return formatted === "—" ? formatted : `${formatted}%`;
   };
@@ -258,7 +269,7 @@ export function BacktestResultsView({
         <div className="metric-primary">
           <span>{t("results.netPnl")}</span>
           <strong>{decimal(data.metrics.netPnl, money)}</strong>
-          <small>{percent(data.metrics.returnPct)}</small>
+          <small>{percent(data.metrics.returnPct, data.returnPctUnit)}</small>
         </div>
         <div>
           <span>{t("results.maxDrawdown")}</span>
@@ -337,7 +348,7 @@ export function BacktestResultsView({
                     }
                   >
                     <span>{monthLabel(month.month, locale)}</span>
-                    <strong>{percent(month.returnPct)}</strong>
+                    <strong>{percent(month.returnPct, data.returnPctUnit)}</strong>
                   </div>
                 );
               })}
