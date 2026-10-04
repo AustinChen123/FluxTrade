@@ -474,10 +474,14 @@ const expectedRelativeImportLedger = [
   "features/trades/TradeChartView.tsx|./demo|value|features/trades/demo.ts",
   "features/trades/TradeChartView.tsx|./tradeCharts|value|features/trades/tradeCharts.ts",
   "features/trades/TradeChartView.tsx|./tradeModel|value|features/trades/tradeModel.ts",
+  "features/trades/tradeModel.test.ts|../../api|type-only|api.ts",
   "features/trades/tradeModel.test.ts|./tradeModel|value|features/trades/tradeModel.ts",
+  "features/trades/tradeModel.ts|../../api|type-only|api.ts",
   "features/trades/tradeModel.ts|../../shared/format/decimal|value|shared/format/decimal.ts",
   "features/trades/tradeModel.ts|../../shared/time/utc|value|shared/time/utc.ts",
   "features/trades/tradeModel.ts|../../shared/trading/closedTrade|type-only|shared/trading/closedTrade.ts",
+  "features/trades/tradeModel.ts|../../shared/trading/closedTradePage|type-only|shared/trading/closedTradePage.ts",
+  "features/trades/tradeModel.ts|../../shared/trading/closedTradePage|value|shared/trading/closedTradePage.ts",
   "main.tsx|./app/App|value|app/App.tsx",
   "main.tsx|./shared/i18n|value|shared/i18n.ts",
   "main.tsx|./shared/theme|value|shared/theme.ts",
@@ -2322,6 +2326,17 @@ describe("frontend architecture ratchet", () => {
       "./resultsModel",
       "features/results/resultsModel.ts"
     ),
+    architectureEdge(
+      "features/trades/tradeModel.ts",
+      "../../api",
+      "api.ts",
+      "type-only"
+    ),
+    architectureEdge(
+      "features/trades/tradeModel.ts",
+      "../../shared/trading/closedTradePage",
+      "shared/trading/closedTradePage.ts"
+    ),
     architectureEdge("architecture.test.ts", "node:fs", "node:fs"),
     architectureEdge("vite.config.ts", "vite", "vite"),
     architectureEdge(
@@ -2357,6 +2372,7 @@ describe("frontend architecture ratchet", () => {
     architectureEdge("features/research/ResearchPage.tsx", "echarts/core", "echarts/core", "type-only"),
     architectureEdge("features/research/ResearchPage.tsx", "./demo", "features/research/demo.ts"),
     architectureEdge("features/research/gaDomain.ts", "../../api", "api.ts"),
+    architectureEdge("features/trades/tradeModel.ts", "../../api", "api.ts"),
     architectureEdge("features/research/gaCharts.ts", "../../api", "api.ts", "type-only"),
     architectureEdge("features/research/demo.ts", "../../api", "api.ts", "type-only"),
     architectureEdge("shared/charts/EChart.tsx", "../../features/research/gaDomain", "features/research/gaDomain.ts"),
@@ -3327,8 +3343,11 @@ describe("frontend architecture ratchet", () => {
     expect(
       directRelativeSpecifiers(edges, "features/trades/tradeModel.ts")
     ).toEqual([
+      "../../api|type-only|api.ts",
       "../../shared/format/decimal|value|shared/format/decimal.ts",
       "../../shared/time/utc|value|shared/time/utc.ts",
+      "../../shared/trading/closedTradePage|type-only|shared/trading/closedTradePage.ts",
+      "../../shared/trading/closedTradePage|value|shared/trading/closedTradePage.ts",
       "../../shared/trading/closedTrade|type-only|shared/trading/closedTrade.ts"
     ]);
     expect(

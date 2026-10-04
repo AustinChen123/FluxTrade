@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 
+import type { BacktestResultsDetail } from "../../api";
 import {
   buildTradeChartModel,
+  projectBacktestTradeIdentity,
+  tradeCandleWindow,
   tradeIdFromChartData,
   type TradeChartSnapshot
 } from "./tradeModel";
@@ -44,7 +47,164 @@ const snapshot = (overrides: Partial<TradeChartSnapshot> = {}): TradeChartSnapsh
   ...overrides
 });
 
+type TradeDetailInput = Pick<
+  BacktestResultsDetail,
+  "job_id" | "strategy_id" | "product_id" | "timeframe" | "currency" |
+  "started_at" | "ended_at" | "trade_page"
+>;
+
+const wireTrade = {
+  id: "job-1:0",
+  entry_time: "2026-07-28T13:32:01.000Z",
+  exit_time: "2026-07-28T13:36:00.000Z",
+  entry_price: "19850.0000000000000001",
+  exit_price: "19853.0000000000000002",
+  side: "LONG",
+  quantity: "0.000000000000000003",
+  pnl: "0.000000000000000004",
+  fee: "0.000000000000000005"
+};
+
+function tradeDetail(overrides: Partial<TradeDetailInput> = {}): TradeDetailInput {
+  return {
+    job_id: "job-1",
+    strategy_id: "strategy-1",
+    product_id: "CME:MNQ",
+    timeframe: "5m",
+    currency: "USDT",
+    started_at: "2026-07-28T13:00:00.000Z",
+    ended_at: "2026-07-28T14:00:00.000Z",
+    trade_page: {
+      items: [wireTrade],
+      total_count: 1,
+      next_cursor: null
+    },
+    ...overrides
+  };
+}
+
 describe("trade chart model", () => {
+  it("projects only Trades metadata and preserves its exact quote and shared first page", () => {
+    const metadata = projectBacktestTradeIdentity(tradeDetail());
+
+    expect(metadata).toEqual({
+      resultId: "job-1",
+      strategyId: "strategy-1",
+      productId: "CME:MNQ",
+      currency: "USDT",
+      timeframe: "5m",
+      timeframeMs: 300_000,
+      coverageStart: Date.parse("2026-07-28T13:00:00.000Z"),
+      coverageEnd: Date.parse("2026-07-28T14:00:00.001Z"),
+      tradePage: {
+        items: [{
+          id: wireTrade.id,
+          side: "LONG",
+          quantity: wireTrade.quantity,
+          entryTime: wireTrade.entry_time,
+          entryPrice: wireTrade.entry_price,
+          exitTime: wireTrade.exit_time,
+          exitPrice: wireTrade.exit_price,
+          fee: wireTrade.fee,
+          pnl: wireTrade.pnl
+        }],
+        totalCount: 1,
+        nextCursor: null
+      }
+    });
+  });
+
+  it.each([
+    ["1s", 1_000],
+    ["2m", 120_000],
+    ["3h", 10_800_000],
+    ["4d", 345_600_000]
+  ])("converts supported decision timeframe %s", (timeframe, milliseconds) => {
+    expect(projectBacktestTradeIdentity(
+      tradeDetail({ timeframe })
+    )?.timeframeMs).toBe(milliseconds);
+  });
+
+  it.each([
+    "0m",
+    "-1m",
+    "1M",
+    "1.5m",
+    "1x",
+    " 1m",
+    "9007199254740991d"
+  ])("rejects malformed or unrepresentable timeframe %s", (timeframe) => {
+    expect(projectBacktestTradeIdentity(
+      tradeDetail({ timeframe })
+    )).toBeNull();
+  });
+
+  it("pads unaligned trade instants using decision timeframe before clipping", () => {
+    const metadata = projectBacktestTradeIdentity(tradeDetail());
+    expect(metadata).not.toBeNull();
+    expect(tradeCandleWindow(metadata!, {
+      ...snapshot().trades[0],
+      entryTime: wireTrade.entry_time,
+      exitTime: wireTrade.exit_time
+    })).toEqual({
+      start: Date.parse("2026-07-28T13:20:00.000Z"),
+      end: Date.parse("2026-07-28T13:50:00.000Z")
+    });
+  });
+
+  it("clips to inclusive result coverage converted to a half-open end plus one millisecond", () => {
+    const metadata = projectBacktestTradeIdentity(tradeDetail({
+      started_at: "2026-07-28T13:30:00.000Z",
+      ended_at: "2026-07-28T13:40:00.000Z",
+      trade_page: {
+        items: [{ ...wireTrade, exit_time: "2026-07-28T13:40:00.000Z" }],
+        total_count: 1,
+        next_cursor: null
+      }
+    }));
+    expect(metadata?.coverageEnd).toBe(Date.parse("2026-07-28T13:40:00.001Z"));
+    expect(metadata && tradeCandleWindow(metadata, {
+      ...snapshot().trades[0],
+      entryTime: wireTrade.entry_time,
+      exitTime: "2026-07-28T13:40:00.000Z"
+    })).toEqual({
+      start: Date.parse("2026-07-28T13:30:00.000Z"),
+      end: Date.parse("2026-07-28T13:40:00.001Z")
+    });
+  });
+
+  it("preserves a single inclusive millisecond of result coverage", () => {
+    const instant = "2026-07-28T13:40:00.000Z";
+    const metadata = projectBacktestTradeIdentity(tradeDetail({
+      timeframe: "1s",
+      started_at: instant,
+      ended_at: instant,
+      trade_page: {
+        items: [{ ...wireTrade, entry_time: instant, exit_time: instant }],
+        total_count: 1,
+        next_cursor: null
+      }
+    }));
+    expect(metadata && tradeCandleWindow(metadata, {
+      ...snapshot().trades[0], entryTime: instant, exitTime: instant
+    })).toEqual({
+      start: Date.parse(instant),
+      end: Date.parse(instant) + 1
+    });
+  });
+
+  it.each([
+    ["reversed", "2026-07-28T13:36:00.000Z", "2026-07-28T13:32:01.000Z"],
+    ["before coverage", "2026-07-28T12:59:59.999Z", "2026-07-28T13:00:00.000Z"],
+    ["after coverage", "2026-07-28T14:00:00.001Z", "2026-07-28T14:00:00.001Z"],
+    ["malformed UTC", "not-a-time", "not-a-time"]
+  ])("rejects %s selected-trade timing", (_name, entryTime, exitTime) => {
+    const metadata = projectBacktestTradeIdentity(tradeDetail());
+    expect(metadata && tradeCandleWindow(metadata, {
+      ...snapshot().trades[0], entryTime, exitTime
+    })).toBeNull();
+  });
+
   it("keeps exact candle and execution timestamps", () => {
     const model = buildTradeChartModel(snapshot());
 
