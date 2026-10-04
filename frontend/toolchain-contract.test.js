@@ -37,7 +37,12 @@ const EXPECTED_SCENARIOS = [
   "lazy-chunk-inventory",
   "responsive-overflow",
   "berlin-presentation-time",
-  "production-results-flow"
+  "production-results-flow",
+  "production-results-states",
+  "production-results-candle-states",
+  "production-results-stale-detail",
+  "production-results-stale-trades",
+  "production-results-stale-candles"
 ];
 const EXPECTED_CASES = {
   "direct-navigation": ["results", "strategies", "trades"],
@@ -50,7 +55,12 @@ const EXPECTED_CASES = {
   "lazy-chunk-inventory": ["main"],
   "responsive-overflow": ["research", "results", "strategies", "trades"],
   "berlin-presentation-time": ["research-api", "demo-features"],
-  "production-results-flow": ["main"]
+  "production-results-flow": ["main"],
+  "production-results-states": ["main"],
+  "production-results-candle-states": ["main"],
+  "production-results-stale-detail": ["main"],
+  "production-results-stale-trades": ["main"],
+  "production-results-stale-candles": ["main"]
 };
 const EXPECTED_NON_ZERO_COUNTS = {
   "direct-navigation:production:results": { S: 1, RI: 1 },
@@ -89,7 +99,12 @@ const EXPECTED_NON_ZERO_COUNTS = {
     RD: 2,
     RT: 2,
     RC: 2
-  }
+  },
+  "production-results-states:production:main": { S: 21, RI: 6, RD: 15 },
+  "production-results-candle-states:production:main": { S: 12, RI: 2, RD: 7, RC: 3 },
+  "production-results-stale-detail:production:main": { S: 5, T: 1, RI: 2, RD: 2 },
+  "production-results-stale-trades:production:main": { S: 6, T: 1, RI: 2, RD: 2, RT: 1 },
+  "production-results-stale-candles:production:main": { S: 8, T: 1, RI: 2, RD: 3, RC: 2 }
 };
 const EXPECTED_SCRIPTS = {
   dev: "vite",
@@ -255,7 +270,7 @@ function exactTripleKeys() {
   const rows = [];
   for (const scenario of EXPECTED_SCENARIOS) {
     const servers =
-      scenario === "production-results-flow"
+      scenario.startsWith("production-results-")
         ? ["production"]
         : scenario === "navigation-serialization" ||
       scenario === "demo-dev" ||
