@@ -80,6 +80,29 @@ export type KillSwitchStatus = {
   listener_available: boolean;
 };
 
+export type BacktestResultsIndexItem = {
+  job_id: string;
+  subject_id: string;
+  dataset_id: string;
+  product_id: string;
+  timeframe: string;
+  started_at: string;
+  ended_at: string;
+  completed_at: string;
+  result_digest: string;
+};
+
+export type BacktestResultsIndexPage = {
+  items: BacktestResultsIndexItem[];
+  next_cursor: string | null;
+  revision: 1;
+};
+
+export type BacktestResultsPageOptions = {
+  limit?: number;
+  cursor?: string;
+};
+
 type Page<TName extends string, T> = {
   total: number;
   limit: number;
@@ -179,6 +202,21 @@ export async function ensureBrowserSession(): Promise<BrowserSession | null> {
   }
 }
 
+export async function loadBacktestResultsIndex(
+  options: BacktestResultsPageOptions = {}
+): Promise<BacktestResultsIndexPage> {
+  const query = new URLSearchParams();
+  if (options.limit !== undefined) query.set("limit", String(options.limit));
+  if (options.cursor !== undefined) query.set("cursor", options.cursor);
+  const suffix = query.toString();
+  const value = await request<unknown>(
+    `/api/v1/backtest-results${suffix ? `?${suffix}` : ""}`,
+    { cache: "no-store" }
+  );
+  if (!validBacktestResultsIndexPage(value)) throw new Error("invalid_response");
+  return value;
+}
+
 export async function loadStrategyStates(): Promise<StrategyState[]> {
   const query = (offset: number) =>
     `/strategy-states?limit=${STRATEGY_PAGE_SIZE}&offset=${offset}`;
@@ -258,6 +296,35 @@ const nullableNumber = (value: unknown) => value === null ||
   (typeof value === "number" && Number.isFinite(value));
 const rows = (value: unknown, valid: (row: unknown) => boolean) =>
   Array.isArray(value) && value.every(valid);
+
+function textFields(value: unknown, ...fields: string[]): boolean {
+  return record(value) && fields.every((key) => text(value[key]));
+}
+
+function validBacktestResultsIndexItem(value: unknown): value is BacktestResultsIndexItem {
+  return textFields(
+    value,
+    "job_id",
+    "subject_id",
+    "dataset_id",
+    "product_id",
+    "timeframe",
+    "started_at",
+    "ended_at",
+    "completed_at",
+    "result_digest"
+  );
+}
+
+function validBacktestResultsIndexPage(
+  value: unknown
+): value is BacktestResultsIndexPage {
+  return record(value) &&
+    rows(value.items, validBacktestResultsIndexItem) &&
+    nullableText(value.next_cursor) &&
+    value.revision === 1;
+}
+
 function validPage(value: unknown, key: string, valid: (row: unknown) => boolean) {
   return record(value) && integer(value.total) && integer(value.offset) &&
     integer(value.limit) && (value.limit as number) > 0 && rows(value[key], valid);

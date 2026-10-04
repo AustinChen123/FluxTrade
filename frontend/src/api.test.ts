@@ -9,6 +9,7 @@ import {
   sendStrategyCommand,
   loadKillSwitchStatus,
   clearKillSwitch,
+  loadBacktestResultsIndex,
   type BrowserSession,
   type StrategyState
 } from "./api";
@@ -44,6 +45,18 @@ const strategy: StrategyState = {
   stopped_at: null,
   version: 1,
   available_commands: ["STOP"]
+};
+
+const resultIndexItem = {
+  job_id: "run/one",
+  subject_id: "subject-1",
+  dataset_id: "dataset-1",
+  product_id: "CME:MNQ",
+  timeframe: "5m",
+  started_at: "2026-01-01T00:00:00.000Z",
+  ended_at: "2026-01-02T00:00:00.000Z",
+  completed_at: "2026-01-02T00:00:01.000Z",
+  result_digest: "digest"
 };
 
 describe("strategy control API", () => {
@@ -163,6 +176,101 @@ describe("strategy control API", () => {
         body: '{"command":"STOP","expected_version":1}'
       })
     );
+  });
+});
+
+describe("backtest results API", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("accepts an empty index page", async () => {
+    const payload = { items: [], next_cursor: null, revision: 1 };
+    const fetch = vi.fn().mockResolvedValue(response(200, payload));
+    vi.stubGlobal("fetch", fetch);
+
+    await expect(loadBacktestResultsIndex()).resolves.toEqual(payload);
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/v1/backtest-results",
+      expect.objectContaining({ credentials: "include", cache: "no-store" })
+    );
+  });
+
+  it("passes an index cursor through as one encoded query value", async () => {
+    const payload = { items: [resultIndexItem], next_cursor: null, revision: 1 };
+    const fetch = vi.fn().mockResolvedValue(response(200, payload));
+    vi.stubGlobal("fetch", fetch);
+
+    await expect(
+      loadBacktestResultsIndex({ limit: 25, cursor: "opaque.cursor_1" })
+    ).resolves.toEqual(payload);
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/v1/backtest-results?limit=25&cursor=opaque.cursor_1",
+      expect.objectContaining({ credentials: "include", cache: "no-store" })
+    );
+  });
+
+  it.each([
+    "job_id",
+    "subject_id",
+    "dataset_id",
+    "product_id",
+    "timeframe",
+    "started_at",
+    "ended_at",
+    "completed_at",
+    "result_digest"
+  ])("rejects an index item with invalid %s", async (field) => {
+    const item = { ...resultIndexItem, [field]: null };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        response(200, { items: [item], next_cursor: null, revision: 1 })
+      )
+    );
+    await expect(loadBacktestResultsIndex()).rejects.toThrow("invalid_response");
+  });
+
+  it.each([
+    ["items", { items: null, next_cursor: null, revision: 1 }],
+    ["cursor", { items: [], next_cursor: 1, revision: 1 }],
+    ["revision", { items: [], next_cursor: null, revision: 2 }]
+  ])("rejects malformed successful index %s payloads", async (_name, payload) => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response(200, payload)));
+    await expect(loadBacktestResultsIndex()).rejects.toThrow("invalid_response");
+  });
+
+  it.each([
+    [401, "browser_session_required"],
+    [403, "forbidden"],
+    [404, "result_not_found"],
+    [409, "result_unavailable"],
+    [422, "validation_error"],
+    [503, "browser_result_backend_unavailable"]
+  ])("retains HTTP %s and its fixed error code", async (status, error) => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(response(status, { error }))
+    );
+    await expect(loadBacktestResultsIndex()).rejects.toMatchObject({
+      status,
+      message: error
+    });
+  });
+
+  it("does not expose malformed JSON details from a successful response", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        statusText: "",
+        json: async () => {
+          throw new Error("private detail");
+        }
+      })
+    );
+    await expect(loadBacktestResultsIndex()).rejects.toMatchObject({
+      status: 200, message: "invalid_response"
+    });
   });
 });
 
