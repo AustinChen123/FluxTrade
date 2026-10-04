@@ -121,7 +121,10 @@ describe("BacktestResultsView", () => {
     ).toContain("15:30");
 
     fireEvent.click(screen.getAllByRole("button", { name: "查看 K 線" })[0]);
-    expect(onInspectTrade).toHaveBeenCalledWith("trade-000184");
+    expect(onInspectTrade).toHaveBeenCalledWith(
+      "trade-000184",
+      "job-research-0042"
+    );
   });
 
   it("uses the same internally consistent trades as candle inspection", () => {

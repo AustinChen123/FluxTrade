@@ -29,7 +29,7 @@ type Props = {
   snapshot?: BacktestResultSnapshot | null;
   loading?: boolean;
   loadError?: boolean;
-  onInspectTrade?: (tradeId: string) => void;
+  onInspectTrade?: (tradeId: string, resultId: string) => void;
   onLoadMoreTrades?: (cursor: string) => Promise<TradePage>;
 };
 
@@ -435,7 +435,7 @@ export function BacktestResultsView({
                     <td>
                       <button
                         type="button"
-                        onClick={() => onInspectTrade?.(trade.id)}
+                        onClick={() => onInspectTrade?.(trade.id, data.jobId)}
                       >
                         {t("results.inspect")}
                       </button>

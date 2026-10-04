@@ -160,7 +160,7 @@ vi.mock("../features/results/BacktestResultsView", async () => {
       onInspectTrade
     }: {
       demoMode: boolean;
-      onInspectTrade?: (tradeId: string) => void;
+      onInspectTrade?: (tradeId: string, resultId: string) => void;
     }) => {
       const [state, setState] = useState("initial");
       useEffect(() => {
@@ -173,7 +173,7 @@ vi.mock("../features/results/BacktestResultsView", async () => {
         <section data-demo={String(demoMode)} data-testid="backtest-results-view">
           <button
             type="button"
-            onClick={() => onInspectTrade?.("trade-000184")}
+            onClick={() => onInspectTrade?.("trade-000184", "job-research-0042")}
           >
             Inspect mock trade
           </button>
@@ -295,7 +295,7 @@ describe("GA visualization state", () => {
     window.history.replaceState(
       {},
       "",
-      "/?view=trades&trade=trade-000185&demo=1"
+      "/?view=trades&result=job-research-0042&trade=trade-000185&demo=1"
     );
 
     render(<App />);
@@ -318,7 +318,7 @@ describe("GA visualization state", () => {
     window.history.replaceState(
       {},
       "",
-      "/?view=trades&trade=trade-000185&demo=1"
+      "/?view=trades&result=job-research-0042&trade=trade-000185&demo=1"
     );
 
     const firstRender = render(<App />);
@@ -343,7 +343,7 @@ describe("GA visualization state", () => {
     window.history.replaceState(
       {},
       "",
-      "/?view=trades&trade=trade-000185&demo=1"
+      "/?view=trades&result=job-research-0042&trade=trade-000185&demo=1"
     );
     render(<App />);
 
@@ -390,7 +390,7 @@ describe("GA visualization state", () => {
     window.history.replaceState(
       {},
       "",
-      "/?view=trades&trade=%0Ainvalid&demo=1"
+      "/?view=trades&result=job-research-0042&trade=%0Ainvalid&demo=1"
     );
 
     render(<App />);
@@ -412,6 +412,9 @@ describe("GA visualization state", () => {
     expect(new URL(window.location.href).searchParams.get("view")).toBe("trades");
     expect(new URL(window.location.href).searchParams.get("trade")).toBe(
       "trade-000184"
+    );
+    expect(new URL(window.location.href).searchParams.get("result")).toBe(
+      "job-research-0042"
     );
 
     fireEvent.click(screen.getByRole("button", { name: "回測績效" }));
