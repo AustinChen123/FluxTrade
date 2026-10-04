@@ -98,6 +98,68 @@ export type BacktestResultsIndexPage = {
   revision: 1;
 };
 
+export type BacktestResultsTrade = {
+  id: string;
+  entry_time: string;
+  exit_time: string;
+  entry_price: string;
+  exit_price: string;
+  side: string;
+  quantity: string;
+  pnl: string;
+  fee: string;
+};
+
+export type BacktestResultsDetailMetrics = {
+  net_pnl: string;
+  return_pct: string;
+  max_drawdown: string;
+  sharpe: string;
+  sortino: string;
+  calmar: string;
+};
+
+export type BacktestResultsEquityItem = {
+  timestamp: string;
+  equity: string;
+  drawdown: string;
+};
+
+export type BacktestResultsMonthlyReturn = {
+  month: string;
+  return_pct: string;
+};
+
+export type BacktestResultsDistributionItem = {
+  lower: string | null;
+  upper: string | null;
+  count: number;
+};
+
+export type BacktestResultsDetail = {
+  job_id: string;
+  strategy_id: string;
+  subject_id: string;
+  dataset_id: string;
+  product_id: string;
+  timeframe: string;
+  started_at: string;
+  ended_at: string;
+  currency: string;
+  metrics: BacktestResultsDetailMetrics;
+  equity: BacktestResultsEquityItem[];
+  monthly_returns: BacktestResultsMonthlyReturn[];
+  pnl_distribution: BacktestResultsDistributionItem[];
+  trade_page: {
+    items: BacktestResultsTrade[];
+    total_count: number;
+    next_cursor: string | null;
+  };
+  input_digest: string;
+  result_digest: string;
+  revision: 1;
+};
+
 export type BacktestResultsPageOptions = {
   limit?: number;
   cursor?: string;
@@ -217,6 +279,17 @@ export async function loadBacktestResultsIndex(
   return value;
 }
 
+export async function loadBacktestResult(
+  jobId: string
+): Promise<BacktestResultsDetail> {
+  const value = await request<unknown>(
+    `/api/v1/backtest-results/${encodeURIComponent(jobId)}`,
+    { cache: "no-store" }
+  );
+  if (!validBacktestResultsDetail(value)) throw new Error("invalid_response");
+  return value;
+}
+
 export async function loadStrategyStates(): Promise<StrategyState[]> {
   const query = (offset: number) =>
     `/strategy-states?limit=${STRATEGY_PAGE_SIZE}&offset=${offset}`;
@@ -322,6 +395,80 @@ function validBacktestResultsIndexPage(
   return record(value) &&
     rows(value.items, validBacktestResultsIndexItem) &&
     nullableText(value.next_cursor) &&
+    value.revision === 1;
+}
+
+function validBacktestResultsTrade(value: unknown): value is BacktestResultsTrade {
+  return textFields(
+    value,
+    "id",
+    "entry_time",
+    "exit_time",
+    "entry_price",
+    "exit_price",
+    "side",
+    "quantity",
+    "pnl",
+    "fee"
+  );
+}
+
+function validBacktestResultsDetailMetrics(
+  value: unknown
+): value is BacktestResultsDetailMetrics {
+  return textFields(
+    value,
+    "net_pnl",
+    "return_pct",
+    "max_drawdown",
+    "sharpe",
+    "sortino",
+    "calmar"
+  );
+}
+
+function validBacktestResultsEquityItem(
+  value: unknown
+): value is BacktestResultsEquityItem {
+  return textFields(value, "timestamp", "equity", "drawdown");
+}
+
+function validBacktestResultsMonthlyReturn(
+  value: unknown
+): value is BacktestResultsMonthlyReturn {
+  return textFields(value, "month", "return_pct");
+}
+
+function validBacktestResultsDistributionItem(
+  value: unknown
+): value is BacktestResultsDistributionItem {
+  return record(value) && nullableText(value.lower) &&
+    nullableText(value.upper) && integer(value.count);
+}
+
+function validBacktestResultsDetail(value: unknown): value is BacktestResultsDetail {
+  if (!record(value) || !record(value.trade_page)) return false;
+  return textFields(
+    value,
+    "job_id",
+    "strategy_id",
+    "subject_id",
+    "dataset_id",
+    "product_id",
+    "timeframe",
+    "started_at",
+    "ended_at",
+    "currency",
+    "input_digest",
+    "result_digest"
+  ) &&
+    validBacktestResultsDetailMetrics(value.metrics) &&
+    rows(value.equity, validBacktestResultsEquityItem) &&
+    rows(value.monthly_returns, validBacktestResultsMonthlyReturn) &&
+    rows(value.pnl_distribution, validBacktestResultsDistributionItem) &&
+    rows(value.trade_page.items, validBacktestResultsTrade) &&
+    integer(value.trade_page.total_count) &&
+    nullableText(value.trade_page.next_cursor) &&
     value.revision === 1;
 }
 

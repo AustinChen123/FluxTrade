@@ -10,6 +10,7 @@ import {
   loadKillSwitchStatus,
   clearKillSwitch,
   loadBacktestResultsIndex,
+  loadBacktestResult,
   type BrowserSession,
   type StrategyState
 } from "./api";
@@ -58,6 +59,69 @@ const resultIndexItem = {
   completed_at: "2026-01-02T00:00:01.000Z",
   result_digest: "digest"
 };
+
+const resultDetail = {
+  job_id: "run/one",
+  strategy_id: "strategy-1",
+  subject_id: "subject-1",
+  dataset_id: "dataset-1",
+  product_id: "CME:MNQ",
+  timeframe: "5m",
+  started_at: "2026-01-01T00:00:00.000Z",
+  ended_at: "2026-01-02T00:00:00.000Z",
+  currency: "USD",
+  metrics: {
+    net_pnl: "12345678901234567890.00000000000000000001",
+    return_pct: "0.00000000000000000000000002",
+    max_drawdown: "0.00000000000000000000000003",
+    sharpe: "1.25",
+    sortino: "1.5",
+    calmar: "2.0"
+  },
+  equity: [{ timestamp: "2026-01-01T00:00:00.000Z", equity: "100.00", drawdown: "0" }],
+  monthly_returns: [{ month: "2026-01", return_pct: "0.00000000000000000000000002" }],
+  pnl_distribution: [{ lower: null, upper: "0.00000000000000000000000001", count: 1 }],
+  trade_page: {
+    items: [{
+      id: "run/one:0",
+      entry_time: "2026-01-01T00:00:00.000Z",
+      exit_time: "2026-01-01T00:05:00.000Z",
+      entry_price: "100.00000000000000000000000001",
+      exit_price: "101.00",
+      side: "LONG",
+      quantity: "0.125",
+      pnl: "0.00000000000000000000000001",
+      fee: "0.00000000000000000000000002"
+    }],
+    total_count: 1,
+    next_cursor: null
+  },
+  input_digest: "input-digest",
+  result_digest: "result-digest",
+  revision: 1
+};
+
+function detailWithField(path: string, value: unknown): Record<string, unknown> {
+  const copy = JSON.parse(JSON.stringify(resultDetail)) as Record<string, unknown>;
+  const fields = path.split(".");
+  let parent = copy;
+  while (fields.length > 1) {
+    parent = parent[fields.shift()!] as Record<string, unknown>;
+  }
+  parent[fields[0]] = value;
+  return copy;
+}
+
+function detailWithoutField(path: string): Record<string, unknown> {
+  const copy = JSON.parse(JSON.stringify(resultDetail)) as Record<string, unknown>;
+  const fields = path.split(".");
+  let parent = copy;
+  while (fields.length > 1) {
+    parent = parent[fields.shift()!] as Record<string, unknown>;
+  }
+  delete parent[fields[0]];
+  return copy;
+}
 
 describe("strategy control API", () => {
   afterEach(() => {
@@ -206,6 +270,88 @@ describe("backtest results API", () => {
       "/api/v1/backtest-results?limit=25&cursor=opaque.cursor_1",
       expect.objectContaining({ credentials: "include", cache: "no-store" })
     );
+  });
+
+  it("loads the exact detail DTO through one encoded job ID segment", async () => {
+    const fetch = vi.fn().mockResolvedValue(response(200, resultDetail));
+    vi.stubGlobal("fetch", fetch);
+
+    await expect(loadBacktestResult("job/one")).resolves.toEqual(resultDetail);
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/v1/backtest-results/job%2Fone",
+      expect.objectContaining({ credentials: "include", cache: "no-store" })
+    );
+  });
+
+  it("accepts empty nested arrays and an empty trade page", async () => {
+    const payload = {
+      ...resultDetail,
+      equity: [],
+      monthly_returns: [],
+      pnl_distribution: [],
+      trade_page: { items: [], total_count: 0, next_cursor: null }
+    };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response(200, payload)));
+    await expect(loadBacktestResult("job/one")).resolves.toEqual(payload);
+  });
+
+  it.each([
+    "job_id", "strategy_id", "subject_id", "dataset_id", "product_id",
+    "timeframe", "started_at", "ended_at", "currency", "input_digest",
+    "result_digest", "metrics.net_pnl", "metrics.return_pct",
+    "metrics.max_drawdown", "metrics.sharpe", "metrics.sortino", "metrics.calmar",
+    "equity.0.timestamp", "equity.0.equity", "equity.0.drawdown",
+    "monthly_returns.0.month", "monthly_returns.0.return_pct",
+    "pnl_distribution.0.count", "trade_page.items.0.id",
+    "trade_page.items.0.entry_time", "trade_page.items.0.exit_time",
+    "trade_page.items.0.entry_price", "trade_page.items.0.exit_price",
+    "trade_page.items.0.side", "trade_page.items.0.quantity",
+    "trade_page.items.0.pnl", "trade_page.items.0.fee"
+  ])("rejects a detail with invalid or missing %s", async (path) => {
+    const payload = detailWithoutField(path);
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response(200, payload)));
+    await expect(loadBacktestResult("run/one")).rejects.toThrow("invalid_response");
+  });
+
+  it.each([
+    ["metrics", null],
+    ["equity", null],
+    ["monthly_returns", null],
+    ["pnl_distribution", null],
+    ["metrics.net_pnl", 1],
+    ["pnl_distribution.0.lower", false],
+    ["pnl_distribution.0.upper", 1],
+    ["pnl_distribution.0.count", 1.5],
+    ["trade_page", null],
+    ["trade_page.items", null],
+    ["trade_page.total_count", "1"],
+    ["trade_page.next_cursor", 1],
+    ["revision", 2]
+  ])("rejects a detail with malformed %s", async (path, value) => {
+    const payload = detailWithField(path, value);
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response(200, payload)));
+    await expect(loadBacktestResult("run/one")).rejects.toThrow("invalid_response");
+  });
+
+  it.each([
+    [401, "browser_session_required"],
+    [403, "forbidden"],
+    [404, "result_not_found"],
+    [409, "result_unavailable"],
+    [422, "validation_error"],
+    [503, "browser_result_backend_unavailable"]
+  ])("preserves detail HTTP %s error status", async (status, error) => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response(status, { error })));
+    await expect(loadBacktestResult("run/one")).rejects.toMatchObject({ status, message: error });
+  });
+
+  it("rejects malformed detail JSON without exposing parser details", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: true, status: 200, statusText: "", json: async () => { throw new Error("private detail"); }
+    }));
+    await expect(loadBacktestResult("run/one")).rejects.toMatchObject({
+      status: 200, message: "invalid_response"
+    });
   });
 
   it.each([
