@@ -35,10 +35,17 @@ from src.control_plane.ga_http_contract import (
     GA_PROFILE_ID,
     GaHttpRequestError,
     is_ga_read_path,
+    parse_ga_command_request,
     parse_ga_read_request,
     project_ga_job,
 )
+from src.control_plane.ga_commands import (
+    GaCommandBackendError,
+    GaCommandService,
+    GaCommandValidationError,
+)
 from src.control_plane.ga_profile import get_golden_cross_profile
+from src.control_plane.ga_lifecycle import GaJobStoreError
 from src.control_plane.models import (
     GenePromotionRequest,
     JobRecord,
@@ -122,6 +129,7 @@ class ControlPlaneApp:
         ops_status_query: OpsStatusQuery | None = None,
         backtest_results_query_service: BacktestResultsQueryService | None = None,
         invalidation_hub: ControlPlaneInvalidationHub | None = None,
+        ga_command_service: GaCommandService | None = None,
     ) -> None:
         if api_key == "":
             raise ValueError("api_key must be non-empty when provided")
@@ -137,6 +145,7 @@ class ControlPlaneApp:
         self.profile_query_service = profile_query_service
         self.ops_status_query = ops_status_query
         self.backtest_results_query_service = backtest_results_query_service
+        self.ga_command_service = ga_command_service
         self.invalidation_hub = (
             invalidation_hub
             if invalidation_hub is not None
@@ -249,8 +258,18 @@ class ControlPlaneApp:
             )
 
         if ga_family:
-            return self._handle_ga_read(
-                method, raw_path, parsed_url.query, body, identity, raw_target
+            if method == "GET":
+                return self._handle_ga_read(
+                    method, raw_path, parsed_url.query, body, identity, raw_target
+                )
+            return self._handle_ga_command(
+                method,
+                raw_path,
+                parsed_url.query,
+                body,
+                headers,
+                identity,
+                raw_target,
             )
 
         if events_path:
@@ -1283,6 +1302,68 @@ class ControlPlaneApp:
         except Exception:
             return _ga_response(503, {"error": "ga_backend_unavailable"})
 
+    def _handle_ga_command(
+        self,
+        method: str,
+        path: str,
+        raw_query: str,
+        body: str | bytes | None,
+        headers: Mapping[str, str] | None,
+        identity: _RequestIdentity,
+        raw_target: str,
+    ) -> HttpResponse:
+        principal = identity.browser_principal
+        if (
+            principal is None
+            or self.browser_auth is None
+            or not principal.has_capability(self.browser_auth.operator_capability)
+        ):
+            return _ga_response(403, {"error": "forbidden"})
+        try:
+            command = parse_ga_command_request(
+                method,
+                path,
+                raw_query,
+                body,
+                headers,
+                raw_target=raw_target,
+            )
+        except GaHttpRequestError:
+            return _ga_response(422, {"error": "validation_error"})
+        if command is None:
+            return _ga_response(404, {"error": "not_found"})
+        if self.ga_command_service is None:
+            return _ga_response(503, {"error": "ga_controls_unavailable"})
+
+        try:
+            status, record = self.ga_command_service.execute(
+                command, actor=principal.actor
+            )
+            return _ga_response(
+                status,
+                {"schema_version": 1, "job": project_ga_job(record)},
+            )
+        except GaJobStoreError as exc:
+            if exc.code == "ga_job_not_found":
+                status = 404
+            elif exc.code == "validation_error":
+                status = 422
+            elif exc.code in {
+                "idempotency_conflict",
+                "job_version_conflict",
+                "job_transition_invalid",
+            }:
+                status = 409
+            else:
+                status = 503
+            return _ga_response(status, {"error": exc.code})
+        except GaCommandValidationError:
+            return _ga_response(422, {"error": "validation_error"})
+        except GaCommandBackendError:
+            return _ga_response(503, {"error": "ga_backend_unavailable"})
+        except Exception:
+            return _ga_response(503, {"error": "ga_backend_unavailable"})
+
     def _authorize(
         self,
         headers: Mapping[str, str] | None,
@@ -1352,7 +1433,7 @@ def _ga_response(status_code: int, body: Mapping[str, Any]) -> HttpResponse:
     response = HttpResponse(
         status_code, dict(body), headers=(("Cache-Control", "no-store"),)
     )
-    if status_code == 200:
+    if status_code in {200, 202}:
         try:
             response.json()
         except Exception:

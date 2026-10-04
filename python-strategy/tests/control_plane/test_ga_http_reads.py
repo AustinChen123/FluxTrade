@@ -388,7 +388,7 @@ def test_ga_read_authentication_is_browser_operator_only(identity):
 @pytest.mark.parametrize(
     "method,path",
     [
-        ("POST", "/api/v1/ga-jobs"),
+        ("POST", "/api/v1/ga-profiles/golden_cross_research_v1"),
         ("GET", "/api/v1/ga-jobs/id/extra"),
         ("GET", "/api/v1/ga-jobs/"),
         ("GET", "/api/v1/ga-profiles/"),

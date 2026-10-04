@@ -70,8 +70,25 @@ class JobStore(Protocol):
     ) -> list[GaJobRecord]: ...
 
     def submit_ga_job_command(
-        self, *, actor: str, idempotency_key: str, request: Mapping[str, Any]
+        self,
+        *,
+        actor: str,
+        idempotency_key: str,
+        request: Mapping[str, Any],
+        http_wire_intent: Mapping[str, object] | None = None,
     ) -> tuple[GaJobRecord, bool]: ...
+
+    def get_ga_command_receipt(
+        self,
+        *,
+        actor: str,
+        idempotency_key: str,
+        operation: str,
+        job_id: str | None = None,
+        expected_version: object = None,
+        request: Mapping[str, Any] | None = None,
+        http_wire_intent: Mapping[str, object] | None = None,
+    ) -> GaJobRecord | None: ...
 
     def transition_ga_job_command(
         self,
@@ -276,10 +293,15 @@ class InMemoryJobStore:
         actor: str,
         idempotency_key: str,
         request: Mapping[str, Any],
+        http_wire_intent: Mapping[str, object] | None = None,
     ) -> tuple[GaJobRecord, bool]:
         actor, idempotency_key = _command_identity(actor, idempotency_key)
         copied_request = _compiled_request_copy(request)
-        fingerprint = _command_fingerprint("submit", request=copied_request)
+        fingerprint = _command_fingerprint(
+            "submit",
+            request=copied_request if http_wire_intent is None else None,
+            http_wire_intent=http_wire_intent,
+        )
         identity = (actor, idempotency_key)
         with self._lock:
             receipt = self._ga_command_receipts.get(identity)
@@ -292,6 +314,34 @@ class InMemoryJobStore:
                 record.detached_copy(),
             )
             return record.detached_copy(), False
+
+    def get_ga_command_receipt(
+        self,
+        *,
+        actor: str,
+        idempotency_key: str,
+        operation: str,
+        job_id: str | None = None,
+        expected_version: object = None,
+        request: Mapping[str, Any] | None = None,
+        http_wire_intent: Mapping[str, object] | None = None,
+    ) -> GaJobRecord | None:
+        actor, idempotency_key = _command_identity(actor, idempotency_key)
+        fingerprint = _command_fingerprint(
+            operation,
+            job_id=job_id,
+            expected_version=expected_version,
+            request=None
+            if http_wire_intent is not None
+            else (None if request is None else _compiled_request_copy(request)),
+            http_wire_intent=http_wire_intent,
+        )
+        with self._lock:
+            receipt = self._ga_command_receipts.get((actor, idempotency_key))
+            if receipt is None:
+                return None
+            record, _ = _replay_or_conflict(receipt, fingerprint)
+            return record
 
     def transition_ga_job_command(
         self,
@@ -573,6 +623,7 @@ class SqliteJobStore:
         actor: str,
         idempotency_key: str,
         request: Mapping[str, Any],
+        http_wire_intent: Mapping[str, object] | None = None,
     ) -> tuple[GaJobRecord, bool]:
         actor, idempotency_key = _command_identity(actor, idempotency_key)
         copied_request = _compiled_request_copy(request)
@@ -580,9 +631,46 @@ class SqliteJobStore:
             actor,
             idempotency_key,
             "submit",
-            _command_fingerprint("submit", request=copied_request),
+            _command_fingerprint(
+                "submit",
+                request=copied_request if http_wire_intent is None else None,
+                http_wire_intent=http_wire_intent,
+            ),
             request=copied_request,
         )
+
+    def get_ga_command_receipt(
+        self,
+        *,
+        actor: str,
+        idempotency_key: str,
+        operation: str,
+        job_id: str | None = None,
+        expected_version: object = None,
+        request: Mapping[str, Any] | None = None,
+        http_wire_intent: Mapping[str, object] | None = None,
+    ) -> GaJobRecord | None:
+        actor, idempotency_key = _command_identity(actor, idempotency_key)
+        fingerprint = _command_fingerprint(
+            operation,
+            job_id=job_id,
+            expected_version=expected_version,
+            request=None
+            if http_wire_intent is not None
+            else (None if request is None else _compiled_request_copy(request)),
+            http_wire_intent=http_wire_intent,
+        )
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT fingerprint, record_json FROM control_plane_ga_command_receipts "
+                "WHERE actor = ? AND idempotency_key = ?",
+                (actor, idempotency_key),
+            ).fetchone()
+        if row is None:
+            return None
+        receipt = (row["fingerprint"], _ga_record_from_json(row["record_json"]))
+        record, _ = _replay_or_conflict(receipt, fingerprint)
+        return record
 
     def transition_ga_job_command(
         self,
@@ -957,6 +1045,7 @@ def _command_fingerprint(
     job_id: str | None = None,
     expected_version: object = None,
     request: dict[str, Any] | None = None,
+    http_wire_intent: Mapping[str, object] | None = None,
 ) -> str:
     intent: dict[str, Any] = {"operation": operation}
     if job_id is not None:
@@ -967,6 +1056,11 @@ def _command_fingerprint(
         normalized = copy.deepcopy(request)
         normalized["evolution"]["epoch_id"] = None
         intent["request"] = normalized
+    if http_wire_intent is not None:
+        if operation != "submit" or request is not None:
+            raise GaJobStoreError("validation_error")
+        intent["representation"] = "http_profile_input_v1"
+        intent["wire_intent"] = copy.deepcopy(dict(http_wire_intent))
     try:
         encoded = json.dumps(
             intent,

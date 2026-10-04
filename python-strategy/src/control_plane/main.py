@@ -31,6 +31,8 @@ from src.control_plane import (
 from src.control_plane.backtest_results import BacktestResultsQueryService
 from src.control_plane.evaluation_data import RequestEvaluationDataSourceProvider
 from src.control_plane.invalidation import ControlPlaneInvalidationHub
+from src.control_plane.ga_commands import GaCommandService
+from src.control_plane.ga_lifecycle import GaJobStatus
 from src.control_plane.jobs import JobStore
 from src.control_plane.ops_status_query import OpsStatusQuery
 from src.control_plane.profile_http_query import ProfileQueryService
@@ -154,18 +156,52 @@ def build_control_plane_app(
         )
     except ValueError:
         ops_status_query = None
+    backtest_executor = BacktestJobExecutor(
+        store=job_store,
+        db_session_factory=db_session_factory,
+        recover_interrupted=recover_interrupted,
+        strategy_loader=strategy_loader,
+    )
+    parameter_search_executor = ParameterSearchJobExecutor(
+        parameter_search_evaluator,
+        store=job_store,
+        db_session_factory=db_session_factory,
+    )
+    ga_command_service = None
+    if isinstance(job_store, SqliteJobStore) and isinstance(
+        parameter_search_evaluator, ParameterSearchEvaluatorRegistry
+    ):
+        ga_command_service = GaCommandService(
+            store=job_store,
+            executor=parameter_search_executor,
+            session_factory=db_session_factory,
+        )
+        try:
+            job_store.interrupt_ga_jobs("control_plane_interrupted")
+            queued_jobs = sorted(
+                (
+                    record
+                    for record in job_store.list_ga_jobs()
+                    if record.status == GaJobStatus.QUEUED
+                ),
+                key=lambda record: record.id,
+            )
+        except Exception:
+            parameter_search_executor.shutdown(
+                wait=True, timeout=0.0, cancel_futures=True
+            )
+            backtest_executor.shutdown(wait=True, timeout=0.0, cancel_futures=True)
+            invalidation_hub.close()
+            raise
+        for record in queued_jobs:
+            try:
+                parameter_search_executor.dispatch_ga_job(record.id, record.version)
+            except Exception:
+                logger.warning("ga_dispatch_failed")
+
     return ControlPlaneApp(
-        BacktestJobExecutor(
-            store=job_store,
-            db_session_factory=db_session_factory,
-            recover_interrupted=recover_interrupted,
-            strategy_loader=strategy_loader,
-        ),
-        parameter_search_executor=ParameterSearchJobExecutor(
-            parameter_search_evaluator,
-            store=job_store,
-            db_session_factory=db_session_factory,
-        ),
+        backtest_executor,
+        parameter_search_executor=parameter_search_executor,
         gene_control=GeneControlService(db_session_factory),
         strategy_control=StrategyControlService(
             RedisStrategyCommandRouter(redis_client, state_query)
@@ -178,6 +214,7 @@ def build_control_plane_app(
         ops_status_query=ops_status_query,
         backtest_results_query_service=backtest_results_query_service,
         invalidation_hub=invalidation_hub,
+        ga_command_service=ga_command_service,
         readiness_probe=(
             readiness_probe
             if readiness_probe is not None
