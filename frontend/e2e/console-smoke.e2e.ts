@@ -929,6 +929,23 @@ async function exerciseScenario(
     await expect(page.locator(".results-metrics .metric-primary strong")).toHaveText(
       "9007199254740993.12 USDT"
     );
+    const resultMetricGeometry = await page
+      .locator(".results-metrics .metric-primary strong")
+      .evaluate((element) => {
+        const bounds = element.getBoundingClientRect();
+        const metric = element.closest(".metric-primary");
+        return {
+          text: element.textContent,
+          clientWidth: element.clientWidth,
+          scrollWidth: element.scrollWidth,
+          right: bounds.right,
+          metricRight: metric?.getBoundingClientRect().right ?? 0
+        };
+      });
+    expect(resultMetricGeometry.scrollWidth, JSON.stringify(resultMetricGeometry))
+      .toBeLessThanOrEqual(resultMetricGeometry.clientWidth);
+    expect(resultMetricGeometry.right, JSON.stringify(resultMetricGeometry))
+      .toBeLessThanOrEqual(resultMetricGeometry.metricRight);
     await expect(page.locator(".results-metrics .metric-primary small")).toContainText("1.25%");
     await expect(page.locator(".results-metrics")).toContainText("123.45 USDT");
     await expect(page.getByText(`${FLOW_RESULT_ID}:0`, { exact: true })).toBeVisible();
@@ -961,7 +978,54 @@ async function exerciseScenario(
     await expect(page.locator(".trade-ledger").getByText(FLOW_TRADE_ID, { exact: true }).first()).toBeVisible();
     await expect(page.locator(".trade-detail").getByText(FLOW_TRADE_ID, { exact: true })).toBeVisible();
     await expect(page.locator(".trade-detail")).toContainText("-9007199254740993.12 USDT");
+    await expect(page.locator(".trade-detail")).toContainText("2.50");
+    await expect(page.locator(".trade-detail")).toContainText("9,007,199,254,740,994.12");
+    await expect(page.locator(".trade-detail")).toContainText("9,007,199,254,740,993.12");
     await expect(page.locator(".trade-detail")).toContainText("0.50 USDT");
+    const detail = page.locator(".trade-detail");
+    const tradeGeometry = await detail.evaluate((element) => {
+      const bounds = element.getBoundingClientRect();
+      const ledger = element.closest(".trade-ledger");
+      const ledgerBounds = ledger?.getBoundingClientRect();
+      const values = [
+        element.querySelector("strong"),
+        ...Array.from(element.querySelectorAll("dl dd"))
+      ].map((value) => {
+        const valueBounds = value!.getBoundingClientRect();
+        return {
+          left: valueBounds.left,
+          right: valueBounds.right,
+          clientWidth: value!.clientWidth,
+          scrollWidth: value!.scrollWidth
+        };
+      });
+      return {
+        left: bounds.left,
+        right: bounds.right,
+        bottom: bounds.bottom,
+        values,
+        ledgerClientHeight: ledger?.clientHeight ?? 0,
+        ledgerScrollHeight: ledger?.scrollHeight ?? 0,
+        ledgerBottom: ledgerBounds?.bottom ?? 0
+      };
+    });
+    expect(tradeGeometry.values).toHaveLength(7);
+    for (const value of tradeGeometry.values) {
+      expect(value.scrollWidth, JSON.stringify({ tradeGeometry, value }))
+        .toBeLessThanOrEqual(value.clientWidth);
+      expect(value.left, JSON.stringify({ tradeGeometry, value }))
+        .toBeGreaterThanOrEqual(tradeGeometry.left);
+      expect(value.right, JSON.stringify({ tradeGeometry, value }))
+        .toBeLessThanOrEqual(tradeGeometry.right);
+    }
+    const entryBounds = tradeGeometry.values[3];
+    const exitBounds = tradeGeometry.values[4];
+    expect(entryBounds.right, JSON.stringify({ entryBounds, exitBounds }))
+      .toBeLessThanOrEqual(exitBounds.left);
+    expect(tradeGeometry.ledgerScrollHeight, JSON.stringify(tradeGeometry))
+      .toBeLessThanOrEqual(tradeGeometry.ledgerClientHeight);
+    expect(tradeGeometry.bottom, JSON.stringify(tradeGeometry))
+      .toBeLessThanOrEqual(tradeGeometry.ledgerBottom);
     await page.screenshot({
       path: testInfo.outputPath(`${testInfo.project.name}-production-results-trades.png`),
       fullPage: true

@@ -117,9 +117,9 @@
 }
 
 .results-metrics strong {
-  overflow: hidden;
+  min-width: 0;
   font-size: clamp(1rem, 2vw, 1.45rem);
-  text-overflow: ellipsis;
+  overflow-wrap: anywhere;
 }
 
 .results-metrics .metric-primary {

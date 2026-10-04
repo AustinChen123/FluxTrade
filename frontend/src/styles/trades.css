@@ -200,10 +200,12 @@
 }
 
 .trade-detail dd {
+  min-width: 0;
   margin-top: 3px;
   color: var(--selection-ink);
   font-family: "SFMono-Regular", "Roboto Mono", monospace;
   font-size: 0.74rem;
+  overflow-wrap: anywhere;
 }
 
 .trade-prompt {
