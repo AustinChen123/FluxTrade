@@ -68,6 +68,7 @@ type ArchitectureRole =
   | "feature-chart"
   | "feature-demo"
   | "shared-chart"
+  | "shared-trading-pager"
   | "shared-pure"
   | "shared-theme"
   | "shared-i18n"
@@ -181,6 +182,7 @@ const expectedInventory = [
   "shared/time/utc.ts",
   "shared/trading/closedTrade.ts",
   "shared/trading/closedTradePage.ts",
+  "shared/trading/useTradePagination.ts",
   "styles/index.css",
   "styles/research.css",
   "styles/responsive.css",
@@ -265,7 +267,6 @@ const expectedBareImportLedger = [
   "features/results/resultsModel.test.ts|vitest|value",
   "features/results/useTradePagination.test.ts|@testing-library/react|value",
   "features/results/useTradePagination.test.ts|vitest|value",
-  "features/results/useTradePagination.ts|react|value",
   "features/strategies/strategyCommandState.test.ts|vitest|value",
   "features/strategies/StrategyManager.test.tsx|@testing-library/react|value",
   "features/strategies/StrategyManager.test.tsx|vitest|value",
@@ -309,7 +310,8 @@ const expectedBareImportLedger = [
   "shared/locales/resources.test.ts|vitest|value",
   "shared/theme.test.ts|vitest|value",
   "shared/time/presentation.test.ts|vitest|value",
-  "shared/time/utc.test.ts|vitest|value"
+  "shared/time/utc.test.ts|vitest|value",
+  "shared/trading/useTradePagination.ts|react|value"
 ] as const;
 
 const expectedRelativeImportLedger = [
@@ -408,10 +410,11 @@ const expectedRelativeImportLedger = [
   "features/results/resultsModel.ts|../../shared/trading/closedTradePage|type-only|shared/trading/closedTradePage.ts",
   "features/results/resultsModel.ts|../../shared/trading/closedTradePage|type-only|shared/trading/closedTradePage.ts",
   "features/results/resultsModel.ts|../../shared/trading/closedTradePage|value|shared/trading/closedTradePage.ts",
+  "features/results/useTradePagination.test.ts|../../shared/trading/useTradePagination|value|shared/trading/useTradePagination.ts",
   "features/results/useTradePagination.test.ts|./demo|value|features/results/demo.ts",
   "features/results/useTradePagination.test.ts|./resultsModel|type-only|features/results/resultsModel.ts",
   "features/results/useTradePagination.test.ts|./useTradePagination|value|features/results/useTradePagination.ts",
-  "features/results/useTradePagination.ts|./resultsModel|value|features/results/resultsModel.ts",
+  "features/results/useTradePagination.ts|../../shared/trading/useTradePagination|value|shared/trading/useTradePagination.ts",
   "features/strategies/strategyCommandState.test.ts|../../api|type-only|api.ts",
   "features/strategies/strategyCommandState.test.ts|./strategyCommandState|value|features/strategies/strategyCommandState.ts",
   "features/strategies/strategyCommandState.ts|../../api|type-only|api.ts",
@@ -477,7 +480,8 @@ const expectedRelativeImportLedger = [
   "shared/time/presentation.test.ts|./presentation|value|shared/time/presentation.ts",
   "shared/time/presentation.ts|./utc|value|shared/time/utc.ts",
   "shared/time/utc.test.ts|./utc|value|shared/time/utc.ts",
-  "shared/trading/closedTradePage.ts|./closedTrade|type-only|shared/trading/closedTrade.ts"
+  "shared/trading/closedTradePage.ts|./closedTrade|type-only|shared/trading/closedTrade.ts",
+  "shared/trading/useTradePagination.ts|./closedTradePage|value|shared/trading/closedTradePage.ts"
 ] as const;
 
 const expectedPolicyGlobalLedger = [
@@ -1043,6 +1047,9 @@ function architectureRole(importer: string): ArchitectureRole {
   if (importer === "features/strategies/useStrategyManager.ts") {
     return "strategy-io";
   }
+  if (importer === "shared/trading/useTradePagination.ts") {
+    return "shared-trading-pager";
+  }
   if (featureOwnerPaths.has(importer)) return "feature-owner";
   if (featurePresentationPaths.has(importer)) return "feature-presentation";
   if (featureModelPaths.has(importer)) return "feature-model";
@@ -1229,6 +1236,7 @@ function assertBareEdge(edge: ImportEdge, role: ArchitectureRole): void {
       "echarts/renderers|value",
       "react|value"
     ]),
+    "shared-trading-pager": new Set(["react|value"]),
     "shared-i18n": new Set(["i18next|value", "react-i18next|value"])
   };
   if (!exactByRole[role]?.has(`${edge.specifier}|${edge.kind}`)) {
@@ -1396,6 +1404,10 @@ function assertRepositoryEdge(edge: ImportEdge, role: ArchitectureRole): void {
     ) {
       denyEdge(edge);
     }
+    return;
+  }
+  if (role === "shared-trading-pager") {
+    if (edge.resolved !== "shared/trading/closedTradePage.ts") denyEdge(edge);
     return;
   }
   if (role === "shared-pure") {
@@ -2097,6 +2109,7 @@ describe("frontend architecture ratchet", () => {
     ["features/research/gaCharts.ts", "feature-chart"],
     ["features/research/demo.ts", "feature-demo"],
     ["shared/charts/EChart.tsx", "shared-chart"],
+    ["shared/trading/useTradePagination.ts", "shared-trading-pager"],
     ["shared/format/decimal.ts", "shared-pure"],
     ["shared/theme.ts", "shared-theme"],
     ["shared/i18n.ts", "shared-i18n"],
@@ -2192,6 +2205,16 @@ describe("frontend architecture ratchet", () => {
       "type-only"
     ),
     architectureEdge(
+      "shared/trading/useTradePagination.ts",
+      "react",
+      "react"
+    ),
+    architectureEdge(
+      "shared/trading/useTradePagination.ts",
+      "./closedTradePage",
+      "shared/trading/closedTradePage.ts"
+    ),
+    architectureEdge(
       "shared/i18n.ts",
       "./locales/en",
       "shared/locales/en.ts"
@@ -2244,6 +2267,9 @@ describe("frontend architecture ratchet", () => {
     architectureEdge("shared/trading/closedTradePage.ts", "../../api", "api.ts"),
     architectureEdge("shared/trading/closedTradePage.ts", "../../features/results/resultsModel", "features/results/resultsModel.ts"),
     architectureEdge("shared/trading/closedTradePage.ts", "react", "react"),
+    architectureEdge("shared/trading/useTradePagination.ts", "../../api", "api.ts"),
+    architectureEdge("shared/trading/useTradePagination.ts", "../../features/results/resultsModel", "features/results/resultsModel.ts"),
+    architectureEdge("shared/trading/useTradePagination.ts", "../../features/trades/tradeModel", "features/trades/tradeModel.ts"),
     architectureEdge("shared/trading/closedTradePage.ts", "../../api", "api.ts"),
     architectureEdge("shared/trading/closedTradePage.ts", "../../features/results/resultsModel", "features/results/resultsModel.ts"),
     architectureEdge("shared/theme.ts", "./time/utc", "shared/time/utc.ts"),
@@ -3039,7 +3065,7 @@ describe("frontend architecture ratchet", () => {
     };
     const appSource = source("app/App.tsx");
     const facadeSource = source("features/results/BacktestResultsView.tsx");
-    const paginationSource = source("features/results/useTradePagination.ts");
+    const paginationSource = source("shared/trading/useTradePagination.ts");
     const modelSource = source("features/results/resultsModel.ts");
     const chartsSource = source("features/results/resultsCharts.ts");
     const app = findNamedFunction(appSource, "App");

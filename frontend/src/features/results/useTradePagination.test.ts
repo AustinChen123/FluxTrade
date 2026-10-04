@@ -5,7 +5,8 @@ import { describe, expect, it, vi } from "vitest";
 
 import { demoBacktestSnapshot } from "./demo";
 import type { TradePage } from "./resultsModel";
-import { useTradePagination } from "./useTradePagination";
+import { useTradePagination as resultsUseTradePagination } from "./useTradePagination";
+import { useTradePagination } from "../../shared/trading/useTradePagination";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -23,6 +24,10 @@ const firstPage: TradePage = {
 };
 
 describe("useTradePagination", () => {
+  it("keeps the Results compatibility export on the shared pager owner", () => {
+    expect(resultsUseTradePagination).toBe(useTradePagination);
+  });
+
   it.each([
     [
       "zero",
