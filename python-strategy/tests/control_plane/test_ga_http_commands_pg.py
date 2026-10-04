@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import logging
+import sqlite3
 from copy import deepcopy
 from concurrent.futures import Future
+from contextlib import closing
 from pathlib import Path
 from typing import cast
 from unittest.mock import MagicMock
@@ -17,6 +20,7 @@ from sqlalchemy.exc import OperationalError
 from src.control_plane.browser_auth import BrowserSessionAuth
 from src.control_plane.app import HttpResponse
 from src.control_plane.ga_lifecycle import GaJobStatus
+from src.control_plane.invalidation import InvalidationSubscription
 from src.control_plane.ga_profile import get_golden_cross_profile
 from src.control_plane.jobs import SqliteJobStore
 from src.control_plane.main import build_control_plane_app
@@ -80,6 +84,15 @@ def _session_headers(app) -> dict[str, str]:
     }
 
 
+def _drain_invalidation_events(
+    stream: InvalidationSubscription,
+) -> list[dict[str, object]]:
+    events = []
+    while (frame := stream.next_frame(timeout=0)) is not None:
+        events.append(json.loads(frame.split(b"data: ", 1)[1].strip()))
+    return events
+
+
 def test_composed_http_submit_runs_native_and_replays_original_receipt(
     fresh_pg_db: str,
     tmp_path: Path,
@@ -88,7 +101,8 @@ def test_composed_http_submit_runs_native_and_replays_original_receipt(
     _upgrade(fresh_pg_db, "head")
     engine = sa.create_engine(_target_url(fresh_pg_db))
     sessions = sessionmaker(bind=engine)
-    store = SqliteJobStore(tmp_path / "ga-http.sqlite3")
+    store_path = tmp_path / "ga-http.sqlite3"
+    store = SqliteJobStore(store_path)
     dataset_id = "ga-http-sealed-native"
     candle_path = tmp_path / "candles.csv"
     rows = _write_research_candles(candle_path)
@@ -125,8 +139,55 @@ def test_composed_http_submit_runs_native_and_replays_original_receipt(
             ),
             readiness_probe=lambda: None,
         )
+        event_stream = app.invalidation_hub.subscribe()
         headers = _session_headers(app)
         profile_input = _profile_input(dataset_id, rows[0][0], rows[-1][0])
+        original_publish = app.invalidation_hub.publish_committed
+        publication_checks: list[tuple[str, str, int]] = []
+        receipt_key_for_publish: str | None = None
+
+        def verify_durable_state_before_publish(
+            resource: str, identity: str, revision: int
+        ) -> None:
+            if resource == "ga_job":
+                with closing(sqlite3.connect(store_path, timeout=0.1)) as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    job_row = connection.execute(
+                        "SELECT ga_version FROM control_plane_jobs "
+                        "WHERE id = ? AND kind = 'ga'",
+                        (identity,),
+                    ).fetchone()
+                    assert job_row == (revision,)
+                    if revision == 1 and receipt_key_for_publish is not None:
+                        receipt = connection.execute(
+                            "SELECT record_json FROM control_plane_ga_command_receipts "
+                            "WHERE actor = ? AND idempotency_key = ?",
+                            ("operator@example.com", receipt_key_for_publish),
+                        ).fetchone()
+                        assert receipt is not None
+                        receipt_record = json.loads(receipt[0])
+                        assert receipt_record["id"] == identity
+                        assert receipt_record["version"] == revision
+                    connection.rollback()
+            else:
+                assert resource == "evolution_epoch"
+                assert cast(QueuePool, engine.pool).checkedout() == 0
+                with sessions() as session:
+                    committed = session.scalar(
+                        select(EvolutionEpoch)
+                        .where(EvolutionEpoch.id == identity)
+                        .with_for_update(nowait=True)
+                    )
+                    assert committed is not None
+                    assert committed.revision == revision
+            publication_checks.append((resource, identity, revision))
+            original_publish(resource, identity, revision)
+
+        monkeypatch.setattr(
+            app.invalidation_hub,
+            "publish_committed",
+            verify_durable_state_before_publish,
+        )
         invalid_input = deepcopy(profile_input)
         invalid_input["dataset_id"] = "missing-sealed-dataset"
         rejected = app.handle(
@@ -188,6 +249,7 @@ def test_composed_http_submit_runs_native_and_replays_original_receipt(
                 raise TypeError("private serializer failure")
             return HttpResponse.json(self)
 
+        receipt_key_for_publish = "native-submit-1"
         with monkeypatch.context() as scoped:
             scoped.setattr(HttpResponse, "json", fail_success_serialization)
             response = app.handle(
@@ -196,6 +258,7 @@ def test_composed_http_submit_runs_native_and_replays_original_receipt(
                 body=json.dumps(profile_input),
                 headers={**headers, "Idempotency-Key": "native-submit-1"},
             )
+        receipt_key_for_publish = None
         assert (response.status_code, response.body) == (
             503,
             {"error": "ga_backend_unavailable"},
@@ -238,10 +301,35 @@ def test_composed_http_submit_runs_native_and_replays_original_receipt(
         with sessions() as session:
             epoch = session.get(EvolutionEpoch, completed.epoch_id)
             assert epoch is not None and epoch.generations_run == 1
+            assert epoch.revision == 3
             genes = session.scalars(
                 select(GeneRecord).where(GeneRecord.epoch_id == completed.epoch_id)
             ).all()
             assert len(genes) == 2
+
+        events = _drain_invalidation_events(event_stream)
+        ga_versions = [
+            event["revision"]
+            for event in events
+            if event["resource"] == "ga_job" and event["identity"] == completed.id
+        ]
+        epoch_revisions = [
+            event["revision"]
+            for event in events
+            if event["resource"] == "evolution_epoch"
+            and event["identity"] == completed.epoch_id
+        ]
+        assert completed.version == 3
+        assert ga_versions == [1, 2, 3]
+        assert epoch_revisions == [1, 2, 3]
+        assert publication_checks[:6] == [
+            ("ga_job", completed.id, 1),
+            ("ga_job", completed.id, 2),
+            ("evolution_epoch", completed.epoch_id, 1),
+            ("evolution_epoch", completed.epoch_id, 2),
+            ("evolution_epoch", completed.epoch_id, 3),
+            ("ga_job", completed.id, 3),
+        ]
 
         retry_headers = {
             **headers,
@@ -474,6 +562,7 @@ def test_composed_http_submit_runs_native_and_replays_original_receipt(
         def forbidden_preflight(_source):
             raise AssertionError("matching receipt must precede mutable preflight")
 
+        valid_get_dataset_metadata = ResearchDatabaseDataSource.get_dataset_metadata
         monkeypatch.setattr(
             ResearchDatabaseDataSource, "get_dataset_metadata", forbidden_preflight
         )
@@ -489,8 +578,15 @@ def test_composed_http_submit_runs_native_and_replays_original_receipt(
         assert replay.body["job"] == original_receipt_body
         assert len(futures) == 2
         assert store.list_ga_jobs() == jobs_before_receipt_replay
+        monkeypatch.setattr(
+            ResearchDatabaseDataSource,
+            "get_dataset_metadata",
+            valid_get_dataset_metadata,
+        )
 
+        original_hub = app.invalidation_hub
         assert app.shutdown(timeout=30)
+        assert original_hub.active_count == 0
         app = None
         reopened_store = SqliteJobStore(tmp_path / "ga-http.sqlite3")
         app = build_control_plane_app(
@@ -528,6 +624,61 @@ def test_composed_http_submit_runs_native_and_replays_original_receipt(
         )
         assert len(futures) == 2
         assert store.list_ga_jobs() == jobs_before_receipt_replay
+
+        warning_calls: list[tuple[object, tuple[object, ...], dict[str, object]]] = []
+        invalidation_logger = logging.getLogger("src.control_plane.invalidation")
+        original_warning = invalidation_logger.warning
+
+        def capture_fixed_warning(message, *args, **kwargs):
+            warning_calls.append((message, args, kwargs))
+            original_warning(message, *args, **kwargs)
+
+        monkeypatch.setattr(invalidation_logger, "warning", capture_fixed_warning)
+        app.invalidation_hub.close()
+        closed_hub_headers = {
+            **reopened_headers,
+            "Idempotency-Key": "native-retry-closed-hub",
+        }
+        closed_hub_body = json.dumps({"expected_version": completed.version})
+        closed_hub_retry = app.handle(
+            "POST",
+            f"/api/v1/ga-jobs/{completed.id}/retry",
+            body=closed_hub_body,
+            headers=closed_hub_headers,
+        )
+        assert closed_hub_retry.status_code == 202
+        assert dict(closed_hub_retry.headers) == {"Cache-Control": "no-store"}
+        assert len(futures) == 3
+        closed_hub_result = futures[2].result(timeout=60)
+        assert closed_hub_result.status.value == "SUCCEEDED"
+        assert closed_hub_result.completed_generation == 0
+        closed_hub_receipt = reopened_store.get_ga_command_receipt(
+            actor="operator@example.com",
+            idempotency_key="native-retry-closed-hub",
+            operation="retry",
+            job_id=completed.id,
+            expected_version=completed.version,
+        )
+        assert closed_hub_receipt is not None
+        assert closed_hub_receipt.status == GaJobStatus.QUEUED
+        assert closed_hub_receipt.id == closed_hub_retry.body["job"]["id"]
+        closed_hub_replay = app.handle(
+            "POST",
+            f"/api/v1/ga-jobs/{completed.id}/retry",
+            body=closed_hub_body,
+            headers=closed_hub_headers,
+        )
+        assert closed_hub_replay.status_code == 202
+        assert closed_hub_replay.body == closed_hub_retry.body
+        assert warning_calls
+        assert all(
+            call == ("invalidation_publish_failed", (), {}) for call in warning_calls
+        )
+        assert not any(
+            completed.id in str(message) or closed_hub_receipt.id in str(message)
+            for message, _args, _kwargs in warning_calls
+        )
+        assert len(futures) == 3
     finally:
         if app is not None:
             assert app.shutdown(timeout=30)

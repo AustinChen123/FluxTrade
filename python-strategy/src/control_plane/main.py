@@ -107,15 +107,23 @@ def build_control_plane_app(
 ) -> ControlPlaneApp:
     if redis_client is None:
         redis_client = create_redis_client()
+    invalidation_hub = ControlPlaneInvalidationHub()
     if job_store is None:
         job_db_path = os.getenv("CONTROL_PLANE_JOB_DB_PATH")
-        job_store = SqliteJobStore(job_db_path) if job_db_path else InMemoryJobStore()
+        job_store = (
+            SqliteJobStore(job_db_path, invalidation_hub=invalidation_hub)
+            if job_db_path
+            else InMemoryJobStore(invalidation_hub=invalidation_hub)
+        )
+    else:
+        bind_hub = getattr(job_store, "bind_invalidation_hub", None)
+        if callable(bind_hub):
+            bind_hub(invalidation_hub)
     backtest_results_query_service = BacktestResultsQueryService(
         db_session_factory,
         cursor_key=secrets.token_bytes(32),
         job_lookup=job_store.get,
     )
-    invalidation_hub = ControlPlaneInvalidationHub()
     if strategy_loader is None:
         strategy_artifacts_path = os.getenv(
             "STRATEGY_ARTIFACTS_PATH", _DEFAULT_STRATEGY_ARTIFACTS_PATH
@@ -166,6 +174,7 @@ def build_control_plane_app(
         parameter_search_evaluator,
         store=job_store,
         db_session_factory=db_session_factory,
+        invalidation_hub=invalidation_hub,
     )
     ga_command_service = None
     if isinstance(job_store, SqliteJobStore) and isinstance(

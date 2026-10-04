@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel
 
+from src.control_plane.invalidation import ControlPlaneInvalidationHub
 from src.control_plane.ga_lifecycle import (
     GaCheckpointReference,
     GaJobRecord,
@@ -123,11 +124,24 @@ class JobStore(Protocol):
 class InMemoryJobStore:
     """Thread-safe in-memory job store for local control-plane operation."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        invalidation_hub: ControlPlaneInvalidationHub | None = None,
+    ) -> None:
         self._jobs: dict[str, JobRecord] = {}
         self._ga_jobs: dict[str, GaJobRecord] = {}
         self._ga_command_receipts: dict[tuple[str, str], tuple[str, GaJobRecord]] = {}
         self._lock = Lock()
+        self._invalidation_hub = invalidation_hub
+
+    def bind_invalidation_hub(self, hub: ControlPlaneInvalidationHub) -> None:
+        self._invalidation_hub = hub
+
+    def _publish_ga_job(self, record: GaJobRecord) -> None:
+        if self._invalidation_hub is not None:
+            self._invalidation_hub.publish_committed(
+                "ga_job", record.id, record.version
+            )
 
     def create(self, *, kind: str, request: BaseModel) -> JobRecord:
         if kind == "ga":
@@ -210,6 +224,7 @@ class InMemoryJobStore:
         record = new_ga_job_record(uuid4().hex, request, epoch_id, retry_of_job_id)
         with self._lock:
             self._ga_jobs[record.id] = record
+        self._publish_ga_job(record)
         return record.detached_copy()
 
     def get_ga_job(self, job_id: str) -> GaJobRecord | None:
@@ -238,7 +253,8 @@ class InMemoryJobStore:
                 raise GaJobStoreError("ga_job_not_found")
             updated = transition_ga_job(current, action, expected_version, payload)
             self._ga_jobs[job_id] = updated
-            return updated.detached_copy()
+        self._publish_ga_job(updated)
+        return updated.detached_copy()
 
     def apply_ga_worker_envelope(
         self,
@@ -261,7 +277,8 @@ class InMemoryJobStore:
                 payload=payload,
             )
             self._ga_jobs[job_id] = updated
-            return updated.detached_copy()
+        self._publish_ga_job(updated)
+        return updated.detached_copy()
 
     def interrupt_ga_jobs(
         self,
@@ -285,7 +302,9 @@ class InMemoryJobStore:
                     )
                     self._ga_jobs[job_id] = updated
                     interrupted.append(updated.detached_copy())
-            return interrupted
+        for record in interrupted:
+            self._publish_ga_job(record)
+        return interrupted
 
     def submit_ga_job_command(
         self,
@@ -313,7 +332,8 @@ class InMemoryJobStore:
                 fingerprint,
                 record.detached_copy(),
             )
-            return record.detached_copy(), False
+        self._publish_ga_job(record)
+        return record.detached_copy(), False
 
     def get_ga_command_receipt(
         self,
@@ -374,7 +394,8 @@ class InMemoryJobStore:
                 fingerprint,
                 updated.detached_copy(),
             )
-            return updated.detached_copy(), False
+        self._publish_ga_job(updated)
+        return updated.detached_copy(), False
 
     def retry_ga_job_command(
         self,
@@ -406,7 +427,8 @@ class InMemoryJobStore:
                 fingerprint,
                 retried.detached_copy(),
             )
-            return retried.detached_copy(), False
+        self._publish_ga_job(retried)
+        return retried.detached_copy(), False
 
     def _update(self, job_id: str, **changes: Any) -> JobRecord:
         with self._lock:
@@ -424,10 +446,24 @@ class InMemoryJobStore:
 class SqliteJobStore:
     """SQLite-backed job store for durable local control-plane operation."""
 
-    def __init__(self, db_path: str | Path) -> None:
+    def __init__(
+        self,
+        db_path: str | Path,
+        invalidation_hub: ControlPlaneInvalidationHub | None = None,
+    ) -> None:
         self._db_path = Path(db_path)
         self._lock = Lock()
+        self._invalidation_hub = invalidation_hub
         self._initialize()
+
+    def bind_invalidation_hub(self, hub: ControlPlaneInvalidationHub) -> None:
+        self._invalidation_hub = hub
+
+    def _publish_ga_job(self, record: GaJobRecord) -> None:
+        if self._invalidation_hub is not None:
+            self._invalidation_hub.publish_committed(
+                "ga_job", record.id, record.version
+            )
 
     def create(self, *, kind: str, request: BaseModel) -> JobRecord:
         if kind == "ga":
@@ -506,6 +542,7 @@ class SqliteJobStore:
                 ),
             )
             conn.commit()
+        self._publish_ga_job(record)
         return record.detached_copy()
 
     def get_ga_job(self, job_id: str) -> GaJobRecord | None:
@@ -546,6 +583,7 @@ class SqliteJobStore:
             except Exception:
                 conn.rollback()
                 raise
+        self._publish_ga_job(updated)
         return updated.detached_copy()
 
     def apply_ga_worker_envelope(
@@ -580,6 +618,7 @@ class SqliteJobStore:
             except Exception:
                 conn.rollback()
                 raise
+        self._publish_ga_job(updated)
         return updated.detached_copy()
 
     def interrupt_ga_jobs(
@@ -615,6 +654,8 @@ class SqliteJobStore:
             except Exception:
                 conn.rollback()
                 raise
+        for record in interrupted:
+            self._publish_ga_job(record)
         return interrupted
 
     def submit_ga_job_command(
@@ -778,10 +819,11 @@ class SqliteJobStore:
                     conn, actor, idempotency_key, fingerprint, record
                 )
                 conn.commit()
-                return record.detached_copy(), False
             except Exception:
                 conn.rollback()
                 raise
+        self._publish_ga_job(record)
+        return record.detached_copy(), False
 
     def mark_running(self, job_id: str) -> JobRecord:
         return self._update(

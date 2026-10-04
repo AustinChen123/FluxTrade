@@ -878,7 +878,9 @@ def test_worker_preserves_original_error_when_abort_marking_fails(
         db_session_factory=cast(SessionFactory, lambda: None),
     )
     monkeypatch.setattr(
-        parameter_search_module, "_ensure_evolution_epoch", lambda *_args: None
+        parameter_search_module,
+        "_ensure_evolution_epoch",
+        lambda *_args, **_kwargs: None,
     )
 
     def fail_checkpoint(*_args, **_kwargs):

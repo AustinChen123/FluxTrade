@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import logging
 import sqlite3
 import ast
 from concurrent.futures import ThreadPoolExecutor
@@ -13,6 +15,7 @@ from pydantic import BaseModel
 
 import src.control_plane.jobs as jobs_module
 from src.control_plane.ga_lifecycle import GaJobStatus, GaJobStoreError
+from src.control_plane.invalidation import ControlPlaneInvalidationHub
 from src.control_plane.jobs import InMemoryJobStore, SqliteJobStore
 
 
@@ -84,6 +87,305 @@ def _job_in_state(store, state: GaJobStatus):
 def _assert_code(error: pytest.ExceptionInfo, code: str) -> None:
     assert isinstance(error.value, GaJobStoreError)
     assert error.value.code == code
+
+
+def _next_event(stream):
+    frame = stream.next_frame(timeout=0)
+    assert frame is not None
+    return json.loads(frame.split(b"data: ", 1)[1].strip())
+
+
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+def test_ga_store_publishes_only_committed_mutations(store_kind, tmp_path):
+    hub = ControlPlaneInvalidationHub()
+    store = (
+        InMemoryJobStore()
+        if store_kind == "memory"
+        else SqliteJobStore(tmp_path / "events.sqlite")
+    )
+    store.bind_invalidation_hub(hub)
+    stream = hub.subscribe()
+
+    request = _request()
+    job, replayed = store.submit_ga_job_command(
+        actor="operator",
+        idempotency_key="submit-once",
+        request=request,
+    )
+    assert not replayed
+    assert _next_event(stream) == {
+        "schema_version": 1,
+        "resource": "ga_job",
+        "identity": job.id,
+        "revision": 1,
+    }
+    assert store.get_ga_job(job.id) == job
+    assert store.list_ga_jobs() == [job]
+    replay, replayed = store.submit_ga_job_command(
+        actor="operator",
+        idempotency_key="submit-once",
+        request=request,
+    )
+    assert replayed and replay == job
+    assert stream.next_frame(timeout=0) is None
+
+    running = _transition(store, job, "claim")
+    assert _next_event(stream)["revision"] == running.version == 2
+    acknowledged = store.apply_ga_worker_envelope(
+        running.id,
+        epoch_id=running.epoch_id,
+        expected_completed_generation=-1,
+        action="ack_generation",
+        payload={
+            "completed_generation": 0,
+            "checkpoint_epoch_id": running.epoch_id,
+        },
+    )
+    assert _next_event(stream)["revision"] == acknowledged.version == 3
+
+    paused, replayed = store.transition_ga_job_command(
+        actor="operator",
+        idempotency_key="pause-once",
+        job_id=job.id,
+        action="pause",
+        expected_version=acknowledged.version,
+    )
+    assert not replayed and paused.status == GaJobStatus.PAUSING
+    assert _next_event(stream)["revision"] == paused.version == 4
+    replay, replayed = store.transition_ga_job_command(
+        actor="operator",
+        idempotency_key="pause-once",
+        job_id=job.id,
+        action="pause",
+        expected_version=acknowledged.version,
+    )
+    assert replayed and replay == paused
+    with pytest.raises(GaJobStoreError) as conflict:
+        store.transition_ga_job(job.id, "pause", paused.version + 1)
+    _assert_code(conflict, "job_version_conflict")
+    assert stream.next_frame(timeout=0) is None
+
+    checkpointed = store.apply_ga_worker_envelope(
+        job.id,
+        epoch_id=paused.epoch_id,
+        expected_completed_generation=0,
+        action="ack_generation",
+        payload={
+            "completed_generation": 1,
+            "checkpoint_epoch_id": paused.epoch_id,
+        },
+    )
+    assert checkpointed.status == GaJobStatus.PAUSED
+    assert _next_event(stream)["revision"] == checkpointed.version == 5
+    resumed, replayed = store.transition_ga_job_command(
+        actor="operator",
+        idempotency_key="resume-once",
+        job_id=job.id,
+        action="resume",
+        expected_version=checkpointed.version,
+    )
+    assert not replayed and resumed.status == GaJobStatus.QUEUED
+    assert _next_event(stream)["revision"] == resumed.version == 6
+    cancelled, replayed = store.transition_ga_job_command(
+        actor="operator",
+        idempotency_key="cancel-once",
+        job_id=job.id,
+        action="cancel",
+        expected_version=resumed.version,
+    )
+    assert not replayed and cancelled.status == GaJobStatus.CANCELLED
+    assert _next_event(stream)["revision"] == cancelled.version == 7
+    retried, replayed = store.retry_ga_job_command(
+        actor="operator",
+        idempotency_key="retry-once",
+        job_id=job.id,
+        expected_version=cancelled.version,
+    )
+    assert not replayed and retried.retry_of_job_id == job.id
+    assert _next_event(stream) == {
+        "schema_version": 1,
+        "resource": "ga_job",
+        "identity": retried.id,
+        "revision": 1,
+    }
+    assert store.retry_ga_job_command(
+        actor="operator",
+        idempotency_key="retry-once",
+        job_id=job.id,
+        expected_version=cancelled.version,
+    ) == (retried, True)
+    assert stream.next_frame(timeout=0) is None
+
+    hub.close()
+
+
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+def test_closed_invalidation_hub_cannot_fail_committed_ga_create(
+    store_kind, tmp_path, monkeypatch: pytest.MonkeyPatch
+):
+    hub = ControlPlaneInvalidationHub()
+    hub.close()
+    store = (
+        InMemoryJobStore(hub)
+        if store_kind == "memory"
+        else SqliteJobStore(tmp_path / "closed-hub.sqlite", hub)
+    )
+
+    warning_calls: list[tuple[object, tuple[object, ...], dict[str, object]]] = []
+    invalidation_logger = logging.getLogger("src.control_plane.invalidation")
+    original_warning = invalidation_logger.warning
+
+    def capture_fixed_warning(message, *args, **kwargs):
+        warning_calls.append((message, args, kwargs))
+        original_warning(message, *args, **kwargs)
+
+    monkeypatch.setattr(invalidation_logger, "warning", capture_fixed_warning)
+    request = _request()
+    job, replayed = store.submit_ga_job_command(
+        actor="operator",
+        idempotency_key="closed-hub-submit",
+        request=request,
+    )
+
+    assert not replayed
+    assert store.get_ga_job(job.id) == job
+    assert (
+        store.get_ga_command_receipt(
+            actor="operator",
+            idempotency_key="closed-hub-submit",
+            operation="submit",
+            request=request,
+        )
+        == job
+    )
+    replay, replayed = store.submit_ga_job_command(
+        actor="operator",
+        idempotency_key="closed-hub-submit",
+        request=request,
+    )
+    assert replayed and replay == job
+    assert warning_calls == [("invalidation_publish_failed", (), {})]
+
+
+def test_sqlite_command_receipt_rollback_publishes_nothing_and_reopens(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "receipt-rollback.sqlite"
+    hub = ControlPlaneInvalidationHub()
+    stream = hub.subscribe()
+    store = SqliteJobStore(path, hub)
+    request = _request()
+    original_insert = jobs_module._insert_ga_command_receipt
+    receipts_written: list[str] = []
+
+    def insert_receipt_then_fail(conn, actor, idempotency_key, fingerprint, record):
+        original_insert(conn, actor, idempotency_key, fingerprint, record)
+        receipts_written.append(idempotency_key)
+        raise RuntimeError("fault after receipt insert before commit")
+
+    monkeypatch.setattr(
+        jobs_module, "_insert_ga_command_receipt", insert_receipt_then_fail
+    )
+    with pytest.raises(RuntimeError, match="after receipt insert"):
+        store.submit_ga_job_command(
+            actor="operator",
+            idempotency_key="atomic-submit",
+            request=request,
+        )
+    assert receipts_written == ["atomic-submit"]
+    assert store.list_ga_jobs() == []
+    assert (
+        store.get_ga_command_receipt(
+            actor="operator",
+            idempotency_key="atomic-submit",
+            operation="submit",
+            request=request,
+        )
+        is None
+    )
+    assert stream.next_frame(timeout=0) is None
+
+    monkeypatch.setattr(jobs_module, "_insert_ga_command_receipt", original_insert)
+    reopened = SqliteJobStore(path, hub)
+    original_publish = hub.publish_committed
+    publication_checks: list[tuple[str, str, int]] = []
+
+    def verify_commit_before_publish(
+        resource: str, identity: str, revision: int
+    ) -> None:
+        assert resource == "ga_job"
+        with closing(sqlite3.connect(path, timeout=0.1)) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            job_row = connection.execute(
+                "SELECT ga_version FROM control_plane_jobs WHERE id = ? AND kind = 'ga'",
+                (identity,),
+            ).fetchone()
+            receipt_row = connection.execute(
+                "SELECT record_json FROM control_plane_ga_command_receipts "
+                "WHERE actor = ? AND idempotency_key = ?",
+                ("operator", "atomic-submit"),
+            ).fetchone()
+            assert job_row == (revision,)
+            assert receipt_row is not None
+            receipt = json.loads(receipt_row[0])
+            assert (receipt["id"], receipt["version"]) == (identity, revision)
+            connection.rollback()
+        publication_checks.append((resource, identity, revision))
+        original_publish(resource, identity, revision)
+
+    monkeypatch.setattr(hub, "publish_committed", verify_commit_before_publish)
+    committed, replayed = reopened.submit_ga_job_command(
+        actor="operator",
+        idempotency_key="atomic-submit",
+        request=request,
+    )
+    assert not replayed
+    assert reopened.get_ga_job(committed.id) == committed
+    assert (
+        reopened.get_ga_command_receipt(
+            actor="operator",
+            idempotency_key="atomic-submit",
+            operation="submit",
+            request=request,
+        )
+        == committed
+    )
+    assert publication_checks == [("ga_job", committed.id, committed.version)]
+    assert _next_event(stream)["revision"] == committed.version == 1
+    assert stream.next_frame(timeout=0) is None
+    hub.close()
+
+
+@pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
+def test_startup_interrupt_publishes_each_changed_ga_version(store_kind, tmp_path):
+    hub = ControlPlaneInvalidationHub()
+    store = (
+        InMemoryJobStore(hub)
+        if store_kind == "memory"
+        else SqliteJobStore(tmp_path / "interrupt-events.sqlite", hub)
+    )
+    stream = hub.subscribe()
+    first = _create(store)
+    second = _create(store)
+    assert _next_event(stream)["identity"] == first.id
+    assert _next_event(stream)["identity"] == second.id
+    first_running = _transition(store, first, "claim")
+    second_running = _transition(store, second, "claim")
+    assert _next_event(stream)["revision"] == first_running.version
+    assert _next_event(stream)["revision"] == second_running.version
+
+    interrupted = store.interrupt_ga_jobs()
+
+    assert {record.id for record in interrupted} == {first.id, second.id}
+    events = [_next_event(stream), _next_event(stream)]
+    assert {event["identity"] for event in events} == {first.id, second.id}
+    assert {event["revision"] for event in events} == {3}
+    first_after = store.get_ga_job(first.id)
+    second_after = store.get_ga_job(second.id)
+    assert first_after is not None and first_after.status == GaJobStatus.FAILED
+    assert second_after is not None and second_after.status == GaJobStatus.FAILED
+    assert stream.next_frame(timeout=0) is None
+    hub.close()
 
 
 @pytest.mark.parametrize("store_kind", ["memory", "sqlite"])
@@ -617,8 +919,11 @@ def test_sqlite_ga_update_failure_after_write_rolls_back_and_reopens(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     path = tmp_path / "jobs.sqlite"
-    store = SqliteJobStore(path)
+    hub = ControlPlaneInvalidationHub()
+    stream = hub.subscribe()
+    store = SqliteJobStore(path, hub)
     job = _create(store)
+    assert _next_event(stream)["revision"] == job.version
     original_write = jobs_module._write_ga_record
     writes: list[str] = []
 
@@ -631,11 +936,14 @@ def test_sqlite_ga_update_failure_after_write_rolls_back_and_reopens(
     with pytest.raises(RuntimeError, match="after UPDATE"):
         store.transition_ga_job(job.id, "claim", 1)
     assert writes == [job.id]
+    assert stream.next_frame(timeout=0) is None
     monkeypatch.setattr(jobs_module, "_write_ga_record", original_write)
-    reopened = SqliteJobStore(path)
+    reopened = SqliteJobStore(path, hub)
     assert reopened.get_ga_job(job.id) == job
     claimed = reopened.transition_ga_job(job.id, "claim", 1)
     assert (claimed.status, claimed.version) == (GaJobStatus.RUNNING, 2)
+    assert _next_event(stream)["revision"] == claimed.version
+    hub.close()
 
 
 def test_sqlite_bulk_interrupt_failure_rolls_back_prior_updates(

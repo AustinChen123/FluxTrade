@@ -778,6 +778,12 @@ class EvolutionEpoch(Base):
     __tablename__ = "evolution_epochs"
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    revision: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        default=1,
+        server_default="1",
+    )
     strategy_id: Mapped[str] = mapped_column(
         String,
         ForeignKey("strategy.id"),
@@ -821,6 +827,7 @@ class EvolutionEpoch(Base):
             "status IN ('running', 'completed', 'aborted')",
             name="chk_epoch_status",
         ),
+        CheckConstraint("revision > 0", name="ck_evolution_epoch_revision_positive"),
     )
 
 

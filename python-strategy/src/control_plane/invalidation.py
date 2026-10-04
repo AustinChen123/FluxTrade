@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from queue import Empty, Full, Queue
 from threading import RLock
 from typing import Mapping, cast
@@ -12,6 +13,7 @@ HEARTBEAT_SECONDS = 15.0
 
 _CLOSED = object()
 _ALLOWED_RESOURCES = frozenset({"ga_job", "evolution_epoch"})
+_logger = logging.getLogger(__name__)
 
 
 class InvalidInvalidationRecord(ValueError):
@@ -82,6 +84,19 @@ class ControlPlaneInvalidationHub:
                     subscription._frames.put_nowait(frame)
                 except Full:
                     self._close_locked(subscription)
+
+    def publish_committed(self, resource: str, identity: str, revision: int) -> None:
+        try:
+            self.publish(
+                {
+                    "schema_version": 1,
+                    "resource": resource,
+                    "identity": identity,
+                    "revision": revision,
+                }
+            )
+        except Exception:
+            _logger.warning("invalidation_publish_failed")
 
     def close(self) -> None:
         with self._lock:

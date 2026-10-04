@@ -26,6 +26,7 @@ from src.control_plane.evolution_persistence import (
     _mark_evolution_completed,
     _persist_evolution_generation,
 )
+from src.control_plane.invalidation import ControlPlaneInvalidationHub
 from src.control_plane.ga_lifecycle import GaJobRecord, GaJobStatus
 from src.control_plane.ga_profile import (
     CompiledGaProfileRequest,
@@ -86,6 +87,7 @@ class ParameterSearchJobExecutor:
         run_inline: bool = False,
         recover_interrupted: bool = False,
         db_session_factory: SessionFactory | None = None,
+        invalidation_hub: ControlPlaneInvalidationHub | None = None,
     ) -> None:
         self.evaluator = evaluator
         self.store = store or InMemoryJobStore()
@@ -105,6 +107,7 @@ class ParameterSearchJobExecutor:
         self._active_evolution_epochs: set[str] = set()
         self._active_evolution_lock = Lock()
         self._db_session_factory = db_session_factory
+        self._invalidation_hub = invalidation_hub
 
     def submit_search(self, request: ParameterSearchJobRequest) -> JobRecord:
         if request.market_data is not None and not isinstance(
@@ -275,6 +278,7 @@ class ParameterSearchJobExecutor:
                 candidates,
                 evaluations,
                 best,
+                invalidation_hub=self._invalidation_hub,
             )
         return _json_safe(
             {
@@ -316,7 +320,11 @@ class ParameterSearchJobExecutor:
                     epoch_exists = session.get(EvolutionEpoch, epoch_id) is not None
                 if not epoch_exists and ga_job.completed_generation != -1:
                     raise ValueError("evolution checkpoint is missing for job progress")
-            _ensure_evolution_epoch(self._db_session_factory, request)
+            _ensure_evolution_epoch(
+                self._db_session_factory,
+                request,
+                invalidation_hub=self._invalidation_hub,
+            )
         except Exception:
             self._release_evolution_epoch(epoch_id)
             raise
@@ -375,6 +383,7 @@ class ParameterSearchJobExecutor:
                     next_generation,
                     population,
                     evaluations,
+                    invalidation_hub=self._invalidation_hub,
                 )
                 if (
                     ga_job is not None
@@ -384,6 +393,7 @@ class ParameterSearchJobExecutor:
                         self._db_session_factory,
                         epoch_id,
                         _select_best_candidate(request, evaluations).score_total,
+                        invalidation_hub=self._invalidation_hub,
                     )
                 next_generation += 1
 
@@ -407,6 +417,7 @@ class ParameterSearchJobExecutor:
                     self._db_session_factory,
                     epoch_id,
                     best.score_total,
+                    invalidation_hub=self._invalidation_hub,
                 )
             elif next_generation >= request.evolution.max_generations:
                 with self._db_session_factory() as session:
@@ -419,6 +430,7 @@ class ParameterSearchJobExecutor:
                         self._db_session_factory,
                         epoch_id,
                         best.score_total,
+                        invalidation_hub=self._invalidation_hub,
                     )
                 if (
                     ga_job.completed_generation == request.evolution.max_generations - 1
@@ -444,7 +456,11 @@ class ParameterSearchJobExecutor:
             )
         except Exception:
             try:
-                _mark_evolution_aborted(self._db_session_factory, epoch_id)
+                _mark_evolution_aborted(
+                    self._db_session_factory,
+                    epoch_id,
+                    invalidation_hub=self._invalidation_hub,
+                )
             except Exception:
                 pass
             raise
@@ -810,6 +826,8 @@ def _record_evolution_epoch(
     candidates: list[ParameterCandidate],
     evaluations: list[ParameterEvaluationResult],
     best: ParameterEvaluationResult,
+    *,
+    invalidation_hub: ControlPlaneInvalidationHub | None = None,
 ) -> str:
     epoch_id = f"epoch_{datetime.now(UTC).strftime('%Y%m%d%H%M%S%f')}"
     started_at = datetime.now(UTC)
@@ -844,6 +862,8 @@ def _record_evolution_epoch(
                 )
             )
         session.commit()
+    if invalidation_hub is not None:
+        invalidation_hub.publish_committed("evolution_epoch", epoch_id, 1)
     return epoch_id
 
 
@@ -859,6 +879,7 @@ def _insert_evolution_epoch(
     session.add(
         EvolutionEpoch(
             id=epoch_id,
+            revision=1,
             strategy_id=request.strategy_id,
             started_at=started_at,
             finished_at=finished_at,
