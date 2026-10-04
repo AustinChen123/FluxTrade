@@ -1,6 +1,13 @@
 import { finiteDecimalNumber } from "../../shared/format/decimal";
-import type { ClosedTrade } from "../../shared/trading/closedTrade";
+import type { TradePage } from "../../shared/trading/closedTradePage";
 import { parseUtcTimestamp } from "../../shared/time/utc";
+
+export {
+  mergeTradeItems,
+  validLoadedTradePage,
+  validTradePage
+} from "../../shared/trading/closedTradePage";
+export type { TradePage } from "../../shared/trading/closedTradePage";
 
 export type EquitySample = {
   timestamp: string;
@@ -17,12 +24,6 @@ export type DistributionBucket = {
   lower: string | null;
   upper: string | null;
   count: number;
-};
-
-export type TradePage = {
-  items: ClosedTrade[];
-  totalCount: number;
-  nextCursor: string | null;
 };
 
 export type BacktestResultSnapshot = {
@@ -72,60 +73,4 @@ export function validDistributionBuckets(
   return buckets.every(
     (bucket) => Number.isSafeInteger(bucket.count) && bucket.count >= 0
   );
-}
-
-export function validTradePage(page: TradePage): boolean {
-  if (
-    !Number.isSafeInteger(page.totalCount) ||
-    page.totalCount < page.items.length ||
-    (page.nextCursor !== null && page.nextCursor.trim() === "")
-  ) {
-    return false;
-  }
-  const ids = new Set<string>();
-  for (const trade of page.items) {
-    if (trade.id.length === 0 || ids.has(trade.id)) {
-      return false;
-    }
-    ids.add(trade.id);
-  }
-  return true;
-}
-
-export function validLoadedTradePage(page: TradePage): boolean {
-  return (
-    validTradePage(page) &&
-    (page.nextCursor === null
-      ? page.items.length === page.totalCount
-      : page.items.length < page.totalCount)
-  );
-}
-
-function sameTrade(left: ClosedTrade, right: ClosedTrade): boolean {
-  return (
-    left.id === right.id &&
-    left.side === right.side &&
-    left.quantity === right.quantity &&
-    left.entryTime === right.entryTime &&
-    left.entryPrice === right.entryPrice &&
-    left.exitTime === right.exitTime &&
-    left.exitPrice === right.exitPrice &&
-    left.fee === right.fee &&
-    left.pnl === right.pnl
-  );
-}
-
-export function mergeTradeItems(
-  current: ClosedTrade[],
-  incoming: ClosedTrade[]
-): ClosedTrade[] | null {
-  const merged = new Map(current.map((trade) => [trade.id, trade]));
-  for (const trade of incoming) {
-    const existing = merged.get(trade.id);
-    if (existing && !sameTrade(existing, trade)) {
-      return null;
-    }
-    merged.set(trade.id, existing ?? trade);
-  }
-  return [...merged.values()];
 }

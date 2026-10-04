@@ -180,6 +180,7 @@ const expectedInventory = [
   "shared/time/utc.test.ts",
   "shared/time/utc.ts",
   "shared/trading/closedTrade.ts",
+  "shared/trading/closedTradePage.ts",
   "styles/index.css",
   "styles/research.css",
   "styles/responsive.css",
@@ -400,10 +401,13 @@ const expectedRelativeImportLedger = [
   "features/results/resultsCharts.ts|../../shared/time/presentation|value|shared/time/presentation.ts",
   "features/results/resultsCharts.ts|./resultsModel|type-only|features/results/resultsModel.ts",
   "features/results/resultsModel.test.ts|../../shared/trading/closedTrade|type-only|shared/trading/closedTrade.ts",
+  "features/results/resultsModel.test.ts|../../shared/trading/closedTradePage|value|shared/trading/closedTradePage.ts",
   "features/results/resultsModel.test.ts|./resultsModel|value|features/results/resultsModel.ts",
   "features/results/resultsModel.ts|../../shared/format/decimal|value|shared/format/decimal.ts",
   "features/results/resultsModel.ts|../../shared/time/utc|value|shared/time/utc.ts",
-  "features/results/resultsModel.ts|../../shared/trading/closedTrade|type-only|shared/trading/closedTrade.ts",
+  "features/results/resultsModel.ts|../../shared/trading/closedTradePage|type-only|shared/trading/closedTradePage.ts",
+  "features/results/resultsModel.ts|../../shared/trading/closedTradePage|type-only|shared/trading/closedTradePage.ts",
+  "features/results/resultsModel.ts|../../shared/trading/closedTradePage|value|shared/trading/closedTradePage.ts",
   "features/results/useTradePagination.test.ts|./demo|value|features/results/demo.ts",
   "features/results/useTradePagination.test.ts|./resultsModel|type-only|features/results/resultsModel.ts",
   "features/results/useTradePagination.test.ts|./useTradePagination|value|features/results/useTradePagination.ts",
@@ -472,7 +476,8 @@ const expectedRelativeImportLedger = [
   "shared/theme.test.ts|./theme|value|shared/theme.ts",
   "shared/time/presentation.test.ts|./presentation|value|shared/time/presentation.ts",
   "shared/time/presentation.ts|./utc|value|shared/time/utc.ts",
-  "shared/time/utc.test.ts|./utc|value|shared/time/utc.ts"
+  "shared/time/utc.test.ts|./utc|value|shared/time/utc.ts",
+  "shared/trading/closedTradePage.ts|./closedTrade|type-only|shared/trading/closedTrade.ts"
 ] as const;
 
 const expectedPolicyGlobalLedger = [
@@ -2181,6 +2186,12 @@ describe("frontend architecture ratchet", () => {
       "shared/trading/closedTrade.ts"
     ),
     architectureEdge(
+      "shared/trading/closedTradePage.ts",
+      "./closedTrade",
+      "shared/trading/closedTrade.ts",
+      "type-only"
+    ),
+    architectureEdge(
       "shared/i18n.ts",
       "./locales/en",
       "shared/locales/en.ts"
@@ -2229,6 +2240,12 @@ describe("frontend architecture ratchet", () => {
     architectureEdge("shared/charts/EChart.tsx", "../../features/research/gaDomain", "features/research/gaDomain.ts"),
     architectureEdge("shared/charts/EChart.tsx", "../theme", "shared/theme.ts"),
     architectureEdge("shared/format/decimal.ts", "../../features/results/resultsModel", "features/results/resultsModel.ts"),
+    architectureEdge("shared/format/decimal.ts", "react", "react"),
+    architectureEdge("shared/trading/closedTradePage.ts", "../../api", "api.ts"),
+    architectureEdge("shared/trading/closedTradePage.ts", "../../features/results/resultsModel", "features/results/resultsModel.ts"),
+    architectureEdge("shared/trading/closedTradePage.ts", "react", "react"),
+    architectureEdge("shared/trading/closedTradePage.ts", "../../api", "api.ts"),
+    architectureEdge("shared/trading/closedTradePage.ts", "../../features/results/resultsModel", "features/results/resultsModel.ts"),
     architectureEdge("shared/theme.ts", "./time/utc", "shared/time/utc.ts"),
     architectureEdge("shared/i18n.ts", "./theme", "shared/theme.ts"),
     architectureEdge("features/results/resultsModel.test.ts", "../trades/tradeModel", "features/trades/tradeModel.ts"),

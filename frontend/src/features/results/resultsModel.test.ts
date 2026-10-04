@@ -2,6 +2,11 @@ import { describe, expect, it } from "vitest";
 
 import type { ClosedTrade } from "../../shared/trading/closedTrade";
 import {
+  mergeTradeItems as sharedMergeTradeItems,
+  validLoadedTradePage as sharedValidLoadedTradePage,
+  validTradePage as sharedValidTradePage
+} from "../../shared/trading/closedTradePage";
+import {
   mergeTradeItems,
   validDistributionBuckets,
   validLoadedTradePage,
@@ -28,6 +33,12 @@ const equitySample = {
 };
 
 describe("resultsModel", () => {
+  it("keeps Results compatibility exports owned by shared closed-trade paging", () => {
+    expect(mergeTradeItems).toBe(sharedMergeTradeItems);
+    expect(validLoadedTradePage).toBe(sharedValidLoadedTradePage);
+    expect(validTradePage).toBe(sharedValidTradePage);
+  });
+
   it("preserves an exact valid equity sequence by identity", () => {
     const samples = [
       equitySample,
