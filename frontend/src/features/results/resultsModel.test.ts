@@ -6,8 +6,10 @@ import {
   validLoadedTradePage as sharedValidLoadedTradePage,
   validTradePage as sharedValidTradePage
 } from "../../shared/trading/closedTradePage";
+import type { BacktestResultsIndexItem } from "../../api";
 import {
   mergeTradeItems,
+  projectBacktestResultsIndexItem,
   validDistributionBuckets,
   validLoadedTradePage,
   validTradePage,
@@ -32,6 +34,19 @@ const equitySample = {
   drawdown: "0.00"
 };
 
+const resultDigest = "1608d4e51f70afa1f3ba17bdfd588ea217686c71ee39615b3cc64486ed289bbd";
+const indexItem: BacktestResultsIndexItem = {
+  job_id: "job-c",
+  subject_id: "summary-strategy:v1",
+  dataset_id: "summary-dataset",
+  product_id: "RITHMIC:MNQ-CONTINUOUS",
+  timeframe: "1m",
+  started_at: "2026-01-01T00:00:00.000Z",
+  ended_at: "2026-01-01T00:01:00.000Z",
+  completed_at: "2026-01-01T00:02:00.000Z",
+  result_digest: resultDigest
+};
+
 describe("resultsModel", () => {
   it("keeps Results compatibility exports owned by shared closed-trade paging", () => {
     expect(mergeTradeItems).toBe(sharedMergeTradeItems);
@@ -50,6 +65,48 @@ describe("resultsModel", () => {
     ];
 
     expect(validateEquitySamples(samples)).toBe(samples);
+  });
+
+  it("projects an admissible index identity without changing timestamps or digest", () => {
+    expect(projectBacktestResultsIndexItem(indexItem)).toEqual({
+      jobId: "job-c",
+      subjectId: "summary-strategy:v1",
+      datasetId: "summary-dataset",
+      productId: "RITHMIC:MNQ-CONTINUOUS",
+      timeframe: "1m",
+      startedAt: indexItem.started_at,
+      endedAt: indexItem.ended_at,
+      completedAt: indexItem.completed_at,
+      resultDigest
+    });
+  });
+
+  it.each(["started_at", "ended_at", "completed_at"])(
+    "rejects an invalid index %s timestamp",
+    (field) => {
+      expect(projectBacktestResultsIndexItem({
+        ...indexItem,
+        [field]: "2026-02-30T00:00:00Z"
+      })).toBeNull();
+    }
+  );
+
+  it("rejects reversed index coverage and malformed result digests", () => {
+    expect(projectBacktestResultsIndexItem({
+      ...indexItem,
+      started_at: "2026-01-01T00:02:00.000Z"
+    })).toBeNull();
+    expect(projectBacktestResultsIndexItem({
+      ...indexItem,
+      result_digest: "not-a-digest"
+    })).toBeNull();
+  });
+
+  it("accepts a valid UTC timestamp at the Unix epoch", () => {
+    expect(projectBacktestResultsIndexItem({
+      ...indexItem,
+      started_at: "1970-01-01T00:00:00.000Z"
+    })).not.toBeNull();
   });
 
   it.each(["0x10", "1e2", "", "Infinity"])(
