@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 import sqlite3
 from contextlib import closing
@@ -17,6 +19,7 @@ from src.control_plane.ga_lifecycle import (
     GaJobStatus,
     GaJobStoreError,
     new_ga_job_record,
+    retry_ga_job_record,
     transition_ga_job,
 )
 from src.control_plane.models import JobRecord, JobStatus
@@ -65,6 +68,29 @@ class JobStore(Protocol):
         self, error: str = "control_plane_interrupted"
     ) -> list[GaJobRecord]: ...
 
+    def submit_ga_job_command(
+        self, *, actor: str, idempotency_key: str, request: Mapping[str, Any]
+    ) -> tuple[GaJobRecord, bool]: ...
+
+    def transition_ga_job_command(
+        self,
+        *,
+        actor: str,
+        idempotency_key: str,
+        job_id: str,
+        action: str,
+        expected_version: object,
+    ) -> tuple[GaJobRecord, bool]: ...
+
+    def retry_ga_job_command(
+        self,
+        *,
+        actor: str,
+        idempotency_key: str,
+        job_id: str,
+        expected_version: object,
+    ) -> tuple[GaJobRecord, bool]: ...
+
 
 class InMemoryJobStore:
     """Thread-safe in-memory job store for local control-plane operation."""
@@ -72,6 +98,7 @@ class InMemoryJobStore:
     def __init__(self) -> None:
         self._jobs: dict[str, JobRecord] = {}
         self._ga_jobs: dict[str, GaJobRecord] = {}
+        self._ga_command_receipts: dict[tuple[str, str], tuple[str, GaJobRecord]] = {}
         self._lock = Lock()
 
     def create(self, *, kind: str, request: BaseModel) -> JobRecord:
@@ -208,6 +235,94 @@ class InMemoryJobStore:
                     self._ga_jobs[job_id] = updated
                     interrupted.append(updated.detached_copy())
             return interrupted
+
+    def submit_ga_job_command(
+        self,
+        *,
+        actor: str,
+        idempotency_key: str,
+        request: Mapping[str, Any],
+    ) -> tuple[GaJobRecord, bool]:
+        actor, idempotency_key = _command_identity(actor, idempotency_key)
+        copied_request = _compiled_request_copy(request)
+        fingerprint = _command_fingerprint("submit", request=copied_request)
+        identity = (actor, idempotency_key)
+        with self._lock:
+            receipt = self._ga_command_receipts.get(identity)
+            if receipt is not None:
+                return _replay_or_conflict(receipt, fingerprint)
+            record = _new_submitted_ga_record(copied_request)
+            self._ga_jobs[record.id] = record.detached_copy()
+            self._ga_command_receipts[identity] = (
+                fingerprint,
+                record.detached_copy(),
+            )
+            return record.detached_copy(), False
+
+    def transition_ga_job_command(
+        self,
+        *,
+        actor: str,
+        idempotency_key: str,
+        job_id: str,
+        action: str,
+        expected_version: object,
+    ) -> tuple[GaJobRecord, bool]:
+        actor, idempotency_key = _command_identity(actor, idempotency_key)
+        if not isinstance(job_id, str) or not job_id.strip():
+            raise GaJobStoreError("validation_error")
+        if not isinstance(action, str) or action not in {"pause", "resume", "cancel"}:
+            raise GaJobStoreError("validation_error")
+        fingerprint = _command_fingerprint(
+            action, job_id=job_id, expected_version=expected_version
+        )
+        identity = (actor, idempotency_key)
+        with self._lock:
+            receipt = self._ga_command_receipts.get(identity)
+            if receipt is not None:
+                return _replay_or_conflict(receipt, fingerprint)
+            current = self._ga_jobs.get(job_id)
+            if current is None:
+                raise GaJobStoreError("ga_job_not_found")
+            updated = transition_ga_job(current, action, expected_version)
+            self._ga_jobs[job_id] = updated.detached_copy()
+            self._ga_command_receipts[identity] = (
+                fingerprint,
+                updated.detached_copy(),
+            )
+            return updated.detached_copy(), False
+
+    def retry_ga_job_command(
+        self,
+        *,
+        actor: str,
+        idempotency_key: str,
+        job_id: str,
+        expected_version: object,
+    ) -> tuple[GaJobRecord, bool]:
+        actor, idempotency_key = _command_identity(actor, idempotency_key)
+        if not isinstance(job_id, str) or not job_id.strip():
+            raise GaJobStoreError("validation_error")
+        fingerprint = _command_fingerprint(
+            "retry", job_id=job_id, expected_version=expected_version
+        )
+        identity = (actor, idempotency_key)
+        with self._lock:
+            receipt = self._ga_command_receipts.get(identity)
+            if receipt is not None:
+                return _replay_or_conflict(receipt, fingerprint)
+            current = self._ga_jobs.get(job_id)
+            if current is None:
+                raise GaJobStoreError("ga_job_not_found")
+            retried = retry_ga_job_record(
+                current, uuid4().hex, uuid4().hex, expected_version
+            )
+            self._ga_jobs[retried.id] = retried.detached_copy()
+            self._ga_command_receipts[identity] = (
+                fingerprint,
+                retried.detached_copy(),
+            )
+            return retried.detached_copy(), False
 
     def _update(self, job_id: str, **changes: Any) -> JobRecord:
         with self._lock:
@@ -384,6 +499,134 @@ class SqliteJobStore:
                 raise
         return interrupted
 
+    def submit_ga_job_command(
+        self,
+        *,
+        actor: str,
+        idempotency_key: str,
+        request: Mapping[str, Any],
+    ) -> tuple[GaJobRecord, bool]:
+        actor, idempotency_key = _command_identity(actor, idempotency_key)
+        copied_request = _compiled_request_copy(request)
+        return self._execute_ga_command(
+            actor,
+            idempotency_key,
+            "submit",
+            _command_fingerprint("submit", request=copied_request),
+            request=copied_request,
+        )
+
+    def transition_ga_job_command(
+        self,
+        *,
+        actor: str,
+        idempotency_key: str,
+        job_id: str,
+        action: str,
+        expected_version: object,
+    ) -> tuple[GaJobRecord, bool]:
+        actor, idempotency_key = _command_identity(actor, idempotency_key)
+        if not isinstance(job_id, str) or not job_id.strip():
+            raise GaJobStoreError("validation_error")
+        if not isinstance(action, str) or action not in {"pause", "resume", "cancel"}:
+            raise GaJobStoreError("validation_error")
+        return self._execute_ga_command(
+            actor,
+            idempotency_key,
+            action,
+            _command_fingerprint(
+                action, job_id=job_id, expected_version=expected_version
+            ),
+            job_id=job_id,
+            expected_version=expected_version,
+        )
+
+    def retry_ga_job_command(
+        self,
+        *,
+        actor: str,
+        idempotency_key: str,
+        job_id: str,
+        expected_version: object,
+    ) -> tuple[GaJobRecord, bool]:
+        actor, idempotency_key = _command_identity(actor, idempotency_key)
+        if not isinstance(job_id, str) or not job_id.strip():
+            raise GaJobStoreError("validation_error")
+        return self._execute_ga_command(
+            actor,
+            idempotency_key,
+            "retry",
+            _command_fingerprint(
+                "retry", job_id=job_id, expected_version=expected_version
+            ),
+            job_id=job_id,
+            expected_version=expected_version,
+        )
+
+    def _execute_ga_command(
+        self,
+        actor: str,
+        idempotency_key: str,
+        operation: str,
+        fingerprint: str,
+        *,
+        request: dict[str, Any] | None = None,
+        job_id: str | None = None,
+        expected_version: object = None,
+    ) -> tuple[GaJobRecord, bool]:
+        with self._lock, closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT fingerprint, record_json FROM control_plane_ga_command_receipts "
+                    "WHERE actor = ? AND idempotency_key = ?",
+                    (actor, idempotency_key),
+                ).fetchone()
+                if row is not None:
+                    receipt = (
+                        row["fingerprint"],
+                        _ga_record_from_json(row["record_json"]),
+                    )
+                    record, replayed = _replay_or_conflict(receipt, fingerprint)
+                    conn.commit()
+                    return record, replayed
+
+                if operation == "submit":
+                    if request is None:
+                        raise GaJobStoreError("validation_error")
+                    record = _new_submitted_ga_record(request)
+                    _insert_ga_record(conn, record)
+                else:
+                    if job_id is None:
+                        raise GaJobStoreError("validation_error")
+                    row = conn.execute(
+                        f"SELECT {_GA_COLUMNS} FROM control_plane_jobs "
+                        "WHERE id = ? AND kind = 'ga'",
+                        (job_id,),
+                    ).fetchone()
+                    if row is None:
+                        raise GaJobStoreError("ga_job_not_found")
+                    current = _ga_row_to_record(row)
+                    if operation == "retry":
+                        record = retry_ga_job_record(
+                            current,
+                            uuid4().hex,
+                            uuid4().hex,
+                            expected_version,
+                        )
+                        _insert_ga_record(conn, record)
+                    else:
+                        record = transition_ga_job(current, operation, expected_version)
+                        _write_ga_record(conn, record, current.version)
+                _insert_ga_command_receipt(
+                    conn, actor, idempotency_key, fingerprint, record
+                )
+                conn.commit()
+                return record.detached_copy(), False
+            except Exception:
+                conn.rollback()
+                raise
+
     def mark_running(self, job_id: str) -> JobRecord:
         return self._update(
             job_id,
@@ -508,6 +751,17 @@ class SqliteJobStore:
                     conn.execute(
                         f"ALTER TABLE control_plane_jobs ADD COLUMN {name} {column_type}"
                     )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS control_plane_ga_command_receipts (
+                    actor TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    record_json TEXT NOT NULL,
+                    PRIMARY KEY (actor, idempotency_key)
+                )
+                """
+            )
             conn.commit()
 
     def _update(self, job_id: str, **changes: Any) -> JobRecord:
@@ -601,6 +855,167 @@ _GA_COLUMNS = (
     "id, status, request_json, error, ga_version, ga_epoch_id, "
     "ga_completed_generation, ga_checkpoint_generation, ga_retry_of_job_id"
 )
+
+
+def _command_identity(actor: str, idempotency_key: str) -> tuple[str, str]:
+    if not isinstance(actor, str) or not actor.strip():
+        raise GaJobStoreError("validation_error")
+    if (
+        not isinstance(idempotency_key, str)
+        or not 1 <= len(idempotency_key) <= 128
+        or any(not 33 <= ord(character) <= 126 for character in idempotency_key)
+    ):
+        raise GaJobStoreError("validation_error")
+    return actor, idempotency_key
+
+
+def _compiled_request_copy(request: Mapping[str, Any]) -> dict[str, Any]:
+    if not isinstance(request, Mapping):
+        raise GaJobStoreError("validation_error")
+    try:
+        copied = json.loads(
+            json.dumps(dict(request), allow_nan=False, separators=(",", ":"))
+        )
+    except (TypeError, ValueError):
+        raise GaJobStoreError("validation_error") from None
+    if not isinstance(copied, dict) or not isinstance(copied.get("evolution"), dict):
+        raise GaJobStoreError("validation_error")
+    return copied
+
+
+def _command_fingerprint(
+    operation: str,
+    *,
+    job_id: str | None = None,
+    expected_version: object = None,
+    request: dict[str, Any] | None = None,
+) -> str:
+    intent: dict[str, Any] = {"operation": operation}
+    if job_id is not None:
+        intent["job_id"] = job_id
+    if operation != "submit":
+        intent["expected_version"] = expected_version
+    if request is not None:
+        normalized = copy.deepcopy(request)
+        normalized["evolution"]["epoch_id"] = None
+        intent["request"] = normalized
+    try:
+        encoded = json.dumps(
+            intent,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError):
+        raise GaJobStoreError("validation_error") from None
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _replay_or_conflict(
+    receipt: tuple[str, GaJobRecord], fingerprint: str
+) -> tuple[GaJobRecord, bool]:
+    stored_fingerprint, record = receipt
+    if stored_fingerprint != fingerprint:
+        raise GaJobStoreError("idempotency_conflict")
+    return record.detached_copy(), True
+
+
+def _new_submitted_ga_record(request: Mapping[str, Any]) -> GaJobRecord:
+    epoch_id = uuid4().hex
+    bound_request = copy.deepcopy(dict(request))
+    bound_request["evolution"]["epoch_id"] = epoch_id
+    return new_ga_job_record(uuid4().hex, bound_request, epoch_id)
+
+
+def _insert_ga_record(conn: sqlite3.Connection, record: GaJobRecord) -> None:
+    now = _format_datetime(datetime.now(UTC))
+    conn.execute(
+        """
+        INSERT INTO control_plane_jobs (
+            id, kind, status, created_at, updated_at, request_json, error,
+            ga_version, ga_epoch_id, ga_completed_generation,
+            ga_checkpoint_generation, ga_retry_of_job_id
+        ) VALUES (?, 'ga', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            record.id,
+            record.status.value,
+            now,
+            now,
+            _dumps(record.request),
+            record.error,
+            record.version,
+            record.epoch_id,
+            record.completed_generation,
+            None
+            if record.checkpoint is None
+            else record.checkpoint.completed_generation,
+            record.retry_of_job_id,
+        ),
+    )
+
+
+def _ga_record_json(record: GaJobRecord) -> str:
+    return _dumps(
+        {
+            "id": record.id,
+            "status": record.status.value,
+            "version": record.version,
+            "request": record.request,
+            "epoch_id": record.epoch_id,
+            "completed_generation": record.completed_generation,
+            "checkpoint": (
+                None
+                if record.checkpoint is None
+                else {
+                    "epoch_id": record.checkpoint.epoch_id,
+                    "completed_generation": record.checkpoint.completed_generation,
+                }
+            ),
+            "retry_of_job_id": record.retry_of_job_id,
+            "error": record.error,
+        }
+    )
+
+
+def _ga_record_from_json(value: str) -> GaJobRecord:
+    data = json.loads(value)
+    checkpoint = data["checkpoint"]
+    return GaJobRecord(
+        id=data["id"],
+        status=GaJobStatus(data["status"]),
+        version=data["version"],
+        request=data["request"],
+        epoch_id=data["epoch_id"],
+        completed_generation=data["completed_generation"],
+        checkpoint=(
+            None
+            if checkpoint is None
+            else GaCheckpointReference(
+                checkpoint["epoch_id"], checkpoint["completed_generation"]
+            )
+        ),
+        retry_of_job_id=data["retry_of_job_id"],
+        error=data["error"],
+    )
+
+
+def _insert_ga_command_receipt(
+    conn: sqlite3.Connection,
+    actor: str,
+    idempotency_key: str,
+    fingerprint: str,
+    record: GaJobRecord,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO control_plane_ga_command_receipts (
+            actor, idempotency_key, fingerprint, record_json
+        ) VALUES (?, ?, ?, ?)
+        """,
+        (actor, idempotency_key, fingerprint, _ga_record_json(record)),
+    )
 
 
 def _ga_row_to_record(row: sqlite3.Row) -> GaJobRecord:

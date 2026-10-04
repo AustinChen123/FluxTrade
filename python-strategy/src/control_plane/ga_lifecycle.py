@@ -178,6 +178,31 @@ def transition_ga_job(
     raise GaJobStoreError("job_transition_invalid")
 
 
+def retry_ga_job_record(
+    current: GaJobRecord,
+    job_id: str,
+    epoch_id: str,
+    expected_version: object,
+) -> GaJobRecord:
+    """Create a fresh queued record from one admissible terminal source."""
+    if type(expected_version) is not int or expected_version < 1:
+        raise GaJobStoreError("validation_error")
+    if current.version != expected_version:
+        raise GaJobStoreError("job_version_conflict")
+    if current.status not in {
+        GaJobStatus.CANCELLED,
+        GaJobStatus.FAILED,
+        GaJobStatus.SUCCEEDED,
+    }:
+        raise GaJobStoreError("job_transition_invalid")
+    request = copy.deepcopy(current.request)
+    evolution = request.get("evolution")
+    if not isinstance(evolution, dict):
+        raise GaJobStoreError("validation_error")
+    evolution["epoch_id"] = epoch_id
+    return new_ga_job_record(job_id, request, epoch_id, current.id)
+
+
 def _validated_payload(
     action: str,
     expected_version: object,
