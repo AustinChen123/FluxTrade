@@ -39,10 +39,12 @@ async function sha256(value: unknown): Promise<string> {
 }
 
 describe("results demo fixture", () => {
-  it("preserves the complete deterministic payload digest", async () => {
-    expect(await sha256(demoBacktestSnapshot)).toBe(
+  it("preserves the original payload and labels legacy return units", async () => {
+    const { returnPctUnit: _unit, ...originalSnapshot } = demoBacktestSnapshot;
+    expect(await sha256(originalSnapshot)).toBe(
       "1608d4e51f70afa1f3ba17bdfd588ea217686c71ee39615b3cc64486ed289bbd"
     );
+    expect(demoBacktestSnapshot.returnPctUnit).toBe("percentage-points");
   });
 
   it("rejects non-JSON classes in the canonicalizer", () => {

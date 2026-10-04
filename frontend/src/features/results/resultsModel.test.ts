@@ -6,10 +6,16 @@ import {
   validLoadedTradePage as sharedValidLoadedTradePage,
   validTradePage as sharedValidTradePage
 } from "../../shared/trading/closedTradePage";
-import type { BacktestResultsIndexItem } from "../../api";
+import type {
+  BacktestResultsDetail,
+  BacktestResultsIndexItem,
+  BacktestResultsTradesPage
+} from "../../api";
 import {
   mergeTradeItems,
+  projectBacktestResultDetail,
   projectBacktestResultsIndexItem,
+  projectBacktestTradesPage,
   validDistributionBuckets,
   validLoadedTradePage,
   validTradePage,
@@ -47,6 +53,57 @@ const indexItem: BacktestResultsIndexItem = {
   result_digest: resultDigest
 };
 
+const detail: BacktestResultsDetail = {
+  job_id: "job-c",
+  strategy_id: "summary-strategy:v1",
+  subject_id: "summary-strategy:v1",
+  dataset_id: "summary-dataset",
+  product_id: "RITHMIC:MNQ-CONTINUOUS",
+  timeframe: "1m",
+  started_at: "2026-01-01T00:00:00.000Z",
+  ended_at: "2026-01-01T00:01:00.000Z",
+  currency: "USD",
+  metrics: {
+    net_pnl: "0.0000000000000000000001",
+    return_pct: "0.0000000000000000000001",
+    max_drawdown: "0",
+    sharpe: "0.25",
+    sortino: "0.5",
+    calmar: "1"
+  },
+  equity: [{
+    timestamp: "2026-01-01T00:00:00.000Z",
+    equity: "100000.0000000000000000000001",
+    drawdown: "0"
+  }],
+  monthly_returns: [{ month: "2026-01", return_pct: "0.0000000000000000000001" }],
+  pnl_distribution: [{ lower: null, upper: "0", count: 0 }],
+  trade_page: {
+    items: [{
+      id: "job-c:0",
+      entry_time: "2026-01-01T00:00:00.000Z",
+      exit_time: "2026-01-01T00:01:00.000Z",
+      entry_price: "1.000000000000000001",
+      exit_price: "1.000000000000000002",
+      side: "LONG",
+      quantity: "0.000000000000000001",
+      pnl: "0.0000000000000000000001",
+      fee: "0"
+    }],
+    total_count: 2,
+    next_cursor: "opaque.cursor"
+  },
+  input_digest: resultDigest,
+  result_digest: resultDigest,
+  revision: 1
+};
+
+const supplementalTrades: BacktestResultsTradesPage = {
+  items: detail.trade_page.items,
+  next_cursor: null,
+  revision: 1
+};
+
 describe("resultsModel", () => {
   it("keeps Results compatibility exports owned by shared closed-trade paging", () => {
     expect(mergeTradeItems).toBe(sharedMergeTradeItems);
@@ -79,6 +136,88 @@ describe("resultsModel", () => {
       completedAt: indexItem.completed_at,
       resultDigest
     });
+  });
+
+  it("projects persisted detail with raw ratio and exact financial strings", () => {
+    const snapshot = projectBacktestResultDetail(detail);
+    expect(snapshot).not.toBeNull();
+    expect(snapshot?.returnPctUnit).toBe("ratio");
+    expect(snapshot?.metrics).toEqual({
+      netPnl: detail.metrics.net_pnl,
+      returnPct: detail.metrics.return_pct,
+      maxDrawdown: detail.metrics.max_drawdown,
+      sharpe: detail.metrics.sharpe,
+      sortino: detail.metrics.sortino,
+      calmar: detail.metrics.calmar
+    });
+    expect(snapshot?.equity[0].equity).toBe(detail.equity[0].equity);
+    expect(snapshot?.monthlyReturns).toEqual([
+      { month: "2026-01", returnPct: detail.monthly_returns[0].return_pct }
+    ]);
+    expect(snapshot?.pnlDistribution).toEqual(detail.pnl_distribution);
+    expect(snapshot?.tradePage).toEqual({
+      items: [{
+        id: "job-c:0",
+        side: "LONG",
+        quantity: detail.trade_page.items[0].quantity,
+        entryTime: detail.trade_page.items[0].entry_time,
+        entryPrice: detail.trade_page.items[0].entry_price,
+        exitTime: detail.trade_page.items[0].exit_time,
+        exitPrice: detail.trade_page.items[0].exit_price,
+        fee: "0",
+        pnl: detail.trade_page.items[0].pnl
+      }],
+      totalCount: 2,
+      nextCursor: "opaque.cursor"
+    });
+  });
+
+  it("uses the detail count when projecting supplemental trade pages", () => {
+    expect(projectBacktestTradesPage(supplementalTrades, detail.trade_page.total_count))
+      .toEqual({
+        items: projectBacktestResultDetail(detail)?.tradePage.items,
+        totalCount: detail.trade_page.total_count,
+        nextCursor: null
+      });
+    expect(projectBacktestTradesPage(supplementalTrades, 0)).toBeNull();
+  });
+
+  it.each([
+    ["metric decimal", { metrics: { ...detail.metrics, net_pnl: "1e2" } }],
+    ["equity UTC", { equity: [{ ...detail.equity[0], timestamp: "2026-02-30T00:00:00Z" }] }],
+    ["equity decimal", { equity: [{ ...detail.equity[0], equity: "NaN" }] }],
+    ["month", { monthly_returns: [{ month: "2026-13", return_pct: "0" }] }],
+    ["monthly decimal", { monthly_returns: [{ month: "2026-01", return_pct: "Infinity" }] }],
+    ["distribution decimal", { pnl_distribution: [{ lower: "1e2", upper: null, count: 0 }] }],
+    ["distribution count", { pnl_distribution: [{ lower: null, upper: null, count: 0.5 }] }],
+    ["trade side", { trade_page: { ...detail.trade_page, items: [{ ...detail.trade_page.items[0], side: "buy" }] } }],
+    ["trade UTC", { trade_page: { ...detail.trade_page, items: [{ ...detail.trade_page.items[0], entry_time: "not-a-time" }] } }],
+    ["trade order", { trade_page: { ...detail.trade_page, items: [{ ...detail.trade_page.items[0], entry_time: "2026-01-01T00:02:00.000Z" }] } }],
+    ["trade decimal", { trade_page: { ...detail.trade_page, items: [{ ...detail.trade_page.items[0], pnl: "1e2" }] } }],
+    ["trade page", { trade_page: { ...detail.trade_page, total_count: 0 } }],
+    ["digest", { result_digest: "not-a-digest" }]
+  ] satisfies Array<[string, Partial<BacktestResultsDetail>]>) (
+    "rejects malformed persisted %s data",
+    (_name, change) => {
+      expect(projectBacktestResultDetail({ ...detail, ...change })).toBeNull();
+    }
+  );
+
+  it("rejects malformed supplemental trade rows", () => {
+    expect(projectBacktestTradesPage({
+      ...supplementalTrades,
+      items: [{ ...supplementalTrades.items[0], side: "buy" }]
+    }, detail.trade_page.total_count)).toBeNull();
+  });
+
+  it("accepts exact decimal equity text even outside Number range", () => {
+    const value = `1${"0".repeat(400)}`;
+    const samples = [{ ...equitySample, equity: value }];
+    expect(validateEquitySamples(samples)).toBe(samples);
+    expect(projectBacktestResultDetail({
+      ...detail,
+      equity: [{ ...detail.equity[0], equity: value }]
+    })?.equity[0].equity).toBe(value);
   });
 
   it.each(["started_at", "ended_at", "completed_at"])(

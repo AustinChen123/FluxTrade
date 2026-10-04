@@ -1,6 +1,16 @@
-import type { BacktestResultsIndexItem } from "../../api";
-import { finiteDecimalNumber } from "../../shared/format/decimal";
-import type { TradePage } from "../../shared/trading/closedTradePage";
+import type {
+  BacktestResultsDetail,
+  BacktestResultsIndexItem,
+  BacktestResultsTrade,
+  BacktestResultsTradesPage
+} from "../../api";
+import { isDecimalString } from "../../shared/format/decimal";
+import type { ClosedTrade } from "../../shared/trading/closedTrade";
+import {
+  validLoadedTradePage,
+  validTradePage,
+  type TradePage
+} from "../../shared/trading/closedTradePage";
 import { parseUtcTimestamp } from "../../shared/time/utc";
 
 export {
@@ -20,6 +30,8 @@ export type MonthlyReturn = {
   month: string;
   returnPct: string;
 };
+
+export type ReturnPctUnit = "ratio" | "percentage-points";
 
 export type BacktestResultIndexItem = {
   jobId: string;
@@ -47,6 +59,7 @@ export type BacktestResultSnapshot = {
   startedAt: string;
   endedAt: string;
   currency: string;
+  returnPctUnit?: ReturnPctUnit;
   metrics: {
     netPnl: string | null;
     returnPct: string | null;
@@ -70,8 +83,8 @@ export function validateEquitySamples(
     if (
       timestamp === null ||
       timestamp <= previousTimestamp ||
-      finiteDecimalNumber(sample.equity) === null ||
-      finiteDecimalNumber(sample.drawdown) === null
+      !isDecimalString(sample.equity) ||
+      !isDecimalString(sample.drawdown)
     ) {
       return null;
     }
@@ -83,8 +96,10 @@ export function validateEquitySamples(
 export function validDistributionBuckets(
   buckets: DistributionBucket[]
 ): boolean {
-  return buckets.every(
-    (bucket) => Number.isSafeInteger(bucket.count) && bucket.count >= 0
+  return buckets.every((bucket) =>
+    Number.isSafeInteger(bucket.count) && bucket.count >= 0 &&
+    (bucket.lower === null || isDecimalString(bucket.lower)) &&
+    (bucket.upper === null || isDecimalString(bucket.upper))
   );
 }
 
@@ -115,5 +130,121 @@ export function projectBacktestResultsIndexItem(
     endedAt: item.ended_at,
     completedAt: item.completed_at,
     resultDigest: item.result_digest
+  };
+}
+
+function projectTrade(trade: BacktestResultsTrade): ClosedTrade | null {
+  const entryTime = parseUtcTimestamp(trade.entry_time);
+  const exitTime = parseUtcTimestamp(trade.exit_time);
+  if (
+    trade.id.length === 0 ||
+    (trade.side !== "LONG" && trade.side !== "SHORT") ||
+    entryTime === null || exitTime === null || entryTime > exitTime ||
+    !isDecimalString(trade.quantity) ||
+    !isDecimalString(trade.entry_price) ||
+    !isDecimalString(trade.exit_price) ||
+    !isDecimalString(trade.fee) ||
+    !isDecimalString(trade.pnl)
+  ) {
+    return null;
+  }
+  return {
+    id: trade.id,
+    side: trade.side,
+    quantity: trade.quantity,
+    entryTime: trade.entry_time,
+    entryPrice: trade.entry_price,
+    exitTime: trade.exit_time,
+    exitPrice: trade.exit_price,
+    fee: trade.fee,
+    pnl: trade.pnl
+  };
+}
+
+function projectTradePage(
+  items: BacktestResultsTrade[],
+  totalCount: number,
+  nextCursor: string | null,
+  loaded: boolean
+): TradePage | null {
+  const projected: ClosedTrade[] = [];
+  for (const item of items) {
+    const trade = projectTrade(item);
+    if (trade === null) return null;
+    projected.push(trade);
+  }
+  const page = { items: projected, totalCount, nextCursor };
+  return (loaded ? validLoadedTradePage(page) : validTradePage(page))
+    ? page
+    : null;
+}
+
+export function projectBacktestTradesPage(
+  page: BacktestResultsTradesPage,
+  totalCount: number
+): TradePage | null {
+  return projectTradePage(page.items, totalCount, page.next_cursor, false);
+}
+
+export function projectBacktestResultDetail(
+  detail: BacktestResultsDetail
+): BacktestResultSnapshot | null {
+  const startedAt = parseUtcTimestamp(detail.started_at);
+  const endedAt = parseUtcTimestamp(detail.ended_at);
+  const metrics = [
+    detail.metrics.net_pnl,
+    detail.metrics.return_pct,
+    detail.metrics.max_drawdown,
+    detail.metrics.sharpe,
+    detail.metrics.sortino,
+    detail.metrics.calmar
+  ];
+  const equity = validateEquitySamples(detail.equity);
+  const monthlyReturnsValid = detail.monthly_returns.every((month) =>
+    /^\d{4}-(?:0[1-9]|1[0-2])$/.test(month.month) &&
+    isDecimalString(month.return_pct)
+  );
+  const distribution = detail.pnl_distribution.map(({ lower, upper, count }) => ({
+    lower, upper, count
+  }));
+  const tradePage = projectTradePage(
+    detail.trade_page.items,
+    detail.trade_page.total_count,
+    detail.trade_page.next_cursor,
+    true
+  );
+  if (
+    startedAt === null || endedAt === null || startedAt > endedAt ||
+    !metrics.every(isDecimalString) || equity === null ||
+    !monthlyReturnsValid || !validDistributionBuckets(distribution) ||
+    !validDigest(detail.input_digest) || !validDigest(detail.result_digest) ||
+    tradePage === null
+  ) {
+    return null;
+  }
+  return {
+    jobId: detail.job_id,
+    strategyId: detail.strategy_id,
+    productId: detail.product_id,
+    timeframe: detail.timeframe,
+    startedAt: detail.started_at,
+    endedAt: detail.ended_at,
+    currency: detail.currency,
+    returnPctUnit: "ratio",
+    metrics: {
+      netPnl: detail.metrics.net_pnl,
+      returnPct: detail.metrics.return_pct,
+      maxDrawdown: detail.metrics.max_drawdown,
+      sharpe: detail.metrics.sharpe,
+      sortino: detail.metrics.sortino,
+      calmar: detail.metrics.calmar
+    },
+    equity,
+    monthlyReturns: detail.monthly_returns.map(({ month, return_pct }) => ({
+      month,
+      returnPct: return_pct
+    })),
+    pnlDistribution: distribution,
+    tradePage
   };
 }

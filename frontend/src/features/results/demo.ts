@@ -63,6 +63,7 @@ export const demoBacktestSnapshot: BacktestResultSnapshot = {
   startedAt: STARTED_AT,
   endedAt: "2026-07-28T20:25:00.000Z",
   currency: "USD",
+  returnPctUnit: "percentage-points",
   metrics: {
     netPnl: "-1.36",
     returnPct: "-0.00136",
