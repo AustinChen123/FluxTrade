@@ -1,5 +1,8 @@
-import { finiteDecimalNumber } from "../../shared/format/decimal";
-import type { BacktestResultsDetail } from "../../api";
+import { finiteDecimalNumber, isDecimalString } from "../../shared/format/decimal";
+import type {
+  BacktestResultsCandlesPage,
+  BacktestResultsDetail
+} from "../../api";
 import type { ClosedTrade } from "../../shared/trading/closedTrade";
 import { projectClosedTradePage } from "../../shared/trading/closedTradePage";
 import type { TradePage } from "../../shared/trading/closedTradePage";
@@ -118,6 +121,43 @@ export type TradeCandle = {
   close: string;
   volume: string;
 };
+
+function sameCandleValues(left: TradeCandle, right: TradeCandle): boolean {
+  return left.open === right.open && left.high === right.high &&
+    left.low === right.low && left.close === right.close &&
+    left.volume === right.volume;
+}
+
+export function projectBacktestCandlesPage(
+  page: BacktestResultsCandlesPage,
+  window: TradeCandleWindow
+): TradeCandle[] | null {
+  if (
+    !Number.isSafeInteger(window.start) || !Number.isSafeInteger(window.end) ||
+    window.start < 0 || window.start >= window.end ||
+    window.end > MAX_UTC_MILLISECONDS
+  ) {
+    return null;
+  }
+  const projected: TradeCandle[] = [];
+  const candlesByInstant = new Map<number, TradeCandle>();
+  for (const candle of page.items) {
+    const timestamp = parseUtcTimestamp(candle.timestamp);
+    if (
+      timestamp === null || timestamp < window.start || timestamp >= window.end ||
+      !isDecimalString(candle.open) || !isDecimalString(candle.high) ||
+      !isDecimalString(candle.low) || !isDecimalString(candle.close) ||
+      !isDecimalString(candle.volume)
+    ) {
+      return null;
+    }
+    const existing = candlesByInstant.get(timestamp);
+    if (existing && !sameCandleValues(existing, candle)) return null;
+    candlesByInstant.set(timestamp, candle);
+    projected.push(candle);
+  }
+  return projected;
+}
 
 export type TradeChartSnapshot = {
   strategyId: string;

@@ -1,8 +1,12 @@
 import { describe, expect, it } from "vitest";
 
-import type { BacktestResultsDetail } from "../../api";
+import type {
+  BacktestResultsCandlesPage,
+  BacktestResultsDetail
+} from "../../api";
 import {
   buildTradeChartModel,
+  projectBacktestCandlesPage,
   projectBacktestTradeIdentity,
   tradeCandleWindow,
   tradeIdFromChartData,
@@ -53,6 +57,17 @@ type TradeDetailInput = Pick<
   "started_at" | "ended_at" | "trade_page"
 >;
 
+function candlePage(
+  items: BacktestResultsCandlesPage["items"]
+): BacktestResultsCandlesPage {
+  return { items, next_cursor: null, revision: 1 };
+}
+
+const candleWindow = {
+  start: Date.parse("2026-07-28T13:30:00.000Z"),
+  end: Date.parse("2026-07-28T13:35:00.000Z")
+};
+
 const wireTrade = {
   id: "job-1:0",
   entry_time: "2026-07-28T13:32:01.000Z",
@@ -84,6 +99,46 @@ function tradeDetail(overrides: Partial<TradeDetailInput> = {}): TradeDetailInpu
 }
 
 describe("trade chart model", () => {
+  it("keeps exact candle Decimal strings and preserves identical-duplicate quality handling", () => {
+    const candle = {
+      timestamp: "2026-07-28T13:30:00.000Z",
+      open: "19850.0000000000000000001",
+      high: "19852.0000000000000000002",
+      low: "19849.0000000000000000003",
+      close: "19851.0000000000000000004",
+      volume: "100.0000000000000000005"
+    };
+    const projected = projectBacktestCandlesPage(
+      candlePage([candle, { ...candle }]),
+      candleWindow
+    );
+    expect(projected).toEqual([candle, candle]);
+    const chart = buildTradeChartModel(snapshot({ candles: projected ?? [] }));
+    expect(chart.timestamps).toEqual([candle.timestamp]);
+    expect(chart.skippedCandles).toBe(1);
+  });
+
+  it("rejects malformed, conflicting duplicate, and out-of-window candle pages", () => {
+    const candle = {
+      timestamp: "2026-07-28T13:30:00.000Z",
+      open: "1", high: "2", low: "0", close: "1", volume: "3"
+    };
+    expect(projectBacktestCandlesPage(
+      candlePage([{ ...candle, close: "1e2" }]), candleWindow
+    )).toBeNull();
+    expect(projectBacktestCandlesPage(
+      candlePage([{ ...candle, timestamp: "2026-02-31T13:30:00.000Z" }]),
+      candleWindow
+    )).toBeNull();
+    expect(projectBacktestCandlesPage(
+      candlePage([{ ...candle, timestamp: "2026-07-28T13:35:00.000Z" }]),
+      candleWindow
+    )).toBeNull();
+    expect(projectBacktestCandlesPage(
+      candlePage([candle, { ...candle, close: "1.00" }]), candleWindow
+    )).toBeNull();
+  });
+
   it("projects only Trades metadata and preserves its exact quote and shared first page", () => {
     const metadata = projectBacktestTradeIdentity(tradeDetail());
 
