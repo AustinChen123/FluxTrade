@@ -15,6 +15,13 @@ import { demoBacktestSnapshot } from "./demo";
 import type { BacktestResultSnapshot } from "./resultsModel";
 
 const chartState = vi.hoisted(() => ({ option: null as unknown }));
+const resultsRead = vi.hoisted(() => ({
+  useBacktestResults: vi.fn()
+}));
+
+vi.mock("./useBacktestResults", () => ({
+  useBacktestResults: resultsRead.useBacktestResults
+}));
 
 vi.mock("../../shared/charts/EChart", () => ({
   EChart: ({
@@ -82,6 +89,15 @@ const zeroTradeSnapshot: BacktestResultSnapshot = {
 describe("BacktestResultsView", () => {
   beforeEach(async () => {
     await i18n.changeLanguage("zh-TW");
+    resultsRead.useBacktestResults.mockReturnValue({
+      state: { status: "unavailable", selection: null },
+      loadMoreIndex: vi.fn().mockResolvedValue(undefined),
+      loadMoreTrades: vi.fn().mockResolvedValue({
+        items: [],
+        totalCount: 0,
+        nextCursor: null
+      })
+    });
   });
 
   afterEach(() => {
@@ -101,6 +117,10 @@ describe("BacktestResultsView", () => {
     expect(
       screen.getByLabelText("回測權益曲線與同步回撤圖")
     ).toBeTruthy();
+    expect(resultsRead.useBacktestResults).toHaveBeenCalledWith({
+      selectedResultId: null,
+      enabled: false
+    });
     expect(screen.getByText("job-research-0042")).toBeTruthy();
     expect(screen.getByText(/1\.36/)).toBeTruthy();
     expect(screen.getAllByRole("button", { name: "查看 K 線" })).toHaveLength(
@@ -125,6 +145,190 @@ describe("BacktestResultsView", () => {
       "trade-000184",
       "job-research-0042"
     );
+  });
+
+  it("loads the explicit index and sends the chosen result ID to the shell", () => {
+    const onSelectResult = vi.fn();
+    resultsRead.useBacktestResults.mockReturnValue({
+      state: {
+        status: "index",
+        selection: null,
+        nextCursor: "signed-index-cursor",
+        items: [{
+          jobId: "job-index-0042",
+          subjectId: "subject-42",
+          datasetId: "dataset-42",
+          productId: "CME:MNQ-CONTINUOUS",
+          timeframe: "5m",
+          startedAt: "2026-01-01T00:00:00.000Z",
+          endedAt: "2026-01-31T23:59:59.000Z",
+          completedAt: "2026-02-01T00:00:00.000Z",
+          resultDigest: "a".repeat(64)
+        }]
+      },
+      loadMoreIndex: vi.fn().mockResolvedValue(undefined),
+      loadMoreTrades: vi.fn()
+    });
+
+    render(
+      <BacktestResultsView
+        demoMode={false}
+        theme="light"
+        selectedResultId={null}
+        onSelectResult={onSelectResult}
+      />
+    );
+
+    expect(resultsRead.useBacktestResults).toHaveBeenCalledWith({
+      selectedResultId: null,
+      enabled: true
+    });
+    fireEvent.click(screen.getByRole("button", { name: /job-index-0042/ }));
+    expect(onSelectResult).toHaveBeenCalledWith("job-index-0042");
+  });
+
+  it("uses the single shared pager with the selected result cursor", async () => {
+    const loadMoreTrades = vi.fn().mockResolvedValue({
+      items: [demoTrades[1]],
+      totalCount: 2,
+      nextCursor: null
+    });
+    const snapshot = {
+      ...zeroTradeSnapshot,
+      jobId: "job-detail-0042",
+      tradePage: {
+        items: [demoTrades[0]],
+        totalCount: 2,
+        nextCursor: "signed-trade-cursor"
+      }
+    };
+    resultsRead.useBacktestResults.mockReturnValue({
+      state: {
+        status: "detail",
+        selection: snapshot.jobId,
+        resultId: snapshot.jobId,
+        snapshot
+      },
+      loadMoreIndex: vi.fn(),
+      loadMoreTrades
+    });
+    render(
+      <BacktestResultsView
+        demoMode={false}
+        theme="light"
+        selectedResultId={snapshot.jobId}
+      />
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "載入更多交易" }));
+    await waitFor(() => expect(loadMoreTrades).toHaveBeenCalledWith("signed-trade-cursor"));
+    await waitFor(() =>
+      expect(
+        document.querySelectorAll(".results-trades tbody tr")
+      ).toHaveLength(2)
+    );
+  });
+
+  it("keeps the next index cursor opaque and invokes the existing hook pager", () => {
+    const loadMoreIndex = vi.fn().mockResolvedValue(undefined);
+    resultsRead.useBacktestResults.mockReturnValue({
+      state: { status: "index", selection: null, nextCursor: "signed.cursor", items: [] },
+      loadMoreIndex,
+      loadMoreTrades: vi.fn()
+    });
+    render(<BacktestResultsView demoMode={false} theme="light" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "載入更多結果" }));
+    expect(loadMoreIndex).toHaveBeenCalledOnce();
+  });
+
+  it("shows the pending state without rendering the development fixture", () => {
+    resultsRead.useBacktestResults.mockReturnValue({
+      state: { status: "pending", selection: "job-pending-0042" },
+      loadMoreIndex: vi.fn(),
+      loadMoreTrades: vi.fn()
+    });
+    render(
+      <BacktestResultsView
+        demoMode={false}
+        theme="light"
+        selectedResultId="job-pending-0042"
+      />
+    );
+
+    expect(screen.getByText("載入回測績效")).toBeTruthy();
+    expect(screen.queryByText("job-research-0042")).toBeNull();
+  });
+
+  it("shows an explicit empty state when the signed index has no results", () => {
+    resultsRead.useBacktestResults.mockReturnValue({
+      state: { status: "empty", selection: null, items: [] },
+      loadMoreIndex: vi.fn(),
+      loadMoreTrades: vi.fn()
+    });
+    render(<BacktestResultsView demoMode={false} theme="light" />);
+
+    expect(screen.getByText("目前沒有已完成的結果")).toBeTruthy();
+    expect(screen.queryByRole("table")).toBeNull();
+  });
+
+  it.each([
+    ["permission-unavailable", "目前工作階段沒有讀取權限"],
+    ["unavailable", "結果可能已不可用"],
+    ["error", "請返回結果清單，稍後再選擇結果"],
+    ["invalid-data", "這筆結果無法安全顯示"]
+  ] as const)("renders a fixed %s state without prior financial data", (status, message) => {
+    resultsRead.useBacktestResults.mockReturnValue({
+      state: { status, selection: "job-failed-0042" },
+      loadMoreIndex: vi.fn(),
+      loadMoreTrades: vi.fn()
+    });
+    render(
+      <BacktestResultsView
+        demoMode={false}
+        theme="light"
+        selectedResultId="job-failed-0042"
+        onSelectResult={vi.fn()}
+      />
+    );
+
+    expect(screen.getByRole("alert").textContent).toContain(message);
+    expect(screen.queryByText("9007199254740993.00")).toBeNull();
+    expect(screen.getByRole("button", { name: "選擇其他結果" })).toBeTruthy();
+  });
+
+  it("does not start production reads when an explicit snapshot is supplied", () => {
+    render(
+      <BacktestResultsView
+        demoMode={false}
+        theme="light"
+        selectedResultId="job-provided-0042"
+        snapshot={zeroTradeSnapshot}
+      />
+    );
+
+    expect(resultsRead.useBacktestResults).toHaveBeenCalledWith({
+      selectedResultId: "job-provided-0042",
+      enabled: false
+    });
+    expect(screen.getByText("job-empty")).toBeTruthy();
+  });
+
+  it("keeps explicit false loading flags compatible with development demo", () => {
+    render(
+      <BacktestResultsView
+        demoMode
+        theme="light"
+        loading={false}
+        loadError={false}
+      />
+    );
+
+    expect(screen.getByText("job-research-0042")).toBeTruthy();
+    expect(resultsRead.useBacktestResults).toHaveBeenCalledWith({
+      selectedResultId: null,
+      enabled: false
+    });
   });
 
   it("formats production raw ratios as percentages and preserves legacy points", () => {
@@ -161,6 +365,52 @@ describe("BacktestResultsView", () => {
       .toBe("1.36%");
     expect(ratio.container.querySelector(".monthly-grid strong")?.textContent)
       .toBe("1.36%");
+  });
+
+  it("keeps authoritative USDT money strings visible without currency coercion", () => {
+    const exactPnl = "12345678901234567890.123456789";
+    const exactDrawdown = "0.0000000000000000001";
+    const exactFee = "0.0000000000000000003";
+    const snapshot = {
+      ...zeroTradeSnapshot,
+      jobId: "job-usdt-0042",
+      currency: "USDT",
+      metrics: {
+        ...zeroTradeSnapshot.metrics,
+        netPnl: exactPnl,
+        maxDrawdown: exactDrawdown
+      },
+      tradePage: {
+        items: [{
+          ...demoTrades[0],
+          pnl: exactPnl,
+          fee: exactFee
+        }],
+        totalCount: 1,
+        nextCursor: null
+      }
+    };
+    resultsRead.useBacktestResults.mockReturnValue({
+      state: {
+        status: "detail",
+        selection: snapshot.jobId,
+        resultId: snapshot.jobId,
+        snapshot
+      },
+      loadMoreIndex: vi.fn(),
+      loadMoreTrades: vi.fn()
+    });
+    render(
+      <BacktestResultsView
+        demoMode={false}
+        theme="light"
+        selectedResultId={snapshot.jobId}
+      />
+    );
+
+    expect(screen.getAllByText(`${exactPnl} USDT`)).toHaveLength(2);
+    expect(screen.getByText(`${exactDrawdown} USDT`)).toBeTruthy();
+    expect(screen.getByText(`${exactFee} USDT`)).toBeTruthy();
   });
 
   it("uses the same internally consistent trades as candle inspection", () => {
@@ -678,20 +928,34 @@ describe("BacktestResultsView", () => {
   it("fails closed when production results are unavailable", () => {
     render(<BacktestResultsView demoMode={false} theme="dark" />);
 
-    expect(screen.getByText("尚未連接正式回測結果")).toBeTruthy();
+    expect(screen.getByText("回測結果清單暫時無法使用")).toBeTruthy();
     expect(screen.queryByLabelText("回測權益曲線與同步回撤圖")).toBeNull();
   });
 
   it("keeps loading, error, and zero-trade states explicit", () => {
+    resultsRead.useBacktestResults.mockReturnValue({
+      state: { status: "pending", selection: null },
+      loadMoreIndex: vi.fn(),
+      loadMoreTrades: vi.fn()
+    });
     const view = render(
       <BacktestResultsView demoMode={false} theme="light" loading />
     );
     expect(screen.getByText("載入回測績效")).toBeTruthy();
+    expect(resultsRead.useBacktestResults).toHaveBeenCalledWith({
+      selectedResultId: null,
+      enabled: false
+    });
+    expect(resultsRead.useBacktestResults).toHaveBeenCalledWith({
+      selectedResultId: null,
+      enabled: false
+    });
 
     view.rerender(
       <BacktestResultsView demoMode={false} theme="light" loadError />
     );
     expect(screen.getByText("回測結果未載入")).toBeTruthy();
+    expect(screen.queryByLabelText("回測權益曲線與同步回撤圖")).toBeNull();
 
     view.rerender(
       <BacktestResultsView

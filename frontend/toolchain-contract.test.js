@@ -79,7 +79,7 @@ const EXPECTED_NON_ZERO_COUNTS = {
 const EXPECTED_SCRIPTS = {
   dev: "vite",
   preview: "vite preview",
-  build: "tsc --noEmit && vite build",
+  build: "tsc --noEmit && vite build && node scripts/assert-results-demo-excluded.mjs",
   test: "vitest run",
   lint: "tsc --noEmit",
   "test:browser": "playwright test"

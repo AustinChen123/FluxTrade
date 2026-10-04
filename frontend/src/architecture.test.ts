@@ -397,6 +397,7 @@ const expectedRelativeImportLedger = [
   "features/results/BacktestResultsView.tsx|./demo|value|features/results/demo.ts",
   "features/results/BacktestResultsView.tsx|./resultsCharts|value|features/results/resultsCharts.ts",
   "features/results/BacktestResultsView.tsx|./resultsModel|value|features/results/resultsModel.ts",
+  "features/results/BacktestResultsView.tsx|./useBacktestResults|value|features/results/useBacktestResults.ts",
   "features/results/BacktestResultsView.tsx|./useTradePagination|value|features/results/useTradePagination.ts",
   "features/results/demo.test.ts|./demo|value|features/results/demo.ts",
   "features/results/demo.ts|../../shared/trading/closedTrade|type-only|shared/trading/closedTrade.ts",
@@ -506,6 +507,7 @@ const expectedPolicyGlobalLedger = [
   "app/App.tsx|window.location.href",
   "app/App.tsx|window.location.search",
   "features/research/FitnessSurface3D.tsx|window.devicePixelRatio",
+  "features/results/BacktestResultsView.tsx|import.meta.env.DEV",
   "features/strategies/useStrategyManager.ts|window.confirm()",
   "features/strategies/useStrategyManager.ts|window.confirm()",
   "features/strategies/useStrategyManager.ts|window.crypto.randomUUID()",
@@ -1660,6 +1662,10 @@ const allowedPolicyGlobals = new Map<string, ReadonlySet<string>>([
   [
     "features/research/FitnessSurface3D.tsx",
     new Set(["window.devicePixelRatio"])
+  ],
+  [
+    "features/results/BacktestResultsView.tsx",
+    new Set(["import.meta.env.DEV"])
   ]
 ]);
 
@@ -1681,6 +1687,54 @@ function assertImportMetaContract(
       node.keywordToken === SyntaxKind.ImportKeyword &&
       node.name.text === "meta"
   );
+  if (importer === "features/results/BacktestResultsView.tsx") {
+    if (metaUses.length !== 1) {
+      throw new Error("architecture Results requires one exact DEV demo guard");
+    }
+    const meta = metaUses[0];
+    const env = meta.parent;
+    const dev = env?.parent;
+    if (
+      !env ||
+      !isPropertyAccessExpression(env) ||
+      env.expression !== meta ||
+      env.questionDotToken ||
+      env.name.text !== "env" ||
+      !dev ||
+      !isPropertyAccessExpression(dev) ||
+      dev.expression !== env ||
+      dev.questionDotToken ||
+      dev.name.text !== "DEV"
+    ) {
+      throw new Error("architecture Results DEV chain denied");
+    }
+    const declaration = descendants(sourceFile).find(
+      (node) =>
+        isVariableDeclaration(node) &&
+        isIdentifier(node.name) &&
+        node.name.text === "useDemoSnapshot"
+    );
+    if (
+      !declaration ||
+      !isVariableDeclaration(declaration) ||
+      !declaration.initializer ||
+      !descendants(declaration.initializer).includes(meta) ||
+      declaration.initializer
+        .getText(sourceFile)
+        .replaceAll(/\s+/gu, "") !==
+        "import.meta.env.DEV===true&&!suppliedSnapshot&&loading!==true&&loadError!==true&&demoMode"
+    ) {
+      throw new Error("architecture Results demo guard changed");
+    }
+    let owner: Node | undefined = declaration.parent;
+    while (owner && !isFunctionDeclaration(owner)) {
+      owner = owner.parent;
+    }
+    if (!owner || owner.name?.text !== "BacktestResultsView") {
+      throw new Error("architecture Results DEV owner denied");
+    }
+    return;
+  }
   if (importer !== "app/App.tsx" && metaUses.length > 0) {
     throw new Error(`architecture import.meta denied: ${importer}`);
   }
@@ -2204,6 +2258,11 @@ describe("frontend architecture ratchet", () => {
       "features/results/resultsModel.ts"
     ),
     architectureEdge(
+      "features/results/BacktestResultsView.tsx",
+      "./useBacktestResults",
+      "features/results/useBacktestResults.ts"
+    ),
+    architectureEdge(
       "features/research/ResearchPage.tsx",
       "../../shared/charts/EChart",
       "shared/charts/EChart.tsx"
@@ -2469,7 +2528,7 @@ describe("frontend architecture ratchet", () => {
       /@charset|@import|url\(/
     );
     await expect(sha256(payload)).resolves.toBe(
-      "22720fa1639594fe3110447adb83239ef24bd4d262e344abbc474640146bc0a9"
+      "f8996fc38d9e3842b2395435e1538ea7ed1ce71eb6fbebde0be88b331c6b65a0"
     );
   });
 
@@ -2651,6 +2710,68 @@ describe("frontend architecture ratchet", () => {
         (fixture) => assertImportMetaContract(fixture, "app/App.tsx")
       )
     ).not.toThrow();
+  });
+
+  it("accepts only the exact Results DEV demo guard", () => {
+    expect(() =>
+      withCompilerFixture(
+        [
+          "export function BacktestResultsView() {",
+          "  const suppliedSnapshot = false;",
+          "  const loading: boolean | undefined = undefined;",
+          "  const loadError: boolean | undefined = undefined;",
+          "  const demoMode = true;",
+          "  const useDemoSnapshot = import.meta.env.DEV === true && !suppliedSnapshot && loading !== true && loadError !== true && demoMode;",
+          "  return useDemoSnapshot;",
+          "}"
+        ].join("\n"),
+        (fixture) =>
+          assertImportMetaContract(
+            fixture,
+            "features/results/BacktestResultsView.tsx"
+          ),
+        ".tsx"
+      )
+    ).not.toThrow();
+  });
+
+  it.each([
+    [
+      "altered guard",
+      "import.meta.env.DEV !== true && !suppliedSnapshot && loading !== true && loadError !== true && demoMode",
+      "BacktestResultsView"
+    ],
+    [
+      "missing DEV guard",
+      "!suppliedSnapshot && loading !== true && loadError !== true && demoMode",
+      "BacktestResultsView"
+    ],
+    [
+      "wrong owner",
+      "import.meta.env.DEV === true && !suppliedSnapshot && loading !== true && loadError !== true && demoMode",
+      "OtherResultsView"
+    ]
+  ])("rejects Results DEV guard mutant %s", (_name, guard, owner) => {
+    expect(() =>
+      withCompilerFixture(
+        [
+          `export function ${owner}() {`,
+          "  const suppliedSnapshot = false;",
+          "  const loading: boolean | undefined = undefined;",
+          "  const loadError: boolean | undefined = undefined;",
+          "  const demoMode = true;",
+          `  const useDemoSnapshot = ${guard};`,
+          "  return useDemoSnapshot;",
+          "}"
+        ].join("\n"),
+        (fixture) =>
+          assertImportMetaContract(
+            fixture,
+            "features/results/BacktestResultsView.tsx"
+          ),
+        ".tsx"
+      )
+    ).toThrow("architecture Results");
   });
 
   it.each([

@@ -47,6 +47,50 @@
   white-space: nowrap;
 }
 
+.results-index-list {
+  display: grid;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.results-index-list li {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 14px;
+  min-width: 0;
+  padding: 13px 16px;
+  border-top: 1px solid var(--grid);
+}
+
+.results-index-identity,
+.results-index-period {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.results-index-identity strong,
+.results-index-period span {
+  overflow-wrap: anywhere;
+  font-family: "SFMono-Regular", "Roboto Mono", monospace;
+  font-size: 0.78rem;
+}
+
+.results-index-identity span,
+.results-index-period time {
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
+.results-index-list button,
+.results-selection-action {
+  min-height: 40px;
+  padding: 0 12px;
+  cursor: pointer;
+}
+
 .results-metrics {
   display: grid;
   grid-template-columns: 1.35fr repeat(5, minmax(0, 1fr));

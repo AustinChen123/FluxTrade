@@ -201,6 +201,10 @@ export function App() {
           <BacktestResultsView
             demoMode={demoMode}
             theme={theme}
+            selectedResultId={selectedResultId}
+            onSelectResult={(resultId) => {
+              chooseView("results", null, resultId);
+            }}
             onInspectTrade={(tradeId, resultId) => {
               chooseView("trades", tradeId, resultId);
             }}

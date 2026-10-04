@@ -21,6 +21,7 @@ import {
   type DistributionBucket,
   type TradePage
 } from "./resultsModel";
+import { useBacktestResults } from "./useBacktestResults";
 import { useTradePagination } from "./useTradePagination";
 
 type Props = {
@@ -29,6 +30,8 @@ type Props = {
   snapshot?: BacktestResultSnapshot | null;
   loading?: boolean;
   loadError?: boolean;
+  selectedResultId?: string | null;
+  onSelectResult?: (resultId: string | null) => void;
   onInspectTrade?: (tradeId: string, resultId: string) => void;
   onLoadMoreTrades?: (cursor: string) => Promise<TradePage>;
 };
@@ -72,15 +75,43 @@ export function BacktestResultsView({
   demoMode,
   theme,
   snapshot,
-  loading = false,
-  loadError = false,
+  loading,
+  loadError,
+  selectedResultId = null,
+  onSelectResult,
   onInspectTrade,
   onLoadMoreTrades
 }: Props) {
   const { t, i18n } = useTranslation();
   const locale: Locale = i18n.resolvedLanguage === "en" ? "en" : "zh-TW";
-  const data =
-    snapshot === undefined ? (demoMode ? demoBacktestSnapshot : null) : snapshot;
+  const suppliedSnapshot = snapshot !== undefined;
+  const suppliedReadState = loading !== undefined || loadError !== undefined;
+  const useDemoSnapshot =
+    import.meta.env.DEV === true &&
+    !suppliedSnapshot &&
+    loading !== true &&
+    loadError !== true &&
+    demoMode;
+  const resultsRead = useBacktestResults({
+    selectedResultId,
+    enabled: !suppliedSnapshot && !suppliedReadState && !useDemoSnapshot
+  });
+  const readState =
+    suppliedSnapshot || suppliedReadState || useDemoSnapshot
+      ? null
+      : resultsRead.state;
+  const data = suppliedSnapshot
+    ? snapshot
+    : useDemoSnapshot
+      ? demoBacktestSnapshot
+      : readState?.status === "detail"
+        ? readState.snapshot
+        : null;
+  const tradePageLoader =
+    onLoadMoreTrades ??
+    (!suppliedSnapshot && !suppliedReadState && !useDemoSnapshot && selectedResultId !== null
+      ? resultsRead.loadMoreTrades
+      : undefined);
   const {
     tradePage,
     tradePageLoading,
@@ -90,7 +121,7 @@ export function BacktestResultsView({
   } = useTradePagination({
     jobId: data?.jobId ?? null,
     initialPage: data?.tradePage ?? null,
-    onLoadMoreTrades
+    onLoadMoreTrades: tradePageLoader
   });
   const equity = useMemo(
     () => validateEquitySamples(data?.equity ?? []),
@@ -157,6 +188,14 @@ export function BacktestResultsView({
     // ECMA-402 preserves validated decimal strings; the ES2022 type only accepts numbers.
     return formatter.format(value as unknown as number);
   };
+  const formatMoney = (value: string | null) => {
+    if (readState?.status === "detail" && money === null) {
+      return isDecimalString(value)
+        ? `${value} ${readState.snapshot.currency}`
+        : "—";
+    }
+    return decimal(value, money);
+  };
   const percent = (
     value: string | null,
     unit: BacktestResultSnapshot["returnPctUnit"]
@@ -173,7 +212,7 @@ export function BacktestResultsView({
     return formatted === "—" ? formatted : `${formatted}%`;
   };
 
-  if (loading) {
+  if (loading === true || readState?.status === "pending") {
     return (
       <section className="results-console" aria-live="polite">
         <div className="empty-panel">{t("results.loading")}</div>
@@ -181,7 +220,7 @@ export function BacktestResultsView({
     );
   }
 
-  if (loadError) {
+  if (loadError === true) {
     return (
       <section className="results-console">
         <div className="error-panel" role="alert">
@@ -190,6 +229,143 @@ export function BacktestResultsView({
             <p>{t("results.loadErrorBody")}</p>
           </div>
         </div>
+      </section>
+    );
+  }
+
+  if (readState?.status === "unavailable" && readState.selection === null) {
+    return (
+      <section className="results-console">
+        <div className="results-intro">
+          <div>
+            <p className="panel-kicker">{t("results.kicker")}</p>
+            <h2>{t("results.title")}</h2>
+            <p>{t("results.body")}</p>
+          </div>
+        </div>
+        <div className="empty-panel">
+          <strong>{t("results.unavailableTitle")}</strong>
+          <p>{t("results.unavailableBody")}</p>
+        </div>
+      </section>
+    );
+  }
+
+  if (
+    readState?.status === "permission-unavailable" ||
+    readState?.status === "unavailable" ||
+    readState?.status === "error" ||
+    readState?.status === "invalid-data"
+  ) {
+    const message = {
+      "permission-unavailable": [
+        "results.permissionTitle",
+        "results.permissionBody"
+      ],
+      unavailable: ["results.resultUnavailableTitle", "results.resultUnavailableBody"],
+      error: ["results.readErrorTitle", "results.readErrorBody"],
+      "invalid-data": ["results.invalidDataTitle", "results.invalidDataBody"]
+    }[readState.status];
+    return (
+      <section className="results-console">
+        <div className="results-intro">
+          <div>
+            <p className="panel-kicker">{t("results.kicker")}</p>
+            <h2>{t("results.title")}</h2>
+            <p>{t("results.body")}</p>
+          </div>
+          {selectedResultId && onSelectResult && (
+            <button
+              type="button"
+              className="results-selection-action"
+              onClick={() => onSelectResult(null)}
+            >
+              {t("results.chooseAnother")}
+            </button>
+          )}
+        </div>
+        <div className="error-panel" role="alert">
+          <div>
+            <strong>{t(message[0])}</strong>
+            <p>{t(message[1])}</p>
+          </div>
+        </div>
+      </section>
+    );
+  }
+
+  if (readState?.status === "empty") {
+    return (
+      <section className="results-console">
+        <div className="results-intro">
+          <div>
+            <p className="panel-kicker">{t("results.kicker")}</p>
+            <h2>{t("results.title")}</h2>
+            <p>{t("results.body")}</p>
+          </div>
+        </div>
+        <div className="empty-panel">
+          <strong>{t("results.noResultsTitle")}</strong>
+          <p>{t("results.noResultsBody")}</p>
+        </div>
+      </section>
+    );
+  }
+
+  if (readState?.status === "index") {
+    return (
+      <section className="results-console" data-testid="backtest-results-view">
+        <div className="results-intro">
+          <div>
+            <p className="panel-kicker">{t("results.kicker")}</p>
+            <h2>{t("results.title")}</h2>
+            <p>{t("results.body")}</p>
+          </div>
+        </div>
+        <article className="panel results-index">
+          <div className="panel-heading">
+            <div>
+              <p className="panel-kicker">{t("results.indexKicker")}</p>
+              <h2>{t("results.indexTitle")}</h2>
+            </div>
+            <span>{t("results.indexCount", { count: readState.items.length })}</span>
+          </div>
+          <ol className="results-index-list">
+            {readState.items.map((item) => (
+              <li key={item.jobId}>
+                <div className="results-index-identity">
+                  <strong>{item.jobId}</strong>
+                  <span>{item.productId} · {item.timeframe}</span>
+                </div>
+                <div className="results-index-period">
+                  <span>{item.subjectId}</span>
+                  <time dateTime={item.completedAt}>
+                    {t("results.completedAt", {
+                      value: formatPresentationTimestamp(item.completedAt, periodDate)
+                    })}
+                  </time>
+                </div>
+                {onSelectResult && (
+                  <button
+                    type="button"
+                    onClick={() => onSelectResult(item.jobId)}
+                    aria-label={t("results.selectResult", { jobId: item.jobId })}
+                  >
+                    {t("results.openResult")}
+                  </button>
+                )}
+              </li>
+            ))}
+          </ol>
+          {readState.nextCursor !== null && (
+            <div className="trade-page-controls">
+              <span>{t("results.moreResultsAvailable")}</span>
+              <button type="button" onClick={() => void resultsRead.loadMoreIndex()}>
+                {t("results.loadMoreResults")}
+              </button>
+            </div>
+          )}
+        </article>
       </section>
     );
   }
@@ -241,6 +417,15 @@ export function BacktestResultsView({
           <p className="panel-kicker">{t("results.kicker")}</p>
           <h2>{t("results.title")}</h2>
           <p>{t("results.body")}</p>
+          {selectedResultId && onSelectResult && (
+            <button
+              type="button"
+              className="results-selection-action"
+              onClick={() => onSelectResult(null)}
+            >
+              {t("results.chooseAnother")}
+            </button>
+          )}
         </div>
         <dl>
           <div>
@@ -268,12 +453,12 @@ export function BacktestResultsView({
       <div className="results-metrics" aria-label={t("results.metricsAria")}>
         <div className="metric-primary">
           <span>{t("results.netPnl")}</span>
-          <strong>{decimal(data.metrics.netPnl, money)}</strong>
+          <strong>{formatMoney(data.metrics.netPnl)}</strong>
           <small>{percent(data.metrics.returnPct, data.returnPctUnit)}</small>
         </div>
         <div>
           <span>{t("results.maxDrawdown")}</span>
-          <strong>{decimal(data.metrics.maxDrawdown, money)}</strong>
+          <strong>{formatMoney(data.metrics.maxDrawdown)}</strong>
         </div>
         <div>
           <span>{t("results.sharpe")}</span>
@@ -440,9 +625,9 @@ export function BacktestResultsView({
                           : undefined
                       }
                     >
-                      {decimal(trade.pnl, money)}
+                      {formatMoney(trade.pnl)}
                     </td>
-                    <td>{decimal(trade.fee, money)}</td>
+                    <td>{formatMoney(trade.fee)}</td>
                     <td>
                       <button
                         type="button"
@@ -470,7 +655,7 @@ export function BacktestResultsView({
               })}
             </span>
             {displayedTradePage.nextCursor !== null &&
-              (onLoadMoreTrades ? (
+              (tradePageLoader ? (
                 <button
                   type="button"
                   disabled={tradePageLoading}

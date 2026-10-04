@@ -157,9 +157,13 @@ vi.mock("../features/results/BacktestResultsView", async () => {
   return {
     BacktestResultsView: ({
       demoMode,
+      selectedResultId,
+      onSelectResult,
       onInspectTrade
     }: {
       demoMode: boolean;
+      selectedResultId?: string | null;
+      onSelectResult?: (resultId: string | null) => void;
       onInspectTrade?: (tradeId: string, resultId: string) => void;
     }) => {
       const [state, setState] = useState("initial");
@@ -170,7 +174,20 @@ vi.mock("../features/results/BacktestResultsView", async () => {
         };
       }, []);
       return (
-        <section data-demo={String(demoMode)} data-testid="backtest-results-view">
+        <section
+          data-demo={String(demoMode)}
+          data-selected-result={selectedResultId ?? ""}
+          data-testid="backtest-results-view"
+        >
+          <button
+            type="button"
+            onClick={() => onSelectResult?.("job-selected-0042")}
+          >
+            Select mock result
+          </button>
+          <button type="button" onClick={() => onSelectResult?.(null)}>
+            Choose another result
+          </button>
           <button
             type="button"
             onClick={() => onInspectTrade?.("trade-000184", "job-research-0042")}
@@ -267,6 +284,7 @@ describe("GA visualization state", () => {
 
   afterEach(() => {
     cleanup();
+    vi.restoreAllMocks();
   });
 
   it("uses browser language with a Traditional Chinese fallback", () => {
@@ -375,6 +393,9 @@ describe("GA visualization state", () => {
     render(<App />);
 
     expect(await screen.findByTestId("backtest-results-view")).toBeTruthy();
+    expect(
+      screen.getByTestId("backtest-results-view").getAttribute("data-selected-result")
+    ).toBe("");
     expect(api.ensureBrowserSession).not.toHaveBeenCalled();
     expect(api.loadEpochs).not.toHaveBeenCalled();
     expect(screen.queryByRole("combobox", { name: "演化批次" })).toBeNull();
@@ -384,6 +405,29 @@ describe("GA visualization state", () => {
     expect(new URL(window.location.href).searchParams.get("view")).toBe(
       "results"
     );
+  });
+
+  it("restores result selection from the URL and writes selection changes canonically", async () => {
+    window.history.replaceState({}, "", "/?view=results&result=job-direct-0042&keep=1");
+    const replaceState = vi.spyOn(window.history, "replaceState");
+    render(<App />);
+
+    const results = await screen.findByTestId("backtest-results-view");
+    expect(results.getAttribute("data-selected-result")).toBe("job-direct-0042");
+
+    fireEvent.click(screen.getByRole("button", { name: "Select mock result" }));
+    expect(new URL(window.location.href).searchParams.get("result")).toBe(
+      "job-selected-0042"
+    );
+    expect(replaceState).toHaveBeenCalledWith(
+      null,
+      "",
+      "/?view=results&result=job-selected-0042&keep=1"
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Choose another result" }));
+    expect(new URL(window.location.href).searchParams.has("result")).toBe(false);
+    expect(results.getAttribute("data-selected-result")).toBe("");
   });
 
   it("does not restore an invalid trade ID from the URL", async () => {
