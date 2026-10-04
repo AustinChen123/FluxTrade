@@ -31,6 +31,14 @@ from src.control_plane.browser_auth import (
 )
 from src.control_plane.gene_control import GeneControlService
 from src.control_plane.full_backtest_request import parse_backtest_request
+from src.control_plane.ga_http_contract import (
+    GA_PROFILE_ID,
+    GaHttpRequestError,
+    is_ga_read_path,
+    parse_ga_read_request,
+    project_ga_job,
+)
+from src.control_plane.ga_profile import get_golden_cross_profile
 from src.control_plane.models import (
     GenePromotionRequest,
     JobRecord,
@@ -164,13 +172,15 @@ class ControlPlaneApp:
         headers: Mapping[str, str] | None = None,
     ) -> HttpResponse:
         method = method.upper()
+        raw_target = path
         parsed_url = urlsplit(path)
         raw_path = parsed_url.path
         clean_path = parsed_url.path.rstrip("/") or "/"
         results_family = _is_backtest_results_path(raw_path)
+        ga_family = is_ga_read_path(raw_path)
         events_path = clean_path == "/api/v1/events"
         results_path = raw_path if results_family else clean_path
-        query = {} if results_family else parse_qs(parsed_url.query)
+        query = {} if results_family or ga_family else parse_qs(parsed_url.query)
 
         if method == "GET" and clean_path == "/health":
             return HttpResponse(200, {"status": "ok"})
@@ -194,6 +204,7 @@ class ControlPlaneApp:
         if isinstance(identity, HttpResponse):
             if (
                 results_family
+                or ga_family
                 or events_path
                 or clean_path
                 in {
@@ -215,8 +226,17 @@ class ControlPlaneApp:
             identity.browser_principal,
         )
         if browser_policy_response is not None:
-            if results_family or events_path or clean_path == "/ops/kill-switch":
-                return HttpResponse(browser_policy_response.status_code, browser_policy_response.body, headers=(("Cache-Control", "no-store"),))
+            if (
+                results_family
+                or ga_family
+                or events_path
+                or clean_path == "/ops/kill-switch"
+            ):
+                return HttpResponse(
+                    browser_policy_response.status_code,
+                    browser_policy_response.body,
+                    headers=(("Cache-Control", "no-store"),),
+                )
             return browser_policy_response
 
         if results_family:
@@ -226,6 +246,11 @@ class ControlPlaneApp:
                 parsed_url.query,
                 body,
                 identity,
+            )
+
+        if ga_family:
+            return self._handle_ga_read(
+                method, raw_path, parsed_url.query, body, identity, raw_target
             )
 
         if events_path:
@@ -1194,6 +1219,70 @@ class ControlPlaneApp:
             )
         return _results_response(200, result)
 
+    def _handle_ga_read(
+        self,
+        method: str,
+        path: str,
+        raw_query: str,
+        body: str | bytes | None,
+        identity: _RequestIdentity,
+        raw_target: str,
+    ) -> HttpResponse:
+        principal = identity.browser_principal
+        if (
+            principal is None
+            or self.browser_auth is None
+            or not principal.has_capability(self.browser_auth.operator_capability)
+        ):
+            return _ga_response(403, {"error": "forbidden"})
+        try:
+            request = parse_ga_read_request(
+                method, path, raw_query, body, raw_target=raw_target
+            )
+        except GaHttpRequestError:
+            return _ga_response(422, {"error": "validation_error"})
+        if request is None:
+            return _ga_response(404, {"error": "not_found"})
+
+        try:
+            if request.route == "profile":
+                if request.identity != GA_PROFILE_ID:
+                    return _ga_response(404, {"error": "ga_profile_not_found"})
+                return _ga_response(
+                    200,
+                    {"schema_version": 1, "profile": get_golden_cross_profile()},
+                )
+
+            store = self.backtest_executor.store
+            if request.route == "detail":
+                assert request.identity is not None
+                record = store.get_ga_job(request.identity)
+                if record is None:
+                    return _ga_response(404, {"error": "ga_job_not_found"})
+                return _ga_response(
+                    200, {"schema_version": 1, "job": project_ga_job(record)}
+                )
+
+            records = store.list_ga_jobs()
+            jobs = sorted(records, key=lambda record: record.id)
+            total_count = len(jobs)
+            items = [
+                project_ga_job(record)
+                for record in jobs[request.offset : request.offset + request.limit]
+            ]
+            return _ga_response(
+                200,
+                {
+                    "schema_version": 1,
+                    "items": items,
+                    "total_count": total_count,
+                    "limit": request.limit,
+                    "offset": request.offset,
+                },
+            )
+        except Exception:
+            return _ga_response(503, {"error": "ga_backend_unavailable"})
+
     def _authorize(
         self,
         headers: Mapping[str, str] | None,
@@ -1257,6 +1346,22 @@ def _results_response(status_code: int, body: Mapping[str, Any]) -> HttpResponse
     return HttpResponse(
         status_code, dict(body), headers=(("Cache-Control", "no-store"),)
     )
+
+
+def _ga_response(status_code: int, body: Mapping[str, Any]) -> HttpResponse:
+    response = HttpResponse(
+        status_code, dict(body), headers=(("Cache-Control", "no-store"),)
+    )
+    if status_code == 200:
+        try:
+            response.json()
+        except Exception:
+            return HttpResponse(
+                503,
+                {"error": "ga_backend_unavailable"},
+                headers=(("Cache-Control", "no-store"),),
+            )
+    return response
 
 
 def _extract_api_key(headers: Mapping[str, str] | None) -> str | None:
