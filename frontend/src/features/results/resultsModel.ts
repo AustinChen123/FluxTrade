@@ -1,12 +1,11 @@
 import type {
   BacktestResultsDetail,
   BacktestResultsIndexItem,
-  BacktestResultsTrade,
   BacktestResultsTradesPage
 } from "../../api";
 import { isDecimalString } from "../../shared/format/decimal";
-import type { ClosedTrade } from "../../shared/trading/closedTrade";
 import {
+  projectClosedTradePage,
   validLoadedTradePage,
   validTradePage,
   type TradePage
@@ -133,57 +132,11 @@ export function projectBacktestResultsIndexItem(
   };
 }
 
-function projectTrade(trade: BacktestResultsTrade): ClosedTrade | null {
-  const entryTime = parseUtcTimestamp(trade.entry_time);
-  const exitTime = parseUtcTimestamp(trade.exit_time);
-  if (
-    trade.id.length === 0 ||
-    (trade.side !== "LONG" && trade.side !== "SHORT") ||
-    entryTime === null || exitTime === null || entryTime > exitTime ||
-    !isDecimalString(trade.quantity) ||
-    !isDecimalString(trade.entry_price) ||
-    !isDecimalString(trade.exit_price) ||
-    !isDecimalString(trade.fee) ||
-    !isDecimalString(trade.pnl)
-  ) {
-    return null;
-  }
-  return {
-    id: trade.id,
-    side: trade.side,
-    quantity: trade.quantity,
-    entryTime: trade.entry_time,
-    entryPrice: trade.entry_price,
-    exitTime: trade.exit_time,
-    exitPrice: trade.exit_price,
-    fee: trade.fee,
-    pnl: trade.pnl
-  };
-}
-
-function projectTradePage(
-  items: BacktestResultsTrade[],
-  totalCount: number,
-  nextCursor: string | null,
-  loaded: boolean
-): TradePage | null {
-  const projected: ClosedTrade[] = [];
-  for (const item of items) {
-    const trade = projectTrade(item);
-    if (trade === null) return null;
-    projected.push(trade);
-  }
-  const page = { items: projected, totalCount, nextCursor };
-  return (loaded ? validLoadedTradePage(page) : validTradePage(page))
-    ? page
-    : null;
-}
-
 export function projectBacktestTradesPage(
   page: BacktestResultsTradesPage,
   totalCount: number
 ): TradePage | null {
-  return projectTradePage(page.items, totalCount, page.next_cursor, false);
+  return projectClosedTradePage(page.items, totalCount, page.next_cursor, false);
 }
 
 export function projectBacktestResultDetail(
@@ -207,7 +160,7 @@ export function projectBacktestResultDetail(
   const distribution = detail.pnl_distribution.map(({ lower, upper, count }) => ({
     lower, upper, count
   }));
-  const tradePage = projectTradePage(
+  const tradePage = projectClosedTradePage(
     detail.trade_page.items,
     detail.trade_page.total_count,
     detail.trade_page.next_cursor,

@@ -416,7 +416,6 @@ const expectedRelativeImportLedger = [
   "features/results/resultsModel.ts|../../api|type-only|api.ts",
   "features/results/resultsModel.ts|../../shared/format/decimal|value|shared/format/decimal.ts",
   "features/results/resultsModel.ts|../../shared/time/utc|value|shared/time/utc.ts",
-  "features/results/resultsModel.ts|../../shared/trading/closedTrade|type-only|shared/trading/closedTrade.ts",
   "features/results/resultsModel.ts|../../shared/trading/closedTradePage|type-only|shared/trading/closedTradePage.ts",
   "features/results/resultsModel.ts|../../shared/trading/closedTradePage|value|shared/trading/closedTradePage.ts",
   "features/results/resultsModel.ts|../../shared/trading/closedTradePage|value|shared/trading/closedTradePage.ts",
@@ -495,6 +494,8 @@ const expectedRelativeImportLedger = [
   "shared/time/presentation.test.ts|./presentation|value|shared/time/presentation.ts",
   "shared/time/presentation.ts|./utc|value|shared/time/utc.ts",
   "shared/time/utc.test.ts|./utc|value|shared/time/utc.ts",
+  "shared/trading/closedTradePage.ts|../format/decimal|value|shared/format/decimal.ts",
+  "shared/trading/closedTradePage.ts|../time/utc|value|shared/time/utc.ts",
   "shared/trading/closedTradePage.ts|./closedTrade|type-only|shared/trading/closedTrade.ts",
   "shared/trading/useTradePagination.ts|./closedTradePage|value|shared/trading/closedTradePage.ts"
 ] as const;
@@ -2368,8 +2369,8 @@ describe("frontend architecture ratchet", () => {
     architectureEdge("shared/trading/useTradePagination.ts", "../../api", "api.ts"),
     architectureEdge("shared/trading/useTradePagination.ts", "../../features/results/resultsModel", "features/results/resultsModel.ts"),
     architectureEdge("shared/trading/useTradePagination.ts", "../../features/trades/tradeModel", "features/trades/tradeModel.ts"),
-    architectureEdge("shared/trading/closedTradePage.ts", "../../api", "api.ts"),
-    architectureEdge("shared/trading/closedTradePage.ts", "../../features/results/resultsModel", "features/results/resultsModel.ts"),
+    architectureEdge("shared/trading/closedTradePage.ts", "../../api", "api.ts", "type-only"),
+    architectureEdge("shared/trading/closedTradePage.ts", "../../features/results/resultsModel", "features/results/resultsModel.ts", "type-only"),
     architectureEdge("shared/theme.ts", "./time/utc", "shared/time/utc.ts"),
     architectureEdge("shared/i18n.ts", "./theme", "shared/theme.ts"),
     architectureEdge("features/results/resultsModel.test.ts", "../trades/tradeModel", "features/trades/tradeModel.ts"),

@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { ClosedTrade } from "../../shared/trading/closedTrade";
 import {
   mergeTradeItems as sharedMergeTradeItems,
+  projectClosedTradePage,
   validLoadedTradePage as sharedValidLoadedTradePage,
   validTradePage as sharedValidTradePage
 } from "../../shared/trading/closedTradePage";
@@ -180,6 +181,24 @@ describe("resultsModel", () => {
         nextCursor: null
       });
     expect(projectBacktestTradesPage(supplementalTrades, 0)).toBeNull();
+  });
+
+  it("keeps detail and supplemental projections on the shared wire mapper", () => {
+    expect(projectClosedTradePage(
+      detail.trade_page.items,
+      detail.trade_page.total_count,
+      detail.trade_page.next_cursor,
+      true
+    )).toEqual(projectBacktestResultDetail(detail)?.tradePage);
+    expect(projectClosedTradePage(
+      supplementalTrades.items,
+      detail.trade_page.total_count,
+      supplementalTrades.next_cursor,
+      false
+    )).toEqual(projectBacktestTradesPage(
+      supplementalTrades,
+      detail.trade_page.total_count
+    ));
   });
 
   it.each([
