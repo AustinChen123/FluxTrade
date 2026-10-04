@@ -51,21 +51,27 @@ const EXPECTED_CASES = {
   "berlin-presentation-time": ["research-api", "demo-features"]
 };
 const EXPECTED_NON_ZERO_COUNTS = {
+  "direct-navigation:production:results": { S: 1, RI: 1 },
   "direct-navigation:dev:strategies": { S: 2, T: 2 },
   "direct-navigation:production:strategies": { S: 1, T: 1 },
+  "direct-navigation:production:trades": { S: 2, RD: 1, RC: 1 },
   "research-cache:dev:main": { S: 4, E: 2, A: 1, a: 1, T: 2 },
   "research-cache:production:main": { S: 2, E: 1, A: 1, a: 1, T: 1 },
   "navigation-serialization:dev:main": { S: 2, T: 2 },
+  "demo-production-denied:production:results": { S: 1, RI: 1 },
+  "demo-production-denied:production:trades": { S: 2, RD: 1, RC: 1 },
   "strategy-command:dev:main": { S: 2, T: 3, C: 1 },
   "strategy-command:production:main": { S: 1, T: 2, C: 1 },
   "locale-theme-reload:dev:main": { S: 4, E: 4, A: 2, a: 2 },
   "locale-theme-reload:production:main": { S: 2, E: 2, A: 2, a: 2 },
   "lazy-chunk-inventory:dev:main": { S: 4, T: 4 },
-  "lazy-chunk-inventory:production:main": { S: 3, E: 1, A: 1, a: 1, T: 2 },
+  "lazy-chunk-inventory:production:main": { S: 5, E: 1, A: 1, a: 1, T: 2, RI: 2 },
   "responsive-overflow:dev:research": { S: 2, E: 2, A: 1, a: 1 },
   "responsive-overflow:production:research": { S: 1, E: 1, A: 1, a: 1 },
+  "responsive-overflow:production:results": { S: 1, RI: 1 },
   "responsive-overflow:dev:strategies": { S: 2, T: 2 },
   "responsive-overflow:production:strategies": { S: 1, T: 1 },
+  "responsive-overflow:production:trades": { S: 2, RD: 1, RC: 1 },
   "berlin-presentation-time:dev:research-api": {
     S: 2,
     E: 2,
@@ -403,11 +409,15 @@ export function validateToolchain(snapshot) {
         b: 0,
         T: 0,
         C: 0,
+        RI: 0,
+        RD: 0,
+        RT: 0,
+        RC: 0,
         ...(EXPECTED_NON_ZERO_COUNTS[key] ?? {})
       };
       if (
         !counts ||
-        !same(Object.keys(counts), ["S", "P", "E", "A", "B", "a", "b", "T", "C"]) ||
+        !same(Object.keys(counts), ["S", "P", "E", "A", "B", "a", "b", "T", "C", "RI", "RD", "RT", "RC"]) ||
         !same(counts, expectedCounts) ||
         Object.values(counts).some(
           (count) => !Number.isInteger(count) || count < 0

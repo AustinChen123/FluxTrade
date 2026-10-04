@@ -215,6 +215,7 @@ const expectedRootExecutableInventory = [
 const expectedOutsideImportLedger = [
   "e2e/console-smoke.e2e.ts|./fixtures|value|e2e/fixtures.ts",
   "e2e/console-smoke.e2e.ts|@playwright/test|value|@playwright/test",
+  "e2e/fixtures.ts|../src/api|type-only|src/api.ts",
   "playwright.config.ts|@playwright/test|value|@playwright/test",
   "toolchain-contract.test.js|./e2e/fixtures.ts|value|e2e/fixtures.ts",
   "toolchain-contract.test.js|./playwright.config.ts|value|playwright.config.ts",
@@ -1147,7 +1148,9 @@ const outsideEdgeKeysByRole: Partial<
     "node:path|value|node:path",
     "vitest|value|vitest"
   ]),
-  "e2e-fixture": new Set(),
+  "e2e-fixture": new Set([
+    "../src/api|type-only|src/api.ts"
+  ]),
   "e2e-test": new Set([
     "./fixtures|value|e2e/fixtures.ts",
     "@playwright/test|value|@playwright/test"
@@ -2163,11 +2166,14 @@ describe("frontend architecture ratchet", () => {
       "vite.config.ts",
       "playwright.config.ts",
       "toolchain-contract.test.js",
-      "e2e/console-smoke.e2e.ts"
+      "e2e/console-smoke.e2e.ts",
+      "e2e/fixtures.ts"
     ]) {
       const owned = edges.filter((edge) => edge.importer === importer);
       if (importer === "toolchain-contract.test.js") {
         expect(owned).toHaveLength(6);
+      } else if (importer === "e2e/fixtures.ts") {
+        expect(owned).toHaveLength(1);
       }
       for (const removed of owned) {
         expect(() =>
@@ -2195,6 +2201,8 @@ describe("frontend architecture ratchet", () => {
     architectureEdge("e2e/fixtures.ts", "node:fs", "node:fs"),
     architectureEdge("e2e/fixtures.ts", "nanoid", "nanoid"),
     architectureEdge("e2e/fixtures.ts", "./src/api", "src/api.ts"),
+    architectureEdge("e2e/fixtures.ts", "../src/api", "src/api.ts"),
+    architectureEdge("e2e/fixtures.ts", "../src/api", "api.ts", "type-only"),
     architectureEdge("e2e/console-smoke.e2e.ts", "vitest", "vitest"),
     architectureEdge("e2e/console-smoke.e2e.ts", "node:fs", "node:fs"),
     architectureEdge("e2e/console-smoke.e2e.ts", "nanoid", "nanoid"),

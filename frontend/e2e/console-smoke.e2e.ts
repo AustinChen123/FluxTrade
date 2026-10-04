@@ -13,6 +13,11 @@ import {
 import {
   BROWSER_LOCALE,
   BROWSER_NOW,
+  BACKTEST_CANDLES,
+  BACKTEST_RESULT_DETAIL,
+  BACKTEST_RESULT_ID,
+  BACKTEST_RESULT_INDEX,
+  BACKTEST_TRADE_ID,
   BROWSER_SESSION,
   BROWSER_TIME_ZONE,
   CASE_IDS,
@@ -52,7 +57,11 @@ const ZERO_COUNTS: MutableRouteCounts = {
   a: 0,
   b: 0,
   T: 0,
-  C: 0
+  C: 0,
+  RI: 0,
+  RD: 0,
+  RT: 0,
+  RC: 0
 };
 const PROJECT_VIEWPORTS = {
   "desktop-1440x900": { width: 1440, height: 900 },
@@ -219,6 +228,34 @@ async function installApiFixtures(
     if (method === "GET" && url.pathname === "/ops/kill-switch" && url.search === "") {
       await route.fulfill({ json: { state: "OK", redis_state: "OK", durable_state: "OK", listener_available: true } });
       return;
+    } else if (
+      method === "GET" &&
+      url.pathname === "/api/v1/backtest-results" &&
+      url.search === ""
+    ) {
+      routeId = "RI";
+      body = BACKTEST_RESULT_INDEX;
+    } else if (
+      method === "GET" &&
+      url.pathname === `/api/v1/backtest-results/${BACKTEST_RESULT_ID}` &&
+      url.search === ""
+    ) {
+      routeId = "RD";
+      body = BACKTEST_RESULT_DETAIL;
+    } else if (
+      method === "GET" &&
+      url.pathname === `/api/v1/backtest-results/${BACKTEST_RESULT_ID}/candles` &&
+      url.search === "?start=1768478400000&end=1768480200000"
+    ) {
+      routeId = "RC";
+      body = BACKTEST_CANDLES;
+    } else if (
+      method === "GET" &&
+      url.pathname === `/api/v1/backtest-results/${BACKTEST_RESULT_ID}/trades` &&
+      url.search === ""
+    ) {
+      routeId = "RT";
+      body = { items: [], next_cursor: null, revision: 1 };
     } else if (url.pathname === "/api/v1/auth/session" && url.search === "") {
       if (method === "GET") {
         routeId = "S";
@@ -490,13 +527,23 @@ async function exerciseScenario(
 
   if (triple.scenario === "direct-navigation") {
     const paths = {
-      results: "/?view=results&keep=1#anchor",
+      results: triple.server === "dev"
+        ? "/?view=results&demo=1&result=job-research-0042&keep=1#anchor"
+        : "/?view=results&keep=1#anchor",
       strategies: "/?view=strategies&keep=1#anchor",
-      trades: "/?view=trades&trade=trade-000184&keep=1#anchor"
+      trades: triple.server === "dev"
+        ? "/?view=trades&demo=1&result=job-research-0042&trade=trade-000184&keep=1#anchor"
+        : `/?view=trades&result=${BACKTEST_RESULT_ID}&trade=${encodeURIComponent(BACKTEST_TRADE_ID)}&keep=1#anchor`
     } as const;
     await open(paths[triple.caseId as keyof typeof paths]);
     if (triple.caseId === "strategies") {
       await waitForStrategy(page);
+    } else if (triple.caseId === "results" && triple.server === "dev") {
+      await expect(page.getByText("job-research-0042", { exact: true })).toBeVisible();
+    } else if (triple.caseId === "trades" && triple.server === "dev") {
+      await expect(page.getByText("trade-000184", { exact: true }).first()).toBeVisible();
+    } else if (triple.caseId === "trades" && triple.server === "production") {
+      await expect(page.getByText(BACKTEST_TRADE_ID, { exact: true }).first()).toBeVisible();
     } else {
       await expect(page.locator(".empty-panel")).toBeVisible();
     }
@@ -511,10 +558,16 @@ async function exerciseScenario(
     expect(new URL(page.url()).searchParams.get("keep")).toBe("1");
     expect(new URL(page.url()).hash).toBe("#anchor");
     expect(new URL(page.url()).searchParams.get("trade")).toBe(
-      triple.caseId === "trades" ? "trade-000184" : null
+      triple.caseId === "trades"
+        ? triple.server === "production" ? BACKTEST_TRADE_ID : "trade-000184"
+        : null
     );
-    if (triple.caseId === "trades") {
-      await expect(page.getByText("trade-000184")).toHaveCount(0);
+    if (triple.caseId === "results" && triple.server === "dev") {
+      expect(new URL(page.url()).searchParams.get("result")).toBe("job-research-0042");
+    } else if (triple.caseId === "trades") {
+      expect(new URL(page.url()).searchParams.get("result")).toBe(
+        triple.server === "production" ? BACKTEST_RESULT_ID : "job-research-0042"
+      );
     }
     return;
   }
@@ -548,16 +601,27 @@ async function exerciseScenario(
         return original(...args);
       };
     });
-    await open("/?view=results&demo=1&keep=1#anchor");
+    await open("/?view=results&demo=1&result=job-research-0042&keep=1#anchor");
+    expect(new URL(page.url()).searchParams.get("result")).toBe("job-research-0042");
+    expect(new URL(page.url()).searchParams.get("trade")).toBeNull();
     await page
       .getByRole("button", { name: /查看 K 線|Inspect candles/ })
       .first()
       .click();
     await expect.poll(() => new URL(page.url()).searchParams.get("view")).toBe("trades");
+    expect(new URL(page.url()).searchParams.get("result")).toBe("job-research-0042");
+    expect(new URL(page.url()).searchParams.get("trade")).toBe("trade-000184");
     await nav(page, 1).click();
+    await expect.poll(() => new URL(page.url()).searchParams.get("view")).toBe("results");
+    expect(new URL(page.url()).searchParams.get("result")).toBe("job-research-0042");
+    expect(new URL(page.url()).searchParams.get("trade")).toBeNull();
     await nav(page, 2).click();
     await waitForStrategy(page);
+    expect(new URL(page.url()).searchParams.get("result")).toBeNull();
+    expect(new URL(page.url()).searchParams.get("trade")).toBeNull();
     await nav(page, 0).click();
+    expect(new URL(page.url()).searchParams.get("result")).toBeNull();
+    expect(new URL(page.url()).searchParams.get("trade")).toBeNull();
     expect(
       await page.evaluate(
         () => (window as typeof window & { __replaceStateCount: number }).__replaceStateCount
@@ -571,7 +635,7 @@ async function exerciseScenario(
   }
 
   if (triple.scenario === "demo-dev") {
-    await open("/?view=results&demo=1");
+    await open("/?view=results&demo=1&result=job-research-0042");
     await expect(page.getByText("job-research-0042", { exact: true })).toBeVisible();
     await page
       .getByRole("button", { name: /查看 K 線|Inspect candles/ })
@@ -583,8 +647,14 @@ async function exerciseScenario(
   }
 
   if (triple.scenario === "demo-production-denied") {
-    await open(`/?view=${triple.caseId}&demo=1`);
-    await expect(page.locator(".empty-panel")).toBeVisible();
+    await open(triple.caseId === "results"
+      ? "/?view=results&demo=1"
+      : `/?view=trades&demo=1&result=${BACKTEST_RESULT_ID}&trade=${encodeURIComponent(BACKTEST_TRADE_ID)}`);
+    if (triple.caseId === "results") {
+      await expect(page.locator(".empty-panel")).toBeVisible();
+    } else {
+      await expect(page.getByText(BACKTEST_TRADE_ID, { exact: true }).first()).toBeVisible();
+    }
     await expect(page.getByText("job-research-0042")).toHaveCount(0);
     await expect(page.getByText("trade-000184")).toHaveCount(0);
     return;
@@ -686,7 +756,7 @@ async function exerciseScenario(
       return;
     }
 
-    await open("/?view=results&demo=1");
+    await open("/?view=results&demo=1&result=job-research-0042");
     await page.locator("#language").selectOption("en");
     await expect(page.getByText(/07\/28\/2026.*16:30.*GMT\+2/).first()).toBeVisible();
     await expect(page.getByText("Jul 2026", { exact: true })).toBeVisible();
@@ -714,9 +784,13 @@ async function exerciseScenario(
 
   const responsivePaths = {
     research: "/",
-    results: "/?view=results&demo=1",
+    results: triple.server === "dev"
+      ? "/?view=results&demo=1&result=job-research-0042"
+      : "/?view=results&demo=1",
     strategies: "/?view=strategies",
-    trades: "/?view=trades&demo=1&trade=trade-000184"
+    trades: triple.server === "dev"
+      ? "/?view=trades&demo=1&result=job-research-0042&trade=trade-000184"
+      : `/?view=trades&demo=1&result=${BACKTEST_RESULT_ID}&trade=${encodeURIComponent(BACKTEST_TRADE_ID)}`
   } as const;
   await open(responsivePaths[triple.caseId as keyof typeof responsivePaths]);
   if (triple.caseId === "research") {
@@ -724,9 +798,12 @@ async function exerciseScenario(
   } else if (triple.caseId === "strategies") {
     await waitForStrategy(page);
   } else if (triple.server === "production") {
-    await expect(page.locator(".empty-panel")).toBeVisible();
-    await expect(page.getByText("job-research-0042")).toHaveCount(0);
-    await expect(page.getByText("trade-000184")).toHaveCount(0);
+    if (triple.caseId === "results") {
+      await expect(page.locator(".empty-panel")).toBeVisible();
+      await expect(page.getByText("job-research-0042")).toHaveCount(0);
+    } else {
+      await expect(page.getByText(BACKTEST_TRADE_ID, { exact: true }).first()).toBeVisible();
+    }
   } else {
     if (triple.caseId === "results") {
       await expect(page.getByText("job-research-0042", { exact: true })).toBeVisible();
