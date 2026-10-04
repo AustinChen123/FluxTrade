@@ -11,6 +11,8 @@ import {
   clearKillSwitch,
   loadBacktestResultsIndex,
   loadBacktestResult,
+  loadBacktestResultTrades,
+  loadBacktestResultCandles,
   type BrowserSession,
   type StrategyState
 } from "./api";
@@ -352,6 +354,171 @@ describe("backtest results API", () => {
     await expect(loadBacktestResult("run/one")).rejects.toMatchObject({
       status: 200, message: "invalid_response"
     });
+  });
+
+  it("loads the supplemental trade page with its opaque cursor", async () => {
+    const payload = {
+      items: [resultDetail.trade_page.items[0]],
+      next_cursor: "opaque+/cursor=1",
+      revision: 1
+    };
+    const fetch = vi.fn().mockResolvedValue(response(200, payload));
+    vi.stubGlobal("fetch", fetch);
+    await expect(
+      loadBacktestResultTrades("job/one", { limit: 25, cursor: "opaque+/cursor=1" })
+    ).resolves.toEqual(payload);
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/v1/backtest-results/job%2Fone/trades?limit=25&cursor=opaque%2B%2Fcursor%3D1",
+      expect.objectContaining({ credentials: "include", cache: "no-store" })
+    );
+  });
+
+  it("loads a candle page for the exact requested half-open range", async () => {
+    const payload = {
+      items: [{
+        timestamp: "2026-01-01T00:00:00.000Z",
+        open: "12345678901234567890.000000000000000001",
+        high: "2", low: "3", close: "4", volume: "5"
+      }],
+      next_cursor: null,
+      revision: 1
+    };
+    const fetch = vi.fn().mockResolvedValue(response(200, payload));
+    vi.stubGlobal("fetch", fetch);
+    await expect(loadBacktestResultCandles("job/one", {
+      start: 1767225600000, end: 1767229200000, limit: 25, cursor: "opaque+/cursor=1"
+    })).resolves.toEqual(payload);
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/v1/backtest-results/job%2Fone/candles?start=1767225600000&end=1767229200000&limit=25&cursor=opaque%2B%2Fcursor%3D1",
+      expect.objectContaining({ credentials: "include", cache: "no-store" })
+    );
+  });
+
+  it.each([
+    ["trade id", "id"], ["trade entry time", "entry_time"],
+    ["trade exit time", "exit_time"], ["trade entry price", "entry_price"],
+    ["trade exit price", "exit_price"], ["trade side", "side"],
+    ["trade quantity", "quantity"], ["trade PnL", "pnl"], ["trade fee", "fee"]
+  ])("rejects a supplemental trade page with an invalid %s", async (_label, field) => {
+    const payload = {
+      items: [{ ...resultDetail.trade_page.items[0], [field]: null }],
+      next_cursor: null,
+      revision: 1
+    };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response(200, payload)));
+    await expect(loadBacktestResultTrades("job", {})).rejects.toThrow("invalid_response");
+  });
+
+  it.each([
+    "id", "entry_time", "exit_time", "entry_price", "exit_price",
+    "side", "quantity", "pnl", "fee"
+  ])("rejects a supplemental trade missing %s", async (field) => {
+    const item = Object.fromEntries(
+      Object.entries(resultDetail.trade_page.items[0]).filter(([key]) => key !== field)
+    );
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response(200, {
+      items: [item], next_cursor: null, revision: 1
+    })));
+    await expect(loadBacktestResultTrades("job", {})).rejects.toThrow("invalid_response");
+  });
+
+  it.each([
+    ["items", { items: null, next_cursor: null, revision: 1 }],
+    ["missing items", { next_cursor: null, revision: 1 }],
+    ["cursor", { items: [], next_cursor: 1, revision: 1 }],
+    ["missing cursor", { items: [], revision: 1 }],
+    ["revision", { items: [], next_cursor: null, revision: 2 }],
+    ["missing revision", { items: [], next_cursor: null }]
+  ])("rejects malformed supplemental trade page %s", async (_name, payload) => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response(200, payload)));
+    await expect(loadBacktestResultTrades("job", {})).rejects.toThrow("invalid_response");
+  });
+
+  it.each([
+    "timestamp", "open", "high", "low", "close", "volume"
+  ])("rejects a candle page with invalid %s", async (field) => {
+    const item = {
+      timestamp: "2026-01-01T00:00:00.000Z",
+      open: "1", high: "2", low: "3", close: "4", volume: "5"
+    };
+    const payload = {
+      items: [{ ...item, [field]: null }], next_cursor: null, revision: 1
+    };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response(200, payload)));
+    await expect(loadBacktestResultCandles("job", { start: 0, end: 1 }))
+      .rejects.toThrow("invalid_response");
+  });
+
+  it.each([
+    "timestamp", "open", "high", "low", "close", "volume"
+  ])("rejects a candle missing %s", async (field) => {
+    const candle = {
+      timestamp: "2026-01-01T00:00:00.000Z",
+      open: "1", high: "2", low: "3", close: "4", volume: "5"
+    };
+    const item = Object.fromEntries(
+      Object.entries(candle).filter(([key]) => key !== field)
+    );
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response(200, {
+      items: [item], next_cursor: null, revision: 1
+    })));
+    await expect(loadBacktestResultCandles("job", { start: 0, end: 1 }))
+      .rejects.toThrow("invalid_response");
+  });
+
+  it.each([
+    ["items", { items: null, next_cursor: null, revision: 1 }],
+    ["missing items", { next_cursor: null, revision: 1 }],
+    ["cursor", { items: [], next_cursor: 1, revision: 1 }],
+    ["missing cursor", { items: [], revision: 1 }],
+    ["revision", { items: [], next_cursor: null, revision: 2 }],
+    ["missing revision", { items: [], next_cursor: null }]
+  ])("rejects malformed candle page %s", async (_name, payload) => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response(200, payload)));
+    await expect(loadBacktestResultCandles("job", { start: 0, end: 1 }))
+      .rejects.toThrow("invalid_response");
+  });
+
+  it("accepts empty supplemental pages and preserves candle strings", async () => {
+    const empty = { items: [], next_cursor: null, revision: 1 };
+    const candle = {
+      timestamp: "2026-01-01T00:00:00.000Z",
+      open: "999999999999999999999999.000000000000000001",
+      high: "2", low: "3", close: "4", volume: "5"
+    };
+    const fetch = vi.fn()
+      .mockResolvedValueOnce(response(200, empty))
+      .mockResolvedValueOnce(response(200, { ...empty, items: [candle] }));
+    vi.stubGlobal("fetch", fetch);
+    await expect(loadBacktestResultTrades("job")).resolves.toEqual(empty);
+    await expect(loadBacktestResultCandles("job", { start: 0, end: 1 }))
+      .resolves.toEqual({ ...empty, items: [candle] });
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it("preserves a candle HTTP validation error and makes one request", async () => {
+    const fetch = vi.fn().mockResolvedValue(response(400, { error: "validation_error" }));
+    vi.stubGlobal("fetch", fetch);
+    await expect(loadBacktestResultCandles("job", { start: 2, end: 1 }))
+      .rejects.toMatchObject({ status: 400, message: "validation_error" });
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not retry a supplemental trade network failure", async () => {
+    const fetch = vi.fn().mockRejectedValue(new Error("network unavailable"));
+    vi.stubGlobal("fetch", fetch);
+    await expect(loadBacktestResultTrades("job")).rejects.toThrow("network unavailable");
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("sanitizes malformed candle JSON without retrying", async () => {
+    const fetch = vi.fn().mockResolvedValue({
+      ok: true, status: 200, statusText: "", json: async () => { throw new Error("private parser detail"); }
+    });
+    vi.stubGlobal("fetch", fetch);
+    await expect(loadBacktestResultCandles("job", { start: 0, end: 1 }))
+      .rejects.toMatchObject({ status: 200, message: "invalid_response" });
+    expect(fetch).toHaveBeenCalledTimes(1);
   });
 
   it.each([

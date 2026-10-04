@@ -110,6 +110,27 @@ export type BacktestResultsTrade = {
   fee: string;
 };
 
+export type BacktestResultsTradesPage = {
+  items: BacktestResultsTrade[];
+  next_cursor: string | null;
+  revision: 1;
+};
+
+export type BacktestResultsCandle = {
+  timestamp: string;
+  open: string;
+  high: string;
+  low: string;
+  close: string;
+  volume: string;
+};
+
+export type BacktestResultsCandlesPage = {
+  items: BacktestResultsCandle[];
+  next_cursor: string | null;
+  revision: 1;
+};
+
 export type BacktestResultsDetailMetrics = {
   net_pnl: string;
   return_pct: string;
@@ -163,6 +184,11 @@ export type BacktestResultsDetail = {
 export type BacktestResultsPageOptions = {
   limit?: number;
   cursor?: string;
+};
+
+export type BacktestResultsCandleOptions = BacktestResultsPageOptions & {
+  start: number;
+  end: number;
 };
 
 type Page<TName extends string, T> = {
@@ -290,6 +316,39 @@ export async function loadBacktestResult(
   return value;
 }
 
+export async function loadBacktestResultTrades(
+  jobId: string,
+  options: BacktestResultsPageOptions = {}
+): Promise<BacktestResultsTradesPage> {
+  const query = new URLSearchParams();
+  if (options.limit !== undefined) query.set("limit", String(options.limit));
+  if (options.cursor !== undefined) query.set("cursor", options.cursor);
+  const suffix = query.toString();
+  const value = await request<unknown>(
+    `/api/v1/backtest-results/${encodeURIComponent(jobId)}/trades${suffix ? `?${suffix}` : ""}`,
+    { cache: "no-store" }
+  );
+  if (!validBacktestResultsTradesPage(value)) throw new Error("invalid_response");
+  return value;
+}
+
+export async function loadBacktestResultCandles(
+  jobId: string,
+  options: BacktestResultsCandleOptions
+): Promise<BacktestResultsCandlesPage> {
+  const query = new URLSearchParams();
+  query.set("start", String(options.start));
+  query.set("end", String(options.end));
+  if (options.limit !== undefined) query.set("limit", String(options.limit));
+  if (options.cursor !== undefined) query.set("cursor", options.cursor);
+  const value = await request<unknown>(
+    `/api/v1/backtest-results/${encodeURIComponent(jobId)}/candles?${query}`,
+    { cache: "no-store" }
+  );
+  if (!validBacktestResultsCandlesPage(value)) throw new Error("invalid_response");
+  return value;
+}
+
 export async function loadStrategyStates(): Promise<StrategyState[]> {
   const query = (offset: number) =>
     `/strategy-states?limit=${STRATEGY_PAGE_SIZE}&offset=${offset}`;
@@ -398,6 +457,13 @@ function validBacktestResultsIndexPage(
     value.revision === 1;
 }
 
+function validBacktestResultsTradesPage(
+  value: unknown
+): value is BacktestResultsTradesPage {
+  return record(value) && rows(value.items, validBacktestResultsTrade) &&
+    nullableText(value.next_cursor) && value.revision === 1;
+}
+
 function validBacktestResultsTrade(value: unknown): value is BacktestResultsTrade {
   return textFields(
     value,
@@ -411,6 +477,17 @@ function validBacktestResultsTrade(value: unknown): value is BacktestResultsTrad
     "pnl",
     "fee"
   );
+}
+
+function validBacktestResultsCandle(value: unknown): value is BacktestResultsCandle {
+  return textFields(value, "timestamp", "open", "high", "low", "close", "volume");
+}
+
+function validBacktestResultsCandlesPage(
+  value: unknown
+): value is BacktestResultsCandlesPage {
+  return record(value) && rows(value.items, validBacktestResultsCandle) &&
+    nullableText(value.next_cursor) && value.revision === 1;
 }
 
 function validBacktestResultsDetailMetrics(
