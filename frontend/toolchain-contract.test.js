@@ -36,7 +36,8 @@ const EXPECTED_SCENARIOS = [
   "locale-theme-reload",
   "lazy-chunk-inventory",
   "responsive-overflow",
-  "berlin-presentation-time"
+  "berlin-presentation-time",
+  "production-results-flow"
 ];
 const EXPECTED_CASES = {
   "direct-navigation": ["results", "strategies", "trades"],
@@ -48,7 +49,8 @@ const EXPECTED_CASES = {
   "locale-theme-reload": ["main"],
   "lazy-chunk-inventory": ["main"],
   "responsive-overflow": ["research", "results", "strategies", "trades"],
-  "berlin-presentation-time": ["research-api", "demo-features"]
+  "berlin-presentation-time": ["research-api", "demo-features"],
+  "production-results-flow": ["main"]
 };
 const EXPECTED_NON_ZERO_COUNTS = {
   "direct-navigation:production:results": { S: 1, RI: 1 },
@@ -80,7 +82,14 @@ const EXPECTED_NON_ZERO_COUNTS = {
     a: 1,
     b: 1
   },
-  "berlin-presentation-time:dev:demo-features": { S: 2, T: 2 }
+  "berlin-presentation-time:dev:demo-features": { S: 2, T: 2 },
+  "production-results-flow:production:main": {
+    S: 8,
+    RI: 2,
+    RD: 2,
+    RT: 2,
+    RC: 2
+  }
 };
 const EXPECTED_SCRIPTS = {
   dev: "vite",
@@ -246,7 +255,9 @@ function exactTripleKeys() {
   const rows = [];
   for (const scenario of EXPECTED_SCENARIOS) {
     const servers =
-      scenario === "navigation-serialization" ||
+      scenario === "production-results-flow"
+        ? ["production"]
+        : scenario === "navigation-serialization" ||
       scenario === "demo-dev" ||
       scenario === "berlin-presentation-time"
         ? ["dev"]

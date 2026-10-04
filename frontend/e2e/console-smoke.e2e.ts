@@ -18,6 +18,17 @@ import {
   BACKTEST_RESULT_ID,
   BACKTEST_RESULT_INDEX,
   BACKTEST_TRADE_ID,
+  FLOW_CANDLE_CURSOR_QUERY,
+  FLOW_INDEX_CURSOR_QUERY,
+  FLOW_RESULT_CANDLES_FIRST,
+  FLOW_RESULT_CANDLES_SECOND,
+  FLOW_RESULT_DETAIL,
+  FLOW_RESULT_ID,
+  FLOW_RESULT_INDEX_FIRST,
+  FLOW_RESULT_INDEX_SECOND,
+  FLOW_RESULT_TRADES_SECOND,
+  FLOW_TRADE_CURSOR_QUERY,
+  FLOW_TRADE_ID,
   BROWSER_SESSION,
   BROWSER_TIME_ZONE,
   CASE_IDS,
@@ -158,7 +169,9 @@ const PROJECTED_HEADERS = new Set([
 
 function triplesFor(scenario: ScenarioId): readonly Triple[] {
   const servers: readonly ServerId[] =
-    scenario === "navigation-serialization" ||
+    scenario === "production-results-flow"
+      ? ["production"]
+      : scenario === "navigation-serialization" ||
     scenario === "demo-dev" ||
     scenario === "berlin-presentation-time"
       ? ["dev"]
@@ -215,7 +228,8 @@ async function installApiFixtures(
   context: BrowserContext,
   counts: MutableRouteCounts,
   commandGate: CommandGate | null,
-  expectedOrigin: string
+  expectedOrigin: string,
+  productionResultsFlow: boolean
 ): Promise<void> {
   let commandAccepted = false;
   await context.route("**/*", async (route: Route) => {
@@ -234,7 +248,49 @@ async function installApiFixtures(
       url.search === ""
     ) {
       routeId = "RI";
-      body = BACKTEST_RESULT_INDEX;
+      body = productionResultsFlow
+        ? FLOW_RESULT_INDEX_FIRST
+        : BACKTEST_RESULT_INDEX;
+    } else if (
+      productionResultsFlow &&
+      method === "GET" &&
+      url.pathname === "/api/v1/backtest-results" &&
+      url.search === FLOW_INDEX_CURSOR_QUERY
+    ) {
+      routeId = "RI";
+      body = FLOW_RESULT_INDEX_SECOND;
+    } else if (
+      productionResultsFlow &&
+      method === "GET" &&
+      url.pathname === `/api/v1/backtest-results/${FLOW_RESULT_ID}` &&
+      url.search === ""
+    ) {
+      routeId = "RD";
+      body = FLOW_RESULT_DETAIL;
+    } else if (
+      productionResultsFlow &&
+      method === "GET" &&
+      url.pathname === `/api/v1/backtest-results/${FLOW_RESULT_ID}/trades` &&
+      url.search === FLOW_TRADE_CURSOR_QUERY
+    ) {
+      routeId = "RT";
+      body = FLOW_RESULT_TRADES_SECOND;
+    } else if (
+      productionResultsFlow &&
+      method === "GET" &&
+      url.pathname === `/api/v1/backtest-results/${FLOW_RESULT_ID}/candles` &&
+      url.search === "?start=1768478700000&end=1768479900000"
+    ) {
+      routeId = "RC";
+      body = FLOW_RESULT_CANDLES_FIRST;
+    } else if (
+      productionResultsFlow &&
+      method === "GET" &&
+      url.pathname === `/api/v1/backtest-results/${FLOW_RESULT_ID}/candles` &&
+      url.search === FLOW_CANDLE_CURSOR_QUERY
+    ) {
+      routeId = "RC";
+      body = FLOW_RESULT_CANDLES_SECOND;
     } else if (
       method === "GET" &&
       url.pathname === `/api/v1/backtest-results/${BACKTEST_RESULT_ID}` &&
@@ -356,6 +412,14 @@ async function installApiFixtures(
       commandGate.signalReceived();
       await commandGate.released;
       commandAccepted = true;
+    } else if (
+      productionResultsFlow &&
+      routeId === "RC" &&
+      url.search === FLOW_CANDLE_CURSOR_QUERY &&
+      commandGate !== null
+    ) {
+      commandGate.signalReceived();
+      await commandGate.released;
     }
     await route.fulfill({
       status: 200,
@@ -520,10 +584,80 @@ async function exerciseScenario(
   page: Page,
   triple: Triple,
   moduleRequests: string[],
-  commandGate: CommandGate | null
+  commandGate: CommandGate | null,
+  testInfo: TestInfo
 ): Promise<void> {
   const base = BASE_URLS[triple.server];
   const open = (path: string) => page.goto(`${base}${path}`);
+
+  if (triple.scenario === "production-results-flow") {
+    await open("/?view=results");
+    await expect(page.locator(".results-index")).toBeVisible();
+    await expect(page.locator(".results-metrics")).toHaveCount(0);
+    await expect(page.getByText(BACKTEST_RESULT_ID, { exact: true })).toBeVisible();
+    await expect(page.getByText(FLOW_RESULT_ID, { exact: true })).toHaveCount(0);
+    expect(new URL(page.url()).searchParams.get("result")).toBeNull();
+    expect(new URL(page.url()).searchParams.get("trade")).toBeNull();
+    await page.screenshot({
+      path: testInfo.outputPath(`${testInfo.project.name}-production-results-index-first.png`),
+      fullPage: true
+    });
+
+    await page.getByRole("button", { name: /載入更多結果|Load more results/ }).click();
+    await expect(page.locator(".results-index")).toBeVisible();
+    await expect(page.getByText(FLOW_RESULT_ID, { exact: true })).toBeVisible();
+    await expect(page.getByText(BACKTEST_RESULT_ID, { exact: true })).toBeVisible();
+    await expect(page.locator(".results-metrics")).toHaveCount(0);
+    expect(new URL(page.url()).searchParams.get("result")).toBeNull();
+    await page.screenshot({
+      path: testInfo.outputPath(`${testInfo.project.name}-production-results-index.png`),
+      fullPage: true
+    });
+
+    await page.getByRole("button", { name: new RegExp(FLOW_RESULT_ID) }).click();
+    await expect.poll(() => new URL(page.url()).searchParams.get("result")).toBe(FLOW_RESULT_ID);
+    await expect(page.locator(".results-metrics .metric-primary strong")).toHaveText(
+      "9007199254740993.12 USDT"
+    );
+    await expect(page.locator(".results-metrics .metric-primary small")).toContainText("1.25%");
+    await expect(page.locator(".results-metrics")).toContainText("123.45 USDT");
+    await expect(page.getByText(`${FLOW_RESULT_ID}:0`, { exact: true })).toBeVisible();
+    await page.screenshot({
+      path: testInfo.outputPath(`${testInfo.project.name}-production-results-detail.png`),
+      fullPage: true
+    });
+
+    await page.getByRole("button", { name: /載入更多交易|Load more trades/ }).click();
+    const selectedTradeRow = page.locator(".results-trades tr").filter({ hasText: FLOW_TRADE_ID });
+    await expect(selectedTradeRow).toBeVisible();
+    await expect(selectedTradeRow).toContainText("-9007199254740993.12 USDT");
+    await expect(selectedTradeRow).toContainText("0.50 USDT");
+    await selectedTradeRow.getByRole("button").click();
+    await expect.poll(() => new URL(page.url()).searchParams.get("view")).toBe("trades");
+    await expect.poll(() => new URL(page.url()).searchParams.get("result")).toBe(FLOW_RESULT_ID);
+    await expect.poll(() => new URL(page.url()).searchParams.get("trade")).toBe(FLOW_TRADE_ID);
+
+    if (!commandGate) throw new Error("missing_production_flow_gate");
+    await commandGate.received;
+    await expect(page.locator(".trade-chart")).toHaveCount(0);
+    await expect(page.getByText(`${FLOW_RESULT_ID}:0`, { exact: true })).toBeVisible();
+    await expect(page.getByText(FLOW_TRADE_ID, { exact: true }).first()).toBeVisible();
+    commandGate.release();
+
+    await expect(page.locator(".trade-chart")).toBeVisible();
+    await expect(page.locator(".trade-chart canvas")).toBeVisible();
+    await expect(page.locator(".trade-quality")).toHaveCount(0);
+    await expect(page.locator(".trade-ledger").getByText(FLOW_RESULT_ID + ":0", { exact: true })).toBeVisible();
+    await expect(page.locator(".trade-ledger").getByText(FLOW_TRADE_ID, { exact: true }).first()).toBeVisible();
+    await expect(page.locator(".trade-detail").getByText(FLOW_TRADE_ID, { exact: true })).toBeVisible();
+    await expect(page.locator(".trade-detail")).toContainText("-9007199254740993.12 USDT");
+    await expect(page.locator(".trade-detail")).toContainText("0.50 USDT");
+    await page.screenshot({
+      path: testInfo.outputPath(`${testInfo.project.name}-production-results-trades.png`),
+      fullPage: true
+    });
+    return;
+  }
 
   if (triple.scenario === "direct-navigation") {
     const paths = {
@@ -833,14 +967,17 @@ async function runTriple(
   const moduleRequests: string[] = [];
   const failures: string[] = [];
   const commandGate =
-    triple.scenario === "strategy-command" ? createCommandGate() : null;
+    triple.scenario === "strategy-command" || triple.scenario === "production-results-flow"
+      ? createCommandGate()
+      : null;
   let documents = 0;
   try {
     await installApiFixtures(
       context,
       observedCounts,
       commandGate,
-      BASE_URLS[triple.server]
+      BASE_URLS[triple.server],
+      triple.scenario === "production-results-flow"
     );
     const page = await context.newPage();
     page.on("console", (message) => {
@@ -868,7 +1005,7 @@ async function runTriple(
       await page.evaluate(() => Intl.DateTimeFormat().resolvedOptions().timeZone)
     ).toBe(BROWSER_TIME_ZONE);
 
-    await exerciseScenario(page, triple, moduleRequests, commandGate);
+    await exerciseScenario(page, triple, moduleRequests, commandGate, testInfo);
     const key = tripleKey(triple);
     expect(observedCounts).toEqual(EXPECTED_REQUEST_COUNTS[key]);
     expect(documents).toBe(EXPECTED_DOCUMENT_COUNTS[key]);
@@ -880,6 +1017,7 @@ async function runTriple(
       fullPage: true
     });
   } finally {
+    commandGate?.release();
     await context.close();
   }
 }

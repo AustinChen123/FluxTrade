@@ -1,7 +1,9 @@
 import type {
   BacktestResultsCandlesPage,
   BacktestResultsDetail,
-  BacktestResultsIndexPage
+  BacktestResultsIndexItem,
+  BacktestResultsIndexPage,
+  BacktestResultsTradesPage
 } from "../src/api";
 
 export const BROWSER_NOW = "2026-08-23T12:00:00Z";
@@ -18,7 +20,8 @@ export const SCENARIO_IDS = [
   "locale-theme-reload",
   "lazy-chunk-inventory",
   "responsive-overflow",
-  "berlin-presentation-time"
+  "berlin-presentation-time",
+  "production-results-flow"
 ] as const;
 
 export type ScenarioId = (typeof SCENARIO_IDS)[number];
@@ -34,7 +37,8 @@ export const CASE_IDS = {
   "locale-theme-reload": ["main"],
   "lazy-chunk-inventory": ["main"],
   "responsive-overflow": ["research", "results", "strategies", "trades"],
-  "berlin-presentation-time": ["research-api", "demo-features"]
+  "berlin-presentation-time": ["research-api", "demo-features"],
+  "production-results-flow": ["main"]
 } as const satisfies Record<ScenarioId, readonly string[]>;
 
 export const BROWSER_SESSION = {
@@ -103,6 +107,113 @@ export const BACKTEST_CANDLES: BacktestResultsCandlesPage = {
     close: "101.00",
     volume: "10"
   }],
+  next_cursor: null,
+  revision: 1
+};
+
+export const FLOW_RESULT_ID = "job-browser-002";
+export const FLOW_TRADE_ID = `${FLOW_RESULT_ID}:1`;
+export const FLOW_INDEX_CURSOR = "signed.index/opaque+token==";
+export const FLOW_TRADE_CURSOR = "signed.trades/opaque+token==";
+export const FLOW_CANDLE_CURSOR = "signed.candles/opaque+token==";
+export const FLOW_INDEX_CURSOR_QUERY = "?cursor=signed.index%2Fopaque%2Btoken%3D%3D";
+export const FLOW_TRADE_CURSOR_QUERY = "?cursor=signed.trades%2Fopaque%2Btoken%3D%3D";
+export const FLOW_CANDLE_CURSOR_QUERY =
+  "?start=1768478700000&end=1768479900000&cursor=signed.candles%2Fopaque%2Btoken%3D%3D";
+
+const flowFirstResult: BacktestResultsIndexItem = {
+  job_id: BACKTEST_RESULT_ID,
+  subject_id: "subject-browser-001",
+  dataset_id: "dataset-browser-001",
+  product_id: "BTC-USDT",
+  timeframe: "5m",
+  started_at: "2026-01-15T12:00:00.000Z",
+  ended_at: "2026-01-15T13:00:00.000Z",
+  completed_at: "2026-01-15T13:01:00.000Z",
+  result_digest: "3".repeat(64)
+};
+const flowSelectedResult: BacktestResultsIndexItem = {
+  ...flowFirstResult,
+  job_id: FLOW_RESULT_ID,
+  subject_id: "subject-browser-002",
+  dataset_id: "dataset-browser-002",
+  ended_at: "2026-01-15T12:24:59.999Z",
+  completed_at: "2026-01-15T13:02:00.000Z",
+  result_digest: "4".repeat(64)
+};
+export const FLOW_RESULT_INDEX_FIRST: BacktestResultsIndexPage = {
+  items: [flowFirstResult],
+  next_cursor: FLOW_INDEX_CURSOR,
+  revision: 1
+};
+export const FLOW_RESULT_INDEX_SECOND: BacktestResultsIndexPage = {
+  items: [flowSelectedResult],
+  next_cursor: null,
+  revision: 1
+};
+
+const flowFirstTrade = {
+  id: `${FLOW_RESULT_ID}:0`,
+  entry_time: "2026-01-15T12:10:00.000Z",
+  exit_time: "2026-01-15T12:15:00.000Z",
+  entry_price: "9007199254740993.12",
+  exit_price: "9007199254740994.12",
+  side: "LONG",
+  quantity: "1.25",
+  pnl: "9007199254740993.12",
+  fee: "0.25"
+} as const;
+const flowSelectedTrade = {
+  id: FLOW_TRADE_ID,
+  entry_time: "2026-01-15T12:15:00.000Z",
+  exit_time: "2026-01-15T12:20:00.000Z",
+  entry_price: "9007199254740994.12",
+  exit_price: "9007199254740993.12",
+  side: "SHORT",
+  quantity: "2.50",
+  pnl: "-9007199254740993.12",
+  fee: "0.50"
+} as const;
+export const FLOW_RESULT_DETAIL: BacktestResultsDetail = {
+  ...BACKTEST_RESULT_DETAIL,
+  job_id: FLOW_RESULT_ID,
+  ended_at: "2026-01-15T12:24:59.999Z",
+  subject_id: "subject-browser-002",
+  dataset_id: "dataset-browser-002",
+  product_id: "BTC-USDT",
+  currency: "USDT",
+  metrics: {
+    ...BACKTEST_RESULT_DETAIL.metrics,
+    net_pnl: "9007199254740993.12",
+    return_pct: "0.0125",
+    max_drawdown: "123.45"
+  },
+  trade_page: {
+    items: [flowFirstTrade],
+    total_count: 2,
+    next_cursor: FLOW_TRADE_CURSOR
+  },
+  input_digest: "5".repeat(64),
+  result_digest: "4".repeat(64)
+};
+export const FLOW_RESULT_TRADES_SECOND: BacktestResultsTradesPage = {
+  items: [flowSelectedTrade],
+  next_cursor: null,
+  revision: 1
+};
+export const FLOW_RESULT_CANDLES_FIRST: BacktestResultsCandlesPage = {
+  items: [
+    { timestamp: "2026-01-15T12:05:00.000Z", open: "100.00", high: "102.00", low: "99.00", close: "101.00", volume: "10" },
+    { timestamp: "2026-01-15T12:10:00.000Z", open: "101.00", high: "103.00", low: "100.00", close: "102.00", volume: "11" },
+    { timestamp: "2026-01-15T12:15:00.000Z", open: "102.00", high: "104.00", low: "101.00", close: "103.00", volume: "12" }
+  ],
+  next_cursor: FLOW_CANDLE_CURSOR,
+  revision: 1
+};
+export const FLOW_RESULT_CANDLES_SECOND: BacktestResultsCandlesPage = {
+  items: [
+    { timestamp: "2026-01-15T12:20:00.000Z", open: "103.00", high: "104.00", low: "101.00", close: "102.00", volume: "13" }
+  ],
   next_cursor: null,
   revision: 1
 };
@@ -269,7 +380,8 @@ export const EXPECTED_REQUEST_COUNTS = {
   "responsive-overflow:production:strategies": { S: 1, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 1, C: 0, RI: 0, RD: 0, RT: 0, RC: 0 },
   "responsive-overflow:production:trades": { S: 2, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 0, C: 0, RI: 0, RD: 1, RT: 0, RC: 1 },
   "berlin-presentation-time:dev:research-api": { S: 2, P: 0, E: 2, A: 1, B: 1, a: 1, b: 1, T: 0, C: 0, RI: 0, RD: 0, RT: 0, RC: 0 },
-  "berlin-presentation-time:dev:demo-features": { S: 2, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 2, C: 0, RI: 0, RD: 0, RT: 0, RC: 0 }
+  "berlin-presentation-time:dev:demo-features": { S: 2, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 2, C: 0, RI: 0, RD: 0, RT: 0, RC: 0 },
+  "production-results-flow:production:main": { S: 8, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 0, C: 0, RI: 2, RD: 2, RT: 2, RC: 2 }
 } as const satisfies Readonly<Record<string, RouteCounts>>;
 
 export const EXPECTED_DOCUMENT_COUNTS = {
@@ -300,7 +412,8 @@ export const EXPECTED_DOCUMENT_COUNTS = {
   "responsive-overflow:production:strategies": 1,
   "responsive-overflow:production:trades": 1,
   "berlin-presentation-time:dev:research-api": 1,
-  "berlin-presentation-time:dev:demo-features": 1
+  "berlin-presentation-time:dev:demo-features": 1,
+  "production-results-flow:production:main": 1
 } as const satisfies Readonly<
   Record<keyof typeof EXPECTED_REQUEST_COUNTS, number>
 >;
