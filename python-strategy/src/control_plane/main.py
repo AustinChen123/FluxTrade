@@ -30,6 +30,7 @@ from src.control_plane import (
 )
 from src.control_plane.backtest_results import BacktestResultsQueryService
 from src.control_plane.evaluation_data import RequestEvaluationDataSourceProvider
+from src.control_plane.invalidation import ControlPlaneInvalidationHub
 from src.control_plane.jobs import JobStore
 from src.control_plane.ops_status_query import OpsStatusQuery
 from src.control_plane.profile_http_query import ProfileQueryService
@@ -112,6 +113,7 @@ def build_control_plane_app(
         cursor_key=secrets.token_bytes(32),
         job_lookup=job_store.get,
     )
+    invalidation_hub = ControlPlaneInvalidationHub()
     if strategy_loader is None:
         strategy_artifacts_path = os.getenv(
             "STRATEGY_ARTIFACTS_PATH", _DEFAULT_STRATEGY_ARTIFACTS_PATH
@@ -175,6 +177,7 @@ def build_control_plane_app(
         profile_query_service=profile_query_service,
         ops_status_query=ops_status_query,
         backtest_results_query_service=backtest_results_query_service,
+        invalidation_hub=invalidation_hub,
         readiness_probe=(
             readiness_probe
             if readiness_probe is not None

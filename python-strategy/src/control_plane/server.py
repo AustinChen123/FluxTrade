@@ -4,11 +4,22 @@ import mimetypes
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from email.message import Message
 from pathlib import Path
+import select
+import socket
 from threading import Event
+import time
 from typing import Type
 from urllib.parse import unquote, urlsplit
 
-from src.control_plane.app import ControlPlaneApp
+from src.control_plane.app import ControlPlaneApp, EventStreamResponse
+from src.control_plane.invalidation import (
+    HEARTBEAT_SECONDS,
+    SubscriptionClosed,
+)
+
+
+_EVENT_STREAM_WRITE_TIMEOUT_SECONDS = 1.0
+_EVENT_HEARTBEAT_SECONDS = HEARTBEAT_SECONDS
 
 
 def _invalid_profile_body(method: str, path: str, headers: Message) -> bool:
@@ -58,6 +69,9 @@ def make_handler(
                 body,
                 dict(self.headers.items()),
             )
+            if isinstance(response, EventStreamResponse):
+                self._handle_event_stream(response)
+                return
             encoded = response.json().encode("utf-8")
             self.send_response(response.status_code)
             self.send_header("Content-Type", "application/json")
@@ -66,6 +80,44 @@ def make_handler(
                 self.send_header(name, value)
             self.end_headers()
             self.wfile.write(encoded)
+
+        def _handle_event_stream(self, response: EventStreamResponse) -> None:
+            self.close_connection = True
+            try:
+                self.connection.settimeout(_EVENT_STREAM_WRITE_TIMEOUT_SECONDS)
+                self.send_response(response.status_code)
+                for name, value in response.headers:
+                    self.send_header(name, value)
+                self.end_headers()
+                heartbeat_deadline = time.monotonic() + _EVENT_HEARTBEAT_SECONDS
+                while True:
+                    if self._event_peer_closed():
+                        break
+                    now = time.monotonic()
+                    if now >= heartbeat_deadline:
+                        self.wfile.write(b": heartbeat\n\n")
+                        heartbeat_deadline = now + _EVENT_HEARTBEAT_SECONDS
+                    remaining = max(heartbeat_deadline - time.monotonic(), 0.0)
+                    try:
+                        frame = response.subscription.next_frame(min(remaining, 0.25))
+                    except SubscriptionClosed:
+                        break
+                    if frame is not None:
+                        self.wfile.write(frame)
+            except OSError:
+                pass
+            finally:
+                response.subscription.close()
+
+        def _event_peer_closed(self) -> bool:
+            try:
+                readable, _, _ = select.select((self.connection,), (), (), 0)
+                if not readable:
+                    return False
+                data = self.connection.recv(1, socket.MSG_PEEK)
+            except OSError:
+                return True
+            return not data
 
         def _serve_static(self) -> bool:
             if static_root is None:
@@ -137,4 +189,5 @@ def serve(
         if stop_event is not None:
             stop_event.set()
     finally:
+        app.close_event_streams()
         server.server_close()

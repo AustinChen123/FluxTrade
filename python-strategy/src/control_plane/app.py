@@ -52,6 +52,11 @@ from src.control_plane.strategy_state_query import StrategyStateQueryService
 from src.control_plane.profile_http_query import ProfileQueryService
 from src.control_plane.ops_status_query import OpsStatusQuery
 from src.control_plane.profile_http_contract import ProfileHttpError
+from src.control_plane.invalidation import (
+    ControlPlaneInvalidationHub,
+    EventConnectionCapacity,
+    InvalidationSubscription,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -65,6 +70,24 @@ class HttpResponse:
 
     def json(self) -> str:
         return json.dumps(self.body, separators=(",", ":"), default=str)
+
+
+class EventStreamResponse(HttpResponse):
+    """Typed stream variant kept within the established response surface."""
+
+    subscription: InvalidationSubscription
+
+    def __init__(
+        self,
+        subscription: InvalidationSubscription,
+        status_code: int = 200,
+        headers: tuple[tuple[str, str], ...] = (
+            ("Content-Type", "text/event-stream"),
+            ("Cache-Control", "no-store"),
+        ),
+    ) -> None:
+        super().__init__(status_code, {}, headers)
+        object.__setattr__(self, "subscription", subscription)
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +113,7 @@ class ControlPlaneApp:
         profile_query_service: ProfileQueryService | None = None,
         ops_status_query: OpsStatusQuery | None = None,
         backtest_results_query_service: BacktestResultsQueryService | None = None,
+        invalidation_hub: ControlPlaneInvalidationHub | None = None,
     ) -> None:
         if api_key == "":
             raise ValueError("api_key must be non-empty when provided")
@@ -105,9 +129,15 @@ class ControlPlaneApp:
         self.profile_query_service = profile_query_service
         self.ops_status_query = ops_status_query
         self.backtest_results_query_service = backtest_results_query_service
+        self.invalidation_hub = (
+            invalidation_hub
+            if invalidation_hub is not None
+            else ControlPlaneInvalidationHub()
+        )
 
     def shutdown(self, timeout: float) -> bool:
         """Stop accepting queued work and wait up to ``timeout`` for active jobs."""
+        self.close_event_streams()
         deadline = time.monotonic() + max(timeout, 0.0)
         backtests_stopped = self.backtest_executor.shutdown(
             wait=True,
@@ -123,6 +153,9 @@ class ControlPlaneApp:
             )
         return backtests_stopped and searches_stopped
 
+    def close_event_streams(self) -> None:
+        self.invalidation_hub.close()
+
     def handle(
         self,
         method: str,
@@ -135,6 +168,7 @@ class ControlPlaneApp:
         raw_path = parsed_url.path
         clean_path = parsed_url.path.rstrip("/") or "/"
         results_family = _is_backtest_results_path(raw_path)
+        events_path = clean_path == "/api/v1/events"
         results_path = raw_path if results_family else clean_path
         query = {} if results_family else parse_qs(parsed_url.query)
 
@@ -158,10 +192,15 @@ class ControlPlaneApp:
 
         identity = self._authorize(headers)
         if isinstance(identity, HttpResponse):
-            if results_family or clean_path in {
-                "/api/v1/auth/session",
-                "/ops/kill-switch",
-            }:
+            if (
+                results_family
+                or events_path
+                or clean_path
+                in {
+                    "/api/v1/auth/session",
+                    "/ops/kill-switch",
+                }
+            ):
                 return HttpResponse(
                     identity.status_code,
                     identity.body,
@@ -176,7 +215,7 @@ class ControlPlaneApp:
             identity.browser_principal,
         )
         if browser_policy_response is not None:
-            if results_family or clean_path == "/ops/kill-switch":
+            if results_family or events_path or clean_path == "/ops/kill-switch":
                 return HttpResponse(browser_policy_response.status_code, browser_policy_response.body, headers=(("Cache-Control", "no-store"),))
             return browser_policy_response
 
@@ -188,6 +227,9 @@ class ControlPlaneApp:
                 body,
                 identity,
             )
+
+        if events_path:
+            return self._handle_events(method, identity)
 
         if (
             identity.browser_principal is not None
@@ -365,6 +407,37 @@ class ControlPlaneApp:
             )
 
         return HttpResponse(404, {"error": "not_found"})
+
+    def _handle_events(
+        self,
+        method: str,
+        identity: _RequestIdentity,
+    ) -> HttpResponse | EventStreamResponse:
+        if method != "GET":
+            return HttpResponse(
+                404,
+                {"error": "not_found"},
+                headers=(("Cache-Control", "no-store"),),
+            )
+        principal = identity.browser_principal
+        if (
+            principal is None
+            or self.browser_auth is None
+            or not principal.has_capability(self.browser_auth.operator_capability)
+        ):
+            return HttpResponse(
+                403,
+                {"error": "forbidden"},
+                headers=(("Cache-Control", "no-store"),),
+            )
+        try:
+            return EventStreamResponse(self.invalidation_hub.subscribe())
+        except EventConnectionCapacity:
+            return HttpResponse(
+                503,
+                {"error": "event_connection_capacity"},
+                headers=(("Cache-Control", "no-store"),),
+            )
 
     def _submit_backtest(
         self,
