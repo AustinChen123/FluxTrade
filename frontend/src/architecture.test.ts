@@ -62,6 +62,7 @@ type ArchitectureRole =
   | "app-shell"
   | "research-io"
   | "strategy-io"
+  | "results-io"
   | "feature-owner"
   | "feature-presentation"
   | "feature-model"
@@ -143,6 +144,8 @@ const expectedInventory = [
   "features/results/resultsCharts.ts",
   "features/results/resultsModel.test.ts",
   "features/results/resultsModel.ts",
+  "features/results/useBacktestResults.test.ts",
+  "features/results/useBacktestResults.ts",
   "features/results/useTradePagination.test.ts",
   "features/results/useTradePagination.ts",
   "features/strategies/StrategyManager.test.tsx",
@@ -265,6 +268,9 @@ const expectedBareImportLedger = [
   "features/results/resultsCharts.test.ts|vitest|value",
   "features/results/resultsCharts.ts|echarts/core|type-only",
   "features/results/resultsModel.test.ts|vitest|value",
+  "features/results/useBacktestResults.test.ts|@testing-library/react|value",
+  "features/results/useBacktestResults.test.ts|vitest|value",
+  "features/results/useBacktestResults.ts|react|value",
   "features/results/useTradePagination.test.ts|@testing-library/react|value",
   "features/results/useTradePagination.test.ts|vitest|value",
   "features/strategies/strategyCommandState.test.ts|vitest|value",
@@ -413,6 +419,11 @@ const expectedRelativeImportLedger = [
   "features/results/resultsModel.ts|../../shared/trading/closedTradePage|type-only|shared/trading/closedTradePage.ts",
   "features/results/resultsModel.ts|../../shared/trading/closedTradePage|value|shared/trading/closedTradePage.ts",
   "features/results/resultsModel.ts|../../shared/trading/closedTradePage|value|shared/trading/closedTradePage.ts",
+  "features/results/useBacktestResults.test.ts|../../api|type-only|api.ts",
+  "features/results/useBacktestResults.test.ts|./useBacktestResults|value|features/results/useBacktestResults.ts",
+  "features/results/useBacktestResults.ts|../../api|value|api.ts",
+  "features/results/useBacktestResults.ts|./resultsModel|type-only|features/results/resultsModel.ts",
+  "features/results/useBacktestResults.ts|./resultsModel|value|features/results/resultsModel.ts",
   "features/results/useTradePagination.test.ts|../../shared/trading/useTradePagination|value|shared/trading/useTradePagination.ts",
   "features/results/useTradePagination.test.ts|./demo|value|features/results/demo.ts",
   "features/results/useTradePagination.test.ts|./resultsModel|type-only|features/results/resultsModel.ts",
@@ -1050,6 +1061,7 @@ function architectureRole(importer: string): ArchitectureRole {
   if (importer === "features/strategies/useStrategyManager.ts") {
     return "strategy-io";
   }
+  if (importer === "features/results/useBacktestResults.ts") return "results-io";
   if (importer === "shared/trading/useTradePagination.ts") {
     return "shared-trading-pager";
   }
@@ -1192,6 +1204,7 @@ function assertBareEdge(edge: ImportEdge, role: ArchitectureRole): void {
         "features/research/ResearchRoute.test.tsx",
         "features/research/useResearchWorkspace.test.ts",
         "features/results/BacktestResultsView.test.tsx",
+        "features/results/useBacktestResults.test.ts",
         "features/results/useTradePagination.test.ts",
         "features/strategies/StrategyManager.test.tsx",
         "features/strategies/StrategyManagerView.test.tsx",
@@ -1217,6 +1230,7 @@ function assertBareEdge(edge: ImportEdge, role: ArchitectureRole): void {
     "app-shell": new Set(["react|value", "react-i18next|value"]),
     "research-io": new Set(["react|value"]),
     "strategy-io": new Set(["react|value", "react-i18next|type-only"]),
+    "results-io": new Set(["react|value"]),
     "feature-owner": new Set([
       "react|value",
       "react-i18next|type-only",
@@ -1344,6 +1358,16 @@ function assertRepositoryEdge(edge: ImportEdge, role: ArchitectureRole): void {
       denyEdge(edge);
     }
     return;
+  }
+  if (role === "results-io") {
+    if (
+      edge.resolved === "api.ts" ||
+      (edge.resolved === "features/results/resultsModel.ts" &&
+        featureModelPaths.has(edge.resolved))
+    ) {
+      return;
+    }
+    denyEdge(edge);
   }
   if (role === "feature-owner" || role === "feature-presentation") {
     if (
@@ -2106,6 +2130,7 @@ describe("frontend architecture ratchet", () => {
     ["app/App.tsx", "app-shell"],
     ["features/research/useResearchWorkspace.ts", "research-io"],
     ["features/strategies/useStrategyManager.ts", "strategy-io"],
+    ["features/results/useBacktestResults.ts", "results-io"],
     ["features/research/ResearchRoute.tsx", "feature-owner"],
     ["features/research/ResearchPage.tsx", "feature-presentation"],
     ["features/research/gaDomain.ts", "feature-model"],
@@ -2162,6 +2187,16 @@ describe("frontend architecture ratchet", () => {
       "features/strategies/useStrategyManager.ts",
       "../../api",
       "api.ts"
+    ),
+    architectureEdge(
+      "features/results/useBacktestResults.ts",
+      "../../api",
+      "api.ts"
+    ),
+    architectureEdge(
+      "features/results/useBacktestResults.ts",
+      "./resultsModel",
+      "features/results/resultsModel.ts"
     ),
     architectureEdge(
       "features/results/BacktestResultsView.tsx",
@@ -2256,6 +2291,7 @@ describe("frontend architecture ratchet", () => {
     architectureEdge("app/App.tsx", "../features/research/gaDomain", "features/research/gaDomain.ts"),
     architectureEdge("features/research/useResearchWorkspace.ts", "../results/resultsModel", "features/results/resultsModel.ts"),
     architectureEdge("features/strategies/useStrategyManager.ts", "../trades/tradeModel", "features/trades/tradeModel.ts"),
+    architectureEdge("features/results/useBacktestResults.ts", "./BacktestResultsView", "features/results/BacktestResultsView.tsx"),
     architectureEdge("features/results/BacktestResultsView.tsx", "../../api", "api.ts"),
     architectureEdge("features/research/ResearchPage.tsx", "../../api", "api.ts", "type-only"),
     architectureEdge("features/research/ResearchPage.tsx", "echarts/core", "echarts/core", "type-only"),
