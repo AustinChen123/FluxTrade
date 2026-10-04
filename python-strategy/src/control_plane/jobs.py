@@ -21,6 +21,7 @@ from src.control_plane.ga_lifecycle import (
     new_ga_job_record,
     retry_ga_job_record,
     transition_ga_job,
+    transition_ga_worker_envelope,
 )
 from src.control_plane.models import JobRecord, JobStatus
 
@@ -90,6 +91,16 @@ class JobStore(Protocol):
         job_id: str,
         expected_version: object,
     ) -> tuple[GaJobRecord, bool]: ...
+
+    def apply_ga_worker_envelope(
+        self,
+        job_id: str,
+        *,
+        epoch_id: str,
+        expected_completed_generation: int,
+        action: str,
+        payload: Mapping[str, object] | None = None,
+    ) -> GaJobRecord: ...
 
 
 class InMemoryJobStore:
@@ -209,6 +220,29 @@ class InMemoryJobStore:
             if current is None:
                 raise GaJobStoreError("ga_job_not_found")
             updated = transition_ga_job(current, action, expected_version, payload)
+            self._ga_jobs[job_id] = updated
+            return updated.detached_copy()
+
+    def apply_ga_worker_envelope(
+        self,
+        job_id: str,
+        *,
+        epoch_id: str,
+        expected_completed_generation: int,
+        action: str,
+        payload: Mapping[str, object] | None = None,
+    ) -> GaJobRecord:
+        with self._lock:
+            current = self._ga_jobs.get(job_id)
+            if current is None:
+                raise GaJobStoreError("ga_job_not_found")
+            updated = transition_ga_worker_envelope(
+                current,
+                epoch_id=epoch_id,
+                expected_completed_generation=expected_completed_generation,
+                action=action,
+                payload=payload,
+            )
             self._ga_jobs[job_id] = updated
             return updated.detached_copy()
 
@@ -457,6 +491,40 @@ class SqliteJobStore:
                     raise GaJobStoreError("ga_job_not_found")
                 current = _ga_row_to_record(row)
                 updated = transition_ga_job(current, action, expected_version, payload)
+                _write_ga_record(conn, updated, current.version)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        return updated.detached_copy()
+
+    def apply_ga_worker_envelope(
+        self,
+        job_id: str,
+        *,
+        epoch_id: str,
+        expected_completed_generation: int,
+        action: str,
+        payload: Mapping[str, object] | None = None,
+    ) -> GaJobRecord:
+        with self._lock, closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    f"SELECT {_GA_COLUMNS} FROM control_plane_jobs "
+                    "WHERE id = ? AND kind = 'ga'",
+                    (job_id,),
+                ).fetchone()
+                if row is None:
+                    raise GaJobStoreError("ga_job_not_found")
+                current = _ga_row_to_record(row)
+                updated = transition_ga_worker_envelope(
+                    current,
+                    epoch_id=epoch_id,
+                    expected_completed_generation=expected_completed_generation,
+                    action=action,
+                    payload=payload,
+                )
                 _write_ga_record(conn, updated, current.version)
                 conn.commit()
             except Exception:

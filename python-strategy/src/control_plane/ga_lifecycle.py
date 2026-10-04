@@ -178,6 +178,29 @@ def transition_ga_job(
     raise GaJobStoreError("job_transition_invalid")
 
 
+def transition_ga_worker_envelope(
+    current: GaJobRecord,
+    *,
+    epoch_id: object,
+    expected_completed_generation: object,
+    action: object,
+    payload: Mapping[str, object] | None = None,
+) -> GaJobRecord:
+    """Apply one worker checkpoint using the current row as its version authority."""
+    if (
+        not isinstance(epoch_id, str)
+        or not epoch_id.strip()
+        or type(expected_completed_generation) is not int
+        or expected_completed_generation < -1
+        or epoch_id != current.epoch_id
+        or expected_completed_generation != current.completed_generation
+        or not isinstance(action, str)
+        or action not in {"ack_generation", "finalize", "fail"}
+    ):
+        raise GaJobStoreError("job_version_conflict")
+    return transition_ga_job(current, action, current.version, payload)
+
+
 def retry_ga_job_record(
     current: GaJobRecord,
     job_id: str,

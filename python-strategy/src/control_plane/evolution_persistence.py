@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from src.control_plane.backtest_jobs import SessionFactory, _json_safe
@@ -108,6 +108,8 @@ def _validate_evolution_epoch(
 def _load_evolution_checkpoint(
     session_factory: SessionFactory,
     request: ParameterSearchJobRequest,
+    *,
+    restore_exact_metrics: bool = False,
 ) -> _EvolutionCheckpoint:
     assert request.evolution is not None
     assert request.evolution.epoch_id is not None
@@ -140,10 +142,23 @@ def _load_evolution_checkpoint(
     evaluations = []
     for record in records:
         param_pack = _restore_param_pack(record.param_pack, request)
+        score_total = record.score_total
+        max_drawdown = record.max_drawdown
+        if restore_exact_metrics:
+            score_total = _checkpoint_decimal_metric(
+                record.score_breakdown,
+                "mark_to_market_pnl",
+                nonnegative=False,
+            )
+            max_drawdown = _checkpoint_decimal_metric(
+                record.score_breakdown,
+                "max_drawdown",
+                nonnegative=True,
+            )
         evaluation = ParameterEvaluationResult(
             candidate_id=record.candidate_id,
-            score_total=record.score_total,
-            max_drawdown=record.max_drawdown,
+            score_total=score_total,
+            max_drawdown=max_drawdown,
             metrics=record.score_breakdown,
         )
         evaluation_cache[canonical_param_key(param_pack)] = evaluation
@@ -161,6 +176,24 @@ def _load_evolution_checkpoint(
         evaluations=evaluations,
         evaluation_cache=evaluation_cache,
     )
+
+
+def _checkpoint_decimal_metric(
+    metrics: dict[str, Any],
+    name: str,
+    *,
+    nonnegative: bool,
+) -> Decimal:
+    value = metrics.get(name)
+    if not isinstance(value, str):
+        raise ValueError(f"evolution checkpoint metric is missing: {name}")
+    try:
+        restored = Decimal(value)
+    except InvalidOperation as exc:
+        raise ValueError(f"evolution checkpoint metric is invalid: {name}") from exc
+    if not restored.is_finite() or (nonnegative and restored < 0):
+        raise ValueError(f"evolution checkpoint metric is invalid: {name}")
+    return restored
 
 
 def _persist_evolution_generation(
