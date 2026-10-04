@@ -33,3 +33,33 @@ if (leakedSentinels.length > 0) {
 }
 
 console.log(`Verified demo trade construction is absent from ${resultsChunks[0]}`);
+
+const tradesChunks = readdirSync(assetsDirectory).filter((name) =>
+  /^TradeChartView-[^/]+\.js$/u.test(name)
+);
+
+if (tradesChunks.length !== 1) {
+  throw new Error(
+    `Expected one Trades entry chunk, found ${tradesChunks.length}`
+  );
+}
+
+const tradesChunk = readFileSync(path.join(assetsDirectory, tradesChunks[0]), "utf8");
+const demoTradesConstruction = [
+  "trade-000184",
+  "19851.25",
+  "19852.25",
+  "2026-07-28T15:30:00.000Z",
+  "0.88"
+];
+const leakedTradesSentinels = demoTradesConstruction.filter((sentinel) =>
+  tradesChunk.includes(sentinel)
+);
+
+if (leakedTradesSentinels.length > 0) {
+  throw new Error(
+    `Trades entry contains demo trade construction: ${leakedTradesSentinels.join(", ")}`
+  );
+}
+
+console.log(`Verified demo trade construction is absent from ${tradesChunks[0]}`);

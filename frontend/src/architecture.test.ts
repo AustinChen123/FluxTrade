@@ -531,6 +531,7 @@ const expectedPolicyGlobalLedger = [
   "features/strategies/useStrategyManager.ts|window.sessionStorage.getItem()",
   "features/strategies/useStrategyManager.ts|window.sessionStorage.removeItem()",
   "features/strategies/useStrategyManager.ts|window.sessionStorage.setItem()",
+  "features/trades/TradeChartView.tsx|import.meta.env.DEV",
   "main.tsx|document.getElementById()",
   "shared/i18n.ts|document.documentElement.lang",
   "shared/i18n.ts|document.documentElement.lang",
@@ -1697,6 +1698,10 @@ const allowedPolicyGlobals = new Map<string, ReadonlySet<string>>([
   [
     "features/results/BacktestResultsView.tsx",
     new Set(["import.meta.env.DEV"])
+  ],
+  [
+    "features/trades/TradeChartView.tsx",
+    new Set(["import.meta.env.DEV"])
   ]
 ]);
 
@@ -1763,6 +1768,54 @@ function assertImportMetaContract(
     }
     if (!owner || owner.name?.text !== "BacktestResultsView") {
       throw new Error("architecture Results DEV owner denied");
+    }
+    return;
+  }
+  if (importer === "features/trades/TradeChartView.tsx") {
+    if (metaUses.length !== 1) {
+      throw new Error("architecture Trades requires one exact DEV demo guard");
+    }
+    const meta = metaUses[0];
+    const env = meta.parent;
+    const dev = env?.parent;
+    if (
+      !env ||
+      !isPropertyAccessExpression(env) ||
+      env.expression !== meta ||
+      env.questionDotToken ||
+      env.name.text !== "env" ||
+      !dev ||
+      !isPropertyAccessExpression(dev) ||
+      dev.expression !== env ||
+      dev.questionDotToken ||
+      dev.name.text !== "DEV"
+    ) {
+      throw new Error("architecture Trades DEV chain denied");
+    }
+    const declaration = descendants(sourceFile).find(
+      (node) =>
+        isVariableDeclaration(node) &&
+        isIdentifier(node.name) &&
+        node.name.text === "useDemoSnapshot"
+    );
+    if (
+      !declaration ||
+      !isVariableDeclaration(declaration) ||
+      !declaration.initializer ||
+      !descendants(declaration.initializer).includes(meta) ||
+      declaration.initializer.getText(sourceFile).replaceAll(/\s+/gu, "") !==
+        "import.meta.env.DEV===true&&snapshot===undefined&&demoMode" ||
+      !isVariableDeclarationList(declaration.parent) ||
+      (declaration.parent.flags & NodeFlags.Const) === 0
+    ) {
+      throw new Error("architecture Trades demo guard changed");
+    }
+    let owner: Node | undefined = declaration.parent;
+    while (owner && !isFunctionDeclaration(owner)) {
+      owner = owner.parent;
+    }
+    if (!owner || owner.name?.text !== "TradeChartView") {
+      throw new Error("architecture Trades DEV owner denied");
     }
     return;
   }
@@ -2837,6 +2890,52 @@ describe("frontend architecture ratchet", () => {
         ".tsx"
       )
     ).toThrow("architecture Results");
+  });
+
+  it("accepts only the exact Trades DEV snapshot guard", () => {
+    expect(() =>
+      withCompilerFixture(
+        [
+          "export function TradeChartView() {",
+          "  const snapshot: unknown = undefined;",
+          "  const demoMode = true;",
+          "  const useDemoSnapshot = import.meta.env.DEV === true && snapshot === undefined && demoMode;",
+          "  return useDemoSnapshot;",
+          "}"
+        ].join("\n"),
+        (fixture) =>
+          assertImportMetaContract(
+            fixture,
+            "features/trades/TradeChartView.tsx"
+          ),
+        ".tsx"
+      )
+    ).not.toThrow();
+  });
+
+  it.each([
+    ["altered guard", "import.meta.env.DEV !== true && snapshot === undefined && demoMode", "TradeChartView"],
+    ["missing DEV guard", "snapshot === undefined && demoMode", "TradeChartView"],
+    ["wrong owner", "import.meta.env.DEV === true && snapshot === undefined && demoMode", "OtherTradeView"]
+  ])("rejects Trades DEV guard mutant %s", (_name, guard, owner) => {
+    expect(() =>
+      withCompilerFixture(
+        [
+          `export function ${owner}() {`,
+          "  const snapshot: unknown = undefined;",
+          "  const demoMode = true;",
+          `  const useDemoSnapshot = ${guard};`,
+          "  return useDemoSnapshot;",
+          "}"
+        ].join("\n"),
+        (fixture) =>
+          assertImportMetaContract(
+            fixture,
+            "features/trades/TradeChartView.tsx"
+          ),
+        ".tsx"
+      )
+    ).toThrow("architecture Trades");
   });
 
   it.each([

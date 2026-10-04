@@ -57,8 +57,10 @@ export function TradeChartView({
 }: Props) {
   const { t, i18n } = useTranslation();
   const locale: Locale = i18n.resolvedLanguage === "en" ? "en" : "zh-TW";
+  const useDemoSnapshot =
+    import.meta.env.DEV === true && snapshot === undefined && demoMode;
   const data =
-    snapshot === undefined ? (demoMode ? demoTradeSnapshot : null) : snapshot;
+    snapshot === undefined ? (useDemoSnapshot ? demoTradeSnapshot : null) : snapshot;
   const [selectedTradeId, setSelectedTradeId] = useState<string | null>(
     initialTradeId ?? null
   );

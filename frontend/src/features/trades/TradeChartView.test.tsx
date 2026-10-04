@@ -149,6 +149,15 @@ describe("TradeChartView", () => {
     ).toBeNull();
   });
 
+  it("does not let the development demo override an explicit null snapshot", () => {
+    render(<TradeChartView demoMode theme="dark" snapshot={null} />);
+
+    expect(screen.getByText("尚未連接正式 K 線資料")).toBeTruthy();
+    expect(
+      screen.queryByLabelText("顯示策略進出場標記的互動式 K 線圖")
+    ).toBeNull();
+  });
+
   it("shows zero trades without hiding valid candles", async () => {
     render(
       <TradeChartView
