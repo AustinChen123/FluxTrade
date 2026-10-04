@@ -469,9 +469,11 @@ const expectedRelativeImportLedger = [
   "features/trades/tradeCharts.ts|../../shared/theme|type-only|shared/theme.ts",
   "features/trades/tradeCharts.ts|../../shared/time/presentation|value|shared/time/presentation.ts",
   "features/trades/tradeCharts.ts|./tradeModel|type-only|features/trades/tradeModel.ts",
+  "features/trades/TradeChartView.test.tsx|../../api|type-only|api.ts",
   "features/trades/TradeChartView.test.tsx|../../shared/i18n|value|shared/i18n.ts",
   "features/trades/TradeChartView.test.tsx|./demo|value|features/trades/demo.ts",
   "features/trades/TradeChartView.test.tsx|./TradeChartView|value|features/trades/TradeChartView.tsx",
+  "features/trades/TradeChartView.test.tsx|./useBacktestTrades|type-only|features/trades/useBacktestTrades.ts",
   "features/trades/TradeChartView.tsx|../../shared/format/decimal|value|shared/format/decimal.ts",
   "features/trades/TradeChartView.tsx|../../shared/i18n|type-only|shared/i18n.ts",
   "features/trades/TradeChartView.tsx|../../shared/theme|type-only|shared/theme.ts",
@@ -480,6 +482,7 @@ const expectedRelativeImportLedger = [
   "features/trades/TradeChartView.tsx|./demo|value|features/trades/demo.ts",
   "features/trades/TradeChartView.tsx|./tradeCharts|value|features/trades/tradeCharts.ts",
   "features/trades/TradeChartView.tsx|./tradeModel|value|features/trades/tradeModel.ts",
+  "features/trades/TradeChartView.tsx|./useBacktestTrades|value|features/trades/useBacktestTrades.ts",
   "features/trades/tradeModel.test.ts|../../api|type-only|api.ts",
   "features/trades/tradeModel.test.ts|./tradeModel|value|features/trades/tradeModel.ts",
   "features/trades/tradeModel.ts|../../api|type-only|api.ts",
@@ -3517,7 +3520,8 @@ describe("frontend architecture ratchet", () => {
       "./CandlestickChart|value|features/trades/CandlestickChart.tsx",
       "./demo|value|features/trades/demo.ts",
       "./tradeCharts|value|features/trades/tradeCharts.ts",
-      "./tradeModel|value|features/trades/tradeModel.ts"
+      "./tradeModel|value|features/trades/tradeModel.ts",
+      "./useBacktestTrades|value|features/trades/useBacktestTrades.ts"
     ]);
 
     expect(modelSource.getText()).not.toMatch(

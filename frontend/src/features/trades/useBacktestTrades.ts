@@ -130,6 +130,7 @@ export function useBacktestTrades({
 }: UseBacktestTradesInput): {
   state: BacktestTradesReadState;
   loadMoreTrades: () => Promise<void>;
+  tradePageLoading: boolean;
 } {
   const currentSelection = useRef({
     resultId: selectedResultId,
@@ -530,5 +531,9 @@ export function useBacktestTrades({
       : { status: candleRead.status, resultId: selectedResultId, tradeId: selectedTradeId };
   }
 
-  return { state, loadMoreTrades };
+  return {
+    state,
+    loadMoreTrades,
+    tradePageLoading: pagerBound && pagination.tradePageLoading
+  };
 }

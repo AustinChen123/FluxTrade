@@ -250,6 +250,40 @@ describe("useBacktestTrades", () => {
     });
   });
 
+  it("passes through loading from the shared pager only while the bound page loads", async () => {
+    api.loadBacktestResult.mockResolvedValue(detail("job-A", {
+      trade_page: {
+        items: [firstTrade], total_count: 2, next_cursor: "signed.trade+A"
+      }
+    }));
+    let resolvePage!: (value: {
+      items: BacktestResultsTrade[];
+      next_cursor: string | null;
+      revision: 1;
+    }) => void;
+    api.loadBacktestResultTrades.mockImplementation(() => new Promise((resolve) => {
+      resolvePage = resolve;
+    }));
+    const { result, rerender } = renderHook(
+      ({ enabled }: { enabled: boolean }) => useBacktestTrades({
+        selectedResultId: "job-A", selectedTradeId: null, enabled
+      }),
+      { initialProps: { enabled: true } }
+    );
+    await waitFor(() => expect(result.current.state.status).toBe("selection"));
+    expect(result.current.tradePageLoading).toBe(false);
+
+    await act(async () => { void result.current.loadMoreTrades(); });
+    await waitFor(() => expect(result.current.tradePageLoading).toBe(true));
+
+    rerender({ enabled: false });
+    await waitFor(() => expect(result.current.tradePageLoading).toBe(false));
+    await act(async () => {
+      resolvePage({ items: [secondTrade], next_cursor: null, revision: 1 });
+    });
+    expect(result.current.tradePageLoading).toBe(false);
+  });
+
   it("reports exhausted exact-ID search unavailable and requests no candles", async () => {
     api.loadBacktestResult.mockResolvedValue(detail("job-A", {
       trade_page: {

@@ -224,8 +224,11 @@ export function App() {
           <TradeChartView
             demoMode={demoMode}
             theme={theme}
+            selectedResultId={selectedResultId}
+            selectedTradeId={inspectedTradeId}
             initialTradeId={inspectedTradeId}
             onSelectTrade={(tradeId) => chooseView("trades", tradeId)}
+            onNavigateResults={() => chooseView("results", null)}
           />
         </Suspense>
       )}

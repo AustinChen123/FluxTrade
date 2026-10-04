@@ -113,12 +113,18 @@ vi.mock("../features/trades/TradeChartView", async () => {
   return {
     TradeChartView: ({
       demoMode,
+      selectedResultId,
+      selectedTradeId,
       initialTradeId,
-      onSelectTrade
+      onSelectTrade,
+      onNavigateResults
     }: {
       demoMode: boolean;
+      selectedResultId?: string | null;
+      selectedTradeId?: string | null;
       initialTradeId?: string | null;
       onSelectTrade?: (tradeId: string) => void;
+      onNavigateResults?: () => void;
     }) => {
       const [state, setState] = useState("initial");
       useEffect(() => {
@@ -130,7 +136,10 @@ vi.mock("../features/trades/TradeChartView", async () => {
       return (
         <section
           data-demo={String(demoMode)}
-          data-selected-trade={initialTradeId ?? ""}
+          data-selected-result={selectedResultId ?? ""}
+          data-selected-trade={(selectedTradeId !== undefined
+            ? selectedTradeId
+            : initialTradeId) ?? ""}
           data-testid="trade-chart-view"
         >
           <button
@@ -138,6 +147,9 @@ vi.mock("../features/trades/TradeChartView", async () => {
             onClick={() => onSelectTrade?.("trade-000184")}
           >
             Select mock trade
+          </button>
+          <button type="button" onClick={onNavigateResults}>
+            Back to Results
           </button>
           <button
             type="button"
@@ -319,6 +331,7 @@ describe("GA visualization state", () => {
     render(<App />);
 
     const tradeView = await screen.findByTestId("trade-chart-view");
+    expect(tradeView.getAttribute("data-selected-result")).toBe("job-research-0042");
     expect(tradeView.getAttribute("data-selected-trade")).toBe("trade-000185");
     expect(api.ensureBrowserSession).not.toHaveBeenCalled();
     expect(api.loadEpochs).not.toHaveBeenCalled();
@@ -330,6 +343,22 @@ describe("GA visualization state", () => {
     expect(new URL(window.location.href).searchParams.get("trade")).toBe(
       "trade-000185"
     );
+  });
+
+  it("returns from Trades through the canonical Results navigation with the same result", async () => {
+    window.history.replaceState(
+      {},
+      "",
+      "/?view=trades&result=job-research-0042&trade=trade-000185"
+    );
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Back to Results" }));
+
+    expect(await screen.findByTestId("backtest-results-view")).toBeTruthy();
+    expect(new URL(window.location.href).searchParams.get("view")).toBe("results");
+    expect(new URL(window.location.href).searchParams.get("result")).toBe("job-research-0042");
+    expect(new URL(window.location.href).searchParams.has("trade")).toBe(false);
   });
 
   it("keeps an in-page trade selection in the URL across reload", async () => {
