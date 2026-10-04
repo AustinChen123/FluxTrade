@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import secrets
 import signal
 import threading
 import time
@@ -27,6 +28,7 @@ from src.control_plane import (
     StrategyControlService,
     StrategyStateQueryService,
 )
+from src.control_plane.backtest_results import BacktestResultsQueryService
 from src.control_plane.evaluation_data import RequestEvaluationDataSourceProvider
 from src.control_plane.jobs import JobStore
 from src.control_plane.ops_status_query import OpsStatusQuery
@@ -105,6 +107,11 @@ def build_control_plane_app(
     if job_store is None:
         job_db_path = os.getenv("CONTROL_PLANE_JOB_DB_PATH")
         job_store = SqliteJobStore(job_db_path) if job_db_path else InMemoryJobStore()
+    backtest_results_query_service = BacktestResultsQueryService(
+        db_session_factory,
+        cursor_key=secrets.token_bytes(32),
+        job_lookup=job_store.get,
+    )
     if strategy_loader is None:
         strategy_artifacts_path = os.getenv(
             "STRATEGY_ARTIFACTS_PATH", _DEFAULT_STRATEGY_ARTIFACTS_PATH
@@ -167,6 +174,7 @@ def build_control_plane_app(
         browser_auth=browser_auth,
         profile_query_service=profile_query_service,
         ops_status_query=ops_status_query,
+        backtest_results_query_service=backtest_results_query_service,
         readiness_probe=(
             readiness_probe
             if readiness_probe is not None
