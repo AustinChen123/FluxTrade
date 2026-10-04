@@ -13,6 +13,17 @@ from typing import Any, Callable
 from pydantic import ValidationError
 
 from src.control_plane.backtest_jobs import BacktestJobExecutor
+from src.control_plane.backtest_result_http_contract import (
+    InvalidBacktestResultHttpRequest,
+    parse_job_id,
+    parse_result_query,
+)
+from src.control_plane.backtest_results import (
+    BacktestResultsNotFound,
+    BacktestResultsQueryService,
+    BacktestResultsReadUnavailable,
+    BacktestResultsUnavailable,
+)
 from src.control_plane.browser_auth import (
     BrowserAuthProvider,
     BrowserAuthRejected,
@@ -78,6 +89,7 @@ class ControlPlaneApp:
         readiness_probe: Callable[[], None] | None = None,
         profile_query_service: ProfileQueryService | None = None,
         ops_status_query: OpsStatusQuery | None = None,
+        backtest_results_query_service: BacktestResultsQueryService | None = None,
     ) -> None:
         if api_key == "":
             raise ValueError("api_key must be non-empty when provided")
@@ -92,6 +104,7 @@ class ControlPlaneApp:
         self.readiness_probe = readiness_probe
         self.profile_query_service = profile_query_service
         self.ops_status_query = ops_status_query
+        self.backtest_results_query_service = backtest_results_query_service
 
     def shutdown(self, timeout: float) -> bool:
         """Stop accepting queued work and wait up to ``timeout`` for active jobs."""
@@ -119,8 +132,11 @@ class ControlPlaneApp:
     ) -> HttpResponse:
         method = method.upper()
         parsed_url = urlsplit(path)
+        raw_path = parsed_url.path
         clean_path = parsed_url.path.rstrip("/") or "/"
-        query = parse_qs(parsed_url.query)
+        results_family = _is_backtest_results_path(raw_path)
+        results_path = raw_path if results_family else clean_path
+        query = {} if results_family else parse_qs(parsed_url.query)
 
         if method == "GET" and clean_path == "/health":
             return HttpResponse(200, {"status": "ok"})
@@ -142,7 +158,10 @@ class ControlPlaneApp:
 
         identity = self._authorize(headers)
         if isinstance(identity, HttpResponse):
-            if clean_path in {"/api/v1/auth/session", "/ops/kill-switch"}:
+            if results_family or clean_path in {
+                "/api/v1/auth/session",
+                "/ops/kill-switch",
+            }:
                 return HttpResponse(
                     identity.status_code,
                     identity.body,
@@ -157,9 +176,18 @@ class ControlPlaneApp:
             identity.browser_principal,
         )
         if browser_policy_response is not None:
-            if clean_path == "/ops/kill-switch":
+            if results_family or clean_path == "/ops/kill-switch":
                 return HttpResponse(browser_policy_response.status_code, browser_policy_response.body, headers=(("Cache-Control", "no-store"),))
             return browser_policy_response
+
+        if results_family:
+            return self._handle_backtest_results(
+                method,
+                results_path,
+                parsed_url.query,
+                body,
+                identity,
+            )
 
         if (
             identity.browser_principal is not None
@@ -1012,6 +1040,87 @@ class ControlPlaneApp:
             ),
         )
 
+    def _handle_backtest_results(
+        self,
+        method: str,
+        path: str,
+        raw_query: str,
+        body: str | bytes | None,
+        identity: _RequestIdentity,
+    ) -> HttpResponse:
+        base = "/api/v1/backtest-results"
+        suffix = path[len(base) :]
+        parts = suffix[1:].split("/") if suffix.startswith("/") else []
+        if method != "GET":
+            return _results_response(404, {"error": "not_found"})
+        if not parts:
+            route = "index"
+            raw_job_id = None
+        elif len(parts) == 1:
+            route = "detail"
+            raw_job_id = parts[0]
+        elif len(parts) == 2 and parts[1] in {"trades", "candles"}:
+            route = parts[1]
+            raw_job_id = parts[0]
+        else:
+            return _results_response(404, {"error": "not_found"})
+
+        principal = identity.browser_principal
+        if (
+            principal is None
+            or self.browser_auth is None
+            or not principal.has_capability(self.browser_auth.operator_capability)
+        ):
+            return _results_response(403, {"error": "forbidden"})
+
+        try:
+            if body is not None and not (
+                type(body) is str and body == "" or type(body) is bytes and body == b""
+            ):
+                raise InvalidBacktestResultHttpRequest()
+            encoded_query = raw_query.encode("ascii", errors="strict")
+            query = parse_result_query(route, encoded_query)
+            job_id = (
+                None
+                if raw_job_id is None
+                else parse_job_id(raw_job_id.encode("ascii", errors="strict"))
+            )
+        except (InvalidBacktestResultHttpRequest, UnicodeEncodeError):
+            return _results_response(422, {"error": "validation_error"})
+
+        service = self.backtest_results_query_service
+        if service is None:
+            return _results_response(
+                503, {"error": "browser_result_backend_unavailable"}
+            )
+        try:
+            if route == "index":
+                result = service.list_index(query)
+            elif route == "detail":
+                assert job_id is not None
+                result = service.get_detail(job_id)
+            elif route == "trades":
+                assert job_id is not None
+                result = service.list_trades(job_id, query)
+            else:
+                assert job_id is not None
+                result = service.list_candles(job_id, query)
+        except InvalidBacktestResultHttpRequest:
+            return _results_response(422, {"error": "validation_error"})
+        except BacktestResultsUnavailable:
+            return _results_response(409, {"error": "result_unavailable"})
+        except BacktestResultsNotFound:
+            return _results_response(404, {"error": "result_not_found"})
+        except BacktestResultsReadUnavailable:
+            return _results_response(
+                503, {"error": "browser_result_backend_unavailable"}
+            )
+        except Exception:
+            return _results_response(
+                503, {"error": "browser_result_backend_unavailable"}
+            )
+        return _results_response(200, result)
+
     def _authorize(
         self,
         headers: Mapping[str, str] | None,
@@ -1064,6 +1173,17 @@ def _single_query_value(query: dict[str, list[str]], key: str) -> str | None:
     if not values:
         return None
     return values[0]
+
+
+def _is_backtest_results_path(path: str) -> bool:
+    base = "/api/v1/backtest-results"
+    return path == base or path.startswith(f"{base}/")
+
+
+def _results_response(status_code: int, body: Mapping[str, Any]) -> HttpResponse:
+    return HttpResponse(
+        status_code, dict(body), headers=(("Cache-Control", "no-store"),)
+    )
 
 
 def _extract_api_key(headers: Mapping[str, str] | None) -> str | None:
