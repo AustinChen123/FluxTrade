@@ -24,11 +24,30 @@ const lifecycles = vi.hoisted(() => ({
   strategies: { mounts: 0, unmounts: 0 },
   trades: { mounts: 0, unmounts: 0 }
 }));
+const invalidation = vi.hoisted(() => ({ autoRefresh: false, enabled: [] as boolean[] }));
 
 vi.mock("../api", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../api")>()),
   ...api
 }));
+vi.mock("./researchInvalidation", async () => {
+  const React = await import("react");
+  return {
+    ResearchInvalidationBridge: ({
+      enabled,
+      onInvalidate
+    }: {
+      enabled: boolean;
+      onInvalidate: () => void;
+    }) => {
+      React.useEffect(() => {
+        invalidation.enabled.push(enabled);
+        if (enabled && invalidation.autoRefresh) void onInvalidate();
+      }, [enabled, onInvalidate]);
+      return null;
+    }
+  };
+});
 
 vi.mock("../shared/charts/EChart", () => ({
   EChart: ({
@@ -273,6 +292,8 @@ const storage = new Map<string, string>();
 describe("GA visualization state", () => {
   beforeEach(async () => {
     vi.clearAllMocks();
+    invalidation.autoRefresh = false;
+    invalidation.enabled.length = 0;
     for (const lifecycle of Object.values(lifecycles)) {
       lifecycle.mounts = 0;
       lifecycle.unmounts = 0;
@@ -515,6 +536,31 @@ describe("GA visualization state", () => {
     expect(api.loadEpochs).toHaveBeenCalledTimes(1);
   });
 
+  it("opens one root stream only for visible non-demo research", async () => {
+    window.history.replaceState({}, "", "/?view=results");
+    api.loadGenerationSummaries.mockResolvedValue([summary]);
+    api.loadGenerationGenes.mockResolvedValue([gene("epoch-a")]);
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("button", { name: "參數研究" }));
+    await screen.findAllByText("candidate-epoch-a");
+    await waitFor(() => expect(invalidation.enabled.at(-1)).toBe(true));
+    fireEvent.click(screen.getByRole("button", { name: "策略管理" }));
+    await screen.findByTestId("strategy-manager");
+    await waitFor(() => expect(invalidation.enabled.at(-1)).toBe(false));
+    fireEvent.click(screen.getByRole("button", { name: "參數研究" }));
+    await waitFor(() => expect(invalidation.enabled.at(-1)).toBe(true));
+
+    cleanup();
+    window.history.replaceState({}, "", "/?demo=1");
+    vi.clearAllMocks();
+    invalidation.enabled.length = 0;
+    render(<App />);
+    await screen.findByText("golden_cross_research");
+    expect(invalidation.enabled).not.toContain(true);
+    expect(api.loadEpochs).not.toHaveBeenCalled();
+  });
+
   it("keeps the selected console page in the URL", async () => {
     api.loadGenerationSummaries.mockResolvedValue([summary]);
     api.loadGenerationGenes.mockResolvedValue([gene("epoch-a")]);
@@ -555,7 +601,8 @@ describe("GA visualization state", () => {
     expect(window.location.hash).toBe("#anchor");
   });
 
-  it("does not reload research data after visiting trade inspection", async () => {
+  it("refreshes authoritative research data after visiting trade inspection", async () => {
+    invalidation.autoRefresh = true;
     api.loadGenerationSummaries.mockResolvedValue([summary]);
     api.loadGenerationGenes.mockResolvedValue([gene("epoch-a")]);
     render(<App />);
@@ -566,12 +613,13 @@ describe("GA visualization state", () => {
     fireEvent.click(screen.getByRole("button", { name: "參數研究" }));
     await screen.findAllByText("candidate-epoch-a");
 
-    expect(api.loadEpochs).toHaveBeenCalledTimes(1);
-    expect(api.loadGenerationSummaries).toHaveBeenCalledTimes(1);
-    expect(api.loadGenerationGenes).toHaveBeenCalledTimes(1);
+    expect(api.loadEpochs).toHaveBeenCalledTimes(3);
+    expect(api.loadGenerationSummaries).toHaveBeenCalledTimes(3);
+    expect(api.loadGenerationGenes).toHaveBeenCalledTimes(3);
   });
 
-  it("does not reload research data when returning from strategy management", async () => {
+  it("refreshes authoritative research data when returning from strategy management", async () => {
+    invalidation.autoRefresh = true;
     const genes = deferred<Gene[]>();
     api.loadGenerationSummaries.mockResolvedValue([summary]);
     api.loadGenerationGenes.mockReturnValue(genes.promise);
@@ -583,9 +631,10 @@ describe("GA visualization state", () => {
     fireEvent.click(screen.getByRole("button", { name: "參數研究" }));
 
     expect(screen.getByText("讀取研究快照")).toBeTruthy();
-    expect(api.loadEpochs).toHaveBeenCalledTimes(1);
-    expect(api.loadGenerationSummaries).toHaveBeenCalledTimes(1);
-    expect(api.loadGenerationGenes).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(api.loadEpochs).toHaveBeenCalledTimes(3));
+    expect(api.loadEpochs).toHaveBeenCalledTimes(3);
+    expect(api.loadGenerationSummaries).toHaveBeenCalledTimes(3);
+    expect(api.loadGenerationGenes).toHaveBeenCalledTimes(3);
 
     genes.resolve([gene("epoch-a")]);
     await screen.findAllByText("candidate-epoch-a");

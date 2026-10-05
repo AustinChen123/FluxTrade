@@ -79,6 +79,7 @@ function workspace(
     yParameter: "slow",
     surfaceMode: "2d",
     loading: false,
+    ready: true,
     error: null,
     model: buildResearchModel(epoch, [gene], gene.id),
     chooseEpoch: vi.fn(),
@@ -88,6 +89,7 @@ function workspace(
     chooseYParameter: vi.fn(),
     chooseSurfaceMode: vi.fn(),
     retry: vi.fn(),
+    refresh: vi.fn().mockResolvedValue(undefined),
     ...overrides
   };
 }

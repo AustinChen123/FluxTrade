@@ -117,6 +117,22 @@ describe("ResearchRoute", () => {
 
   afterEach(cleanup);
 
+  it("offers a manual full refresh for visible research", async () => {
+    render(
+      <ResearchRoute visible demoMode={false} theme="light">
+        {({ toolbar, content }) => <>{toolbar}{content}</>}
+      </ResearchRoute>
+    );
+    await screen.findAllByText("candidate");
+    expect(api.loadEpochs).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "重新整理研究資料" }));
+
+    await waitFor(() => expect(api.loadEpochs).toHaveBeenCalledTimes(2));
+    expect(api.loadGenerationSummaries).toHaveBeenCalledTimes(2);
+    expect(api.loadGenerationGenes).toHaveBeenCalledTimes(2);
+  });
+
   it("keeps the request owner mounted while both hidden slots are null", async () => {
     const epochs = deferred<Epoch[]>();
     api.loadEpochs.mockReturnValue(epochs.promise);

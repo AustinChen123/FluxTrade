@@ -60,6 +60,7 @@ type ArchitectureRole =
   | "vite-env"
   | "app-navigation"
   | "app-shell"
+  | "research-stream"
   | "research-io"
   | "strategy-io"
   | "results-io"
@@ -81,7 +82,8 @@ type ArchitectureRole =
   | "playwright-config"
   | "toolchain-test"
   | "e2e-fixture"
-  | "e2e-test";
+  | "e2e-test"
+  | "e2e-real-test";
 
 const frontendRoot = process.cwd();
 const sourceRoot = path.resolve(process.cwd(), "src");
@@ -120,6 +122,8 @@ const expectedInventory = [
   "app/App.tsx",
   "app/navigation.test.ts",
   "app/navigation.ts",
+  "app/researchInvalidation.test.ts",
+  "app/researchInvalidation.ts",
   "architecture.test.ts",
   "features/research/FitnessSurface3D.test.tsx",
   "features/research/FitnessSurface3D.tsx",
@@ -203,11 +207,13 @@ const expectedInventorySet = new Set<string>(expectedInventory);
 
 const expectedE2eInventory = [
   "e2e/console-smoke.e2e.ts",
-  "e2e/fixtures.ts"
+  "e2e/fixtures.ts",
+  "e2e/research-invalidation-real.e2e.ts"
 ] as const;
 
 const expectedRootExecutableInventory = [
   "playwright.config.ts",
+  "playwright.integration.config.ts",
   "toolchain-contract.test.js",
   "vite.config.ts"
 ] as const;
@@ -216,7 +222,10 @@ const expectedOutsideImportLedger = [
   "e2e/console-smoke.e2e.ts|./fixtures|value|e2e/fixtures.ts",
   "e2e/console-smoke.e2e.ts|@playwright/test|value|@playwright/test",
   "e2e/fixtures.ts|../src/api|type-only|src/api.ts",
+  "e2e/research-invalidation-real.e2e.ts|@playwright/test|value|@playwright/test",
+  "e2e/research-invalidation-real.e2e.ts|node:fs|value|node:fs",
   "playwright.config.ts|@playwright/test|value|@playwright/test",
+  "playwright.integration.config.ts|@playwright/test|value|@playwright/test",
   "toolchain-contract.test.js|./e2e/fixtures.ts|value|e2e/fixtures.ts",
   "toolchain-contract.test.js|./playwright.config.ts|value|playwright.config.ts",
   "toolchain-contract.test.js|node:child_process|value|node:child_process",
@@ -234,10 +243,15 @@ const expectedBareImportLedger = [
   "app/App.test.tsx|react|value",
   "app/App.test.tsx|react|value",
   "app/App.test.tsx|react|value",
+  "app/App.test.tsx|react|value",
   "app/App.test.tsx|vitest|value",
   "app/App.tsx|react-i18next|value",
   "app/App.tsx|react|value",
   "app/navigation.test.ts|vitest|value",
+  "app/researchInvalidation.test.ts|@testing-library/react|value",
+  "app/researchInvalidation.test.ts|react|value",
+  "app/researchInvalidation.test.ts|vitest|value",
+  "app/researchInvalidation.ts|react|value",
   "architecture.test.ts|node:fs|value",
   "architecture.test.ts|node:path|value",
   "architecture.test.ts|typescript/unstable/ast|value",
@@ -340,7 +354,9 @@ const expectedRelativeImportLedger = [
   "app/App.tsx|../shared/i18n|type-only|shared/i18n.ts",
   "app/App.tsx|../shared/theme|value|shared/theme.ts",
   "app/App.tsx|./navigation|value|app/navigation.ts",
+  "app/App.tsx|./researchInvalidation|value|app/researchInvalidation.ts",
   "app/navigation.test.ts|./navigation|value|app/navigation.ts",
+  "app/researchInvalidation.test.ts|./researchInvalidation|value|app/researchInvalidation.ts",
   "features/research/demo.test.ts|./demo|value|features/research/demo.ts",
   "features/research/demo.ts|./gaDomain|type-only|features/research/gaDomain.ts",
   "features/research/FitnessSurface3D.test.tsx|./FitnessSurface3D|value|features/research/FitnessSurface3D.tsx",
@@ -527,6 +543,7 @@ const expectedPolicyGlobalLedger = [
   "app/App.tsx|window.location.href",
   "app/App.tsx|window.location.href",
   "app/App.tsx|window.location.search",
+  "app/researchInvalidation.ts|fetch()",
   "features/research/FitnessSurface3D.tsx|window.devicePixelRatio",
   "features/results/BacktestResultsView.tsx|import.meta.env.DEV",
   "features/strategies/useStrategyManager.ts|window.confirm()",
@@ -1079,6 +1096,7 @@ function architectureRole(importer: string): ArchitectureRole {
   if (importer === "vite-env.d.ts") return "vite-env";
   if (importer === "app/navigation.ts") return "app-navigation";
   if (importer === "app/App.tsx") return "app-shell";
+  if (importer === "app/researchInvalidation.ts") return "research-stream";
   if (importer === "features/research/useResearchWorkspace.ts") {
     return "research-io";
   }
@@ -1100,10 +1118,13 @@ function architectureRole(importer: string): ArchitectureRole {
     return "locale-resource-test";
   }
   if (importer === "vite.config.ts") return "vite-config";
-  if (importer === "playwright.config.ts") return "playwright-config";
+  if (new Set(["playwright.config.ts", "playwright.integration.config.ts"]).has(importer)) {
+    return "playwright-config";
+  }
   if (importer === "toolchain-contract.test.js") return "toolchain-test";
   if (importer === "e2e/fixtures.ts") return "e2e-fixture";
   if (importer === "e2e/console-smoke.e2e.ts") return "e2e-test";
+  if (importer === "e2e/research-invalidation-real.e2e.ts") return "e2e-real-test";
   if (
     expectedInventorySet.has(importer) &&
     /\.test\.[jt]sx?$/u.test(importer)
@@ -1154,6 +1175,10 @@ const outsideEdgeKeysByRole: Partial<
   "e2e-test": new Set([
     "./fixtures|value|e2e/fixtures.ts",
     "@playwright/test|value|@playwright/test"
+  ]),
+  "e2e-real-test": new Set([
+    "@playwright/test|value|@playwright/test",
+    "node:fs|value|node:fs"
   ])
 };
 
@@ -1194,7 +1219,8 @@ function assertBareEdge(edge: ImportEdge, role: ArchitectureRole): void {
       "playwright-config",
       "toolchain-test",
       "e2e-fixture",
-      "e2e-test"
+      "e2e-test",
+      "e2e-real-test"
     ].includes(role)
   ) {
     assertOutsideEdge(edge, role);
@@ -1218,7 +1244,10 @@ function assertBareEdge(edge: ImportEdge, role: ArchitectureRole): void {
     if (!allowedTestPackages.has(edge.specifier)) denyEdge(edge);
     if (
       edge.specifier === "react" &&
-      edge.importer !== "app/App.test.tsx"
+      !new Set([
+        "app/App.test.tsx",
+        "app/researchInvalidation.test.ts"
+      ]).has(edge.importer)
     ) {
       denyEdge(edge);
     }
@@ -1226,6 +1255,7 @@ function assertBareEdge(edge: ImportEdge, role: ArchitectureRole): void {
       edge.specifier === "@testing-library/react" &&
       !new Set([
         "app/App.test.tsx",
+        "app/researchInvalidation.test.ts",
         "features/research/FitnessSurface3D.test.tsx",
         "features/research/ResearchPage.test.tsx",
         "features/research/ResearchRoute.test.tsx",
@@ -1256,6 +1286,7 @@ function assertBareEdge(edge: ImportEdge, role: ArchitectureRole): void {
   const exactByRole: Partial<Record<ArchitectureRole, ReadonlySet<string>>> = {
     main: new Set(["react|value", "react-dom/client|value"]),
     "app-shell": new Set(["react|value", "react-i18next|value"]),
+    "research-stream": new Set(["react|value"]),
     "research-io": new Set(["react|value"]),
     "strategy-io": new Set(["react|value", "react-i18next|type-only"]),
     "results-io": new Set(["react|value"]),
@@ -1333,9 +1364,10 @@ function assertRepositoryEdge(edge: ImportEdge, role: ArchitectureRole): void {
     [
       "vite-config",
       "playwright-config",
-      "toolchain-test",
-      "e2e-fixture",
-      "e2e-test"
+    "toolchain-test",
+    "e2e-fixture",
+    "e2e-test",
+    "e2e-real-test"
     ].includes(role)
   ) {
     assertOutsideEdge(edge, role);
@@ -1366,6 +1398,7 @@ function assertRepositoryEdge(edge: ImportEdge, role: ArchitectureRole): void {
     if (
       !new Set([
         "app/navigation.ts",
+        "app/researchInvalidation.ts",
         "features/research/ResearchRoute.tsx",
         "features/results/BacktestResultsView.tsx",
         "features/strategies/StrategyManager.tsx",
@@ -1378,6 +1411,7 @@ function assertRepositoryEdge(edge: ImportEdge, role: ArchitectureRole): void {
     }
     return;
   }
+  if (role === "research-stream") denyEdge(edge);
   if (role === "research-io" || role === "strategy-io") {
     if (
       !isSameFeature(edge.importer, edge.resolved) &&
@@ -1655,6 +1689,7 @@ function collectPolicyGlobalUses(): PolicyGlobalUse[] {
 }
 
 const allowedPolicyGlobals = new Map<string, ReadonlySet<string>>([
+  ["app/researchInvalidation.ts", new Set(["fetch()"])],
   ["api.ts", new Set(["fetch()"])],
   ["main.tsx", new Set(["document.getElementById()"])],
   [
@@ -2083,9 +2118,11 @@ function assertCurrentArchitecture(): void {
   for (const importer of [
     "vite.config.ts",
     "playwright.config.ts",
+    "playwright.integration.config.ts",
     "toolchain-contract.test.js",
     "e2e/fixtures.ts",
-    "e2e/console-smoke.e2e.ts"
+    "e2e/console-smoke.e2e.ts",
+    "e2e/research-invalidation-real.e2e.ts"
   ]) {
     assertOutsideEdgeSet(importer, outsideEdges);
   }
@@ -2152,9 +2189,11 @@ describe("frontend architecture ratchet", () => {
     for (const importer of [
       "vite.config.ts",
       "playwright.config.ts",
+      "playwright.integration.config.ts",
       "toolchain-contract.test.js",
       "e2e/fixtures.ts",
-      "e2e/console-smoke.e2e.ts"
+      "e2e/console-smoke.e2e.ts",
+      "e2e/research-invalidation-real.e2e.ts"
     ]) {
       expect(() => assertOutsideEdgeSet(importer, edges)).not.toThrow();
     }
@@ -2165,9 +2204,11 @@ describe("frontend architecture ratchet", () => {
     for (const importer of [
       "vite.config.ts",
       "playwright.config.ts",
+      "playwright.integration.config.ts",
       "toolchain-contract.test.js",
       "e2e/console-smoke.e2e.ts",
-      "e2e/fixtures.ts"
+      "e2e/fixtures.ts",
+      "e2e/research-invalidation-real.e2e.ts"
     ]) {
       const owned = edges.filter((edge) => edge.importer === importer);
       if (importer === "toolchain-contract.test.js") {
@@ -2277,6 +2318,7 @@ describe("frontend architecture ratchet", () => {
     ["vite-env.d.ts", "vite-env"],
     ["app/navigation.ts", "app-navigation"],
     ["app/App.tsx", "app-shell"],
+    ["app/researchInvalidation.ts", "research-stream"],
     ["features/research/useResearchWorkspace.ts", "research-io"],
     ["features/strategies/useStrategyManager.ts", "strategy-io"],
     ["features/results/useBacktestResults.ts", "results-io"],
@@ -2298,7 +2340,8 @@ describe("frontend architecture ratchet", () => {
     ["playwright.config.ts", "playwright-config"],
     ["toolchain-contract.test.js", "toolchain-test"],
     ["e2e/fixtures.ts", "e2e-fixture"],
-    ["e2e/console-smoke.e2e.ts", "e2e-test"]
+    ["e2e/console-smoke.e2e.ts", "e2e-test"],
+    ["e2e/research-invalidation-real.e2e.ts", "e2e-real-test"]
   ] as const)("classifies %s as the exact %s role", (importer, role) => {
     expect(architectureRole(importer)).toBe(role);
   });
@@ -2327,6 +2370,11 @@ describe("frontend architecture ratchet", () => {
       "app/App.tsx",
       "../features/research/ResearchRoute",
       "features/research/ResearchRoute.tsx"
+    ),
+    architectureEdge(
+      "app/App.tsx",
+      "./researchInvalidation",
+      "app/researchInvalidation.ts"
     ),
     architectureEdge(
       "features/research/useResearchWorkspace.ts",
@@ -2471,6 +2519,7 @@ describe("frontend architecture ratchet", () => {
 
   it.each([
     architectureEdge("main.tsx", "./features/research/gaDomain", "features/research/gaDomain.ts"),
+    architectureEdge("app/researchInvalidation.ts", "../../api", "api.ts"),
     architectureEdge("api.ts", "./shared/time/utc", "shared/time/utc.ts"),
     architectureEdge("vite-env.d.ts", "react", "react"),
     architectureEdge("app/navigation.ts", "../api", "api.ts"),
@@ -2747,7 +2796,8 @@ describe("frontend architecture ratchet", () => {
       "../features/trades/TradeChartView|value|features/trades/TradeChartView.tsx",
       "../shared/i18n|type-only|shared/i18n.ts",
       "../shared/theme|value|shared/theme.ts",
-      "./navigation|value|app/navigation.ts"
+      "./navigation|value|app/navigation.ts",
+      "./researchInvalidation|value|app/researchInvalidation.ts"
     ]);
     expect(directRelativeSpecifiers(edges, "features/research/gaDomain.ts")).toEqual([
       "../../api|type-only|api.ts"
@@ -3322,7 +3372,7 @@ describe("frontend architecture ratchet", () => {
         (node) =>
           isIdentifier(node.expression) && node.expression.text === "useEffect"
       )
-    ).toHaveLength(4);
+    ).toHaveLength(5);
     expect(
       workspaceCalls.filter(
         (node) =>

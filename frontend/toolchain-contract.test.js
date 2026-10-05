@@ -67,19 +67,19 @@ const EXPECTED_NON_ZERO_COUNTS = {
   "direct-navigation:dev:strategies": { S: 2, T: 2 },
   "direct-navigation:production:strategies": { S: 1, T: 1 },
   "direct-navigation:production:trades": { S: 2, RD: 1, RC: 1 },
-  "research-cache:dev:main": { S: 4, E: 2, A: 1, a: 1, T: 2 },
-  "research-cache:production:main": { S: 2, E: 1, A: 1, a: 1, T: 1 },
+  "research-cache:dev:main": { S: 4, E: 2, A: 1, a: 1, T: 2, I: 2 },
+  "research-cache:production:main": { S: 2, E: 1, A: 1, a: 1, T: 1, I: 2 },
   "navigation-serialization:dev:main": { S: 2, T: 2 },
   "demo-production-denied:production:results": { S: 1, RI: 1 },
   "demo-production-denied:production:trades": { S: 2, RD: 1, RC: 1 },
   "strategy-command:dev:main": { S: 2, T: 3, C: 1 },
   "strategy-command:production:main": { S: 1, T: 2, C: 1 },
-  "locale-theme-reload:dev:main": { S: 4, E: 4, A: 2, a: 2 },
-  "locale-theme-reload:production:main": { S: 2, E: 2, A: 2, a: 2 },
+  "locale-theme-reload:dev:main": { S: 4, E: 4, A: 2, a: 2, I: 2 },
+  "locale-theme-reload:production:main": { S: 2, E: 2, A: 2, a: 2, I: 2 },
   "lazy-chunk-inventory:dev:main": { S: 4, T: 4 },
-  "lazy-chunk-inventory:production:main": { S: 5, E: 1, A: 1, a: 1, T: 2, RI: 2 },
-  "responsive-overflow:dev:research": { S: 2, E: 2, A: 1, a: 1 },
-  "responsive-overflow:production:research": { S: 1, E: 1, A: 1, a: 1 },
+  "lazy-chunk-inventory:production:main": { S: 5, E: 1, A: 1, a: 1, T: 2, RI: 2, I: 5 },
+  "responsive-overflow:dev:research": { S: 2, E: 2, A: 1, a: 1, I: 1 },
+  "responsive-overflow:production:research": { S: 1, E: 1, A: 1, a: 1, I: 1 },
   "responsive-overflow:production:results": { S: 1, RI: 1 },
   "responsive-overflow:dev:strategies": { S: 2, T: 2 },
   "responsive-overflow:production:strategies": { S: 1, T: 1 },
@@ -90,7 +90,8 @@ const EXPECTED_NON_ZERO_COUNTS = {
     A: 1,
     B: 1,
     a: 1,
-    b: 1
+    b: 1,
+    I: 1
   },
   "berlin-presentation-time:dev:demo-features": { S: 2, T: 2 },
   "production-results-flow:production:main": {
@@ -358,7 +359,7 @@ export function validateToolchain(snapshot) {
         "undici-types"
       ] !== "~6.20.0" ||
       snapshot.tsconfigBytes !==
-        '{\n  "extends": "./tsconfig.json",\n  "compilerOptions": {\n    "types": ["node"],\n    "skipLibCheck": false\n  },\n  "include": ["playwright.config.ts", "e2e/**/*.ts"]\n}\n'
+        '{\n  "extends": "./tsconfig.json",\n  "compilerOptions": {\n    "types": ["node"],\n    "skipLibCheck": false\n  },\n  "include": [\n    "playwright.config.ts",\n    "playwright.integration.config.ts",\n    "e2e/**/*.ts"\n  ]\n}\n'
     ) {
       return INVALID;
     }
@@ -371,6 +372,7 @@ export function validateToolchain(snapshot) {
     if (
       config.testDir !== "./e2e" ||
       config.testMatch !== "**/*.e2e.ts" ||
+      !same(config.testIgnore, ["research-invalidation-real.e2e.ts"]) ||
       config.outputDir !== "test-results" ||
       config.fullyParallel !== false ||
       config.workers !== 1 ||
@@ -439,11 +441,12 @@ export function validateToolchain(snapshot) {
         RD: 0,
         RT: 0,
         RC: 0,
+        I: 0,
         ...(EXPECTED_NON_ZERO_COUNTS[key] ?? {})
       };
       if (
         !counts ||
-        !same(Object.keys(counts), ["S", "P", "E", "A", "B", "a", "b", "T", "C", "RI", "RD", "RT", "RC"]) ||
+        !same(Object.keys(counts), ["S", "P", "E", "A", "B", "a", "b", "T", "C", "RI", "RD", "RT", "RC", "I"]) ||
         !same(counts, expectedCounts) ||
         Object.values(counts).some(
           (count) => !Number.isInteger(count) || count < 0

@@ -3,6 +3,7 @@ import { defineConfig } from "@playwright/test";
 export default defineConfig({
   testDir: "./e2e",
   testMatch: "**/*.e2e.ts",
+  testIgnore: ["research-invalidation-real.e2e.ts"],
   outputDir: "test-results",
   reporter: [
     ["list"],

@@ -83,7 +83,7 @@ function deferred<T>() {
 
 describe("useResearchWorkspace", () => {
   beforeEach(() => {
-    vi.clearAllMocks();
+    vi.resetAllMocks();
     api.ensureBrowserSession.mockResolvedValue(undefined);
     api.loadEpochs.mockResolvedValue([epoch("a"), epoch("b")]);
     api.loadGenerationSummaries.mockResolvedValue([summary]);
@@ -136,6 +136,303 @@ describe("useResearchWorkspace", () => {
     expect(result.current.selectedGeneId).toBe(1);
     expect(result.current.xParameter).toBe("fast");
     expect(result.current.yParameter).toBe("slow");
+  });
+
+  it("refreshes the complete snapshot while preserving valid selections", async () => {
+    const generations = [summary, { ...summary, generation_index: 1 }];
+    api.loadGenerationSummaries
+      .mockResolvedValueOnce(generations)
+      .mockResolvedValueOnce(generations.map((item) => ({ ...item, score_max: "2" })));
+    api.loadGenerationGenes.mockImplementation(
+      (_epochId: string, generationIndex: number) =>
+        Promise.resolve([
+          {
+            ...gene("a"),
+            id: 1,
+            generation_index: generationIndex,
+            score_total: api.loadGenerationGenes.mock.calls.length > 2 ? "9" : "1"
+          },
+          {
+            ...gene("a"),
+            id: 2,
+            generation_index: generationIndex,
+            score_total: api.loadGenerationGenes.mock.calls.length > 2 ? "8" : "2"
+          }
+        ])
+    );
+    const { result } = renderHook(() => useResearchWorkspace(false));
+    await waitFor(() => expect(result.current.genes).toHaveLength(2));
+    act(() => result.current.chooseGeneration(0));
+    await waitFor(() => expect(result.current.generationIndex).toBe(0));
+    act(() => {
+      result.current.chooseGene(1);
+      result.current.chooseXParameter("fast");
+      result.current.chooseYParameter("slow");
+    });
+    await waitFor(() => expect(result.current.selectedGeneId).toBe(1));
+
+    await act(async () => result.current.refresh());
+
+    expect(api.loadEpochs).toHaveBeenCalledTimes(2);
+    expect(api.loadGenerationSummaries).toHaveBeenLastCalledWith("a");
+    expect(api.loadGenerationGenes).toHaveBeenLastCalledWith("a", 0);
+    expect(result.current.epochId).toBe("a");
+    expect(result.current.generationIndex).toBe(0);
+    expect(result.current.selectedGeneId).toBe(1);
+    expect(result.current.xParameter).toBe("fast");
+    expect(result.current.yParameter).toBe("slow");
+    expect(result.current.genes[0]?.score_total).toBe("9");
+    expect(result.current.summaries[0]?.score_max).toBe("2");
+  });
+
+  it("keeps an initial gene request from overwriting a newer in-flight refresh", async () => {
+    const initialGenes = deferred<Gene[]>();
+    const refreshedGenes = deferred<Gene[]>();
+    api.loadGenerationGenes
+      .mockReturnValueOnce(initialGenes.promise)
+      .mockReturnValueOnce(refreshedGenes.promise);
+    const { result } = renderHook(() => useResearchWorkspace(false));
+    await waitFor(() => expect(api.loadGenerationGenes).toHaveBeenCalledTimes(1));
+
+    let refresh!: Promise<void>;
+    act(() => { refresh = result.current.refresh(); });
+    await waitFor(() => expect(api.loadGenerationGenes).toHaveBeenCalledTimes(2));
+    expect(result.current.loading).toBe(true);
+
+    await act(async () => {
+      initialGenes.resolve([{ ...gene("a"), score_total: "1" }]);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const staleState = {
+      genes: result.current.genes,
+      loading: result.current.loading,
+      error: result.current.error
+    };
+    await act(async () => {
+      refreshedGenes.resolve([{ ...gene("a"), score_total: "9" }]);
+      await refresh;
+    });
+
+    expect(staleState).toEqual({ genes: [], loading: true, error: null });
+    expect(result.current.genes[0]?.score_total).toBe("9");
+    expect(result.current.loading).toBe(false);
+  });
+
+  it("keeps a pending selection summary from replacing a newer refresh", async () => {
+    const staleSummary = deferred<GenerationSummary[]>();
+    let selectedEpochCalls = 0;
+    api.loadGenerationSummaries.mockImplementation((epochId: string) => {
+      if (epochId !== "b") return Promise.resolve([summary]);
+      selectedEpochCalls += 1;
+      return selectedEpochCalls === 1
+        ? staleSummary.promise
+        : Promise.resolve([{ ...summary, score_max: "9" }]);
+    });
+    const { result } = renderHook(() => useResearchWorkspace(false));
+    await waitFor(() => expect(result.current.genes).toEqual([gene("a")]));
+
+    act(() => result.current.chooseEpoch("b"));
+    await waitFor(() => expect(selectedEpochCalls).toBe(1));
+    await act(async () => result.current.refresh());
+    expect(result.current.summaries[0]?.score_max).toBe("9");
+
+    await act(async () => {
+      staleSummary.resolve([{ ...summary, score_max: "1" }]);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(result.current.epochId).toBe("b");
+    expect(result.current.summaries[0]?.score_max).toBe("9");
+    expect(result.current.error).toBeNull();
+  });
+
+  it("ignores a pending selection failure after a newer refresh completes", async () => {
+    const staleSummary = deferred<GenerationSummary[]>();
+    let selectedEpochCalls = 0;
+    api.loadGenerationSummaries.mockImplementation((epochId: string) => {
+      if (epochId !== "b") return Promise.resolve([summary]);
+      selectedEpochCalls += 1;
+      return selectedEpochCalls === 1
+        ? staleSummary.promise
+        : Promise.resolve([{ ...summary, score_max: "9" }]);
+    });
+    const { result } = renderHook(() => useResearchWorkspace(false));
+    await waitFor(() => expect(result.current.genes).toEqual([gene("a")]));
+
+    act(() => result.current.chooseEpoch("b"));
+    await waitFor(() => expect(selectedEpochCalls).toBe(1));
+    await act(async () => result.current.refresh());
+    expect(result.current.summaries[0]?.score_max).toBe("9");
+
+    await act(async () => {
+      staleSummary.reject(new Error("obsolete selection summary"));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(result.current.epochId).toBe("b");
+    expect(result.current.summaries[0]?.score_max).toBe("9");
+    expect(result.current.error).toBeNull();
+    expect(result.current.loading).toBe(false);
+  });
+
+  it("retries an epoch-stage full-refresh failure even when epochs were loaded", async () => {
+    const refreshedEpochs = [epoch("a"), epoch("b")];
+    api.loadEpochs
+      .mockResolvedValueOnce([epoch("a"), epoch("b")])
+      .mockRejectedValueOnce(new Error("refresh epochs failed"))
+      .mockResolvedValueOnce(refreshedEpochs);
+    const { result } = renderHook(() => useResearchWorkspace(false));
+    await waitFor(() => expect(result.current.genes).toEqual([gene("a")]));
+
+    await act(async () => result.current.refresh());
+    expect(api.loadEpochs).toHaveBeenCalledTimes(2);
+    act(() => result.current.retry());
+    await waitFor(() => expect(api.loadEpochs).toHaveBeenCalledTimes(3));
+
+    expect(result.current.epochs).toEqual(refreshedEpochs);
+    expect(result.current.ready).toBe(true);
+  });
+
+  it.each(["epochs", "summaries", "genes"] as const)(
+    "retries a failed full refresh from the beginning after its %s stage",
+    async (failedStage) => {
+      const refreshedEpoch = { ...epoch("a"), best_score: "9" };
+      const refreshedSummary = { ...summary, score_max: "9" };
+      const refreshedGene = { ...gene("a"), score_total: "9" };
+      const { result } = renderHook(() => useResearchWorkspace(false));
+      await waitFor(() => expect(result.current.genes).toEqual([gene("a")]));
+      const calls: string[] = [];
+      let failStageOnce = true;
+      api.ensureBrowserSession.mockImplementation(async () => {
+        calls.push("session");
+      });
+      api.loadEpochs.mockImplementation(async () => {
+        calls.push("epochs");
+        if (failedStage === "epochs" && failStageOnce) {
+          failStageOnce = false;
+          throw new Error("full refresh epochs failed");
+        }
+        return [refreshedEpoch];
+      });
+      api.loadGenerationSummaries.mockImplementation(async () => {
+        calls.push("summaries");
+        if (failedStage === "summaries" && failStageOnce) {
+          failStageOnce = false;
+          throw new Error("full refresh summaries failed");
+        }
+        return [refreshedSummary];
+      });
+      api.loadGenerationGenes.mockImplementation(async () => {
+        calls.push("genes");
+        if (failedStage === "genes" && failStageOnce) {
+          failStageOnce = false;
+          throw new Error("full refresh genes failed");
+        }
+        return [refreshedGene];
+      });
+      act(() => {
+        result.current.chooseGene(1);
+        result.current.chooseXParameter("fast");
+        result.current.chooseYParameter("slow");
+      });
+      await waitFor(() => expect(result.current.selectedGeneId).toBe(1));
+      calls.length = 0;
+
+      await act(async () => result.current.refresh());
+
+      expect(calls).toEqual(
+        failedStage === "epochs"
+          ? ["session", "epochs"]
+          : failedStage === "summaries"
+            ? ["session", "epochs", "summaries"]
+            : ["session", "epochs", "summaries", "genes"]
+      );
+      expect(result.current.epochs[0]?.best_score).toBe("1");
+      expect(result.current.summaries[0]?.score_max).toBe("1");
+      expect(result.current.genes[0]?.score_total).toBe("1");
+      expect(result.current.error).toEqual({
+        type: "unexpected",
+        message: `full refresh ${failedStage} failed`
+      });
+
+      calls.length = 0;
+      act(() => result.current.retry());
+      await waitFor(() => {
+        expect(result.current.genes).toEqual([refreshedGene]);
+        expect(result.current.error).toBeNull();
+        expect(result.current.loading).toBe(false);
+      });
+
+      expect(calls).toEqual(["session", "epochs", "summaries", "genes"]);
+      expect(result.current.epochs[0]).toEqual(refreshedEpoch);
+      expect(result.current.summaries).toEqual([refreshedSummary]);
+      expect(result.current.genes).toEqual([refreshedGene]);
+      expect(result.current.selectedGeneId).toBe(1);
+      expect(result.current.xParameter).toBe("fast");
+      expect(result.current.yParameter).toBe("slow");
+      expect(result.current.loading).toBe(false);
+    }
+  );
+
+  it("marks the workspace ready when a full refresh recovers initial epoch failure", async () => {
+    api.loadEpochs
+      .mockRejectedValueOnce(new Error("initial epochs failed"))
+      .mockResolvedValueOnce([epoch("a")]);
+    const { result } = renderHook(() => useResearchWorkspace(false));
+    await waitFor(() => expect(result.current.error).toEqual({
+      type: "unexpected",
+      message: "initial epochs failed"
+    }));
+    expect(result.current.ready).toBe(false);
+
+    await act(async () => result.current.refresh());
+
+    expect(result.current.ready).toBe(true);
+    expect(result.current.genes).toEqual([gene("a")]);
+    expect(result.current.error).toBeNull();
+  });
+
+  it("retries the failed summary stage without repeating epoch admission", async () => {
+    api.loadGenerationSummaries
+      .mockRejectedValueOnce(new Error("summary retry"))
+      .mockResolvedValueOnce([summary]);
+    const { result } = renderHook(() => useResearchWorkspace(false));
+    await waitFor(() => expect(result.current.error).toEqual({
+      type: "unexpected",
+      message: "summary retry"
+    }));
+    expect(api.loadEpochs).toHaveBeenCalledTimes(1);
+
+    act(() => result.current.retry());
+    await waitFor(() => expect(result.current.genes).toEqual([gene("a")]));
+
+    expect(api.loadEpochs).toHaveBeenCalledTimes(1);
+    expect(api.loadGenerationSummaries).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not commit a full-refresh response after the epoch selection changes", async () => {
+    const staleEpochs = deferred<Epoch[]>();
+    api.loadEpochs
+      .mockResolvedValueOnce([epoch("a"), epoch("b")])
+      .mockReturnValueOnce(staleEpochs.promise);
+    const { result } = renderHook(() => useResearchWorkspace(false));
+    await waitFor(() => expect(result.current.genes).toEqual([gene("a")]));
+
+    let refresh!: Promise<void>;
+    act(() => { refresh = result.current.refresh(); });
+    act(() => result.current.chooseEpoch("b"));
+    await waitFor(() => expect(result.current.genes).toEqual([gene("b")]));
+    await act(async () => {
+      staleEpochs.resolve([{ ...epoch("a"), best_score: "999" }]);
+      await refresh;
+    });
+
+    expect(result.current.epochId).toBe("b");
+    expect(result.current.epoch?.best_score).toBe("1");
+    expect(result.current.genes).toEqual([gene("b")]);
   });
 
   it("fences a stale summary response after an epoch transition", async () => {

@@ -110,7 +110,8 @@ const ZERO_COUNTS: MutableRouteCounts = {
   RI: 0,
   RD: 0,
   RT: 0,
-  RC: 0
+  RC: 0,
+  I: 0
 };
 const PROJECT_VIEWPORTS = {
   "desktop-1440x900": { width: 1440, height: 900 },
@@ -327,9 +328,10 @@ async function installApiFixtures(
   commandGate: CommandGate | null,
   expectedOrigin: string,
   scenario: ScenarioId
-): Promise<void> {
+): Promise<() => void> {
   const productionResultsFlow = scenario === "production-results-flow";
   let commandAccepted = false;
+  const pendingEventRequests: Array<() => void> = [];
   await context.route("**/*", async (route: Route) => {
     const request = route.request();
     const url = new URL(request.url());
@@ -341,6 +343,12 @@ async function installApiFixtures(
     if (method === "GET" && url.pathname === "/ops/kill-switch" && url.search === "") {
       await route.fulfill({ json: { state: "OK", redis_state: "OK", durable_state: "OK", listener_available: true } });
       return;
+    } else if (
+      method === "GET" &&
+      url.pathname === "/api/v1/events" &&
+      url.search === ""
+    ) {
+      routeId = "I";
     } else if (
       method === "GET" &&
       url.pathname === "/api/v1/backtest-results" &&
@@ -678,6 +686,13 @@ async function installApiFixtures(
       expect(request.postData()).toBe(
         '{"command":"STOP","expected_version":3}'
       );
+    } else if (routeId === "I") {
+      expect(projectHeaders(request)).toEqual({ accept: "*/*" });
+      expect(request.postData()).toBeNull();
+      counts[routeId] += 1;
+      await new Promise<void>((resolve) => pendingEventRequests.push(resolve));
+      await route.abort().catch(() => undefined);
+      return;
     } else {
       expect(projectHeaders(request)).toEqual(expectedGetHeaders());
       expect(request.postData()).toBeNull();
@@ -715,6 +730,10 @@ async function installApiFixtures(
       body: JSON.stringify(body)
     });
   });
+  return () => {
+    for (const release of pendingEventRequests) release();
+    pendingEventRequests.length = 0;
+  };
 }
 
 function nav(page: Page, index: 0 | 1 | 2 | 3) {
@@ -1277,6 +1296,7 @@ async function exerciseScenario(
       await expect(page.getByText("trade-000184", { exact: true }).first()).toBeVisible();
     } else if (triple.caseId === "trades" && triple.server === "production") {
       await expect(page.getByText(BACKTEST_TRADE_ID, { exact: true }).first()).toBeVisible();
+      await expect(page.locator(".trade-chart canvas")).toBeVisible();
     } else {
       await expect(page.locator(".empty-panel")).toBeVisible();
     }
@@ -1566,6 +1586,7 @@ async function runTriple(
   const moduleRequests: string[] = [];
   const failures: string[] = [];
   const expectedApiFailures: string[] = [];
+  let releaseEventRequests = () => {};
   const commandGate =
     triple.scenario === "strategy-command" ||
     triple.scenario === "production-results-flow" ||
@@ -1574,7 +1595,7 @@ async function runTriple(
       : null;
   let documents = 0;
   try {
-    await installApiFixtures(
+    releaseEventRequests = await installApiFixtures(
       context,
       observedCounts,
       commandGate,
@@ -1632,6 +1653,7 @@ async function runTriple(
     });
   } finally {
     commandGate?.release();
+    releaseEventRequests();
     await context.close();
   }
 }

@@ -8,6 +8,7 @@ export const en = {
       "epoch": "Evolution run",
       "language": "Language",
       "theme": "Theme",
+      "refreshResearch": "Refresh research data",
       "light": "Switch to light theme",
       "dark": "Switch to dark theme"
     },

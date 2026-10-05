@@ -23,6 +23,7 @@ import {
   serializeNavigation,
   type View
 } from "./navigation";
+import { ResearchInvalidationBridge } from "./researchInvalidation";
 
 const StrategyManager = lazy(() =>
   import("../features/strategies/StrategyManager").then((module) => ({
@@ -86,8 +87,12 @@ export function App() {
     setView(nextView);
   };
 
-  const renderShell = ({ toolbar, content }: ResearchSlots) => (
+  const renderShell = ({ toolbar, content, refresh, streamReady }: ResearchSlots) => (
     <main className="console-shell">
+      <ResearchInvalidationBridge
+        enabled={streamReady && view === "research" && !demoMode}
+        onInvalidate={refresh}
+      />
       <header className="topbar">
         <div>
           <p className="eyebrow">{t("app.eyebrow")}</p>
@@ -246,6 +251,11 @@ export function App() {
       {renderShell}
     </ResearchRoute>
   ) : (
-    renderShell({ toolbar: null, content: null })
+    renderShell({
+      toolbar: null,
+      content: null,
+      refresh: async () => undefined,
+      streamReady: false
+    })
   );
 }

@@ -25,6 +25,8 @@ import { useResearchWorkspace } from "./useResearchWorkspace";
 export type ResearchSlots = {
   readonly toolbar: ReactNode;
   readonly content: ReactNode;
+  readonly refresh: () => Promise<void>;
+  readonly streamReady: boolean;
 };
 
 export type ResearchRouteProps = {
@@ -208,6 +210,13 @@ export function ResearchRoute({
           </option>
         ))}
       </select>
+      <button
+        type="button"
+        disabled={workspace.loading}
+        onClick={() => void workspace.refresh()}
+      >
+        {t("controls.refreshResearch")}
+      </button>
     </div>
   ) : null;
   const content = visible ? (
@@ -226,5 +235,10 @@ export function ResearchRoute({
     />
   ) : null;
 
-  return children({ toolbar, content });
+  return children({
+    toolbar,
+    content,
+    refresh: workspace.refresh,
+    streamReady: visible && !demoMode && workspace.ready
+  });
 }

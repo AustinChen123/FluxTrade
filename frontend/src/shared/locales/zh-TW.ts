@@ -8,6 +8,7 @@ export const zhTW = {
       "epoch": "演化批次",
       "language": "語言",
       "theme": "主題",
+      "refreshResearch": "重新整理研究資料",
       "light": "切換至日間主題",
       "dark": "切換至夜間主題"
     },
