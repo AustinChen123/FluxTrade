@@ -16,6 +16,7 @@ from src.control_plane.app import ControlPlaneApp, EventStreamResponse, HttpResp
 from src.control_plane.backtest_jobs import BacktestJobExecutor
 from src.control_plane.browser_auth import BrowserSessionAuth
 from src.control_plane.invalidation import (
+    MAX_QUEUED_EVENT_FRAMES,
     ControlPlaneInvalidationHub,
     EventConnectionCapacity,
     InvalidInvalidationRecord,
@@ -443,10 +444,10 @@ def test_slow_socket_overflow_releases_blocked_writer_within_write_timeout(
 
     monkeypatch.setattr(server_module, "_EVENT_STREAM_WRITE_TIMEOUT_SECONDS", 0.25)
     app = _app()
-    blocked_frame_write_observed = Event()
+    frame_write_started = Event()
+    frame_write_finished = Event()
     handler_finished = Event()
     write_durations: list[float] = []
-    frame_write_started_at: list[float | None] = [None]
 
     class ObservedWriter:
         def __init__(self, writer) -> None:
@@ -456,14 +457,14 @@ def test_slow_socket_overflow_releases_blocked_writer_within_write_timeout(
             started = time.monotonic()
             is_event_frame = data.startswith(b"event: invalidate\n")
             if is_event_frame:
-                frame_write_started_at[0] = started
+                frame_write_started.set()
             try:
                 return self._writer.write(data)
             finally:
                 elapsed = time.monotonic() - started
                 write_durations.append(elapsed)
                 if is_event_frame:
-                    frame_write_started_at[0] = None
+                    frame_write_finished.set()
 
         def __getattr__(self, name: str) -> Any:
             return getattr(self._writer, name)
@@ -511,17 +512,27 @@ def test_slow_socket_overflow_releases_blocked_writer_within_write_timeout(
         assert b"Content-Type: text/event-stream\r\n" in response_headers
         assert app.invalidation_hub.active_count == 1
 
+        blocked_write_observed = False
         for revision in range(1, 2_000):
+            # Advance only after the preceding frame write completes. This
+            # prevents the hub queue from overflowing before TCP backpressure
+            # has actually stalled the handler's writer.
+            frame_write_started.clear()
+            frame_write_finished.clear()
             app.invalidation_hub.publish(_record(identity="x" * 128, revision=revision))
-            started_at = frame_write_started_at[0]
-            if started_at is not None and time.monotonic() - started_at >= 0.05:
-                blocked_frame_write_observed.set()
+            assert frame_write_started.wait(timeout=1), write_durations
+            if not frame_write_finished.wait(timeout=0.05):
+                blocked_write_observed = True
+                break
             if app.invalidation_hub.active_count == 0:
                 break
-            time.sleep(0.001)
+
+        assert blocked_write_observed, write_durations
+        assert app.invalidation_hub.active_count == 1
+        for revision in range(2_000, 2_000 + MAX_QUEUED_EVENT_FRAMES + 1):
+            app.invalidation_hub.publish(_record(identity="x" * 128, revision=revision))
 
         assert app.invalidation_hub.active_count == 0
-        assert blocked_frame_write_observed.is_set(), write_durations
         release_started = time.monotonic()
         assert handler_finished.wait(timeout=1)
         assert time.monotonic() - release_started < 1
