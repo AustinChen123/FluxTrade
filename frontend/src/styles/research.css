@@ -364,6 +364,112 @@ dd {
   cursor: pointer;
 }
 
+.ga-console {
+  display: grid;
+  gap: 16px;
+  margin-top: 20px;
+  padding: 0 16px 18px;
+}
+
+.ga-console > .panel-heading { margin: 0 -16px; }
+.ga-console h3 { margin: 0; font-size: 0.94rem; }
+.ga-form-panel,
+.ga-candidate-section,
+.ga-job-detail,
+.ga-job-layout > section { min-width: 0; }
+.ga-form-panel > summary,
+.ga-readonly > summary { cursor: pointer; font-weight: 650; }
+.ga-help,
+.ga-notice,
+.ga-awaiting p,
+.ga-confirm p { color: var(--muted); line-height: 1.5; }
+.ga-form-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin: 14px 0;
+}
+.ga-field {
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+  color: var(--muted);
+  font-family: "SFMono-Regular", "Roboto Mono", monospace;
+  font-size: 0.68rem;
+}
+.ga-field input,
+.ga-field select {
+  width: 100%;
+  min-width: 0;
+  min-height: 38px;
+  padding: 7px 9px;
+  border: 1px solid var(--grid);
+  color: var(--ink);
+  background: var(--surface);
+  font: 500 0.78rem "SFMono-Regular", "Roboto Mono", monospace;
+}
+.ga-actions,
+.ga-confirm,
+.ga-epoch-link { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.ga-actions button,
+.ga-console > button,
+.ga-console section > button {
+  min-height: 38px;
+  padding: 8px 12px;
+  cursor: pointer;
+}
+.ga-actions button:disabled,
+.ga-console button:disabled { cursor: not-allowed; opacity: 0.55; }
+.ga-confirm,
+.ga-awaiting {
+  padding: 12px;
+  border: 1px solid var(--grid);
+  background: var(--surface);
+}
+.ga-awaiting { border-left: 4px solid var(--coral); }
+.ga-job-layout {
+  display: grid;
+  grid-template-columns: minmax(250px, 0.75fr) minmax(0, 1.5fr);
+  gap: 16px;
+}
+.ga-subheading { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
+.ga-subheading > span { color: var(--muted); font-size: 0.78rem; }
+.ga-job-list,
+.ga-audit-list { display: grid; gap: 6px; margin: 0 0 10px; padding: 0; list-style: none; }
+.ga-job-list button {
+  display: grid;
+  width: 100%;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 10px;
+  min-height: 42px;
+  padding: 7px 9px;
+  text-align: left;
+  cursor: pointer;
+}
+.ga-job-list button[aria-pressed="true"] { border-color: var(--ink); background: var(--selection-bg); color: var(--selection-ink); }
+.ga-job-id { overflow-wrap: anywhere; font-family: "SFMono-Regular", "Roboto Mono", monospace; }
+.ga-job-facts,
+.ga-readonly dl {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin: 12px 0;
+}
+.ga-job-facts > div,
+.ga-readonly dl > div { min-width: 0; overflow-wrap: anywhere; }
+.ga-job-facts dd,
+.ga-readonly dd { margin-top: 4px; font: 500 0.73rem "SFMono-Regular", "Roboto Mono", monospace; }
+.ga-readonly { margin: 12px 0; padding: 10px; border: 1px solid var(--grid); }
+.ga-readonly dl { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.ga-epoch-link { margin: 10px 0; }
+.ga-epoch-link time,
+.ga-audit-list time { color: var(--muted); font-size: 0.72rem; }
+.ga-candidate-section { padding-top: 14px; border-top: 1px solid var(--grid); }
+.ga-candidate-row { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 0; border-top: 1px solid var(--grid); }
+.ga-candidate-row span { overflow-wrap: anywhere; font: 500 0.74rem "SFMono-Regular", "Roboto Mono", monospace; }
+.ga-audit-list li { display: grid; grid-template-columns: auto auto minmax(0, 1fr); gap: 10px; }
+.ga-message { min-height: 0; margin: 0; padding: 8px 12px; }
+
 .loading-indicator {
   position: fixed;
   right: 24px;

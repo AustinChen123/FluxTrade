@@ -13,6 +13,11 @@ import {
   loadBacktestResult,
   loadBacktestResultTrades,
   loadBacktestResultCandles,
+  loadGaProfile,
+  loadGaJobs,
+  loadGaJob,
+  sendGaCommand,
+  promoteResearchCandidate,
   type BrowserSession,
   type StrategyState
 } from "./api";
@@ -242,6 +247,121 @@ describe("strategy control API", () => {
         body: '{"command":"STOP","expected_version":1}'
       })
     );
+  });
+});
+
+describe("research GA API", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  const gaJob = {
+    id: "ga-job-1", kind: "ga", status: "QUEUED", version: 1,
+    epoch_id: null, completed_generation: -1, checkpoint: null,
+    retry_of_job_id: null, request: { ga_binding: { input_digest: "c".repeat(64) } },
+    error: null
+  };
+
+  it("has explicit profile, persisted-job and command transports", async () => {
+    const profile = {
+      schema_version: 1,
+      profile: {
+        parameter_search_profile_id: "golden_cross_research_v1",
+        profile_revision: "a".repeat(64),
+        strategy_subject: "builtin:golden_cross",
+        strategy_version: "b".repeat(64),
+        fitness_profile_id: "mark_to_market_pnl_v1",
+        cost_profile_id: "explicit_accounting_v1",
+        accepted_fields: { dataset_id: { required: true, type: "string" } }
+      }
+    };
+    const job = {
+      id: "ga-job-1", kind: "ga", status: "QUEUED", version: 1,
+      epoch_id: null, completed_generation: -1, checkpoint: null,
+      retry_of_job_id: null, request: { ga_binding: { input_digest: "c".repeat(64) } },
+      error: null
+    };
+    const fetch = vi.fn()
+      .mockResolvedValueOnce(response(200, profile))
+      .mockResolvedValueOnce(response(200, {
+        schema_version: 1, items: [job], total_count: 1, limit: 50, offset: 0
+      }))
+      .mockResolvedValueOnce(response(200, { schema_version: 1, job }))
+      .mockResolvedValueOnce(response(202, { schema_version: 1, job }))
+      .mockResolvedValueOnce(response(200, {
+        scope: "RESEARCH_CANDIDATE_ONLY",
+        gene: { gene_id: 7, strategy_id: "golden_cross", role: "champion", activated_at: "2026-10-05T12:00:00Z", retired_gene_ids: [3] }
+      }));
+    vi.stubGlobal("fetch", fetch);
+
+    await expect(loadGaProfile()).resolves.toMatchObject(profile);
+    await expect(loadGaJobs(50, 0)).resolves.toMatchObject({ items: [job] });
+    await expect(loadGaJob("ga-job-1")).resolves.toMatchObject({ job });
+    await expect(sendGaCommand("submit", null, "intent-1", { dataset_id: "sealed" }, "csrf"))
+      .resolves.toMatchObject({ job });
+    await expect(promoteResearchCandidate(7, null, "csrf")).resolves.toMatchObject({
+      scope: "RESEARCH_CANDIDATE_ONLY"
+    });
+
+    expect(fetch).toHaveBeenNthCalledWith(1,
+      "/api/v1/ga-profiles/golden_cross_research_v1",
+      expect.objectContaining({ credentials: "include", cache: "no-store" })
+    );
+    expect(fetch).toHaveBeenNthCalledWith(2,
+      "/api/v1/ga-jobs?limit=50&offset=0",
+      expect.objectContaining({ credentials: "include", cache: "no-store" })
+    );
+    expect(fetch.mock.calls[3][1]).toMatchObject({
+      method: "POST",
+      headers: expect.objectContaining({ "Idempotency-Key": "intent-1", "X-CSRF-Token": "csrf" }),
+      body: JSON.stringify({ dataset_id: "sealed" })
+    });
+    expect(fetch.mock.calls[4][1]).toMatchObject({
+      method: "POST", headers: expect.objectContaining({ "X-CSRF-Token": "csrf" }),
+      body: JSON.stringify({ reason: null })
+    });
+  });
+
+  it.each([
+    [{ schema_version: 1, profile: { parameter_search_profile_id: "wrong" } }],
+    [{ schema_version: 1, profile: {
+      parameter_search_profile_id: "golden_cross_research_v1",
+      strategy_subject: "builtin:golden_cross", profile_revision: "revision", strategy_version: "v1",
+      fitness_profile_id: "fitness", accepted_fields: {}
+    } }]
+  ])("rejects an invalid profile response", async (payload) => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response(200, payload)));
+    await expect(loadGaProfile()).rejects.toThrow("invalid_response");
+  });
+
+  it.each([
+    [{ schema_version: 1, items: [{ ...gaJob, status: "UNKNOWN" }], total_count: 1, limit: 50, offset: 0 }],
+    [{ schema_version: 1, items: [{ ...gaJob, version: true }], total_count: 1, limit: 50, offset: 0 }],
+    [{ schema_version: 1, items: [{ ...gaJob, checkpoint: { epoch_id: "e", completed_generation: -1 } }], total_count: 1, limit: 50, offset: 0 }]
+  ])("rejects malformed persisted job pages", async (payload) => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response(200, payload)));
+    await expect(loadGaJobs()).rejects.toThrow("invalid_response");
+  });
+
+  it("requires detail identity and the operation's accepted status", async () => {
+    const fetch = vi.fn()
+      .mockResolvedValueOnce(response(200, { schema_version: 1, job: { ...gaJob, id: "other" } }))
+      .mockResolvedValueOnce(response(200, { schema_version: 1, job: { ...gaJob, status: "FAILED" } }));
+    vi.stubGlobal("fetch", fetch);
+    await expect(loadGaJob("ga-job-1")).rejects.toThrow("invalid_response");
+    await expect(sendGaCommand("retry", "ga-job-1", "retry-key", { expected_version: 8 }, "csrf"))
+      .rejects.toThrow("invalid_response");
+    expect(fetch).toHaveBeenNthCalledWith(2, "/api/v1/ga-jobs/ga-job-1/retry", expect.objectContaining({
+      method: "POST", cache: "no-store", credentials: "include",
+      headers: expect.objectContaining({ "Idempotency-Key": "retry-key", "X-CSRF-Token": "csrf" })
+    }));
+  });
+
+  it.each([
+    [{ scope: "DEPLOYED", gene: { gene_id: 7, strategy_id: "golden_cross", role: "champion", activated_at: null, retired_gene_ids: [] } }],
+    [{ scope: "RESEARCH_CANDIDATE_ONLY", gene: { gene_id: 7, strategy_id: "golden_cross", role: "challenger", activated_at: null, retired_gene_ids: [] } }],
+    [{ scope: "RESEARCH_CANDIDATE_ONLY", gene: { gene_id: 7, strategy_id: "golden_cross", role: "champion", activated_at: null, retired_gene_ids: ["3"] } }]
+  ])("rejects a promotion response outside the research-only receipt contract", async (payload) => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response(200, payload)));
+    await expect(promoteResearchCandidate(7, "reviewed", "csrf")).rejects.toThrow("invalid_response");
   });
 });
 

@@ -17,6 +17,7 @@ import {
 const api = vi.hoisted(() => ({
   ensureBrowserSession: vi.fn(),
   loadEpochs: vi.fn(),
+  loadEpochById: vi.fn(),
   loadGenerationGenes: vi.fn(),
   loadGenerationSummaries: vi.fn()
 }));
@@ -183,6 +184,35 @@ describe("useResearchWorkspace", () => {
     expect(result.current.yParameter).toBe("slow");
     expect(result.current.genes[0]?.score_total).toBe("9");
     expect(result.current.summaries[0]?.score_max).toBe("2");
+  });
+
+  it("preserves a selected epoch beyond the first list page through exact identity read", async () => {
+    api.loadEpochs.mockResolvedValueOnce([epoch("a"), epoch("b")]).mockResolvedValueOnce([epoch("a")]);
+    api.loadEpochById.mockResolvedValue(epoch("b"));
+    const { result } = renderHook(() => useResearchWorkspace(false));
+    await waitFor(() => expect(result.current.genes).toEqual([gene("a")]));
+    act(() => result.current.chooseEpoch("b"));
+    await waitFor(() => expect(result.current.genes).toEqual([gene("b")]));
+
+    await act(async () => result.current.refresh());
+
+    expect(api.loadEpochById).toHaveBeenCalledWith("b");
+    expect(result.current.epochId).toBe("b");
+    expect(result.current.epochs.map((item) => item.id)).toEqual(["a", "b"]);
+    expect(result.current.genes).toEqual([gene("b")]);
+  });
+
+  it("does not duplicate the first epoch when refreshing an initially empty selection", async () => {
+    api.loadEpochs.mockResolvedValueOnce([]).mockResolvedValueOnce([epoch("a")]);
+    const { result } = renderHook(() => useResearchWorkspace(false));
+    await waitFor(() => expect(result.current.ready).toBe(true));
+    expect(result.current.epochId).toBe("");
+    expect(result.current.epochs).toEqual([]);
+
+    await act(async () => result.current.refresh());
+
+    expect(result.current.epochId).toBe("a");
+    expect(result.current.epochs.map((item) => item.id)).toEqual(["a"]);
   });
 
   it("keeps an initial gene request from overwriting a newer in-flight refresh", async () => {

@@ -68,6 +68,8 @@ function workspace(
   overrides: Partial<ResearchWorkspace> = {}
 ): ResearchWorkspace {
   return {
+    session: null,
+    sessionResolved: true,
     epochs: [epoch],
     epoch,
     epochId: epoch.id,
@@ -83,6 +85,7 @@ function workspace(
     error: null,
     model: buildResearchModel(epoch, [gene], gene.id),
     chooseEpoch: vi.fn(),
+    openEpoch: vi.fn().mockResolvedValue(undefined),
     chooseGeneration: vi.fn(),
     chooseGene: vi.fn(),
     chooseXParameter: vi.fn(),

@@ -3,7 +3,8 @@ import type {
   BacktestResultsDetail,
   BacktestResultsIndexItem,
   BacktestResultsIndexPage,
-  BacktestResultsTradesPage
+  BacktestResultsTradesPage,
+  GaProfile
 } from "../src/api";
 
 export const BROWSER_NOW = "2026-08-23T12:00:00Z";
@@ -59,6 +60,63 @@ export const BROWSER_SESSION = {
   expires_at: "2026-08-24T12:00:00Z",
   step_up_expires_at: null
 } as const;
+
+export const GA_PROFILE: GaProfile = {
+  parameter_search_profile_id: "golden_cross_research_v1",
+  profile_revision: "a".repeat(64),
+  strategy_subject: "builtin:golden_cross",
+  strategy_version: "b".repeat(64),
+  fitness_profile_id: "mark_to_market_pnl_v1",
+  cost_profile_id: "explicit_accounting_v1",
+  accepted_fields: {
+    parameter_search_profile_id: { required: true, type: "string", const: "golden_cross_research_v1", immutable: "server_profile" },
+    strategy_subject: { required: true, type: "string", const: "builtin:golden_cross", immutable: "server_profile" },
+    fitness_profile_id: { required: true, type: "string", const: "mark_to_market_pnl_v1", immutable: "server_profile" },
+    cost_profile_id: { required: true, type: "string", const: "explicit_accounting_v1", immutable: "server_profile" },
+    profile_revision: { required: true, type: "sha256", immutable: "server_profile" },
+    strategy_version: { required: true, type: "sha256", immutable: "imported_builtin_source" },
+    dataset_id: { required: true, type: "string", source: "sealed_metadata.id", immutable: "compiled_binding" },
+    start_time: { required: true, type: "strict_integer_utc_ms", minimum: 0, maximum: 253402300799999, constraint: "within sealed coverage and <= end_time", immutable: "compiled_binding" },
+    end_time: { required: true, type: "strict_integer_utc_ms", minimum: 0, maximum: 253402300799999, constraint: "inclusive; within sealed coverage and >= start_time", immutable: "compiled_binding" },
+    initial_balance: { required: true, type: "finite_decimal_or_decimal_string", exclusive_minimum: "0", immutable: "compiled_binding" },
+    fees: { required: true, type: "object", immutable: "compiled_binding", fields: {
+      maker: { required: true, type: "finite_decimal_or_decimal_string", minimum: "0", immutable: "compiled_binding" },
+      taker: { required: true, type: "finite_decimal_or_decimal_string", minimum: "0", immutable: "compiled_binding" }
+    } },
+    instrument: { required: true, type: "object", immutable: "compiled_binding", constraint: "dated_future products require quantity_step and price_tick", fields: {
+      multiplier: { required: false, type: "finite_decimal_or_decimal_string", default: "1", exclusive_minimum: "0", immutable: "compiled_binding" },
+      quantity_step: { required: false, type: "finite_decimal_or_decimal_string_or_null", default: null, exclusive_minimum_when_set: "0", constraint: "required for dated_future products", immutable: "compiled_binding" },
+      price_tick: { required: false, type: "finite_decimal_or_decimal_string_or_null", default: null, exclusive_minimum_when_set: "0", constraint: "required for dated_future products", immutable: "compiled_binding" },
+      fee_model: { required: false, type: "string_enum", default: "percentage_notional", choices: ["per_contract", "percentage_notional"], immutable: "compiled_binding" },
+      capital_model: { required: false, type: "string_enum", default: "notional", choices: ["notional", "per_contract"], immutable: "compiled_binding" },
+      capital_per_contract: { required: false, type: "finite_decimal_or_decimal_string_or_null", default: null, exclusive_minimum_when_set: "0", constraint: "positive and required only when capital_model is per_contract", immutable: "compiled_binding" }
+    } },
+    parameters: {
+      required: false,
+      type: "object",
+      dependency: "short_window.max < long_window.min",
+      quantity_constraint: "must align to instrument.quantity_step when configured",
+      fields: {
+        short_window: { required: false, type: "integer_range", default: { min: 5, max: 50, step: 5 }, constraint: "min <= max; step > 0", immutable: "compiled_binding", fields: {
+          min: { required: true, type: "strict_integer", minimum: 1, maximum: 10000, immutable: "compiled_binding" },
+          max: { required: true, type: "strict_integer", minimum: 1, maximum: 10000, immutable: "compiled_binding" },
+          step: { required: true, type: "strict_integer", exclusive_minimum: 0, immutable: "compiled_binding" }
+        } },
+        long_window: { required: false, type: "integer_range", default: { min: 60, max: 200, step: 10 }, constraint: "min <= max; step > 0", immutable: "compiled_binding", fields: {
+          min: { required: true, type: "strict_integer", minimum: 2, maximum: 10000, immutable: "compiled_binding" },
+          max: { required: true, type: "strict_integer", minimum: 2, maximum: 10000, immutable: "compiled_binding" },
+          step: { required: true, type: "strict_integer", exclusive_minimum: 0, immutable: "compiled_binding" }
+        } },
+        quantity: { required: false, type: "finite_decimal_or_decimal_string", default: "0.01", exclusive_minimum: "0", immutable: "compiled_binding" }
+      }
+    },
+    population_size: { required: false, type: "strict_integer", default: 32, minimum: 2, maximum: 256, constraint: "must not exceed parameter Cartesian cardinality", immutable: "compiled_binding" },
+    max_generations: { required: false, type: "strict_integer", default: 10, minimum: 1, maximum: 100, immutable: "compiled_binding" },
+    seed: { required: false, type: "strict_integer", default: 0, minimum: 0, maximum: 2147483647, immutable: "compiled_binding" }
+  },
+  compiled_fields: { kind: "parameter_search", strategy_type: "golden_cross", strategy_id: "golden_cross", objective: "maximize_score", market_data: "sealed_dataset", write_reports: false, capital_allocation: null, evaluation_set: null, fitness: null },
+  evolution_defaults: { tournament_size: 2, elite_count: 1, crossover_probability: "0.9", mutation_probability: "0.1", mutation_sigma_steps: "1" }
+};
 
 // Fixed synthetic wire DTOs for browser-contract checks; these are not economic evidence.
 export const BACKTEST_RESULT_ID = "job-browser-001";
@@ -510,43 +568,45 @@ export type RouteCounts = Readonly<{
   RT: number;
   RC: number;
   I: number;
+  GP: number;
+  GJ: number;
 }>;
 
 export const EXPECTED_REQUEST_COUNTS = {
-  "direct-navigation:dev:results": { S: 0, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 0, C: 0, RI: 0, RD: 0, RT: 0, RC: 0, I: 0 },
-  "direct-navigation:dev:strategies": { S: 2, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 2, C: 0, RI: 0, RD: 0, RT: 0, RC: 0, I: 0 },
-  "direct-navigation:dev:trades": { S: 0, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 0, C: 0, RI: 0, RD: 0, RT: 0, RC: 0, I: 0 },
-  "direct-navigation:production:results": { S: 1, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 0, C: 0, RI: 1, RD: 0, RT: 0, RC: 0, I: 0 },
-  "direct-navigation:production:strategies": { S: 1, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 1, C: 0, RI: 0, RD: 0, RT: 0, RC: 0, I: 0 },
-  "direct-navigation:production:trades": { S: 2, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 0, C: 0, RI: 0, RD: 1, RT: 0, RC: 1, I: 0 },
-  "research-cache:dev:main": { S: 4, P: 0, E: 2, A: 1, B: 0, a: 1, b: 0, T: 2, C: 0, RI: 0, RD: 0, RT: 0, RC: 0, I: 2 },
-  "research-cache:production:main": { S: 2, P: 0, E: 1, A: 1, B: 0, a: 1, b: 0, T: 1, C: 0, RI: 0, RD: 0, RT: 0, RC: 0, I: 2 },
-  "navigation-serialization:dev:main": { S: 2, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 2, C: 0, RI: 0, RD: 0, RT: 0, RC: 0, I: 0 },
-  "demo-dev:dev:main": { S: 0, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 0, C: 0, RI: 0, RD: 0, RT: 0, RC: 0, I: 0 },
-  "demo-production-denied:production:results": { S: 1, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 0, C: 0, RI: 1, RD: 0, RT: 0, RC: 0, I: 0 },
-  "demo-production-denied:production:trades": { S: 2, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 0, C: 0, RI: 0, RD: 1, RT: 0, RC: 1, I: 0 },
-  "strategy-command:dev:main": { S: 2, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 3, C: 1, RI: 0, RD: 0, RT: 0, RC: 0, I: 0 },
-  "strategy-command:production:main": { S: 1, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 2, C: 1, RI: 0, RD: 0, RT: 0, RC: 0, I: 0 },
-  "locale-theme-reload:dev:main": { S: 4, P: 0, E: 4, A: 2, B: 0, a: 2, b: 0, T: 0, C: 0, RI: 0, RD: 0, RT: 0, RC: 0, I: 2 },
-  "locale-theme-reload:production:main": { S: 2, P: 0, E: 2, A: 2, B: 0, a: 2, b: 0, T: 0, C: 0, RI: 0, RD: 0, RT: 0, RC: 0, I: 2 },
-  "lazy-chunk-inventory:dev:main": { S: 4, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 4, C: 0, RI: 0, RD: 0, RT: 0, RC: 0, I: 0 },
-  "lazy-chunk-inventory:production:main": { S: 5, P: 0, E: 1, A: 1, B: 0, a: 1, b: 0, T: 2, C: 0, RI: 2, RD: 0, RT: 0, RC: 0, I: 5 },
-  "responsive-overflow:dev:research": { S: 2, P: 0, E: 2, A: 1, B: 0, a: 1, b: 0, T: 0, C: 0, RI: 0, RD: 0, RT: 0, RC: 0, I: 1 },
-  "responsive-overflow:dev:results": { S: 0, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 0, C: 0, RI: 0, RD: 0, RT: 0, RC: 0, I: 0 },
-  "responsive-overflow:dev:strategies": { S: 2, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 2, C: 0, RI: 0, RD: 0, RT: 0, RC: 0, I: 0 },
-  "responsive-overflow:dev:trades": { S: 0, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 0, C: 0, RI: 0, RD: 0, RT: 0, RC: 0, I: 0 },
-  "responsive-overflow:production:research": { S: 1, P: 0, E: 1, A: 1, B: 0, a: 1, b: 0, T: 0, C: 0, RI: 0, RD: 0, RT: 0, RC: 0, I: 1 },
-  "responsive-overflow:production:results": { S: 1, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 0, C: 0, RI: 1, RD: 0, RT: 0, RC: 0, I: 0 },
-  "responsive-overflow:production:strategies": { S: 1, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 1, C: 0, RI: 0, RD: 0, RT: 0, RC: 0, I: 0 },
-  "responsive-overflow:production:trades": { S: 2, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 0, C: 0, RI: 0, RD: 1, RT: 0, RC: 1, I: 0 },
-  "berlin-presentation-time:dev:research-api": { S: 2, P: 0, E: 2, A: 1, B: 1, a: 1, b: 1, T: 0, C: 0, RI: 0, RD: 0, RT: 0, RC: 0, I: 1 },
-  "berlin-presentation-time:dev:demo-features": { S: 2, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 2, C: 0, RI: 0, RD: 0, RT: 0, RC: 0, I: 0 },
-  "production-results-flow:production:main": { S: 8, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 0, C: 0, RI: 2, RD: 2, RT: 2, RC: 2, I: 0 },
-  "production-results-states:production:main": { S: 21, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 0, C: 0, RI: 6, RD: 15, RT: 0, RC: 0, I: 0 },
-  "production-results-candle-states:production:main": { S: 12, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 0, C: 0, RI: 2, RD: 7, RT: 0, RC: 3, I: 0 },
-  "production-results-stale-detail:production:main": { S: 5, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 1, C: 0, RI: 2, RD: 2, RT: 0, RC: 0, I: 0 },
-  "production-results-stale-trades:production:main": { S: 6, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 1, C: 0, RI: 2, RD: 2, RT: 1, RC: 0, I: 0 },
-  "production-results-stale-candles:production:main": { S: 8, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 1, C: 0, RI: 2, RD: 3, RT: 0, RC: 2, I: 0 }
+  "direct-navigation:dev:results": { S: 0, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 0, C: 0, RI: 0, RD: 0, RT: 0, RC: 0, I: 0, GP: 0, GJ: 0 },
+  "direct-navigation:dev:strategies": { S: 2, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 2, C: 0, RI: 0, RD: 0, RT: 0, RC: 0, I: 0, GP: 0, GJ: 0 },
+  "direct-navigation:dev:trades": { S: 0, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 0, C: 0, RI: 0, RD: 0, RT: 0, RC: 0, I: 0, GP: 0, GJ: 0 },
+  "direct-navigation:production:results": { S: 1, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 0, C: 0, RI: 1, RD: 0, RT: 0, RC: 0, I: 0, GP: 0, GJ: 0 },
+  "direct-navigation:production:strategies": { S: 1, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 1, C: 0, RI: 0, RD: 0, RT: 0, RC: 0, I: 0, GP: 0, GJ: 0 },
+  "direct-navigation:production:trades": { S: 2, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 0, C: 0, RI: 0, RD: 1, RT: 0, RC: 1, I: 0, GP: 0, GJ: 0 },
+  "research-cache:dev:main": { S: 4, P: 0, E: 2, A: 1, B: 0, a: 1, b: 0, T: 2, C: 0, RI: 0, RD: 0, RT: 0, RC: 0, I: 2, GP: 2, GJ: 2 },
+  "research-cache:production:main": { S: 2, P: 0, E: 1, A: 1, B: 0, a: 1, b: 0, T: 1, C: 0, RI: 0, RD: 0, RT: 0, RC: 0, I: 2, GP: 2, GJ: 2 },
+  "navigation-serialization:dev:main": { S: 2, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 2, C: 0, RI: 0, RD: 0, RT: 0, RC: 0, I: 0, GP: 0, GJ: 0 },
+  "demo-dev:dev:main": { S: 0, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 0, C: 0, RI: 0, RD: 0, RT: 0, RC: 0, I: 0, GP: 0, GJ: 0 },
+  "demo-production-denied:production:results": { S: 1, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 0, C: 0, RI: 1, RD: 0, RT: 0, RC: 0, I: 0, GP: 0, GJ: 0 },
+  "demo-production-denied:production:trades": { S: 2, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 0, C: 0, RI: 0, RD: 1, RT: 0, RC: 1, I: 0, GP: 0, GJ: 0 },
+  "strategy-command:dev:main": { S: 2, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 3, C: 1, RI: 0, RD: 0, RT: 0, RC: 0, I: 0, GP: 0, GJ: 0 },
+  "strategy-command:production:main": { S: 1, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 2, C: 1, RI: 0, RD: 0, RT: 0, RC: 0, I: 0, GP: 0, GJ: 0 },
+  "locale-theme-reload:dev:main": { S: 4, P: 0, E: 4, A: 2, B: 0, a: 2, b: 0, T: 0, C: 0, RI: 0, RD: 0, RT: 0, RC: 0, I: 2, GP: 2, GJ: 2 },
+  "locale-theme-reload:production:main": { S: 2, P: 0, E: 2, A: 2, B: 0, a: 2, b: 0, T: 0, C: 0, RI: 0, RD: 0, RT: 0, RC: 0, I: 2, GP: 2, GJ: 2 },
+  "lazy-chunk-inventory:dev:main": { S: 4, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 4, C: 0, RI: 0, RD: 0, RT: 0, RC: 0, I: 0, GP: 0, GJ: 0 },
+  "lazy-chunk-inventory:production:main": { S: 5, P: 0, E: 1, A: 1, B: 0, a: 1, b: 0, T: 2, C: 0, RI: 2, RD: 0, RT: 0, RC: 0, I: 5, GP: 5, GJ: 5 },
+  "responsive-overflow:dev:research": { S: 2, P: 0, E: 2, A: 1, B: 0, a: 1, b: 0, T: 0, C: 0, RI: 0, RD: 0, RT: 0, RC: 0, I: 1, GP: 1, GJ: 1 },
+  "responsive-overflow:dev:results": { S: 0, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 0, C: 0, RI: 0, RD: 0, RT: 0, RC: 0, I: 0, GP: 0, GJ: 0 },
+  "responsive-overflow:dev:strategies": { S: 2, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 2, C: 0, RI: 0, RD: 0, RT: 0, RC: 0, I: 0, GP: 0, GJ: 0 },
+  "responsive-overflow:dev:trades": { S: 0, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 0, C: 0, RI: 0, RD: 0, RT: 0, RC: 0, I: 0, GP: 0, GJ: 0 },
+  "responsive-overflow:production:research": { S: 1, P: 0, E: 1, A: 1, B: 0, a: 1, b: 0, T: 0, C: 0, RI: 0, RD: 0, RT: 0, RC: 0, I: 1, GP: 1, GJ: 1 },
+  "responsive-overflow:production:results": { S: 1, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 0, C: 0, RI: 1, RD: 0, RT: 0, RC: 0, I: 0, GP: 0, GJ: 0 },
+  "responsive-overflow:production:strategies": { S: 1, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 1, C: 0, RI: 0, RD: 0, RT: 0, RC: 0, I: 0, GP: 0, GJ: 0 },
+  "responsive-overflow:production:trades": { S: 2, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 0, C: 0, RI: 0, RD: 1, RT: 0, RC: 1, I: 0, GP: 0, GJ: 0 },
+  "berlin-presentation-time:dev:research-api": { S: 2, P: 0, E: 2, A: 1, B: 1, a: 1, b: 1, T: 0, C: 0, RI: 0, RD: 0, RT: 0, RC: 0, I: 1, GP: 1, GJ: 1 },
+  "berlin-presentation-time:dev:demo-features": { S: 2, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 2, C: 0, RI: 0, RD: 0, RT: 0, RC: 0, I: 0, GP: 0, GJ: 0 },
+  "production-results-flow:production:main": { S: 8, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 0, C: 0, RI: 2, RD: 2, RT: 2, RC: 2, I: 0, GP: 0, GJ: 0 },
+  "production-results-states:production:main": { S: 21, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 0, C: 0, RI: 6, RD: 15, RT: 0, RC: 0, I: 0, GP: 0, GJ: 0 },
+  "production-results-candle-states:production:main": { S: 12, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 0, C: 0, RI: 2, RD: 7, RT: 0, RC: 3, I: 0, GP: 0, GJ: 0 },
+  "production-results-stale-detail:production:main": { S: 5, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 1, C: 0, RI: 2, RD: 2, RT: 0, RC: 0, I: 0, GP: 0, GJ: 0 },
+  "production-results-stale-trades:production:main": { S: 6, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 1, C: 0, RI: 2, RD: 2, RT: 1, RC: 0, I: 0, GP: 0, GJ: 0 },
+  "production-results-stale-candles:production:main": { S: 8, P: 0, E: 0, A: 0, B: 0, a: 0, b: 0, T: 1, C: 0, RI: 2, RD: 3, RT: 0, RC: 2, I: 0, GP: 0, GJ: 0 }
 } as const satisfies Readonly<Record<string, RouteCounts>>;
 
 export const EXPECTED_DOCUMENT_COUNTS = {

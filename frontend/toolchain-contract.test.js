@@ -15,6 +15,7 @@ import {
   EPOCH_B,
   EXPECTED_DOCUMENT_COUNTS,
   EXPECTED_REQUEST_COUNTS,
+  GA_PROFILE,
   GENE_A,
   GENE_B,
   GENERATION_A,
@@ -67,19 +68,19 @@ const EXPECTED_NON_ZERO_COUNTS = {
   "direct-navigation:dev:strategies": { S: 2, T: 2 },
   "direct-navigation:production:strategies": { S: 1, T: 1 },
   "direct-navigation:production:trades": { S: 2, RD: 1, RC: 1 },
-  "research-cache:dev:main": { S: 4, E: 2, A: 1, a: 1, T: 2, I: 2 },
-  "research-cache:production:main": { S: 2, E: 1, A: 1, a: 1, T: 1, I: 2 },
+  "research-cache:dev:main": { S: 4, E: 2, A: 1, a: 1, T: 2, I: 2, GP: 2, GJ: 2 },
+  "research-cache:production:main": { S: 2, E: 1, A: 1, a: 1, T: 1, I: 2, GP: 2, GJ: 2 },
   "navigation-serialization:dev:main": { S: 2, T: 2 },
   "demo-production-denied:production:results": { S: 1, RI: 1 },
   "demo-production-denied:production:trades": { S: 2, RD: 1, RC: 1 },
   "strategy-command:dev:main": { S: 2, T: 3, C: 1 },
   "strategy-command:production:main": { S: 1, T: 2, C: 1 },
-  "locale-theme-reload:dev:main": { S: 4, E: 4, A: 2, a: 2, I: 2 },
-  "locale-theme-reload:production:main": { S: 2, E: 2, A: 2, a: 2, I: 2 },
+  "locale-theme-reload:dev:main": { S: 4, E: 4, A: 2, a: 2, I: 2, GP: 2, GJ: 2 },
+  "locale-theme-reload:production:main": { S: 2, E: 2, A: 2, a: 2, I: 2, GP: 2, GJ: 2 },
   "lazy-chunk-inventory:dev:main": { S: 4, T: 4 },
-  "lazy-chunk-inventory:production:main": { S: 5, E: 1, A: 1, a: 1, T: 2, RI: 2, I: 5 },
-  "responsive-overflow:dev:research": { S: 2, E: 2, A: 1, a: 1, I: 1 },
-  "responsive-overflow:production:research": { S: 1, E: 1, A: 1, a: 1, I: 1 },
+  "lazy-chunk-inventory:production:main": { S: 5, E: 1, A: 1, a: 1, T: 2, RI: 2, I: 5, GP: 5, GJ: 5 },
+  "responsive-overflow:dev:research": { S: 2, E: 2, A: 1, a: 1, I: 1, GP: 1, GJ: 1 },
+  "responsive-overflow:production:research": { S: 1, E: 1, A: 1, a: 1, I: 1, GP: 1, GJ: 1 },
   "responsive-overflow:production:results": { S: 1, RI: 1 },
   "responsive-overflow:dev:strategies": { S: 2, T: 2 },
   "responsive-overflow:production:strategies": { S: 1, T: 1 },
@@ -91,7 +92,9 @@ const EXPECTED_NON_ZERO_COUNTS = {
     B: 1,
     a: 1,
     b: 1,
-    I: 1
+    I: 1,
+    GP: 1,
+    GJ: 1
   },
   "berlin-presentation-time:dev:demo-features": { S: 2, T: 2 },
   "production-results-flow:production:main": {
@@ -142,6 +145,59 @@ const EXPECTED_FIXTURES = {
     csrf_token: "csrf-browser-smoke",
     expires_at: "2026-08-24T12:00:00Z",
     step_up_expires_at: null
+  },
+  gaProfile: {
+    parameter_search_profile_id: "golden_cross_research_v1",
+    profile_revision: "a".repeat(64),
+    strategy_subject: "builtin:golden_cross", strategy_version: "b".repeat(64),
+    fitness_profile_id: "mark_to_market_pnl_v1",
+    cost_profile_id: "explicit_accounting_v1",
+    accepted_fields: {
+      parameter_search_profile_id: { required: true, type: "string", const: "golden_cross_research_v1", immutable: "server_profile" },
+      strategy_subject: { required: true, type: "string", const: "builtin:golden_cross", immutable: "server_profile" },
+      fitness_profile_id: { required: true, type: "string", const: "mark_to_market_pnl_v1", immutable: "server_profile" },
+      cost_profile_id: { required: true, type: "string", const: "explicit_accounting_v1", immutable: "server_profile" },
+      profile_revision: { required: true, type: "sha256", immutable: "server_profile" },
+      strategy_version: { required: true, type: "sha256", immutable: "imported_builtin_source" },
+      dataset_id: { required: true, type: "string", source: "sealed_metadata.id", immutable: "compiled_binding" },
+      start_time: { required: true, type: "strict_integer_utc_ms", minimum: 0, maximum: 253402300799999, constraint: "within sealed coverage and <= end_time", immutable: "compiled_binding" },
+      end_time: { required: true, type: "strict_integer_utc_ms", minimum: 0, maximum: 253402300799999, constraint: "inclusive; within sealed coverage and >= start_time", immutable: "compiled_binding" },
+      initial_balance: { required: true, type: "finite_decimal_or_decimal_string", exclusive_minimum: "0", immutable: "compiled_binding" },
+      fees: { required: true, type: "object", immutable: "compiled_binding", fields: {
+        maker: { required: true, type: "finite_decimal_or_decimal_string", minimum: "0", immutable: "compiled_binding" },
+        taker: { required: true, type: "finite_decimal_or_decimal_string", minimum: "0", immutable: "compiled_binding" }
+      } },
+      instrument: { required: true, type: "object", immutable: "compiled_binding", constraint: "dated_future products require quantity_step and price_tick", fields: {
+        multiplier: { required: false, type: "finite_decimal_or_decimal_string", default: "1", exclusive_minimum: "0", immutable: "compiled_binding" },
+        quantity_step: { required: false, type: "finite_decimal_or_decimal_string_or_null", default: null, exclusive_minimum_when_set: "0", constraint: "required for dated_future products", immutable: "compiled_binding" },
+        price_tick: { required: false, type: "finite_decimal_or_decimal_string_or_null", default: null, exclusive_minimum_when_set: "0", constraint: "required for dated_future products", immutable: "compiled_binding" },
+        fee_model: { required: false, type: "string_enum", default: "percentage_notional", choices: ["per_contract", "percentage_notional"], immutable: "compiled_binding" },
+        capital_model: { required: false, type: "string_enum", default: "notional", choices: ["notional", "per_contract"], immutable: "compiled_binding" },
+        capital_per_contract: { required: false, type: "finite_decimal_or_decimal_string_or_null", default: null, exclusive_minimum_when_set: "0", constraint: "positive and required only when capital_model is per_contract", immutable: "compiled_binding" }
+      } },
+      parameters: {
+        required: false, type: "object", dependency: "short_window.max < long_window.min",
+        quantity_constraint: "must align to instrument.quantity_step when configured",
+        fields: {
+          short_window: { required: false, type: "integer_range", default: { min: 5, max: 50, step: 5 }, constraint: "min <= max; step > 0", immutable: "compiled_binding", fields: {
+            min: { required: true, type: "strict_integer", minimum: 1, maximum: 10000, immutable: "compiled_binding" },
+            max: { required: true, type: "strict_integer", minimum: 1, maximum: 10000, immutable: "compiled_binding" },
+            step: { required: true, type: "strict_integer", exclusive_minimum: 0, immutable: "compiled_binding" }
+          } },
+          long_window: { required: false, type: "integer_range", default: { min: 60, max: 200, step: 10 }, constraint: "min <= max; step > 0", immutable: "compiled_binding", fields: {
+            min: { required: true, type: "strict_integer", minimum: 2, maximum: 10000, immutable: "compiled_binding" },
+            max: { required: true, type: "strict_integer", minimum: 2, maximum: 10000, immutable: "compiled_binding" },
+            step: { required: true, type: "strict_integer", exclusive_minimum: 0, immutable: "compiled_binding" }
+          } },
+          quantity: { required: false, type: "finite_decimal_or_decimal_string", default: "0.01", exclusive_minimum: "0", immutable: "compiled_binding" }
+        }
+      },
+      population_size: { required: false, type: "strict_integer", default: 32, minimum: 2, maximum: 256, constraint: "must not exceed parameter Cartesian cardinality", immutable: "compiled_binding" },
+      max_generations: { required: false, type: "strict_integer", default: 10, minimum: 1, maximum: 100, immutable: "compiled_binding" },
+      seed: { required: false, type: "strict_integer", default: 0, minimum: 0, maximum: 2147483647, immutable: "compiled_binding" }
+    },
+    compiled_fields: { kind: "parameter_search", strategy_type: "golden_cross", strategy_id: "golden_cross", objective: "maximize_score", market_data: "sealed_dataset", write_reports: false, capital_allocation: null, evaluation_set: null, fitness: null },
+    evolution_defaults: { tournament_size: 2, elite_count: 1, crossover_probability: "0.9", mutation_probability: "0.1", mutation_sigma_steps: "1" }
   },
   epochA: {
     id: "epoch-a",
@@ -442,11 +498,15 @@ export function validateToolchain(snapshot) {
         RT: 0,
         RC: 0,
         I: 0,
+        GP: 0,
+        GJ: 0,
+        GP: 0,
+        GJ: 0,
         ...(EXPECTED_NON_ZERO_COUNTS[key] ?? {})
       };
       if (
         !counts ||
-        !same(Object.keys(counts), ["S", "P", "E", "A", "B", "a", "b", "T", "C", "RI", "RD", "RT", "RC", "I"]) ||
+        !same(Object.keys(counts), ["S", "P", "E", "A", "B", "a", "b", "T", "C", "RI", "RD", "RT", "RC", "I", "GP", "GJ"]) ||
         !same(counts, expectedCounts) ||
         Object.values(counts).some(
           (count) => !Number.isInteger(count) || count < 0
@@ -485,6 +545,7 @@ function snapshot() {
       cases: CASE_IDS,
       responses: {
         browserSession: BROWSER_SESSION,
+        gaProfile: GA_PROFILE,
         epochA: EPOCH_A,
         epochB: EPOCH_B,
         generationA: GENERATION_A,

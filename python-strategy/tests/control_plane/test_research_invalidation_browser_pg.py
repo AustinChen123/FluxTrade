@@ -26,7 +26,7 @@ from src.control_plane.browser_auth import BrowserSessionAuth
 from src.control_plane.jobs import SqliteJobStore
 from src.control_plane.main import build_control_plane_app
 from src.control_plane.parameter_search import ParameterSearchJobExecutor
-from src.core.orm_models import EvolutionEpoch, Strategy
+from src.core.orm_models import EvolutionEpoch, GeneRecord, Strategy, SystemEvent
 from src.core.research_datasets import ResearchDatasetImporter, ResearchDatasetSpec
 from test_control_plane import PRODUCT_ID, TIMEFRAME, _write_research_candles
 from test_migrations import _target_url, _upgrade, fresh_pg_db as _fresh_pg_db
@@ -190,6 +190,8 @@ def test_real_https_browser_reconnect_refreshes_missed_pg_epoch(
     proxy_handlers: list[BaseHTTPRequestHandler] = []
     event_statuses: list[int] = []
     stream_exits: list[str] = []
+    forwarded_ga_bodies: list[dict[str, object]] = []
+    forwarded_ga_keys: list[str] = []
     event_requests = 0
 
     class HttpsProxyHandler(BaseHTTPRequestHandler):
@@ -213,6 +215,11 @@ def test_real_https_browser_reconnect_refreshes_missed_pg_epoch(
                         return
             length = int(self.headers.get("Content-Length", "0"))
             body = self.rfile.read(length) if length else None
+            if self.command == "POST" and self.path == "/api/v1/ga-jobs" and body:
+                parsed_body = json.loads(body)
+                assert isinstance(parsed_body, dict)
+                forwarded_ga_bodies.append(parsed_body)
+                forwarded_ga_keys.append(self.headers.get("Idempotency-Key", ""))
             headers = {
                 name: value
                 for name, value in self.headers.items()
@@ -226,7 +233,9 @@ def test_real_https_browser_reconnect_refreshes_missed_pg_epoch(
                 }
             }
             headers["Tailscale-User-Login"] = "research-browser@example.invalid"
-            headers["Tailscale-App-Capabilities"] = json.dumps({_OPERATOR: [{}]})
+            headers["Tailscale-App-Capabilities"] = json.dumps(
+                {_OPERATOR: [{}], _STEP_UP: [{}]}
+            )
             upstream = http.client.HTTPConnection(
                 "127.0.0.1", backend.server_port, timeout=5
             )
@@ -312,7 +321,9 @@ def test_real_https_browser_reconnect_refreshes_missed_pg_epoch(
         identity_headers = {
             "Origin": origin,
             "Tailscale-User-Login": "research-browser@example.invalid",
-            "Tailscale-App-Capabilities": json.dumps({_OPERATOR: [{}]}),
+            "Tailscale-App-Capabilities": json.dumps(
+                {_OPERATOR: [{}], _STEP_UP: [{}]}
+            ),
         }
         status, response_headers, session_body = _https_json(
             port,
@@ -336,7 +347,9 @@ def test_real_https_browser_reconnect_refreshes_missed_pg_epoch(
             "Origin": origin,
             "Cookie": cookie_pair,
             "Tailscale-User-Login": "research-browser@example.invalid",
-            "Tailscale-App-Capabilities": json.dumps({_OPERATOR: [{}]}),
+            "Tailscale-App-Capabilities": json.dumps(
+                {_OPERATOR: [{}], _STEP_UP: [{}]}
+            ),
             "X-CSRF-Token": csrf_token,
             "Content-Type": "application/json",
             "Idempotency-Key": "browser-reconnect-initial",
@@ -367,6 +380,32 @@ def test_real_https_browser_reconnect_refreshes_missed_pg_epoch(
         first_epoch_id = first_evolution.get("epoch_id")
         assert isinstance(first_epoch_id, str) and first_epoch_id
 
+        # Establish a known prior champion through the existing authenticated
+        # lifecycle route, using a gene produced by the real native worker.
+        with sessions() as session:
+            first_genes = list(
+                session.scalars(
+                    select(GeneRecord)
+                    .where(GeneRecord.epoch_id == first_epoch_id)
+                    .order_by(GeneRecord.id)
+                ).all()
+            )
+        assert len(first_genes) >= 2, "native fixture job must persist challengers"
+        prior_gene_id = first_genes[0].id
+        status, _headers, prior_receipt = _https_json(
+            port,
+            "POST",
+            f"/genes/{prior_gene_id}/promote",
+            command_headers,
+            body=json.dumps({"reason": "fixture establishes prior champion"}),
+        )
+        assert status == 200 and isinstance(prior_receipt, dict)
+        assert prior_receipt.get("scope") == "RESEARCH_CANDIDATE_ONLY"
+        prior_gene = prior_receipt.get("gene")
+        assert isinstance(prior_gene, dict)
+        assert prior_gene.get("role") == "champion"
+        assert prior_gene.get("retired_gene_ids") == []
+
         ready_path = tmp_path / "browser-ready.json"
         continue_path = tmp_path / "browser-continue.json"
         env = {
@@ -376,6 +415,10 @@ def test_real_https_browser_reconnect_refreshes_missed_pg_epoch(
             "RESEARCH_REAL_READY_FILE": str(ready_path),
             "RESEARCH_REAL_CONTINUE_FILE": str(continue_path),
             "RESEARCH_REAL_INITIAL_EPOCH": first_epoch_id,
+            "RESEARCH_REAL_DATASET_ID": dataset_id,
+            "RESEARCH_REAL_START": str(candles[0][0]),
+            "RESEARCH_REAL_END": str(candles[-1][0]),
+            "RESEARCH_REAL_RESULT_FILE": str(tmp_path / "browser-result.json"),
         }
         browser_process = subprocess.Popen(
             [
@@ -443,6 +486,67 @@ def test_real_https_browser_reconnect_refreshes_missed_pg_epoch(
 
         output, _ = browser_process.communicate(timeout=90)
         assert browser_process.returncode == 0, output[-8000:]
+        result_path = tmp_path / "browser-result.json"
+        assert result_path.is_file(), "browser did not report its UI-submitted job"
+        browser_result = json.loads(result_path.read_text(encoding="utf-8"))
+        assert isinstance(browser_result, dict)
+        ui_job_id = browser_result.get("jobId")
+        assert isinstance(ui_job_id, str) and ui_job_id in futures
+        ui_completion = futures[ui_job_id].result(timeout=60)
+        assert ui_completion.status.value == "SUCCEEDED"
+        ui_record = store.get_ga_job(ui_job_id)
+        assert ui_record is not None and ui_record.status.value == "SUCCEEDED"
+        assert ui_record.epoch_id
+        assert ui_record.completed_generation == 0
+        assert len(forwarded_ga_bodies) == 3
+        assert len(forwarded_ga_keys) == 3 and forwarded_ga_keys[-1]
+        assert forwarded_ga_keys[:2] == [
+            "browser-reconnect-initial",
+            "browser-reconnect-second",
+        ]
+        ui_payload = forwarded_ga_bodies[-1]
+        assert ui_payload["dataset_id"] == dataset_id
+        assert ui_payload["initial_balance"] == "10000.123456789012345678901234"
+        assert ui_payload["fees"] == {"maker": "0.000001", "taker": "0.000123"}
+        stored_backtest = ui_record.request["backtest"]
+        assert isinstance(stored_backtest, dict)
+        assert stored_backtest["initial_balance"] == "10000.123456789012345678901234"
+        assert stored_backtest["maker_fee"] == "0.000001"
+        assert stored_backtest["taker_fee"] == "0.000123"
+        persisted_receipt = store.get_ga_command_receipt(
+            actor="research-browser@example.invalid",
+            idempotency_key=forwarded_ga_keys[-1],
+            operation="submit",
+            http_wire_intent=ui_payload,
+        )
+        assert persisted_receipt is not None and persisted_receipt.id == ui_job_id
+        with sessions() as session:
+            ui_epoch = session.get(EvolutionEpoch, ui_record.epoch_id)
+            assert ui_epoch is not None and ui_epoch.generations_run == 1
+            ui_genes = list(
+                session.scalars(
+                    select(GeneRecord).where(GeneRecord.epoch_id == ui_record.epoch_id)
+                ).all()
+            )
+            assert len(ui_genes) == 2
+            promoted_gene_id = next(
+                gene.id for gene in ui_genes if gene.role == "champion"
+            )
+            retired_prior = session.get(GeneRecord, prior_gene_id)
+            assert retired_prior is not None and retired_prior.role == "retired"
+            events = list(
+                session.scalars(
+                    select(SystemEvent).where(
+                        SystemEvent.event_type.in_(["gene_promote", "gene_retire"]),
+                        SystemEvent.related_gene_id.in_([prior_gene_id, promoted_gene_id]),
+                    )
+                ).all()
+            )
+            assert {(event.event_type, event.related_gene_id) for event in events} == {
+                ("gene_promote", prior_gene_id),
+                ("gene_retire", prior_gene_id),
+                ("gene_promote", promoted_gene_id),
+            }
     finally:
         release_reconnect.set()
         if browser_process is not None and browser_process.poll() is None:

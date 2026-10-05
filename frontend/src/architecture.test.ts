@@ -62,6 +62,7 @@ type ArchitectureRole =
   | "app-shell"
   | "research-stream"
   | "research-io"
+  | "research-ga-io"
   | "strategy-io"
   | "results-io"
   | "trades-io"
@@ -127,6 +128,7 @@ const expectedInventory = [
   "architecture.test.ts",
   "features/research/FitnessSurface3D.test.tsx",
   "features/research/FitnessSurface3D.tsx",
+  "features/research/GaOperationsPanel.tsx",
   "features/research/ResearchPage.test.tsx",
   "features/research/ResearchPage.tsx",
   "features/research/ResearchRoute.test.tsx",
@@ -137,8 +139,12 @@ const expectedInventory = [
   "features/research/gaCharts.ts",
   "features/research/gaDomain.test.ts",
   "features/research/gaDomain.ts",
+  "features/research/gaOperationsModel.test.ts",
+  "features/research/gaOperationsModel.ts",
   "features/research/researchModel.test.ts",
   "features/research/researchModel.ts",
+  "features/research/useGaOperations.test.ts",
+  "features/research/useGaOperations.ts",
   "features/research/useResearchWorkspace.test.ts",
   "features/research/useResearchWorkspace.ts",
   "features/results/BacktestResultsView.test.tsx",
@@ -266,6 +272,9 @@ const expectedBareImportLedger = [
   "features/research/gaCharts.ts|echarts/core|type-only",
   "features/research/gaCharts.ts|echarts|type-only",
   "features/research/gaDomain.test.ts|vitest|value",
+  "features/research/gaOperationsModel.test.ts|vitest|value",
+  "features/research/GaOperationsPanel.tsx|react-i18next|value",
+  "features/research/GaOperationsPanel.tsx|react|value",
   "features/research/researchModel.test.ts|vitest|value",
   "features/research/ResearchPage.test.tsx|@testing-library/react|value",
   "features/research/ResearchPage.test.tsx|vitest|value",
@@ -275,6 +284,9 @@ const expectedBareImportLedger = [
   "features/research/ResearchRoute.test.tsx|vitest|value",
   "features/research/ResearchRoute.tsx|react-i18next|value",
   "features/research/ResearchRoute.tsx|react|value",
+  "features/research/useGaOperations.test.ts|@testing-library/react|value",
+  "features/research/useGaOperations.test.ts|vitest|value",
+  "features/research/useGaOperations.ts|react|value",
   "features/research/useResearchWorkspace.test.ts|@testing-library/react|value",
   "features/research/useResearchWorkspace.test.ts|vitest|value",
   "features/research/useResearchWorkspace.ts|react|value",
@@ -373,6 +385,14 @@ const expectedRelativeImportLedger = [
   "features/research/gaDomain.test.ts|./demo|value|features/research/demo.ts",
   "features/research/gaDomain.test.ts|./gaDomain|value|features/research/gaDomain.ts",
   "features/research/gaDomain.ts|../../api|type-only|api.ts",
+  "features/research/gaOperationsModel.test.ts|../../api|type-only|api.ts",
+  "features/research/gaOperationsModel.test.ts|./gaOperationsModel|value|features/research/gaOperationsModel.ts",
+  "features/research/gaOperationsModel.ts|../../api|type-only|api.ts",
+  "features/research/GaOperationsPanel.tsx|../../shared/i18n|type-only|shared/i18n.ts",
+  "features/research/GaOperationsPanel.tsx|../../shared/time/presentation|value|shared/time/presentation.ts",
+  "features/research/GaOperationsPanel.tsx|./gaOperationsModel|value|features/research/gaOperationsModel.ts",
+  "features/research/GaOperationsPanel.tsx|./useGaOperations|type-only|features/research/useGaOperations.ts",
+  "features/research/GaOperationsPanel.tsx|./useResearchWorkspace|type-only|features/research/useResearchWorkspace.ts",
   "features/research/researchModel.test.ts|../../api|type-only|api.ts",
   "features/research/researchModel.test.ts|./gaDomain|value|features/research/gaDomain.ts",
   "features/research/researchModel.test.ts|./researchModel|value|features/research/researchModel.ts",
@@ -391,16 +411,27 @@ const expectedRelativeImportLedger = [
   "features/research/ResearchPage.tsx|./researchModel|value|features/research/researchModel.ts",
   "features/research/ResearchPage.tsx|./useResearchWorkspace|type-only|features/research/useResearchWorkspace.ts",
   "features/research/ResearchRoute.test.tsx|../../api|type-only|api.ts",
-  "features/research/ResearchRoute.test.tsx|../../api|type-only|api.ts",
+  "features/research/ResearchRoute.test.tsx|../../api|value|api.ts",
   "features/research/ResearchRoute.test.tsx|../../shared/i18n|value|shared/i18n.ts",
+  "features/research/ResearchRoute.test.tsx|./gaOperationsModel|value|features/research/gaOperationsModel.ts",
   "features/research/ResearchRoute.test.tsx|./ResearchRoute|value|features/research/ResearchRoute.tsx",
   "features/research/ResearchRoute.tsx|../../shared/i18n|type-only|shared/i18n.ts",
   "features/research/ResearchRoute.tsx|../../shared/theme|type-only|shared/theme.ts",
   "features/research/ResearchRoute.tsx|../../shared/time/presentation|value|shared/time/presentation.ts",
   "features/research/ResearchRoute.tsx|./gaCharts|value|features/research/gaCharts.ts",
   "features/research/ResearchRoute.tsx|./gaDomain|value|features/research/gaDomain.ts",
+  "features/research/ResearchRoute.tsx|./GaOperationsPanel|value|features/research/GaOperationsPanel.tsx",
   "features/research/ResearchRoute.tsx|./ResearchPage|value|features/research/ResearchPage.tsx",
+  "features/research/ResearchRoute.tsx|./useGaOperations|value|features/research/useGaOperations.ts",
   "features/research/ResearchRoute.tsx|./useResearchWorkspace|value|features/research/useResearchWorkspace.ts",
+  "features/research/useGaOperations.test.ts|../../api|type-only|api.ts",
+  "features/research/useGaOperations.test.ts|../../api|value|api.ts",
+  "features/research/useGaOperations.test.ts|./gaOperationsModel|value|features/research/gaOperationsModel.ts",
+  "features/research/useGaOperations.test.ts|./useGaOperations|value|features/research/useGaOperations.ts",
+  "features/research/useGaOperations.test.ts|./useResearchWorkspace|type-only|features/research/useResearchWorkspace.ts",
+  "features/research/useGaOperations.ts|../../api|value|api.ts",
+  "features/research/useGaOperations.ts|./gaOperationsModel|value|features/research/gaOperationsModel.ts",
+  "features/research/useGaOperations.ts|./useResearchWorkspace|type-only|features/research/useResearchWorkspace.ts",
   "features/research/useResearchWorkspace.test.ts|../../api|type-only|api.ts",
   "features/research/useResearchWorkspace.test.ts|../../api|value|api.ts",
   "features/research/useResearchWorkspace.test.ts|./useResearchWorkspace|value|features/research/useResearchWorkspace.ts",
@@ -545,6 +576,11 @@ const expectedPolicyGlobalLedger = [
   "app/App.tsx|window.location.search",
   "app/researchInvalidation.ts|fetch()",
   "features/research/FitnessSurface3D.tsx|window.devicePixelRatio",
+  "features/research/useGaOperations.ts|window.crypto.randomUUID()",
+  "features/research/useGaOperations.ts|window.sessionStorage.getItem()",
+  "features/research/useGaOperations.ts|window.sessionStorage.removeItem()",
+  "features/research/useGaOperations.ts|window.sessionStorage.setItem()",
+  "features/research/useGaOperations.ts|window.sessionStorage.setItem()",
   "features/results/BacktestResultsView.tsx|import.meta.env.DEV",
   "features/strategies/useStrategyManager.ts|window.confirm()",
   "features/strategies/useStrategyManager.ts|window.confirm()",
@@ -1044,12 +1080,14 @@ const featureOwnerPaths = new Set([
 ]);
 const featurePresentationPaths = new Set([
   "features/research/FitnessSurface3D.tsx",
+  "features/research/GaOperationsPanel.tsx",
   "features/research/ResearchPage.tsx",
   "features/strategies/StrategyManagerView.tsx",
   "features/trades/CandlestickChart.tsx"
 ]);
 const featureModelPaths = new Set([
   "features/research/gaDomain.ts",
+  "features/research/gaOperationsModel.ts",
   "features/research/researchModel.ts",
   "features/results/resultsModel.ts",
   "features/strategies/strategyCommandState.ts",
@@ -1100,6 +1138,7 @@ function architectureRole(importer: string): ArchitectureRole {
   if (importer === "features/research/useResearchWorkspace.ts") {
     return "research-io";
   }
+  if (importer === "features/research/useGaOperations.ts") return "research-ga-io";
   if (importer === "features/strategies/useStrategyManager.ts") {
     return "strategy-io";
   }
@@ -1259,6 +1298,7 @@ function assertBareEdge(edge: ImportEdge, role: ArchitectureRole): void {
         "features/research/FitnessSurface3D.test.tsx",
         "features/research/ResearchPage.test.tsx",
         "features/research/ResearchRoute.test.tsx",
+        "features/research/useGaOperations.test.ts",
         "features/research/useResearchWorkspace.test.ts",
         "features/results/BacktestResultsView.test.tsx",
         "features/results/useBacktestResults.test.ts",
@@ -1288,6 +1328,7 @@ function assertBareEdge(edge: ImportEdge, role: ArchitectureRole): void {
     "app-shell": new Set(["react|value", "react-i18next|value"]),
     "research-stream": new Set(["react|value"]),
     "research-io": new Set(["react|value"]),
+    "research-ga-io": new Set(["react|value"]),
     "strategy-io": new Set(["react|value", "react-i18next|type-only"]),
     "results-io": new Set(["react|value"]),
     "trades-io": new Set(["react|value"]),
@@ -1412,6 +1453,12 @@ function assertRepositoryEdge(edge: ImportEdge, role: ArchitectureRole): void {
     return;
   }
   if (role === "research-stream") denyEdge(edge);
+  if (role === "research-ga-io") {
+    if (
+      (!isSameFeature(edge.importer, edge.resolved) && edge.resolved !== "api.ts")
+    ) denyEdge(edge);
+    return;
+  }
   if (role === "research-io" || role === "strategy-io") {
     if (
       !isSameFeature(edge.importer, edge.resolved) &&
@@ -1699,6 +1746,15 @@ const allowedPolicyGlobals = new Map<string, ReadonlySet<string>>([
       "window.history.replaceState()",
       "window.location.href",
       "window.location.search"
+    ])
+  ],
+  [
+    "features/research/useGaOperations.ts",
+    new Set([
+      "window.crypto.randomUUID()",
+      "window.sessionStorage.getItem()",
+      "window.sessionStorage.removeItem()",
+      "window.sessionStorage.setItem()"
     ])
   ],
   [
@@ -2320,6 +2376,7 @@ describe("frontend architecture ratchet", () => {
     ["app/App.tsx", "app-shell"],
     ["app/researchInvalidation.ts", "research-stream"],
     ["features/research/useResearchWorkspace.ts", "research-io"],
+    ["features/research/useGaOperations.ts", "research-ga-io"],
     ["features/strategies/useStrategyManager.ts", "strategy-io"],
     ["features/results/useBacktestResults.ts", "results-io"],
     ["features/trades/useBacktestTrades.ts", "trades-io"],
@@ -2380,6 +2437,17 @@ describe("frontend architecture ratchet", () => {
       "features/research/useResearchWorkspace.ts",
       "../../api",
       "api.ts"
+    ),
+    architectureEdge(
+      "features/research/useGaOperations.ts",
+      "../../api",
+      "api.ts"
+    ),
+    architectureEdge(
+      "features/research/useGaOperations.ts",
+      "../../api",
+      "api.ts",
+      "type-only"
     ),
     architectureEdge(
       "features/strategies/useStrategyManager.ts",
@@ -2706,7 +2774,7 @@ describe("frontend architecture ratchet", () => {
       /@charset|@import|url\(/
     );
     await expect(sha256(payload)).resolves.toBe(
-      "631b21e397fc9973af198a1b088fbf4f477a1b8018a7bc86c40058d843ca5076"
+      "d76986b478061f42791e8f338a3b9a7a2ac7b08abbf833b2340eeb871342454a"
     );
   });
 
@@ -2806,6 +2874,9 @@ describe("frontend architecture ratchet", () => {
       "../../shared/theme|type-only|shared/theme.ts",
       "./gaDomain|value|features/research/gaDomain.ts"
     ]);
+    expect(directRelativeSpecifiers(edges, "features/research/ResearchRoute.tsx")).toContain(
+      "./useGaOperations|value|features/research/useGaOperations.ts"
+    );
     expect(
       directRelativeSpecifiers(edges, "features/research/useResearchWorkspace.ts")
     ).toEqual([
@@ -3284,6 +3355,10 @@ describe("frontend architecture ratchet", () => {
     const researchStateNames = [
       "epochs",
       "setEpochs",
+      "session",
+      "setSession",
+      "sessionResolved",
+      "setSessionResolved",
       "epochId",
       "setEpochId",
       "summaries",
@@ -3353,6 +3428,8 @@ describe("frontend architecture ratchet", () => {
     });
     expect(statePairs).toEqual([
       "epochs/setEpochs",
+      "session/setSession",
+      "sessionResolved/setSessionResolved",
       "epochId/setEpochId",
       "summaries/setSummaries",
       "generationIndex/setGenerationIndex",
@@ -3386,6 +3463,12 @@ describe("frontend architecture ratchet", () => {
           isCallExpression(node) &&
           isIdentifier(node.expression) &&
           node.expression.text === "useResearchWorkspace"
+      )
+    ).toHaveLength(1);
+    expect(findNamedFunction(source("features/research/useGaOperations.ts"), "useGaOperations")).toHaveLength(1);
+    expect(
+      descendants(route[0]).filter(
+        (node) => isCallExpression(node) && isIdentifier(node.expression) && node.expression.text === "useGaOperations"
       )
     ).toHaveLength(1);
     expect(

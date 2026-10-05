@@ -3,10 +3,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ApiError,
   ensureBrowserSession,
+  loadEpochById,
   loadEpochs,
   loadGenerationGenes,
   loadGenerationSummaries,
   type Epoch,
+  type BrowserSession,
   type Gene,
   type GenerationSummary
 } from "../../api";
@@ -50,6 +52,8 @@ export function classifyResearchError(reason: unknown): ResearchError {
 }
 
 export type ResearchWorkspace = {
+  readonly session: BrowserSession | null;
+  readonly sessionResolved: boolean;
   readonly epochs: Epoch[];
   readonly epoch: Epoch | null;
   readonly epochId: string;
@@ -65,6 +69,7 @@ export type ResearchWorkspace = {
   readonly error: ResearchError | null;
   readonly model: ResearchModel;
   readonly chooseEpoch: (epochId: string) => void;
+  readonly openEpoch: (epochId: string) => Promise<void>;
   readonly chooseGeneration: (generationIndex: number) => void;
   readonly chooseGene: (geneId: number) => void;
   readonly chooseXParameter: (parameter: string) => void;
@@ -76,6 +81,8 @@ export type ResearchWorkspace = {
 
 export function useResearchWorkspace(demoMode: boolean): ResearchWorkspace {
   const [epochs, setEpochs] = useState<Epoch[]>([]);
+  const [session, setSession] = useState<BrowserSession | null>(null);
+  const [sessionResolved, setSessionResolved] = useState(demoMode);
   const [epochId, setEpochId] = useState("");
   const [summaries, setSummaries] = useState<GenerationSummary[]>([]);
   const [generationIndex, setGenerationIndex] = useState<number | null>(null);
@@ -131,7 +138,11 @@ export function useResearchWorkspace(demoMode: boolean): ResearchWorkspace {
       if (demoMode) {
         return [demoEpoch];
       }
-      await ensureBrowserSession();
+      const currentSession = await ensureBrowserSession();
+      if (current()) {
+        setSession(currentSession);
+        setSessionResolved(true);
+      }
       return loadEpochs();
     };
     void load()
@@ -264,12 +275,19 @@ export function useResearchWorkspace(demoMode: boolean): ResearchWorkspace {
     setLoading(true);
     setFailure(null);
     try {
-      await ensureBrowserSession();
+      const currentSession = await ensureBrowserSession();
+      if (!current()) return;
+      setSession(currentSession);
+      setSessionResolved(true);
       const nextEpochs = await loadEpochs();
       if (!current()) return;
-      const nextEpoch = nextEpochs.find((item) => item.id === selected.epochId)
-        ?? nextEpochs[0]
-        ?? null;
+      const listedEpoch = nextEpochs.find((item) => item.id === selected.epochId);
+      const nextEpoch = listedEpoch ?? (selected.epochId
+        ? await loadEpochById(selected.epochId)
+        : nextEpochs[0] ?? null);
+      const committedEpochs = nextEpoch && !nextEpochs.some((item) => item.id === nextEpoch.id)
+        ? [...nextEpochs, nextEpoch]
+        : nextEpochs;
       stage = "summaries";
       const nextSummaries = nextEpoch
         ? await loadGenerationSummaries(nextEpoch.id)
@@ -286,7 +304,7 @@ export function useResearchWorkspace(demoMode: boolean): ResearchWorkspace {
         ? await loadGenerationGenes(nextEpoch.id, nextGeneration)
         : [];
       if (!current()) return;
-      setEpochs(nextEpochs);
+      setEpochs(committedEpochs);
       setEpochsLoaded(true);
       setEpochId(nextEpoch?.id ?? "");
       setSummaries(nextSummaries);
@@ -320,6 +338,45 @@ export function useResearchWorkspace(demoMode: boolean): ResearchWorkspace {
     setSelectedGeneId(null);
     setEpochId(nextEpochId);
   };
+  const openEpoch = useCallback(async (nextEpochId: string) => {
+    if (demoMode) return;
+    if (epochs.some((item) => item.id === nextEpochId)) {
+      refreshVersion.current += 1;
+      setLoading(false);
+      setSummaries([]);
+      setGenerationIndex(null);
+      setGenes([]);
+      setSelectedGeneId(null);
+      setEpochId(nextEpochId);
+      return;
+    }
+    const version = ++refreshVersion.current;
+    const current = () => version === refreshVersion.current;
+    setLoading(true);
+    setFailure(null);
+    try {
+      const currentSession = await ensureBrowserSession();
+      if (!current()) return;
+      setSession(currentSession);
+      setSessionResolved(true);
+      const item = await loadEpochById(nextEpochId);
+      if (!current()) return;
+      setEpochs((items) => items.some((existing) => existing.id === item.id)
+        ? items
+        : [...items, item]);
+      setSummaries([]);
+      setGenerationIndex(null);
+      setGenes([]);
+      setSelectedGeneId(null);
+      setEpochId(item.id);
+    } catch (reason) {
+      if (current()) {
+        setFailure({ stage: "epochs", error: classifyResearchError(reason) });
+      }
+    } finally {
+      if (current()) setLoading(false);
+    }
+  }, [demoMode, epochs]);
   const chooseGeneration = (nextGenerationIndex: number) => {
     refreshVersion.current += 1;
     setGenerationIndex(nextGenerationIndex);
@@ -331,6 +388,8 @@ export function useResearchWorkspace(demoMode: boolean): ResearchWorkspace {
   };
 
   return {
+    session,
+    sessionResolved,
     epochs,
     epoch,
     epochId,
@@ -346,6 +405,7 @@ export function useResearchWorkspace(demoMode: boolean): ResearchWorkspace {
     error: failure?.error ?? null,
     model,
     chooseEpoch,
+    openEpoch,
     chooseGeneration,
     chooseGene,
     chooseXParameter: setXParameter,

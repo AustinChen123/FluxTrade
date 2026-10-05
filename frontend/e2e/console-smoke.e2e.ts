@@ -74,6 +74,7 @@ import {
   F2B_STATES_INDEX,
   F2B_ZERO_DETAIL,
   F2B_ZERO_RESULT_ID,
+  GA_PROFILE,
   GENE_A,
   GENE_B,
   GENERATION_A,
@@ -111,7 +112,9 @@ const ZERO_COUNTS: MutableRouteCounts = {
   RD: 0,
   RT: 0,
   RC: 0,
-  I: 0
+  I: 0,
+  GP: 0,
+  GJ: 0
 };
 const PROJECT_VIEWPORTS = {
   "desktop-1440x900": { width: 1440, height: 900 },
@@ -349,6 +352,20 @@ async function installApiFixtures(
       url.search === ""
     ) {
       routeId = "I";
+    } else if (
+      method === "GET" &&
+      url.pathname === "/api/v1/ga-profiles/golden_cross_research_v1" &&
+      url.search === ""
+    ) {
+      routeId = "GP";
+      body = { schema_version: 1, profile: GA_PROFILE };
+    } else if (
+      method === "GET" &&
+      url.pathname === "/api/v1/ga-jobs" &&
+      url.search === "?limit=50&offset=0"
+    ) {
+      routeId = "GJ";
+      body = { schema_version: 1, items: [], total_count: 0, limit: 50, offset: 0 };
     } else if (
       method === "GET" &&
       url.pathname === "/api/v1/backtest-results" &&
@@ -1407,6 +1424,7 @@ async function exerciseScenario(
       await expect(page.locator(".empty-panel")).toBeVisible();
     } else {
       await expect(page.getByText(BACKTEST_TRADE_ID, { exact: true }).first()).toBeVisible();
+      await expect(page.locator(".trade-chart canvas")).toBeVisible();
     }
     await expect(page.getByText("job-research-0042")).toHaveCount(0);
     await expect(page.getByText("trade-000184")).toHaveCount(0);
@@ -1556,12 +1574,14 @@ async function exerciseScenario(
       await expect(page.getByText("job-research-0042")).toHaveCount(0);
     } else {
       await expect(page.getByText(BACKTEST_TRADE_ID, { exact: true }).first()).toBeVisible();
+      await expect(page.locator(".trade-chart canvas")).toBeVisible();
     }
   } else {
     if (triple.caseId === "results") {
       await expect(page.getByText("job-research-0042", { exact: true })).toBeVisible();
     } else {
       await expect(page.getByText("trade-000184", { exact: true }).first()).toBeVisible();
+      await expect(page.locator(".trade-chart canvas")).toBeVisible();
     }
   }
   expect(
@@ -1639,7 +1659,7 @@ async function runTriple(
 
     await exerciseScenario(page, triple, moduleRequests, observedCounts, commandGate, testInfo);
     const key = tripleKey(triple);
-    expect(observedCounts).toEqual(EXPECTED_REQUEST_COUNTS[key]);
+    expect(observedCounts).toEqual({ ...ZERO_COUNTS, ...EXPECTED_REQUEST_COUNTS[key] });
     expect(documents).toBe(EXPECTED_DOCUMENT_COUNTS[key]);
     expect(expectedApiFailures.sort()).toEqual(
       [...(EXPECTED_API_STATUS_DIAGNOSTICS[triple.scenario] ?? [])].sort()
@@ -1713,19 +1733,22 @@ for (const view of ["strategies", "research"] as const) {
         }
       });
       await page.goto(`http://127.0.0.1:4174/?view=${view}`);
+      const primaryAlert = view === "research"
+        ? page.locator("section.error-panel[role=alert]")
+        : page.getByRole("alert");
       const success = scenario === "read-only" || scenario === "operator";
       if (success) {
         await expect(page.getByText(view === "strategies" ? "active-strategy" : "candidate-a", { exact: true }).first()).toBeVisible();
       } else {
-        await expect(page.getByRole("alert")).toBeVisible();
+        await expect(primaryAlert).toBeVisible();
       }
       for (const locale of ["en", "zh-TW"]) {
         await page.locator("#language").selectOption(locale);
         if (!success) {
-          await expect(page.getByRole("alert")).not.toContainText("SENSITIVE_SENTINEL");
-          expect((await page.getByRole("alert").innerText()).length).toBeLessThan(350);
+          await expect(primaryAlert).not.toContainText("SENSITIVE_SENTINEL");
+          expect((await primaryAlert.innerText()).length).toBeLessThan(350);
           if (["401", "403", "session-denied"].includes(scenario)) {
-            await expect(page.getByRole("alert")).toContainText(locale === "en" ? "This session cannot" : "目前工作階段沒有");
+            await expect(primaryAlert).toContainText(locale === "en" ? "This session cannot" : "目前工作階段沒有");
           }
         } else if (view === "strategies") {
           if (scenario === "read-only") {
