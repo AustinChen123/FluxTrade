@@ -5,9 +5,21 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Hashable, Protocol
 
+from sqlalchemy.exc import SQLAlchemyError
+
 from src.control_plane.models import ParameterSearchJobRequest
 from src.core.data_sources.csv_source import CsvDataSource
+from src.core.data_sources.research_database import ResearchDatabaseDataSource
 from src.core.interfaces.data_source import IDataSource
+from src.core.research_datasets import ResearchDatasetIntegrityError
+
+
+class SealedDatasetRejectedError(ValueError):
+    """A sealed dataset is missing, invalid, or incompatible with the request."""
+
+
+class SealedDatasetBackendUnavailableError(RuntimeError):
+    """The sealed dataset catalog could not be queried."""
 
 
 class EvaluationDataSourceProvider(Protocol):
@@ -40,3 +52,81 @@ class CsvEvaluationDataSourceProvider:
         path = Path(request.backtest.candles_csv_path)
         stat = path.stat()
         return str(path.resolve()), stat.st_mtime_ns, stat.st_size
+
+
+class DatabaseEvaluationDataSourceProvider:
+    """Provide one explicitly bound, sealed research dataset to an evaluation."""
+
+    def __init__(self, dataset_id: str, session_factory=None) -> None:
+        if not isinstance(dataset_id, str) or not dataset_id.strip():
+            raise ValueError("dataset_id must be non-empty")
+        self._dataset_id = dataset_id
+        self._source = ResearchDatabaseDataSource(
+            dataset_id,
+            session_factory=session_factory,
+        )
+
+    def create(self, request: ParameterSearchJobRequest) -> IDataSource:
+        self._validate_request(request)
+        return self._source
+
+    def cache_key(self, request: ParameterSearchJobRequest) -> Hashable:
+        self._validate_request(request)
+        return (
+            self._dataset_id,
+            request.product_id,
+            request.timeframe,
+            request.start_time,
+            request.end_time,
+        )
+
+    def _validate_request(self, request: ParameterSearchJobRequest) -> None:
+        if request.start_time > request.end_time:
+            raise ValueError("evaluation range must not be reversed")
+        available_range = self._source.get_available_range(
+            request.product_id,
+            request.timeframe,
+        )
+        if available_range is None:
+            raise ValueError("dataset product/timeframe does not match request")
+        if (
+            request.start_time < available_range[0]
+            or request.end_time > available_range[1]
+        ):
+            raise ValueError("requested range is outside sealed dataset coverage")
+
+
+class RequestEvaluationDataSourceProvider:
+    """Select the explicitly requested sealed source or legacy CSV source."""
+
+    def __init__(self, session_factory=None) -> None:
+        self._session_factory = session_factory
+        self._csv_provider = CsvEvaluationDataSourceProvider()
+
+    def create(self, request: ParameterSearchJobRequest) -> IDataSource:
+        return self._provider_for(request).create(request)
+
+    def cache_key(self, request: ParameterSearchJobRequest) -> Hashable:
+        return self._provider_for(request).cache_key(request)
+
+    def _provider_for(
+        self,
+        request: ParameterSearchJobRequest,
+    ) -> EvaluationDataSourceProvider:
+        if request.market_data is None:
+            return self._csv_provider
+        return DatabaseEvaluationDataSourceProvider(
+            request.market_data.dataset_id,
+            session_factory=self._session_factory,
+        )
+
+    def validate_sealed_request(self, request: ParameterSearchJobRequest) -> None:
+        """Check a sealed request's catalog identity without loading candles."""
+        if request.market_data is None:
+            return
+        try:
+            self.cache_key(request)
+        except SQLAlchemyError as exc:
+            raise SealedDatasetBackendUnavailableError from exc
+        except (ResearchDatasetIntegrityError, ValueError) as exc:
+            raise SealedDatasetRejectedError from exc

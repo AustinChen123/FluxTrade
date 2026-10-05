@@ -1,6 +1,114 @@
-import { finiteDecimalNumber } from "../../shared/format/decimal";
+import { finiteDecimalNumber, isDecimalString } from "../../shared/format/decimal";
+import type {
+  BacktestResultsCandlesPage,
+  BacktestResultsDetail
+} from "../../api";
 import type { ClosedTrade } from "../../shared/trading/closedTrade";
+import { projectClosedTradePage } from "../../shared/trading/closedTradePage";
+import type { TradePage } from "../../shared/trading/closedTradePage";
 import { parseUtcTimestamp } from "../../shared/time/utc";
+
+const MAX_UTC_MILLISECONDS = 253_402_300_799_999;
+
+type TradeDetailInput = Pick<
+  BacktestResultsDetail,
+  "job_id" | "strategy_id" | "product_id" | "timeframe" | "currency" |
+  "started_at" | "ended_at" | "trade_page"
+>;
+
+export type BacktestTradeIdentity = {
+  resultId: string;
+  strategyId: string;
+  productId: string;
+  currency: string;
+  timeframe: string;
+  timeframeMs: number;
+  coverageStart: number;
+  coverageEnd: number;
+  tradePage: TradePage;
+};
+
+export type TradeCandleWindow = { start: number; end: number };
+
+function timeframeMilliseconds(timeframe: string): number | null {
+  const match = /^([0-9]+)([smhd])$/.exec(timeframe);
+  if (!match) return null;
+  const amount = Number(match[1]);
+  const unitMilliseconds = {
+    s: 1_000,
+    m: 60_000,
+    h: 3_600_000,
+    d: 86_400_000
+  }[match[2] as "s" | "m" | "h" | "d"];
+  const duration = amount * unitMilliseconds;
+  return Number.isSafeInteger(amount) && amount > 0 &&
+    Number.isSafeInteger(duration) && duration > 0
+    ? duration
+    : null;
+}
+
+export function projectBacktestTradeIdentity(
+  detail: TradeDetailInput
+): BacktestTradeIdentity | null {
+  const timeframeMs = timeframeMilliseconds(detail.timeframe);
+  const coverageStart = parseUtcTimestamp(detail.started_at);
+  const coverageEndInclusive = parseUtcTimestamp(detail.ended_at);
+  if (
+    timeframeMs === null || coverageStart === null || coverageEndInclusive === null ||
+    coverageStart < 0 || coverageStart > coverageEndInclusive
+  ) {
+    return null;
+  }
+  const coverageEnd = coverageEndInclusive + 1;
+  if (
+    !Number.isSafeInteger(coverageEnd) ||
+    coverageEnd > MAX_UTC_MILLISECONDS
+  ) {
+    return null;
+  }
+  const tradePage = projectClosedTradePage(
+    detail.trade_page.items,
+    detail.trade_page.total_count,
+    detail.trade_page.next_cursor,
+    true
+  );
+  if (tradePage === null) return null;
+  return {
+    resultId: detail.job_id,
+    strategyId: detail.strategy_id,
+    productId: detail.product_id,
+    currency: detail.currency,
+    timeframe: detail.timeframe,
+    timeframeMs,
+    coverageStart,
+    coverageEnd,
+    tradePage
+  };
+}
+
+export function tradeCandleWindow(
+  identity: BacktestTradeIdentity,
+  trade: ClosedTrade
+): TradeCandleWindow | null {
+  const entry = parseUtcTimestamp(trade.entryTime);
+  const exit = parseUtcTimestamp(trade.exitTime);
+  if (
+    entry === null || exit === null || entry > exit ||
+    entry < identity.coverageStart || exit < identity.coverageStart ||
+    entry >= identity.coverageEnd || exit >= identity.coverageEnd
+  ) {
+    return null;
+  }
+  const timeframeMs = identity.timeframeMs;
+  const rawStart = Math.floor(entry / timeframeMs) * timeframeMs - 2 * timeframeMs;
+  const rawEnd = Math.floor(exit / timeframeMs) * timeframeMs + 3 * timeframeMs;
+  if (!Number.isSafeInteger(rawStart) || !Number.isSafeInteger(rawEnd)) return null;
+  const start = Math.max(identity.coverageStart, rawStart);
+  const end = Math.min(identity.coverageEnd, rawEnd);
+  return Number.isSafeInteger(start) && Number.isSafeInteger(end) && start < end
+    ? { start, end }
+    : null;
+}
 
 export type TradeSide = "LONG" | "SHORT";
 export type TradeEvent = "entry" | "exit";
@@ -13,6 +121,43 @@ export type TradeCandle = {
   close: string;
   volume: string;
 };
+
+function sameCandleValues(left: TradeCandle, right: TradeCandle): boolean {
+  return left.open === right.open && left.high === right.high &&
+    left.low === right.low && left.close === right.close &&
+    left.volume === right.volume;
+}
+
+export function projectBacktestCandlesPage(
+  page: BacktestResultsCandlesPage,
+  window: TradeCandleWindow
+): TradeCandle[] | null {
+  if (
+    !Number.isSafeInteger(window.start) || !Number.isSafeInteger(window.end) ||
+    window.start < 0 || window.start >= window.end ||
+    window.end > MAX_UTC_MILLISECONDS
+  ) {
+    return null;
+  }
+  const projected: TradeCandle[] = [];
+  const candlesByInstant = new Map<number, TradeCandle>();
+  for (const candle of page.items) {
+    const timestamp = parseUtcTimestamp(candle.timestamp);
+    if (
+      timestamp === null || timestamp < window.start || timestamp >= window.end ||
+      !isDecimalString(candle.open) || !isDecimalString(candle.high) ||
+      !isDecimalString(candle.low) || !isDecimalString(candle.close) ||
+      !isDecimalString(candle.volume)
+    ) {
+      return null;
+    }
+    const existing = candlesByInstant.get(timestamp);
+    if (existing && !sameCandleValues(existing, candle)) return null;
+    candlesByInstant.set(timestamp, candle);
+    projected.push(candle);
+  }
+  return projected;
+}
 
 export type TradeChartSnapshot = {
   strategyId: string;

@@ -2,10 +2,12 @@ export type View = "research" | "results" | "strategies" | "trades";
 
 export interface NavigationState {
   readonly view: View;
+  readonly selectedResultId: string | null;
   readonly inspectedTradeId: string | null;
 }
 
 export interface SerializedNavigation {
+  readonly selectedResultId: string | null;
   readonly inspectedTradeId: string | null;
   readonly relativeUrl: string;
 }
@@ -19,6 +21,16 @@ function validTradeId(value: string | null): value is string {
   );
 }
 
+function validResultId(value: string | null): value is string {
+  return (
+    value !== null &&
+    value.length >= 1 &&
+    value.length <= 128 &&
+    value.trim().length > 0 &&
+    !/[\u0000-\u001F\u007F-\u009F]/.test(value)
+  );
+}
+
 export function parseNavigation(search: string): NavigationState {
   const parameters = new URLSearchParams(search);
   const requestedView = parameters.get("view");
@@ -29,11 +41,20 @@ export function parseNavigation(search: string): NavigationState {
       ? requestedView
       : "research";
   const requestedTradeId = parameters.get("trade");
+  const requestedResultId = parameters.get("result");
+  const selectedResultId =
+    (view === "results" || view === "trades") &&
+    validResultId(requestedResultId)
+      ? requestedResultId
+      : null;
 
   return {
     view,
+    selectedResultId,
     inspectedTradeId:
-      view === "trades" && validTradeId(requestedTradeId)
+      view === "trades" &&
+      selectedResultId !== null &&
+      validTradeId(requestedTradeId)
         ? requestedTradeId
         : null
   };
@@ -46,10 +67,18 @@ export function parseDemoMode(currentUrl: URL, dev: boolean): boolean {
 export function serializeNavigation(
   currentUrl: URL,
   view: View,
-  requestedTradeId: string | null
+  requestedTradeId: string | null,
+  requestedResultId: string | null = currentUrl.searchParams.get("result")
 ): SerializedNavigation {
+  const selectedResultId =
+    (view === "results" || view === "trades") &&
+    validResultId(requestedResultId)
+      ? requestedResultId
+      : null;
   const inspectedTradeId =
-    view === "trades" && validTradeId(requestedTradeId)
+    view === "trades" &&
+    selectedResultId !== null &&
+    validTradeId(requestedTradeId)
       ? requestedTradeId
       : null;
 
@@ -63,8 +92,14 @@ export function serializeNavigation(
   } else {
     currentUrl.searchParams.set("trade", inspectedTradeId);
   }
+  if (selectedResultId === null) {
+    currentUrl.searchParams.delete("result");
+  } else {
+    currentUrl.searchParams.set("result", selectedResultId);
+  }
 
   return {
+    selectedResultId,
     inspectedTradeId,
     relativeUrl: `${currentUrl.pathname}${currentUrl.search}${currentUrl.hash}`
   };

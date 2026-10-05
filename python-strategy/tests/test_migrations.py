@@ -3245,6 +3245,10 @@ def test_order_identity_incompatible_downgrade_keeps_scoped_indexes(
     _upgrade(fresh_pg_db, "head")
     engine = sa.create_engine(_target_url(fresh_pg_db))
     try:
+        with engine.connect() as conn:
+            starting_revision = conn.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar_one()
         _insert_order_identity_prerequisites(
             engine,
             exchange_id=exchange_id,
@@ -3281,7 +3285,7 @@ def test_order_identity_incompatible_downgrade_keeps_scoped_indexes(
                 conn.execute(
                     text("SELECT version_num FROM alembic_version")
                 ).scalar_one()
-                == "d95a2b73e608"
+                == starting_revision
             )
     finally:
         engine.dispose()

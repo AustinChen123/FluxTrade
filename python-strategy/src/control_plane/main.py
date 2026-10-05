@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import logging
 import os
+import secrets
 import signal
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.pool import NullPool
@@ -27,6 +28,11 @@ from src.control_plane import (
     StrategyControlService,
     StrategyStateQueryService,
 )
+from src.control_plane.backtest_results import BacktestResultsQueryService
+from src.control_plane.evaluation_data import RequestEvaluationDataSourceProvider
+from src.control_plane.invalidation import ControlPlaneInvalidationHub
+from src.control_plane.ga_commands import GaCommandService
+from src.control_plane.ga_lifecycle import GaJobStatus
 from src.control_plane.jobs import JobStore
 from src.control_plane.ops_status_query import OpsStatusQuery
 from src.control_plane.profile_http_query import ProfileQueryService
@@ -35,9 +41,11 @@ from src.control_plane.server import serve
 from src.core.db import SessionLocal, get_engine
 from src.core.redis_factory import create_redis_client
 from src.core.runtime_environment import RuntimeEnvironment
+from src.core.strategy_loader import StrategyLoader
 
 
 logger = logging.getLogger(__name__)
+_DEFAULT_STRATEGY_ARTIFACTS_PATH = "/app/strategy_artifacts"
 
 
 def _utc_ms() -> int:
@@ -95,12 +103,36 @@ def build_control_plane_app(
     browser_auth: BrowserAuthProvider | None = None,
     readiness_probe: Callable[[], None] | None = None,
     profile_query_service: ProfileQueryService | None = None,
+    strategy_loader: Callable[[], Mapping[str, object]] | None = None,
 ) -> ControlPlaneApp:
     if redis_client is None:
         redis_client = create_redis_client()
+    invalidation_hub = ControlPlaneInvalidationHub()
     if job_store is None:
         job_db_path = os.getenv("CONTROL_PLANE_JOB_DB_PATH")
-        job_store = SqliteJobStore(job_db_path) if job_db_path else InMemoryJobStore()
+        job_store = (
+            SqliteJobStore(job_db_path, invalidation_hub=invalidation_hub)
+            if job_db_path
+            else InMemoryJobStore(invalidation_hub=invalidation_hub)
+        )
+    else:
+        bind_hub = getattr(job_store, "bind_invalidation_hub", None)
+        if callable(bind_hub):
+            bind_hub(invalidation_hub)
+    backtest_results_query_service = BacktestResultsQueryService(
+        db_session_factory,
+        cursor_key=secrets.token_bytes(32),
+        job_lookup=job_store.get,
+    )
+    if strategy_loader is None:
+        strategy_artifacts_path = os.getenv(
+            "STRATEGY_ARTIFACTS_PATH", _DEFAULT_STRATEGY_ARTIFACTS_PATH
+        )
+
+        def load_strategy_catalog() -> Mapping[str, object]:
+            return StrategyLoader.scan_production_sources(strategy_artifacts_path)
+
+        strategy_loader = load_strategy_catalog
 
     state_query = StrategyStateQueryService(db_session_factory)
     if profile_query_service is None:
@@ -111,13 +143,19 @@ def build_control_plane_app(
         )
     recover_interrupted = isinstance(job_store, SqliteJobStore)
     if parameter_search_evaluator is None:
+        evaluation_data_provider = RequestEvaluationDataSourceProvider(
+            session_factory=db_session_factory
+        )
         parameter_search_evaluator = ParameterSearchEvaluatorRegistry(
             {
                 "csv_signal": CsvSignalBacktestParameterEvaluator(
                     db_session_factory=db_session_factory
                 ),
-                "golden_cross": GoldenCrossResearchParameterEvaluator(),
-            }
+                "golden_cross": GoldenCrossResearchParameterEvaluator(
+                    data_source_provider=evaluation_data_provider
+                ),
+            },
+            data_source_provider=evaluation_data_provider,
         )
     ops_status_query: OpsStatusQuery | None
     try:
@@ -126,17 +164,53 @@ def build_control_plane_app(
         )
     except ValueError:
         ops_status_query = None
+    backtest_executor = BacktestJobExecutor(
+        store=job_store,
+        db_session_factory=db_session_factory,
+        recover_interrupted=recover_interrupted,
+        strategy_loader=strategy_loader,
+    )
+    parameter_search_executor = ParameterSearchJobExecutor(
+        parameter_search_evaluator,
+        store=job_store,
+        db_session_factory=db_session_factory,
+        invalidation_hub=invalidation_hub,
+    )
+    ga_command_service = None
+    if isinstance(job_store, SqliteJobStore) and isinstance(
+        parameter_search_evaluator, ParameterSearchEvaluatorRegistry
+    ):
+        ga_command_service = GaCommandService(
+            store=job_store,
+            executor=parameter_search_executor,
+            session_factory=db_session_factory,
+        )
+        try:
+            job_store.interrupt_ga_jobs("control_plane_interrupted")
+            queued_jobs = sorted(
+                (
+                    record
+                    for record in job_store.list_ga_jobs()
+                    if record.status == GaJobStatus.QUEUED
+                ),
+                key=lambda record: record.id,
+            )
+        except Exception:
+            parameter_search_executor.shutdown(
+                wait=True, timeout=0.0, cancel_futures=True
+            )
+            backtest_executor.shutdown(wait=True, timeout=0.0, cancel_futures=True)
+            invalidation_hub.close()
+            raise
+        for record in queued_jobs:
+            try:
+                parameter_search_executor.dispatch_ga_job(record.id, record.version)
+            except Exception:
+                logger.warning("ga_dispatch_failed")
+
     return ControlPlaneApp(
-        BacktestJobExecutor(
-            store=job_store,
-            db_session_factory=db_session_factory,
-            recover_interrupted=recover_interrupted,
-        ),
-        parameter_search_executor=ParameterSearchJobExecutor(
-            parameter_search_evaluator,
-            store=job_store,
-            db_session_factory=db_session_factory,
-        ),
+        backtest_executor,
+        parameter_search_executor=parameter_search_executor,
         gene_control=GeneControlService(db_session_factory),
         strategy_control=StrategyControlService(
             RedisStrategyCommandRouter(redis_client, state_query)
@@ -147,6 +221,9 @@ def build_control_plane_app(
         browser_auth=browser_auth,
         profile_query_service=profile_query_service,
         ops_status_query=ops_status_query,
+        backtest_results_query_service=backtest_results_query_service,
+        invalidation_hub=invalidation_hub,
+        ga_command_service=ga_command_service,
         readiness_probe=(
             readiness_probe
             if readiness_probe is not None

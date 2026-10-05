@@ -15,6 +15,8 @@ from src.control_plane.backtest_jobs import (
 from src.control_plane.evaluation_data import (
     CsvEvaluationDataSourceProvider,
     EvaluationDataSourceProvider,
+    RequestEvaluationDataSourceProvider,
+    SealedDatasetRejectedError,
 )
 from src.control_plane.models import (
     ParameterCandidate,
@@ -72,15 +74,24 @@ class ParameterSearchEvaluatorRegistry:
     def __init__(
         self,
         evaluators: Mapping[str, ParameterSearchEvaluator],
+        *,
+        data_source_provider: RequestEvaluationDataSourceProvider | None = None,
     ) -> None:
         if not evaluators:
             raise ValueError("at least one parameter-search evaluator is required")
         self._evaluators = dict(evaluators)
+        self._data_source_provider = data_source_provider
 
     def validate_request(self, request: ParameterSearchJobRequest) -> None:
         evaluator = self._resolve(request)
         if isinstance(evaluator, ParameterSearchRequestValidator):
             evaluator.validate_request(request)
+        if request.market_data is not None:
+            if self._data_source_provider is None:
+                raise SealedDatasetRejectedError(
+                    "sealed dataset source is not configured"
+                )
+            self._data_source_provider.validate_sealed_request(request)
         if request.evaluation_set is None:
             return
         requires_warmup = any(
@@ -278,11 +289,11 @@ class ResearchBacktestParameterEvaluator:
             end_time=request.end_time,
             product_id=request.product_id,
             timeframe=request.timeframe,
-            initial_balance=float(request.backtest.initial_balance),
+            initial_balance=request.backtest.initial_balance,
             data_source=data_source,
             fee_config={
-                "maker": float(request.backtest.maker_fee),
-                "taker": float(request.backtest.taker_fee),
+                "maker": request.backtest.maker_fee,
+                "taker": request.backtest.taker_fee,
             },
             precision_codec=self._precision_codec,
             prepared_scaled_candles=prepared_scaled_candles,

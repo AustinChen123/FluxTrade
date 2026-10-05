@@ -1,6 +1,23 @@
-import { finiteDecimalNumber } from "../../shared/format/decimal";
-import type { ClosedTrade } from "../../shared/trading/closedTrade";
+import type {
+  BacktestResultsDetail,
+  BacktestResultsIndexItem,
+  BacktestResultsTradesPage
+} from "../../api";
+import { isDecimalString } from "../../shared/format/decimal";
+import {
+  projectClosedTradePage,
+  validLoadedTradePage,
+  validTradePage,
+  type TradePage
+} from "../../shared/trading/closedTradePage";
 import { parseUtcTimestamp } from "../../shared/time/utc";
+
+export {
+  mergeTradeItems,
+  validLoadedTradePage,
+  validTradePage
+} from "../../shared/trading/closedTradePage";
+export type { TradePage } from "../../shared/trading/closedTradePage";
 
 export type EquitySample = {
   timestamp: string;
@@ -13,16 +30,24 @@ export type MonthlyReturn = {
   returnPct: string;
 };
 
+export type ReturnPctUnit = "ratio" | "percentage-points";
+
+export type BacktestResultIndexItem = {
+  jobId: string;
+  subjectId: string;
+  datasetId: string;
+  productId: string;
+  timeframe: string;
+  startedAt: string;
+  endedAt: string;
+  completedAt: string;
+  resultDigest: string;
+};
+
 export type DistributionBucket = {
   lower: string | null;
   upper: string | null;
   count: number;
-};
-
-export type TradePage = {
-  items: ClosedTrade[];
-  totalCount: number;
-  nextCursor: string | null;
 };
 
 export type BacktestResultSnapshot = {
@@ -33,6 +58,7 @@ export type BacktestResultSnapshot = {
   startedAt: string;
   endedAt: string;
   currency: string;
+  returnPctUnit?: ReturnPctUnit;
   metrics: {
     netPnl: string | null;
     returnPct: string | null;
@@ -56,8 +82,8 @@ export function validateEquitySamples(
     if (
       timestamp === null ||
       timestamp <= previousTimestamp ||
-      finiteDecimalNumber(sample.equity) === null ||
-      finiteDecimalNumber(sample.drawdown) === null
+      !isDecimalString(sample.equity) ||
+      !isDecimalString(sample.drawdown)
     ) {
       return null;
     }
@@ -69,63 +95,109 @@ export function validateEquitySamples(
 export function validDistributionBuckets(
   buckets: DistributionBucket[]
 ): boolean {
-  return buckets.every(
-    (bucket) => Number.isSafeInteger(bucket.count) && bucket.count >= 0
+  return buckets.every((bucket) =>
+    Number.isSafeInteger(bucket.count) && bucket.count >= 0 &&
+    (bucket.lower === null || isDecimalString(bucket.lower)) &&
+    (bucket.upper === null || isDecimalString(bucket.upper))
   );
 }
 
-export function validTradePage(page: TradePage): boolean {
+function validDigest(value: string): boolean {
+  return /^[0-9a-f]{64}$/.test(value);
+}
+
+export function projectBacktestResultsIndexItem(
+  item: BacktestResultsIndexItem
+): BacktestResultIndexItem | null {
+  const startedAt = parseUtcTimestamp(item.started_at);
+  const endedAt = parseUtcTimestamp(item.ended_at);
+  const completedAt = parseUtcTimestamp(item.completed_at);
   if (
-    !Number.isSafeInteger(page.totalCount) ||
-    page.totalCount < page.items.length ||
-    (page.nextCursor !== null && page.nextCursor.trim() === "")
+    startedAt === null || endedAt === null || completedAt === null ||
+    startedAt > endedAt ||
+    !validDigest(item.result_digest)
   ) {
-    return false;
+    return null;
   }
-  const ids = new Set<string>();
-  for (const trade of page.items) {
-    if (trade.id.length === 0 || ids.has(trade.id)) {
-      return false;
-    }
-    ids.add(trade.id);
-  }
-  return true;
+  return {
+    jobId: item.job_id,
+    subjectId: item.subject_id,
+    datasetId: item.dataset_id,
+    productId: item.product_id,
+    timeframe: item.timeframe,
+    startedAt: item.started_at,
+    endedAt: item.ended_at,
+    completedAt: item.completed_at,
+    resultDigest: item.result_digest
+  };
 }
 
-export function validLoadedTradePage(page: TradePage): boolean {
-  return (
-    validTradePage(page) &&
-    (page.nextCursor === null
-      ? page.items.length === page.totalCount
-      : page.items.length < page.totalCount)
+export function projectBacktestTradesPage(
+  page: BacktestResultsTradesPage,
+  totalCount: number
+): TradePage | null {
+  return projectClosedTradePage(page.items, totalCount, page.next_cursor, false);
+}
+
+export function projectBacktestResultDetail(
+  detail: BacktestResultsDetail
+): BacktestResultSnapshot | null {
+  const startedAt = parseUtcTimestamp(detail.started_at);
+  const endedAt = parseUtcTimestamp(detail.ended_at);
+  const metrics = [
+    detail.metrics.net_pnl,
+    detail.metrics.return_pct,
+    detail.metrics.max_drawdown,
+    detail.metrics.sharpe,
+    detail.metrics.sortino,
+    detail.metrics.calmar
+  ];
+  const equity = validateEquitySamples(detail.equity);
+  const monthlyReturnsValid = detail.monthly_returns.every((month) =>
+    /^\d{4}-(?:0[1-9]|1[0-2])$/.test(month.month) &&
+    isDecimalString(month.return_pct)
   );
-}
-
-function sameTrade(left: ClosedTrade, right: ClosedTrade): boolean {
-  return (
-    left.id === right.id &&
-    left.side === right.side &&
-    left.quantity === right.quantity &&
-    left.entryTime === right.entryTime &&
-    left.entryPrice === right.entryPrice &&
-    left.exitTime === right.exitTime &&
-    left.exitPrice === right.exitPrice &&
-    left.fee === right.fee &&
-    left.pnl === right.pnl
+  const distribution = detail.pnl_distribution.map(({ lower, upper, count }) => ({
+    lower, upper, count
+  }));
+  const tradePage = projectClosedTradePage(
+    detail.trade_page.items,
+    detail.trade_page.total_count,
+    detail.trade_page.next_cursor,
+    true
   );
-}
-
-export function mergeTradeItems(
-  current: ClosedTrade[],
-  incoming: ClosedTrade[]
-): ClosedTrade[] | null {
-  const merged = new Map(current.map((trade) => [trade.id, trade]));
-  for (const trade of incoming) {
-    const existing = merged.get(trade.id);
-    if (existing && !sameTrade(existing, trade)) {
-      return null;
-    }
-    merged.set(trade.id, existing ?? trade);
+  if (
+    startedAt === null || endedAt === null || startedAt > endedAt ||
+    !metrics.every(isDecimalString) || equity === null ||
+    !monthlyReturnsValid || !validDistributionBuckets(distribution) ||
+    !validDigest(detail.input_digest) || !validDigest(detail.result_digest) ||
+    tradePage === null
+  ) {
+    return null;
   }
-  return [...merged.values()];
+  return {
+    jobId: detail.job_id,
+    strategyId: detail.strategy_id,
+    productId: detail.product_id,
+    timeframe: detail.timeframe,
+    startedAt: detail.started_at,
+    endedAt: detail.ended_at,
+    currency: detail.currency,
+    returnPctUnit: "ratio",
+    metrics: {
+      netPnl: detail.metrics.net_pnl,
+      returnPct: detail.metrics.return_pct,
+      maxDrawdown: detail.metrics.max_drawdown,
+      sharpe: detail.metrics.sharpe,
+      sortino: detail.metrics.sortino,
+      calmar: detail.metrics.calmar
+    },
+    equity,
+    monthlyReturns: detail.monthly_returns.map(({ month, return_pct }) => ({
+      month,
+      returnPct: return_pct
+    })),
+    pnlDistribution: distribution,
+    tradePage
+  };
 }

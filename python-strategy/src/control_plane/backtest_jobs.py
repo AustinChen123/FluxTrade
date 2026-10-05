@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor, wait as wait_futures
 from contextlib import AbstractContextManager
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, fields, is_dataclass
 from decimal import Decimal
 from threading import Lock
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 from sqlalchemy.orm import Session
 
@@ -15,6 +16,23 @@ from src.control_plane.models import (
     BacktestJobRequest,
     JobRecord,
     JobStatus,
+)
+from src.control_plane.full_backtest import (
+    FullBacktestExecutionError,
+    FullBacktestResolutionError,
+    ResolvedFullBacktest,
+    resolve_full_backtest,
+    run_full_backtest,
+)
+from src.control_plane.full_backtest_request import (
+    BacktestRequest,
+    FullStrategyBacktestRequest,
+    parse_backtest_request,
+)
+from src.core.backtest_result_owner import (
+    BacktestResultPersistenceError,
+    BacktestResultPersistenceOwner,
+    BacktestResultRunIdentity,
 )
 from src.core.backtest_runner import BacktestRunner
 from src.core.data_sources.csv_source import CsvDataSource
@@ -54,6 +72,7 @@ class BacktestJobExecutor:
         max_workers: int = 2,
         run_inline: bool = False,
         recover_interrupted: bool = False,
+        strategy_loader: Callable[[], Mapping[str, object]] | None = None,
     ) -> None:
         self.store = store or InMemoryJobStore()
         if recover_interrupted:
@@ -61,13 +80,14 @@ class BacktestJobExecutor:
                 "Job interrupted before control plane startup"
             )
         self._db_session_factory = db_session_factory
+        self._strategy_loader = strategy_loader
         self._run_inline = run_inline
         self._executor = None if run_inline else ThreadPoolExecutor(max_workers=max_workers)
         self._futures: dict[str, Future[JobRecord]] = {}
         self._futures_lock = Lock()
         self._closed = False
 
-    def submit_backtest(self, request: BacktestJobRequest) -> JobRecord:
+    def submit_backtest(self, request: BacktestRequest) -> JobRecord:
         with self._futures_lock:
             if self._closed:
                 raise RuntimeError("backtest executor is shut down")
@@ -107,12 +127,14 @@ class BacktestJobExecutor:
         job = self.store.get(job_id)
         if job is None:
             raise KeyError(job_id)
-        if job.kind != "csv_signal_backtest":
+        if job.kind not in {"csv_signal_backtest", "full_strategy_backtest"}:
             raise ValueError(f"unsupported job kind: {job.kind}")
         if job.status not in {JobStatus.FAILED, JobStatus.CANCELLED}:
             raise ValueError(f"{job.status.value.lower()} jobs cannot be retried")
 
-        request = BacktestJobRequest.model_validate(job.request)
+        request = parse_backtest_request(job.request)
+        if request.kind != job.kind:
+            raise ValueError(f"unsupported job kind: {job.kind}")
         return self.submit_backtest(request)
 
     def shutdown(
@@ -139,20 +161,79 @@ class BacktestJobExecutor:
         self._executor.shutdown(wait=True)
         return True
 
-    def _run_job(self, job_id: str, request: BacktestJobRequest) -> JobRecord:
+    def _run_job(self, job_id: str, request: BacktestRequest) -> JobRecord:
         try:
             current = self.store.get(job_id)
             if current is not None and current.status == JobStatus.CANCELLED:
                 return current
             self.store.mark_running(job_id)
-            try:
-                result = self.run_backtest_request(request)
-            except Exception as exc:
-                return self.store.mark_failed(job_id, str(exc))
+            if isinstance(request, FullStrategyBacktestRequest):
+                try:
+                    result = self._run_full_strategy_request(job_id, request)
+                except FullBacktestResolutionError as exc:
+                    return self.store.mark_failed(job_id, exc.code)
+                except FullBacktestExecutionError as exc:
+                    return self.store.mark_failed(job_id, exc.code)
+                except BacktestResultPersistenceError:
+                    return self.store.mark_failed(
+                        job_id, "browser_result_persistence_failed"
+                    )
+                except Exception:
+                    return self.store.mark_failed(
+                        job_id, "browser_result_execution_failed"
+                    )
+            else:
+                try:
+                    result = self.run_backtest_request(request)
+                except Exception as exc:
+                    return self.store.mark_failed(job_id, str(exc))
             return self.store.mark_succeeded(job_id, result)
         finally:
             with self._futures_lock:
                 self._futures.pop(job_id, None)
+
+    def _run_full_strategy_request(
+        self, job_id: str, request: FullStrategyBacktestRequest
+    ) -> dict[str, str]:
+        if self._strategy_loader is None:
+            raise FullBacktestResolutionError("browser_result_subject_unavailable")
+        if self._db_session_factory is None:
+            raise FullBacktestResolutionError("browser_result_backend_unavailable")
+
+        session_factory = cast(Callable[[], Session], self._db_session_factory)
+        resolved: ResolvedFullBacktest = resolve_full_backtest(
+            request,
+            strategy_loader=self._strategy_loader,
+            session_factory=session_factory,
+        )
+        outcome = run_full_backtest(resolved, session_factory=session_factory)
+        identity = BacktestResultRunIdentity(
+            job_id=job_id,
+            strategy_id=request.strategy_id,
+            artifact_version=request.artifact_version,
+            catalog_sha256=resolved.catalog_sha256,
+            dataset_id=resolved.dataset.id,
+            dataset_checksum_sha256=resolved.dataset.checksum_sha256,
+            product_id=resolved.dataset.product_id,
+            timeframe=resolved.decision_timeframe,
+            currency=request.instrument.quote,
+            start=request.start,
+            end=request.end,
+            initial_balance=request.initial_balance,
+            instrument=request.instrument.to_instrument_spec(),
+            maker_fee=request.fees.maker,
+            taker_fee=request.fees.taker,
+            drawdown_limit=request.drawdown_limit,
+            execution_timeframe=resolved.execution_timeframe,
+        )
+        receipt = BacktestResultPersistenceOwner(session_factory).persist(
+            identity, outcome
+        )
+        return {
+            "job_id": receipt.job_id,
+            "input_digest": receipt.input_digest,
+            "result_digest": receipt.result_digest,
+        }
 
     def run_backtest_request(
         self,
@@ -220,4 +301,9 @@ def _json_safe(value: Any) -> Any:
         return [_json_safe(v) for v in value]
     if hasattr(value, "model_dump"):
         return _json_safe(value.model_dump(mode="json"))
+    if is_dataclass(value) and not isinstance(value, type):
+        return {
+            field.name: _json_safe(getattr(value, field.name))
+            for field in fields(value)
+        }
     return value

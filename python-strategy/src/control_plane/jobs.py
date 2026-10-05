@@ -1,16 +1,29 @@
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 import sqlite3
 from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Lock
-from typing import Any, Protocol
+from typing import Any, Mapping, Protocol
 from uuid import uuid4
 
 from pydantic import BaseModel
 
+from src.control_plane.invalidation import ControlPlaneInvalidationHub
+from src.control_plane.ga_lifecycle import (
+    GaCheckpointReference,
+    GaJobRecord,
+    GaJobStatus,
+    GaJobStoreError,
+    new_ga_job_record,
+    retry_ga_job_record,
+    transition_ga_job,
+    transition_ga_worker_envelope,
+)
 from src.control_plane.models import JobRecord, JobStatus
 
 
@@ -33,15 +46,106 @@ class JobStore(Protocol):
 
     def mark_interrupted_active_jobs(self, error: str) -> list[JobRecord]: ...
 
+    def create_ga_job(
+        self,
+        *,
+        request: Mapping[str, Any],
+        epoch_id: str,
+        retry_of_job_id: str | None = None,
+    ) -> GaJobRecord: ...
+
+    def get_ga_job(self, job_id: str) -> GaJobRecord | None: ...
+
+    def list_ga_jobs(self) -> list[GaJobRecord]: ...
+
+    def transition_ga_job(
+        self,
+        job_id: str,
+        action: str,
+        expected_version: object,
+        payload: Mapping[str, object] | None = None,
+    ) -> GaJobRecord: ...
+
+    def interrupt_ga_jobs(
+        self, error: str = "control_plane_interrupted"
+    ) -> list[GaJobRecord]: ...
+
+    def submit_ga_job_command(
+        self,
+        *,
+        actor: str,
+        idempotency_key: str,
+        request: Mapping[str, Any],
+        http_wire_intent: Mapping[str, object] | None = None,
+    ) -> tuple[GaJobRecord, bool]: ...
+
+    def get_ga_command_receipt(
+        self,
+        *,
+        actor: str,
+        idempotency_key: str,
+        operation: str,
+        job_id: str | None = None,
+        expected_version: object = None,
+        request: Mapping[str, Any] | None = None,
+        http_wire_intent: Mapping[str, object] | None = None,
+    ) -> GaJobRecord | None: ...
+
+    def transition_ga_job_command(
+        self,
+        *,
+        actor: str,
+        idempotency_key: str,
+        job_id: str,
+        action: str,
+        expected_version: object,
+    ) -> tuple[GaJobRecord, bool]: ...
+
+    def retry_ga_job_command(
+        self,
+        *,
+        actor: str,
+        idempotency_key: str,
+        job_id: str,
+        expected_version: object,
+    ) -> tuple[GaJobRecord, bool]: ...
+
+    def apply_ga_worker_envelope(
+        self,
+        job_id: str,
+        *,
+        epoch_id: str,
+        expected_completed_generation: int,
+        action: str,
+        payload: Mapping[str, object] | None = None,
+    ) -> GaJobRecord: ...
+
 
 class InMemoryJobStore:
     """Thread-safe in-memory job store for local control-plane operation."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        invalidation_hub: ControlPlaneInvalidationHub | None = None,
+    ) -> None:
         self._jobs: dict[str, JobRecord] = {}
+        self._ga_jobs: dict[str, GaJobRecord] = {}
+        self._ga_command_receipts: dict[tuple[str, str], tuple[str, GaJobRecord]] = {}
         self._lock = Lock()
+        self._invalidation_hub = invalidation_hub
+
+    def bind_invalidation_hub(self, hub: ControlPlaneInvalidationHub) -> None:
+        self._invalidation_hub = hub
+
+    def _publish_ga_job(self, record: GaJobRecord) -> None:
+        if self._invalidation_hub is not None:
+            self._invalidation_hub.publish_committed(
+                "ga_job", record.id, record.version
+            )
 
     def create(self, *, kind: str, request: BaseModel) -> JobRecord:
+        if kind == "ga":
+            raise ValueError("GA jobs require the GA store API")
         job = JobRecord.new(job_id=uuid4().hex, kind=kind, request=request)
         with self._lock:
             self._jobs[job.id] = job
@@ -110,6 +214,222 @@ class InMemoryJobStore:
             interrupted.append(self.mark_failed(job_id, error))
         return interrupted
 
+    def create_ga_job(
+        self,
+        *,
+        request: Mapping[str, Any],
+        epoch_id: str,
+        retry_of_job_id: str | None = None,
+    ) -> GaJobRecord:
+        record = new_ga_job_record(uuid4().hex, request, epoch_id, retry_of_job_id)
+        with self._lock:
+            self._ga_jobs[record.id] = record
+        self._publish_ga_job(record)
+        return record.detached_copy()
+
+    def get_ga_job(self, job_id: str) -> GaJobRecord | None:
+        with self._lock:
+            record = self._ga_jobs.get(job_id)
+            return None if record is None else record.detached_copy()
+
+    def list_ga_jobs(self) -> list[GaJobRecord]:
+        with self._lock:
+            records = sorted(
+                self._ga_jobs.values(),
+                key=lambda job: job.id,
+            )
+            return [record.detached_copy() for record in records]
+
+    def transition_ga_job(
+        self,
+        job_id: str,
+        action: str,
+        expected_version: object,
+        payload: Mapping[str, object] | None = None,
+    ) -> GaJobRecord:
+        with self._lock:
+            current = self._ga_jobs.get(job_id)
+            if current is None:
+                raise GaJobStoreError("ga_job_not_found")
+            updated = transition_ga_job(current, action, expected_version, payload)
+            self._ga_jobs[job_id] = updated
+        self._publish_ga_job(updated)
+        return updated.detached_copy()
+
+    def apply_ga_worker_envelope(
+        self,
+        job_id: str,
+        *,
+        epoch_id: str,
+        expected_completed_generation: int,
+        action: str,
+        payload: Mapping[str, object] | None = None,
+    ) -> GaJobRecord:
+        with self._lock:
+            current = self._ga_jobs.get(job_id)
+            if current is None:
+                raise GaJobStoreError("ga_job_not_found")
+            updated = transition_ga_worker_envelope(
+                current,
+                epoch_id=epoch_id,
+                expected_completed_generation=expected_completed_generation,
+                action=action,
+                payload=payload,
+            )
+            self._ga_jobs[job_id] = updated
+        self._publish_ga_job(updated)
+        return updated.detached_copy()
+
+    def interrupt_ga_jobs(
+        self,
+        error: str = "control_plane_interrupted",
+    ) -> list[GaJobRecord]:
+        if not isinstance(error, str) or not error.strip():
+            raise GaJobStoreError("validation_error")
+        with self._lock:
+            interrupted = []
+            for job_id, current in tuple(self._ga_jobs.items()):
+                if current.status in {
+                    GaJobStatus.RUNNING,
+                    GaJobStatus.PAUSING,
+                    GaJobStatus.CANCELLING,
+                }:
+                    updated = transition_ga_job(
+                        current,
+                        "interrupt",
+                        current.version,
+                        {"error": error},
+                    )
+                    self._ga_jobs[job_id] = updated
+                    interrupted.append(updated.detached_copy())
+        for record in interrupted:
+            self._publish_ga_job(record)
+        return interrupted
+
+    def submit_ga_job_command(
+        self,
+        *,
+        actor: str,
+        idempotency_key: str,
+        request: Mapping[str, Any],
+        http_wire_intent: Mapping[str, object] | None = None,
+    ) -> tuple[GaJobRecord, bool]:
+        actor, idempotency_key = _command_identity(actor, idempotency_key)
+        copied_request = _compiled_request_copy(request)
+        fingerprint = _command_fingerprint(
+            "submit",
+            request=copied_request if http_wire_intent is None else None,
+            http_wire_intent=http_wire_intent,
+        )
+        identity = (actor, idempotency_key)
+        with self._lock:
+            receipt = self._ga_command_receipts.get(identity)
+            if receipt is not None:
+                return _replay_or_conflict(receipt, fingerprint)
+            record = _new_submitted_ga_record(copied_request)
+            self._ga_jobs[record.id] = record.detached_copy()
+            self._ga_command_receipts[identity] = (
+                fingerprint,
+                record.detached_copy(),
+            )
+        self._publish_ga_job(record)
+        return record.detached_copy(), False
+
+    def get_ga_command_receipt(
+        self,
+        *,
+        actor: str,
+        idempotency_key: str,
+        operation: str,
+        job_id: str | None = None,
+        expected_version: object = None,
+        request: Mapping[str, Any] | None = None,
+        http_wire_intent: Mapping[str, object] | None = None,
+    ) -> GaJobRecord | None:
+        actor, idempotency_key = _command_identity(actor, idempotency_key)
+        fingerprint = _command_fingerprint(
+            operation,
+            job_id=job_id,
+            expected_version=expected_version,
+            request=None
+            if http_wire_intent is not None
+            else (None if request is None else _compiled_request_copy(request)),
+            http_wire_intent=http_wire_intent,
+        )
+        with self._lock:
+            receipt = self._ga_command_receipts.get((actor, idempotency_key))
+            if receipt is None:
+                return None
+            record, _ = _replay_or_conflict(receipt, fingerprint)
+            return record
+
+    def transition_ga_job_command(
+        self,
+        *,
+        actor: str,
+        idempotency_key: str,
+        job_id: str,
+        action: str,
+        expected_version: object,
+    ) -> tuple[GaJobRecord, bool]:
+        actor, idempotency_key = _command_identity(actor, idempotency_key)
+        if not isinstance(job_id, str) or not job_id.strip():
+            raise GaJobStoreError("validation_error")
+        if not isinstance(action, str) or action not in {"pause", "resume", "cancel"}:
+            raise GaJobStoreError("validation_error")
+        fingerprint = _command_fingerprint(
+            action, job_id=job_id, expected_version=expected_version
+        )
+        identity = (actor, idempotency_key)
+        with self._lock:
+            receipt = self._ga_command_receipts.get(identity)
+            if receipt is not None:
+                return _replay_or_conflict(receipt, fingerprint)
+            current = self._ga_jobs.get(job_id)
+            if current is None:
+                raise GaJobStoreError("ga_job_not_found")
+            updated = transition_ga_job(current, action, expected_version)
+            self._ga_jobs[job_id] = updated.detached_copy()
+            self._ga_command_receipts[identity] = (
+                fingerprint,
+                updated.detached_copy(),
+            )
+        self._publish_ga_job(updated)
+        return updated.detached_copy(), False
+
+    def retry_ga_job_command(
+        self,
+        *,
+        actor: str,
+        idempotency_key: str,
+        job_id: str,
+        expected_version: object,
+    ) -> tuple[GaJobRecord, bool]:
+        actor, idempotency_key = _command_identity(actor, idempotency_key)
+        if not isinstance(job_id, str) or not job_id.strip():
+            raise GaJobStoreError("validation_error")
+        fingerprint = _command_fingerprint(
+            "retry", job_id=job_id, expected_version=expected_version
+        )
+        identity = (actor, idempotency_key)
+        with self._lock:
+            receipt = self._ga_command_receipts.get(identity)
+            if receipt is not None:
+                return _replay_or_conflict(receipt, fingerprint)
+            current = self._ga_jobs.get(job_id)
+            if current is None:
+                raise GaJobStoreError("ga_job_not_found")
+            retried = retry_ga_job_record(
+                current, uuid4().hex, uuid4().hex, expected_version
+            )
+            self._ga_jobs[retried.id] = retried.detached_copy()
+            self._ga_command_receipts[identity] = (
+                fingerprint,
+                retried.detached_copy(),
+            )
+        self._publish_ga_job(retried)
+        return retried.detached_copy(), False
+
     def _update(self, job_id: str, **changes: Any) -> JobRecord:
         with self._lock:
             current = self._jobs[job_id]
@@ -126,12 +446,28 @@ class InMemoryJobStore:
 class SqliteJobStore:
     """SQLite-backed job store for durable local control-plane operation."""
 
-    def __init__(self, db_path: str | Path) -> None:
+    def __init__(
+        self,
+        db_path: str | Path,
+        invalidation_hub: ControlPlaneInvalidationHub | None = None,
+    ) -> None:
         self._db_path = Path(db_path)
         self._lock = Lock()
+        self._invalidation_hub = invalidation_hub
         self._initialize()
 
+    def bind_invalidation_hub(self, hub: ControlPlaneInvalidationHub) -> None:
+        self._invalidation_hub = hub
+
+    def _publish_ga_job(self, record: GaJobRecord) -> None:
+        if self._invalidation_hub is not None:
+            self._invalidation_hub.publish_committed(
+                "ga_job", record.id, record.version
+            )
+
     def create(self, *, kind: str, request: BaseModel) -> JobRecord:
+        if kind == "ga":
+            raise ValueError("GA jobs require the GA store API")
         job = JobRecord.new(job_id=uuid4().hex, kind=kind, request=request)
         with self._lock, closing(self._connect()) as conn:
             conn.execute(
@@ -154,7 +490,7 @@ class SqliteJobStore:
                 SELECT id, kind, status, created_at, updated_at, started_at,
                        finished_at, request_json, result_json, error
                 FROM control_plane_jobs
-                WHERE id = ?
+                WHERE id = ? AND kind <> 'ga'
                 """,
                 (job_id,),
             ).fetchone()
@@ -167,10 +503,327 @@ class SqliteJobStore:
                 SELECT id, kind, status, created_at, updated_at, started_at,
                        finished_at, request_json, result_json, error
                 FROM control_plane_jobs
+                WHERE kind <> 'ga'
                 ORDER BY created_at DESC
                 """
             ).fetchall()
         return [self._row_to_record(row) for row in rows]
+
+    def create_ga_job(
+        self,
+        *,
+        request: Mapping[str, Any],
+        epoch_id: str,
+        retry_of_job_id: str | None = None,
+    ) -> GaJobRecord:
+        record = new_ga_job_record(uuid4().hex, request, epoch_id, retry_of_job_id)
+        now = _format_datetime(datetime.now(UTC))
+        with self._lock, closing(self._connect()) as conn:
+            conn.execute(
+                """
+                INSERT INTO control_plane_jobs (
+                    id, kind, status, created_at, updated_at, request_json,
+                    error, ga_version, ga_epoch_id, ga_completed_generation,
+                    ga_checkpoint_generation, ga_retry_of_job_id
+                ) VALUES (?, 'ga', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.id,
+                    record.status.value,
+                    now,
+                    now,
+                    _dumps(record.request),
+                    record.error,
+                    record.version,
+                    record.epoch_id,
+                    record.completed_generation,
+                    None,
+                    record.retry_of_job_id,
+                ),
+            )
+            conn.commit()
+        self._publish_ga_job(record)
+        return record.detached_copy()
+
+    def get_ga_job(self, job_id: str) -> GaJobRecord | None:
+        with self._lock, closing(self._connect()) as conn:
+            row = conn.execute(
+                f"SELECT {_GA_COLUMNS} FROM control_plane_jobs WHERE id = ? AND kind = 'ga'",
+                (job_id,),
+            ).fetchone()
+        return None if row is None else _ga_row_to_record(row)
+
+    def list_ga_jobs(self) -> list[GaJobRecord]:
+        with self._lock, closing(self._connect()) as conn:
+            rows = conn.execute(
+                f"SELECT {_GA_COLUMNS} FROM control_plane_jobs WHERE kind = 'ga' ORDER BY created_at DESC"
+            ).fetchall()
+        return [_ga_row_to_record(row) for row in rows]
+
+    def transition_ga_job(
+        self,
+        job_id: str,
+        action: str,
+        expected_version: object,
+        payload: Mapping[str, object] | None = None,
+    ) -> GaJobRecord:
+        with self._lock, closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    f"SELECT {_GA_COLUMNS} FROM control_plane_jobs WHERE id = ? AND kind = 'ga'",
+                    (job_id,),
+                ).fetchone()
+                if row is None:
+                    raise GaJobStoreError("ga_job_not_found")
+                current = _ga_row_to_record(row)
+                updated = transition_ga_job(current, action, expected_version, payload)
+                _write_ga_record(conn, updated, current.version)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        self._publish_ga_job(updated)
+        return updated.detached_copy()
+
+    def apply_ga_worker_envelope(
+        self,
+        job_id: str,
+        *,
+        epoch_id: str,
+        expected_completed_generation: int,
+        action: str,
+        payload: Mapping[str, object] | None = None,
+    ) -> GaJobRecord:
+        with self._lock, closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    f"SELECT {_GA_COLUMNS} FROM control_plane_jobs "
+                    "WHERE id = ? AND kind = 'ga'",
+                    (job_id,),
+                ).fetchone()
+                if row is None:
+                    raise GaJobStoreError("ga_job_not_found")
+                current = _ga_row_to_record(row)
+                updated = transition_ga_worker_envelope(
+                    current,
+                    epoch_id=epoch_id,
+                    expected_completed_generation=expected_completed_generation,
+                    action=action,
+                    payload=payload,
+                )
+                _write_ga_record(conn, updated, current.version)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        self._publish_ga_job(updated)
+        return updated.detached_copy()
+
+    def interrupt_ga_jobs(
+        self,
+        error: str = "control_plane_interrupted",
+    ) -> list[GaJobRecord]:
+        if not isinstance(error, str) or not error.strip():
+            raise GaJobStoreError("validation_error")
+        interrupted: list[GaJobRecord] = []
+        with self._lock, closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                rows = conn.execute(
+                    f"SELECT {_GA_COLUMNS} FROM control_plane_jobs "
+                    "WHERE kind = 'ga' AND status IN (?, ?, ?)",
+                    (
+                        GaJobStatus.RUNNING.value,
+                        GaJobStatus.PAUSING.value,
+                        GaJobStatus.CANCELLING.value,
+                    ),
+                ).fetchall()
+                for row in rows:
+                    current = _ga_row_to_record(row)
+                    updated = transition_ga_job(
+                        current,
+                        "interrupt",
+                        current.version,
+                        {"error": error},
+                    )
+                    _write_ga_record(conn, updated, current.version)
+                    interrupted.append(updated.detached_copy())
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        for record in interrupted:
+            self._publish_ga_job(record)
+        return interrupted
+
+    def submit_ga_job_command(
+        self,
+        *,
+        actor: str,
+        idempotency_key: str,
+        request: Mapping[str, Any],
+        http_wire_intent: Mapping[str, object] | None = None,
+    ) -> tuple[GaJobRecord, bool]:
+        actor, idempotency_key = _command_identity(actor, idempotency_key)
+        copied_request = _compiled_request_copy(request)
+        return self._execute_ga_command(
+            actor,
+            idempotency_key,
+            "submit",
+            _command_fingerprint(
+                "submit",
+                request=copied_request if http_wire_intent is None else None,
+                http_wire_intent=http_wire_intent,
+            ),
+            request=copied_request,
+        )
+
+    def get_ga_command_receipt(
+        self,
+        *,
+        actor: str,
+        idempotency_key: str,
+        operation: str,
+        job_id: str | None = None,
+        expected_version: object = None,
+        request: Mapping[str, Any] | None = None,
+        http_wire_intent: Mapping[str, object] | None = None,
+    ) -> GaJobRecord | None:
+        actor, idempotency_key = _command_identity(actor, idempotency_key)
+        fingerprint = _command_fingerprint(
+            operation,
+            job_id=job_id,
+            expected_version=expected_version,
+            request=None
+            if http_wire_intent is not None
+            else (None if request is None else _compiled_request_copy(request)),
+            http_wire_intent=http_wire_intent,
+        )
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT fingerprint, record_json FROM control_plane_ga_command_receipts "
+                "WHERE actor = ? AND idempotency_key = ?",
+                (actor, idempotency_key),
+            ).fetchone()
+        if row is None:
+            return None
+        receipt = (row["fingerprint"], _ga_record_from_json(row["record_json"]))
+        record, _ = _replay_or_conflict(receipt, fingerprint)
+        return record
+
+    def transition_ga_job_command(
+        self,
+        *,
+        actor: str,
+        idempotency_key: str,
+        job_id: str,
+        action: str,
+        expected_version: object,
+    ) -> tuple[GaJobRecord, bool]:
+        actor, idempotency_key = _command_identity(actor, idempotency_key)
+        if not isinstance(job_id, str) or not job_id.strip():
+            raise GaJobStoreError("validation_error")
+        if not isinstance(action, str) or action not in {"pause", "resume", "cancel"}:
+            raise GaJobStoreError("validation_error")
+        return self._execute_ga_command(
+            actor,
+            idempotency_key,
+            action,
+            _command_fingerprint(
+                action, job_id=job_id, expected_version=expected_version
+            ),
+            job_id=job_id,
+            expected_version=expected_version,
+        )
+
+    def retry_ga_job_command(
+        self,
+        *,
+        actor: str,
+        idempotency_key: str,
+        job_id: str,
+        expected_version: object,
+    ) -> tuple[GaJobRecord, bool]:
+        actor, idempotency_key = _command_identity(actor, idempotency_key)
+        if not isinstance(job_id, str) or not job_id.strip():
+            raise GaJobStoreError("validation_error")
+        return self._execute_ga_command(
+            actor,
+            idempotency_key,
+            "retry",
+            _command_fingerprint(
+                "retry", job_id=job_id, expected_version=expected_version
+            ),
+            job_id=job_id,
+            expected_version=expected_version,
+        )
+
+    def _execute_ga_command(
+        self,
+        actor: str,
+        idempotency_key: str,
+        operation: str,
+        fingerprint: str,
+        *,
+        request: dict[str, Any] | None = None,
+        job_id: str | None = None,
+        expected_version: object = None,
+    ) -> tuple[GaJobRecord, bool]:
+        with self._lock, closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT fingerprint, record_json FROM control_plane_ga_command_receipts "
+                    "WHERE actor = ? AND idempotency_key = ?",
+                    (actor, idempotency_key),
+                ).fetchone()
+                if row is not None:
+                    receipt = (
+                        row["fingerprint"],
+                        _ga_record_from_json(row["record_json"]),
+                    )
+                    record, replayed = _replay_or_conflict(receipt, fingerprint)
+                    conn.commit()
+                    return record, replayed
+
+                if operation == "submit":
+                    if request is None:
+                        raise GaJobStoreError("validation_error")
+                    record = _new_submitted_ga_record(request)
+                    _insert_ga_record(conn, record)
+                else:
+                    if job_id is None:
+                        raise GaJobStoreError("validation_error")
+                    row = conn.execute(
+                        f"SELECT {_GA_COLUMNS} FROM control_plane_jobs "
+                        "WHERE id = ? AND kind = 'ga'",
+                        (job_id,),
+                    ).fetchone()
+                    if row is None:
+                        raise GaJobStoreError("ga_job_not_found")
+                    current = _ga_row_to_record(row)
+                    if operation == "retry":
+                        record = retry_ga_job_record(
+                            current,
+                            uuid4().hex,
+                            uuid4().hex,
+                            expected_version,
+                        )
+                        _insert_ga_record(conn, record)
+                    else:
+                        record = transition_ga_job(current, operation, expected_version)
+                        _write_ga_record(conn, record, current.version)
+                _insert_ga_command_receipt(
+                    conn, actor, idempotency_key, fingerprint, record
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        self._publish_ga_job(record)
+        return record.detached_copy(), False
 
     def mark_running(self, job_id: str) -> JobRecord:
         return self._update(
@@ -219,7 +872,7 @@ class SqliteJobStore:
                 SELECT id, kind, status, created_at, updated_at, started_at,
                        finished_at, request_json, result_json, error
                 FROM control_plane_jobs
-                WHERE status IN (?, ?)
+                WHERE kind <> 'ga' AND status IN (?, ?)
                 """,
                 (JobStatus.QUEUED.value, JobStatus.RUNNING.value),
             ).fetchall()
@@ -229,7 +882,7 @@ class SqliteJobStore:
                 """
                 UPDATE control_plane_jobs
                 SET status = ?, updated_at = ?, finished_at = ?, error = ?
-                WHERE status IN (?, ?)
+                WHERE kind <> 'ga' AND status IN (?, ?)
                 """,
                 (
                     JobStatus.FAILED.value,
@@ -270,7 +923,40 @@ class SqliteJobStore:
                     finished_at TEXT,
                     request_json TEXT NOT NULL,
                     result_json TEXT,
-                    error TEXT
+                    error TEXT,
+                    ga_version INTEGER,
+                    ga_epoch_id TEXT,
+                    ga_completed_generation INTEGER,
+                    ga_checkpoint_generation INTEGER,
+                    ga_retry_of_job_id TEXT
+                )
+                """
+            )
+            columns = {
+                row["name"]
+                for row in conn.execute(
+                    "PRAGMA table_info(control_plane_jobs)"
+                ).fetchall()
+            }
+            for name, column_type in (
+                ("ga_version", "INTEGER"),
+                ("ga_epoch_id", "TEXT"),
+                ("ga_completed_generation", "INTEGER"),
+                ("ga_checkpoint_generation", "INTEGER"),
+                ("ga_retry_of_job_id", "TEXT"),
+            ):
+                if name not in columns:
+                    conn.execute(
+                        f"ALTER TABLE control_plane_jobs ADD COLUMN {name} {column_type}"
+                    )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS control_plane_ga_command_receipts (
+                    actor TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    record_json TEXT NOT NULL,
+                    PRIMARY KEY (actor, idempotency_key)
                 )
                 """
             )
@@ -283,7 +969,7 @@ class SqliteJobStore:
                 SELECT id, kind, status, created_at, updated_at, started_at,
                        finished_at, request_json, result_json, error
                 FROM control_plane_jobs
-                WHERE id = ?
+                WHERE id = ? AND kind <> 'ga'
                 """,
                 (job_id,),
             ).fetchone()
@@ -300,7 +986,7 @@ class SqliteJobStore:
                 UPDATE control_plane_jobs
                 SET status = ?, updated_at = ?, started_at = ?, finished_at = ?,
                     result_json = ?, error = ?
-                WHERE id = ?
+                WHERE id = ? AND kind <> 'ga'
                 """,
                 (
                     updated.status.value,
@@ -361,6 +1047,242 @@ def _format_datetime(value: datetime | None) -> str | None:
     if value is None:
         return None
     return value.isoformat()
+
+
+_GA_COLUMNS = (
+    "id, status, request_json, error, ga_version, ga_epoch_id, "
+    "ga_completed_generation, ga_checkpoint_generation, ga_retry_of_job_id"
+)
+
+
+def _command_identity(actor: str, idempotency_key: str) -> tuple[str, str]:
+    if not isinstance(actor, str) or not actor.strip():
+        raise GaJobStoreError("validation_error")
+    if (
+        not isinstance(idempotency_key, str)
+        or not 1 <= len(idempotency_key) <= 128
+        or any(not 33 <= ord(character) <= 126 for character in idempotency_key)
+    ):
+        raise GaJobStoreError("validation_error")
+    return actor, idempotency_key
+
+
+def _compiled_request_copy(request: Mapping[str, Any]) -> dict[str, Any]:
+    if not isinstance(request, Mapping):
+        raise GaJobStoreError("validation_error")
+    try:
+        copied = json.loads(
+            json.dumps(dict(request), allow_nan=False, separators=(",", ":"))
+        )
+    except (TypeError, ValueError):
+        raise GaJobStoreError("validation_error") from None
+    if not isinstance(copied, dict) or not isinstance(copied.get("evolution"), dict):
+        raise GaJobStoreError("validation_error")
+    return copied
+
+
+def _command_fingerprint(
+    operation: str,
+    *,
+    job_id: str | None = None,
+    expected_version: object = None,
+    request: dict[str, Any] | None = None,
+    http_wire_intent: Mapping[str, object] | None = None,
+) -> str:
+    intent: dict[str, Any] = {"operation": operation}
+    if job_id is not None:
+        intent["job_id"] = job_id
+    if operation != "submit":
+        intent["expected_version"] = expected_version
+    if request is not None:
+        normalized = copy.deepcopy(request)
+        normalized["evolution"]["epoch_id"] = None
+        intent["request"] = normalized
+    if http_wire_intent is not None:
+        if operation != "submit" or request is not None:
+            raise GaJobStoreError("validation_error")
+        intent["representation"] = "http_profile_input_v1"
+        intent["wire_intent"] = copy.deepcopy(dict(http_wire_intent))
+    try:
+        encoded = json.dumps(
+            intent,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError):
+        raise GaJobStoreError("validation_error") from None
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _replay_or_conflict(
+    receipt: tuple[str, GaJobRecord], fingerprint: str
+) -> tuple[GaJobRecord, bool]:
+    stored_fingerprint, record = receipt
+    if stored_fingerprint != fingerprint:
+        raise GaJobStoreError("idempotency_conflict")
+    return record.detached_copy(), True
+
+
+def _new_submitted_ga_record(request: Mapping[str, Any]) -> GaJobRecord:
+    epoch_id = uuid4().hex
+    bound_request = copy.deepcopy(dict(request))
+    bound_request["evolution"]["epoch_id"] = epoch_id
+    return new_ga_job_record(uuid4().hex, bound_request, epoch_id)
+
+
+def _insert_ga_record(conn: sqlite3.Connection, record: GaJobRecord) -> None:
+    now = _format_datetime(datetime.now(UTC))
+    conn.execute(
+        """
+        INSERT INTO control_plane_jobs (
+            id, kind, status, created_at, updated_at, request_json, error,
+            ga_version, ga_epoch_id, ga_completed_generation,
+            ga_checkpoint_generation, ga_retry_of_job_id
+        ) VALUES (?, 'ga', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            record.id,
+            record.status.value,
+            now,
+            now,
+            _dumps(record.request),
+            record.error,
+            record.version,
+            record.epoch_id,
+            record.completed_generation,
+            None
+            if record.checkpoint is None
+            else record.checkpoint.completed_generation,
+            record.retry_of_job_id,
+        ),
+    )
+
+
+def _ga_record_json(record: GaJobRecord) -> str:
+    return _dumps(
+        {
+            "id": record.id,
+            "status": record.status.value,
+            "version": record.version,
+            "request": record.request,
+            "epoch_id": record.epoch_id,
+            "completed_generation": record.completed_generation,
+            "checkpoint": (
+                None
+                if record.checkpoint is None
+                else {
+                    "epoch_id": record.checkpoint.epoch_id,
+                    "completed_generation": record.checkpoint.completed_generation,
+                }
+            ),
+            "retry_of_job_id": record.retry_of_job_id,
+            "error": record.error,
+        }
+    )
+
+
+def _ga_record_from_json(value: str) -> GaJobRecord:
+    data = json.loads(value)
+    checkpoint = data["checkpoint"]
+    return GaJobRecord(
+        id=data["id"],
+        status=GaJobStatus(data["status"]),
+        version=data["version"],
+        request=data["request"],
+        epoch_id=data["epoch_id"],
+        completed_generation=data["completed_generation"],
+        checkpoint=(
+            None
+            if checkpoint is None
+            else GaCheckpointReference(
+                checkpoint["epoch_id"], checkpoint["completed_generation"]
+            )
+        ),
+        retry_of_job_id=data["retry_of_job_id"],
+        error=data["error"],
+    )
+
+
+def _insert_ga_command_receipt(
+    conn: sqlite3.Connection,
+    actor: str,
+    idempotency_key: str,
+    fingerprint: str,
+    record: GaJobRecord,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO control_plane_ga_command_receipts (
+            actor, idempotency_key, fingerprint, record_json
+        ) VALUES (?, ?, ?, ?)
+        """,
+        (actor, idempotency_key, fingerprint, _ga_record_json(record)),
+    )
+
+
+def _ga_row_to_record(row: sqlite3.Row) -> GaJobRecord:
+    return GaJobRecord(
+        id=row["id"],
+        status=GaJobStatus(row["status"]),
+        version=row["ga_version"],
+        request=json.loads(row["request_json"]),
+        epoch_id=row["ga_epoch_id"],
+        completed_generation=row["ga_completed_generation"],
+        checkpoint=(
+            None
+            if row["ga_checkpoint_generation"] is None
+            else GaCheckpointReference(
+                row["ga_epoch_id"],
+                row["ga_checkpoint_generation"],
+            )
+        ),
+        retry_of_job_id=row["ga_retry_of_job_id"],
+        error=row["error"],
+    )
+
+
+def _write_ga_record(
+    conn: sqlite3.Connection,
+    updated: GaJobRecord,
+    expected_version: int,
+) -> None:
+    now = _format_datetime(datetime.now(UTC))
+    finished_at = (
+        now
+        if updated.status
+        in {
+            GaJobStatus.CANCELLED,
+            GaJobStatus.SUCCEEDED,
+            GaJobStatus.FAILED,
+        }
+        else None
+    )
+    cursor = conn.execute(
+        """
+        UPDATE control_plane_jobs
+        SET status = ?, updated_at = ?, finished_at = ?, error = ?,
+            ga_version = ?, ga_completed_generation = ?,
+            ga_checkpoint_generation = ?
+        WHERE id = ? AND kind = 'ga' AND ga_version = ?
+        """,
+        (
+            updated.status.value,
+            now,
+            finished_at,
+            updated.error,
+            updated.version,
+            updated.completed_generation,
+            None
+            if updated.checkpoint is None
+            else updated.checkpoint.completed_generation,
+            updated.id,
+            expected_version,
+        ),
+    )
+    if cursor.rowcount != 1:
+        raise GaJobStoreError("job_version_conflict")
 
 
 def _dumps(value: Any) -> str:

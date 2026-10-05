@@ -4,5 +4,9 @@
     "types": ["node"],
     "skipLibCheck": false
   },
-  "include": ["playwright.config.ts", "e2e/**/*.ts"]
+  "include": [
+    "playwright.config.ts",
+    "playwright.integration.config.ts",
+    "e2e/**/*.ts"
+  ]
 }

@@ -60,14 +60,19 @@ type ArchitectureRole =
   | "vite-env"
   | "app-navigation"
   | "app-shell"
+  | "research-stream"
   | "research-io"
+  | "research-ga-io"
   | "strategy-io"
+  | "results-io"
+  | "trades-io"
   | "feature-owner"
   | "feature-presentation"
   | "feature-model"
   | "feature-chart"
   | "feature-demo"
   | "shared-chart"
+  | "shared-trading-pager"
   | "shared-pure"
   | "shared-theme"
   | "shared-i18n"
@@ -78,7 +83,8 @@ type ArchitectureRole =
   | "playwright-config"
   | "toolchain-test"
   | "e2e-fixture"
-  | "e2e-test";
+  | "e2e-test"
+  | "e2e-real-test";
 
 const frontendRoot = process.cwd();
 const sourceRoot = path.resolve(process.cwd(), "src");
@@ -117,9 +123,12 @@ const expectedInventory = [
   "app/App.tsx",
   "app/navigation.test.ts",
   "app/navigation.ts",
+  "app/researchInvalidation.test.ts",
+  "app/researchInvalidation.ts",
   "architecture.test.ts",
   "features/research/FitnessSurface3D.test.tsx",
   "features/research/FitnessSurface3D.tsx",
+  "features/research/GaOperationsPanel.tsx",
   "features/research/ResearchPage.test.tsx",
   "features/research/ResearchPage.tsx",
   "features/research/ResearchRoute.test.tsx",
@@ -130,8 +139,12 @@ const expectedInventory = [
   "features/research/gaCharts.ts",
   "features/research/gaDomain.test.ts",
   "features/research/gaDomain.ts",
+  "features/research/gaOperationsModel.test.ts",
+  "features/research/gaOperationsModel.ts",
   "features/research/researchModel.test.ts",
   "features/research/researchModel.ts",
+  "features/research/useGaOperations.test.ts",
+  "features/research/useGaOperations.ts",
   "features/research/useResearchWorkspace.test.ts",
   "features/research/useResearchWorkspace.ts",
   "features/results/BacktestResultsView.test.tsx",
@@ -142,6 +155,8 @@ const expectedInventory = [
   "features/results/resultsCharts.ts",
   "features/results/resultsModel.test.ts",
   "features/results/resultsModel.ts",
+  "features/results/useBacktestResults.test.ts",
+  "features/results/useBacktestResults.ts",
   "features/results/useTradePagination.test.ts",
   "features/results/useTradePagination.ts",
   "features/strategies/StrategyManager.test.tsx",
@@ -162,6 +177,8 @@ const expectedInventory = [
   "features/trades/tradeCharts.ts",
   "features/trades/tradeModel.test.ts",
   "features/trades/tradeModel.ts",
+  "features/trades/useBacktestTrades.test.ts",
+  "features/trades/useBacktestTrades.ts",
   "main.tsx",
   "shared/charts/EChart.test.tsx",
   "shared/charts/EChart.tsx",
@@ -180,6 +197,8 @@ const expectedInventory = [
   "shared/time/utc.test.ts",
   "shared/time/utc.ts",
   "shared/trading/closedTrade.ts",
+  "shared/trading/closedTradePage.ts",
+  "shared/trading/useTradePagination.ts",
   "styles/index.css",
   "styles/research.css",
   "styles/responsive.css",
@@ -194,11 +213,13 @@ const expectedInventorySet = new Set<string>(expectedInventory);
 
 const expectedE2eInventory = [
   "e2e/console-smoke.e2e.ts",
-  "e2e/fixtures.ts"
+  "e2e/fixtures.ts",
+  "e2e/research-invalidation-real.e2e.ts"
 ] as const;
 
 const expectedRootExecutableInventory = [
   "playwright.config.ts",
+  "playwright.integration.config.ts",
   "toolchain-contract.test.js",
   "vite.config.ts"
 ] as const;
@@ -206,7 +227,11 @@ const expectedRootExecutableInventory = [
 const expectedOutsideImportLedger = [
   "e2e/console-smoke.e2e.ts|./fixtures|value|e2e/fixtures.ts",
   "e2e/console-smoke.e2e.ts|@playwright/test|value|@playwright/test",
+  "e2e/fixtures.ts|../src/api|type-only|src/api.ts",
+  "e2e/research-invalidation-real.e2e.ts|@playwright/test|value|@playwright/test",
+  "e2e/research-invalidation-real.e2e.ts|node:fs|value|node:fs",
   "playwright.config.ts|@playwright/test|value|@playwright/test",
+  "playwright.integration.config.ts|@playwright/test|value|@playwright/test",
   "toolchain-contract.test.js|./e2e/fixtures.ts|value|e2e/fixtures.ts",
   "toolchain-contract.test.js|./playwright.config.ts|value|playwright.config.ts",
   "toolchain-contract.test.js|node:child_process|value|node:child_process",
@@ -224,10 +249,15 @@ const expectedBareImportLedger = [
   "app/App.test.tsx|react|value",
   "app/App.test.tsx|react|value",
   "app/App.test.tsx|react|value",
+  "app/App.test.tsx|react|value",
   "app/App.test.tsx|vitest|value",
   "app/App.tsx|react-i18next|value",
   "app/App.tsx|react|value",
   "app/navigation.test.ts|vitest|value",
+  "app/researchInvalidation.test.ts|@testing-library/react|value",
+  "app/researchInvalidation.test.ts|react|value",
+  "app/researchInvalidation.test.ts|vitest|value",
+  "app/researchInvalidation.ts|react|value",
   "architecture.test.ts|node:fs|value",
   "architecture.test.ts|node:path|value",
   "architecture.test.ts|typescript/unstable/ast|value",
@@ -242,6 +272,9 @@ const expectedBareImportLedger = [
   "features/research/gaCharts.ts|echarts/core|type-only",
   "features/research/gaCharts.ts|echarts|type-only",
   "features/research/gaDomain.test.ts|vitest|value",
+  "features/research/gaOperationsModel.test.ts|vitest|value",
+  "features/research/GaOperationsPanel.tsx|react-i18next|value",
+  "features/research/GaOperationsPanel.tsx|react|value",
   "features/research/researchModel.test.ts|vitest|value",
   "features/research/ResearchPage.test.tsx|@testing-library/react|value",
   "features/research/ResearchPage.test.tsx|vitest|value",
@@ -251,6 +284,9 @@ const expectedBareImportLedger = [
   "features/research/ResearchRoute.test.tsx|vitest|value",
   "features/research/ResearchRoute.tsx|react-i18next|value",
   "features/research/ResearchRoute.tsx|react|value",
+  "features/research/useGaOperations.test.ts|@testing-library/react|value",
+  "features/research/useGaOperations.test.ts|vitest|value",
+  "features/research/useGaOperations.ts|react|value",
   "features/research/useResearchWorkspace.test.ts|@testing-library/react|value",
   "features/research/useResearchWorkspace.test.ts|vitest|value",
   "features/research/useResearchWorkspace.ts|react|value",
@@ -262,9 +298,11 @@ const expectedBareImportLedger = [
   "features/results/resultsCharts.test.ts|vitest|value",
   "features/results/resultsCharts.ts|echarts/core|type-only",
   "features/results/resultsModel.test.ts|vitest|value",
+  "features/results/useBacktestResults.test.ts|@testing-library/react|value",
+  "features/results/useBacktestResults.test.ts|vitest|value",
+  "features/results/useBacktestResults.ts|react|value",
   "features/results/useTradePagination.test.ts|@testing-library/react|value",
   "features/results/useTradePagination.test.ts|vitest|value",
-  "features/results/useTradePagination.ts|react|value",
   "features/strategies/strategyCommandState.test.ts|vitest|value",
   "features/strategies/StrategyManager.test.tsx|@testing-library/react|value",
   "features/strategies/StrategyManager.test.tsx|vitest|value",
@@ -290,6 +328,9 @@ const expectedBareImportLedger = [
   "features/trades/TradeChartView.tsx|react-i18next|value",
   "features/trades/TradeChartView.tsx|react|value",
   "features/trades/tradeModel.test.ts|vitest|value",
+  "features/trades/useBacktestTrades.test.ts|@testing-library/react|value",
+  "features/trades/useBacktestTrades.test.ts|vitest|value",
+  "features/trades/useBacktestTrades.ts|react|value",
   "main.tsx|react-dom/client|value",
   "main.tsx|react|value",
   "shared/charts/EChart.test.tsx|@testing-library/react|value",
@@ -308,7 +349,8 @@ const expectedBareImportLedger = [
   "shared/locales/resources.test.ts|vitest|value",
   "shared/theme.test.ts|vitest|value",
   "shared/time/presentation.test.ts|vitest|value",
-  "shared/time/utc.test.ts|vitest|value"
+  "shared/time/utc.test.ts|vitest|value",
+  "shared/trading/useTradePagination.ts|react|value"
 ] as const;
 
 const expectedRelativeImportLedger = [
@@ -324,7 +366,9 @@ const expectedRelativeImportLedger = [
   "app/App.tsx|../shared/i18n|type-only|shared/i18n.ts",
   "app/App.tsx|../shared/theme|value|shared/theme.ts",
   "app/App.tsx|./navigation|value|app/navigation.ts",
+  "app/App.tsx|./researchInvalidation|value|app/researchInvalidation.ts",
   "app/navigation.test.ts|./navigation|value|app/navigation.ts",
+  "app/researchInvalidation.test.ts|./researchInvalidation|value|app/researchInvalidation.ts",
   "features/research/demo.test.ts|./demo|value|features/research/demo.ts",
   "features/research/demo.ts|./gaDomain|type-only|features/research/gaDomain.ts",
   "features/research/FitnessSurface3D.test.tsx|./FitnessSurface3D|value|features/research/FitnessSurface3D.tsx",
@@ -341,6 +385,14 @@ const expectedRelativeImportLedger = [
   "features/research/gaDomain.test.ts|./demo|value|features/research/demo.ts",
   "features/research/gaDomain.test.ts|./gaDomain|value|features/research/gaDomain.ts",
   "features/research/gaDomain.ts|../../api|type-only|api.ts",
+  "features/research/gaOperationsModel.test.ts|../../api|type-only|api.ts",
+  "features/research/gaOperationsModel.test.ts|./gaOperationsModel|value|features/research/gaOperationsModel.ts",
+  "features/research/gaOperationsModel.ts|../../api|type-only|api.ts",
+  "features/research/GaOperationsPanel.tsx|../../shared/i18n|type-only|shared/i18n.ts",
+  "features/research/GaOperationsPanel.tsx|../../shared/time/presentation|value|shared/time/presentation.ts",
+  "features/research/GaOperationsPanel.tsx|./gaOperationsModel|value|features/research/gaOperationsModel.ts",
+  "features/research/GaOperationsPanel.tsx|./useGaOperations|type-only|features/research/useGaOperations.ts",
+  "features/research/GaOperationsPanel.tsx|./useResearchWorkspace|type-only|features/research/useResearchWorkspace.ts",
   "features/research/researchModel.test.ts|../../api|type-only|api.ts",
   "features/research/researchModel.test.ts|./gaDomain|value|features/research/gaDomain.ts",
   "features/research/researchModel.test.ts|./researchModel|value|features/research/researchModel.ts",
@@ -359,16 +411,27 @@ const expectedRelativeImportLedger = [
   "features/research/ResearchPage.tsx|./researchModel|value|features/research/researchModel.ts",
   "features/research/ResearchPage.tsx|./useResearchWorkspace|type-only|features/research/useResearchWorkspace.ts",
   "features/research/ResearchRoute.test.tsx|../../api|type-only|api.ts",
-  "features/research/ResearchRoute.test.tsx|../../api|type-only|api.ts",
+  "features/research/ResearchRoute.test.tsx|../../api|value|api.ts",
   "features/research/ResearchRoute.test.tsx|../../shared/i18n|value|shared/i18n.ts",
+  "features/research/ResearchRoute.test.tsx|./gaOperationsModel|value|features/research/gaOperationsModel.ts",
   "features/research/ResearchRoute.test.tsx|./ResearchRoute|value|features/research/ResearchRoute.tsx",
   "features/research/ResearchRoute.tsx|../../shared/i18n|type-only|shared/i18n.ts",
   "features/research/ResearchRoute.tsx|../../shared/theme|type-only|shared/theme.ts",
   "features/research/ResearchRoute.tsx|../../shared/time/presentation|value|shared/time/presentation.ts",
   "features/research/ResearchRoute.tsx|./gaCharts|value|features/research/gaCharts.ts",
   "features/research/ResearchRoute.tsx|./gaDomain|value|features/research/gaDomain.ts",
+  "features/research/ResearchRoute.tsx|./GaOperationsPanel|value|features/research/GaOperationsPanel.tsx",
   "features/research/ResearchRoute.tsx|./ResearchPage|value|features/research/ResearchPage.tsx",
+  "features/research/ResearchRoute.tsx|./useGaOperations|value|features/research/useGaOperations.ts",
   "features/research/ResearchRoute.tsx|./useResearchWorkspace|value|features/research/useResearchWorkspace.ts",
+  "features/research/useGaOperations.test.ts|../../api|type-only|api.ts",
+  "features/research/useGaOperations.test.ts|../../api|value|api.ts",
+  "features/research/useGaOperations.test.ts|./gaOperationsModel|value|features/research/gaOperationsModel.ts",
+  "features/research/useGaOperations.test.ts|./useGaOperations|value|features/research/useGaOperations.ts",
+  "features/research/useGaOperations.test.ts|./useResearchWorkspace|type-only|features/research/useResearchWorkspace.ts",
+  "features/research/useGaOperations.ts|../../api|value|api.ts",
+  "features/research/useGaOperations.ts|./gaOperationsModel|value|features/research/gaOperationsModel.ts",
+  "features/research/useGaOperations.ts|./useResearchWorkspace|type-only|features/research/useResearchWorkspace.ts",
   "features/research/useResearchWorkspace.test.ts|../../api|type-only|api.ts",
   "features/research/useResearchWorkspace.test.ts|../../api|value|api.ts",
   "features/research/useResearchWorkspace.test.ts|./useResearchWorkspace|value|features/research/useResearchWorkspace.ts",
@@ -388,6 +451,7 @@ const expectedRelativeImportLedger = [
   "features/results/BacktestResultsView.tsx|./demo|value|features/results/demo.ts",
   "features/results/BacktestResultsView.tsx|./resultsCharts|value|features/results/resultsCharts.ts",
   "features/results/BacktestResultsView.tsx|./resultsModel|value|features/results/resultsModel.ts",
+  "features/results/BacktestResultsView.tsx|./useBacktestResults|value|features/results/useBacktestResults.ts",
   "features/results/BacktestResultsView.tsx|./useTradePagination|value|features/results/useTradePagination.ts",
   "features/results/demo.test.ts|./demo|value|features/results/demo.ts",
   "features/results/demo.ts|../../shared/trading/closedTrade|type-only|shared/trading/closedTrade.ts",
@@ -399,15 +463,26 @@ const expectedRelativeImportLedger = [
   "features/results/resultsCharts.ts|../../shared/theme|type-only|shared/theme.ts",
   "features/results/resultsCharts.ts|../../shared/time/presentation|value|shared/time/presentation.ts",
   "features/results/resultsCharts.ts|./resultsModel|type-only|features/results/resultsModel.ts",
+  "features/results/resultsModel.test.ts|../../api|type-only|api.ts",
   "features/results/resultsModel.test.ts|../../shared/trading/closedTrade|type-only|shared/trading/closedTrade.ts",
+  "features/results/resultsModel.test.ts|../../shared/trading/closedTradePage|value|shared/trading/closedTradePage.ts",
   "features/results/resultsModel.test.ts|./resultsModel|value|features/results/resultsModel.ts",
+  "features/results/resultsModel.ts|../../api|type-only|api.ts",
   "features/results/resultsModel.ts|../../shared/format/decimal|value|shared/format/decimal.ts",
   "features/results/resultsModel.ts|../../shared/time/utc|value|shared/time/utc.ts",
-  "features/results/resultsModel.ts|../../shared/trading/closedTrade|type-only|shared/trading/closedTrade.ts",
+  "features/results/resultsModel.ts|../../shared/trading/closedTradePage|type-only|shared/trading/closedTradePage.ts",
+  "features/results/resultsModel.ts|../../shared/trading/closedTradePage|value|shared/trading/closedTradePage.ts",
+  "features/results/resultsModel.ts|../../shared/trading/closedTradePage|value|shared/trading/closedTradePage.ts",
+  "features/results/useBacktestResults.test.ts|../../api|type-only|api.ts",
+  "features/results/useBacktestResults.test.ts|./useBacktestResults|value|features/results/useBacktestResults.ts",
+  "features/results/useBacktestResults.ts|../../api|value|api.ts",
+  "features/results/useBacktestResults.ts|./resultsModel|type-only|features/results/resultsModel.ts",
+  "features/results/useBacktestResults.ts|./resultsModel|value|features/results/resultsModel.ts",
+  "features/results/useTradePagination.test.ts|../../shared/trading/useTradePagination|value|shared/trading/useTradePagination.ts",
   "features/results/useTradePagination.test.ts|./demo|value|features/results/demo.ts",
   "features/results/useTradePagination.test.ts|./resultsModel|type-only|features/results/resultsModel.ts",
   "features/results/useTradePagination.test.ts|./useTradePagination|value|features/results/useTradePagination.ts",
-  "features/results/useTradePagination.ts|./resultsModel|value|features/results/resultsModel.ts",
+  "features/results/useTradePagination.ts|../../shared/trading/useTradePagination|value|shared/trading/useTradePagination.ts",
   "features/strategies/strategyCommandState.test.ts|../../api|type-only|api.ts",
   "features/strategies/strategyCommandState.test.ts|./strategyCommandState|value|features/strategies/strategyCommandState.ts",
   "features/strategies/strategyCommandState.ts|../../api|type-only|api.ts",
@@ -442,9 +517,11 @@ const expectedRelativeImportLedger = [
   "features/trades/tradeCharts.ts|../../shared/theme|type-only|shared/theme.ts",
   "features/trades/tradeCharts.ts|../../shared/time/presentation|value|shared/time/presentation.ts",
   "features/trades/tradeCharts.ts|./tradeModel|type-only|features/trades/tradeModel.ts",
+  "features/trades/TradeChartView.test.tsx|../../api|type-only|api.ts",
   "features/trades/TradeChartView.test.tsx|../../shared/i18n|value|shared/i18n.ts",
   "features/trades/TradeChartView.test.tsx|./demo|value|features/trades/demo.ts",
   "features/trades/TradeChartView.test.tsx|./TradeChartView|value|features/trades/TradeChartView.tsx",
+  "features/trades/TradeChartView.test.tsx|./useBacktestTrades|type-only|features/trades/useBacktestTrades.ts",
   "features/trades/TradeChartView.tsx|../../shared/format/decimal|value|shared/format/decimal.ts",
   "features/trades/TradeChartView.tsx|../../shared/i18n|type-only|shared/i18n.ts",
   "features/trades/TradeChartView.tsx|../../shared/theme|type-only|shared/theme.ts",
@@ -453,10 +530,21 @@ const expectedRelativeImportLedger = [
   "features/trades/TradeChartView.tsx|./demo|value|features/trades/demo.ts",
   "features/trades/TradeChartView.tsx|./tradeCharts|value|features/trades/tradeCharts.ts",
   "features/trades/TradeChartView.tsx|./tradeModel|value|features/trades/tradeModel.ts",
+  "features/trades/TradeChartView.tsx|./useBacktestTrades|value|features/trades/useBacktestTrades.ts",
+  "features/trades/tradeModel.test.ts|../../api|type-only|api.ts",
   "features/trades/tradeModel.test.ts|./tradeModel|value|features/trades/tradeModel.ts",
+  "features/trades/tradeModel.ts|../../api|type-only|api.ts",
   "features/trades/tradeModel.ts|../../shared/format/decimal|value|shared/format/decimal.ts",
   "features/trades/tradeModel.ts|../../shared/time/utc|value|shared/time/utc.ts",
   "features/trades/tradeModel.ts|../../shared/trading/closedTrade|type-only|shared/trading/closedTrade.ts",
+  "features/trades/tradeModel.ts|../../shared/trading/closedTradePage|type-only|shared/trading/closedTradePage.ts",
+  "features/trades/tradeModel.ts|../../shared/trading/closedTradePage|value|shared/trading/closedTradePage.ts",
+  "features/trades/useBacktestTrades.test.ts|../../api|type-only|api.ts",
+  "features/trades/useBacktestTrades.test.ts|./useBacktestTrades|value|features/trades/useBacktestTrades.ts",
+  "features/trades/useBacktestTrades.ts|../../api|value|api.ts",
+  "features/trades/useBacktestTrades.ts|../../shared/trading/closedTradePage|value|shared/trading/closedTradePage.ts",
+  "features/trades/useBacktestTrades.ts|../../shared/trading/useTradePagination|value|shared/trading/useTradePagination.ts",
+  "features/trades/useBacktestTrades.ts|./tradeModel|value|features/trades/tradeModel.ts",
   "main.tsx|./app/App|value|app/App.tsx",
   "main.tsx|./shared/i18n|value|shared/i18n.ts",
   "main.tsx|./shared/theme|value|shared/theme.ts",
@@ -472,7 +560,11 @@ const expectedRelativeImportLedger = [
   "shared/theme.test.ts|./theme|value|shared/theme.ts",
   "shared/time/presentation.test.ts|./presentation|value|shared/time/presentation.ts",
   "shared/time/presentation.ts|./utc|value|shared/time/utc.ts",
-  "shared/time/utc.test.ts|./utc|value|shared/time/utc.ts"
+  "shared/time/utc.test.ts|./utc|value|shared/time/utc.ts",
+  "shared/trading/closedTradePage.ts|../format/decimal|value|shared/format/decimal.ts",
+  "shared/trading/closedTradePage.ts|../time/utc|value|shared/time/utc.ts",
+  "shared/trading/closedTradePage.ts|./closedTrade|type-only|shared/trading/closedTrade.ts",
+  "shared/trading/useTradePagination.ts|./closedTradePage|value|shared/trading/closedTradePage.ts"
 ] as const;
 
 const expectedPolicyGlobalLedger = [
@@ -482,13 +574,21 @@ const expectedPolicyGlobalLedger = [
   "app/App.tsx|window.location.href",
   "app/App.tsx|window.location.href",
   "app/App.tsx|window.location.search",
+  "app/researchInvalidation.ts|fetch()",
   "features/research/FitnessSurface3D.tsx|window.devicePixelRatio",
+  "features/research/useGaOperations.ts|window.crypto.randomUUID()",
+  "features/research/useGaOperations.ts|window.sessionStorage.getItem()",
+  "features/research/useGaOperations.ts|window.sessionStorage.removeItem()",
+  "features/research/useGaOperations.ts|window.sessionStorage.setItem()",
+  "features/research/useGaOperations.ts|window.sessionStorage.setItem()",
+  "features/results/BacktestResultsView.tsx|import.meta.env.DEV",
   "features/strategies/useStrategyManager.ts|window.confirm()",
   "features/strategies/useStrategyManager.ts|window.confirm()",
   "features/strategies/useStrategyManager.ts|window.crypto.randomUUID()",
   "features/strategies/useStrategyManager.ts|window.sessionStorage.getItem()",
   "features/strategies/useStrategyManager.ts|window.sessionStorage.removeItem()",
   "features/strategies/useStrategyManager.ts|window.sessionStorage.setItem()",
+  "features/trades/TradeChartView.tsx|import.meta.env.DEV",
   "main.tsx|document.getElementById()",
   "shared/i18n.ts|document.documentElement.lang",
   "shared/i18n.ts|document.documentElement.lang",
@@ -980,12 +1080,14 @@ const featureOwnerPaths = new Set([
 ]);
 const featurePresentationPaths = new Set([
   "features/research/FitnessSurface3D.tsx",
+  "features/research/GaOperationsPanel.tsx",
   "features/research/ResearchPage.tsx",
   "features/strategies/StrategyManagerView.tsx",
   "features/trades/CandlestickChart.tsx"
 ]);
 const featureModelPaths = new Set([
   "features/research/gaDomain.ts",
+  "features/research/gaOperationsModel.ts",
   "features/research/researchModel.ts",
   "features/results/resultsModel.ts",
   "features/strategies/strategyCommandState.ts",
@@ -1032,11 +1134,18 @@ function architectureRole(importer: string): ArchitectureRole {
   if (importer === "vite-env.d.ts") return "vite-env";
   if (importer === "app/navigation.ts") return "app-navigation";
   if (importer === "app/App.tsx") return "app-shell";
+  if (importer === "app/researchInvalidation.ts") return "research-stream";
   if (importer === "features/research/useResearchWorkspace.ts") {
     return "research-io";
   }
+  if (importer === "features/research/useGaOperations.ts") return "research-ga-io";
   if (importer === "features/strategies/useStrategyManager.ts") {
     return "strategy-io";
+  }
+  if (importer === "features/results/useBacktestResults.ts") return "results-io";
+  if (importer === "features/trades/useBacktestTrades.ts") return "trades-io";
+  if (importer === "shared/trading/useTradePagination.ts") {
+    return "shared-trading-pager";
   }
   if (featureOwnerPaths.has(importer)) return "feature-owner";
   if (featurePresentationPaths.has(importer)) return "feature-presentation";
@@ -1048,10 +1157,13 @@ function architectureRole(importer: string): ArchitectureRole {
     return "locale-resource-test";
   }
   if (importer === "vite.config.ts") return "vite-config";
-  if (importer === "playwright.config.ts") return "playwright-config";
+  if (new Set(["playwright.config.ts", "playwright.integration.config.ts"]).has(importer)) {
+    return "playwright-config";
+  }
   if (importer === "toolchain-contract.test.js") return "toolchain-test";
   if (importer === "e2e/fixtures.ts") return "e2e-fixture";
   if (importer === "e2e/console-smoke.e2e.ts") return "e2e-test";
+  if (importer === "e2e/research-invalidation-real.e2e.ts") return "e2e-real-test";
   if (
     expectedInventorySet.has(importer) &&
     /\.test\.[jt]sx?$/u.test(importer)
@@ -1096,10 +1208,16 @@ const outsideEdgeKeysByRole: Partial<
     "node:path|value|node:path",
     "vitest|value|vitest"
   ]),
-  "e2e-fixture": new Set(),
+  "e2e-fixture": new Set([
+    "../src/api|type-only|src/api.ts"
+  ]),
   "e2e-test": new Set([
     "./fixtures|value|e2e/fixtures.ts",
     "@playwright/test|value|@playwright/test"
+  ]),
+  "e2e-real-test": new Set([
+    "@playwright/test|value|@playwright/test",
+    "node:fs|value|node:fs"
   ])
 };
 
@@ -1140,7 +1258,8 @@ function assertBareEdge(edge: ImportEdge, role: ArchitectureRole): void {
       "playwright-config",
       "toolchain-test",
       "e2e-fixture",
-      "e2e-test"
+      "e2e-test",
+      "e2e-real-test"
     ].includes(role)
   ) {
     assertOutsideEdge(edge, role);
@@ -1164,7 +1283,10 @@ function assertBareEdge(edge: ImportEdge, role: ArchitectureRole): void {
     if (!allowedTestPackages.has(edge.specifier)) denyEdge(edge);
     if (
       edge.specifier === "react" &&
-      edge.importer !== "app/App.test.tsx"
+      !new Set([
+        "app/App.test.tsx",
+        "app/researchInvalidation.test.ts"
+      ]).has(edge.importer)
     ) {
       denyEdge(edge);
     }
@@ -1172,17 +1294,21 @@ function assertBareEdge(edge: ImportEdge, role: ArchitectureRole): void {
       edge.specifier === "@testing-library/react" &&
       !new Set([
         "app/App.test.tsx",
+        "app/researchInvalidation.test.ts",
         "features/research/FitnessSurface3D.test.tsx",
         "features/research/ResearchPage.test.tsx",
         "features/research/ResearchRoute.test.tsx",
+        "features/research/useGaOperations.test.ts",
         "features/research/useResearchWorkspace.test.ts",
         "features/results/BacktestResultsView.test.tsx",
+        "features/results/useBacktestResults.test.ts",
         "features/results/useTradePagination.test.ts",
         "features/strategies/StrategyManager.test.tsx",
         "features/strategies/StrategyManagerView.test.tsx",
         "features/strategies/useStrategyManager.test.ts",
         "features/trades/CandlestickChart.test.tsx",
         "features/trades/TradeChartView.test.tsx",
+        "features/trades/useBacktestTrades.test.ts",
         "shared/charts/EChart.test.tsx"
       ]).has(edge.importer)
     ) {
@@ -1200,8 +1326,12 @@ function assertBareEdge(edge: ImportEdge, role: ArchitectureRole): void {
   const exactByRole: Partial<Record<ArchitectureRole, ReadonlySet<string>>> = {
     main: new Set(["react|value", "react-dom/client|value"]),
     "app-shell": new Set(["react|value", "react-i18next|value"]),
+    "research-stream": new Set(["react|value"]),
     "research-io": new Set(["react|value"]),
+    "research-ga-io": new Set(["react|value"]),
     "strategy-io": new Set(["react|value", "react-i18next|type-only"]),
+    "results-io": new Set(["react|value"]),
+    "trades-io": new Set(["react|value"]),
     "feature-owner": new Set([
       "react|value",
       "react-i18next|type-only",
@@ -1224,6 +1354,7 @@ function assertBareEdge(edge: ImportEdge, role: ArchitectureRole): void {
       "echarts/renderers|value",
       "react|value"
     ]),
+    "shared-trading-pager": new Set(["react|value"]),
     "shared-i18n": new Set(["i18next|value", "react-i18next|value"])
   };
   if (!exactByRole[role]?.has(`${edge.specifier}|${edge.kind}`)) {
@@ -1274,9 +1405,10 @@ function assertRepositoryEdge(edge: ImportEdge, role: ArchitectureRole): void {
     [
       "vite-config",
       "playwright-config",
-      "toolchain-test",
-      "e2e-fixture",
-      "e2e-test"
+    "toolchain-test",
+    "e2e-fixture",
+    "e2e-test",
+    "e2e-real-test"
     ].includes(role)
   ) {
     assertOutsideEdge(edge, role);
@@ -1307,6 +1439,7 @@ function assertRepositoryEdge(edge: ImportEdge, role: ArchitectureRole): void {
     if (
       !new Set([
         "app/navigation.ts",
+        "app/researchInvalidation.ts",
         "features/research/ResearchRoute.tsx",
         "features/results/BacktestResultsView.tsx",
         "features/strategies/StrategyManager.tsx",
@@ -1319,6 +1452,13 @@ function assertRepositoryEdge(edge: ImportEdge, role: ArchitectureRole): void {
     }
     return;
   }
+  if (role === "research-stream") denyEdge(edge);
+  if (role === "research-ga-io") {
+    if (
+      (!isSameFeature(edge.importer, edge.resolved) && edge.resolved !== "api.ts")
+    ) denyEdge(edge);
+    return;
+  }
   if (role === "research-io" || role === "strategy-io") {
     if (
       !isSameFeature(edge.importer, edge.resolved) &&
@@ -1329,6 +1469,16 @@ function assertRepositoryEdge(edge: ImportEdge, role: ArchitectureRole): void {
     }
     return;
   }
+  if (role === "results-io") {
+    if (
+      edge.resolved === "api.ts" ||
+      (edge.resolved === "features/results/resultsModel.ts" &&
+        featureModelPaths.has(edge.resolved))
+    ) {
+      return;
+    }
+    denyEdge(edge);
+  }
   if (role === "feature-owner" || role === "feature-presentation") {
     if (
       !isSameFeature(edge.importer, edge.resolved) &&
@@ -1337,6 +1487,17 @@ function assertRepositoryEdge(edge: ImportEdge, role: ArchitectureRole): void {
       denyEdge(edge);
     }
     return;
+  }
+  if (role === "trades-io") {
+    if (
+      edge.resolved === "api.ts" ||
+      edge.resolved === "features/trades/tradeModel.ts" ||
+      edge.resolved === "shared/trading/closedTradePage.ts" ||
+      edge.resolved === "shared/trading/useTradePagination.ts"
+    ) {
+      return;
+    }
+    denyEdge(edge);
   }
   if (role === "feature-model") {
     if (edge.resolved === "api.ts") {
@@ -1391,6 +1552,10 @@ function assertRepositoryEdge(edge: ImportEdge, role: ArchitectureRole): void {
     ) {
       denyEdge(edge);
     }
+    return;
+  }
+  if (role === "shared-trading-pager") {
+    if (edge.resolved !== "shared/trading/closedTradePage.ts") denyEdge(edge);
     return;
   }
   if (role === "shared-pure") {
@@ -1571,6 +1736,7 @@ function collectPolicyGlobalUses(): PolicyGlobalUse[] {
 }
 
 const allowedPolicyGlobals = new Map<string, ReadonlySet<string>>([
+  ["app/researchInvalidation.ts", new Set(["fetch()"])],
   ["api.ts", new Set(["fetch()"])],
   ["main.tsx", new Set(["document.getElementById()"])],
   [
@@ -1580,6 +1746,15 @@ const allowedPolicyGlobals = new Map<string, ReadonlySet<string>>([
       "window.history.replaceState()",
       "window.location.href",
       "window.location.search"
+    ])
+  ],
+  [
+    "features/research/useGaOperations.ts",
+    new Set([
+      "window.crypto.randomUUID()",
+      "window.sessionStorage.getItem()",
+      "window.sessionStorage.removeItem()",
+      "window.sessionStorage.setItem()"
     ])
   ],
   [
@@ -1616,6 +1791,14 @@ const allowedPolicyGlobals = new Map<string, ReadonlySet<string>>([
   [
     "features/research/FitnessSurface3D.tsx",
     new Set(["window.devicePixelRatio"])
+  ],
+  [
+    "features/results/BacktestResultsView.tsx",
+    new Set(["import.meta.env.DEV"])
+  ],
+  [
+    "features/trades/TradeChartView.tsx",
+    new Set(["import.meta.env.DEV"])
   ]
 ]);
 
@@ -1637,6 +1820,102 @@ function assertImportMetaContract(
       node.keywordToken === SyntaxKind.ImportKeyword &&
       node.name.text === "meta"
   );
+  if (importer === "features/results/BacktestResultsView.tsx") {
+    if (metaUses.length !== 1) {
+      throw new Error("architecture Results requires one exact DEV demo guard");
+    }
+    const meta = metaUses[0];
+    const env = meta.parent;
+    const dev = env?.parent;
+    if (
+      !env ||
+      !isPropertyAccessExpression(env) ||
+      env.expression !== meta ||
+      env.questionDotToken ||
+      env.name.text !== "env" ||
+      !dev ||
+      !isPropertyAccessExpression(dev) ||
+      dev.expression !== env ||
+      dev.questionDotToken ||
+      dev.name.text !== "DEV"
+    ) {
+      throw new Error("architecture Results DEV chain denied");
+    }
+    const declaration = descendants(sourceFile).find(
+      (node) =>
+        isVariableDeclaration(node) &&
+        isIdentifier(node.name) &&
+        node.name.text === "useDemoSnapshot"
+    );
+    if (
+      !declaration ||
+      !isVariableDeclaration(declaration) ||
+      !declaration.initializer ||
+      !descendants(declaration.initializer).includes(meta) ||
+      declaration.initializer
+        .getText(sourceFile)
+        .replaceAll(/\s+/gu, "") !==
+        "import.meta.env.DEV===true&&!suppliedSnapshot&&loading!==true&&loadError!==true&&demoMode"
+    ) {
+      throw new Error("architecture Results demo guard changed");
+    }
+    let owner: Node | undefined = declaration.parent;
+    while (owner && !isFunctionDeclaration(owner)) {
+      owner = owner.parent;
+    }
+    if (!owner || owner.name?.text !== "BacktestResultsView") {
+      throw new Error("architecture Results DEV owner denied");
+    }
+    return;
+  }
+  if (importer === "features/trades/TradeChartView.tsx") {
+    if (metaUses.length !== 1) {
+      throw new Error("architecture Trades requires one exact DEV demo guard");
+    }
+    const meta = metaUses[0];
+    const env = meta.parent;
+    const dev = env?.parent;
+    if (
+      !env ||
+      !isPropertyAccessExpression(env) ||
+      env.expression !== meta ||
+      env.questionDotToken ||
+      env.name.text !== "env" ||
+      !dev ||
+      !isPropertyAccessExpression(dev) ||
+      dev.expression !== env ||
+      dev.questionDotToken ||
+      dev.name.text !== "DEV"
+    ) {
+      throw new Error("architecture Trades DEV chain denied");
+    }
+    const declaration = descendants(sourceFile).find(
+      (node) =>
+        isVariableDeclaration(node) &&
+        isIdentifier(node.name) &&
+        node.name.text === "useDemoSnapshot"
+    );
+    if (
+      !declaration ||
+      !isVariableDeclaration(declaration) ||
+      !declaration.initializer ||
+      !descendants(declaration.initializer).includes(meta) ||
+      declaration.initializer.getText(sourceFile).replaceAll(/\s+/gu, "") !==
+        "import.meta.env.DEV===true&&snapshot===undefined&&demoMode" ||
+      !isVariableDeclarationList(declaration.parent) ||
+      (declaration.parent.flags & NodeFlags.Const) === 0
+    ) {
+      throw new Error("architecture Trades demo guard changed");
+    }
+    let owner: Node | undefined = declaration.parent;
+    while (owner && !isFunctionDeclaration(owner)) {
+      owner = owner.parent;
+    }
+    if (!owner || owner.name?.text !== "TradeChartView") {
+      throw new Error("architecture Trades DEV owner denied");
+    }
+    return;
+  }
   if (importer !== "app/App.tsx" && metaUses.length > 0) {
     throw new Error(`architecture import.meta denied: ${importer}`);
   }
@@ -1895,9 +2174,11 @@ function assertCurrentArchitecture(): void {
   for (const importer of [
     "vite.config.ts",
     "playwright.config.ts",
+    "playwright.integration.config.ts",
     "toolchain-contract.test.js",
     "e2e/fixtures.ts",
-    "e2e/console-smoke.e2e.ts"
+    "e2e/console-smoke.e2e.ts",
+    "e2e/research-invalidation-real.e2e.ts"
   ]) {
     assertOutsideEdgeSet(importer, outsideEdges);
   }
@@ -1964,9 +2245,11 @@ describe("frontend architecture ratchet", () => {
     for (const importer of [
       "vite.config.ts",
       "playwright.config.ts",
+      "playwright.integration.config.ts",
       "toolchain-contract.test.js",
       "e2e/fixtures.ts",
-      "e2e/console-smoke.e2e.ts"
+      "e2e/console-smoke.e2e.ts",
+      "e2e/research-invalidation-real.e2e.ts"
     ]) {
       expect(() => assertOutsideEdgeSet(importer, edges)).not.toThrow();
     }
@@ -1977,12 +2260,17 @@ describe("frontend architecture ratchet", () => {
     for (const importer of [
       "vite.config.ts",
       "playwright.config.ts",
+      "playwright.integration.config.ts",
       "toolchain-contract.test.js",
-      "e2e/console-smoke.e2e.ts"
+      "e2e/console-smoke.e2e.ts",
+      "e2e/fixtures.ts",
+      "e2e/research-invalidation-real.e2e.ts"
     ]) {
       const owned = edges.filter((edge) => edge.importer === importer);
       if (importer === "toolchain-contract.test.js") {
         expect(owned).toHaveLength(6);
+      } else if (importer === "e2e/fixtures.ts") {
+        expect(owned).toHaveLength(1);
       }
       for (const removed of owned) {
         expect(() =>
@@ -2010,6 +2298,8 @@ describe("frontend architecture ratchet", () => {
     architectureEdge("e2e/fixtures.ts", "node:fs", "node:fs"),
     architectureEdge("e2e/fixtures.ts", "nanoid", "nanoid"),
     architectureEdge("e2e/fixtures.ts", "./src/api", "src/api.ts"),
+    architectureEdge("e2e/fixtures.ts", "../src/api", "src/api.ts"),
+    architectureEdge("e2e/fixtures.ts", "../src/api", "api.ts", "type-only"),
     architectureEdge("e2e/console-smoke.e2e.ts", "vitest", "vitest"),
     architectureEdge("e2e/console-smoke.e2e.ts", "node:fs", "node:fs"),
     architectureEdge("e2e/console-smoke.e2e.ts", "nanoid", "nanoid"),
@@ -2084,14 +2374,19 @@ describe("frontend architecture ratchet", () => {
     ["vite-env.d.ts", "vite-env"],
     ["app/navigation.ts", "app-navigation"],
     ["app/App.tsx", "app-shell"],
+    ["app/researchInvalidation.ts", "research-stream"],
     ["features/research/useResearchWorkspace.ts", "research-io"],
+    ["features/research/useGaOperations.ts", "research-ga-io"],
     ["features/strategies/useStrategyManager.ts", "strategy-io"],
+    ["features/results/useBacktestResults.ts", "results-io"],
+    ["features/trades/useBacktestTrades.ts", "trades-io"],
     ["features/research/ResearchRoute.tsx", "feature-owner"],
     ["features/research/ResearchPage.tsx", "feature-presentation"],
     ["features/research/gaDomain.ts", "feature-model"],
     ["features/research/gaCharts.ts", "feature-chart"],
     ["features/research/demo.ts", "feature-demo"],
     ["shared/charts/EChart.tsx", "shared-chart"],
+    ["shared/trading/useTradePagination.ts", "shared-trading-pager"],
     ["shared/format/decimal.ts", "shared-pure"],
     ["shared/theme.ts", "shared-theme"],
     ["shared/i18n.ts", "shared-i18n"],
@@ -2102,7 +2397,8 @@ describe("frontend architecture ratchet", () => {
     ["playwright.config.ts", "playwright-config"],
     ["toolchain-contract.test.js", "toolchain-test"],
     ["e2e/fixtures.ts", "e2e-fixture"],
-    ["e2e/console-smoke.e2e.ts", "e2e-test"]
+    ["e2e/console-smoke.e2e.ts", "e2e-test"],
+    ["e2e/research-invalidation-real.e2e.ts", "e2e-real-test"]
   ] as const)("classifies %s as the exact %s role", (importer, role) => {
     expect(architectureRole(importer)).toBe(role);
   });
@@ -2133,9 +2429,25 @@ describe("frontend architecture ratchet", () => {
       "features/research/ResearchRoute.tsx"
     ),
     architectureEdge(
+      "app/App.tsx",
+      "./researchInvalidation",
+      "app/researchInvalidation.ts"
+    ),
+    architectureEdge(
       "features/research/useResearchWorkspace.ts",
       "../../api",
       "api.ts"
+    ),
+    architectureEdge(
+      "features/research/useGaOperations.ts",
+      "../../api",
+      "api.ts"
+    ),
+    architectureEdge(
+      "features/research/useGaOperations.ts",
+      "../../api",
+      "api.ts",
+      "type-only"
     ),
     architectureEdge(
       "features/strategies/useStrategyManager.ts",
@@ -2143,9 +2455,44 @@ describe("frontend architecture ratchet", () => {
       "api.ts"
     ),
     architectureEdge(
+      "features/results/useBacktestResults.ts",
+      "../../api",
+      "api.ts"
+    ),
+    architectureEdge(
+      "features/results/useBacktestResults.ts",
+      "./resultsModel",
+      "features/results/resultsModel.ts"
+    ),
+    architectureEdge(
+      "features/trades/useBacktestTrades.ts",
+      "../../api",
+      "api.ts"
+    ),
+    architectureEdge(
+      "features/trades/useBacktestTrades.ts",
+      "../../shared/trading/closedTradePage",
+      "shared/trading/closedTradePage.ts"
+    ),
+    architectureEdge(
+      "features/trades/useBacktestTrades.ts",
+      "../../shared/trading/useTradePagination",
+      "shared/trading/useTradePagination.ts"
+    ),
+    architectureEdge(
+      "features/trades/useBacktestTrades.ts",
+      "./tradeModel",
+      "features/trades/tradeModel.ts"
+    ),
+    architectureEdge(
       "features/results/BacktestResultsView.tsx",
       "./resultsModel",
       "features/results/resultsModel.ts"
+    ),
+    architectureEdge(
+      "features/results/BacktestResultsView.tsx",
+      "./useBacktestResults",
+      "features/results/useBacktestResults.ts"
     ),
     architectureEdge(
       "features/research/ResearchPage.tsx",
@@ -2181,6 +2528,22 @@ describe("frontend architecture ratchet", () => {
       "shared/trading/closedTrade.ts"
     ),
     architectureEdge(
+      "shared/trading/closedTradePage.ts",
+      "./closedTrade",
+      "shared/trading/closedTrade.ts",
+      "type-only"
+    ),
+    architectureEdge(
+      "shared/trading/useTradePagination.ts",
+      "react",
+      "react"
+    ),
+    architectureEdge(
+      "shared/trading/useTradePagination.ts",
+      "./closedTradePage",
+      "shared/trading/closedTradePage.ts"
+    ),
+    architectureEdge(
       "shared/i18n.ts",
       "./locales/en",
       "shared/locales/en.ts"
@@ -2189,6 +2552,17 @@ describe("frontend architecture ratchet", () => {
       "features/results/resultsModel.test.ts",
       "./resultsModel",
       "features/results/resultsModel.ts"
+    ),
+    architectureEdge(
+      "features/trades/tradeModel.ts",
+      "../../api",
+      "api.ts",
+      "type-only"
+    ),
+    architectureEdge(
+      "features/trades/tradeModel.ts",
+      "../../shared/trading/closedTradePage",
+      "shared/trading/closedTradePage.ts"
     ),
     architectureEdge("architecture.test.ts", "node:fs", "node:fs"),
     architectureEdge("vite.config.ts", "vite", "vite"),
@@ -2213,22 +2587,35 @@ describe("frontend architecture ratchet", () => {
 
   it.each([
     architectureEdge("main.tsx", "./features/research/gaDomain", "features/research/gaDomain.ts"),
+    architectureEdge("app/researchInvalidation.ts", "../../api", "api.ts"),
     architectureEdge("api.ts", "./shared/time/utc", "shared/time/utc.ts"),
     architectureEdge("vite-env.d.ts", "react", "react"),
     architectureEdge("app/navigation.ts", "../api", "api.ts"),
     architectureEdge("app/App.tsx", "../features/research/gaDomain", "features/research/gaDomain.ts"),
     architectureEdge("features/research/useResearchWorkspace.ts", "../results/resultsModel", "features/results/resultsModel.ts"),
     architectureEdge("features/strategies/useStrategyManager.ts", "../trades/tradeModel", "features/trades/tradeModel.ts"),
+    architectureEdge("features/results/useBacktestResults.ts", "./BacktestResultsView", "features/results/BacktestResultsView.tsx"),
+    architectureEdge("features/trades/useBacktestTrades.ts", "../results/resultsModel", "features/results/resultsModel.ts"),
     architectureEdge("features/results/BacktestResultsView.tsx", "../../api", "api.ts"),
     architectureEdge("features/research/ResearchPage.tsx", "../../api", "api.ts", "type-only"),
     architectureEdge("features/research/ResearchPage.tsx", "echarts/core", "echarts/core", "type-only"),
     architectureEdge("features/research/ResearchPage.tsx", "./demo", "features/research/demo.ts"),
     architectureEdge("features/research/gaDomain.ts", "../../api", "api.ts"),
+    architectureEdge("features/trades/tradeModel.ts", "../../api", "api.ts"),
     architectureEdge("features/research/gaCharts.ts", "../../api", "api.ts", "type-only"),
     architectureEdge("features/research/demo.ts", "../../api", "api.ts", "type-only"),
     architectureEdge("shared/charts/EChart.tsx", "../../features/research/gaDomain", "features/research/gaDomain.ts"),
     architectureEdge("shared/charts/EChart.tsx", "../theme", "shared/theme.ts"),
     architectureEdge("shared/format/decimal.ts", "../../features/results/resultsModel", "features/results/resultsModel.ts"),
+    architectureEdge("shared/format/decimal.ts", "react", "react"),
+    architectureEdge("shared/trading/closedTradePage.ts", "../../api", "api.ts"),
+    architectureEdge("shared/trading/closedTradePage.ts", "../../features/results/resultsModel", "features/results/resultsModel.ts"),
+    architectureEdge("shared/trading/closedTradePage.ts", "react", "react"),
+    architectureEdge("shared/trading/useTradePagination.ts", "../../api", "api.ts"),
+    architectureEdge("shared/trading/useTradePagination.ts", "../../features/results/resultsModel", "features/results/resultsModel.ts"),
+    architectureEdge("shared/trading/useTradePagination.ts", "../../features/trades/tradeModel", "features/trades/tradeModel.ts"),
+    architectureEdge("shared/trading/closedTradePage.ts", "../../api", "api.ts", "type-only"),
+    architectureEdge("shared/trading/closedTradePage.ts", "../../features/results/resultsModel", "features/results/resultsModel.ts", "type-only"),
     architectureEdge("shared/theme.ts", "./time/utc", "shared/time/utc.ts"),
     architectureEdge("shared/i18n.ts", "./theme", "shared/theme.ts"),
     architectureEdge("features/results/resultsModel.test.ts", "../trades/tradeModel", "features/trades/tradeModel.ts"),
@@ -2387,7 +2774,7 @@ describe("frontend architecture ratchet", () => {
       /@charset|@import|url\(/
     );
     await expect(sha256(payload)).resolves.toBe(
-      "22720fa1639594fe3110447adb83239ef24bd4d262e344abbc474640146bc0a9"
+      "d76986b478061f42791e8f338a3b9a7a2ac7b08abbf833b2340eeb871342454a"
     );
   });
 
@@ -2477,7 +2864,8 @@ describe("frontend architecture ratchet", () => {
       "../features/trades/TradeChartView|value|features/trades/TradeChartView.tsx",
       "../shared/i18n|type-only|shared/i18n.ts",
       "../shared/theme|value|shared/theme.ts",
-      "./navigation|value|app/navigation.ts"
+      "./navigation|value|app/navigation.ts",
+      "./researchInvalidation|value|app/researchInvalidation.ts"
     ]);
     expect(directRelativeSpecifiers(edges, "features/research/gaDomain.ts")).toEqual([
       "../../api|type-only|api.ts"
@@ -2486,6 +2874,9 @@ describe("frontend architecture ratchet", () => {
       "../../shared/theme|type-only|shared/theme.ts",
       "./gaDomain|value|features/research/gaDomain.ts"
     ]);
+    expect(directRelativeSpecifiers(edges, "features/research/ResearchRoute.tsx")).toContain(
+      "./useGaOperations|value|features/research/useGaOperations.ts"
+    );
     expect(
       directRelativeSpecifiers(edges, "features/research/useResearchWorkspace.ts")
     ).toEqual([
@@ -2569,6 +2960,114 @@ describe("frontend architecture ratchet", () => {
         (fixture) => assertImportMetaContract(fixture, "app/App.tsx")
       )
     ).not.toThrow();
+  });
+
+  it("accepts only the exact Results DEV demo guard", () => {
+    expect(() =>
+      withCompilerFixture(
+        [
+          "export function BacktestResultsView() {",
+          "  const suppliedSnapshot = false;",
+          "  const loading: boolean | undefined = undefined;",
+          "  const loadError: boolean | undefined = undefined;",
+          "  const demoMode = true;",
+          "  const useDemoSnapshot = import.meta.env.DEV === true && !suppliedSnapshot && loading !== true && loadError !== true && demoMode;",
+          "  return useDemoSnapshot;",
+          "}"
+        ].join("\n"),
+        (fixture) =>
+          assertImportMetaContract(
+            fixture,
+            "features/results/BacktestResultsView.tsx"
+          ),
+        ".tsx"
+      )
+    ).not.toThrow();
+  });
+
+  it.each([
+    [
+      "altered guard",
+      "import.meta.env.DEV !== true && !suppliedSnapshot && loading !== true && loadError !== true && demoMode",
+      "BacktestResultsView"
+    ],
+    [
+      "missing DEV guard",
+      "!suppliedSnapshot && loading !== true && loadError !== true && demoMode",
+      "BacktestResultsView"
+    ],
+    [
+      "wrong owner",
+      "import.meta.env.DEV === true && !suppliedSnapshot && loading !== true && loadError !== true && demoMode",
+      "OtherResultsView"
+    ]
+  ])("rejects Results DEV guard mutant %s", (_name, guard, owner) => {
+    expect(() =>
+      withCompilerFixture(
+        [
+          `export function ${owner}() {`,
+          "  const suppliedSnapshot = false;",
+          "  const loading: boolean | undefined = undefined;",
+          "  const loadError: boolean | undefined = undefined;",
+          "  const demoMode = true;",
+          `  const useDemoSnapshot = ${guard};`,
+          "  return useDemoSnapshot;",
+          "}"
+        ].join("\n"),
+        (fixture) =>
+          assertImportMetaContract(
+            fixture,
+            "features/results/BacktestResultsView.tsx"
+          ),
+        ".tsx"
+      )
+    ).toThrow("architecture Results");
+  });
+
+  it("accepts only the exact Trades DEV snapshot guard", () => {
+    expect(() =>
+      withCompilerFixture(
+        [
+          "export function TradeChartView() {",
+          "  const snapshot: unknown = undefined;",
+          "  const demoMode = true;",
+          "  const useDemoSnapshot = import.meta.env.DEV === true && snapshot === undefined && demoMode;",
+          "  return useDemoSnapshot;",
+          "}"
+        ].join("\n"),
+        (fixture) =>
+          assertImportMetaContract(
+            fixture,
+            "features/trades/TradeChartView.tsx"
+          ),
+        ".tsx"
+      )
+    ).not.toThrow();
+  });
+
+  it.each([
+    ["altered guard", "import.meta.env.DEV !== true && snapshot === undefined && demoMode", "TradeChartView"],
+    ["missing DEV guard", "snapshot === undefined && demoMode", "TradeChartView"],
+    ["wrong owner", "import.meta.env.DEV === true && snapshot === undefined && demoMode", "OtherTradeView"]
+  ])("rejects Trades DEV guard mutant %s", (_name, guard, owner) => {
+    expect(() =>
+      withCompilerFixture(
+        [
+          `export function ${owner}() {`,
+          "  const snapshot: unknown = undefined;",
+          "  const demoMode = true;",
+          `  const useDemoSnapshot = ${guard};`,
+          "  return useDemoSnapshot;",
+          "}"
+        ].join("\n"),
+        (fixture) =>
+          assertImportMetaContract(
+            fixture,
+            "features/trades/TradeChartView.tsx"
+          ),
+        ".tsx"
+      )
+    ).toThrow("architecture Trades");
   });
 
   it.each([
@@ -2856,6 +3355,10 @@ describe("frontend architecture ratchet", () => {
     const researchStateNames = [
       "epochs",
       "setEpochs",
+      "session",
+      "setSession",
+      "sessionResolved",
+      "setSessionResolved",
       "epochId",
       "setEpochId",
       "summaries",
@@ -2925,6 +3428,8 @@ describe("frontend architecture ratchet", () => {
     });
     expect(statePairs).toEqual([
       "epochs/setEpochs",
+      "session/setSession",
+      "sessionResolved/setSessionResolved",
       "epochId/setEpochId",
       "summaries/setSummaries",
       "generationIndex/setGenerationIndex",
@@ -2944,7 +3449,7 @@ describe("frontend architecture ratchet", () => {
         (node) =>
           isIdentifier(node.expression) && node.expression.text === "useEffect"
       )
-    ).toHaveLength(4);
+    ).toHaveLength(5);
     expect(
       workspaceCalls.filter(
         (node) =>
@@ -2958,6 +3463,12 @@ describe("frontend architecture ratchet", () => {
           isCallExpression(node) &&
           isIdentifier(node.expression) &&
           node.expression.text === "useResearchWorkspace"
+      )
+    ).toHaveLength(1);
+    expect(findNamedFunction(source("features/research/useGaOperations.ts"), "useGaOperations")).toHaveLength(1);
+    expect(
+      descendants(route[0]).filter(
+        (node) => isCallExpression(node) && isIdentifier(node.expression) && node.expression.text === "useGaOperations"
       )
     ).toHaveLength(1);
     expect(
@@ -3022,7 +3533,7 @@ describe("frontend architecture ratchet", () => {
     };
     const appSource = source("app/App.tsx");
     const facadeSource = source("features/results/BacktestResultsView.tsx");
-    const paginationSource = source("features/results/useTradePagination.ts");
+    const paginationSource = source("shared/trading/useTradePagination.ts");
     const modelSource = source("features/results/resultsModel.ts");
     const chartsSource = source("features/results/resultsCharts.ts");
     const app = findNamedFunction(appSource, "App");
@@ -3123,8 +3634,11 @@ describe("frontend architecture ratchet", () => {
     expect(
       directRelativeSpecifiers(edges, "features/trades/tradeModel.ts")
     ).toEqual([
+      "../../api|type-only|api.ts",
       "../../shared/format/decimal|value|shared/format/decimal.ts",
       "../../shared/time/utc|value|shared/time/utc.ts",
+      "../../shared/trading/closedTradePage|type-only|shared/trading/closedTradePage.ts",
+      "../../shared/trading/closedTradePage|value|shared/trading/closedTradePage.ts",
       "../../shared/trading/closedTrade|type-only|shared/trading/closedTrade.ts"
     ]);
     expect(
@@ -3147,7 +3661,8 @@ describe("frontend architecture ratchet", () => {
       "./CandlestickChart|value|features/trades/CandlestickChart.tsx",
       "./demo|value|features/trades/demo.ts",
       "./tradeCharts|value|features/trades/tradeCharts.ts",
-      "./tradeModel|value|features/trades/tradeModel.ts"
+      "./tradeModel|value|features/trades/tradeModel.ts",
+      "./useBacktestTrades|value|features/trades/useBacktestTrades.ts"
     ]);
 
     expect(modelSource.getText()).not.toMatch(

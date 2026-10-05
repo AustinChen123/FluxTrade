@@ -47,6 +47,7 @@ from src.core.backtest.flow_neutral_performance import (
     FlowNeutralPerformanceTracker,
     return_metric_inputs,
 )
+from src.core.backtest_result_persistence import FullBacktestOutcome
 from src.core.backtest.run_evidence import (
     BacktestDatasetEvidence,
     BacktestRunProvenance,
@@ -347,7 +348,7 @@ class BacktestRunner:
         product_id: str,
         timeframe: str,
         initial_balance: InitialBalanceInput = Decimal("10000"),
-        max_drawdown_limit: Optional[float] = 0.20,
+        max_drawdown_limit: Decimal | float | None = 0.20,
         data_source: Optional[IDataSource] = None,
         fee_config: Mapping[str, Decimal | float] | None = None,
         report_config: Optional[Dict] = None,
@@ -360,6 +361,8 @@ class BacktestRunner:
         external_funding_account_id: str | None = None,
         market_slippage_bps: Decimal = Decimal("0"),
         modeled_profile_input: ModeledProfileInput | None = None,
+        *,
+        capture_completed_outcome: bool = False,
     ):
         self.start_time = start_time
         self.end_time = end_time
@@ -403,6 +406,10 @@ class BacktestRunner:
         ):
             raise TypeError("modeled_profile_input must be ModeledProfileInput")
         self._modeled_profile_input = modeled_profile_input
+        if type(capture_completed_outcome) is not bool:
+            raise TypeError("capture_completed_outcome must be bool")
+        self._capture_completed_outcome = capture_completed_outcome
+        self.completed_outcome: FullBacktestOutcome | None = None
 
         self.clock = BacktestClock(start_time=start_time / 1000)
         self._strategies_buffer: List[BaseStrategy] = []
@@ -711,6 +718,7 @@ class BacktestRunner:
         return str(output_dir)
 
     def run(self):
+        self.completed_outcome = None
         # 0. Registration Check
         with self._db_session_factory() as db_session:
             self._ensure_strategies_registered(db_session)
@@ -1144,6 +1152,13 @@ class BacktestRunner:
         result["annualized_sharpe"] = annualized_sharpe_from_moments(
             daily_return_moments
         )
+
+        if self._capture_completed_outcome:
+            self.completed_outcome = FullBacktestOutcome.from_completed_result(
+                initial_balance=self.initial_balance,
+                result=result,
+                equity_samples=progress.equity_samples,
+            )
 
         return result
 

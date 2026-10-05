@@ -4,7 +4,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, wait as wait_futures
 from datetime import UTC, datetime
 from decimal import Decimal
 from threading import Lock
-from typing import Any, Iterable
+from typing import Any, Iterable, cast
 from uuid import uuid4
 
 from sqlalchemy.orm import Session
@@ -18,12 +18,20 @@ from src.control_plane.evolution import (
     initial_population,
     next_population,
 )
+from src.control_plane.evaluation_data import SealedDatasetRejectedError
 from src.control_plane.evolution_persistence import (
     _ensure_evolution_epoch,
     _load_evolution_checkpoint,
     _mark_evolution_aborted,
     _mark_evolution_completed,
     _persist_evolution_generation,
+)
+from src.control_plane.invalidation import ControlPlaneInvalidationHub
+from src.control_plane.ga_lifecycle import GaJobRecord, GaJobStatus
+from src.control_plane.ga_profile import (
+    CompiledGaProfileRequest,
+    _input_digest,
+    get_golden_cross_profile,
 )
 from src.control_plane.jobs import InMemoryJobStore, JobStore
 from src.control_plane.models import (
@@ -40,6 +48,7 @@ from src.control_plane.parameter_evaluation import (
     GoldenCrossFastFitnessParameterEvaluator as GoldenCrossFastFitnessParameterEvaluator,
     GoldenCrossResearchParameterEvaluator as GoldenCrossResearchParameterEvaluator,
     ParameterSearchEvaluator,
+    ParameterSearchEvaluatorRegistry,
     ParameterSearchRequestValidator,
     ResearchBacktestParameterEvaluator as ResearchBacktestParameterEvaluator,
     WalkForwardWarmupEvaluator,
@@ -61,6 +70,7 @@ from src.control_plane.parameter_selection import (
 )
 from src.control_plane.search_space import resolve_parameter_candidates
 from src.core.models import GeneRole
+from src.core.data_sources.research_database import ResearchDatabaseDataSource
 from src.core.orm_models import EvolutionEpoch, GeneRecord
 from src.core.product_registry import CapitalModel
 
@@ -77,6 +87,7 @@ class ParameterSearchJobExecutor:
         run_inline: bool = False,
         recover_interrupted: bool = False,
         db_session_factory: SessionFactory | None = None,
+        invalidation_hub: ControlPlaneInvalidationHub | None = None,
     ) -> None:
         self.evaluator = evaluator
         self.store = store or InMemoryJobStore()
@@ -84,16 +95,28 @@ class ParameterSearchJobExecutor:
             self.store.mark_interrupted_active_jobs(
                 "Job interrupted before control plane startup"
             )
+            self.store.interrupt_ga_jobs("control_plane_interrupted")
         self._run_inline = run_inline
         self._executor = None if run_inline else ThreadPoolExecutor(max_workers=max_workers)
         self._futures: dict[str, Future[JobRecord]] = {}
+        self._ga_futures: set[Future[GaJobRecord]] = set()
+        self._ga_futures_lock = Lock()
         self._futures_lock = Lock()
         self._closed = False
+        self._ga_job_locks: dict[str, Lock] = {}
         self._active_evolution_epochs: set[str] = set()
         self._active_evolution_lock = Lock()
         self._db_session_factory = db_session_factory
+        self._invalidation_hub = invalidation_hub
 
     def submit_search(self, request: ParameterSearchJobRequest) -> JobRecord:
+        if request.market_data is not None and not isinstance(
+            self.evaluator,
+            ParameterSearchEvaluatorRegistry,
+        ):
+            raise SealedDatasetRejectedError(
+                "sealed dataset requires an explicitly configured evaluator registry"
+            )
         if isinstance(self.evaluator, ParameterSearchRequestValidator):
             self.evaluator.validate_request(request)
         if request.evolution is not None and request.evolution.epoch_id is None:
@@ -162,7 +185,12 @@ class ParameterSearchJobExecutor:
             self._closed = True
             if self._executor is None:
                 return True
-            futures = tuple(self._futures.values())
+            with self._ga_futures_lock:
+                ga_futures = tuple(self._ga_futures)
+            futures = tuple(
+                cast(Future[Any], future)
+                for future in (*self._futures.values(), *ga_futures)
+            )
             self._executor.shutdown(
                 wait=False,
                 cancel_futures=cancel_futures,
@@ -174,6 +202,36 @@ class ParameterSearchJobExecutor:
             return False
         self._executor.shutdown(wait=True)
         return True
+
+    def dispatch_ga_job(
+        self,
+        job_id: str,
+        expected_version: int,
+    ) -> GaJobRecord | Future[GaJobRecord]:
+        """Dispatch an existing queued GA record through the shared executor."""
+        if not isinstance(job_id, str) or not job_id.strip():
+            raise ValueError("job_id must be non-empty")
+        with self._futures_lock:
+            if self._closed:
+                raise RuntimeError("parameter-search executor is shut down")
+            dispatch_lock = self._ga_job_locks.setdefault(job_id, Lock())
+            if self._run_inline:
+                return self._run_ga_job(job_id, expected_version, dispatch_lock)
+            assert self._executor is not None
+            future = self._executor.submit(
+                self._run_ga_job,
+                job_id,
+                expected_version,
+                dispatch_lock,
+            )
+            with self._ga_futures_lock:
+                self._ga_futures.add(future)
+        future.add_done_callback(self._discard_ga_future)
+        return future
+
+    def _discard_ga_future(self, future: Future[GaJobRecord]) -> None:
+        with self._ga_futures_lock:
+            self._ga_futures.discard(future)
 
     def _run_job(self, job_id: str, request: ParameterSearchJobRequest) -> JobRecord:
         try:
@@ -220,6 +278,7 @@ class ParameterSearchJobExecutor:
                 candidates,
                 evaluations,
                 best,
+                invalidation_hub=self._invalidation_hub,
             )
         return _json_safe(
             {
@@ -244,6 +303,7 @@ class ParameterSearchJobExecutor:
     def _run_evolution(
         self,
         request: ParameterSearchJobRequest,
+        ga_job: GaJobRecord | None = None,
     ) -> dict[str, object]:
         if self._db_session_factory is None:
             raise ValueError("evolution requires db_session_factory")
@@ -255,7 +315,16 @@ class ParameterSearchJobExecutor:
 
         self._claim_evolution_epoch(epoch_id)
         try:
-            _ensure_evolution_epoch(self._db_session_factory, request)
+            if ga_job is not None:
+                with self._db_session_factory() as session:
+                    epoch_exists = session.get(EvolutionEpoch, epoch_id) is not None
+                if not epoch_exists and ga_job.completed_generation != -1:
+                    raise ValueError("evolution checkpoint is missing for job progress")
+            _ensure_evolution_epoch(
+                self._db_session_factory,
+                request,
+                invalidation_hub=self._invalidation_hub,
+            )
         except Exception:
             self._release_evolution_epoch(epoch_id)
             raise
@@ -263,11 +332,18 @@ class ParameterSearchJobExecutor:
             checkpoint = _load_evolution_checkpoint(
                 self._db_session_factory,
                 request,
+                restore_exact_metrics=ga_job is not None,
             )
             population = checkpoint.population
             evaluations = checkpoint.evaluations
             evaluation_cache = checkpoint.evaluation_cache
             next_generation = checkpoint.generations_run
+
+            if (
+                ga_job is not None
+                and next_generation != ga_job.completed_generation + 1
+            ):
+                raise ValueError("evolution checkpoint does not match job progress")
 
             if next_generation == 0:
                 population = initial_population(
@@ -307,15 +383,70 @@ class ParameterSearchJobExecutor:
                     next_generation,
                     population,
                     evaluations,
+                    invalidation_hub=self._invalidation_hub,
                 )
+                if (
+                    ga_job is not None
+                    and next_generation == request.evolution.max_generations - 1
+                ):
+                    _mark_evolution_completed(
+                        self._db_session_factory,
+                        epoch_id,
+                        _select_best_candidate(request, evaluations).score_total,
+                        invalidation_hub=self._invalidation_hub,
+                    )
                 next_generation += 1
 
+                if ga_job is not None:
+                    ga_job = self.store.apply_ga_worker_envelope(
+                        ga_job.id,
+                        epoch_id=epoch_id,
+                        expected_completed_generation=next_generation - 2,
+                        action="ack_generation",
+                        payload={
+                            "completed_generation": next_generation - 1,
+                            "checkpoint_epoch_id": epoch_id,
+                        },
+                    )
+                    if ga_job.status != GaJobStatus.RUNNING:
+                        break
+
             best = _select_best_candidate(request, evaluations)
-            _mark_evolution_completed(
-                self._db_session_factory,
-                epoch_id,
-                best.score_total,
-            )
+            if ga_job is None:
+                _mark_evolution_completed(
+                    self._db_session_factory,
+                    epoch_id,
+                    best.score_total,
+                    invalidation_hub=self._invalidation_hub,
+                )
+            elif next_generation >= request.evolution.max_generations:
+                with self._db_session_factory() as session:
+                    epoch = session.get(EvolutionEpoch, epoch_id)
+                    already_completed = (
+                        epoch is not None and epoch.status == "completed"
+                    )
+                if not already_completed:
+                    _mark_evolution_completed(
+                        self._db_session_factory,
+                        epoch_id,
+                        best.score_total,
+                        invalidation_hub=self._invalidation_hub,
+                    )
+                if (
+                    ga_job.completed_generation == request.evolution.max_generations - 1
+                    and ga_job.status
+                    in {
+                        GaJobStatus.RUNNING,
+                        GaJobStatus.PAUSING,
+                        GaJobStatus.CANCELLING,
+                    }
+                ):
+                    ga_job = self.store.apply_ga_worker_envelope(
+                        ga_job.id,
+                        epoch_id=epoch_id,
+                        expected_completed_generation=ga_job.completed_generation,
+                        action="finalize",
+                    )
             return _evolution_result_payload(
                 request,
                 population,
@@ -324,7 +455,14 @@ class ParameterSearchJobExecutor:
                 next_generation,
             )
         except Exception:
-            _mark_evolution_aborted(self._db_session_factory, epoch_id)
+            try:
+                _mark_evolution_aborted(
+                    self._db_session_factory,
+                    epoch_id,
+                    invalidation_hub=self._invalidation_hub,
+                )
+            except Exception:
+                pass
             raise
         finally:
             self._release_evolution_epoch(epoch_id)
@@ -338,6 +476,91 @@ class ParameterSearchJobExecutor:
     def _release_evolution_epoch(self, epoch_id: str) -> None:
         with self._active_evolution_lock:
             self._active_evolution_epochs.discard(epoch_id)
+
+    def _run_ga_job(
+        self,
+        job_id: str,
+        expected_version: int,
+        dispatch_lock: Lock,
+    ) -> GaJobRecord:
+        with dispatch_lock:
+            claimed = self.store.transition_ga_job(job_id, "claim", expected_version)
+            try:
+                request = _validated_ga_worker_request(
+                    claimed,
+                    self.evaluator,
+                    self._db_session_factory,
+                )
+                self._run_evolution(request, claimed)
+                current = self.store.get_ga_job(job_id)
+                if current is None:
+                    raise ValueError("GA job disappeared during execution")
+                return current
+            except Exception as exc:
+                current = self.store.get_ga_job(job_id)
+                if current is not None and current.status in {
+                    GaJobStatus.RUNNING,
+                    GaJobStatus.PAUSING,
+                    GaJobStatus.CANCELLING,
+                }:
+                    try:
+                        self.store.apply_ga_worker_envelope(
+                            job_id,
+                            epoch_id=current.epoch_id,
+                            expected_completed_generation=current.completed_generation,
+                            action="fail",
+                            payload={"error": str(exc) or type(exc).__name__},
+                        )
+                    except Exception:
+                        pass
+                raise
+
+
+def _validated_ga_worker_request(
+    job: GaJobRecord,
+    evaluator: ParameterSearchEvaluator,
+    session_factory: SessionFactory | None,
+) -> CompiledGaProfileRequest:
+    if session_factory is None:
+        raise ValueError("GA worker requires db_session_factory")
+    request = CompiledGaProfileRequest.model_validate(job.request)
+    binding = request.ga_binding
+    profile = get_golden_cross_profile()
+    if (
+        binding.parameter_search_profile_id != profile["parameter_search_profile_id"]
+        or binding.profile_revision != profile["profile_revision"]
+        or binding.strategy_subject != profile["strategy_subject"]
+        or binding.strategy_version != profile["strategy_version"]
+        or binding.fitness_profile_id != profile["fitness_profile_id"]
+        or binding.cost_profile_id != profile["cost_profile_id"]
+        or binding.input_digest != _input_digest(request)
+    ):
+        raise ValueError("GA profile binding no longer matches the request")
+    if (
+        request.evolution is None
+        or request.evolution.epoch_id != job.epoch_id
+        or request.market_data is None
+        or request.market_data.dataset_id != binding.dataset_id
+        or request.strategy_type != "golden_cross"
+    ):
+        raise ValueError("GA request identity does not match the job")
+    metadata = ResearchDatabaseDataSource(
+        binding.dataset_id,
+        session_factory=session_factory,
+    ).get_dataset_metadata()
+    if (
+        metadata.id != binding.dataset_id
+        or metadata.checksum_sha256 != binding.dataset_checksum
+        or metadata.product_id != request.product_id
+        or metadata.timeframe != request.timeframe
+        or request.start_time < metadata.start_time
+        or request.end_time > metadata.end_time
+    ):
+        raise ValueError("sealed dataset no longer matches the GA request")
+    if not isinstance(evaluator, ParameterSearchEvaluatorRegistry):
+        raise ValueError("GA worker requires the configured evaluator registry")
+    evaluator.validate_request(request)
+    return request
 
 
 def _evaluate_evolution_candidate(
@@ -603,6 +826,8 @@ def _record_evolution_epoch(
     candidates: list[ParameterCandidate],
     evaluations: list[ParameterEvaluationResult],
     best: ParameterEvaluationResult,
+    *,
+    invalidation_hub: ControlPlaneInvalidationHub | None = None,
 ) -> str:
     epoch_id = f"epoch_{datetime.now(UTC).strftime('%Y%m%d%H%M%S%f')}"
     started_at = datetime.now(UTC)
@@ -637,6 +862,8 @@ def _record_evolution_epoch(
                 )
             )
         session.commit()
+    if invalidation_hub is not None:
+        invalidation_hub.publish_committed("evolution_epoch", epoch_id, 1)
     return epoch_id
 
 
@@ -652,6 +879,7 @@ def _insert_evolution_epoch(
     session.add(
         EvolutionEpoch(
             id=epoch_id,
+            revision=1,
             strategy_id=request.strategy_id,
             started_at=started_at,
             finished_at=finished_at,

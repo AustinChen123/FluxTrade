@@ -13,14 +13,40 @@ from typing import Any, Callable
 from pydantic import ValidationError
 
 from src.control_plane.backtest_jobs import BacktestJobExecutor
+from src.control_plane.backtest_result_http_contract import (
+    InvalidBacktestResultHttpRequest,
+    parse_job_id,
+    parse_result_query,
+)
+from src.control_plane.backtest_results import (
+    BacktestResultsNotFound,
+    BacktestResultsQueryService,
+    BacktestResultsReadUnavailable,
+    BacktestResultsUnavailable,
+)
 from src.control_plane.browser_auth import (
     BrowserAuthProvider,
     BrowserAuthRejected,
     BrowserPrincipal,
 )
 from src.control_plane.gene_control import GeneControlService
+from src.control_plane.full_backtest_request import parse_backtest_request
+from src.control_plane.ga_http_contract import (
+    GA_PROFILE_ID,
+    GaHttpRequestError,
+    is_ga_read_path,
+    parse_ga_command_request,
+    parse_ga_read_request,
+    project_ga_job,
+)
+from src.control_plane.ga_commands import (
+    GaCommandBackendError,
+    GaCommandService,
+    GaCommandValidationError,
+)
+from src.control_plane.ga_profile import get_golden_cross_profile
+from src.control_plane.ga_lifecycle import GaJobStoreError
 from src.control_plane.models import (
-    BacktestJobRequest,
     GenePromotionRequest,
     JobRecord,
     ParameterSearchJobRequest,
@@ -28,6 +54,10 @@ from src.control_plane.models import (
 )
 from src.control_plane.parameter_search import ParameterSearchJobExecutor
 from src.control_plane.parameter_evaluation import UnsupportedParameterSearchError
+from src.control_plane.evaluation_data import (
+    SealedDatasetBackendUnavailableError,
+    SealedDatasetRejectedError,
+)
 from src.control_plane.presets import GoldenCrossParameterSearchPreset
 from src.control_plane.strategy_control import (
     StrategyControlService,
@@ -37,6 +67,11 @@ from src.control_plane.strategy_state_query import StrategyStateQueryService
 from src.control_plane.profile_http_query import ProfileQueryService
 from src.control_plane.ops_status_query import OpsStatusQuery
 from src.control_plane.profile_http_contract import ProfileHttpError
+from src.control_plane.invalidation import (
+    ControlPlaneInvalidationHub,
+    EventConnectionCapacity,
+    InvalidationSubscription,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -50,6 +85,24 @@ class HttpResponse:
 
     def json(self) -> str:
         return json.dumps(self.body, separators=(",", ":"), default=str)
+
+
+class EventStreamResponse(HttpResponse):
+    """Typed stream variant kept within the established response surface."""
+
+    subscription: InvalidationSubscription
+
+    def __init__(
+        self,
+        subscription: InvalidationSubscription,
+        status_code: int = 200,
+        headers: tuple[tuple[str, str], ...] = (
+            ("Content-Type", "text/event-stream"),
+            ("Cache-Control", "no-store"),
+        ),
+    ) -> None:
+        super().__init__(status_code, {}, headers)
+        object.__setattr__(self, "subscription", subscription)
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +127,9 @@ class ControlPlaneApp:
         readiness_probe: Callable[[], None] | None = None,
         profile_query_service: ProfileQueryService | None = None,
         ops_status_query: OpsStatusQuery | None = None,
+        backtest_results_query_service: BacktestResultsQueryService | None = None,
+        invalidation_hub: ControlPlaneInvalidationHub | None = None,
+        ga_command_service: GaCommandService | None = None,
     ) -> None:
         if api_key == "":
             raise ValueError("api_key must be non-empty when provided")
@@ -88,9 +144,17 @@ class ControlPlaneApp:
         self.readiness_probe = readiness_probe
         self.profile_query_service = profile_query_service
         self.ops_status_query = ops_status_query
+        self.backtest_results_query_service = backtest_results_query_service
+        self.ga_command_service = ga_command_service
+        self.invalidation_hub = (
+            invalidation_hub
+            if invalidation_hub is not None
+            else ControlPlaneInvalidationHub()
+        )
 
     def shutdown(self, timeout: float) -> bool:
         """Stop accepting queued work and wait up to ``timeout`` for active jobs."""
+        self.close_event_streams()
         deadline = time.monotonic() + max(timeout, 0.0)
         backtests_stopped = self.backtest_executor.shutdown(
             wait=True,
@@ -106,6 +170,9 @@ class ControlPlaneApp:
             )
         return backtests_stopped and searches_stopped
 
+    def close_event_streams(self) -> None:
+        self.invalidation_hub.close()
+
     def handle(
         self,
         method: str,
@@ -114,9 +181,15 @@ class ControlPlaneApp:
         headers: Mapping[str, str] | None = None,
     ) -> HttpResponse:
         method = method.upper()
+        raw_target = path
         parsed_url = urlsplit(path)
+        raw_path = parsed_url.path
         clean_path = parsed_url.path.rstrip("/") or "/"
-        query = parse_qs(parsed_url.query)
+        results_family = _is_backtest_results_path(raw_path)
+        ga_family = is_ga_read_path(raw_path)
+        events_path = clean_path == "/api/v1/events"
+        results_path = raw_path if results_family else clean_path
+        query = {} if results_family or ga_family else parse_qs(parsed_url.query)
 
         if method == "GET" and clean_path == "/health":
             return HttpResponse(200, {"status": "ok"})
@@ -138,7 +211,16 @@ class ControlPlaneApp:
 
         identity = self._authorize(headers)
         if isinstance(identity, HttpResponse):
-            if clean_path in {"/api/v1/auth/session", "/ops/kill-switch"}:
+            if (
+                results_family
+                or ga_family
+                or events_path
+                or clean_path
+                in {
+                    "/api/v1/auth/session",
+                    "/ops/kill-switch",
+                }
+            ):
                 return HttpResponse(
                     identity.status_code,
                     identity.body,
@@ -153,9 +235,56 @@ class ControlPlaneApp:
             identity.browser_principal,
         )
         if browser_policy_response is not None:
-            if clean_path == "/ops/kill-switch":
-                return HttpResponse(browser_policy_response.status_code, browser_policy_response.body, headers=(("Cache-Control", "no-store"),))
+            if (
+                results_family
+                or ga_family
+                or events_path
+                or clean_path == "/ops/kill-switch"
+            ):
+                return HttpResponse(
+                    browser_policy_response.status_code,
+                    browser_policy_response.body,
+                    headers=(("Cache-Control", "no-store"),),
+                )
             return browser_policy_response
+
+        if results_family:
+            return self._handle_backtest_results(
+                method,
+                results_path,
+                parsed_url.query,
+                body,
+                identity,
+            )
+
+        if ga_family:
+            if method == "GET":
+                return self._handle_ga_read(
+                    method, raw_path, parsed_url.query, body, identity, raw_target
+                )
+            return self._handle_ga_command(
+                method,
+                raw_path,
+                parsed_url.query,
+                body,
+                headers,
+                identity,
+                raw_target,
+            )
+
+        if events_path:
+            return self._handle_events(method, identity)
+
+        if (
+            identity.browser_principal is not None
+            and method == "POST"
+            and clean_path
+            in {
+                "/jobs/parameter-searches",
+                "/jobs/parameter-search-presets/golden-cross",
+            }
+        ):
+            return HttpResponse(403, {"error": "browser_ga_controls_unavailable"})
 
         if method == "GET" and clean_path == "/api/v1/market-data/volume-profiles":
             if body is not None and not (
@@ -188,7 +317,9 @@ class ControlPlaneApp:
             return self._logout_browser_session(identity.browser_principal)
 
         if method == "POST" and clean_path == "/jobs/backtests":
-            return self._submit_backtest(body)
+            return self._submit_backtest(
+                body, browser_principal=identity.browser_principal
+            )
 
         if method == "POST" and clean_path == "/jobs/parameter-searches":
             return self._submit_parameter_search(body)
@@ -200,7 +331,11 @@ class ControlPlaneApp:
             return self._submit_golden_cross_parameter_search_preset(body)
 
         if method == "POST" and clean_path.startswith("/jobs/"):
-            return self._handle_job_action(clean_path, body)
+            return self._handle_job_action(
+                clean_path,
+                body,
+                browser_principal=identity.browser_principal,
+            )
 
         if method == "POST" and clean_path.startswith("/genes/"):
             return self._submit_gene_action(clean_path, body, actor=identity.actor)
@@ -317,13 +452,57 @@ class ControlPlaneApp:
 
         return HttpResponse(404, {"error": "not_found"})
 
-    def _submit_backtest(self, body: str | bytes | None) -> HttpResponse:
+    def _handle_events(
+        self,
+        method: str,
+        identity: _RequestIdentity,
+    ) -> HttpResponse | EventStreamResponse:
+        if method != "GET":
+            return HttpResponse(
+                404,
+                {"error": "not_found"},
+                headers=(("Cache-Control", "no-store"),),
+            )
+        principal = identity.browser_principal
+        if (
+            principal is None
+            or self.browser_auth is None
+            or not principal.has_capability(self.browser_auth.operator_capability)
+        ):
+            return HttpResponse(
+                403,
+                {"error": "forbidden"},
+                headers=(("Cache-Control", "no-store"),),
+            )
+        try:
+            return EventStreamResponse(self.invalidation_hub.subscribe())
+        except EventConnectionCapacity:
+            return HttpResponse(
+                503,
+                {"error": "event_connection_capacity"},
+                headers=(("Cache-Control", "no-store"),),
+            )
+
+    def _submit_backtest(
+        self,
+        body: str | bytes | None,
+        *,
+        browser_principal: BrowserPrincipal | None = None,
+    ) -> HttpResponse:
+        full_strategy = False
         try:
             payload = self._parse_json_body(body)
-            request = BacktestJobRequest.model_validate(payload)
+            full_strategy = payload.get("kind") == "full_strategy_backtest"
+            if full_strategy and browser_principal is not None:
+                return HttpResponse(
+                    403, {"error": "browser_backtest_controls_unavailable"}
+                )
+            request = parse_backtest_request(payload)
         except json.JSONDecodeError as exc:
             return HttpResponse(400, {"error": "invalid_json", "detail": str(exc)})
         except ValidationError as exc:
+            if full_strategy:
+                return HttpResponse(422, {"error": "validation_error"})
             return HttpResponse(
                 422,
                 {
@@ -359,6 +538,11 @@ class ControlPlaneApp:
 
         try:
             job = self.parameter_search_executor.submit_search(request)
+        except (
+            SealedDatasetRejectedError,
+            SealedDatasetBackendUnavailableError,
+        ) as exc:
+            return _sealed_dataset_error_response(exc)
         except UnsupportedParameterSearchError as exc:
             return HttpResponse(
                 422,
@@ -392,6 +576,11 @@ class ControlPlaneApp:
 
         try:
             job = self.parameter_search_executor.submit_search(request)
+        except (
+            SealedDatasetRejectedError,
+            SealedDatasetBackendUnavailableError,
+        ) as exc:
+            return _sealed_dataset_error_response(exc)
         except UnsupportedParameterSearchError as exc:
             return HttpResponse(
                 422,
@@ -404,6 +593,8 @@ class ControlPlaneApp:
         self,
         path: str,
         body: str | bytes | None,
+        *,
+        browser_principal: BrowserPrincipal | None = None,
     ) -> HttpResponse:
         if path.endswith("/cancel"):
             job_id = path.removeprefix("/jobs/")[: -len("/cancel")]
@@ -413,6 +604,15 @@ class ControlPlaneApp:
                 existing = self.backtest_executor.store.get(job_id)
                 if existing is None:
                     return HttpResponse(404, {"error": "job_not_found"})
+                if (
+                    existing.kind == "full_strategy_backtest"
+                    and browser_principal is not None
+                ):
+                    return HttpResponse(
+                        403, {"error": "browser_backtest_controls_unavailable"}
+                    )
+                if existing.kind == "parameter_search" and browser_principal is not None:
+                    return HttpResponse(403, {"error": "browser_ga_controls_unavailable"})
                 payload = self._parse_json_body(body) if body not in (None, "") else {}
                 reason = payload.get("reason")
                 if reason is not None and not isinstance(reason, str):
@@ -439,12 +639,26 @@ class ControlPlaneApp:
                 existing = self.backtest_executor.store.get(job_id)
                 if existing is None:
                     return HttpResponse(404, {"error": "job_not_found"})
+                if (
+                    existing.kind == "full_strategy_backtest"
+                    and browser_principal is not None
+                ):
+                    return HttpResponse(
+                        403, {"error": "browser_backtest_controls_unavailable"}
+                    )
+                if existing.kind == "parameter_search" and browser_principal is not None:
+                    return HttpResponse(403, {"error": "browser_ga_controls_unavailable"})
                 if existing.kind == "parameter_search":
                     if self.parameter_search_executor is None:
                         return HttpResponse(503, {"error": "parameter_search_unavailable"})
                     job = self.parameter_search_executor.retry_search(job_id)
                 else:
                     job = self.backtest_executor.retry_backtest(job_id)
+            except (
+                SealedDatasetRejectedError,
+                SealedDatasetBackendUnavailableError,
+            ) as exc:
+                return _sealed_dataset_error_response(exc)
             except ValueError as exc:
                 return HttpResponse(409, {"error": "job_action_rejected", "detail": str(exc)})
             except KeyError:
@@ -627,7 +841,10 @@ class ControlPlaneApp:
         except KeyError:
             return HttpResponse(404, {"error": "gene_not_found"})
 
-        return HttpResponse(200, {"gene": result})
+        return HttpResponse(
+            200,
+            {"scope": "RESEARCH_CANDIDATE_ONLY", "gene": result},
+        )
 
     def _list_genes(self, query: dict[str, list[str]]) -> HttpResponse:
         if self.gene_control is None:
@@ -943,6 +1160,213 @@ class ControlPlaneApp:
             ),
         )
 
+    def _handle_backtest_results(
+        self,
+        method: str,
+        path: str,
+        raw_query: str,
+        body: str | bytes | None,
+        identity: _RequestIdentity,
+    ) -> HttpResponse:
+        base = "/api/v1/backtest-results"
+        suffix = path[len(base) :]
+        parts = suffix[1:].split("/") if suffix.startswith("/") else []
+        if method != "GET":
+            return _results_response(404, {"error": "not_found"})
+        if not parts:
+            route = "index"
+            raw_job_id = None
+        elif len(parts) == 1:
+            route = "detail"
+            raw_job_id = parts[0]
+        elif len(parts) == 2 and parts[1] in {"trades", "candles"}:
+            route = parts[1]
+            raw_job_id = parts[0]
+        else:
+            return _results_response(404, {"error": "not_found"})
+
+        principal = identity.browser_principal
+        if (
+            principal is None
+            or self.browser_auth is None
+            or not principal.has_capability(self.browser_auth.operator_capability)
+        ):
+            return _results_response(403, {"error": "forbidden"})
+
+        try:
+            if body is not None and not (
+                type(body) is str and body == "" or type(body) is bytes and body == b""
+            ):
+                raise InvalidBacktestResultHttpRequest()
+            encoded_query = raw_query.encode("ascii", errors="strict")
+            query = parse_result_query(route, encoded_query)
+            job_id = (
+                None
+                if raw_job_id is None
+                else parse_job_id(raw_job_id.encode("ascii", errors="strict"))
+            )
+        except (InvalidBacktestResultHttpRequest, UnicodeEncodeError):
+            return _results_response(422, {"error": "validation_error"})
+
+        service = self.backtest_results_query_service
+        if service is None:
+            return _results_response(
+                503, {"error": "browser_result_backend_unavailable"}
+            )
+        try:
+            if route == "index":
+                result = service.list_index(query)
+            elif route == "detail":
+                assert job_id is not None
+                result = service.get_detail(job_id)
+            elif route == "trades":
+                assert job_id is not None
+                result = service.list_trades(job_id, query)
+            else:
+                assert job_id is not None
+                result = service.list_candles(job_id, query)
+        except InvalidBacktestResultHttpRequest:
+            return _results_response(422, {"error": "validation_error"})
+        except BacktestResultsUnavailable:
+            return _results_response(409, {"error": "result_unavailable"})
+        except BacktestResultsNotFound:
+            return _results_response(404, {"error": "result_not_found"})
+        except BacktestResultsReadUnavailable:
+            return _results_response(
+                503, {"error": "browser_result_backend_unavailable"}
+            )
+        except Exception:
+            return _results_response(
+                503, {"error": "browser_result_backend_unavailable"}
+            )
+        return _results_response(200, result)
+
+    def _handle_ga_read(
+        self,
+        method: str,
+        path: str,
+        raw_query: str,
+        body: str | bytes | None,
+        identity: _RequestIdentity,
+        raw_target: str,
+    ) -> HttpResponse:
+        principal = identity.browser_principal
+        if (
+            principal is None
+            or self.browser_auth is None
+            or not principal.has_capability(self.browser_auth.operator_capability)
+        ):
+            return _ga_response(403, {"error": "forbidden"})
+        try:
+            request = parse_ga_read_request(
+                method, path, raw_query, body, raw_target=raw_target
+            )
+        except GaHttpRequestError:
+            return _ga_response(422, {"error": "validation_error"})
+        if request is None:
+            return _ga_response(404, {"error": "not_found"})
+
+        try:
+            if request.route == "profile":
+                if request.identity != GA_PROFILE_ID:
+                    return _ga_response(404, {"error": "ga_profile_not_found"})
+                return _ga_response(
+                    200,
+                    {"schema_version": 1, "profile": get_golden_cross_profile()},
+                )
+
+            store = self.backtest_executor.store
+            if request.route == "detail":
+                assert request.identity is not None
+                record = store.get_ga_job(request.identity)
+                if record is None:
+                    return _ga_response(404, {"error": "ga_job_not_found"})
+                return _ga_response(
+                    200, {"schema_version": 1, "job": project_ga_job(record)}
+                )
+
+            records = store.list_ga_jobs()
+            jobs = sorted(records, key=lambda record: record.id)
+            total_count = len(jobs)
+            items = [
+                project_ga_job(record)
+                for record in jobs[request.offset : request.offset + request.limit]
+            ]
+            return _ga_response(
+                200,
+                {
+                    "schema_version": 1,
+                    "items": items,
+                    "total_count": total_count,
+                    "limit": request.limit,
+                    "offset": request.offset,
+                },
+            )
+        except Exception:
+            return _ga_response(503, {"error": "ga_backend_unavailable"})
+
+    def _handle_ga_command(
+        self,
+        method: str,
+        path: str,
+        raw_query: str,
+        body: str | bytes | None,
+        headers: Mapping[str, str] | None,
+        identity: _RequestIdentity,
+        raw_target: str,
+    ) -> HttpResponse:
+        principal = identity.browser_principal
+        if (
+            principal is None
+            or self.browser_auth is None
+            or not principal.has_capability(self.browser_auth.operator_capability)
+        ):
+            return _ga_response(403, {"error": "forbidden"})
+        try:
+            command = parse_ga_command_request(
+                method,
+                path,
+                raw_query,
+                body,
+                headers,
+                raw_target=raw_target,
+            )
+        except GaHttpRequestError:
+            return _ga_response(422, {"error": "validation_error"})
+        if command is None:
+            return _ga_response(404, {"error": "not_found"})
+        if self.ga_command_service is None:
+            return _ga_response(503, {"error": "ga_controls_unavailable"})
+
+        try:
+            status, record = self.ga_command_service.execute(
+                command, actor=principal.actor
+            )
+            return _ga_response(
+                status,
+                {"schema_version": 1, "job": project_ga_job(record)},
+            )
+        except GaJobStoreError as exc:
+            if exc.code == "ga_job_not_found":
+                status = 404
+            elif exc.code == "validation_error":
+                status = 422
+            elif exc.code in {
+                "idempotency_conflict",
+                "job_version_conflict",
+                "job_transition_invalid",
+            }:
+                status = 409
+            else:
+                status = 503
+            return _ga_response(status, {"error": exc.code})
+        except GaCommandValidationError:
+            return _ga_response(422, {"error": "validation_error"})
+        except GaCommandBackendError:
+            return _ga_response(503, {"error": "ga_backend_unavailable"})
+        except Exception:
+            return _ga_response(503, {"error": "ga_backend_unavailable"})
+
     def _authorize(
         self,
         headers: Mapping[str, str] | None,
@@ -997,6 +1421,33 @@ def _single_query_value(query: dict[str, list[str]], key: str) -> str | None:
     return values[0]
 
 
+def _is_backtest_results_path(path: str) -> bool:
+    base = "/api/v1/backtest-results"
+    return path == base or path.startswith(f"{base}/")
+
+
+def _results_response(status_code: int, body: Mapping[str, Any]) -> HttpResponse:
+    return HttpResponse(
+        status_code, dict(body), headers=(("Cache-Control", "no-store"),)
+    )
+
+
+def _ga_response(status_code: int, body: Mapping[str, Any]) -> HttpResponse:
+    response = HttpResponse(
+        status_code, dict(body), headers=(("Cache-Control", "no-store"),)
+    )
+    if status_code in {200, 202}:
+        try:
+            response.json()
+        except Exception:
+            return HttpResponse(
+                503,
+                {"error": "ga_backend_unavailable"},
+                headers=(("Cache-Control", "no-store"),),
+            )
+    return response
+
+
 def _extract_api_key(headers: Mapping[str, str] | None) -> str | None:
     if headers is None:
         return None
@@ -1031,6 +1482,14 @@ def _requires_step_up(path: str) -> bool:
     return path == "/ops/kill-switch/clear" or (
         path.startswith("/genes/") and path.endswith("/promote")
     )
+
+
+def _sealed_dataset_error_response(
+    error: SealedDatasetRejectedError | SealedDatasetBackendUnavailableError,
+) -> HttpResponse:
+    if isinstance(error, SealedDatasetRejectedError):
+        return HttpResponse(422, {"error": "sealed_dataset_rejected"})
+    return HttpResponse(503, {"error": "sealed_dataset_backend_unavailable"})
 
 
 def _utc_iso(value: float | None) -> str | None:

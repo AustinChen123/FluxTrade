@@ -24,11 +24,30 @@ const lifecycles = vi.hoisted(() => ({
   strategies: { mounts: 0, unmounts: 0 },
   trades: { mounts: 0, unmounts: 0 }
 }));
+const invalidation = vi.hoisted(() => ({ autoRefresh: false, enabled: [] as boolean[] }));
 
 vi.mock("../api", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../api")>()),
   ...api
 }));
+vi.mock("./researchInvalidation", async () => {
+  const React = await import("react");
+  return {
+    ResearchInvalidationBridge: ({
+      enabled,
+      onInvalidate
+    }: {
+      enabled: boolean;
+      onInvalidate: () => void;
+    }) => {
+      React.useEffect(() => {
+        invalidation.enabled.push(enabled);
+        if (enabled && invalidation.autoRefresh) void onInvalidate();
+      }, [enabled, onInvalidate]);
+      return null;
+    }
+  };
+});
 
 vi.mock("../shared/charts/EChart", () => ({
   EChart: ({
@@ -113,12 +132,18 @@ vi.mock("../features/trades/TradeChartView", async () => {
   return {
     TradeChartView: ({
       demoMode,
+      selectedResultId,
+      selectedTradeId,
       initialTradeId,
-      onSelectTrade
+      onSelectTrade,
+      onNavigateResults
     }: {
       demoMode: boolean;
+      selectedResultId?: string | null;
+      selectedTradeId?: string | null;
       initialTradeId?: string | null;
       onSelectTrade?: (tradeId: string) => void;
+      onNavigateResults?: () => void;
     }) => {
       const [state, setState] = useState("initial");
       useEffect(() => {
@@ -130,7 +155,10 @@ vi.mock("../features/trades/TradeChartView", async () => {
       return (
         <section
           data-demo={String(demoMode)}
-          data-selected-trade={initialTradeId ?? ""}
+          data-selected-result={selectedResultId ?? ""}
+          data-selected-trade={(selectedTradeId !== undefined
+            ? selectedTradeId
+            : initialTradeId) ?? ""}
           data-testid="trade-chart-view"
         >
           <button
@@ -138,6 +166,9 @@ vi.mock("../features/trades/TradeChartView", async () => {
             onClick={() => onSelectTrade?.("trade-000184")}
           >
             Select mock trade
+          </button>
+          <button type="button" onClick={onNavigateResults}>
+            Back to Results
           </button>
           <button
             type="button"
@@ -157,10 +188,14 @@ vi.mock("../features/results/BacktestResultsView", async () => {
   return {
     BacktestResultsView: ({
       demoMode,
+      selectedResultId,
+      onSelectResult,
       onInspectTrade
     }: {
       demoMode: boolean;
-      onInspectTrade?: (tradeId: string) => void;
+      selectedResultId?: string | null;
+      onSelectResult?: (resultId: string | null) => void;
+      onInspectTrade?: (tradeId: string, resultId: string) => void;
     }) => {
       const [state, setState] = useState("initial");
       useEffect(() => {
@@ -170,10 +205,23 @@ vi.mock("../features/results/BacktestResultsView", async () => {
         };
       }, []);
       return (
-        <section data-demo={String(demoMode)} data-testid="backtest-results-view">
+        <section
+          data-demo={String(demoMode)}
+          data-selected-result={selectedResultId ?? ""}
+          data-testid="backtest-results-view"
+        >
           <button
             type="button"
-            onClick={() => onInspectTrade?.("trade-000184")}
+            onClick={() => onSelectResult?.("job-selected-0042")}
+          >
+            Select mock result
+          </button>
+          <button type="button" onClick={() => onSelectResult?.(null)}>
+            Choose another result
+          </button>
+          <button
+            type="button"
+            onClick={() => onInspectTrade?.("trade-000184", "job-research-0042")}
           >
             Inspect mock trade
           </button>
@@ -244,6 +292,8 @@ const storage = new Map<string, string>();
 describe("GA visualization state", () => {
   beforeEach(async () => {
     vi.clearAllMocks();
+    invalidation.autoRefresh = false;
+    invalidation.enabled.length = 0;
     for (const lifecycle of Object.values(lifecycles)) {
       lifecycle.mounts = 0;
       lifecycle.unmounts = 0;
@@ -267,6 +317,7 @@ describe("GA visualization state", () => {
 
   afterEach(() => {
     cleanup();
+    vi.restoreAllMocks();
   });
 
   it("uses browser language with a Traditional Chinese fallback", () => {
@@ -295,12 +346,13 @@ describe("GA visualization state", () => {
     window.history.replaceState(
       {},
       "",
-      "/?view=trades&trade=trade-000185&demo=1"
+      "/?view=trades&result=job-research-0042&trade=trade-000185&demo=1"
     );
 
     render(<App />);
 
     const tradeView = await screen.findByTestId("trade-chart-view");
+    expect(tradeView.getAttribute("data-selected-result")).toBe("job-research-0042");
     expect(tradeView.getAttribute("data-selected-trade")).toBe("trade-000185");
     expect(api.ensureBrowserSession).not.toHaveBeenCalled();
     expect(api.loadEpochs).not.toHaveBeenCalled();
@@ -314,11 +366,27 @@ describe("GA visualization state", () => {
     );
   });
 
+  it("returns from Trades through the canonical Results navigation with the same result", async () => {
+    window.history.replaceState(
+      {},
+      "",
+      "/?view=trades&result=job-research-0042&trade=trade-000185"
+    );
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Back to Results" }));
+
+    expect(await screen.findByTestId("backtest-results-view")).toBeTruthy();
+    expect(new URL(window.location.href).searchParams.get("view")).toBe("results");
+    expect(new URL(window.location.href).searchParams.get("result")).toBe("job-research-0042");
+    expect(new URL(window.location.href).searchParams.has("trade")).toBe(false);
+  });
+
   it("keeps an in-page trade selection in the URL across reload", async () => {
     window.history.replaceState(
       {},
       "",
-      "/?view=trades&trade=trade-000185&demo=1"
+      "/?view=trades&result=job-research-0042&trade=trade-000185&demo=1"
     );
 
     const firstRender = render(<App />);
@@ -343,7 +411,7 @@ describe("GA visualization state", () => {
     window.history.replaceState(
       {},
       "",
-      "/?view=trades&trade=trade-000185&demo=1"
+      "/?view=trades&result=job-research-0042&trade=trade-000185&demo=1"
     );
     render(<App />);
 
@@ -375,6 +443,9 @@ describe("GA visualization state", () => {
     render(<App />);
 
     expect(await screen.findByTestId("backtest-results-view")).toBeTruthy();
+    expect(
+      screen.getByTestId("backtest-results-view").getAttribute("data-selected-result")
+    ).toBe("");
     expect(api.ensureBrowserSession).not.toHaveBeenCalled();
     expect(api.loadEpochs).not.toHaveBeenCalled();
     expect(screen.queryByRole("combobox", { name: "演化批次" })).toBeNull();
@@ -386,11 +457,34 @@ describe("GA visualization state", () => {
     );
   });
 
+  it("restores result selection from the URL and writes selection changes canonically", async () => {
+    window.history.replaceState({}, "", "/?view=results&result=job-direct-0042&keep=1");
+    const replaceState = vi.spyOn(window.history, "replaceState");
+    render(<App />);
+
+    const results = await screen.findByTestId("backtest-results-view");
+    expect(results.getAttribute("data-selected-result")).toBe("job-direct-0042");
+
+    fireEvent.click(screen.getByRole("button", { name: "Select mock result" }));
+    expect(new URL(window.location.href).searchParams.get("result")).toBe(
+      "job-selected-0042"
+    );
+    expect(replaceState).toHaveBeenCalledWith(
+      null,
+      "",
+      "/?view=results&result=job-selected-0042&keep=1"
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Choose another result" }));
+    expect(new URL(window.location.href).searchParams.has("result")).toBe(false);
+    expect(results.getAttribute("data-selected-result")).toBe("");
+  });
+
   it("does not restore an invalid trade ID from the URL", async () => {
     window.history.replaceState(
       {},
       "",
-      "/?view=trades&trade=%0Ainvalid&demo=1"
+      "/?view=trades&result=job-research-0042&trade=%0Ainvalid&demo=1"
     );
 
     render(<App />);
@@ -412,6 +506,9 @@ describe("GA visualization state", () => {
     expect(new URL(window.location.href).searchParams.get("view")).toBe("trades");
     expect(new URL(window.location.href).searchParams.get("trade")).toBe(
       "trade-000184"
+    );
+    expect(new URL(window.location.href).searchParams.get("result")).toBe(
+      "job-research-0042"
     );
 
     fireEvent.click(screen.getByRole("button", { name: "回測績效" }));
@@ -437,6 +534,31 @@ describe("GA visualization state", () => {
     epochs.resolve([epoch("epoch-a"), epoch("epoch-b")]);
     await screen.findAllByText("candidate-epoch-a");
     expect(api.loadEpochs).toHaveBeenCalledTimes(1);
+  });
+
+  it("opens one root stream only for visible non-demo research", async () => {
+    window.history.replaceState({}, "", "/?view=results");
+    api.loadGenerationSummaries.mockResolvedValue([summary]);
+    api.loadGenerationGenes.mockResolvedValue([gene("epoch-a")]);
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("button", { name: "參數研究" }));
+    await screen.findAllByText("candidate-epoch-a");
+    await waitFor(() => expect(invalidation.enabled.at(-1)).toBe(true));
+    fireEvent.click(screen.getByRole("button", { name: "策略管理" }));
+    await screen.findByTestId("strategy-manager");
+    await waitFor(() => expect(invalidation.enabled.at(-1)).toBe(false));
+    fireEvent.click(screen.getByRole("button", { name: "參數研究" }));
+    await waitFor(() => expect(invalidation.enabled.at(-1)).toBe(true));
+
+    cleanup();
+    window.history.replaceState({}, "", "/?demo=1");
+    vi.clearAllMocks();
+    invalidation.enabled.length = 0;
+    render(<App />);
+    await screen.findByText("golden_cross_research");
+    expect(invalidation.enabled).not.toContain(true);
+    expect(api.loadEpochs).not.toHaveBeenCalled();
   });
 
   it("keeps the selected console page in the URL", async () => {
@@ -479,7 +601,8 @@ describe("GA visualization state", () => {
     expect(window.location.hash).toBe("#anchor");
   });
 
-  it("does not reload research data after visiting trade inspection", async () => {
+  it("refreshes authoritative research data after visiting trade inspection", async () => {
+    invalidation.autoRefresh = true;
     api.loadGenerationSummaries.mockResolvedValue([summary]);
     api.loadGenerationGenes.mockResolvedValue([gene("epoch-a")]);
     render(<App />);
@@ -490,12 +613,13 @@ describe("GA visualization state", () => {
     fireEvent.click(screen.getByRole("button", { name: "參數研究" }));
     await screen.findAllByText("candidate-epoch-a");
 
-    expect(api.loadEpochs).toHaveBeenCalledTimes(1);
-    expect(api.loadGenerationSummaries).toHaveBeenCalledTimes(1);
-    expect(api.loadGenerationGenes).toHaveBeenCalledTimes(1);
+    expect(api.loadEpochs).toHaveBeenCalledTimes(3);
+    expect(api.loadGenerationSummaries).toHaveBeenCalledTimes(3);
+    expect(api.loadGenerationGenes).toHaveBeenCalledTimes(3);
   });
 
-  it("does not reload research data when returning from strategy management", async () => {
+  it("refreshes authoritative research data when returning from strategy management", async () => {
+    invalidation.autoRefresh = true;
     const genes = deferred<Gene[]>();
     api.loadGenerationSummaries.mockResolvedValue([summary]);
     api.loadGenerationGenes.mockReturnValue(genes.promise);
@@ -507,9 +631,10 @@ describe("GA visualization state", () => {
     fireEvent.click(screen.getByRole("button", { name: "參數研究" }));
 
     expect(screen.getByText("讀取研究快照")).toBeTruthy();
-    expect(api.loadEpochs).toHaveBeenCalledTimes(1);
-    expect(api.loadGenerationSummaries).toHaveBeenCalledTimes(1);
-    expect(api.loadGenerationGenes).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(api.loadEpochs).toHaveBeenCalledTimes(3));
+    expect(api.loadEpochs).toHaveBeenCalledTimes(3);
+    expect(api.loadGenerationSummaries).toHaveBeenCalledTimes(3);
+    expect(api.loadGenerationGenes).toHaveBeenCalledTimes(3);
 
     genes.resolve([gene("epoch-a")]);
     await screen.findAllByText("candidate-epoch-a");

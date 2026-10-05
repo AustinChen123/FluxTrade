@@ -403,6 +403,60 @@ class SystemEvent(Base):
 
 class BacktestResultSummary(Base):
     __tablename__ = "backtest_result_summary"
+    __table_args__ = (
+        UniqueConstraint("job_id", name="uq_backtest_summary_job_id"),
+        CheckConstraint(
+            "((job_id IS NULL) AND dataset_id IS NULL AND subject_kind IS NULL "
+            "AND subject_id IS NULL AND input_digest IS NULL AND result_digest IS NULL "
+            "AND product_id IS NULL AND timeframe IS NULL AND currency IS NULL "
+            "AND completed_at IS NULL AND initial_balance IS NULL AND net_pnl IS NULL "
+            "AND return_pct IS NULL AND max_drawdown IS NULL AND sharpe IS NULL "
+            "AND sortino IS NULL AND calmar IS NULL) OR "
+            "((job_id IS NOT NULL) AND dataset_id IS NOT NULL "
+            "AND subject_kind IS NOT NULL AND subject_kind = 'STRATEGY_ARTIFACT' "
+            "AND subject_id IS NOT NULL "
+            "AND input_digest IS NOT NULL AND result_digest IS NOT NULL "
+            "AND product_id IS NOT NULL AND timeframe IS NOT NULL "
+            "AND currency IS NOT NULL AND completed_at IS NOT NULL "
+            "AND initial_balance IS NOT NULL AND net_pnl IS NOT NULL "
+            "AND return_pct IS NOT NULL AND max_drawdown IS NOT NULL "
+            "AND sharpe IS NOT NULL AND sortino IS NOT NULL AND calmar IS NOT NULL)",
+            name="ck_backtest_summary_formal_fields",
+        ),
+        CheckConstraint(
+            "subject_kind IS NULL OR subject_kind = 'STRATEGY_ARTIFACT'",
+            name="ck_backtest_summary_subject_kind",
+        ),
+        CheckConstraint(
+            "initial_balance IS NULL OR initial_balance > 0",
+            name="ck_backtest_summary_initial_balance_positive",
+        ),
+        CheckConstraint(
+            "max_drawdown IS NULL OR max_drawdown >= 0",
+            name="ck_backtest_summary_max_drawdown_nonnegative",
+        ),
+        CheckConstraint(
+            "job_id IS NULL OR total_pnl NOT IN "
+            "('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric)",
+            name="ck_backtest_summary_total_pnl_finite_formal",
+        ).ddl_if(dialect="postgresql"),
+        *(
+            CheckConstraint(
+                f"{field} IS NULL OR {field} NOT IN "
+                "('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric)",
+                name=f"ck_backtest_summary_{field}_finite",
+            ).ddl_if(dialect="postgresql")
+            for field in (
+                "initial_balance",
+                "net_pnl",
+                "return_pct",
+                "max_drawdown",
+                "sharpe",
+                "sortino",
+                "calmar",
+            )
+        ),
+    )
     id: Mapped[int] = mapped_column(
         _autoincrement_bigint(),
         primary_key=True,
@@ -418,6 +472,151 @@ class BacktestResultSummary(Base):
     total_pnl: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
     # Text is used for JSONB compatibility in the generic ORM.
     metrics_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    job_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    dataset_id: Mapped[str | None] = mapped_column(
+        String(128),
+        ForeignKey(
+            "research_dataset.id",
+            name="fk_backtest_summary_dataset_id_research_dataset",
+        ),
+        nullable=True,
+    )
+    subject_kind: Mapped[str | None] = mapped_column(String, nullable=True)
+    subject_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    input_digest: Mapped[str | None] = mapped_column(String, nullable=True)
+    result_digest: Mapped[str | None] = mapped_column(String, nullable=True)
+    product_id: Mapped[str | None] = mapped_column(
+        String,
+        ForeignKey("product.id", name="fk_backtest_summary_product_id_product"),
+        nullable=True,
+    )
+    timeframe: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    currency: Mapped[str | None] = mapped_column(String, nullable=True)
+    completed_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    initial_balance: Mapped[Decimal | None] = mapped_column(Numeric, nullable=True)
+    net_pnl: Mapped[Decimal | None] = mapped_column(Numeric, nullable=True)
+    return_pct: Mapped[Decimal | None] = mapped_column(Numeric, nullable=True)
+    max_drawdown: Mapped[Decimal | None] = mapped_column(Numeric, nullable=True)
+    sharpe: Mapped[Decimal | None] = mapped_column(Numeric, nullable=True)
+    sortino: Mapped[Decimal | None] = mapped_column(Numeric, nullable=True)
+    calmar: Mapped[Decimal | None] = mapped_column(Numeric, nullable=True)
+
+
+class BacktestEquitySample(Base):
+    __tablename__ = "backtest_equity_sample"
+    __table_args__ = (
+        CheckConstraint("sequence >= 0", name="ck_backtest_equity_sample_sequence"),
+        CheckConstraint(
+            "drawdown >= 0", name="ck_backtest_equity_sample_drawdown_nonnegative"
+        ),
+        CheckConstraint(
+            "equity NOT IN ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric)",
+            name="ck_backtest_equity_sample_equity_finite",
+        ).ddl_if(dialect="postgresql"),
+        CheckConstraint(
+            "drawdown NOT IN ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric)",
+            name="ck_backtest_equity_sample_drawdown_finite",
+        ).ddl_if(dialect="postgresql"),
+    )
+
+    summary_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey(
+            "backtest_result_summary.id",
+            name="fk_backtest_equity_sample_summary",
+        ),
+        primary_key=True,
+    )
+    sequence: Mapped[int] = mapped_column(Integer, primary_key=True)
+    timestamp: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    equity: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+    drawdown: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+
+
+class BacktestClosedTrade(Base):
+    __tablename__ = "backtest_closed_trade"
+    __table_args__ = (
+        CheckConstraint("sequence >= 0", name="ck_backtest_closed_trade_sequence"),
+        CheckConstraint("side IN ('LONG', 'SHORT')", name="ck_backtest_closed_trade_side"),
+        CheckConstraint(
+            "quantity > 0", name="ck_backtest_closed_trade_quantity_positive"
+        ),
+        *(
+            CheckConstraint(
+                f"{field} NOT IN ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric)",
+                name=f"ck_backtest_closed_trade_{field}_finite",
+            ).ddl_if(dialect="postgresql")
+            for field in ("quantity", "entry_price", "exit_price", "fee", "pnl")
+        ),
+    )
+
+    summary_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey(
+            "backtest_result_summary.id",
+            name="fk_backtest_closed_trade_summary",
+        ),
+        primary_key=True,
+    )
+    sequence: Mapped[int] = mapped_column(Integer, primary_key=True)
+    entry_time: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    exit_time: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    side: Mapped[str] = mapped_column(String(5), nullable=False)
+    quantity: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+    entry_price: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+    exit_price: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+    fee: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+    pnl: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+
+
+class BacktestMonthlyReturn(Base):
+    __tablename__ = "backtest_monthly_return"
+    __table_args__ = (
+        CheckConstraint(
+            "return_pct NOT IN ('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric)",
+            name="ck_backtest_monthly_return_finite",
+        ).ddl_if(dialect="postgresql"),
+    )
+
+    summary_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey(
+            "backtest_result_summary.id",
+            name="fk_backtest_monthly_return_summary",
+        ),
+        primary_key=True,
+    )
+    month: Mapped[str] = mapped_column(String(7), primary_key=True)
+    return_pct: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
+
+
+class BacktestPnlDistribution(Base):
+    __tablename__ = "backtest_pnl_distribution"
+    __table_args__ = (
+        CheckConstraint("sequence >= 0", name="ck_backtest_pnl_distribution_sequence"),
+        CheckConstraint("count >= 0", name="ck_backtest_pnl_distribution_count"),
+        *(
+            CheckConstraint(
+                f"{field} IS NULL OR {field} NOT IN "
+                "('NaN'::numeric, 'Infinity'::numeric, '-Infinity'::numeric)",
+                name=f"ck_backtest_pnl_distribution_{field}_finite",
+            ).ddl_if(dialect="postgresql")
+            for field in ("lower", "upper")
+        ),
+    )
+
+    summary_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey(
+            "backtest_result_summary.id",
+            name="fk_backtest_pnl_distribution_summary",
+        ),
+        primary_key=True,
+    )
+    sequence: Mapped[int] = mapped_column(Integer, primary_key=True)
+    lower: Mapped[Decimal | None] = mapped_column(Numeric, nullable=True)
+    upper: Mapped[Decimal | None] = mapped_column(Numeric, nullable=True)
+    count: Mapped[int] = mapped_column(Integer, nullable=False)
 
 
 class BacktestTradeLog(Base):
@@ -579,6 +778,12 @@ class EvolutionEpoch(Base):
     __tablename__ = "evolution_epochs"
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    revision: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        default=1,
+        server_default="1",
+    )
     strategy_id: Mapped[str] = mapped_column(
         String,
         ForeignKey("strategy.id"),
@@ -622,6 +827,7 @@ class EvolutionEpoch(Base):
             "status IN ('running', 'completed', 'aborted')",
             name="chk_epoch_status",
         ),
+        CheckConstraint("revision > 0", name="ck_evolution_epoch_revision_positive"),
     )
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Generator, Optional
 
 import pandas as pd
@@ -11,6 +12,16 @@ from src.core.interfaces.data_source import IDataSource
 from src.core.models import Candlestick
 from src.core.orm_models import ResearchCandlestick, ResearchDataset
 from src.core.research_datasets import ResearchDatasetIntegrityError
+
+
+@dataclass(frozen=True, slots=True)
+class ResearchDatasetMetadata:
+    id: str
+    product_id: str
+    timeframe: str
+    checksum_sha256: str
+    start_time: int
+    end_time: int
 
 
 def _empty_candle_frame() -> pd.DataFrame:
@@ -136,6 +147,21 @@ class ResearchDatabaseDataSource(IDataSource):
             ):
                 return None
             return (dataset.start_time, dataset.end_time)
+        finally:
+            session.close()
+
+    def get_dataset_metadata(self) -> ResearchDatasetMetadata:
+        session: Session = self._session_factory()
+        try:
+            dataset = self._require_valid_dataset(session)
+            return ResearchDatasetMetadata(
+                id=dataset.id,
+                product_id=dataset.product_id,
+                timeframe=dataset.timeframe,
+                checksum_sha256=dataset.checksum_sha256,
+                start_time=dataset.start_time,
+                end_time=dataset.end_time,
+            )
         finally:
             session.close()
 

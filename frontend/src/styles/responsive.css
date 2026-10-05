@@ -27,6 +27,9 @@
   .trade-layout {
     grid-template-columns: 1fr;
   }
+
+  .ga-form-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .ga-job-layout { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 760px) {
@@ -78,6 +81,12 @@
     grid-template-columns: 1fr;
   }
 
+  .ga-form-grid,
+  .ga-job-facts,
+  .ga-readonly dl { grid-template-columns: 1fr; }
+  .ga-job-list button { grid-template-columns: minmax(0, 1fr) auto; }
+  .ga-job-list button > span:last-child { grid-column: 1 / -1; }
+
   .trade-intro > dl {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -85,6 +94,19 @@
   .results-intro > dl,
   .results-metrics {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .results-index-list li {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .results-index-period {
+    grid-column: 1;
+  }
+
+  .results-index-list li > button {
+    grid-column: 2;
+    grid-row: 1 / span 2;
   }
 
   .results-intro > dl dd {

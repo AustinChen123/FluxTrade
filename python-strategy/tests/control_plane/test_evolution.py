@@ -1,3 +1,4 @@
+import json
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
@@ -12,6 +13,12 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool
 
 from src.control_plane.jobs import InMemoryJobStore, SqliteJobStore
+from src.control_plane.invalidation import ControlPlaneInvalidationHub
+from src.control_plane.evolution_persistence import (
+    _mark_evolution_aborted,
+    _mark_evolution_completed,
+    _persist_evolution_generation,
+)
 from src.control_plane.fitness import expected_maximum_sharpe
 from src.control_plane.evolution import (
     _value_index,
@@ -180,6 +187,97 @@ def _gene_snapshot(factory):
             )
             for record in records
         ]
+
+
+def test_new_evolution_epoch_starts_at_revision_one(tmp_path):
+    factory = _session_factory(tmp_path, "epoch_revision.db")
+    request = _request(seed=41)
+    assert request.evolution is not None
+    request = request.model_copy(
+        update={
+            "evolution": request.evolution.model_copy(
+                update={"epoch_id": "epoch-revision-one"}
+            )
+        }
+    )
+
+    _ensure_evolution_epoch(factory, request)
+
+    with factory() as session:
+        epoch = session.get(EvolutionEpoch, "epoch-revision-one")
+        assert epoch is not None
+        assert getattr(epoch, "revision", None) == 1
+
+
+def test_epoch_revisions_publish_only_after_each_committed_write(tmp_path):
+    factory = _session_factory(tmp_path, "epoch_events.db")
+    hub = ControlPlaneInvalidationHub()
+    stream = hub.subscribe()
+    request = _request(seed=43)
+    assert request.evolution is not None and request.search_space is not None
+    epoch_id = "epoch-event-sequence"
+    request = request.model_copy(
+        update={
+            "evolution": request.evolution.model_copy(update={"epoch_id": epoch_id})
+        }
+    )
+
+    def assert_revision(expected: int) -> None:
+        frame = stream.next_frame(timeout=0)
+        assert frame is not None
+        event = json.loads(frame.split(b"data: ", 1)[1].strip())
+        assert event == {
+            "schema_version": 1,
+            "resource": "evolution_epoch",
+            "identity": epoch_id,
+            "revision": expected,
+        }
+        with factory() as session:
+            committed = session.get(EvolutionEpoch, epoch_id)
+            assert committed is not None and committed.revision >= expected
+
+    _ensure_evolution_epoch(factory, request, invalidation_hub=hub)
+    assert_revision(1)
+    _ensure_evolution_epoch(factory, request, invalidation_hub=hub)
+    assert_revision(2)
+
+    assert request.search_space is not None and request.evolution is not None
+    population = initial_population(
+        request.search_space,
+        request.evolution,
+        seed=request.seed or 0,
+    )
+    evaluations = [
+        ParameterEvaluationResult(
+            candidate_id=candidate.candidate_id,
+            score_total=Decimal(index + 1),
+            max_drawdown=Decimal("0"),
+            metrics={
+                "mark_to_market_pnl": str(index + 1),
+                "max_drawdown": "0",
+            },
+        )
+        for index, candidate in enumerate(population)
+    ]
+    _persist_evolution_generation(
+        factory,
+        request,
+        0,
+        population,
+        evaluations,
+        invalidation_hub=hub,
+    )
+    assert_revision(3)
+    _mark_evolution_completed(
+        factory,
+        epoch_id,
+        evaluations[0].score_total,
+        invalidation_hub=hub,
+    )
+    assert_revision(4)
+    _mark_evolution_aborted(factory, epoch_id, invalidation_hub=hub)
+    assert stream.next_frame(timeout=0) is None
+    hub.close()
 
 
 def test_evolution_converges_to_known_optimum_within_thirty_generations(tmp_path):

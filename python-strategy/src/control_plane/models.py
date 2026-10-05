@@ -500,6 +500,22 @@ class FitnessConfig(BaseModel):
         return validate_fitness_expression(value)
 
 
+class SealedDatasetMarketData(BaseModel):
+    """Explicit reference to one immutable sealed research dataset."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["sealed_dataset"]
+    dataset_id: str = Field(min_length=1, max_length=128)
+
+    @field_validator("dataset_id")
+    @classmethod
+    def validate_dataset_id(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("dataset_id must be non-empty")
+        return value
+
+
 class ParameterSearchJobRequest(BaseModel):
     """Request payload for evaluating strategy parameter candidates."""
 
@@ -510,6 +526,10 @@ class ParameterSearchJobRequest(BaseModel):
     timeframe: str = Field(min_length=1)
     start_time: int
     end_time: int
+    market_data: SealedDatasetMarketData | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     objective: Literal[
         "maximize_score",
         "maximize_return",
@@ -548,6 +568,21 @@ class ParameterSearchJobRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_candidate_source(self) -> "ParameterSearchJobRequest":
+        if self.market_data is not None:
+            if self.strategy_type != "golden_cross":
+                raise ValueError(
+                    "sealed_dataset supports only strategy_type=golden_cross"
+                )
+            if self.backtest is None:
+                raise ValueError("sealed_dataset requires backtest accounting settings")
+            if self.backtest.candles_csv_path is not None:
+                raise ValueError("sealed_dataset does not accept candles_csv_path")
+            if self.backtest.write_reports:
+                raise ValueError("sealed_dataset does not support write_reports")
+            if self.evaluation_set is not None:
+                raise ValueError("sealed_dataset does not accept evaluation_set")
+            if self.fitness is not None:
+                raise ValueError("sealed_dataset does not accept fitness")
         has_candidates = self.candidates is not None
         has_search_space = self.search_space is not None
         if has_candidates == has_search_space:

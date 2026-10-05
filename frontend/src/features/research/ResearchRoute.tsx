@@ -1,4 +1,4 @@
-import { useMemo, type ReactNode } from "react";
+import { useCallback, useMemo, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 
 import type { Locale } from "../../shared/i18n";
@@ -20,11 +20,15 @@ import {
   surfaceRow
 } from "./gaDomain";
 import { ResearchPage } from "./ResearchPage";
+import { GaOperationsPanel } from "./GaOperationsPanel";
+import { useGaOperations } from "./useGaOperations";
 import { useResearchWorkspace } from "./useResearchWorkspace";
 
 export type ResearchSlots = {
   readonly toolbar: ReactNode;
   readonly content: ReactNode;
+  readonly refresh: () => Promise<void>;
+  readonly streamReady: boolean;
 };
 
 export type ResearchRouteProps = {
@@ -43,6 +47,10 @@ export function ResearchRoute({
   const { t, i18n } = useTranslation();
   const locale: Locale = i18n.resolvedLanguage === "en" ? "en" : "zh-TW";
   const workspace = useResearchWorkspace(demoMode);
+  const gaOperations = useGaOperations(visible && !demoMode, workspace);
+  const refresh = useCallback(async () => {
+    await Promise.all([workspace.refresh(), gaOperations.refresh()]);
+  }, [gaOperations.refresh, workspace.refresh]);
   const model = workspace.model;
   const chartCopy = useMemo<ChartCopy>(
     () => ({
@@ -208,10 +216,18 @@ export function ResearchRoute({
           </option>
         ))}
       </select>
+      <button
+        type="button"
+        disabled={workspace.loading}
+        onClick={() => void refresh()}
+      >
+        {t("controls.refreshResearch")}
+      </button>
     </div>
   ) : null;
   const content = visible ? (
-    <ResearchPage
+    <>
+      <ResearchPage
       workspace={workspace}
       locale={locale}
       theme={theme}
@@ -222,9 +238,16 @@ export function ResearchRoute({
       selectedSurfaceRow={selectedSurfaceRow}
       surface={surface}
       surfaceSelection={surfaceSelection}
-      parallel={parallel}
-    />
+        parallel={parallel}
+      />
+      <GaOperationsPanel state={gaOperations} workspace={workspace} locale={locale} />
+    </>
   ) : null;
 
-  return children({ toolbar, content });
+  return children({
+    toolbar,
+    content,
+    refresh,
+    streamReady: visible && !demoMode && workspace.ready
+  });
 }

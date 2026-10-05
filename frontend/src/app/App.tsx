@@ -23,6 +23,7 @@ import {
   serializeNavigation,
   type View
 } from "./navigation";
+import { ResearchInvalidationBridge } from "./researchInvalidation";
 
 const StrategyManager = lazy(() =>
   import("../features/strategies/StrategyManager").then((module) => ({
@@ -51,6 +52,9 @@ export function App() {
     parseNavigation(window.location.search)
   );
   const [view, setView] = useState<View>(initialNavigation.view);
+  const [selectedResultId, setSelectedResultId] = useState<string | null>(
+    initialNavigation.selectedResultId
+  );
   const [researchActivated, setResearchActivated] = useState(
     view === "research"
   );
@@ -63,22 +67,32 @@ export function App() {
     applyTheme(theme);
   }, [theme]);
 
-  const chooseView = (nextView: View, requestedTradeId: string | null = null) => {
+  const chooseView = (
+    nextView: View,
+    requestedTradeId: string | null = null,
+    requestedResultId: string | null = selectedResultId
+  ) => {
     if (nextView === "research") {
       setResearchActivated(true);
     }
     const navigation = serializeNavigation(
       new URL(window.location.href),
       nextView,
-      requestedTradeId
+      requestedTradeId,
+      requestedResultId
     );
+    setSelectedResultId(navigation.selectedResultId);
     setInspectedTradeId(navigation.inspectedTradeId);
     window.history.replaceState(null, "", navigation.relativeUrl);
     setView(nextView);
   };
 
-  const renderShell = ({ toolbar, content }: ResearchSlots) => (
+  const renderShell = ({ toolbar, content, refresh, streamReady }: ResearchSlots) => (
     <main className="console-shell">
+      <ResearchInvalidationBridge
+        enabled={streamReady && view === "research" && !demoMode}
+        onInvalidate={refresh}
+      />
       <header className="topbar">
         <div>
           <p className="eyebrow">{t("app.eyebrow")}</p>
@@ -192,8 +206,12 @@ export function App() {
           <BacktestResultsView
             demoMode={demoMode}
             theme={theme}
-            onInspectTrade={(tradeId) => {
-              chooseView("trades", tradeId);
+            selectedResultId={selectedResultId}
+            onSelectResult={(resultId) => {
+              chooseView("results", null, resultId);
+            }}
+            onInspectTrade={(tradeId, resultId) => {
+              chooseView("trades", tradeId, resultId);
             }}
           />
         </Suspense>
@@ -211,8 +229,11 @@ export function App() {
           <TradeChartView
             demoMode={demoMode}
             theme={theme}
+            selectedResultId={selectedResultId}
+            selectedTradeId={inspectedTradeId}
             initialTradeId={inspectedTradeId}
             onSelectTrade={(tradeId) => chooseView("trades", tradeId)}
+            onNavigateResults={() => chooseView("results", null)}
           />
         </Suspense>
       )}
@@ -230,6 +251,11 @@ export function App() {
       {renderShell}
     </ResearchRoute>
   ) : (
-    renderShell({ toolbar: null, content: null })
+    renderShell({
+      toolbar: null,
+      content: null,
+      refresh: async () => undefined,
+      streamReady: false
+    })
   );
 }

@@ -3,8 +3,10 @@ import {
   test,
   type Browser,
   type BrowserContext,
+  type ConsoleMessage,
   type Page,
   type Request,
+  type Response,
   type Route,
   type TestInfo,
   type ViewportSize
@@ -13,6 +15,22 @@ import {
 import {
   BROWSER_LOCALE,
   BROWSER_NOW,
+  BACKTEST_CANDLES,
+  BACKTEST_RESULT_DETAIL,
+  BACKTEST_RESULT_ID,
+  BACKTEST_RESULT_INDEX,
+  BACKTEST_TRADE_ID,
+  FLOW_CANDLE_CURSOR_QUERY,
+  FLOW_INDEX_CURSOR_QUERY,
+  FLOW_RESULT_CANDLES_FIRST,
+  FLOW_RESULT_CANDLES_SECOND,
+  FLOW_RESULT_DETAIL,
+  FLOW_RESULT_ID,
+  FLOW_RESULT_INDEX_FIRST,
+  FLOW_RESULT_INDEX_SECOND,
+  FLOW_RESULT_TRADES_SECOND,
+  FLOW_TRADE_CURSOR_QUERY,
+  FLOW_TRADE_ID,
   BROWSER_SESSION,
   BROWSER_TIME_ZONE,
   CASE_IDS,
@@ -20,6 +38,43 @@ import {
   EPOCH_B,
   EXPECTED_DOCUMENT_COUNTS,
   EXPECTED_REQUEST_COUNTS,
+  F2B_CANDLE_FIRST_422_DETAIL,
+  F2B_CANDLE_FIRST_422_ID,
+  F2B_CANDLE_NEXT_422_DETAIL,
+  F2B_CANDLE_NEXT_422_FIRST,
+  F2B_CANDLE_NEXT_422_ID,
+  F2B_CANDLE_NEXT_422_QUERY,
+  F2B_CANDLE_STATES_INDEX,
+  F2B_ERROR_RESULT_ID,
+  F2B_FORBIDDEN_RESULT_ID,
+  F2B_INVALID_RESULT_ID,
+  F2B_MISSING_RESULT_ID,
+  F2B_REVERSED_DETAIL,
+  F2B_REVERSED_RESULT_ID,
+  F2B_STALE_CANDLES_CURSOR_QUERY,
+  F2B_STALE_CANDLES_FINAL,
+  F2B_STALE_CANDLES_FIRST,
+  F2B_STALE_CANDLES_INDEX,
+  F2B_STALE_CANDLES_NEW_DETAIL,
+  F2B_STALE_CANDLES_NEW_ID,
+  F2B_STALE_CANDLES_OLD_DETAIL,
+  F2B_STALE_CANDLES_OLD_ID,
+  F2B_STALE_CANDLES_UNEXPECTED_CURSOR,
+  F2B_STALE_DETAIL_INDEX,
+  F2B_STALE_DETAIL_NEW_DETAIL,
+  F2B_STALE_DETAIL_NEW_ID,
+  F2B_STALE_DETAIL_OLD_DETAIL,
+  F2B_STALE_DETAIL_OLD_ID,
+  F2B_STALE_TRADES_CURSOR_QUERY,
+  F2B_STALE_TRADES_INDEX,
+  F2B_STALE_TRADES_NEW_DETAIL,
+  F2B_STALE_TRADES_NEW_ID,
+  F2B_STALE_TRADES_OLD_DETAIL,
+  F2B_STALE_TRADES_OLD_ID,
+  F2B_STATES_INDEX,
+  F2B_ZERO_DETAIL,
+  F2B_ZERO_RESULT_ID,
+  GA_PROFILE,
   GENE_A,
   GENE_B,
   GENERATION_A,
@@ -52,7 +107,14 @@ const ZERO_COUNTS: MutableRouteCounts = {
   a: 0,
   b: 0,
   T: 0,
-  C: 0
+  C: 0,
+  RI: 0,
+  RD: 0,
+  RT: 0,
+  RC: 0,
+  I: 0,
+  GP: 0,
+  GJ: 0
 };
 const PROJECT_VIEWPORTS = {
   "desktop-1440x900": { width: 1440, height: 900 },
@@ -149,7 +211,9 @@ const PROJECTED_HEADERS = new Set([
 
 function triplesFor(scenario: ScenarioId): readonly Triple[] {
   const servers: readonly ServerId[] =
-    scenario === "navigation-serialization" ||
+    scenario.startsWith("production-results-")
+      ? ["production"]
+      : scenario === "navigation-serialization" ||
     scenario === "demo-dev" ||
     scenario === "berlin-presentation-time"
       ? ["dev"]
@@ -164,6 +228,65 @@ function triplesFor(scenario: ScenarioId): readonly Triple[] {
 function tripleKey(triple: Triple): keyof typeof EXPECTED_REQUEST_COUNTS {
   return `${triple.scenario}:${triple.server}:${triple.caseId}` as keyof typeof EXPECTED_REQUEST_COUNTS;
 }
+
+function expectedApiStatusFailure(
+  scenario: ScenarioId,
+  message: ConsoleMessage,
+  expectedOrigin: string
+): string | null {
+  const location = message.location();
+  let url: URL;
+  try {
+    url = new URL(location.url);
+  } catch {
+    return null;
+  }
+  if (url.origin !== new URL(expectedOrigin).origin) return null;
+  const pathname = url.pathname;
+  const text = message.text();
+  if (scenario === "production-results-states") {
+    if (pathname === "/api/v1/backtest-results/job-browser-403" &&
+      text === "Failed to load resource: the server responded with a status of 403 (Forbidden)") {
+      return `${pathname}|${text}`;
+    }
+    if (pathname === "/api/v1/backtest-results/job-browser-404" &&
+      text === "Failed to load resource: the server responded with a status of 404 (Not Found)") {
+      return `${pathname}|${text}`;
+    }
+    if (pathname === "/api/v1/backtest-results/job-browser-503" &&
+      text === "Failed to load resource: the server responded with a status of 503 (Service Unavailable)") {
+      return `${pathname}|${text}`;
+    }
+  }
+  if (scenario === "production-results-candle-states") {
+    if ((pathname === "/api/v1/backtest-results/job-browser-candle-first-422/candles" ||
+      pathname === "/api/v1/backtest-results/job-browser-candle-next-422/candles") &&
+      text === "Failed to load resource: the server responded with a status of 422 (Unprocessable Entity)") {
+      return `${pathname}|${text}`;
+    }
+  }
+  if (scenario === "production-results-stale-trades" &&
+    pathname === "/api/v1/backtest-results/job-browser-stale-trades-old/trades" &&
+    text === "Failed to load resource: the server responded with a status of 503 (Service Unavailable)") {
+    return `${pathname}|${text}`;
+  }
+  return null;
+}
+
+const EXPECTED_API_STATUS_DIAGNOSTICS: Partial<Record<ScenarioId, readonly string[]>> = {
+  "production-results-states": [
+    ...Array(3).fill("/api/v1/backtest-results/job-browser-403|Failed to load resource: the server responded with a status of 403 (Forbidden)"),
+    ...Array(3).fill("/api/v1/backtest-results/job-browser-404|Failed to load resource: the server responded with a status of 404 (Not Found)"),
+    ...Array(3).fill("/api/v1/backtest-results/job-browser-503|Failed to load resource: the server responded with a status of 503 (Service Unavailable)")
+  ],
+  "production-results-candle-states": [
+    "/api/v1/backtest-results/job-browser-candle-first-422/candles|Failed to load resource: the server responded with a status of 422 (Unprocessable Entity)",
+    "/api/v1/backtest-results/job-browser-candle-next-422/candles|Failed to load resource: the server responded with a status of 422 (Unprocessable Entity)"
+  ],
+  "production-results-stale-trades": [
+    "/api/v1/backtest-results/job-browser-stale-trades-old/trades|Failed to load resource: the server responded with a status of 503 (Service Unavailable)"
+  ]
+};
 
 function validatedViewport(testInfo: TestInfo): ViewportSize {
   const expected =
@@ -206,19 +329,289 @@ async function installApiFixtures(
   context: BrowserContext,
   counts: MutableRouteCounts,
   commandGate: CommandGate | null,
-  expectedOrigin: string
-): Promise<void> {
+  expectedOrigin: string,
+  scenario: ScenarioId
+): Promise<() => void> {
+  const productionResultsFlow = scenario === "production-results-flow";
   let commandAccepted = false;
+  const pendingEventRequests: Array<() => void> = [];
   await context.route("**/*", async (route: Route) => {
     const request = route.request();
     const url = new URL(request.url());
     const method = request.method();
     let routeId: RouteId | null = null;
     let body: unknown;
+    let responseStatus = 200;
 
     if (method === "GET" && url.pathname === "/ops/kill-switch" && url.search === "") {
       await route.fulfill({ json: { state: "OK", redis_state: "OK", durable_state: "OK", listener_available: true } });
       return;
+    } else if (
+      method === "GET" &&
+      url.pathname === "/api/v1/events" &&
+      url.search === ""
+    ) {
+      routeId = "I";
+    } else if (
+      method === "GET" &&
+      url.pathname === "/api/v1/ga-profiles/golden_cross_research_v1" &&
+      url.search === ""
+    ) {
+      routeId = "GP";
+      body = { schema_version: 1, profile: GA_PROFILE };
+    } else if (
+      method === "GET" &&
+      url.pathname === "/api/v1/ga-jobs" &&
+      url.search === "?limit=50&offset=0"
+    ) {
+      routeId = "GJ";
+      body = { schema_version: 1, items: [], total_count: 0, limit: 50, offset: 0 };
+    } else if (
+      method === "GET" &&
+      url.pathname === "/api/v1/backtest-results" &&
+      url.search === ""
+    ) {
+      routeId = "RI";
+      body = scenario === "production-results-flow"
+        ? FLOW_RESULT_INDEX_FIRST
+        : scenario === "production-results-states"
+          ? F2B_STATES_INDEX
+          : scenario === "production-results-candle-states"
+            ? F2B_CANDLE_STATES_INDEX
+            : scenario === "production-results-stale-detail"
+              ? F2B_STALE_DETAIL_INDEX
+              : scenario === "production-results-stale-trades"
+                ? F2B_STALE_TRADES_INDEX
+                : scenario === "production-results-stale-candles"
+                  ? F2B_STALE_CANDLES_INDEX
+                  : BACKTEST_RESULT_INDEX;
+    } else if (
+      productionResultsFlow &&
+      method === "GET" &&
+      url.pathname === "/api/v1/backtest-results" &&
+      url.search === FLOW_INDEX_CURSOR_QUERY
+    ) {
+      routeId = "RI";
+      body = FLOW_RESULT_INDEX_SECOND;
+    } else if (
+      scenario === "production-results-states" &&
+      method === "GET" &&
+      url.pathname === `/api/v1/backtest-results/${F2B_ZERO_RESULT_ID}` &&
+      url.search === ""
+    ) {
+      routeId = "RD";
+      body = F2B_ZERO_DETAIL;
+    } else if (
+      scenario === "production-results-states" &&
+      method === "GET" &&
+      url.pathname === `/api/v1/backtest-results/${F2B_FORBIDDEN_RESULT_ID}` &&
+      url.search === ""
+    ) {
+      routeId = "RD";
+      responseStatus = 403;
+      body = { error: "SENSITIVE_SENTINEL" };
+    } else if (
+      scenario === "production-results-states" &&
+      method === "GET" &&
+      url.pathname === `/api/v1/backtest-results/${F2B_MISSING_RESULT_ID}` &&
+      url.search === ""
+    ) {
+      routeId = "RD";
+      responseStatus = 404;
+      body = { error: "SENSITIVE_SENTINEL" };
+    } else if (
+      scenario === "production-results-states" &&
+      method === "GET" &&
+      url.pathname === `/api/v1/backtest-results/${F2B_ERROR_RESULT_ID}` &&
+      url.search === ""
+    ) {
+      routeId = "RD";
+      responseStatus = 503;
+      body = { error: "SENSITIVE_SENTINEL" };
+    } else if (
+      scenario === "production-results-states" &&
+      method === "GET" &&
+      url.pathname === `/api/v1/backtest-results/${F2B_INVALID_RESULT_ID}` &&
+      url.search === ""
+    ) {
+      routeId = "RD";
+      body = { ...F2B_ZERO_DETAIL, job_id: F2B_INVALID_RESULT_ID, metrics: "SENSITIVE_SENTINEL" };
+    } else if (
+      scenario === "production-results-candle-states" &&
+      method === "GET" &&
+      url.pathname === `/api/v1/backtest-results/${F2B_REVERSED_RESULT_ID}` &&
+      url.search === ""
+    ) {
+      routeId = "RD";
+      body = F2B_REVERSED_DETAIL;
+    } else if (
+      scenario === "production-results-candle-states" &&
+      method === "GET" &&
+      url.pathname === `/api/v1/backtest-results/${F2B_CANDLE_FIRST_422_ID}` &&
+      url.search === ""
+    ) {
+      routeId = "RD";
+      body = F2B_CANDLE_FIRST_422_DETAIL;
+    } else if (
+      scenario === "production-results-candle-states" &&
+      method === "GET" &&
+      url.pathname === `/api/v1/backtest-results/${F2B_CANDLE_NEXT_422_ID}` &&
+      url.search === ""
+    ) {
+      routeId = "RD";
+      body = F2B_CANDLE_NEXT_422_DETAIL;
+    } else if (
+      scenario === "production-results-stale-detail" &&
+      method === "GET" &&
+      url.pathname === `/api/v1/backtest-results/${F2B_STALE_DETAIL_OLD_ID}` &&
+      url.search === ""
+    ) {
+      routeId = "RD";
+      body = F2B_STALE_DETAIL_OLD_DETAIL;
+    } else if (
+      scenario === "production-results-stale-detail" &&
+      method === "GET" &&
+      url.pathname === `/api/v1/backtest-results/${F2B_STALE_DETAIL_NEW_ID}` &&
+      url.search === ""
+    ) {
+      routeId = "RD";
+      body = F2B_STALE_DETAIL_NEW_DETAIL;
+    } else if (
+      scenario === "production-results-stale-trades" &&
+      method === "GET" &&
+      url.pathname === `/api/v1/backtest-results/${F2B_STALE_TRADES_OLD_ID}` &&
+      url.search === ""
+    ) {
+      routeId = "RD";
+      body = F2B_STALE_TRADES_OLD_DETAIL;
+    } else if (
+      scenario === "production-results-stale-trades" &&
+      method === "GET" &&
+      url.pathname === `/api/v1/backtest-results/${F2B_STALE_TRADES_NEW_ID}` &&
+      url.search === ""
+    ) {
+      routeId = "RD";
+      body = F2B_STALE_TRADES_NEW_DETAIL;
+    } else if (
+      scenario === "production-results-stale-candles" &&
+      method === "GET" &&
+      url.pathname === `/api/v1/backtest-results/${F2B_STALE_CANDLES_OLD_ID}` &&
+      url.search === ""
+    ) {
+      routeId = "RD";
+      body = F2B_STALE_CANDLES_OLD_DETAIL;
+    } else if (
+      scenario === "production-results-stale-candles" &&
+      method === "GET" &&
+      url.pathname === `/api/v1/backtest-results/${F2B_STALE_CANDLES_NEW_ID}` &&
+      url.search === ""
+    ) {
+      routeId = "RD";
+      body = F2B_STALE_CANDLES_NEW_DETAIL;
+    } else if (
+      productionResultsFlow &&
+      method === "GET" &&
+      url.pathname === `/api/v1/backtest-results/${FLOW_RESULT_ID}` &&
+      url.search === ""
+    ) {
+      routeId = "RD";
+      body = FLOW_RESULT_DETAIL;
+    } else if (
+      productionResultsFlow &&
+      method === "GET" &&
+      url.pathname === `/api/v1/backtest-results/${FLOW_RESULT_ID}/trades` &&
+      url.search === FLOW_TRADE_CURSOR_QUERY
+    ) {
+      routeId = "RT";
+      body = FLOW_RESULT_TRADES_SECOND;
+    } else if (
+      scenario === "production-results-stale-trades" &&
+      method === "GET" &&
+      url.pathname === `/api/v1/backtest-results/${F2B_STALE_TRADES_OLD_ID}/trades` &&
+      url.search === F2B_STALE_TRADES_CURSOR_QUERY
+    ) {
+      routeId = "RT";
+      responseStatus = 503;
+      body = { error: "SENSITIVE_SENTINEL" };
+    } else if (
+      productionResultsFlow &&
+      method === "GET" &&
+      url.pathname === `/api/v1/backtest-results/${FLOW_RESULT_ID}/candles` &&
+      url.search === "?start=1768478700000&end=1768479900000"
+    ) {
+      routeId = "RC";
+      body = FLOW_RESULT_CANDLES_FIRST;
+    } else if (
+      productionResultsFlow &&
+      method === "GET" &&
+      url.pathname === `/api/v1/backtest-results/${FLOW_RESULT_ID}/candles` &&
+      url.search === FLOW_CANDLE_CURSOR_QUERY
+    ) {
+      routeId = "RC";
+      body = FLOW_RESULT_CANDLES_SECOND;
+    } else if (
+      scenario === "production-results-candle-states" &&
+      method === "GET" &&
+      url.pathname === `/api/v1/backtest-results/${F2B_CANDLE_FIRST_422_ID}/candles` &&
+      url.search === "?start=1768478400000&end=1768480200000"
+    ) {
+      routeId = "RC";
+      responseStatus = 422;
+      body = { error: "SENSITIVE_SENTINEL" };
+    } else if (
+      scenario === "production-results-candle-states" &&
+      method === "GET" &&
+      url.pathname === `/api/v1/backtest-results/${F2B_CANDLE_NEXT_422_ID}/candles` &&
+      url.search === "?start=1768478400000&end=1768480200000"
+    ) {
+      routeId = "RC";
+      body = F2B_CANDLE_NEXT_422_FIRST;
+    } else if (
+      scenario === "production-results-candle-states" &&
+      method === "GET" &&
+      url.pathname === `/api/v1/backtest-results/${F2B_CANDLE_NEXT_422_ID}/candles` &&
+      url.search === F2B_CANDLE_NEXT_422_QUERY
+    ) {
+      routeId = "RC";
+      responseStatus = 422;
+      body = { error: "SENSITIVE_SENTINEL" };
+    } else if (
+      scenario === "production-results-stale-candles" &&
+      method === "GET" &&
+      url.pathname === `/api/v1/backtest-results/${F2B_STALE_CANDLES_OLD_ID}/candles` &&
+      url.search === "?start=1768478400000&end=1768480200000"
+    ) {
+      routeId = "RC";
+      body = F2B_STALE_CANDLES_FIRST;
+    } else if (
+      scenario === "production-results-stale-candles" &&
+      method === "GET" &&
+      url.pathname === `/api/v1/backtest-results/${F2B_STALE_CANDLES_OLD_ID}/candles` &&
+      url.search === F2B_STALE_CANDLES_CURSOR_QUERY
+    ) {
+      routeId = "RC";
+      body = F2B_STALE_CANDLES_FINAL;
+    } else if (
+      method === "GET" &&
+      url.pathname === `/api/v1/backtest-results/${BACKTEST_RESULT_ID}` &&
+      url.search === ""
+    ) {
+      routeId = "RD";
+      body = BACKTEST_RESULT_DETAIL;
+    } else if (
+      method === "GET" &&
+      url.pathname === `/api/v1/backtest-results/${BACKTEST_RESULT_ID}/candles` &&
+      url.search === "?start=1768478400000&end=1768480200000"
+    ) {
+      routeId = "RC";
+      body = BACKTEST_CANDLES;
+    } else if (
+      method === "GET" &&
+      url.pathname === `/api/v1/backtest-results/${BACKTEST_RESULT_ID}/trades` &&
+      url.search === ""
+    ) {
+      routeId = "RT";
+      body = { items: [], next_cursor: null, revision: 1 };
     } else if (url.pathname === "/api/v1/auth/session" && url.search === "") {
       if (method === "GET") {
         routeId = "S";
@@ -310,6 +703,13 @@ async function installApiFixtures(
       expect(request.postData()).toBe(
         '{"command":"STOP","expected_version":3}'
       );
+    } else if (routeId === "I") {
+      expect(projectHeaders(request)).toEqual({ accept: "*/*" });
+      expect(request.postData()).toBeNull();
+      counts[routeId] += 1;
+      await new Promise<void>((resolve) => pendingEventRequests.push(resolve));
+      await route.abort().catch(() => undefined);
+      return;
     } else {
       expect(projectHeaders(request)).toEqual(expectedGetHeaders());
       expect(request.postData()).toBeNull();
@@ -319,13 +719,38 @@ async function installApiFixtures(
       commandGate.signalReceived();
       await commandGate.released;
       commandAccepted = true;
+    } else if (
+      productionResultsFlow &&
+      routeId === "RC" &&
+      url.search === FLOW_CANDLE_CURSOR_QUERY &&
+      commandGate !== null
+    ) {
+      commandGate.signalReceived();
+      await commandGate.released;
+    } else if (
+      commandGate !== null && (
+        (scenario === "production-results-stale-detail" &&
+          url.pathname === `/api/v1/backtest-results/${F2B_STALE_DETAIL_OLD_ID}`) ||
+        (scenario === "production-results-stale-trades" &&
+          url.pathname.endsWith(`/${F2B_STALE_TRADES_OLD_ID}/trades`)) ||
+        (scenario === "production-results-stale-candles" &&
+          url.pathname.endsWith(`/${F2B_STALE_CANDLES_OLD_ID}/candles`) &&
+          url.search === F2B_STALE_CANDLES_CURSOR_QUERY)
+      )
+    ) {
+      commandGate.signalReceived();
+      await commandGate.released;
     }
     await route.fulfill({
-      status: 200,
+      status: responseStatus,
       contentType: "application/json",
       body: JSON.stringify(body)
     });
   });
+  return () => {
+    for (const release of pendingEventRequests) release();
+    pendingEventRequests.length = 0;
+  };
 }
 
 function nav(page: Page, index: 0 | 1 | 2 | 3) {
@@ -338,6 +763,27 @@ async function waitForResearch(page: Page): Promise<void> {
 
 async function waitForStrategy(page: Page): Promise<void> {
   await expect(page.getByText("active-strategy", { exact: true })).toBeVisible();
+}
+
+async function openIndexedResult(page: Page, resultId: string): Promise<void> {
+  await page.getByRole("button", { name: new RegExp(resultId) }).click();
+  await expect.poll(() => new URL(page.url()).searchParams.get("result"))
+    .toBe(resultId);
+}
+
+async function clearResultThroughNavigation(page: Page): Promise<void> {
+  await nav(page, 2).click();
+  await waitForStrategy(page);
+  await nav(page, 1).click();
+  await expect(page.locator(".results-index")).toBeVisible();
+}
+
+async function flushDeliveredResponse(page: Page, response: Promise<Response>): Promise<void> {
+  const delivered = await response;
+  await delivered.finished();
+  await page.evaluate(() => new Promise<void>((resolve) => {
+    requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+  }));
 }
 
 async function assertBerlinPresentationRuntime(page: Page): Promise<void> {
@@ -483,20 +929,391 @@ async function exerciseScenario(
   page: Page,
   triple: Triple,
   moduleRequests: string[],
-  commandGate: CommandGate | null
+  counts: MutableRouteCounts,
+  commandGate: CommandGate | null,
+  testInfo: TestInfo
 ): Promise<void> {
   const base = BASE_URLS[triple.server];
   const open = (path: string) => page.goto(`${base}${path}`);
 
+  if (triple.scenario === "production-results-flow") {
+    await open("/?view=results");
+    await expect(page.locator(".results-index")).toBeVisible();
+    await expect(page.locator(".results-metrics")).toHaveCount(0);
+    await expect(page.getByText(BACKTEST_RESULT_ID, { exact: true })).toBeVisible();
+    await expect(page.getByText(FLOW_RESULT_ID, { exact: true })).toHaveCount(0);
+    expect(new URL(page.url()).searchParams.get("result")).toBeNull();
+    expect(new URL(page.url()).searchParams.get("trade")).toBeNull();
+    await page.screenshot({
+      path: testInfo.outputPath(`${testInfo.project.name}-production-results-index-first.png`),
+      fullPage: true
+    });
+
+    await page.getByRole("button", { name: /載入更多結果|Load more results/ }).click();
+    await expect(page.locator(".results-index")).toBeVisible();
+    await expect(page.getByText(FLOW_RESULT_ID, { exact: true })).toBeVisible();
+    await expect(page.getByText(BACKTEST_RESULT_ID, { exact: true })).toBeVisible();
+    await expect(page.locator(".results-metrics")).toHaveCount(0);
+    expect(new URL(page.url()).searchParams.get("result")).toBeNull();
+    await page.screenshot({
+      path: testInfo.outputPath(`${testInfo.project.name}-production-results-index.png`),
+      fullPage: true
+    });
+
+    await page.getByRole("button", { name: new RegExp(FLOW_RESULT_ID) }).click();
+    await expect.poll(() => new URL(page.url()).searchParams.get("result")).toBe(FLOW_RESULT_ID);
+    await expect(page.locator(".results-metrics .metric-primary strong")).toHaveText(
+      "9007199254740993.12 USDT"
+    );
+    const resultMetricGeometry = await page
+      .locator(".results-metrics .metric-primary strong")
+      .evaluate((element) => {
+        const bounds = element.getBoundingClientRect();
+        const metric = element.closest(".metric-primary");
+        return {
+          text: element.textContent,
+          clientWidth: element.clientWidth,
+          scrollWidth: element.scrollWidth,
+          right: bounds.right,
+          metricRight: metric?.getBoundingClientRect().right ?? 0
+        };
+      });
+    expect(resultMetricGeometry.scrollWidth, JSON.stringify(resultMetricGeometry))
+      .toBeLessThanOrEqual(resultMetricGeometry.clientWidth);
+    expect(resultMetricGeometry.right, JSON.stringify(resultMetricGeometry))
+      .toBeLessThanOrEqual(resultMetricGeometry.metricRight);
+    await expect(page.locator(".results-metrics .metric-primary small")).toContainText("1.25%");
+    await expect(page.locator(".results-metrics")).toContainText("123.45 USDT");
+    await expect(page.getByText(`${FLOW_RESULT_ID}:0`, { exact: true })).toBeVisible();
+    await page.screenshot({
+      path: testInfo.outputPath(`${testInfo.project.name}-production-results-detail.png`),
+      fullPage: true
+    });
+
+    await page.getByRole("button", { name: /載入更多交易|Load more trades/ }).click();
+    const selectedTradeRow = page.locator(".results-trades tr").filter({ hasText: FLOW_TRADE_ID });
+    await expect(selectedTradeRow).toBeVisible();
+    await expect(selectedTradeRow).toContainText("-9007199254740993.12 USDT");
+    await expect(selectedTradeRow).toContainText("0.50 USDT");
+    await selectedTradeRow.getByRole("button").click();
+    await expect.poll(() => new URL(page.url()).searchParams.get("view")).toBe("trades");
+    await expect.poll(() => new URL(page.url()).searchParams.get("result")).toBe(FLOW_RESULT_ID);
+    await expect.poll(() => new URL(page.url()).searchParams.get("trade")).toBe(FLOW_TRADE_ID);
+
+    if (!commandGate) throw new Error("missing_production_flow_gate");
+    await commandGate.received;
+    await expect(page.locator(".trade-chart")).toHaveCount(0);
+    await expect(page.getByText(`${FLOW_RESULT_ID}:0`, { exact: true })).toBeVisible();
+    await expect(page.getByText(FLOW_TRADE_ID, { exact: true }).first()).toBeVisible();
+    commandGate.release();
+
+    await expect(page.locator(".trade-chart")).toBeVisible();
+    await expect(page.locator(".trade-chart canvas")).toBeVisible();
+    await expect(page.locator(".trade-quality")).toHaveCount(0);
+    await expect(page.locator(".trade-ledger").getByText(FLOW_RESULT_ID + ":0", { exact: true })).toBeVisible();
+    await expect(page.locator(".trade-ledger").getByText(FLOW_TRADE_ID, { exact: true }).first()).toBeVisible();
+    await expect(page.locator(".trade-detail").getByText(FLOW_TRADE_ID, { exact: true })).toBeVisible();
+    await expect(page.locator(".trade-detail")).toContainText("-9007199254740993.12 USDT");
+    await expect(page.locator(".trade-detail")).toContainText("2.50");
+    await expect(page.locator(".trade-detail")).toContainText("9,007,199,254,740,994.12");
+    await expect(page.locator(".trade-detail")).toContainText("9,007,199,254,740,993.12");
+    await expect(page.locator(".trade-detail")).toContainText("0.50 USDT");
+    const detail = page.locator(".trade-detail");
+    const tradeGeometry = await detail.evaluate((element) => {
+      const bounds = element.getBoundingClientRect();
+      const ledger = element.closest(".trade-ledger");
+      const ledgerBounds = ledger?.getBoundingClientRect();
+      const values = [
+        element.querySelector("strong"),
+        ...Array.from(element.querySelectorAll("dl dd"))
+      ].map((value) => {
+        const valueBounds = value!.getBoundingClientRect();
+        return {
+          left: valueBounds.left,
+          right: valueBounds.right,
+          clientWidth: value!.clientWidth,
+          scrollWidth: value!.scrollWidth
+        };
+      });
+      return {
+        left: bounds.left,
+        right: bounds.right,
+        bottom: bounds.bottom,
+        values,
+        ledgerClientHeight: ledger?.clientHeight ?? 0,
+        ledgerScrollHeight: ledger?.scrollHeight ?? 0,
+        ledgerBottom: ledgerBounds?.bottom ?? 0
+      };
+    });
+    expect(tradeGeometry.values).toHaveLength(7);
+    for (const value of tradeGeometry.values) {
+      expect(value.scrollWidth, JSON.stringify({ tradeGeometry, value }))
+        .toBeLessThanOrEqual(value.clientWidth);
+      expect(value.left, JSON.stringify({ tradeGeometry, value }))
+        .toBeGreaterThanOrEqual(tradeGeometry.left);
+      expect(value.right, JSON.stringify({ tradeGeometry, value }))
+        .toBeLessThanOrEqual(tradeGeometry.right);
+    }
+    const entryBounds = tradeGeometry.values[3];
+    const exitBounds = tradeGeometry.values[4];
+    expect(entryBounds.right, JSON.stringify({ entryBounds, exitBounds }))
+      .toBeLessThanOrEqual(exitBounds.left);
+    expect(tradeGeometry.ledgerScrollHeight, JSON.stringify(tradeGeometry))
+      .toBeLessThanOrEqual(tradeGeometry.ledgerClientHeight);
+    expect(tradeGeometry.bottom, JSON.stringify(tradeGeometry))
+      .toBeLessThanOrEqual(tradeGeometry.ledgerBottom);
+    await page.screenshot({
+      path: testInfo.outputPath(`${testInfo.project.name}-production-results-trades.png`),
+      fullPage: true
+    });
+    return;
+  }
+
+  if (triple.scenario === "production-results-states") {
+    await open("/?view=results");
+    await expect(page.locator(".results-index")).toBeVisible();
+    await expect(page.getByText(F2B_ZERO_RESULT_ID, { exact: true })).toBeVisible();
+    await page.getByRole("button", { name: new RegExp(F2B_ZERO_RESULT_ID) }).click();
+    await expect.poll(() => new URL(page.url()).searchParams.get("result"))
+      .toBe(F2B_ZERO_RESULT_ID);
+    await expect(page.locator(".results-metrics")).toBeVisible();
+    await expect(page.locator(".results-metrics .metric-primary strong"))
+      .toHaveText("US$0.00");
+    await expect(page.locator(".results-risk-panel .results-risk-chart")).toBeVisible();
+    await expect(page.getByText("這次結果沒有月報酬資料。", { exact: true })).toBeVisible();
+    await expect(page.getByText("這次結果沒有交易分布資料。", { exact: true })).toBeVisible();
+    await expect(page.locator(".results-trades")).toContainText("這次回測沒有已平倉交易。");
+    await nav(page, 3).click();
+    await expect(page.locator(".trade-ledger")).toBeVisible();
+    await expect(page.locator(".trade-ledger").locator(".panel-heading span")).toHaveText("0");
+    await expect(page.locator(".trade-chart-panel .empty-panel"))
+      .toContainText("這段 K 線沒有已平倉交易。");
+    await expect(page.locator(".trade-chart")).toHaveCount(0);
+    expect(new URL(page.url()).searchParams.get("trade")).toBeNull();
+    await nav(page, 1).click();
+    await expect(page.locator(".results-metrics")).toBeVisible();
+    await page.getByRole("button", { name: "選擇其他結果" }).click();
+    await expect(page.locator(".results-index")).toBeVisible();
+
+    const failures = [
+      {
+        id: F2B_FORBIDDEN_RESULT_ID,
+        resultText: "目前工作階段沒有讀取權限。請從受信任的控制台入口重新開啟。",
+        tradeText: "目前工作階段無法讀取所選結果。請返回結果頁選擇其他結果。"
+      },
+      {
+        id: F2B_MISSING_RESULT_ID,
+        resultText: "結果可能已不可用；返回結果清單並選擇其他項目。",
+        tradeText: "請返回結果頁並選擇可用的結果。"
+      },
+      {
+        id: F2B_ERROR_RESULT_ID,
+        resultText: "請返回結果清單，稍後再選擇結果。",
+        tradeText: "請返回結果頁。所選交易資料可用前，不會顯示圖表。"
+      },
+      {
+        id: F2B_INVALID_RESULT_ID,
+        resultText: "這筆結果無法安全顯示。返回結果清單並選擇其他項目。",
+        tradeText: "所選資料無法安全顯示。請返回結果頁並選擇其他結果。"
+      }
+    ];
+    for (const failure of failures) {
+      await page.getByRole("button", { name: new RegExp(failure.id) }).click();
+      await expect(page.locator(".error-panel")).toContainText(failure.resultText);
+      await expect(page.locator(".results-metrics")).toHaveCount(0);
+      await expect(page.locator(".results-risk-panel")).toHaveCount(0);
+      await expect(page.locator(".results-trades")).toHaveCount(0);
+      await expect(page.locator(".trade-chart")).toHaveCount(0);
+      await expect(page.locator("body")).not.toContainText("US$0.00");
+      await expect(page.locator("body")).not.toContainText("SENSITIVE_SENTINEL");
+      await nav(page, 3).click();
+      await expect(page.locator(".trade-console .empty-panel"))
+        .toContainText(failure.tradeText);
+      await expect(page.locator(".trade-chart")).toHaveCount(0);
+      await expect(page.locator(".trade-detail")).toHaveCount(0);
+      await expect(page.locator(".trade-ledger li")).toHaveCount(0);
+      await expect(page.locator("body")).not.toContainText("US$0.00");
+      await expect(page.locator("body")).not.toContainText("SENSITIVE_SENTINEL");
+      await nav(page, 1).click();
+      await expect(page.locator(".error-panel")).toContainText(failure.resultText);
+      await page.getByRole("button", { name: "選擇其他結果" }).click();
+      await expect(page.locator(".results-index")).toBeVisible();
+    }
+    return;
+  }
+
+  if (triple.scenario === "production-results-candle-states") {
+    await open(
+      `/?view=trades&result=${encodeURIComponent(F2B_REVERSED_RESULT_ID)}&trade=${encodeURIComponent(`${F2B_REVERSED_RESULT_ID}:0`)}`
+    );
+    await expect(page.locator(".trade-chart-panel .empty-panel"))
+      .toContainText("所選資料無法安全顯示。請返回結果頁並選擇其他結果。");
+    expect(new URL(page.url()).searchParams.get("result")).toBe(F2B_REVERSED_RESULT_ID);
+    expect(new URL(page.url()).searchParams.get("trade"))
+      .toBe(`${F2B_REVERSED_RESULT_ID}:0`);
+    expect(counts.RC).toBe(0);
+    await expect(page.locator(".trade-chart")).toHaveCount(0);
+
+    await nav(page, 1).click();
+    await expect(page.locator(".error-panel"))
+      .toContainText("這筆結果無法安全顯示。返回結果清單並選擇其他項目。");
+    await page.getByRole("button", { name: "選擇其他結果" }).click();
+    await expect(page.locator(".results-index")).toBeVisible();
+    await openIndexedResult(page, F2B_CANDLE_FIRST_422_ID);
+    await expect(page.locator(".results-metrics")).toBeVisible();
+    await page.locator(".results-trades tr")
+      .filter({ hasText: `${F2B_CANDLE_FIRST_422_ID}:0` })
+      .getByRole("button").click();
+    await expect.poll(() => new URL(page.url()).searchParams.get("trade"))
+      .toBe(`${F2B_CANDLE_FIRST_422_ID}:0`);
+    await expect(page.locator(".trade-chart-panel .empty-panel"))
+      .toContainText("所選交易範圍超出可用 K 線資料。請返回結果頁並選擇其他交易。");
+    expect(new URL(page.url()).searchParams.get("result")).toBe(F2B_CANDLE_FIRST_422_ID);
+    expect(counts.RC).toBe(1);
+    await expect(page.locator(".trade-chart")).toHaveCount(0);
+    await expect(page.locator(".trade-quality")).toHaveCount(0);
+
+    await nav(page, 1).click();
+    await expect(page.locator(".results-metrics")).toBeVisible();
+    await page.getByRole("button", { name: "選擇其他結果" }).click();
+    await expect(page.locator(".results-index")).toBeVisible();
+    await openIndexedResult(page, F2B_CANDLE_NEXT_422_ID);
+    await expect(page.locator(".results-metrics")).toBeVisible();
+    await page.locator(".results-trades tr")
+      .filter({ hasText: `${F2B_CANDLE_NEXT_422_ID}:0` })
+      .getByRole("button").click();
+    await expect.poll(() => new URL(page.url()).searchParams.get("trade"))
+      .toBe(`${F2B_CANDLE_NEXT_422_ID}:0`);
+    await expect(page.locator(".trade-chart-panel .empty-panel"))
+      .toContainText("所選交易範圍超出可用 K 線資料。請返回結果頁並選擇其他交易。");
+    expect(new URL(page.url()).searchParams.get("result")).toBe(F2B_CANDLE_NEXT_422_ID);
+    expect(counts.RC).toBe(3);
+    await expect(page.locator(".trade-chart")).toHaveCount(0);
+    await expect(page.locator(".trade-quality")).toHaveCount(0);
+    await expect(page.locator("body")).not.toContainText("SENSITIVE_SENTINEL");
+    return;
+  }
+
+  if (
+    triple.scenario === "production-results-stale-detail" ||
+    triple.scenario === "production-results-stale-trades" ||
+    triple.scenario === "production-results-stale-candles"
+  ) {
+    if (!commandGate) throw new Error("missing_stale_response_gate");
+    const indexId = triple.scenario === "production-results-stale-detail"
+      ? F2B_STALE_DETAIL_OLD_ID
+      : triple.scenario === "production-results-stale-trades"
+        ? F2B_STALE_TRADES_OLD_ID
+        : F2B_STALE_CANDLES_OLD_ID;
+    const replacementId = triple.scenario === "production-results-stale-detail"
+      ? F2B_STALE_DETAIL_NEW_ID
+      : triple.scenario === "production-results-stale-trades"
+        ? F2B_STALE_TRADES_NEW_ID
+        : F2B_STALE_CANDLES_NEW_ID;
+    const oldPath = triple.scenario === "production-results-stale-detail"
+      ? `/api/v1/backtest-results/${indexId}`
+      : triple.scenario === "production-results-stale-trades"
+        ? `/api/v1/backtest-results/${indexId}/trades`
+        : `/api/v1/backtest-results/${indexId}/candles`;
+
+    await open("/?view=results");
+    await expect(page.locator(".results-index")).toBeVisible();
+    await openIndexedResult(page, indexId);
+
+    if (triple.scenario === "production-results-stale-trades") {
+      await expect(page.locator(".results-metrics .metric-primary strong"))
+        .toHaveText("US$11.00");
+      await page.getByRole("button", { name: /載入更多交易|Load more trades/ }).click();
+    } else if (triple.scenario === "production-results-stale-candles") {
+      await expect(page.locator(".results-metrics")).toBeVisible();
+      await page.locator(".results-trades tr")
+        .filter({ hasText: `${indexId}:0` })
+        .getByRole("button").click();
+      await expect.poll(() => new URL(page.url()).searchParams.get("trade"))
+        .toBe(`${indexId}:0`);
+    }
+    await commandGate.received;
+
+    if (triple.scenario === "production-results-stale-detail") {
+      await expect(page.locator(".results-console .empty-panel"))
+        .toHaveText("載入回測績效");
+      await expect(page.locator(".results-metrics")).toHaveCount(0);
+      await expect(page.locator(".results-risk-panel")).toHaveCount(0);
+      await expect(page.locator(".results-trades")).toHaveCount(0);
+      await expect(page.locator(".trade-chart")).toHaveCount(0);
+      await expect(page.locator("body")).not.toContainText("US$11.00");
+    } else if (triple.scenario === "production-results-stale-trades") {
+      expect(new URL(page.url()).searchParams.get("result")).toBe(indexId);
+      expect(new URL(page.url()).searchParams.get("trade")).toBeNull();
+    } else if (triple.scenario === "production-results-stale-candles") {
+      await expect(page.locator(".trade-chart")).toHaveCount(0);
+    }
+
+    await clearResultThroughNavigation(page);
+    await openIndexedResult(page, replacementId);
+    await expect(page.locator(".results-metrics .metric-primary strong"))
+      .toHaveText("US$22.00");
+    const responsePath = oldPath;
+    const oldResponse = page.waitForResponse((response) => {
+      const requestUrl = new URL(response.url());
+      return requestUrl.origin === new URL(base).origin &&
+        requestUrl.pathname === responsePath &&
+        requestUrl.search === (
+          triple.scenario === "production-results-stale-trades"
+            ? F2B_STALE_TRADES_CURSOR_QUERY
+            : triple.scenario === "production-results-stale-candles"
+              ? F2B_STALE_CANDLES_CURSOR_QUERY
+              : ""
+        );
+    });
+    commandGate.release();
+    const delivered = await oldResponse;
+    await expect(delivered.status()).toBe(
+      triple.scenario === "production-results-stale-trades" ? 503 : 200
+    );
+    await flushDeliveredResponse(page, Promise.resolve(delivered));
+    expect(new URL(page.url()).searchParams.get("result")).toBe(replacementId);
+    await expect(page.locator(".results-metrics .metric-primary strong"))
+      .toHaveText("US$22.00");
+    await expect(page.locator("body")).not.toContainText("US$11.00");
+    await expect(page.locator("body")).not.toContainText("SENSITIVE_SENTINEL");
+    await expect(page.locator(".error-panel")).toHaveCount(0);
+    if (triple.scenario === "production-results-stale-detail") {
+      expect(counts.RT).toBe(0);
+      expect(counts.RC).toBe(0);
+    } else if (triple.scenario === "production-results-stale-trades") {
+      expect(counts.RT).toBe(1);
+      expect(counts.RC).toBe(0);
+    } else {
+      expect(counts.RC).toBe(2);
+      expect(counts.RT).toBe(0);
+      expect(F2B_STALE_CANDLES_FINAL.next_cursor).toBe(F2B_STALE_CANDLES_UNEXPECTED_CURSOR);
+      await expect(page.locator(".results-trades")).toContainText(`${replacementId}:0`);
+      await expect(page.locator(".results-trades")).not.toContainText(`${indexId}:0`);
+    }
+    return;
+  }
+
   if (triple.scenario === "direct-navigation") {
     const paths = {
-      results: "/?view=results&keep=1#anchor",
+      results: triple.server === "dev"
+        ? "/?view=results&demo=1&result=job-research-0042&keep=1#anchor"
+        : "/?view=results&keep=1#anchor",
       strategies: "/?view=strategies&keep=1#anchor",
-      trades: "/?view=trades&trade=trade-000184&keep=1#anchor"
+      trades: triple.server === "dev"
+        ? "/?view=trades&demo=1&result=job-research-0042&trade=trade-000184&keep=1#anchor"
+        : `/?view=trades&result=${BACKTEST_RESULT_ID}&trade=${encodeURIComponent(BACKTEST_TRADE_ID)}&keep=1#anchor`
     } as const;
     await open(paths[triple.caseId as keyof typeof paths]);
     if (triple.caseId === "strategies") {
       await waitForStrategy(page);
+    } else if (triple.caseId === "results" && triple.server === "dev") {
+      await expect(page.getByText("job-research-0042", { exact: true })).toBeVisible();
+    } else if (triple.caseId === "trades" && triple.server === "dev") {
+      await expect(page.getByText("trade-000184", { exact: true }).first()).toBeVisible();
+    } else if (triple.caseId === "trades" && triple.server === "production") {
+      await expect(page.getByText(BACKTEST_TRADE_ID, { exact: true }).first()).toBeVisible();
+      await expect(page.locator(".trade-chart canvas")).toBeVisible();
     } else {
       await expect(page.locator(".empty-panel")).toBeVisible();
     }
@@ -511,10 +1328,16 @@ async function exerciseScenario(
     expect(new URL(page.url()).searchParams.get("keep")).toBe("1");
     expect(new URL(page.url()).hash).toBe("#anchor");
     expect(new URL(page.url()).searchParams.get("trade")).toBe(
-      triple.caseId === "trades" ? "trade-000184" : null
+      triple.caseId === "trades"
+        ? triple.server === "production" ? BACKTEST_TRADE_ID : "trade-000184"
+        : null
     );
-    if (triple.caseId === "trades") {
-      await expect(page.getByText("trade-000184")).toHaveCount(0);
+    if (triple.caseId === "results" && triple.server === "dev") {
+      expect(new URL(page.url()).searchParams.get("result")).toBe("job-research-0042");
+    } else if (triple.caseId === "trades") {
+      expect(new URL(page.url()).searchParams.get("result")).toBe(
+        triple.server === "production" ? BACKTEST_RESULT_ID : "job-research-0042"
+      );
     }
     return;
   }
@@ -548,16 +1371,27 @@ async function exerciseScenario(
         return original(...args);
       };
     });
-    await open("/?view=results&demo=1&keep=1#anchor");
+    await open("/?view=results&demo=1&result=job-research-0042&keep=1#anchor");
+    expect(new URL(page.url()).searchParams.get("result")).toBe("job-research-0042");
+    expect(new URL(page.url()).searchParams.get("trade")).toBeNull();
     await page
       .getByRole("button", { name: /查看 K 線|Inspect candles/ })
       .first()
       .click();
     await expect.poll(() => new URL(page.url()).searchParams.get("view")).toBe("trades");
+    expect(new URL(page.url()).searchParams.get("result")).toBe("job-research-0042");
+    expect(new URL(page.url()).searchParams.get("trade")).toBe("trade-000184");
     await nav(page, 1).click();
+    await expect.poll(() => new URL(page.url()).searchParams.get("view")).toBe("results");
+    expect(new URL(page.url()).searchParams.get("result")).toBe("job-research-0042");
+    expect(new URL(page.url()).searchParams.get("trade")).toBeNull();
     await nav(page, 2).click();
     await waitForStrategy(page);
+    expect(new URL(page.url()).searchParams.get("result")).toBeNull();
+    expect(new URL(page.url()).searchParams.get("trade")).toBeNull();
     await nav(page, 0).click();
+    expect(new URL(page.url()).searchParams.get("result")).toBeNull();
+    expect(new URL(page.url()).searchParams.get("trade")).toBeNull();
     expect(
       await page.evaluate(
         () => (window as typeof window & { __replaceStateCount: number }).__replaceStateCount
@@ -571,7 +1405,7 @@ async function exerciseScenario(
   }
 
   if (triple.scenario === "demo-dev") {
-    await open("/?view=results&demo=1");
+    await open("/?view=results&demo=1&result=job-research-0042");
     await expect(page.getByText("job-research-0042", { exact: true })).toBeVisible();
     await page
       .getByRole("button", { name: /查看 K 線|Inspect candles/ })
@@ -583,8 +1417,15 @@ async function exerciseScenario(
   }
 
   if (triple.scenario === "demo-production-denied") {
-    await open(`/?view=${triple.caseId}&demo=1`);
-    await expect(page.locator(".empty-panel")).toBeVisible();
+    await open(triple.caseId === "results"
+      ? "/?view=results&demo=1"
+      : `/?view=trades&demo=1&result=${BACKTEST_RESULT_ID}&trade=${encodeURIComponent(BACKTEST_TRADE_ID)}`);
+    if (triple.caseId === "results") {
+      await expect(page.locator(".empty-panel")).toBeVisible();
+    } else {
+      await expect(page.getByText(BACKTEST_TRADE_ID, { exact: true }).first()).toBeVisible();
+      await expect(page.locator(".trade-chart canvas")).toBeVisible();
+    }
     await expect(page.getByText("job-research-0042")).toHaveCount(0);
     await expect(page.getByText("trade-000184")).toHaveCount(0);
     return;
@@ -686,7 +1527,7 @@ async function exerciseScenario(
       return;
     }
 
-    await open("/?view=results&demo=1");
+    await open("/?view=results&demo=1&result=job-research-0042");
     await page.locator("#language").selectOption("en");
     await expect(page.getByText(/07\/28\/2026.*16:30.*GMT\+2/).first()).toBeVisible();
     await expect(page.getByText("Jul 2026", { exact: true })).toBeVisible();
@@ -714,9 +1555,13 @@ async function exerciseScenario(
 
   const responsivePaths = {
     research: "/",
-    results: "/?view=results&demo=1",
+    results: triple.server === "dev"
+      ? "/?view=results&demo=1&result=job-research-0042"
+      : "/?view=results&demo=1",
     strategies: "/?view=strategies",
-    trades: "/?view=trades&demo=1&trade=trade-000184"
+    trades: triple.server === "dev"
+      ? "/?view=trades&demo=1&result=job-research-0042&trade=trade-000184"
+      : `/?view=trades&demo=1&result=${BACKTEST_RESULT_ID}&trade=${encodeURIComponent(BACKTEST_TRADE_ID)}`
   } as const;
   await open(responsivePaths[triple.caseId as keyof typeof responsivePaths]);
   if (triple.caseId === "research") {
@@ -724,14 +1569,19 @@ async function exerciseScenario(
   } else if (triple.caseId === "strategies") {
     await waitForStrategy(page);
   } else if (triple.server === "production") {
-    await expect(page.locator(".empty-panel")).toBeVisible();
-    await expect(page.getByText("job-research-0042")).toHaveCount(0);
-    await expect(page.getByText("trade-000184")).toHaveCount(0);
+    if (triple.caseId === "results") {
+      await expect(page.locator(".empty-panel")).toBeVisible();
+      await expect(page.getByText("job-research-0042")).toHaveCount(0);
+    } else {
+      await expect(page.getByText(BACKTEST_TRADE_ID, { exact: true }).first()).toBeVisible();
+      await expect(page.locator(".trade-chart canvas")).toBeVisible();
+    }
   } else {
     if (triple.caseId === "results") {
       await expect(page.getByText("job-research-0042", { exact: true })).toBeVisible();
     } else {
       await expect(page.getByText("trade-000184", { exact: true }).first()).toBeVisible();
+      await expect(page.locator(".trade-chart canvas")).toBeVisible();
     }
   }
   expect(
@@ -755,23 +1605,39 @@ async function runTriple(
   const observedCounts: MutableRouteCounts = { ...ZERO_COUNTS };
   const moduleRequests: string[] = [];
   const failures: string[] = [];
+  const expectedApiFailures: string[] = [];
+  let releaseEventRequests = () => {};
   const commandGate =
-    triple.scenario === "strategy-command" ? createCommandGate() : null;
+    triple.scenario === "strategy-command" ||
+    triple.scenario === "production-results-flow" ||
+    triple.scenario.startsWith("production-results-stale-")
+      ? createCommandGate()
+      : null;
   let documents = 0;
   try {
-    await installApiFixtures(
+    releaseEventRequests = await installApiFixtures(
       context,
       observedCounts,
       commandGate,
-      BASE_URLS[triple.server]
+      BASE_URLS[triple.server],
+      triple.scenario
     );
     const page = await context.newPage();
     page.on("console", (message) => {
       if (message.type() === "error") {
         const location = message.location();
-        failures.push(
-          `console:${message.text()}:${location.url}:${location.lineNumber}:${location.columnNumber}`
+        const expected = expectedApiStatusFailure(
+          triple.scenario,
+          message,
+          BASE_URLS[triple.server]
         );
+        if (expected) {
+          expectedApiFailures.push(expected);
+        } else {
+          failures.push(
+            `console:${message.text()}:${location.url}:${location.lineNumber}:${location.columnNumber}`
+          );
+        }
       }
     });
     page.on("pageerror", (error) => failures.push(`pageerror:${error.message}`));
@@ -791,10 +1657,13 @@ async function runTriple(
       await page.evaluate(() => Intl.DateTimeFormat().resolvedOptions().timeZone)
     ).toBe(BROWSER_TIME_ZONE);
 
-    await exerciseScenario(page, triple, moduleRequests, commandGate);
+    await exerciseScenario(page, triple, moduleRequests, observedCounts, commandGate, testInfo);
     const key = tripleKey(triple);
-    expect(observedCounts).toEqual(EXPECTED_REQUEST_COUNTS[key]);
+    expect(observedCounts).toEqual({ ...ZERO_COUNTS, ...EXPECTED_REQUEST_COUNTS[key] });
     expect(documents).toBe(EXPECTED_DOCUMENT_COUNTS[key]);
+    expect(expectedApiFailures.sort()).toEqual(
+      [...(EXPECTED_API_STATUS_DIAGNOSTICS[triple.scenario] ?? [])].sort()
+    );
     expect(failures).toEqual([]);
     await page.screenshot({
       path: testInfo.outputPath(
@@ -803,6 +1672,8 @@ async function runTriple(
       fullPage: true
     });
   } finally {
+    commandGate?.release();
+    releaseEventRequests();
     await context.close();
   }
 }
@@ -862,19 +1733,22 @@ for (const view of ["strategies", "research"] as const) {
         }
       });
       await page.goto(`http://127.0.0.1:4174/?view=${view}`);
+      const primaryAlert = view === "research"
+        ? page.locator("section.error-panel[role=alert]")
+        : page.getByRole("alert");
       const success = scenario === "read-only" || scenario === "operator";
       if (success) {
         await expect(page.getByText(view === "strategies" ? "active-strategy" : "candidate-a", { exact: true }).first()).toBeVisible();
       } else {
-        await expect(page.getByRole("alert")).toBeVisible();
+        await expect(primaryAlert).toBeVisible();
       }
       for (const locale of ["en", "zh-TW"]) {
         await page.locator("#language").selectOption(locale);
         if (!success) {
-          await expect(page.getByRole("alert")).not.toContainText("SENSITIVE_SENTINEL");
-          expect((await page.getByRole("alert").innerText()).length).toBeLessThan(350);
+          await expect(primaryAlert).not.toContainText("SENSITIVE_SENTINEL");
+          expect((await primaryAlert.innerText()).length).toBeLessThan(350);
           if (["401", "403", "session-denied"].includes(scenario)) {
-            await expect(page.getByRole("alert")).toContainText(locale === "en" ? "This session cannot" : "目前工作階段沒有");
+            await expect(primaryAlert).toContainText(locale === "en" ? "This session cannot" : "目前工作階段沒有");
           }
         } else if (view === "strategies") {
           if (scenario === "read-only") {

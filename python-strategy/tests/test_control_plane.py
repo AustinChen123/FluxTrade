@@ -1262,6 +1262,7 @@ def test_control_plane_promotes_gene_and_retires_previous_champion(tmp_path):
     )
 
     assert response.status_code == 200
+    assert response.body["scope"] == "RESEARCH_CANDIDATE_ONLY"
     assert response.body["gene"]["gene_id"] == challenger_id
     assert response.body["gene"]["role"] == "champion"
     assert response.body["gene"]["retired_gene_ids"] == [champion_id]
@@ -2635,6 +2636,7 @@ def test_production_control_plane_wiring_has_no_missing_dependency_503(tmp_path)
         if response.status_code == 503
     }
     assert unexpected_503s == {}
+    assert responses["promote_gene"].body == {"error": "gene_not_found"}
     assert responses["submit_parameter_search"].status_code == 202
     assert responses["submit_parameter_preset"].status_code == 202
     assert responses["submit_strategy_command"].status_code == 202
