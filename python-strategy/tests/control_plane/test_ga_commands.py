@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from concurrent.futures import Future, ThreadPoolExecutor
 from copy import deepcopy
 from threading import Barrier
@@ -374,7 +375,11 @@ def test_service_commands_commit_once_and_replay_original_snapshot(
     assert len(dispatched) == expected_dispatches
 
 
-def test_dispatch_failure_keeps_accepted_receipt_and_replay_does_not_reschedule(caplog):
+def test_dispatch_failure_keeps_accepted_receipt_and_replay_does_not_reschedule(
+    caplog, monkeypatch
+):
+    logger = logging.getLogger("src.control_plane.ga_commands")
+    monkeypatch.setattr(logger, "disabled", False)
     store = InMemoryJobStore()
     request = {
         "kind": "parameter_search",
