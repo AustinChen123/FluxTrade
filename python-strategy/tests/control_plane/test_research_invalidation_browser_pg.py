@@ -321,9 +321,7 @@ def test_real_https_browser_reconnect_refreshes_missed_pg_epoch(
         identity_headers = {
             "Origin": origin,
             "Tailscale-User-Login": "research-browser@example.invalid",
-            "Tailscale-App-Capabilities": json.dumps(
-                {_OPERATOR: [{}], _STEP_UP: [{}]}
-            ),
+            "Tailscale-App-Capabilities": json.dumps({_OPERATOR: [{}], _STEP_UP: [{}]}),
         }
         status, response_headers, session_body = _https_json(
             port,
@@ -347,9 +345,7 @@ def test_real_https_browser_reconnect_refreshes_missed_pg_epoch(
             "Origin": origin,
             "Cookie": cookie_pair,
             "Tailscale-User-Login": "research-browser@example.invalid",
-            "Tailscale-App-Capabilities": json.dumps(
-                {_OPERATOR: [{}], _STEP_UP: [{}]}
-            ),
+            "Tailscale-App-Capabilities": json.dumps({_OPERATOR: [{}], _STEP_UP: [{}]}),
             "X-CSRF-Token": csrf_token,
             "Content-Type": "application/json",
             "Idempotency-Key": "browser-reconnect-initial",
@@ -538,7 +534,9 @@ def test_real_https_browser_reconnect_refreshes_missed_pg_epoch(
                 session.scalars(
                     select(SystemEvent).where(
                         SystemEvent.event_type.in_(["gene_promote", "gene_retire"]),
-                        SystemEvent.related_gene_id.in_([prior_gene_id, promoted_gene_id]),
+                        SystemEvent.related_gene_id.in_(
+                            [prior_gene_id, promoted_gene_id]
+                        ),
                     )
                 ).all()
             )
