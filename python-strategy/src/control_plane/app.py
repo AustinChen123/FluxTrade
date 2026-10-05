@@ -841,7 +841,10 @@ class ControlPlaneApp:
         except KeyError:
             return HttpResponse(404, {"error": "gene_not_found"})
 
-        return HttpResponse(200, {"gene": result})
+        return HttpResponse(
+            200,
+            {"scope": "RESEARCH_CANDIDATE_ONLY", "gene": result},
+        )
 
     def _list_genes(self, query: dict[str, list[str]]) -> HttpResponse:
         if self.gene_control is None:

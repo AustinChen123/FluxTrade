@@ -464,6 +464,7 @@ def test_browser_gene_promotion_ignores_body_actor():
     )
 
     assert response.status_code == 200
+    assert response.body["scope"] == "RESEARCH_CANDIDATE_ONLY"
     gene_control.promote_gene.assert_called_once_with(
         7,
         reason="approved",
