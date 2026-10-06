@@ -6,6 +6,9 @@ from src.core.interfaces.exchange import (
     ExchangeOrderEvent,
     ExchangeOrderSnapshot,
 )
+from src.core.adapters.rithmic_order_status import (
+    _normalize_snapshot_status as _normalize_snapshot_status,
+)
 
 
 class RithmicUnmappedOrderEvent(ExchangeError):
@@ -113,39 +116,3 @@ def project_rithmic_order_event(
 
 def _event_decimal(value: object) -> Decimal | None:
     return Decimal(str(value)) if value is not None else None
-
-
-def _normalize_snapshot_status(
-    status: str,
-    filled_quantity: Decimal,
-    quantity: Decimal,
-    *,
-    notification_type: str | None = None,
-) -> str:
-    normalized = status.strip().lower().replace("-", "_").replace(" ", "_")
-    notification = str(notification_type or "").strip().upper()
-    if quantity <= 0 or filled_quantity < 0 or filled_quantity > quantity:
-        raise ExchangeError("invalid_rithmic_order_snapshot_quantities")
-    if notification == "CANCEL":
-        if filled_quantity == quantity:
-            raise ExchangeError("invalid_rithmic_cancel_snapshot_quantities")
-        return "cancelled"
-    if notification == "REJECT":
-        if filled_quantity == quantity:
-            raise ExchangeError("invalid_rithmic_reject_snapshot_quantities")
-        return "rejected"
-    if normalized in {"open", "open_pending", "new", "submitted", "accepted"}:
-        return "partially_filled" if filled_quantity > 0 else "open"
-    if normalized in {"partial", "partially_filled", "partiallyfilled"}:
-        if Decimal("0") < filled_quantity < quantity:
-            return "partially_filled"
-    elif normalized in {"complete", "completed", "filled"}:
-        if filled_quantity == quantity:
-            return "filled"
-    elif normalized in {"cancel", "canceled", "cancelled"}:
-        return "cancelled"
-    elif normalized in {"reject", "rejected", "failed", "expired"}:
-        return "rejected"
-    raise ExchangeError(
-        f"unsupported_rithmic_order_snapshot_status: status={normalized}"
-    )

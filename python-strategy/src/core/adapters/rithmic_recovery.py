@@ -4,6 +4,10 @@ from importlib import import_module
 from typing import Iterable, Protocol, TypeVar, cast
 
 from src.core.adapters.rithmic_native_bracket import native_bracket_leg_type
+from src.core.adapters.rithmic_order_status import (
+    _normalize_status as _normalize_status,
+    rithmic_order_may_be_working as rithmic_order_may_be_working,
+)
 from src.core.interfaces.exchange import ExchangeOrderEvent
 from src.core.product_registry import to_rithmic_symbol
 
@@ -475,40 +479,6 @@ def _classify_order(
     )
 
 
-def _normalize_status(
-    status: str,
-    cumulative_quantity: Decimal,
-    order_quantity: Decimal,
-    *,
-    notification_type: str | None = None,
-) -> str | None:
-    normalized = (status or "").strip().lower()
-    notification = str(notification_type or "").strip().upper()
-    if notification == "CANCEL":
-        return "cancelled" if cumulative_quantity < order_quantity else None
-    if notification == "REJECT":
-        return "failed" if cumulative_quantity < order_quantity else None
-    if normalized in {"open", "new", "submitted", "accepted", "modified"}:
-        if cumulative_quantity >= order_quantity:
-            return None
-        return "partially_filled" if cumulative_quantity > 0 else "open"
-    if normalized in {"partial", "partially_filled", "partiallyfilled"}:
-        return (
-            "partially_filled"
-            if Decimal("0") < cumulative_quantity < order_quantity
-            else None
-        )
-    if normalized in {"filled", "closed"}:
-        return "filled" if cumulative_quantity == order_quantity else None
-    if normalized in {"canceled", "cancelled"}:
-        return "cancelled"
-    if normalized in {"rejected", "expired", "failed"}:
-        return "failed"
-    if normalized == "complete":
-        return "filled" if cumulative_quantity == order_quantity else None
-    return None
-
-
 def _normalize_transaction_type(value: str) -> str | None:
     normalized = (value or "").strip().upper()
     if normalized == "BUY":
@@ -516,31 +486,6 @@ def _normalize_transaction_type(value: str) -> str | None:
     if normalized in {"SELL", "SS"}:
         return "sell"
     return None
-
-
-def rithmic_order_may_be_working(remote: _LedgerOrder) -> bool:
-    notification = str(getattr(remote, "notification_type", None) or "").strip().upper()
-    quantity = _decimal(getattr(remote, "quantity", None))
-    filled = _decimal(getattr(remote, "filled_quantity", None))
-    status = str(getattr(remote, "status", None) or "").strip().lower()
-    if notification == "COMPLETE" and status in {"complete", "completed"}:
-        return False
-    if notification in {"CANCEL", "REJECT"} or status in {
-        "cancel",
-        "canceled",
-        "cancelled",
-        "reject",
-        "rejected",
-        "expired",
-        "failed",
-    }:
-        return not (quantity > 0 and filled < quantity)
-    if quantity > 0 and filled == quantity:
-        return not (
-            notification == "FILL"
-            or status in {"complete", "completed", "filled", "closed"}
-        )
-    return True
 
 
 def _event_matches_local(order: _RecoveryOrder, event: ExchangeOrderEvent) -> bool:
