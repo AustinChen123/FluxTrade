@@ -67,19 +67,19 @@ def event(**overrides):
     [
         ("OPEN", "0", "open"),
         ("OPEN", "1", "partially_filled"),
-        ("OPEN", "2", "partially_filled"),
+        ("OPEN", "2", None),
         ("OPEN_PENDING", "0", "open"),
         ("OPEN_PENDING", "1", "partially_filled"),
-        ("OPEN_PENDING", "2", "partially_filled"),
+        ("OPEN_PENDING", "2", None),
         ("NEW", "0", "open"),
         ("NEW", "1", "partially_filled"),
-        ("NEW", "2", "partially_filled"),
+        ("NEW", "2", None),
         ("SUBMITTED", "0", "open"),
         ("SUBMITTED", "1", "partially_filled"),
-        ("SUBMITTED", "2", "partially_filled"),
+        ("SUBMITTED", "2", None),
         ("ACCEPTED", "0", "open"),
         ("ACCEPTED", "1", "partially_filled"),
-        ("ACCEPTED", "2", "partially_filled"),
+        ("ACCEPTED", "2", None),
         ("open pending", "1", "partially_filled"),
         ("open-pending", "1", "partially_filled"),
         ("PARTIAL", "1", "partially_filled"),
@@ -91,30 +91,39 @@ def event(**overrides):
         ("FILLED", "2", "filled"),
         ("CANCEL", "0", "cancelled"),
         ("CANCEL", "1", "cancelled"),
-        ("CANCEL", "2", "cancelled"),
+        ("CANCEL", "2", None),
         ("CANCELED", "0", "cancelled"),
         ("CANCELED", "1", "cancelled"),
-        ("CANCELED", "2", "cancelled"),
+        ("CANCELED", "2", None),
         ("CANCELLED", "0", "cancelled"),
         ("CANCELLED", "1", "cancelled"),
-        ("CANCELLED", "2", "cancelled"),
+        ("CANCELLED", "2", None),
         ("REJECT", "0", "rejected"),
         ("REJECT", "1", "rejected"),
-        ("REJECT", "2", "rejected"),
+        ("REJECT", "2", None),
         ("REJECTED", "0", "rejected"),
         ("REJECTED", "1", "rejected"),
-        ("REJECTED", "2", "rejected"),
+        ("REJECTED", "2", None),
         ("FAILED", "0", "rejected"),
         ("FAILED", "1", "rejected"),
-        ("FAILED", "2", "rejected"),
+        ("FAILED", "2", None),
         ("EXPIRED", "0", "rejected"),
         ("EXPIRED", "1", "rejected"),
-        ("EXPIRED", "2", "rejected"),
+        ("EXPIRED", "2", None),
         ("cancelled", "1", "cancelled"),
         ("rejected", "1", "rejected"),
     ],
 )
 def test_snapshot_status_alias_ledger_is_literal(status, filled, expected):
+    if expected is None:
+        with pytest.raises(
+            ExchangeError, match="unsupported_rithmic_order_snapshot_status"
+        ):
+            project_rithmic_order_snapshot(
+                snapshot(status=status, filled_quantity=filled),
+                account_id=ACCOUNT_ID,
+            )
+        return
     projected = project_rithmic_order_snapshot(
         snapshot(status=status, filled_quantity=filled),
         account_id=ACCOUNT_ID,
@@ -331,15 +340,14 @@ def test_snapshot_uses_configured_account_and_preserves_raw_provider_values():
     )
 
 
-def test_snapshot_missing_fill_is_the_existing_scale_free_zero():
-    projected = project_rithmic_order_snapshot(
-        snapshot(filled_quantity=None, average_fill_price=None),
-        account_id=ACCOUNT_ID,
-    )
-
-    assert projected.filled_quantity is not None
-    assert projected.filled_quantity.as_tuple() == Decimal("0").as_tuple()
-    assert projected.average_price is None
+def test_snapshot_missing_fill_stays_unresolved_instead_of_becoming_zero():
+    with pytest.raises(
+        ExchangeError, match="unsupported_rithmic_order_snapshot_status"
+    ):
+        project_rithmic_order_snapshot(
+            snapshot(filled_quantity=None, average_fill_price=None),
+            account_id=ACCOUNT_ID,
+        )
 
 
 @pytest.mark.parametrize("missing_field", ["quantity", "filled_quantity", "status"])

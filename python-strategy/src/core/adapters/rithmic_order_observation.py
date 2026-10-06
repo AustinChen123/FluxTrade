@@ -8,6 +8,7 @@ from src.core.interfaces.exchange import (
 )
 from src.core.adapters.rithmic_order_status import (
     _normalize_snapshot_status as _normalize_snapshot_status,
+    _status_decimal as _status_decimal,
 )
 
 
@@ -30,12 +31,13 @@ def project_rithmic_order_snapshot(
     account_id: str,
 ) -> ExchangeOrderSnapshot:
     quantity = Decimal(str(getattr(remote, "quantity")))
-    filled_quantity = _event_decimal(getattr(remote, "filled_quantity")) or Decimal("0")
+    filled_quantity = _event_decimal(getattr(remote, "filled_quantity"))
     status = _normalize_snapshot_status(
         str(getattr(remote, "status")),
         filled_quantity,
         quantity,
         notification_type=getattr(remote, "notification_type", None),
+        unfilled_quantity=_status_decimal(getattr(remote, "unfilled_quantity", None)),
     )
     basket_id = getattr(remote, "basket_id")
     if type(basket_id) is not str or not str.strip(basket_id):

@@ -18,10 +18,13 @@ from src.core.adapters.rithmic_recovery import (
     load_rithmic_recovery_snapshot,
     rithmic_order_may_be_working,
 )
+from src.core.adapters.rithmic_order_observation import (
+    project_rithmic_order_snapshot,
+)
 from src.core.adapters.rithmic_owned_order_reconciliation import (
     RithmicOwnedOrderReconciler,
 )
-from src.core.interfaces.exchange import OwnedOrderReconciliationContext
+from src.core.interfaces.exchange import ExchangeError, OwnedOrderReconciliationContext
 
 
 SAFE_SNAPSHOT_FAILURES = [
@@ -367,7 +370,6 @@ def snapshot(
                 status="complete",
                 notification_type="COMPLETE",
                 filled_quantity=None,
-                completion_reason="FA",
             ),
             False,
         ),
@@ -392,6 +394,7 @@ def snapshot(
                 status="OPEN",
                 notification_type="FILL",
                 filled_quantity="2",
+                unfilled_quantity="0",
             ),
             False,
         ),
@@ -407,6 +410,81 @@ def snapshot(
 )
 def test_rithmic_order_working_classifier_is_fail_closed(remote, expected):
     assert rithmic_order_may_be_working(remote) is expected
+
+
+@pytest.mark.parametrize(
+    (
+        "status",
+        "notification",
+        "filled",
+        "unfilled",
+        "snapshot_status",
+        "recovery_status",
+        "working",
+    ),
+    [
+        ("OPEN_PENDING", "OPEN_PENDING", "0", "2", "open", "open", True),
+        ("cancelled", "CANCEL", None, None, None, None, True),
+        ("cancelled", "CANCEL", "0", "2", "cancelled", "cancelled", False),
+        ("complete", "COMPLETE", None, None, None, None, False),
+        ("complete", "COMPLETE", "0", "2", None, None, False),
+        ("complete", "COMPLETE", "1", "1", None, None, False),
+        ("UNKNOWN", "FILL", None, None, None, None, True),
+        ("UNKNOWN", "FILL", "0", "2", None, None, True),
+        (
+            "UNKNOWN",
+            "FILL",
+            "1",
+            "1",
+            "partially_filled",
+            "partially_filled",
+            True,
+        ),
+        ("UNKNOWN", "FILL", "2", "0", "filled", "filled", False),
+        ("UNKNOWN", "FILL", "2", None, "filled", "filled", False),
+        ("UNKNOWN", "FILL", "1", "0", None, None, True),
+        ("UNKNOWN", "FILL", "2", "1", None, None, True),
+    ],
+)
+def test_snapshot_recovery_and_working_share_status_interpretation(
+    status,
+    notification,
+    filled,
+    unfilled,
+    snapshot_status,
+    recovery_status,
+    working,
+):
+    remote = remote_order(
+        status=status,
+        notification_type=notification,
+        filled_quantity=filled,
+        unfilled_quantity=unfilled,
+        average_fill_price=(
+            "20000.25" if filled is not None and Decimal(filled) > 0 else None
+        ),
+    )
+    if snapshot_status is None:
+        with pytest.raises(
+            ExchangeError, match="unsupported_rithmic_order_snapshot_status"
+        ):
+            project_rithmic_order_snapshot(remote, account_id="ACCOUNT-A")
+    else:
+        assert (
+            project_rithmic_order_snapshot(remote, account_id="ACCOUNT-A").status
+            == snapshot_status
+        )
+
+    plan, external = build_rithmic_recovery_plan(
+        [local_order()], snapshot(orders=[remote])
+    )
+    assert external == []
+    if recovery_status is None:
+        assert plan[0].classification == "unresolved"
+        assert plan[0].event is None
+    else:
+        assert recovery_event(plan[0]).status == recovery_status
+    assert rithmic_order_may_be_working(remote) is working
 
 
 @pytest.mark.parametrize(
@@ -789,6 +867,7 @@ def test_remote_only_terminal_orders_do_not_trigger_external_order_lockdown():
                     status="complete",
                     notification_type="FILL",
                     filled_quantity="2",
+                    unfilled_quantity="0",
                 ),
                 remote_order(
                     basket_id="status-cancelled-1",
@@ -974,6 +1053,7 @@ def test_native_child_is_recovered_without_parent_in_local_active_set():
         price_type="stop_market",
         transaction_type="SELL",
         quantity="1",
+        unfilled_quantity="1",
         trigger_price="19998.25",
         bracket_type="stop_only_static",
     )
@@ -1086,6 +1166,7 @@ def test_unexpected_extra_native_leg_is_reported_external():
             price_type="stop_market",
             transaction_type="SELL",
             quantity="1",
+            unfilled_quantity="1",
         ),
         remote_order(
             client_order_id=parent_client_id,
@@ -1094,6 +1175,7 @@ def test_unexpected_extra_native_leg_is_reported_external():
             price_type="limit",
             transaction_type="SELL",
             quantity="1",
+            unfilled_quantity="1",
         ),
     ]
 
@@ -1128,6 +1210,7 @@ def test_native_children_sharing_parent_user_tag_do_not_duplicate_parent_identit
             client_order_id=parent_client_id,
             basket_id="parent-1",
             quantity="1",
+            unfilled_quantity="1",
         ),
         remote_order(
             client_order_id=parent_client_id,
@@ -1136,6 +1219,7 @@ def test_native_children_sharing_parent_user_tag_do_not_duplicate_parent_identit
             price_type="stop_market",
             transaction_type="SELL",
             quantity="1",
+            unfilled_quantity="1",
         ),
         remote_order(
             client_order_id=parent_client_id,
@@ -1144,6 +1228,7 @@ def test_native_children_sharing_parent_user_tag_do_not_duplicate_parent_identit
             price_type="limit",
             transaction_type="SELL",
             quantity="1",
+            unfilled_quantity="1",
         ),
     ]
 

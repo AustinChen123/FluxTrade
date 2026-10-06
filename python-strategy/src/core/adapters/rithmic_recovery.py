@@ -428,11 +428,17 @@ def _classify_order(
             status = "partially_filled"
             unresolved = True
     else:
+        status_quantity = (
+            cumulative_quantity if remote.filled_quantity is not None or fills else None
+        )
         status = _normalize_status(
             remote.status,
-            cumulative_quantity,
+            status_quantity,
             order_quantity,
             notification_type=getattr(remote, "notification_type", None),
+            unfilled_quantity=_status_decimal(
+                getattr(remote, "unfilled_quantity", None)
+            ),
         )
         if status is None:
             return _blocked(order, "unknown_rithmic_order_status")
