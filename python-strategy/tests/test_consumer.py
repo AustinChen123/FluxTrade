@@ -10,10 +10,13 @@ Covers:
 """
 
 import json
+import logging
 from decimal import Decimal
+from io import StringIO
 from unittest.mock import MagicMock, call, patch
 
 import pytest
+import structlog
 
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import RedisError, ResponseError
@@ -923,9 +926,13 @@ class TestDeliverySemantics:
         _install_redis_client(consumer, redis)
         consumer.running = True
 
-        with pytest.raises(MarketStreamPendingError, match="market callback failed"):
+        with pytest.raises(
+            MarketStreamPendingError, match="market callback failed"
+        ) as failure:
             consumer._consume_loop()
 
+        assert getattr(failure.value, "_diagnostic_stage") == "market_delivery"
+        assert isinstance(failure.value.__cause__, RuntimeError)
         assert redis.requested_counts == [1]
         assert redis.pending == 1
         assert len(redis.messages) == 1
@@ -1090,6 +1097,7 @@ class TestDeliverySemantics:
         callback = MagicMock()
         with patch("src.core.consumer.create_redis_client", return_value=mock_redis):
             consumer = DataConsumer(channels=[stream], on_message_callback=callback)
+        consumer._callback_failure_diagnostic = {"signature": ("old",)}
         mock_redis.set.return_value = True
         mock_redis.get.side_effect = lambda _key: consumer._ownership_token
         message_id = "1704067200000-0"
@@ -1124,6 +1132,7 @@ class TestDeliverySemantics:
 
         callback.assert_called_once()
         assert mock_redis.xack.call_count == 2
+        assert consumer._callback_failure_diagnostic is None
         assert consumer._completed_pending == set()
         assert consumer._blocked_streams == set()
 
@@ -1320,11 +1329,13 @@ class TestDeliverySemantics:
         with pytest.raises(
             MarketStreamPendingError,
             match="pending market callback failed",
-        ):
+        ) as failure:
             consumer._ensure_no_abandoned_pending([stream])
 
         assert redis.pending == 1
         assert redis.acked == []
+        assert getattr(failure.value, "_diagnostic_stage") == "pending_replay"
+        assert isinstance(failure.value.__cause__, RuntimeError)
 
     def test_redis_error_invalidates_consumer_group_cache(self, mock_redis):
         with patch("src.core.consumer.create_redis_client", return_value=mock_redis):
@@ -1526,3 +1537,112 @@ class TestConsumerStop:
         """stop() should close the Redis connection."""
         consumer.stop()
         mock_redis.close.assert_called_once()
+
+
+class TestCallbackFailureDiagnostics:
+    def test_sanitized_cause_survives_production_json_formatter(
+        self, consumer, monkeypatch
+    ):
+        output = StringIO()
+        handler = logging.StreamHandler(output)
+        handler.setFormatter(
+            structlog.stdlib.ProcessorFormatter(
+                processors=[
+                    structlog.stdlib.ProcessorFormatter.remove_processors_meta,
+                    structlog.processors.JSONRenderer(),
+                ],
+                foreign_pre_chain=[structlog.stdlib.PositionalArgumentsFormatter()],
+            )
+        )
+        logger = logging.getLogger("src.core.consumer")
+        old_handlers, old_propagate, old_level = (
+            logger.handlers[:],
+            logger.propagate,
+            logger.level,
+        )
+        logger.handlers = [handler]
+        logger.propagate = False
+        logger.setLevel(logging.ERROR)
+        try:
+            try:
+                raise ValueError("provider secret token=DO_NOT_LOG")
+            except ValueError as cause:
+                raise RuntimeError("payload account=DO_NOT_LOG") from cause
+        except RuntimeError as error:
+            consumer._record_callback_failure(
+                "pending_replay", "_recover_abandoned_pending", error
+            )
+        finally:
+            logger.handlers = old_handlers
+            logger.propagate = old_propagate
+            logger.setLevel(old_level)
+
+        record = json.loads(output.getvalue())
+        event = record["event"]
+        assert "consumer_callback_failure" in event
+        diagnostic = json.loads(event.split("consumer_callback_failure ", 1)[1])
+        assert diagnostic["stage"] == "pending_replay"
+        assert diagnostic["exception_types"] == ["RuntimeError", "ValueError"]
+        assert diagnostic["location"] == (
+            "src/core/consumer.py:_recover_abandoned_pending"
+        )
+        assert diagnostic["repeat_count"] == 0
+        assert "DO_NOT_LOG" not in output.getvalue()
+
+    def test_suppresses_identical_failure_and_emits_summary_at_window(
+        self, consumer, monkeypatch
+    ):
+        now = [10.0]
+        logged = []
+        monkeypatch.setattr("src.core.consumer.time.monotonic", lambda: now[0])
+        monkeypatch.setattr(
+            "src.core.consumer.logger.error", lambda *args: logged.append(args)
+        )
+        first = RuntimeError("secret one")
+        same_type = RuntimeError("secret two")
+
+        consumer._record_callback_failure("market_delivery", "_consume_loop", first)
+        now[0] = 69.999
+        consumer._record_callback_failure("market_delivery", "_consume_loop", same_type)
+        assert len(logged) == 1
+        now[0] = 70.0
+        consumer._record_callback_failure("market_delivery", "_consume_loop", same_type)
+        assert len(logged) == 2
+        summary = json.loads(logged[-1][1])
+        assert summary["repeat_count"] == 2
+        assert summary["first_exception_types"] == ["RuntimeError"]
+
+    def test_changed_cause_or_stage_emits_immediately_and_success_resets(
+        self, consumer
+    ):
+        logged = []
+        with patch(
+            "src.core.consumer.logger.error",
+            side_effect=lambda *args: logged.append(args),
+        ):
+            consumer._record_callback_failure(
+                "market_delivery", "_consume_loop", RuntimeError("one")
+            )
+            consumer._record_callback_failure(
+                "pending_replay", "_recover_abandoned_pending", RuntimeError("two")
+            )
+            assert len(logged) == 2
+            consumer._record_callback_failure(
+                "pending_replay", "_recover_abandoned_pending", ValueError("three")
+            )
+            assert len(logged) == 3
+            consumer._reset_callback_failure_diagnostic()
+            consumer._record_callback_failure(
+                "pending_replay", "_recover_abandoned_pending", ValueError("three")
+            )
+        assert len(logged) == 4
+        assert json.loads(logged[-1][1])["repeat_count"] == 0
+
+    def test_logging_failure_is_swallowed(self, consumer, monkeypatch):
+        monkeypatch.setattr(
+            "src.core.consumer.logger.error",
+            MagicMock(side_effect=RuntimeError("logging failed")),
+        )
+        consumer._record_callback_failure(
+            "market_delivery", "_consume_loop", RuntimeError("callback failed")
+        )

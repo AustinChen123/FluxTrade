@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import socket
 import threading
 import time
@@ -28,6 +29,8 @@ MAX_BACKOFF = 300.0
 MAX_RETRIES = 10
 DEFAULT_PENDING_CLAIM_IDLE_MS = 60_000
 DEFAULT_OWNERSHIP_LEASE_MS = 10_000
+CALLBACK_FAILURE_LOG_INTERVAL_SECONDS = 60.0
+_SAFE_EXCEPTION_TYPE = re.compile(r"[^A-Za-z0-9_.-]")
 XAUTOCLAIM_WITH_QUARANTINE = """
 if redis.call('GET', KEYS[3]) ~= ARGV[1] then
     return {0}
@@ -179,6 +182,7 @@ class DataConsumer:
         )
         self._initialized_channels: set[str] = set()
         self._completed_pending: set[tuple[str, str]] = set()
+        self._callback_failure_diagnostic: dict[str, Any] | None = None
         self._blocked_streams: set[str] = set()
         self._registered_streams: set[str] = set()
         self._existing_group_streams_scanned = False
@@ -349,10 +353,19 @@ class DataConsumer:
                 # operator/recovery workflow may resolve the pending delivery;
                 # the next loop rechecks the group before consumption resumes.
                 self._initialized_channels.clear()
-                logger.critical(
-                    "Market stream blocked by ambiguous delivery: %s",
-                    e,
-                )
+                stage = getattr(e, "_diagnostic_stage", "pending_delivery")
+                if stage not in {
+                    "pending_delivery",
+                    "pending_replay",
+                    "market_delivery",
+                }:
+                    stage = "pending_delivery"
+                location = {
+                    "pending_delivery": "start",
+                    "pending_replay": "_recover_abandoned_pending",
+                    "market_delivery": "_consume_loop",
+                }[stage]
+                self._record_callback_failure(stage, location, e.__cause__)
                 if self._stop_requested.wait(INITIAL_BACKOFF):
                     break
             except RedisConnectionError as e:
@@ -581,14 +594,18 @@ class DataConsumer:
             try:
                 self.pending_replay_callback(model)
             except Exception as exc:
-                raise MarketStreamPendingError(
+                pending_error = MarketStreamPendingError(
                     f"pending market callback failed {stream_key}:{message_id}"
-                ) from exc
+                )
+                setattr(pending_error, "_diagnostic_stage", "pending_replay")
+                raise pending_error from exc
             self._assert_ownership()
             self._completed_pending.add((stream_key, message_id))
             self._ack_message(stream_key, message_id)
             self._completed_pending.discard((stream_key, message_id))
             self._blocked_streams.discard(stream_key)
+            self._reset_callback_failure_diagnostic()
+
     def _ensure_no_abandoned_pending(self, channels: list[str]) -> None:
         """Recover idle deliveries before allowing any newer market data."""
         pending_by_stream: list[tuple[str, int]] = []
@@ -605,6 +622,7 @@ class DataConsumer:
                     allow_already_absent=True,
                 )
                 self._completed_pending.discard((stream_key, message_id))
+                self._reset_callback_failure_diagnostic()
             summary = self.redis_client.xpending(stream_key, self.group_name)
             pending = self._pending_count(summary, stream_key)
             if pending:
@@ -789,9 +807,11 @@ class DataConsumer:
                     try:
                         self.callback(model)
                     except Exception as exc:
-                        raise MarketStreamPendingError(
+                        pending_error = MarketStreamPendingError(
                             f"market callback failed {stream_key}:{message_id}"
-                        ) from exc
+                        )
+                        setattr(pending_error, "_diagnostic_stage", "market_delivery")
+                        raise pending_error from exc
                     self._assert_ownership()
                     # Remember callback completion across a Redis reconnect.
                     # This process may retry only the ACK, never the callback.
@@ -799,6 +819,71 @@ class DataConsumer:
                     self._ack_message(stream_key, message_id)
                     self._completed_pending.discard((stream_key, message_id))
                     self._blocked_streams.discard(stream_key)
+                    self._reset_callback_failure_diagnostic()
+
+    @staticmethod
+    def _callback_failure_causes(exc: BaseException | None) -> tuple[str, ...]:
+        causes: list[str] = []
+        current: BaseException | None = exc
+        seen: set[int] = set()
+        while current is not None and len(causes) < 4 and id(current) not in seen:
+            seen.add(id(current))
+            name = type(current).__name__
+            safe_name = _SAFE_EXCEPTION_TYPE.sub("_", name)[:64] or "UnknownError"
+            causes.append(safe_name)
+            current = current.__cause__ or current.__context__
+        return tuple(causes)
+
+    def _record_callback_failure(
+        self, stage: str, location: str, exc: BaseException | None
+    ) -> None:
+        """Log safe callback failure metadata without affecting delivery decisions."""
+        try:
+            causes = self._callback_failure_causes(exc)
+            signature = (stage, location, causes)
+            now = time.monotonic()
+            prior = self._callback_failure_diagnostic
+            if prior is not None and prior["signature"] == signature:
+                prior["repeat_count"] += 1
+                if now - prior["last_emitted"] < CALLBACK_FAILURE_LOG_INTERVAL_SECONDS:
+                    return
+                first_causes = prior["first_causes"]
+                repeat_count = prior["repeat_count"]
+                prior["last_emitted"] = now
+            else:
+                first_causes = causes
+                repeat_count = 0
+                self._callback_failure_diagnostic = {
+                    "signature": signature,
+                    "first_causes": first_causes,
+                    "last_emitted": now,
+                    "repeat_count": repeat_count,
+                }
+
+            # The JSON is part of the message so it survives the production
+            # ProcessorFormatter, which does not add arbitrary LogRecord extras.
+            logger.error(
+                "consumer_callback_failure %s",
+                json.dumps(
+                    {
+                        "stage": stage,
+                        "cause_status": "known" if causes else "unknown",
+                        "exception_types": causes,
+                        "first_exception_types": first_causes,
+                        "location": f"src/core/consumer.py:{location}",
+                        "repeat_count": repeat_count,
+                    },
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+            )
+        except Exception:
+            # Diagnostics are observational only; callback and ACK semantics
+            # remain authoritative even if time, formatting, or logging fails.
+            return
+
+    def _reset_callback_failure_diagnostic(self) -> None:
+        self._callback_failure_diagnostic = None
 
     def _parse_message(self, stream_key: str, data: dict) -> Union[Candlestick, Trade, None]:
         """Helper to parse raw stream data into models."""

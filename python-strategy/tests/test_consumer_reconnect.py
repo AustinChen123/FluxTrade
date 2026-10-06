@@ -247,6 +247,119 @@ class TestReconnectionBackoff:
         wait.assert_called_once_with(INITIAL_BACKOFF)
         assert consumer._consume_loop.call_count == 2
 
+    @pytest.mark.parametrize(
+        ("stage", "cause_type", "cause_status"),
+        [
+            ("market_delivery", RuntimeError, "known"),
+            ("pending_replay", ValueError, "known"),
+            ("pending_delivery", None, "unknown"),
+        ],
+    )
+    def test_start_suppresses_pending_retry_logs_and_preserves_safe_cause(
+        self, consumer, caplog, monkeypatch, stage, cause_type, cause_status
+    ):
+        import json
+
+        now = [5.0]
+        monkeypatch.setattr("src.core.consumer.time.monotonic", lambda: now[0])
+        caplog.set_level("ERROR", logger="src.core.consumer")
+        calls = 0
+
+        def fail_pending():
+            nonlocal calls
+            calls += 1
+            if calls == 4:
+                now[0] = 65.0
+            error = MarketStreamPendingError(
+                "private stream/account identifiers must not be logged"
+            )
+            if stage != "pending_delivery":
+                setattr(error, "_diagnostic_stage", stage)
+            if cause_type is not None:
+                try:
+                    raise cause_type("secret provider text must not be logged")
+                except cause_type as cause:
+                    raise error from cause
+            raise error
+
+        consumer._consume_loop = MagicMock(side_effect=fail_pending)
+        waits = 0
+
+        def stop_after_four_waits(_seconds):
+            nonlocal waits
+            waits += 1
+            if waits == 4:
+                consumer.running = False
+            return False
+
+        with patch.object(
+            consumer._stop_requested, "wait", side_effect=stop_after_four_waits
+        ):
+            consumer.start()
+
+        events = [
+            record.getMessage()
+            for record in caplog.records
+            if "consumer_callback_failure " in record.getMessage()
+        ]
+        assert len(events) == 2
+        first = json.loads(events[0].split("consumer_callback_failure ", 1)[1])
+        assert first["repeat_count"] == 0
+        diagnostic = json.loads(events[1].split("consumer_callback_failure ", 1)[1])
+        assert diagnostic["stage"] == stage
+        assert diagnostic["cause_status"] == cause_status
+        assert diagnostic["repeat_count"] == 3
+        if cause_type is None:
+            assert diagnostic["exception_types"] == []
+        else:
+            assert diagnostic["exception_types"] == [cause_type.__name__]
+        assert "secret" not in caplog.text
+        assert "private stream" not in caplog.text
+        assert consumer._consume_loop.call_count == 4
+
+    @pytest.mark.parametrize(
+        ("failure_target", "failure"),
+        [
+            ("src.core.consumer.time.monotonic", OSError("clock unavailable")),
+            ("src.core.consumer.json.dumps", ValueError("format unavailable")),
+            ("src.core.consumer.logger.error", RuntimeError("handler unavailable")),
+        ],
+    )
+    def test_diagnostic_failures_do_not_change_pending_retry_or_stop(
+        self, consumer, monkeypatch, failure_target, failure
+    ):
+        monkeypatch.setattr(failure_target, MagicMock(side_effect=failure))
+        calls = 0
+
+        def pending_failure():
+            nonlocal calls
+            calls += 1
+            error = MarketStreamPendingError("not emitted")
+            setattr(error, "_diagnostic_stage", "market_delivery")
+            try:
+                raise ValueError("private cause text")
+            except ValueError as cause:
+                raise error from cause
+
+        consumer._consume_loop = MagicMock(side_effect=pending_failure)
+        waits = 0
+
+        def stop_after_two_waits(_seconds):
+            nonlocal waits
+            waits += 1
+            if waits == 2:
+                consumer.running = False
+            return False
+
+        with patch.object(
+            consumer._stop_requested, "wait", side_effect=stop_after_two_waits
+        ):
+            consumer.start()
+
+        assert calls == 2
+        assert waits == 2
+        assert consumer._completed_pending == set()
+
     def test_ownership_loss_exits_for_fresh_service_restart(self, consumer):
         consumer._consume_loop = MagicMock(
             side_effect=MarketStreamOwnershipError("successor took ownership")
