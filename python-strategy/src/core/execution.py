@@ -1393,36 +1393,12 @@ class ExecutionEngine:
                 candle,
             )
             if freshness_rejection is not None:
-                self._validate_existing_entry_identity(existing_order, signal)
-                if not self._existing_entry_may_have_reached_broker(existing_order):
-                    if (
-                        str(
-                            getattr(
-                                existing_order.status, "value", existing_order.status
-                            )
-                        ).upper()
-                        == OrderStatus.NEW.value
-                    ):
-                        existing_order.submitted_at = None
-                        self.order_manager.fail_order(
-                            existing_order,
-                            freshness_rejection.reason,
-                        )
-                    self._fail_pending_conditional_orders_for_terminal_entry(
-                        existing_order,
-                        only_proven_unsubmitted=True,
-                    )
-                    self._record_order_rejection(
-                        order=existing_order,
-                        order_type=str(existing_order.type),
-                        error=freshness_rejection,
-                        phase="entry_candle_freshness",
-                    )
-                    self._audit_non_submission(
-                        signal,
-                        candle,
-                        freshness_rejection.reason,
-                    )
+                if self._reject_expired_existing_entry(
+                    existing_order,
+                    signal,
+                    candle,
+                    freshness_rejection,
+                ):
                     raise freshness_rejection
             self.logger.info(
                 "Order already exists for client_order_id=%s", client_order_id
@@ -1758,6 +1734,65 @@ class ExecutionEngine:
         rejection = self._entry_candle_freshness_rejection(signal, candle)
         if rejection is not None:
             raise rejection
+
+    def _entry_candle_admission(
+        self,
+        signal: Signal,
+        candle: Optional[Candlestick],
+    ) -> bool:
+        """Suppress expired new work while preserving broker-evidenced replay."""
+        rejection = self._entry_candle_freshness_rejection(signal, candle)
+        if rejection is None:
+            return True
+        if self.audit_external_orders:
+            existing_order = self.order_manager.repo.get_order_by_client_order_id(
+                self._client_order_id_for_signal(signal)
+            )
+            if existing_order is not None:
+                if not self._reject_expired_existing_entry(
+                    existing_order,
+                    signal,
+                    candle,
+                    rejection,
+                ):
+                    return True
+            else:
+                self._audit_non_submission(signal, candle, rejection.reason)
+        self.logger.warning(
+            "Entry suppressed before submission: reason=%s",
+            rejection.reason,
+        )
+        return False
+
+    def _reject_expired_existing_entry(
+        self,
+        order,
+        signal: Signal,
+        candle: Optional[Candlestick],
+        rejection: _EntryCandleFreshnessRejected,
+    ) -> bool:
+        """Clean up and audit one exact-scoped stale record only if never sent."""
+        self._validate_existing_entry_identity(order, signal)
+        if self._existing_entry_may_have_reached_broker(order):
+            return False
+        if (
+            str(getattr(order.status, "value", order.status)).upper()
+            == OrderStatus.NEW.value
+        ):
+            order.submitted_at = None
+            self.order_manager.fail_order(order, rejection.reason)
+        self._fail_pending_conditional_orders_for_terminal_entry(
+            order,
+            only_proven_unsubmitted=True,
+        )
+        self._record_order_rejection(
+            order=order,
+            order_type=str(order.type),
+            error=rejection,
+            phase="entry_candle_freshness",
+        )
+        self._audit_non_submission(signal, candle, rejection.reason)
+        return True
 
     def _entry_candle_freshness_rejection(
         self,

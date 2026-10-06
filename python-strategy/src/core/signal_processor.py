@@ -161,7 +161,9 @@ class SignalProcessor:
         ) = None,
         portfolio_coordinator: PortfolioCoordinator | None = None,
         signal_batch_observer: Callable[[tuple[Signal, ...]], None] | None = None,
-        entry_admission_handler: Callable[[Signal], bool] | None = None,
+        entry_admission_handler: (
+            Callable[[Signal, Candlestick | None], bool] | None
+        ) = None,
         strategy_context_loader: StrategyContextLoader | None = None,
     ) -> None:
         self.registry = registry
@@ -327,7 +329,7 @@ class SignalProcessor:
                     )
                     try:
                         entry_admissions = [
-                            self._entry_is_admitted(signal)
+                            self._entry_is_admitted(signal, candle)
                             for _strategy_id, signals in decisions
                             for signal in signals
                             if signal.type in (SignalType.LONG, SignalType.SHORT)
@@ -627,7 +629,7 @@ class SignalProcessor:
             }
             try:
                 entry_admissions = [
-                    self._entry_is_admitted(signal)
+                    self._entry_is_admitted(signal, None)
                     for _strategy_id, signal in replay_decisions
                     if signal.type in (SignalType.LONG, SignalType.SHORT)
                 ]
@@ -651,11 +653,15 @@ class SignalProcessor:
         for strategy_id, replay_stable_signal in replay_decisions:
             self._process_signals(strategy_id, [replay_stable_signal], None)
 
-    def _entry_is_admitted(self, signal: Signal) -> bool:
+    def _entry_is_admitted(
+        self,
+        signal: Signal,
+        candle: Candlestick | None,
+    ) -> bool:
         return (
             signal.type not in (SignalType.LONG, SignalType.SHORT)
             or self.entry_admission_handler is None
-            or self.entry_admission_handler(signal)
+            or self.entry_admission_handler(signal, candle)
         )
 
     def _locally_restored_entry_ids(

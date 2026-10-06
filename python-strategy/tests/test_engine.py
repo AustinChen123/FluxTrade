@@ -38,7 +38,11 @@ from src.core.models import (
     StrategyStatus,
     Trade,
 )
-from src.core.orm_models import Candlestick as ORMCandlestick, StrategyState
+from src.core.orm_models import (
+    Candlestick as ORMCandlestick,
+    SignalAudit,
+    StrategyState,
+)
 from src.core.ops_command_service import OpsCommandService
 from src.core.strategy_command_dispatch_service import (
     StrategyCommandDispatchService,
@@ -4245,6 +4249,7 @@ class TestHeartbeatRecording:
             )
 
         assert engine._entry_admission_gate is None
+        assert engine.execution_engine.entry_candle_freshness_enabled is False
         assert engine._signal_processor.entry_admission_handler is None
 
     def test_live_non_rithmic_engine_has_no_gate_or_extra_redis_read(
@@ -4258,7 +4263,10 @@ class TestHeartbeatRecording:
             engine = engine_factory()
 
         assert engine._entry_admission_gate is None
-        assert engine._signal_processor.entry_admission_handler is None
+        assert engine.execution_engine.entry_candle_freshness_enabled is True
+        assert engine._signal_processor.entry_admission_handler == (
+            engine._entry_signal_allowed_for_processor
+        )
 
         engine.process_signal(
             Signal(
@@ -4273,6 +4281,84 @@ class TestHeartbeatRecording:
         )
 
         engine.redis_client.get.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "status",
+        [OrderStatus.SUBMITTED_UNCONFIRMED.value, "UNRECOGNIZED"],
+    )
+    def test_protected_stale_replay_does_not_override_existing_health_gate(
+        self,
+        engine_factory,
+        mock_clock,
+        order_factory,
+        signal_factory,
+        status,
+    ):
+        with patch(
+            "src.core.engine.RuntimeEnvironment.from_env",
+            return_value=RuntimeEnvironment("live"),
+        ):
+            engine = engine_factory(audit_external_orders=True)
+        signal = signal_factory(metadata={"client_order_id": "test-execution-long-812"})
+        existing = order_factory(
+            client_order_id=signal.metadata["client_order_id"],
+            strategy_id=signal.strategy_id,
+            product_id=signal.product_id,
+            status=status,
+        )
+        engine.execution_engine.order_manager.repo.add_order(existing)
+        engine._entry_signal_allowed = MagicMock(return_value=False)
+        candle = Candlestick(
+            product_id=signal.product_id,
+            timeframe="1m",
+            timestamp=1704067200000,
+            open=Decimal("42000"),
+            high=Decimal("42000"),
+            low=Decimal("42000"),
+            close=Decimal("42000"),
+            volume=Decimal("1"),
+        )
+        mock_clock.advance(600)
+
+        assert engine._entry_signal_allowed_for_processor(signal, candle) is False
+        engine._entry_signal_allowed.assert_called_once_with(signal)
+        assert existing.status == status
+        assert existing.exchange_order_id is None
+
+    def test_direct_process_signal_uses_candle_freshness_admission(
+        self,
+        engine_factory,
+        mock_clock,
+        mock_db_session,
+        signal_factory,
+    ):
+        with patch(
+            "src.core.engine.RuntimeEnvironment.from_env",
+            return_value=RuntimeEnvironment("live"),
+        ):
+            engine = engine_factory(audit_external_orders=True)
+        signal = signal_factory()
+        candle = Candlestick(
+            product_id=signal.product_id,
+            timeframe="1m",
+            timestamp=1704067200000,
+            open=Decimal("42000"),
+            high=Decimal("42000"),
+            low=Decimal("42000"),
+            close=Decimal("42000"),
+            volume=Decimal("1"),
+        )
+        mock_clock.advance(600)
+
+        assert engine.process_signal(signal, candle) is False
+        assert engine.execution_engine.order_manager.repo.orders == {}
+        audits = [
+            call.args[0]
+            for call in mock_db_session.add.call_args_list
+            if isinstance(call.args[0], SignalAudit)
+        ]
+        assert audits[-1].risk_status == "REJECT"
+        assert audits[-1].risk_message == "entry_candle_expired"
 
     def test_live_ccxt_engine_installs_balance_entry_admission_handler(
         self,

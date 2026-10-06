@@ -423,6 +423,9 @@ class StrategyEngine:
             ),
             repository_account_identity=(runtime_bootstrap.repository_account_identity),
             operation_guard=self._assert_runtime_leadership,
+            entry_candle_freshness_enabled=(
+                self.runtime_environment.identity == "live"
+            ),
             order_event_processor=runtime_bootstrap.process_order_event,
             pending_protection_fill_processor=(
                 runtime_bootstrap.audit_pending_protection_fill
@@ -667,7 +670,8 @@ class StrategyEngine:
                 logger=logger,
             )
         if (
-            self._entry_admission_gate is not None
+            self.runtime_environment.identity == "live"
+            or self._entry_admission_gate is not None
             or self._live_balance_asset is not None
         ):
             self._signal_processor.entry_admission_handler = (
@@ -1732,7 +1736,10 @@ class StrategyEngine:
         """
         if not self._runtime_signal_allowed(signal):
             return False
-        if not _entry_admitted and not self._entry_signal_allowed(signal):
+        if not _entry_admitted and not self._entry_signal_allowed_for_processor(
+            signal,
+            candle,
+        ):
             return False
         return self._signal_execution.process(signal, candle)
 
@@ -1841,13 +1848,23 @@ class StrategyEngine:
             return False
         return True
 
-    def _entry_signal_allowed_for_processor(self, signal: Signal) -> bool:
+    def _entry_signal_allowed_for_processor(
+        self,
+        signal: Signal,
+        candle: Candlestick | None = None,
+    ) -> bool:
         """Avoid consuming a kill-switch rejection as benign health suppression."""
         if (
             self._kill_switch_halted
             and not self.execution_engine.order_event_stream_failed
         ):
             return True
+        freshness_admission = self.execution_engine._entry_candle_admission(
+            signal,
+            candle,
+        )
+        if not freshness_admission:
+            return False
         return self._entry_signal_allowed(signal)
 
     def shutdown(

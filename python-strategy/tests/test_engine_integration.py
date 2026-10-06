@@ -18,6 +18,7 @@ from src.core.models import (
     OrderSide,
     Position,
     PositionSide,
+    OrderStatus,
     Signal,
     SignalType,
     StrategyStatus,
@@ -27,12 +28,16 @@ from src.core.orm_models import Candlestick as ORMCandlestick
 from src.core.orm_models import (
     Exchange,
     MarketDataApplication,
+    Order as StoredOrder,
     Product,
     SignalAudit,
     Strategy,
     StrategyState,
     StrategyStateTransition,
+    SystemEvent,
 )
+from src.core.client_order_id import market_signal_client_order_id
+from src.core.repositories import LiveOrderRepository
 from src.core.runtime_environment import RuntimeEnvironment
 from src.core.strategy_context import StrategyContext
 from src.strategies.base import BaseStrategy, StrategyRequirements
@@ -74,6 +79,42 @@ class EmittingStrategy(BaseStrategy):
             type=SignalType.LONG,
             value=candle.close,
         )
+
+
+class StatefulEntryStrategy(EmittingStrategy):
+    def __init__(self, strategy_id: str, product_id: str = "BINANCE:BTCUSDT-PERP"):
+        super().__init__(strategy_id, product_id)
+        self._in_position = False
+
+    @property
+    def requirements(self) -> StrategyRequirements:
+        return StrategyRequirements(self.product_id, "1m", 0)
+
+    def on_candle(
+        self,
+        candle: Candlestick,
+        context: StrategyContext | None = None,
+    ) -> Signal:
+        self.candles_received.append(candle)
+        self._in_position = True
+        return Signal(
+            strategy_id=self.strategy_id,
+            product_id=self.product_id,
+            timeframe=candle.timeframe,
+            timestamp=candle.timestamp + 49 * 60_000,
+            type=SignalType.LONG,
+            quantity=Decimal("1"),
+            value=candle.close,
+        )
+
+    def snapshot_walk_forward_trade_state(self) -> bool:
+        return self._in_position
+
+    def restore_walk_forward_trade_state(self, state: object) -> None:
+        self._in_position = state is True
+
+    def fresh_instance_for_replay(self) -> BaseStrategy:
+        return type(self)(self.strategy_id, self.product_id)
 
 
 class RestartAccountService:
@@ -219,6 +260,253 @@ def test_full_lifecycle_routes_signal_through_wired_components(
     mock_db_session.add.assert_called_once()
     mock_db_session.commit.assert_called_once()
     assert engine.running is False
+
+
+def test_expired_pending_candle_retries_local_cleanup_before_receipt_and_fresh_entry(
+    engine_factory,
+    sqlite_order_session_factory,
+    mock_clock,
+    monkeypatch,
+):
+    factory = sqlite_order_session_factory
+    bind = factory.kw["bind"]
+    for table in (
+        ORMCandlestick.__table__,
+        MarketDataApplication.__table__,
+        SignalAudit.__table__,
+        SystemEvent.__table__,
+    ):
+        table.create(bind, checkfirst=True)
+
+    strategy_id = "test_strategy"
+    product_id = "BINANCE:BTCUSDT-PERP"
+    stale = make_candle(product_id=product_id)
+    stale_signal_id = market_signal_client_order_id(
+        strategy_id,
+        product_id,
+        stale.timeframe,
+        stale.timestamp,
+        SignalType.LONG.value.lower(),
+        0,
+    )
+    parent_id = "stale-parent"
+    child_id = "stale-child"
+    with factory() as session:
+        session.add(Exchange(id="BINANCE", name="Binance"))
+        session.add(
+            Product(
+                id=product_id,
+                exchange_id="BINANCE",
+                base_asset="BTC",
+                quote_asset="USDT",
+            )
+        )
+        session.commit()
+        session.add(
+            StoredOrder(
+                id=parent_id,
+                strategy_id=strategy_id,
+                product_id=product_id,
+                exchange_id="BINANCE",
+                type="market",
+                side=OrderSide.BUY.value,
+                quantity=Decimal("1"),
+                status="failed",
+                timestamp=stale.timestamp,
+                filled_quantity=Decimal("0"),
+                client_order_id=stale_signal_id,
+                intent_payload={},
+            )
+        )
+        session.add(
+            StoredOrder(
+                id=child_id,
+                strategy_id=strategy_id,
+                product_id=product_id,
+                exchange_id="BINANCE",
+                type="stop_loss",
+                side=OrderSide.SELL.value,
+                quantity=Decimal("1"),
+                status=OrderStatus.NEW.value,
+                timestamp=stale.timestamp,
+                filled_quantity=Decimal("0"),
+                intent_payload={
+                    "pending_entry_order_id": parent_id,
+                    "placement_mode": "attach-at-entry",
+                },
+            )
+        )
+        session.commit()
+
+    repository = LiveOrderRepository(db_session_factory=factory)
+    with (
+        patch(
+            "src.core.engine.RuntimeEnvironment.from_env",
+            return_value=RuntimeEnvironment("live"),
+        ),
+        patch("src.core.order_manager.create_redis_client", return_value=MagicMock()),
+    ):
+        engine = engine_factory(
+            audit_external_orders=True,
+            db_session_factory=factory,
+            order_repository=repository,
+        )
+    engine.execution_engine.process_market_data = MagicMock(return_value=[])
+    engine.execution_engine._assert_external_operation_allowed = lambda: None
+    engine.risk_manager.check_risk = MagicMock(return_value=(True, "ok"))
+    engine._signal_processor.state_manager = None
+    adapter = engine.execution_engine.adapter
+    place_order_wire = MagicMock(wraps=adapter.place_order)
+    monkeypatch.setattr(adapter, "place_order", place_order_wire)
+    strategy = StatefulEntryStrategy(strategy_id, product_id)
+    engine._runtime_artifacts.register_strategy(strategy)
+    mock_clock.advance(600)
+
+    original_update = repository.update_order
+    cleanup_failed = False
+
+    def fail_first_child_cleanup(order):
+        nonlocal cleanup_failed
+        if order.id == child_id and not cleanup_failed:
+            cleanup_failed = True
+            raise RuntimeError("child cleanup store unavailable")
+        original_update(order)
+
+    monkeypatch.setattr(repository, "update_order", fail_first_child_cleanup)
+    with pytest.raises(RuntimeError, match="child cleanup store unavailable"):
+        engine.on_market_data(stale)
+
+    with factory() as session:
+        assert (
+            session.get(
+                MarketDataApplication, ("live", product_id, "1m", stale.timestamp)
+            )
+            is None
+        )
+        assert session.get(StoredOrder, child_id).status == OrderStatus.NEW.value
+    assert strategy._in_position is False
+    assert cleanup_failed is True
+    place_order_wire.assert_not_called()
+
+    engine.replay_pending_market_data(stale)
+    place_order_wire.assert_not_called()
+
+    with factory() as session:
+        receipt = session.get(
+            MarketDataApplication,
+            ("live", product_id, "1m", stale.timestamp),
+        )
+        assert receipt is not None
+        assert (
+            session.get(StoredOrder, child_id).status
+            == OrderStatus.FAILED.value.lower()
+        )
+        audit = session.query(SignalAudit).filter_by(strategy_id=strategy_id).one()
+        assert audit.risk_status == "REJECT"
+        assert audit.risk_message == "entry_candle_expired"
+    assert engine.strategy_instances[strategy_id]._in_position is False
+    engine.on_market_data(stale)
+    assert engine.execution_engine.process_market_data.call_count == 2
+    place_order_wire.assert_not_called()
+
+    fresh = stale.model_copy(update={"timestamp": stale.timestamp + 600_000})
+    mock_clock.set_time((fresh.timestamp + 60_000) / 1000)
+    engine.on_market_data(fresh)
+
+    fresh_signal_id = market_signal_client_order_id(
+        strategy_id,
+        product_id,
+        fresh.timeframe,
+        fresh.timestamp,
+        SignalType.LONG.value.lower(),
+        0,
+    )
+    assert place_order_wire.call_count == 1
+    assert place_order_wire.call_args.args[0].client_order_id == fresh_signal_id
+
+    with factory() as session:
+        assert (
+            session.get(
+                MarketDataApplication,
+                ("live", product_id, "1m", fresh.timestamp),
+            )
+            is not None
+        )
+        fresh_order = (
+            session.query(StoredOrder)
+            .filter_by(strategy_id=strategy_id, client_order_id=fresh_signal_id)
+            .one()
+        )
+        assert fresh_order.exchange_order_id is not None
+        assert fresh_order.status == OrderStatus.SUBMITTED.value
+        assert fresh_order.client_order_id != stale_signal_id
+
+
+def test_expired_admission_audit_failure_rolls_back_state_without_receipt(
+    engine_factory,
+    sqlite_order_session_factory,
+    mock_clock,
+):
+    from src.core import execution as execution_module
+
+    factory = sqlite_order_session_factory
+    bind = factory.kw["bind"]
+    for table in (
+        ORMCandlestick.__table__,
+        MarketDataApplication.__table__,
+        SignalAudit.__table__,
+        SystemEvent.__table__,
+    ):
+        table.create(bind, checkfirst=True)
+    with factory() as session:
+        session.add(Exchange(id="BINANCE", name="Binance"))
+        session.add(
+            Product(
+                id="BINANCE:BTCUSDT-PERP",
+                exchange_id="BINANCE",
+                base_asset="BTC",
+                quote_asset="USDT",
+            )
+        )
+        session.commit()
+    repository = LiveOrderRepository(db_session_factory=factory)
+    with (
+        patch(
+            "src.core.engine.RuntimeEnvironment.from_env",
+            return_value=RuntimeEnvironment("live"),
+        ),
+        patch("src.core.order_manager.create_redis_client", return_value=MagicMock()),
+    ):
+        engine = engine_factory(
+            audit_external_orders=True,
+            db_session_factory=factory,
+            order_repository=repository,
+        )
+    engine.execution_engine.process_market_data = MagicMock(return_value=[])
+    engine._signal_processor.state_manager = None
+    strategy = StatefulEntryStrategy("test_strategy")
+    engine._runtime_artifacts.register_strategy(strategy)
+    candle = make_candle()
+    mock_clock.advance(600)
+
+    with patch.object(
+        execution_module,
+        "commit_signal_audit",
+        side_effect=RuntimeError("audit store unavailable"),
+    ):
+        with pytest.raises(RuntimeError, match="audit store unavailable"):
+            engine.on_market_data(candle)
+
+    with factory() as session:
+        assert (
+            session.get(
+                MarketDataApplication,
+                ("live", candle.product_id, candle.timeframe, candle.timestamp),
+            )
+            is None
+        )
+        assert session.query(StoredOrder).count() == 0
+    assert strategy._in_position is False
 
 
 def test_command_router_lists_registered_strategies(engine_factory):

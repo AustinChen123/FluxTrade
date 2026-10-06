@@ -522,6 +522,7 @@ def test_portfolio_admission_checks_complete_batch_before_submission() -> None:
     handler = MagicMock(return_value=True)
     admission = MagicMock(side_effect=[True, False])
 
+    candle = make_candle()
     SignalProcessor(
         registry,
         MagicMock(default_quantity=Decimal("1")),
@@ -529,12 +530,13 @@ def test_portfolio_admission_checks_complete_batch_before_submission() -> None:
         exposure_loader=lambda *_args: PortfolioExposureSnapshot({}),
         portfolio_coordinator=coordinator,
         entry_admission_handler=admission,
-    ).on_candle(make_candle())
+    ).on_candle(candle)
 
     assert [call.args[0].strategy_id for call in admission.call_args_list] == [
         "sleeve_0",
         "sleeve_1",
     ]
+    assert all(call.args[1] is candle for call in admission.call_args_list)
     handler.assert_not_called()
 
 
@@ -666,7 +668,10 @@ def test_admission_error_propagates_and_rolls_back_exclusive_slot_state() -> Non
     cause = RuntimeError("admission unavailable")
     handler = MagicMock()
 
-    def fail_admission(_signal: Signal) -> bool:
+    def fail_admission(
+        _signal: Signal,
+        _candle: Candlestick | None,
+    ) -> bool:
         raise cause
 
     with pytest.raises(RuntimeError, match="admission unavailable") as caught:
@@ -1256,6 +1261,7 @@ def test_on_trade_admission_rejection_skips_submission() -> None:
 
     assert admission.call_count == 2
     assert admission.call_args.args[0].metadata["client_order_id"]
+    assert admission.call_args.args[1] is None
     signal_handler.assert_called_once()
 
 
@@ -1283,7 +1289,10 @@ def test_on_trade_admission_error_propagates_and_restores_state() -> None:
     signal_handler = MagicMock()
     cause = RuntimeError("admission unavailable")
 
-    def fail_admission(_signal: Signal) -> bool:
+    def fail_admission(
+        _signal: Signal,
+        _candle: Candlestick | None,
+    ) -> bool:
         raise cause
 
     processor = SignalProcessor(
