@@ -154,8 +154,22 @@ class RithmicExchangeAdapter(IExchangeAdapter):
             adapter=self,
             profile=self.profile,
             account_id=self.account_id,
+            validate_snapshot_identities=self._validate_recovery_snapshot_identities,
             context=context,
         )
+
+    def _validate_recovery_snapshot_identities(self, snapshot: object) -> None:
+        configured_symbols = {symbol for _, symbol in self._products_by_native_identity}
+        for collection_name in ("orders", "order_history", "fills"):
+            for row in getattr(snapshot, collection_name, ()):
+                symbol = str(getattr(row, "symbol", "") or "").strip().upper()
+                if symbol not in configured_symbols:
+                    continue
+                exchange = str(getattr(row, "exchange", "") or "").strip().upper()
+                if (exchange, symbol) not in self._products_by_native_identity:
+                    raise ExchangeError(
+                        "rithmic_recovery_snapshot_instrument_identity_mismatch"
+                    )
 
     def start_order_event_stream(self) -> None:
         with self._client_lock:

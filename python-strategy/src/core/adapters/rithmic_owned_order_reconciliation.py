@@ -92,11 +92,13 @@ class RithmicOwnedOrderReconciler:
         adapter: IExchangeAdapter,
         profile: str,
         account_id: str | None,
+        validate_snapshot_identities: Callable[[Any], None],
         context: OwnedOrderReconciliationContext,
     ) -> None:
         self.adapter = adapter
         self.profile = profile
         self.account_id = account_id
+        self.validate_snapshot_identities = validate_snapshot_identities
         self.context = context
 
     def reconcile(
@@ -215,6 +217,13 @@ class RithmicOwnedOrderReconciler:
             ]
             external_orders = []
         else:
+            try:
+                self.validate_snapshot_identities(snapshot)
+            except ExchangeError:
+                return self._write_identity_failure_audit(
+                    orders,
+                    "rithmic_recovery_snapshot_instrument_identity_mismatch",
+                )
             recovery_plan, external_orders = build_rithmic_recovery_plan(
                 orders, snapshot
             )

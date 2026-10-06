@@ -21,6 +21,7 @@ from src.core.adapters.rithmic_recovery import (
 from src.core.adapters.rithmic_order_observation import (
     project_rithmic_order_snapshot,
 )
+from src.core.adapters.rithmic_adapter import RithmicExchangeAdapter
 from src.core.adapters.rithmic_owned_order_reconciliation import (
     RithmicOwnedOrderReconciler,
 )
@@ -97,6 +98,7 @@ class LedgerOrderFixture:
     exchange_order_id: str | None = "exchange-1"
     basket_id: str = "basket-1"
     original_basket_id: str | None = None
+    exchange: str | None = "CME"
     symbol: str = "NQU6"
     status: str = "OPEN"
     notification_type: str | None = "OPEN"
@@ -150,9 +152,8 @@ class LedgerSnapshotFixture:
     )
 
 
-def owned_reconciler(
+def owned_reconciliation_context(
     *,
-    adapter,
     order_manager,
     clock,
     db_session_factory,
@@ -163,22 +164,27 @@ def owned_reconciler(
     account_id="ACCOUNT",
     **_unused,
 ):
+    return OwnedOrderReconciliationContext(
+        list_recoverable_client_orders=lambda: (
+            order_manager.repo.list_client_orders_by_statuses(
+                {"NEW", "SUBMITTED_UNCONFIRMED", "SUBMITTED", "PARTIALLY_FILLED"}
+            )
+        ),
+        process_exchange_order_event=process_exchange_order_event,
+        now_seconds=lambda: float(clock.now()),
+        db_session_factory=db_session_factory,
+        local_positions_loader=local_positions_loader,
+        logger=logger or logging.getLogger("OrderReconciler"),
+    )
+
+
+def owned_reconciler(*, adapter, profile="test", account_id="ACCOUNT", **kwargs):
     return RithmicOwnedOrderReconciler(
         adapter=adapter,
         profile=profile,
         account_id=account_id,
-        context=OwnedOrderReconciliationContext(
-            list_recoverable_client_orders=lambda: (
-                order_manager.repo.list_client_orders_by_statuses(
-                    {"NEW", "SUBMITTED_UNCONFIRMED", "SUBMITTED", "PARTIALLY_FILLED"}
-                )
-            ),
-            process_exchange_order_event=process_exchange_order_event,
-            now_seconds=lambda: float(clock.now()),
-            db_session_factory=db_session_factory,
-            local_positions_loader=local_positions_loader,
-            logger=logger or logging.getLogger("OrderReconciler"),
-        ),
+        validate_snapshot_identities=lambda _snapshot: None,
+        context=owned_reconciliation_context(**kwargs),
     )
 
 
@@ -194,6 +200,34 @@ def snapshot_failure(exception_type=RuntimeError, **attributes):
             raise error from source
         except Exception as chained:
             return chained
+
+
+def configured_rithmic_adapter():
+    return RithmicExchangeAdapter(
+        profile="test",
+        account_id="ACCOUNT",
+        instruments={
+            "RITHMIC:NQ-202609": {
+                "exchange": "CME",
+                "quantity_step": "1",
+                "price_tick": "0.25",
+                "multiplier": "20",
+            }
+        },
+    )
+
+
+def actual_adapter_reconciler(adapter, order, processor, db):
+    repo = MagicMock()
+    repo.list_client_orders_by_statuses.return_value = [order]
+    context = owned_reconciliation_context(
+        order_manager=SimpleNamespace(repo=repo),
+        clock=SimpleNamespace(now=lambda: 1_700_000_200),
+        db_session_factory=lambda: nullcontext(db),
+        process_exchange_order_event=processor,
+        local_positions_loader=lambda: [],
+    )
+    return adapter.create_owned_order_reconciler(context)
 
 
 def assert_no_raw_sentinels(value):
@@ -282,6 +316,7 @@ def remote_order(
     exchange_order_id: str | None = "exchange-1",
     basket_id: str = "basket-1",
     original_basket_id: str | None = None,
+    exchange: str | None = "CME",
     symbol: str = "NQU6",
     status: str = "OPEN",
     notification_type: str | None = "OPEN",
@@ -302,6 +337,7 @@ def remote_order(
         exchange_order_id=exchange_order_id,
         basket_id=basket_id,
         original_basket_id=original_basket_id,
+        exchange=exchange,
         symbol=symbol,
         status=status,
         notification_type=notification_type,
@@ -1316,6 +1352,167 @@ def test_reconciler_applies_owned_event_without_remote_side_effects_and_audits(
         "completed",
     ]
     assert db.commit.call_count == 2
+
+
+@pytest.mark.parametrize(
+    ("collection_name", "exchange"),
+    [
+        ("orders", "ICE"),
+        ("orders", None),
+        ("order_history", "ICE"),
+        ("order_history", None),
+        ("fills", "ICE"),
+        ("fills", None),
+    ],
+)
+def test_actual_adapter_reconciler_blocks_wrong_or_missing_snapshot_exchange(
+    collection_name, exchange
+):
+    remote = remote_order(
+        status="FILLED",
+        notification_type="FILL",
+        filled_quantity="2",
+        unfilled_quantity="0",
+        average_fill_price="20000.25",
+        exchange=exchange if collection_name != "fills" else "CME",
+    )
+    fill = remote_fill(
+        fill_quantity="2",
+        fill_price="20000.25",
+        exchange=exchange if collection_name == "fills" else "CME",
+    )
+    remote_snapshot = snapshot()
+    remote_snapshot.orders = []
+    remote_snapshot.order_history = []
+    remote_snapshot.fills = []
+    if collection_name == "orders":
+        remote_snapshot.orders = [remote]
+        remote_snapshot.fills = [fill]
+    elif collection_name == "order_history":
+        remote_snapshot.order_history = [remote]
+        remote_snapshot.fills = [fill]
+    else:
+        remote_snapshot.orders = [remote]
+        remote_snapshot.fills = [fill]
+
+    processor = Mock(return_value={"action": "applied"})
+    db = MagicMock()
+    reconciler = actual_adapter_reconciler(
+        configured_rithmic_adapter(), local_order(status="SUBMITTED"), processor, db
+    )
+    result = reconciler.reconcile(
+        snapshot_loader=Mock(return_value=remote_snapshot),
+    )
+
+    processor.assert_not_called()
+    assert result["auto_resume_safe"] is False
+    assert mapping(sequence(result["results"])[0])["reason"] == (
+        "rithmic_recovery_snapshot_instrument_identity_mismatch"
+    )
+    assert result["ledger_verification"] is None
+    assert db.add.call_count == 1
+
+
+def test_actual_adapter_validates_all_collections_before_applying_recovery(
+    monkeypatch,
+):
+    adapter = configured_rithmic_adapter()
+    trace = []
+    validator = adapter._validate_recovery_snapshot_identities
+
+    def validate(snapshot_value):
+        trace.append("validate")
+        validator(snapshot_value)
+
+    monkeypatch.setattr(adapter, "_validate_recovery_snapshot_identities", validate)
+    processor = Mock(
+        side_effect=lambda *_args, **_kwargs: (
+            trace.append("apply") or {"action": "applied"}
+        )
+    )
+    remote = remote_order(
+        status="FILLED",
+        notification_type="FILL",
+        filled_quantity="2",
+        unfilled_quantity="0",
+        average_fill_price="20000.25",
+    )
+    remote_history = remote_order(
+        status="FILLED",
+        notification_type="FILL",
+        filled_quantity="2",
+        unfilled_quantity="0",
+        average_fill_price="20000.25",
+    )
+    fill = remote_fill(fill_quantity="2", fill_price="20000.25")
+    reconciler = actual_adapter_reconciler(
+        adapter, local_order(status="SUBMITTED"), processor, MagicMock()
+    )
+
+    result = reconciler.reconcile(
+        snapshot_loader=Mock(
+            return_value=snapshot(
+                orders=[remote], order_history=[remote_history], fills=[fill]
+            )
+        ),
+    )
+
+    assert trace == ["validate", "apply"]
+    processor.assert_called_once()
+    assert result["repaired_count"] == 1
+
+
+def test_actual_adapter_skips_identity_validation_after_account_mismatch(
+    monkeypatch,
+):
+    adapter = configured_rithmic_adapter()
+    validator = Mock(wraps=adapter._validate_recovery_snapshot_identities)
+    monkeypatch.setattr(adapter, "_validate_recovery_snapshot_identities", validator)
+    processor = Mock()
+    reconciler = actual_adapter_reconciler(
+        adapter, local_order(status="SUBMITTED"), processor, MagicMock()
+    )
+    invalid_remote = remote_order(exchange="ICE")
+    remote_snapshot = snapshot(orders=[invalid_remote])
+    remote_snapshot.account_id = "OTHER"
+
+    result = reconciler.reconcile(snapshot_loader=Mock(return_value=remote_snapshot))
+
+    validator.assert_not_called()
+    processor.assert_not_called()
+    assert mapping(sequence(result["results"])[0])["reason"] == (
+        "remote_account_id_mismatch"
+    )
+
+
+def test_actual_adapter_keeps_unconfigured_symbol_on_existing_external_path():
+    processor = Mock()
+    reconciler = actual_adapter_reconciler(
+        configured_rithmic_adapter(),
+        local_order(status="SUBMITTED"),
+        processor,
+        MagicMock(),
+    )
+    unrelated = remote_order(
+        basket_id="manual-basket",
+        exchange_order_id="manual-exchange",
+        client_order_id=None,
+        exchange="ICE",
+        symbol="ESU6",
+    )
+
+    result = reconciler.reconcile(
+        snapshot_loader=Mock(return_value=snapshot(orders=[unrelated])),
+    )
+
+    processor.assert_not_called()
+    assert result["external_count"] == 1
+    assert mapping(sequence(result["external_orders"])[0])["basket_id"] == (
+        "manual-basket"
+    )
+    assert mapping(sequence(result["results"])[0])["reason"] == (
+        "no_authoritative_remote_evidence"
+    )
 
 
 def test_reconciler_does_not_mutate_when_planned_audit_fails():
