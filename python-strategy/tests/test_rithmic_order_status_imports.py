@@ -26,6 +26,7 @@ def test_status_module_imports_only_stdlib_and_exchange_error():
             )
 
     assert imports == {
+        "dataclasses": {"dataclass"},
         "decimal": {"Decimal"},
         "src.core.interfaces.exchange": {"ExchangeError"},
     }
