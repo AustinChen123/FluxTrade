@@ -558,7 +558,7 @@ def test_recovery_matches_cloned_python_snapshot_rows_by_stable_identity():
             snapshot(
                 order_history=[remote_order(status="COMPLETE", filled_quantity="1")]
             ),
-            "unknown_rithmic_order_status",
+            "missing_authoritative_fill_average",
         ),
         (
             snapshot(
@@ -644,6 +644,18 @@ def test_recovery_matches_cloned_python_snapshot_rows_by_stable_identity():
             ),
             "unknown_rithmic_order_status",
         ),
+        (
+            snapshot(
+                orders=[
+                    remote_order(
+                        status="FILLED",
+                        filled_quantity="2",
+                        average_fill_price="NaN",
+                    )
+                ]
+            ),
+            "missing_authoritative_fill_average",
+        ),
     ],
 )
 def test_owned_order_recovery_fails_closed_without_unambiguous_evidence(
@@ -665,6 +677,35 @@ def test_duplicate_identical_fills_are_idempotent():
     )
 
     assert recovery_event(plan[0]).cumulative_filled_quantity == Decimal("1")
+
+
+@pytest.mark.parametrize(
+    ("remote_average", "expected_reason"),
+    [(None, None), ("0", "order_and_fill_history_average_mismatch")],
+)
+def test_fill_history_supplies_only_absent_order_average(
+    remote_average, expected_reason
+):
+    remote = remote_order(
+        status="FILLED",
+        notification_type="STATUS",
+        filled_quantity=None,
+        unfilled_quantity=None,
+        average_fill_price=remote_average,
+    )
+    fills = [remote_fill(fill_quantity="2", fill_price="20000.25")]
+    plan, _ = build_rithmic_recovery_plan(
+        [local_order()], snapshot(order_history=[remote], fills=fills)
+    )
+    assert plan[0].reason == expected_reason
+    if expected_reason is None:
+        event = recovery_event(plan[0])
+        assert (event.cumulative_filled_quantity, event.cumulative_average_price) == (
+            Decimal("2"),
+            Decimal("20000.25"),
+        )
+    else:
+        assert plan[0].classification == "unresolved"
 
 
 def test_duplicate_local_order_identity_fails_closed_before_repair():

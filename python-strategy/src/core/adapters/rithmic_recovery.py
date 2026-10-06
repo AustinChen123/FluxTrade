@@ -6,6 +6,7 @@ from typing import Iterable, Protocol, TypeVar, cast
 from src.core.adapters.rithmic_native_bracket import native_bracket_leg_type
 from src.core.adapters.rithmic_order_status import (
     _normalize_status as _normalize_status,
+    _status_decimal as _status_decimal,
     rithmic_order_may_be_working as rithmic_order_may_be_working,
 )
 from src.core.interfaces.exchange import ExchangeOrderEvent
@@ -386,8 +387,16 @@ def _classify_order(
             return _blocked(order, "order_and_fill_exchange_order_id_mismatch")
 
     fill_quantity, fill_average = _aggregate_fills(fills)
-    remote_quantity = _decimal(remote.filled_quantity) if remote is not None else None
-    remote_average = _decimal(remote.average_fill_price) if remote is not None else None
+    remote_quantity = (
+        _decimal(remote.filled_quantity)
+        if remote is not None and remote.filled_quantity is not None
+        else None
+    )
+    remote_average = (
+        _status_decimal(remote.average_fill_price) if remote is not None else None
+    )
+    if remote_average is not None and not remote_average.is_finite():
+        return _blocked(order, "missing_authoritative_fill_average")
     if remote_quantity is not None and fills and remote_quantity != fill_quantity:
         return _blocked(
             order, "order_and_fill_history_quantity_mismatch", unresolved=True

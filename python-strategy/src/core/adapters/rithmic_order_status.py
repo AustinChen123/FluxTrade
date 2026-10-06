@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 from src.core.interfaces.exchange import ExchangeError
 
@@ -219,3 +219,12 @@ def rithmic_order_may_be_working(remote: object) -> bool:
 
 def _decimal(value) -> Decimal:
     return Decimal(str(value or "0"))
+
+
+def _status_decimal(value: object) -> Decimal | None:
+    if value is None:
+        return None
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return Decimal("NaN")
