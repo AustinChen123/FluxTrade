@@ -12,6 +12,7 @@ Covers:
 
 from contextlib import AbstractContextManager, nullcontext
 from copy import copy
+from datetime import datetime, timezone
 import threading
 from types import SimpleNamespace
 
@@ -40,9 +41,22 @@ from src.core.interfaces.exchange import ExchangeOrderEvent
 from src.core.interfaces.exchange import ExchangeError
 from src.core.interfaces.exchange import NetworkError
 from src.core.interfaces.exchange import ExchangeOrderLookupUnsupported
-from src.core.models import OrderSide, OrderStatus, Position, PositionSide, SignalType
+from src.core.models import (
+    Candlestick,
+    OrderSide,
+    OrderStatus,
+    Position,
+    PositionSide,
+    SignalType,
+)
 from src.core.runtime_capabilities import OrderAccountIdentity
-from src.core.orm_models import SignalAudit, SystemEvent, Trade as StoredTrade
+from src.core.orm_models import (
+    Order as StoredOrder,
+    SignalAudit,
+    Strategy as StoredStrategy,
+    SystemEvent,
+    Trade as StoredTrade,
+)
 from src.core.client_order_id import generate_client_order_id, parse_client_order_id
 from src.core.repositories import LiveOrderRepository
 from src.core.product_registry import InstrumentSpec
@@ -4276,6 +4290,661 @@ class TestExecutionErrorHandling:
         result = execution_engine.execute_signal(signal)
 
         assert result is None
+
+
+class TestEntryCandleFreshness:
+    @staticmethod
+    def candle(signal, timeframe="5m"):
+        return Candlestick(
+            product_id=signal.product_id,
+            timeframe=timeframe,
+            timestamp=1704067200000,
+            open=Decimal("42000"),
+            high=Decimal("42000"),
+            low=Decimal("42000"),
+            close=Decimal("42000"),
+            volume=Decimal("1"),
+        )
+
+    @staticmethod
+    def durable_audited_engine(
+        sqlite_order_session_factory,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+    ):
+        repository = LiveOrderRepository(
+            db_session_factory=sqlite_order_session_factory
+        )
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            db_session_factory=lambda: _session_context(mock_db_session),
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=repository,
+            audit_external_orders=True,
+            entry_candle_freshness_enabled=True,
+        )
+        return engine, repository
+
+    @staticmethod
+    def persisted_status(repository, order_id):
+        order = repository.get_order(order_id)
+        assert order is not None
+        return order.status
+
+    @pytest.mark.parametrize("signal_type", [SignalType.LONG, SignalType.SHORT])
+    @pytest.mark.parametrize(
+        ("elapsed_seconds", "expired"),
+        [(360, False), (600, True), (2940, True)],
+    )
+    def test_deadline_uses_input_candle_and_is_exclusive(
+        self,
+        signal_type,
+        elapsed_seconds,
+        expired,
+        execution_engine,
+        mock_clock,
+        mock_exchange_adapter,
+        signal_factory,
+    ):
+        execution_engine.entry_candle_freshness_enabled = True
+        signal = signal_factory(
+            signal_type=signal_type,
+            timestamp=1704070800000,
+            timeframe="1m",
+        )
+        candle = self.candle(signal)
+        mock_clock.advance(elapsed_seconds)
+
+        if expired:
+            with pytest.raises(ExchangeError, match="entry_candle_expired"):
+                execution_engine.execute_signal(signal, candle)
+            assert mock_exchange_adapter.open_orders == []
+        else:
+            assert execution_engine.execute_signal(signal, candle) is not None
+            assert len(mock_exchange_adapter.open_orders) == 1
+
+    def test_final_guard_cleans_never_submitted_order_after_slow_validation(
+        self,
+        execution_engine,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        signal_factory,
+    ):
+        execution_engine.entry_candle_freshness_enabled = True
+        signal = signal_factory(
+            stop_loss=Decimal("41000"),
+            take_profit=Decimal("43000"),
+        )
+        candle = self.candle(signal)
+
+        def slow_validation(orders):
+            for index, order in enumerate(orders):
+                order.client_order_id = f"freshness-test-{index}"
+
+        fence_calls = 0
+
+        def delayed_operation_fence():
+            nonlocal fence_calls
+            fence_calls += 1
+            if fence_calls == 2:
+                assert execution_engine._order_event_apply_lock._is_owned()
+                assert len(mock_order_repo.orders) == 3
+                assert {order.status for order in mock_order_repo.orders.values()} == {
+                    OrderStatus.SUBMITTED_UNCONFIRMED.value
+                }
+                mock_clock.advance(600)
+
+        execution_engine._validate_order_group = slow_validation
+        execution_engine._supports_atomic_order_group = lambda _orders: True
+        execution_engine._assert_external_operation_allowed = delayed_operation_fence
+        execution_engine._adopt_order_after_ambiguous_submit_error = MagicMock()
+        with pytest.raises(ExchangeError, match="entry_candle_expired"):
+            execution_engine.execute_signal(signal, candle)
+        assert fence_calls == 2
+
+        orders = list(mock_order_repo.orders.values())
+        assert len(orders) == 3
+        assert {order.status for order in orders} == {OrderStatus.FAILED.value.lower()}
+        assert all(order.submitted_at is None for order in orders)
+        assert mock_exchange_adapter.open_orders == []
+        execution_engine._adopt_order_after_ambiguous_submit_error.assert_not_called()
+        assert execution_engine._submission_gate_owner.in_flight == 0
+        assert execution_engine._order_event_apply_lock.acquire(blocking=False)
+        execution_engine._order_event_apply_lock.release()
+
+        execution_engine._supports_atomic_order_group = lambda _orders: False
+        execution_engine._validate_order_group = lambda _orders: None
+        execution_engine._assert_external_operation_allowed = lambda: None
+        mock_clock.set_time(1704067300.0)
+        retry_signal = signal_factory(
+            metadata={
+                "client_order_id": generate_client_order_id(
+                    "freshness", "execution", "long", clock_ns=lambda: 401
+                )
+            }
+        )
+        assert execution_engine.execute_signal(retry_signal, self.candle(retry_signal))
+        assert len(mock_exchange_adapter.open_orders) == 1
+
+    def test_freshness_failure_is_durably_failed_in_repository(
+        self,
+        sqlite_order_session_factory,
+        mock_clock,
+        mock_exchange_adapter,
+        signal_factory,
+    ):
+        engine = ExecutionEngine(
+            db_session=None,
+            db_session_factory=sqlite_order_session_factory,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            entry_candle_freshness_enabled=True,
+        )
+        signal = signal_factory()
+        mock_clock.advance(600)
+
+        with pytest.raises(ExchangeError, match="entry_candle_expired"):
+            engine.execute_signal(signal, self.candle(signal))
+
+        with sqlite_order_session_factory() as session:
+            failed = (
+                session.query(StoredOrder)
+                .filter_by(
+                    strategy_id=signal.strategy_id,
+                    product_id=signal.product_id,
+                )
+                .one()
+            )
+            assert failed.status == OrderStatus.FAILED.value.lower()
+            assert failed.submitted_at is None
+        assert mock_exchange_adapter.open_orders == []
+
+    @pytest.mark.parametrize(
+        ("timeframe", "product_id"),
+        [("0m", "BINANCE:BTCUSDT-PERP"), ("5m", "BINANCE:ETHUSDT-PERP")],
+    )
+    def test_invalid_input_candle_provenance_fails_closed_without_wire(
+        self,
+        timeframe,
+        product_id,
+        execution_engine,
+        mock_exchange_adapter,
+        signal_factory,
+    ):
+        execution_engine.entry_candle_freshness_enabled = True
+        signal = signal_factory()
+        candle = self.candle(signal, timeframe).model_copy(
+            update={"product_id": product_id}
+        )
+
+        with pytest.raises(ExchangeError, match="entry_candle_provenance_invalid"):
+            execution_engine.execute_signal(signal, candle)
+        assert mock_exchange_adapter.open_orders == []
+
+    def test_enabled_guard_keeps_backtest_and_candleless_paths_unchanged(
+        self,
+        execution_engine,
+        mock_clock,
+        mock_exchange_adapter,
+        signal_factory,
+    ):
+        stale_signal = signal_factory()
+        stale_candle = self.candle(stale_signal)
+        mock_clock.advance(600)
+
+        assert execution_engine.entry_candle_freshness_enabled is False
+        assert execution_engine.execute_signal(stale_signal, stale_candle) is not None
+
+        backtest_engine = ExecutionEngine(
+            db_session=None,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=execution_engine.order_manager.repo,
+            is_backtest=True,
+            entry_candle_freshness_enabled=True,
+        )
+        backtest_signal = signal_factory(
+            metadata={
+                "client_order_id": generate_client_order_id(
+                    "freshness", "execution", "long", clock_ns=lambda: 201
+                )
+            }
+        )
+        assert (
+            backtest_engine.execute_signal(
+                backtest_signal, self.candle(backtest_signal)
+            )
+            is not None
+        )
+
+        execution_engine.entry_candle_freshness_enabled = True
+        candleless_signal = signal_factory(
+            metadata={
+                "client_order_id": generate_client_order_id(
+                    "freshness", "execution", "long", clock_ns=lambda: 202
+                )
+            }
+        )
+        assert execution_engine.execute_signal(candleless_signal) is not None
+
+        exit_signal = signal_factory(
+            signal_type=SignalType.EXIT_LONG,
+            metadata={
+                "client_order_id": generate_client_order_id(
+                    "freshness", "execution", "exit", clock_ns=lambda: 203
+                )
+            },
+        )
+        mock_exchange_adapter.positions[exit_signal.product_id] = Position(
+            strategy_id=exit_signal.strategy_id,
+            product_id=exit_signal.product_id,
+            side=PositionSide.LONG,
+            quantity=Decimal("0.1"),
+            entry_price=Decimal("42000"),
+            unrealized_pnl=Decimal("0"),
+        )
+        assert execution_engine.execute_signal(exit_signal, stale_candle) is not None
+
+    def test_existing_order_account_scope_mismatch_is_rejected(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        order_factory,
+        signal_factory,
+    ):
+        signal = signal_factory(
+            metadata={
+                "client_order_id": generate_client_order_id(
+                    "test_strategy", "execution", "long", clock_ns=lambda: 301
+                )
+            }
+        )
+        existing = order_factory(
+            client_order_id=signal.metadata["client_order_id"],
+            strategy_id=signal.strategy_id,
+            product_id=signal.product_id,
+            status="SUBMITTED_UNCONFIRMED",
+        )
+        mock_order_repo.add_order(existing)
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            db_session_factory=lambda: _session_context(mock_db_session),
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            audit_external_orders=True,
+            entry_candle_freshness_enabled=True,
+            repository_account_identity=OrderAccountIdentity("binance", "main"),
+        )
+        mock_clock.advance(600)
+
+        with pytest.raises(
+            ExchangeError, match="entry_client_order_id_account_mismatch"
+        ):
+            engine.execute_signal(signal, self.candle(signal))
+        assert mock_exchange_adapter.open_orders == []
+
+    def test_audited_final_guard_writes_pre_submit_outcome_without_adoption(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        signal_factory,
+    ):
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            db_session_factory=lambda: _session_context(mock_db_session),
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            audit_external_orders=True,
+            entry_candle_freshness_enabled=True,
+        )
+        signal = signal_factory()
+        engine._validate_order_group = lambda orders: mock_clock.advance(600)
+        engine._adopt_order_after_ambiguous_submit_error = MagicMock()
+
+        with pytest.raises(ExchangeError, match="entry_candle_expired"):
+            engine.execute_signal(signal, self.candle(signal))
+
+        [order] = list(mock_order_repo.orders.values())
+        assert order.status == OrderStatus.FAILED.value.lower()
+        assert order.submitted_at is None
+        assert mock_exchange_adapter.open_orders == []
+        engine._adopt_order_after_ambiguous_submit_error.assert_not_called()
+        outcomes = [
+            call.args[0]
+            for call in mock_db_session.add.call_args_list
+            if isinstance(call.args[0], SignalAudit)
+            and call.args[0].outcome_payload is not None
+        ]
+        assert outcomes[-1].outcome_payload["status"] == "expired_before_submit"
+
+    def test_audit_storage_failure_propagates_after_expiry_cleanup(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        signal_factory,
+    ):
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            db_session_factory=lambda: _session_context(mock_db_session),
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            audit_external_orders=True,
+            entry_candle_freshness_enabled=True,
+        )
+        signal = signal_factory()
+        engine._validate_order_group = lambda orders: mock_clock.advance(600)
+
+        with patch.object(
+            execution_module,
+            "write_signal_audit_outcome",
+            side_effect=RuntimeError("audit store unavailable"),
+        ):
+            with pytest.raises(RuntimeError, match="audit store unavailable"):
+                engine.execute_signal(signal, self.candle(signal))
+
+        [order] = list(mock_order_repo.orders.values())
+        assert order.status == OrderStatus.FAILED.value.lower()
+        assert order.submitted_at is None
+        assert engine._submission_gate_owner.in_flight == 0
+        assert mock_exchange_adapter.open_orders == []
+
+    def test_intent_audit_failure_replay_cleans_only_exact_never_sent_children(
+        self,
+        sqlite_order_session_factory,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        order_factory,
+        signal_factory,
+    ):
+        engine, repository = self.durable_audited_engine(
+            sqlite_order_session_factory,
+            mock_db_session,
+            mock_clock,
+            mock_exchange_adapter,
+        )
+        signal = signal_factory(
+            price=Decimal("42000"),
+            stop_loss=Decimal("41000"),
+            take_profit=Decimal("43000"),
+            metadata={
+                "client_order_id": generate_client_order_id(
+                    "test_strategy", "execution", "long", clock_ns=lambda: 901
+                )
+            },
+        )
+        candle = self.candle(signal)
+
+        # Orders are durable; only the audit session is mocked in this test.
+        with patch.object(
+            execution_module,
+            "write_signal_audit_intent",
+            side_effect=RuntimeError("intent audit unavailable"),
+        ):
+            with pytest.raises(RuntimeError, match="intent audit unavailable"):
+                engine.execute_signal(signal, candle)
+
+        parent = repository.get_order_by_client_order_id(
+            signal.metadata["client_order_id"]
+        )
+        assert parent is not None
+        pending = repository.list_orders_by_statuses({OrderStatus.NEW.value})
+        children = [
+            child
+            for child in pending
+            if isinstance(child.intent_payload, dict)
+            and child.intent_payload.get("pending_entry_order_id") == parent.id
+        ]
+        assert {child.type for child in children} == {"stop_loss", "take_profit"}
+
+        with sqlite_order_session_factory() as db:
+            db.add(StoredStrategy(id="freshness-other", name="Other"))
+            db.commit()
+        unrelated = [
+            order_factory(
+                order_type="stop_loss",
+                product_id="BINANCE:ETHUSDT-PERP",
+                status=OrderStatus.NEW.value,
+            ),
+            order_factory(
+                order_type="take_profit",
+                strategy_id="freshness-other",
+                status=OrderStatus.NEW.value,
+            ),
+            order_factory(
+                order_type="stop_loss",
+                account_profile="binance",
+                account_id="TEST_ACCOUNT_001",
+                status=OrderStatus.NEW.value,
+            ),
+        ]
+        protected = [
+            order_factory(
+                order_type="stop_loss",
+                status=OrderStatus.NEW.value,
+                exchange_order_id="CHILD-ACK",
+            ),
+            order_factory(
+                order_type="take_profit",
+                status=OrderStatus.NEW.value,
+            ),
+            order_factory(
+                order_type="stop_loss",
+                status=OrderStatus.NEW.value,
+            ),
+            order_factory(
+                order_type="take_profit",
+                status=OrderStatus.NEW.value,
+                filled_quantity=Decimal("0.01"),
+            ),
+        ]
+        protected[1].submitted_at = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        protected[2].acked_at = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        for child in [*unrelated, *protected]:
+            child.intent_payload = {
+                "pending_entry_order_id": parent.id,
+                "placement_mode": "place-after-fill",
+            }
+            repository.add_order(child)
+
+        retry_engine, retry_repository = self.durable_audited_engine(
+            sqlite_order_session_factory,
+            mock_db_session,
+            mock_clock,
+            mock_exchange_adapter,
+        )
+        retry_engine._adopt_order_after_ambiguous_submit_error = MagicMock()
+        mock_clock.advance(600)
+        for _ in range(2):
+            with pytest.raises(ExchangeError, match="entry_candle_expired"):
+                retry_engine.execute_signal(signal, candle)
+
+        assert self.persisted_status(retry_repository, parent.id) == (
+            OrderStatus.FAILED.value.lower()
+        )
+        for child in children:
+            assert self.persisted_status(retry_repository, child.id) == (
+                OrderStatus.FAILED.value.lower()
+            )
+        for child in [*unrelated, *protected]:
+            assert self.persisted_status(retry_repository, child.id) == (
+                OrderStatus.NEW.value
+            )
+        assert mock_exchange_adapter.open_orders == []
+        retry_engine._adopt_order_after_ambiguous_submit_error.assert_not_called()
+
+    def test_conditional_cleanup_storage_failure_retries_for_failed_parent(
+        self,
+        sqlite_order_session_factory,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        signal_factory,
+    ):
+        engine, repository = self.durable_audited_engine(
+            sqlite_order_session_factory,
+            mock_db_session,
+            mock_clock,
+            mock_exchange_adapter,
+        )
+        signal = signal_factory(
+            price=Decimal("42000"),
+            stop_loss=Decimal("41000"),
+            take_profit=Decimal("43000"),
+            metadata={
+                "client_order_id": generate_client_order_id(
+                    "test_strategy", "execution", "long", clock_ns=lambda: 902
+                )
+            },
+        )
+        candle = self.candle(signal)
+        with patch.object(
+            execution_module,
+            "write_signal_audit_intent",
+            side_effect=RuntimeError("intent audit unavailable"),
+        ):
+            with pytest.raises(RuntimeError, match="intent audit unavailable"):
+                engine.execute_signal(signal, candle)
+        parent = repository.get_order_by_client_order_id(
+            signal.metadata["client_order_id"]
+        )
+        assert parent is not None
+        children = [
+            child
+            for child in repository.list_orders_by_statuses({OrderStatus.NEW.value})
+            if isinstance(child.intent_payload, dict)
+            and child.intent_payload.get("pending_entry_order_id") == parent.id
+        ]
+        assert len(children) == 2
+        child_ids = {child.id for child in children}
+        original_update = repository.update_order
+        child_updates = 0
+
+        def fail_second_child_update(order):
+            nonlocal child_updates
+            if order.id in child_ids:
+                child_updates += 1
+                if child_updates == 2:
+                    raise RuntimeError("conditional cleanup storage unavailable")
+            original_update(order)
+
+        repository.update_order = fail_second_child_update
+        mock_clock.advance(600)
+        with pytest.raises(
+            RuntimeError, match="conditional cleanup storage unavailable"
+        ):
+            engine.execute_signal(signal, candle)
+        repository.update_order = original_update
+
+        assert self.persisted_status(repository, parent.id) == (
+            OrderStatus.FAILED.value.lower()
+        )
+        partial_states = {
+            self.persisted_status(repository, child.id) for child in children
+        }
+        assert partial_states == {
+            OrderStatus.NEW.value,
+            OrderStatus.FAILED.value.lower(),
+        }
+
+        retry_engine, retry_repository = self.durable_audited_engine(
+            sqlite_order_session_factory,
+            mock_db_session,
+            mock_clock,
+            mock_exchange_adapter,
+        )
+        with pytest.raises(ExchangeError, match="entry_candle_expired"):
+            retry_engine.execute_signal(signal, candle)
+        assert self.persisted_status(retry_repository, parent.id) == (
+            OrderStatus.FAILED.value.lower()
+        )
+        assert {
+            self.persisted_status(retry_repository, child.id) for child in children
+        } == {OrderStatus.FAILED.value.lower()}
+        assert mock_exchange_adapter.open_orders == []
+
+    @pytest.mark.parametrize(
+        ("status", "exchange_order_id", "evidence", "expected_expiry"),
+        [
+            ("NEW", None, None, True),
+            ("failed", None, None, True),
+            ("SUBMITTED_UNCONFIRMED", None, None, False),
+            ("submitted", "EX-1", None, False),
+            ("UNKNOWN", None, None, False),
+            ("new", None, "submitted_at", False),
+            ("FAILED", None, "acked_at", False),
+            ("FAILED", None, "filled", False),
+            ("cancelled", None, None, False),
+            ("FILLED", None, None, False),
+            ("LIQUIDATED", None, None, False),
+            ("CLOSED", None, None, False),
+        ],
+    )
+    def test_audited_existing_order_only_expires_known_never_sent_states(
+        self,
+        status,
+        exchange_order_id,
+        evidence,
+        expected_expiry,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        order_factory,
+        signal_factory,
+    ):
+        signal = signal_factory(
+            metadata={
+                "client_order_id": generate_client_order_id(
+                    "test_strategy", "execution", "long", clock_ns=lambda: 101
+                )
+            }
+        )
+        existing = order_factory(
+            client_order_id=signal.metadata["client_order_id"],
+            strategy_id=signal.strategy_id,
+            product_id=signal.product_id,
+            status=status,
+            exchange_order_id=exchange_order_id,
+        )
+        if evidence == "submitted_at":
+            existing.submitted_at = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        elif evidence == "acked_at":
+            existing.acked_at = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        elif evidence == "filled":
+            existing.filled_quantity = Decimal("0.1")
+        mock_order_repo.add_order(existing)
+        engine = ExecutionEngine(
+            db_session=mock_db_session,
+            db_session_factory=lambda: _session_context(mock_db_session),
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            audit_external_orders=True,
+            entry_candle_freshness_enabled=True,
+        )
+        mock_clock.advance(600)
+
+        if expected_expiry:
+            with pytest.raises(ExchangeError, match="entry_candle_expired"):
+                engine.execute_signal(signal, self.candle(signal))
+            assert existing.status == OrderStatus.FAILED.value.lower()
+        else:
+            assert engine.execute_signal(signal, self.candle(signal)) == existing.id
+            assert existing.status == status
+        assert mock_exchange_adapter.open_orders == []
 
 
 class TestAuditedExecution:

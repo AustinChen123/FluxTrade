@@ -28,6 +28,7 @@ from src.core.runtime_capabilities import (
 from src.core.interfaces.exchange import IExchangeAdapter, ExchangeError, NetworkError
 from src.core.interfaces.exchange import ExchangeOrderEvent
 from src.core.clock import Clock
+from src.core.data_provider import timeframe_to_ms
 from src.core.interfaces import IOrderRepository
 from src.core.interfaces.order_cancellation import (
     OrderCancellationRepository,
@@ -82,6 +83,14 @@ from src.core.strategy_context import RejectionSnapshot
 OPS_KILL_SWITCH_STRATEGY_ID = "__ops_kill_switch__"
 
 
+class _EntryCandleFreshnessRejected(ExchangeError):
+    """Known pre-submit entry rejection; no provider request was attempted."""
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(reason)
+
+
 @dataclass(frozen=True)
 class FlattenPending:
     order_id: str
@@ -115,12 +124,16 @@ class ExecutionEngine:
         operation_guard: Callable[[], None] | None = None,
         order_event_processor: OrderEventProcessor | None = None,
         pending_protection_fill_processor: PendingProtectionFillProcessor | None = None,
+        entry_candle_freshness_enabled: bool = False,
     ):
         self.logger = logging.getLogger("ExecutionEngine")
         self.clock = clock
         self._db_session_factory = db_session_factory
         self._db_session = db_session
         self.audit_external_orders = audit_external_orders
+        self.entry_candle_freshness_enabled = entry_candle_freshness_enabled
+        self._repository_account_identity = repository_account_identity
+        self._order_account_identity_resolver = order_account_identity_resolver
         self._operation_guard = operation_guard or (lambda: None)
         self._order_event_processor = (
             order_event_processor or process_order_event_without_venue_policy
@@ -601,7 +614,12 @@ class ExecutionEngine:
             reconcile_generation=reconcile_generation,
         )
 
-    def _fail_pending_conditional_orders_for_terminal_entry(self, entry_order) -> None:
+    def _fail_pending_conditional_orders_for_terminal_entry(
+        self,
+        entry_order,
+        *,
+        only_proven_unsubmitted: bool = False,
+    ) -> None:
         """Clear pending protection for an entry that terminated with zero fills.
 
         No fill means no position, so the NEW conditional orders will never be
@@ -621,14 +639,26 @@ class ExecutionEngine:
                 OrderStatus.SUBMITTED.value,
             }
         ):
+            if not isinstance(order.intent_payload, dict):
+                continue
+            if order.intent_payload.get("pending_entry_order_id") != str(
+                entry_order.id
+            ):
+                continue
+            if only_proven_unsubmitted:
+                if order.type not in {"stop_loss", "take_profit", "trailing_stop"}:
+                    continue
+                if (
+                    order.product_id != entry_order.product_id
+                    or order.strategy_id != entry_order.strategy_id
+                    or order.account_profile != entry_order.account_profile
+                    or order.account_id != entry_order.account_id
+                    or self._existing_entry_may_have_reached_broker(order)
+                ):
+                    continue
             if (
-                isinstance(order.intent_payload, dict)
-                and order.intent_payload.get("pending_entry_order_id")
-                == str(entry_order.id)
-                and (
-                    order.status == OrderStatus.NEW.value
-                    or order.intent_payload.get("placement_mode") == "attach-at-entry"
-                )
+                order.status == OrderStatus.NEW.value
+                or order.intent_payload.get("placement_mode") == "attach-at-entry"
             ):
                 self.order_manager.fail_order(order, "entry_terminal_without_fill")
 
@@ -1284,6 +1314,8 @@ class ExecutionEngine:
             exchange_id, atomic_group = self._place_entry_order(
                 order,
                 conditional_orders,
+                signal=signal,
+                candle=candle,
             )
             EXECUTION_LATENCY.observe(_time.monotonic() - t0)
             if not atomic_group:
@@ -1298,6 +1330,15 @@ class ExecutionEngine:
             ).inc()
         except ExchangeError as e:
             self.logger.error("Execution Failed: %s", e)
+            if isinstance(e, _EntryCandleFreshnessRejected):
+                self._fail_never_submitted_entry(
+                    order,
+                    conditional_orders,
+                    e,
+                    order_type=order_type,
+                    phase="entry_candle_freshness",
+                )
+                raise
             self.order_manager.fail_order(order, str(e))
             for conditional_order in conditional_orders:
                 self.order_manager.fail_order(
@@ -1347,6 +1388,42 @@ class ExecutionEngine:
             client_order_id
         )
         if existing_order is not None:
+            freshness_rejection = self._entry_candle_freshness_rejection(
+                signal,
+                candle,
+            )
+            if freshness_rejection is not None:
+                self._validate_existing_entry_identity(existing_order, signal)
+                if not self._existing_entry_may_have_reached_broker(existing_order):
+                    if (
+                        str(
+                            getattr(
+                                existing_order.status, "value", existing_order.status
+                            )
+                        ).upper()
+                        == OrderStatus.NEW.value
+                    ):
+                        existing_order.submitted_at = None
+                        self.order_manager.fail_order(
+                            existing_order,
+                            freshness_rejection.reason,
+                        )
+                    self._fail_pending_conditional_orders_for_terminal_entry(
+                        existing_order,
+                        only_proven_unsubmitted=True,
+                    )
+                    self._record_order_rejection(
+                        order=existing_order,
+                        order_type=str(existing_order.type),
+                        error=freshness_rejection,
+                        phase="entry_candle_freshness",
+                    )
+                    self._audit_non_submission(
+                        signal,
+                        candle,
+                        freshness_rejection.reason,
+                    )
+                    raise freshness_rejection
             self.logger.info(
                 "Order already exists for client_order_id=%s", client_order_id
             )
@@ -1389,6 +1466,11 @@ class ExecutionEngine:
 
         submit_attempted = False
         atomic_group = False
+
+        def mark_submit_attempted() -> None:
+            nonlocal submit_attempted
+            submit_attempted = True
+
         try:
             self._validate_order_group([order, *conditional_orders])
             atomic_group = self._supports_atomic_order_group(
@@ -1397,10 +1479,12 @@ class ExecutionEngine:
             self.order_manager.mark_submitted_unconfirmed(order)
             self.logger.info("Sending Order %s via Adapter...", order.id)
             t0 = _time.monotonic()
-            submit_attempted = True
             exchange_id, atomic_group = self._place_entry_order(
                 order,
                 conditional_orders,
+                signal=signal,
+                candle=candle,
+                on_submit_attempted=mark_submit_attempted,
             )
             EXECUTION_LATENCY.observe(_time.monotonic() - t0)
             if not atomic_group:
@@ -1415,6 +1499,16 @@ class ExecutionEngine:
             ).inc()
         except ExchangeError as e:
             self.logger.error("Execution Failed: %s", e)
+            if isinstance(e, _EntryCandleFreshnessRejected):
+                self._fail_never_submitted_entry(
+                    order,
+                    conditional_orders,
+                    e,
+                    order_type=order_type,
+                    phase="entry_candle_freshness",
+                    audit=audit,
+                )
+                raise
             if atomic_group and isinstance(e, NetworkError):
                 self._submission_gate_owner.claim_reconcile_halt()
                 adoption = {
@@ -1614,12 +1708,21 @@ class ExecutionEngine:
         )
 
     def _place_entry_order(
-        self, entry_order, conditional_orders: list
+        self,
+        entry_order,
+        conditional_orders: list,
+        *,
+        signal: Signal,
+        candle: Optional[Candlestick],
+        on_submit_attempted: Callable[[], None] | None = None,
     ) -> tuple[str, bool]:
         orders = [entry_order, *conditional_orders]
         atomic_group = self._supports_atomic_order_group(orders)
         if not atomic_group:
             self._assert_external_operation_allowed()
+            self._assert_entry_candle_fresh(signal, candle)
+            if on_submit_attempted is not None:
+                on_submit_attempted()
             return self.adapter.place_order(entry_order), False
 
         with self._order_event_apply_lock:
@@ -1627,6 +1730,9 @@ class ExecutionEngine:
                 if order.client_order_id:
                     self.order_manager.mark_submitted_unconfirmed(order)
             self._assert_external_operation_allowed()
+            self._assert_entry_candle_fresh(signal, candle)
+            if on_submit_attempted is not None:
+                on_submit_attempted()
             exchange_id = self.adapter.place_order_group(orders)
             try:
                 self._record_order_ack(
@@ -1643,6 +1749,132 @@ class ExecutionEngine:
                 self.halt_for_reconcile()
                 raise
             return exchange_id, True
+
+    def _assert_entry_candle_fresh(
+        self,
+        signal: Signal,
+        candle: Optional[Candlestick],
+    ) -> None:
+        rejection = self._entry_candle_freshness_rejection(signal, candle)
+        if rejection is not None:
+            raise rejection
+
+    def _entry_candle_freshness_rejection(
+        self,
+        signal: Signal,
+        candle: Optional[Candlestick],
+    ) -> _EntryCandleFreshnessRejected | None:
+        if (
+            not self.entry_candle_freshness_enabled
+            or self.order_manager.is_backtest
+            or candle is None
+            or signal.type not in (SignalType.LONG, SignalType.SHORT)
+        ):
+            return None
+        try:
+            duration_ms = timeframe_to_ms(candle.timeframe)
+        except (IndexError, TypeError, ValueError):
+            return _EntryCandleFreshnessRejected("entry_candle_provenance_invalid")
+        if (
+            type(candle.timestamp) is not int
+            or candle.timestamp < 0
+            or type(duration_ms) is not int
+            or duration_ms <= 0
+            or candle.product_id != signal.product_id
+        ):
+            return _EntryCandleFreshnessRejected("entry_candle_provenance_invalid")
+        deadline_ms = candle.timestamp + 2 * duration_ms
+        if int(self.clock.now() * 1000) >= deadline_ms:
+            return _EntryCandleFreshnessRejected("entry_candle_expired")
+        return None
+
+    def _validate_existing_entry_identity(self, order, signal: Signal) -> None:
+        if (
+            order.product_id != signal.product_id
+            or order.strategy_id != signal.strategy_id
+        ):
+            raise ExchangeError("entry_client_order_id_identity_mismatch")
+        expected_identity = self._repository_account_identity
+        if expected_identity is not None and (
+            order.account_profile != expected_identity.account_profile
+            or order.account_id != expected_identity.account_id
+        ):
+            raise ExchangeError("entry_client_order_id_account_mismatch")
+
+    @staticmethod
+    def _existing_entry_may_have_reached_broker(order) -> bool:
+        status = str(getattr(order.status, "value", order.status)).upper()
+        if status in {
+            OrderStatus.SUBMITTED_UNCONFIRMED.value,
+            OrderStatus.SUBMITTED.value,
+            OrderStatus.PARTIALLY_FILLED.value,
+            OrderStatus.FILLED.value,
+            OrderStatus.CANCELLED.value,
+            OrderStatus.LIQUIDATED.value,
+            "CLOSED",
+        }:
+            return True
+        if (
+            order.exchange_order_id
+            or order.submitted_at is not None
+            or order.acked_at is not None
+        ):
+            return True
+        try:
+            if (
+                order.filled_quantity is not None
+                and Decimal(str(order.filled_quantity)) > 0
+            ):
+                return True
+        except Exception:
+            return True
+        return status not in {OrderStatus.NEW.value, OrderStatus.FAILED.value}
+
+    def _fail_never_submitted_entry(
+        self,
+        entry_order,
+        conditional_orders: list,
+        error: _EntryCandleFreshnessRejected,
+        *,
+        order_type: str,
+        phase: str,
+        audit=None,
+    ) -> None:
+        for order in [entry_order, *conditional_orders]:
+            # These records were created by this invocation and the wire seam
+            # raised before its submit-attempt callback.
+            order.submitted_at = None
+            self.order_manager.fail_order(order, error.reason)
+
+        reason = self._record_order_rejection(
+            order=entry_order,
+            order_type=order_type,
+            error=error,
+            phase=phase,
+            write_event=audit is None,
+        )
+        if audit is not None:
+            if self._db_session_factory is None:
+                raise RuntimeError("audit_external_orders requires db_session_factory")
+            with self._db_session_factory() as db:
+                execution_failure_diagnostics.write_order_rejection_event(
+                    db,
+                    order=entry_order,
+                    order_type=order_type,
+                    reason=reason,
+                    error=error,
+                    phase=phase,
+                )
+                write_signal_audit_outcome(
+                    db,
+                    audit,
+                    order_id=str(entry_order.id),
+                    risk_message=error.reason,
+                    outcome_payload={
+                        "status": "expired_before_submit",
+                        "reason": error.reason,
+                    },
+                )
 
     def _attach_min_notional_reference_price(
         self,
