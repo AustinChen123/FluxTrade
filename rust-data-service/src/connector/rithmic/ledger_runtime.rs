@@ -103,6 +103,70 @@ pub(crate) fn is_retryable_snapshot_error(error: &anyhow::Error) -> bool {
             .any(|source| source.downcast_ref::<RetryableLedgerFailure>().is_some())
 }
 
+#[allow(dead_code)]
+pub(crate) fn connect_diagnostics(
+    failure: LedgerSnapshotFailure,
+    error: &anyhow::Error,
+) -> (&'static str, &'static str) {
+    if failure != LedgerSnapshotFailure::ORDER_CONNECT
+        && failure != LedgerSnapshotFailure::PNL_CONNECT
+    {
+        return ("unclassified", "unclassified");
+    }
+    (
+        transport::connect_phase(error),
+        transport::connect_failure_kind(error),
+    )
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) async fn scripted_connect_failure(failure: LedgerSnapshotFailure) -> anyhow::Error {
+    use super::{codec, protocol, session::LoginParameters};
+    use futures_util::{SinkExt, StreamExt};
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::{accept_async, tungstenite::protocol::Message};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = accept_async(stream).await.unwrap();
+        assert!(matches!(
+            socket.next().await.unwrap().unwrap(),
+            Message::Binary(_)
+        ));
+        socket
+            .send(Message::Binary(
+                codec::encode(&protocol::Reject {
+                    template_id: 75,
+                    user_msg: vec!["secret-user-text".to_string()],
+                    rp_code: vec!["secret-provider-code".to_string()],
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+    });
+
+    let login = LoginParameters::new(
+        "test-user".to_string(),
+        "test-password".to_string(),
+        "test-system".to_string(),
+        "FluxTrade".to_string(),
+        "0.1.0".to_string(),
+        Plant::Order,
+    )
+    .unwrap();
+    let error = match transport::connect(&url, login, Duration::from_secs(1)).await {
+        Ok(_) => panic!("scripted handshake rejection must fail connection"),
+        Err(error) => error.context(failure),
+    };
+    server.await.unwrap();
+    error
+}
+
 #[cfg(test)]
 #[allow(dead_code)]
 pub(crate) fn mark_test_retryable_snapshot_error(error: anyhow::Error) -> anyhow::Error {

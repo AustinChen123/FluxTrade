@@ -4,7 +4,8 @@ use crate::rithmic_ledger::{
         TransactionType,
     },
     ledger_runtime::{
-        is_retryable_snapshot_error, LedgerSnapshotFailure, RecoveryQuery, RemoteLedgerSnapshot,
+        connect_diagnostics, is_retryable_snapshot_error, LedgerSnapshotFailure, RecoveryQuery,
+        RemoteLedgerSnapshot,
     },
     profile_lock::ProfileLease,
 };
@@ -351,19 +352,36 @@ fn runtime_error(py: Python<'_>, error: anyhow::Error) -> PyErr {
         .copied()
         .unwrap_or(UNCLASSIFIED_FAILURE);
     let retryable = failure == PROFILE_LEASE_FAILURE || is_retryable_snapshot_error(&error);
+    let (connect_phase, connect_failure_kind) = connect_diagnostics(failure, &error);
     let target = PyRuntimeError::new_err("Rithmic ledger snapshot failed")
         .into_value(py)
         .into_bound(py)
         .into_any();
-    project_runtime_error_target(failure, retryable, target)
+    project_runtime_error_target(
+        failure,
+        retryable,
+        connect_phase,
+        connect_failure_kind,
+        target,
+    )
 }
 
 fn project_runtime_error_target(
     failure: LedgerSnapshotFailure,
     retryable: bool,
+    connect_phase: &'static str,
+    connect_failure_kind: &'static str,
     target: Bound<'_, PyAny>,
 ) -> PyErr {
-    if set_diagnostic_attributes(&target, failure, retryable).is_err() {
+    if set_diagnostic_attributes(
+        &target,
+        failure,
+        retryable,
+        connect_phase,
+        connect_failure_kind,
+    )
+    .is_err()
+    {
         return PyRuntimeError::new_err("Rithmic ledger snapshot failed");
     }
     PyErr::from_value(target)
@@ -373,6 +391,8 @@ fn set_diagnostic_attributes(
     target: &Bound<'_, PyAny>,
     failure: LedgerSnapshotFailure,
     retryable: bool,
+    connect_phase: &'static str,
+    connect_failure_kind: &'static str,
 ) -> PyResult<()> {
     let [stage, stable_error_code, safe_cause] = failure.safe_fields();
     target
@@ -380,13 +400,17 @@ fn set_diagnostic_attributes(
         .and_then(|_| target.setattr("stable_error_code", stable_error_code))
         .and_then(|_| target.setattr("safe_cause", safe_cause))
         .and_then(|_| target.setattr("retryable", retryable))
+        .and_then(|_| target.setattr("connect_phase", connect_phase))
+        .and_then(|_| target.setattr("connect_failure_kind", connect_failure_kind))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::rithmic_ledger::ledger::{Account, AccountIdentity};
+    use pyo3::types::PyModule;
     use rust_decimal_macros::dec;
+    use std::ffi::CString;
 
     #[test]
     fn runtime_error_projects_only_the_independent_safe_ledger() {
@@ -482,6 +506,225 @@ unclassified_internal|unclassified_ledger_snapshot_failure|ledger snapshot faile
                         .unwrap(),
                     index == 0
                 );
+                assert_eq!(
+                    value
+                        .getattr("connect_phase")
+                        .unwrap()
+                        .extract::<String>()
+                        .unwrap(),
+                    "unclassified"
+                );
+                assert_eq!(
+                    value
+                        .getattr("connect_failure_kind")
+                        .unwrap()
+                        .extract::<String>()
+                        .unwrap(),
+                    "unclassified"
+                );
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn actual_connect_error_projects_complete_safe_diagnostics() {
+        for failure in [
+            LedgerSnapshotFailure::ORDER_CONNECT,
+            LedgerSnapshotFailure::PNL_CONNECT,
+        ] {
+            let error =
+                crate::rithmic_ledger::ledger_runtime::scripted_connect_failure(failure).await;
+            Python::with_gil(|py| {
+                let projected = runtime_error(py, error);
+                let value = projected.value(py);
+                assert!(value.is_instance_of::<PyRuntimeError>());
+                assert_eq!(value.to_string(), "Rithmic ledger snapshot failed");
+                assert_eq!(
+                    value
+                        .getattr("args")
+                        .unwrap()
+                        .extract::<(String,)>()
+                        .unwrap(),
+                    ("Rithmic ledger snapshot failed".to_string(),)
+                );
+                let [stage, code, cause] = failure.safe_fields();
+                for (attribute, expected) in [
+                    ("stage", stage),
+                    ("stable_error_code", code),
+                    ("safe_cause", cause),
+                    ("connect_phase", "discovery_exchange"),
+                    ("connect_failure_kind", "handshake_rejected"),
+                ] {
+                    let actual = value
+                        .getattr(attribute)
+                        .unwrap()
+                        .extract::<String>()
+                        .unwrap();
+                    assert_eq!(actual, expected);
+                    assert!(!actual.contains("secret"));
+                }
+                assert!(!value
+                    .getattr("retryable")
+                    .unwrap()
+                    .extract::<bool>()
+                    .unwrap());
+            });
+        }
+    }
+
+    #[test]
+    fn connect_failure_projects_only_static_phase_and_kind() {
+        Python::with_gil(|py| {
+            let target = PyRuntimeError::new_err("Rithmic ledger snapshot failed")
+                .into_value(py)
+                .into_bound(py)
+                .into_any();
+            let error = project_runtime_error_target(
+                LedgerSnapshotFailure::ORDER_CONNECT,
+                false,
+                "discovery_exchange",
+                "handshake_rejected",
+                target,
+            );
+            let value = error.value(py);
+            assert_eq!(
+                value
+                    .getattr("connect_phase")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "discovery_exchange"
+            );
+            assert_eq!(
+                value
+                    .getattr("connect_failure_kind")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "handshake_rejected"
+            );
+            assert_eq!(value.to_string(), "Rithmic ledger snapshot failed");
+        });
+    }
+
+    #[tokio::test]
+    async fn non_connect_failure_ignores_actual_connect_source_markers() {
+        let error = crate::rithmic_ledger::ledger_runtime::scripted_connect_failure(
+            LedgerSnapshotFailure::ORDER_HEARTBEAT,
+        )
+        .await;
+        Python::with_gil(|py| {
+            let error = runtime_error(py, error);
+            let value = error.value(py);
+            assert_eq!(
+                value.getattr("stage").unwrap().extract::<String>().unwrap(),
+                "order_heartbeat"
+            );
+            assert_eq!(
+                value
+                    .getattr("stable_error_code")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "order_heartbeat_failed"
+            );
+            assert_eq!(
+                value
+                    .getattr("safe_cause")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "ORDER heartbeat failed"
+            );
+            assert!(!value
+                .getattr("retryable")
+                .unwrap()
+                .extract::<bool>()
+                .unwrap());
+            assert_eq!(
+                value
+                    .getattr("connect_phase")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "unclassified"
+            );
+            assert_eq!(
+                value
+                    .getattr("connect_failure_kind")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "unclassified"
+            );
+            assert_eq!(value.to_string(), "Rithmic ledger snapshot failed");
+        });
+    }
+
+    #[test]
+    fn connect_attribute_projection_failure_returns_fixed_error_without_partial_target() {
+        let source = CString::new(
+            r#"
+class FailsConnectPhase(RuntimeError):
+    def __setattr__(self, name, value):
+        if name == "connect_phase":
+            raise RuntimeError("connect phase sentinel")
+        super().__setattr__(name, value)
+
+class FailsConnectFailureKind(RuntimeError):
+    def __setattr__(self, name, value):
+        if name == "connect_failure_kind":
+            raise RuntimeError("connect kind sentinel")
+        super().__setattr__(name, value)
+"#,
+        )
+        .unwrap();
+        let filename = CString::new("diagnostic_target_test.py").unwrap();
+        let module_name = CString::new("diagnostic_target_test").unwrap();
+
+        Python::with_gil(|py| {
+            let module = PyModule::from_code(
+                py,
+                source.as_c_str(),
+                filename.as_c_str(),
+                module_name.as_c_str(),
+            )
+            .unwrap();
+            for class_name in ["FailsConnectPhase", "FailsConnectFailureKind"] {
+                let target = module
+                    .getattr(class_name)
+                    .unwrap()
+                    .call1(("diagnostic target sentinel",))
+                    .unwrap();
+                let error = project_runtime_error_target(
+                    LedgerSnapshotFailure::ORDER_CONNECT,
+                    false,
+                    "discovery_exchange",
+                    "handshake_rejected",
+                    target.into_any(),
+                );
+                let value = error.value(py);
+                assert!(value.is_instance_of::<PyRuntimeError>());
+                assert_eq!(value.get_type().name().unwrap(), "RuntimeError");
+                assert_eq!(
+                    value
+                        .getattr("args")
+                        .unwrap()
+                        .extract::<(String,)>()
+                        .unwrap(),
+                    ("Rithmic ledger snapshot failed".to_string(),)
+                );
+                assert_eq!(value.to_string(), "Rithmic ledger snapshot failed");
+                for attribute in [
+                    "stage",
+                    "stable_error_code",
+                    "safe_cause",
+                    "retryable",
+                    "connect_phase",
+                    "connect_failure_kind",
+                ] {
+                    assert!(!value.hasattr(attribute).unwrap());
+                }
             }
         });
     }
@@ -489,8 +732,13 @@ unclassified_internal|unclassified_ledger_snapshot_failure|ledger snapshot faile
     #[test]
     fn rejected_diagnostic_target_returns_fixed_runtime_error() {
         Python::with_gil(|py| {
-            let error =
-                project_runtime_error_target(PROFILE_LEASE_FAILURE, true, py.None().into_bound(py));
+            let error = project_runtime_error_target(
+                PROFILE_LEASE_FAILURE,
+                true,
+                "unclassified",
+                "unclassified",
+                py.None().into_bound(py),
+            );
             let value = error.value(py);
             assert!(value.is_instance_of::<PyRuntimeError>());
             assert_eq!(value.to_string(), "Rithmic ledger snapshot failed");
@@ -597,7 +845,9 @@ unclassified_internal|unclassified_ledger_snapshot_failure|ledger snapshot faile
         assert!(allow_threads
             .contains(".build()\n            .context(RUNTIME_INITIALIZATION_FAILURE)?"));
         let runtime_error = source.split_once("fn runtime_error").unwrap().1;
-        assert!(runtime_error.contains("project_runtime_error_target(failure, retryable, target)"));
+        assert!(runtime_error.contains(
+            "project_runtime_error_target(\n        failure,\n        retryable,\n        connect_phase,\n        connect_failure_kind,\n        target,\n    )"
+        ));
     }
 
     fn account() -> AccountIdentity {

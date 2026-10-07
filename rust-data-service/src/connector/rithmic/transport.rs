@@ -1,7 +1,8 @@
 use super::{
     codec,
     session::{
-        is_fatal_session_error, is_retryable_session_error, LoginParameters, RithmicSession,
+        is_fatal_session_error, is_handshake_rejection, is_retryable_session_error,
+        LoginParameters, RithmicSession,
     },
 };
 use anyhow::{bail, ensure, Context, Result};
@@ -36,6 +37,71 @@ struct RetryableTransportFailure {
 #[derive(Debug, thiserror::Error)]
 #[error("Rithmic maintenance active; provider I/O suppressed")]
 struct MaintenanceSuppressed;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ConnectPhase {
+    DiscoveryWebsocket,
+    DiscoveryExchange,
+    LoginWebsocket,
+    LoginExchange,
+    InitialHeartbeat,
+}
+
+impl ConnectPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::DiscoveryWebsocket => "discovery_websocket",
+            Self::DiscoveryExchange => "discovery_exchange",
+            Self::LoginWebsocket => "login_websocket",
+            Self::LoginExchange => "login_exchange",
+            Self::InitialHeartbeat => "initial_heartbeat",
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{source}")]
+struct ConnectPhaseFailure {
+    phase: ConnectPhase,
+    #[source]
+    source: anyhow::Error,
+}
+
+fn mark_connect_phase(error: anyhow::Error, phase: ConnectPhase) -> anyhow::Error {
+    ConnectPhaseFailure {
+        phase,
+        source: error,
+    }
+    .into()
+}
+
+pub(crate) fn connect_phase(error: &anyhow::Error) -> &'static str {
+    error
+        .chain()
+        .find_map(|source| {
+            source
+                .downcast_ref::<ConnectPhaseFailure>()
+                .map(|failure| failure.phase.as_str())
+        })
+        .unwrap_or("unclassified")
+}
+
+pub(crate) fn connect_failure_kind(error: &anyhow::Error) -> &'static str {
+    if error
+        .chain()
+        .any(|source| source.downcast_ref::<MaintenanceSuppressed>().is_some())
+    {
+        "maintenance"
+    } else if error.chain().any(is_handshake_rejection) {
+        "handshake_rejected"
+    } else if is_fatal_session_error(error) {
+        "session_fatal"
+    } else if is_retryable_transport_error(error) {
+        "transport"
+    } else {
+        "unclassified"
+    }
+}
 
 fn mark_retryable_transport(error: anyhow::Error) -> anyhow::Error {
     RetryableTransportFailure { source: error }.into()
@@ -627,60 +693,94 @@ pub(crate) async fn connect_with_maintenance_guard(
 ) -> Result<RithmicConnection> {
     let mut session = RithmicSession::new(login);
 
-    ensure_provider_io_allowed(maintenance_active.as_ref())?;
+    ensure_provider_io_allowed(maintenance_active.as_ref())
+        .map_err(|error| mark_connect_phase(error, ConnectPhase::DiscoveryWebsocket))?;
     let (mut discovery, _) = match timeout(response_timeout, connect_async(url)).await {
         Ok(Ok(connection)) => connection,
-        Ok(Err(error)) => return Err(mark_retryable_transport(error.into())),
+        Ok(Err(error)) => {
+            return Err(mark_connect_phase(
+                mark_retryable_transport(error.into()),
+                ConnectPhase::DiscoveryWebsocket,
+            ));
+        }
         Err(error) => {
-            return Err(mark_retryable_transport(
-                anyhow::Error::new(error).context("Rithmic system-info connection timed out"),
+            return Err(mark_connect_phase(
+                mark_retryable_transport(
+                    anyhow::Error::new(error).context("Rithmic system-info connection timed out"),
+                ),
+                ConnectPhase::DiscoveryWebsocket,
             ));
         }
     };
-    ensure_provider_io_allowed(maintenance_active.as_ref())?;
-    send_binary(
-        &mut discovery,
-        session.begin_system_info()?,
-        response_timeout,
-    )
-    .await?;
-    ensure_provider_io_allowed(maintenance_active.as_ref())?;
-    let response = receive_binary_guarded(
-        &mut discovery,
-        response_timeout,
-        maintenance_active.as_ref(),
-    )
-    .await?;
-    session.reject_terminal(&response)?;
-    session.accept_system_info(&response)?;
+    let discovery_exchange = async {
+        ensure_provider_io_allowed(maintenance_active.as_ref())?;
+        send_binary(
+            &mut discovery,
+            session.begin_system_info()?,
+            response_timeout,
+        )
+        .await?;
+        ensure_provider_io_allowed(maintenance_active.as_ref())?;
+        let response = receive_binary_guarded(
+            &mut discovery,
+            response_timeout,
+            maintenance_active.as_ref(),
+        )
+        .await?;
+        session.reject_terminal(&response)?;
+        session.accept_system_info(&response)
+    }
+    .await;
+    discovery_exchange
+        .map_err(|error| mark_connect_phase(error, ConnectPhase::DiscoveryExchange))?;
     drop(discovery);
 
-    ensure_provider_io_allowed(maintenance_active.as_ref())?;
+    ensure_provider_io_allowed(maintenance_active.as_ref())
+        .map_err(|error| mark_connect_phase(error, ConnectPhase::LoginWebsocket))?;
     let (mut socket, _) = match timeout(response_timeout, connect_async(url)).await {
         Ok(Ok(connection)) => connection,
-        Ok(Err(error)) => return Err(mark_retryable_transport(error.into())),
+        Ok(Err(error)) => {
+            return Err(mark_connect_phase(
+                mark_retryable_transport(error.into()),
+                ConnectPhase::LoginWebsocket,
+            ));
+        }
         Err(error) => {
-            return Err(mark_retryable_transport(
-                anyhow::Error::new(error).context("Rithmic login connection timed out"),
+            return Err(mark_connect_phase(
+                mark_retryable_transport(
+                    anyhow::Error::new(error).context("Rithmic login connection timed out"),
+                ),
+                ConnectPhase::LoginWebsocket,
             ));
         }
     };
-    session.mark_reconnected()?;
-    ensure_provider_io_allowed(maintenance_active.as_ref())?;
-    send_binary(&mut socket, session.begin_login()?, response_timeout).await?;
-    ensure_provider_io_allowed(maintenance_active.as_ref())?;
-    let response =
-        receive_binary_guarded(&mut socket, response_timeout, maintenance_active.as_ref()).await?;
-    session.reject_terminal(&response)?;
-    let initial_heartbeat = session.accept_login(&response)?;
-    ensure_provider_io_allowed(maintenance_active.as_ref())?;
-    send_binary(&mut socket, initial_heartbeat, response_timeout).await?;
+    let login_exchange = async {
+        session.mark_reconnected()?;
+        ensure_provider_io_allowed(maintenance_active.as_ref())?;
+        send_binary(&mut socket, session.begin_login()?, response_timeout).await?;
+        ensure_provider_io_allowed(maintenance_active.as_ref())?;
+        let response =
+            receive_binary_guarded(&mut socket, response_timeout, maintenance_active.as_ref())
+                .await?;
+        session.reject_terminal(&response)?;
+        session.accept_login(&response)
+    }
+    .await
+    .map_err(|error| mark_connect_phase(error, ConnectPhase::LoginExchange))?;
+
+    let heartbeat_deadline = async {
+        ensure_provider_io_allowed(maintenance_active.as_ref())?;
+        send_binary(&mut socket, login_exchange, response_timeout).await?;
+        deadline_after(response_timeout)
+    }
+    .await
+    .map_err(|error| mark_connect_phase(error, ConnectPhase::InitialHeartbeat))?;
 
     Ok(RithmicConnection {
         socket,
         session,
         response_timeout,
-        heartbeat_deadline: deadline_after(response_timeout)?,
+        heartbeat_deadline,
         awaiting_heartbeat: true,
         maintenance_active,
     })
@@ -919,6 +1019,7 @@ mod tests {
         Arc, Mutex,
     };
     use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
     use tokio_tungstenite::accept_async;
 
     fn utc(value: &str) -> DateTime<Utc> {
@@ -1619,6 +1720,297 @@ mod tests {
             Plant::Ticker,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn connect_diagnostic_phase_and_kind_matrix_is_static() {
+        let phases = [
+            (ConnectPhase::DiscoveryWebsocket, "discovery_websocket"),
+            (ConnectPhase::DiscoveryExchange, "discovery_exchange"),
+            (ConnectPhase::LoginWebsocket, "login_websocket"),
+            (ConnectPhase::LoginExchange, "login_exchange"),
+            (ConnectPhase::InitialHeartbeat, "initial_heartbeat"),
+        ];
+        for (phase, expected) in phases {
+            let error = mark_connect_phase(
+                mark_retryable_transport(anyhow::anyhow!(
+                    "password=secret account=account-sentinel"
+                )),
+                phase,
+            );
+            assert_eq!(connect_phase(&error), expected);
+            assert_eq!(connect_failure_kind(&error), "transport");
+            assert!(is_retryable_connection_error(&error));
+            assert!(!connect_phase(&error).contains("secret"));
+            assert!(!connect_failure_kind(&error).contains("account-sentinel"));
+        }
+
+        let mut session = RithmicSession::new(login());
+        session.begin_system_info().unwrap();
+        let response = codec::encode(&protocol::ResponseRithmicSystemInfo {
+            template_id: 17,
+            rp_code: vec!["0".to_string()],
+            system_name: vec!["different-system".to_string()],
+            ..Default::default()
+        })
+        .unwrap();
+        let fatal = session.accept_system_info(&response).unwrap_err();
+        assert!(is_fatal_session_error(&fatal));
+        assert!(!fatal.chain().any(is_handshake_rejection));
+        let fatal = mark_connect_phase(fatal, ConnectPhase::LoginExchange);
+        assert_eq!(connect_failure_kind(&fatal), "session_fatal");
+
+        let mut session = RithmicSession::new(login());
+        session.begin_system_info().unwrap();
+        let reject = codec::encode(&protocol::Reject {
+            template_id: 75,
+            user_msg: vec!["password-secret-sentinel".to_string()],
+            rp_code: vec!["provider-code-sentinel".to_string()],
+        })
+        .unwrap();
+        let handshake = session.reject_terminal(&reject).unwrap_err();
+        assert!(is_fatal_session_error(&handshake));
+        assert!(is_handshake_rejection(
+            handshake
+                .chain()
+                .find(|source| is_handshake_rejection(*source))
+                .unwrap()
+        ));
+        let handshake = mark_connect_phase(handshake, ConnectPhase::DiscoveryExchange);
+        assert_eq!(connect_failure_kind(&handshake), "handshake_rejected");
+        assert_eq!(
+            super::super::ledger_runtime::connect_diagnostics(
+                super::super::ledger_runtime::LedgerSnapshotFailure::ORDER_CONNECT,
+                &handshake,
+            ),
+            ("discovery_exchange", "handshake_rejected")
+        );
+        assert_eq!(
+            super::super::ledger_runtime::connect_diagnostics(
+                super::super::ledger_runtime::LedgerSnapshotFailure::PNL_CONNECT,
+                &handshake,
+            ),
+            ("discovery_exchange", "handshake_rejected")
+        );
+        assert_eq!(
+            super::super::ledger_runtime::connect_diagnostics(
+                super::super::ledger_runtime::LedgerSnapshotFailure::ORDER_HEARTBEAT,
+                &handshake,
+            ),
+            ("unclassified", "unclassified")
+        );
+        let maintenance =
+            mark_connect_phase(MaintenanceSuppressed.into(), ConnectPhase::InitialHeartbeat);
+        assert_eq!(connect_failure_kind(&maintenance), "maintenance");
+        assert!(is_retryable_connection_error(&maintenance));
+
+        let unknown = mark_connect_phase(
+            anyhow::anyhow!("provider text password=secret-sentinel"),
+            ConnectPhase::InitialHeartbeat,
+        );
+        assert_eq!(connect_phase(&unknown), "initial_heartbeat");
+        assert_eq!(connect_failure_kind(&unknown), "unclassified");
+        assert_eq!(
+            connect_phase(&anyhow::anyhow!("missing phase")),
+            "unclassified"
+        );
+        let missing_phase_transport = mark_retryable_transport(anyhow::anyhow!("safe network"));
+        assert_eq!(connect_phase(&missing_phase_transport), "unclassified");
+        assert_eq!(connect_failure_kind(&missing_phase_transport), "transport");
+    }
+
+    #[tokio::test]
+    async fn scripted_connect_rejection_keeps_phase_and_does_not_start_login() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (inspect_tx, inspect_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            assert_template(socket.next().await.unwrap().unwrap(), 16);
+            socket
+                .send(Message::Binary(
+                    codec::encode(&protocol::Reject {
+                        template_id: 75,
+                        user_msg: vec!["provider-secret-sentinel".to_string()],
+                        rp_code: vec!["unknown-provider-code".to_string()],
+                    })
+                    .unwrap()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            inspect_rx.await.unwrap();
+            let second_connection = timeout(Duration::from_millis(25), listener.accept()).await;
+            assert!(
+                second_connection.is_err(),
+                "connect rejection must not open another websocket"
+            );
+            if let Ok(Some(Ok(message))) = timeout(Duration::from_millis(25), socket.next()).await {
+                assert!(
+                    !matches!(message, Message::Binary(_)),
+                    "connect rejection must not send another binary request"
+                );
+            }
+        });
+
+        let error = match connect(&url, login(), Duration::from_secs(1)).await {
+            Ok(_) => panic!("scripted handshake rejection must fail connection"),
+            Err(error) => error,
+        };
+        assert_eq!(connect_phase(&error), "discovery_exchange");
+        assert_eq!(connect_failure_kind(&error), "handshake_rejected");
+        assert!(error
+            .to_string()
+            .contains("stable_error_code=rithmic_handshake_rejected"));
+        assert!(!error.to_string().contains("provider-secret-sentinel"));
+        assert!(!error.to_string().contains("unknown-provider-code"));
+        inspect_tx.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn discovery_websocket_failure_has_typed_phase() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+
+        let error = match connect(&format!("ws://{address}"), login(), Duration::from_secs(1)).await
+        {
+            Ok(_) => panic!("closed local port must reject the websocket connection"),
+            Err(error) => error,
+        };
+        assert_eq!(connect_phase(&error), "discovery_websocket");
+        assert_eq!(connect_failure_kind(&error), "transport");
+        assert!(is_retryable_connection_error(&error));
+    }
+
+    #[tokio::test]
+    async fn login_websocket_failure_has_typed_phase() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut discovery = accept_async(stream).await.unwrap();
+            assert_template(discovery.next().await.unwrap().unwrap(), 16);
+            drop(listener);
+            discovery
+                .send(Message::Binary(
+                    codec::encode(&protocol::ResponseRithmicSystemInfo {
+                        template_id: 17,
+                        rp_code: vec!["0".to_string()],
+                        system_name: vec!["test-system".to_string()],
+                        ..Default::default()
+                    })
+                    .unwrap()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+        });
+
+        let error = match connect(&url, login(), Duration::from_secs(1)).await {
+            Ok(_) => panic!("the closed listener must reject the login websocket"),
+            Err(error) => error,
+        };
+        server.await.unwrap();
+        assert_eq!(connect_phase(&error), "login_websocket");
+        assert_eq!(connect_failure_kind(&error), "transport");
+        assert!(is_retryable_connection_error(&error));
+    }
+
+    #[tokio::test]
+    async fn login_exchange_failure_has_typed_phase_and_safe_kind() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut discovery = accept_async(stream).await.unwrap();
+            assert_template(discovery.next().await.unwrap().unwrap(), 16);
+            discovery
+                .send(Message::Binary(
+                    codec::encode(&protocol::ResponseRithmicSystemInfo {
+                        template_id: 17,
+                        rp_code: vec!["0".to_string()],
+                        system_name: vec!["test-system".to_string()],
+                        ..Default::default()
+                    })
+                    .unwrap()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            drop(discovery);
+
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut login_socket = accept_async(stream).await.unwrap();
+            assert_template(login_socket.next().await.unwrap().unwrap(), 10);
+            login_socket
+                .send(Message::Binary(
+                    codec::encode(&protocol::ResponseLogin {
+                        template_id: 11,
+                        rp_code: vec!["13".to_string(), "secret-user-text".to_string()],
+                        heartbeat_interval: Some(30.0),
+                        ..Default::default()
+                    })
+                    .unwrap()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+        });
+
+        let error = match connect(&url, login(), Duration::from_secs(1)).await {
+            Ok(_) => panic!("non-success login response must fail"),
+            Err(error) => error,
+        };
+        server.await.unwrap();
+        assert_eq!(connect_phase(&error), "login_exchange");
+        assert_eq!(connect_failure_kind(&error), "session_fatal");
+        assert!(!is_retryable_connection_error(&error));
+        assert!(!error.to_string().contains("secret-user-text"));
+    }
+
+    #[tokio::test]
+    async fn initial_heartbeat_deadline_failure_has_typed_phase() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { serve_handshake(&listener, 30.0).await });
+
+        let error = match connect(&url, login(), Duration::MAX).await {
+            Ok(_) => panic!("out-of-range initial heartbeat deadline must fail"),
+            Err(error) => error,
+        };
+        server.await.unwrap();
+        assert_eq!(connect_phase(&error), "initial_heartbeat");
+        assert_eq!(connect_failure_kind(&error), "unclassified");
+        assert!(!is_retryable_connection_error(&error));
+    }
+
+    #[tokio::test]
+    async fn connect_maintenance_diagnostics_do_not_open_provider_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let guard: MaintenanceGuard = Arc::new(|| true);
+        let error = match connect_with_maintenance_guard(
+            &url,
+            login(),
+            Duration::from_secs(1),
+            guard,
+        )
+        .await
+        {
+            Ok(_) => panic!("maintenance must suppress provider I/O"),
+            Err(error) => error,
+        };
+
+        assert_eq!(connect_phase(&error), "discovery_websocket");
+        assert_eq!(connect_failure_kind(&error), "maintenance");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
     }
 
     async fn serve_handshake(
