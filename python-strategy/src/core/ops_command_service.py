@@ -80,6 +80,7 @@ class OpsCommandService:
             kill_switch_kwargs = {"actor": actor, "reason": reason}
             if operation_id is not None:
                 kill_switch_kwargs["operation_id"] = operation_id
+            kill_switch_kwargs["operator_origin"] = True
             result = self._run_kill_switch(**kill_switch_kwargs)
             self._mark_kill_switch_halted()
 

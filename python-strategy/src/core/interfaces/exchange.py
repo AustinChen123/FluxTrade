@@ -50,6 +50,7 @@ class OwnedOrderReconciler(Protocol):
         self,
         *,
         snapshot_loader: Callable[..., Any] | None = None,
+        startup_position_restorer: Callable[..., dict[str, object]] | None = None,
     ) -> dict[str, object]: ...
 
 

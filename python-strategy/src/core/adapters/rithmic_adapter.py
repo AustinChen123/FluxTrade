@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from dataclasses import replace
 from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING
 
@@ -149,6 +150,22 @@ class RithmicExchangeAdapter(IExchangeAdapter):
         from src.core.adapters.rithmic_owned_order_reconciliation import (
             RithmicOwnedOrderReconciler,
         )
+
+        local_positions_loader = context.local_positions_loader
+        if local_positions_loader is not None:
+            configured_product_ids = frozenset(self.configured_product_ids)
+
+            def load_configured_local_positions() -> list[object]:
+                return [
+                    position
+                    for position in local_positions_loader()
+                    if getattr(position, "product_id", None) in configured_product_ids
+                ]
+
+            context = replace(
+                context,
+                local_positions_loader=load_configured_local_positions,
+            )
 
         return RithmicOwnedOrderReconciler(
             adapter=self,

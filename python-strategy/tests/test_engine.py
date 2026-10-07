@@ -1797,7 +1797,12 @@ class TestEngineInit:
             RithmicLedgerRecoveryService,
         )
         assert result is summary
-        engine.execution_engine.reconcile_owned_orders.assert_called_once_with()
+        engine.execution_engine.reconcile_owned_orders.assert_called_once()
+        assert callable(
+            engine.execution_engine.reconcile_owned_orders.call_args.kwargs[
+                "startup_position_restorer"
+            ]
+        )
         engine.execution_engine.reconcile_recoverable_client_orders.assert_not_called()
         engine.account_service.replace_authoritative_balance.assert_called_once_with(
             venue="rithmic",
@@ -3791,6 +3796,7 @@ class TestHandleCommand:
             actor="operator@example.com",
             reason=None,
             operation_id="mobile-lockdown-1",
+            operator_origin=True,
         )
         engine.ops_safety.persist_kill_switch_state.assert_called_once_with(
             "LOCKDOWN",
@@ -3889,6 +3895,7 @@ class TestHandleCommand:
             actor="operator@example.com",
             reason=None,
             operation_id="persistence-failed",
+            operator_origin=True,
         )
         engine._venue_runtime.requires_authoritative_flatten_verification.assert_not_called()
         engine._mark_kill_switch_operation_completed.assert_not_called()
@@ -10606,6 +10613,7 @@ def test_kill_switch_dispatch_uses_facade_not_concrete_adapter(
             actor="ops",
             reason="drill",
             operation_id=None,
+            operator_origin=False,
         )
     else:
         engine.ops_safety.kill_switch.assert_called_once_with(
@@ -10635,6 +10643,7 @@ def test_rithmic_kill_switch_delegates_exactly_once_to_venue_owner(engine):
         actor="ops",
         reason="drill",
         operation_id="operation-1",
+        operator_origin=False,
     )
     engine.ops_safety.kill_switch.assert_not_called()
 
@@ -10659,6 +10668,7 @@ def test_rithmic_kill_switch_uses_runtime_execution_facade(engine):
         actor="ops",
         reason="drill",
         operation_id="operation-1",
+        operator_origin=False,
     )
     engine._venue_runtime.emergency_flatten.execute.assert_not_called()
     engine.ops_safety.kill_switch.assert_not_called()

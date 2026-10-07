@@ -336,10 +336,17 @@ class OrderReconciler:
 
         return payload
 
-    def reconcile_owned_orders(self, *, snapshot_loader=None) -> dict[str, object]:
+    def reconcile_owned_orders(
+        self, *, snapshot_loader=None, startup_position_restorer=None
+    ) -> dict[str, object]:
         """Delegate owned-order recovery to the adapter capability."""
         if self._owned_order_reconciler is None:
             raise ExchangeError("owned_order_reconciliation_unsupported")
+        if startup_position_restorer is not None:
+            return self._owned_order_reconciler.reconcile(
+                snapshot_loader=snapshot_loader,
+                startup_position_restorer=startup_position_restorer,
+            )
         return self._owned_order_reconciler.reconcile(snapshot_loader=snapshot_loader)
 
     def resync_recoverable_order_events(self) -> dict[str, object]:

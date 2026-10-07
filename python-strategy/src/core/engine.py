@@ -948,6 +948,7 @@ class StrategyEngine:
         actor: str,
         reason: str | None,
         operation_id: str | None = None,
+        operator_origin: bool = False,
     ) -> dict:
         def run_generic_kill_switch() -> dict:
             if operation_id is None:
@@ -966,6 +967,7 @@ class StrategyEngine:
             actor=actor,
             reason=reason,
             operation_id=operation_id,
+            operator_origin=operator_origin,
         )
 
     def _reconcile_recoverable_orders_on_startup(self) -> dict | None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from decimal import Decimal, InvalidOperation
 from logging import Logger
 from typing import Any
 
@@ -14,8 +15,42 @@ from src.core.adapters.rithmic_recovery import (
 from src.core.adapters.rithmic_order_event_lifecycle import (
     RithmicOrderEventLifecycleGate,
 )
+from src.core.adapters.rithmic_operator_flat_baseline import (
+    _BaselineRecord,
+    write_rithmic_operator_flat_baseline,
+)
 from src.core.execution import ExecutionEngine
 from src.core.ops_safety import OpsSafetyService
+
+
+def _has_only_flat_residual_drifts(
+    drifts: object,
+    product_ids: tuple[str, ...] | list[str],
+    *,
+    require_residual: bool,
+) -> bool:
+    if not isinstance(drifts, list) or (require_residual and not drifts):
+        return False
+    for drift in drifts:
+        if not isinstance(drift, dict) or drift.get("product_id") not in product_ids:
+            return False
+        local_value = drift.get("local_quantity")
+        remote_value = drift.get("remote_quantity")
+        if not isinstance(local_value, str) or not isinstance(remote_value, str):
+            return False
+        try:
+            local_quantity = Decimal(local_value)
+            remote_quantity = Decimal(remote_value)
+        except InvalidOperation:
+            return False
+        if (
+            not local_quantity.is_finite()
+            or not remote_quantity.is_finite()
+            or local_quantity == 0
+            or remote_quantity != 0
+        ):
+            return False
+    return True
 
 
 def _empty_result() -> dict[str, Any]:
@@ -72,6 +107,8 @@ class RithmicEmergencyFlattenService:
         clear_polling_stop: Callable[[], None],
         restart_generic_worker: Callable[[], None],
         run_when_submissions_drained: Callable[[Callable[[], None]], None],
+        db_session_factory: Callable[[], Any] | None = None,
+        authoritative_account_scope_matches: Callable[[], bool] | None = None,
         logger: Logger,
     ) -> None:
         if not profile or not account_id:
@@ -87,6 +124,10 @@ class RithmicEmergencyFlattenService:
         self.clear_polling_stop = clear_polling_stop
         self.restart_generic_worker = restart_generic_worker
         self.run_when_submissions_drained = run_when_submissions_drained
+        self.db_session_factory = db_session_factory
+        self.authoritative_account_scope_matches = (
+            authoritative_account_scope_matches or (lambda: False)
+        )
         self.logger = logger
 
     def execute(
@@ -95,12 +136,14 @@ class RithmicEmergencyFlattenService:
         actor: str,
         reason: str | None,
         operation_id: str | None = None,
+        operator_origin: bool = False,
     ) -> dict[str, Any]:
         return self.operation_gate.run(
             self._execute_serialized,
             actor=actor,
             reason=reason,
             operation_id=operation_id,
+            operator_origin=operator_origin,
         )
 
     def _execute_serialized(
@@ -109,6 +152,7 @@ class RithmicEmergencyFlattenService:
         actor: str,
         reason: str | None,
         operation_id: str | None = None,
+        operator_origin: bool = False,
     ) -> dict[str, Any]:
         aggregate: dict[str, Any] | None = None
         operation_failed = False
@@ -174,6 +218,7 @@ class RithmicEmergencyFlattenService:
                         break
 
                 snapshot = self._load_snapshot()
+                snapshot_observed_at_ms = int(self.execution_engine.clock.now() * 1000)
                 reconciliation = self._reconcile(snapshot)
                 remaining_positions = self.adapter.positions_from_ledger_snapshot(
                     snapshot
@@ -182,16 +227,57 @@ class RithmicEmergencyFlattenService:
                     rithmic_order_may_be_working(order) for order in snapshot.orders
                 )
                 if not working_orders_remain:
-                    self.account_service.replace_positions_for_products(
-                        remaining_positions,
-                        self.adapter.configured_product_ids,
-                        timestamp_ms=int(self.execution_engine.clock.now() * 1000),
+                    baseline: _BaselineRecord | None = None
+                    correction: dict[str, object] | None = None
+                    prior_positions: list[Any] = []
+                    if operator_origin:
+                        configured_products = set(self.adapter.configured_product_ids)
+                        prior_positions = [
+                            position
+                            for position in self.account_service.get_all_positions()
+                            if position.product_id in configured_products
+                        ]
+                        correction, baseline = self._prepare_operator_baseline(
+                            snapshot=snapshot,
+                            reconciliation=reconciliation,
+                            remaining_positions=remaining_positions,
+                            actor=actor,
+                            operation_id=operation_id,
+                            observed_at_ms=snapshot_observed_at_ms,
+                            prior_positions=prior_positions,
+                        )
+                        if aggregate is not None:
+                            aggregate["position_correction"] = correction
+                    if baseline is not None:
+                        correction = {
+                            **(correction or {}),
+                            "baseline_event_id": baseline.event_id,
+                            "reason": "operator_flat_baseline",
+                            "economics_unresolved": True,
+                        }
+                        if aggregate is not None:
+                            aggregate["position_correction"] = correction
+                    suppress_unaudited_flat_projection = bool(
+                        operator_origin
+                        and not remaining_positions
+                        and prior_positions
+                        and baseline is None
                     )
-                    reconciliation = self._reconcile(snapshot)
+                    if not suppress_unaudited_flat_projection:
+                        self.account_service.replace_positions_for_products(
+                            remaining_positions,
+                            self.adapter.configured_product_ids,
+                            timestamp_ms=snapshot_observed_at_ms,
+                        )
+                        reconciliation = self._reconcile(snapshot)
                     if (
                         not remaining_positions
                         and reconciliation.get("auto_resume_safe") is True
                     ):
+                        if correction is not None and aggregate is not None:
+                            if baseline is not None:
+                                correction["status"] = "applied"
+                            aggregate["position_correction"] = correction
                         return finalize(True)
 
                 if working_orders_remain:
@@ -246,6 +332,79 @@ class RithmicEmergencyFlattenService:
                     )
                 else:
                     raise
+
+    def _prepare_operator_baseline(
+        self,
+        *,
+        snapshot: Any,
+        reconciliation: dict[str, Any],
+        remaining_positions: list[Any],
+        actor: str,
+        operation_id: str | None,
+        observed_at_ms: int,
+        prior_positions: list[Any],
+    ) -> tuple[dict[str, object], _BaselineRecord | None]:
+        def inapplicable(reason: str) -> tuple[dict[str, object], None]:
+            return (
+                {
+                    "status": "inapplicable",
+                    "baseline_event_id": None,
+                    "reason": reason,
+                    "economics_unresolved": None,
+                },
+                None,
+            )
+
+        if not self.authoritative_account_scope_matches():
+            return inapplicable("remote_state_inapplicable")
+        if (
+            snapshot.account_id != self.account_id
+            or remaining_positions
+            or reconciliation.get("external_count") != 0
+        ):
+            return inapplicable("remote_state_inapplicable")
+        verification = reconciliation.get("ledger_verification")
+        if not isinstance(verification, dict) or verification.get("errors"):
+            return inapplicable("remote_state_inapplicable")
+        results = reconciliation.get("results")
+        if not isinstance(results, list) or any(
+            not isinstance(item, dict)
+            or item.get("unresolved") is not False
+            or item.get("verification_blocked") is not False
+            for item in results
+        ):
+            return inapplicable("remote_state_inapplicable")
+        if not _has_only_flat_residual_drifts(
+            verification.get("position_drifts"),
+            self.adapter.configured_product_ids,
+            require_residual=True,
+        ):
+            return inapplicable("remote_state_inapplicable")
+        if not prior_positions:
+            return inapplicable("no_residual_position")
+        if not operation_id:
+            return inapplicable("no_baseline")
+        if self.db_session_factory is None:
+            raise RuntimeError("rithmic_operator_flat_baseline_database_unavailable")
+        record = write_rithmic_operator_flat_baseline(
+            self.db_session_factory,
+            operation_id=operation_id,
+            actor=actor,
+            profile=self.profile,
+            account_id=self.account_id,
+            product_ids=self.adapter.configured_product_ids,
+            observed_at_ms=observed_at_ms,
+            prior_positions=prior_positions,
+        )
+        return (
+            {
+                "status": "inapplicable",
+                "baseline_event_id": record.event_id,
+                "reason": "operator_flat_baseline",
+                "economics_unresolved": True,
+            },
+            record,
+        )
 
     def schedule_portfolio_exit_compensation(self, reason: str) -> None:
         """Run or queue the same authoritative flatten after submission drain."""

@@ -13,6 +13,10 @@ from typing import Any
 from src.core.adapters.rithmic_adapter import RithmicExchangeAdapter
 from src.core.adapters.rithmic_emergency_flatten import (
     RithmicEmergencyFlattenService,
+    _has_only_flat_residual_drifts,
+)
+from src.core.adapters.rithmic_operator_flat_baseline import (
+    read_latest_rithmic_operator_flat_baseline,
 )
 from src.core.adapters.rithmic_external_order_drift import (
     RithmicExternalOrderDriftService,
@@ -40,6 +44,7 @@ from src.core.adapters.rithmic_order_reconnect import (
     RithmicOrderReconnectService,
 )
 from src.core.adapters.rithmic_portfolio_exit import RithmicPortfolioExitService
+from src.core.adapters.rithmic_recovery import rithmic_order_may_be_working
 from src.core.adapters.rithmic_runtime_recovery import (
     RithmicRuntimeRecoveryService,
 )
@@ -394,6 +399,7 @@ class RithmicRuntimeOwners:
         actor: str,
         reason: str | None,
         operation_id: str | None = None,
+        operator_origin: bool = False,
     ) -> dict[str, Any]:
         """Dispatch emergency flatten to the current venue owner."""
         if self.emergency_flatten is None:
@@ -402,6 +408,7 @@ class RithmicRuntimeOwners:
             actor=actor,
             reason=reason,
             operation_id=operation_id,
+            operator_origin=operator_origin,
         )
 
     def run_emergency_flatten(
@@ -411,6 +418,7 @@ class RithmicRuntimeOwners:
         actor: str,
         reason: str | None,
         operation_id: str | None = None,
+        operator_origin: bool = False,
     ) -> dict[str, Any]:
         """Select generic flatten or the current venue owner."""
         if not self.is_rithmic_runtime:
@@ -419,6 +427,7 @@ class RithmicRuntimeOwners:
             actor=actor,
             reason=reason,
             operation_id=operation_id,
+            operator_origin=operator_origin,
         )
 
     def requires_authoritative_flatten_verification(self) -> bool:
@@ -529,12 +538,92 @@ def build_rithmic_runtime_owners(
     operation_gate = RithmicOrderEventLifecycleGate()
     if not isinstance(adapter, RithmicExchangeAdapter):
         return RithmicRuntimeOwners(order_event_lifecycle=operation_gate)
+
+    def authoritative_account_scope_matches() -> bool:
+        return (
+            getattr(account_service, "_authoritative_venue", None) == "rithmic"
+            and getattr(account_service, "_authoritative_account_id", None)
+            == account_id
+        )
+
+    def restore_startup_position_baseline(
+        *,
+        snapshot: Any,
+        recovery: dict[str, object],
+        ledger_verification: dict[str, Any],
+    ) -> dict[str, object]:
+        def inapplicable(reason: str) -> dict[str, object]:
+            return {
+                "status": "inapplicable",
+                "baseline_event_id": None,
+                "reason": reason,
+                "economics_unresolved": None,
+            }
+
+        if not profile or not account_id or snapshot.account_id != account_id:
+            return inapplicable("remote_state_inapplicable")
+        if not authoritative_account_scope_matches():
+            return inapplicable("remote_state_inapplicable")
+        if recovery.get("external_count") != 0 or ledger_verification.get("errors"):
+            return inapplicable("remote_state_inapplicable")
+        results = recovery.get("results")
+        if not isinstance(results, list) or any(
+            not isinstance(item, dict)
+            or item.get("unresolved") is not False
+            or item.get("verification_blocked") is not False
+            for item in results
+        ):
+            return inapplicable("remote_state_inapplicable")
+        if not _has_only_flat_residual_drifts(
+            ledger_verification.get("position_drifts"),
+            adapter.configured_product_ids,
+            require_residual=False,
+        ):
+            return inapplicable("remote_state_inapplicable")
+        if adapter.positions_from_ledger_snapshot(snapshot) or any(
+            rithmic_order_may_be_working(order) for order in snapshot.orders
+        ):
+            return inapplicable("remote_state_inapplicable")
+        session_factory = getattr(execution_engine, "_db_session_factory", None)
+        if session_factory is None:
+            raise RuntimeError("rithmic_operator_flat_baseline_database_unavailable")
+        baseline = read_latest_rithmic_operator_flat_baseline(
+            session_factory,
+            profile=profile,
+            account_id=account_id,
+            product_ids=adapter.configured_product_ids,
+        )
+        if baseline.record is None:
+            return inapplicable(
+                baseline.reason
+                if baseline.reason
+                in {
+                    "no_baseline",
+                    "scope_or_version_inapplicable",
+                    "durable_cut_changed",
+                }
+                else "scope_or_version_inapplicable"
+            )
+        account_service.replace_positions_for_products(
+            [],
+            adapter.configured_product_ids,
+            timestamp_ms=int(execution_engine.clock.now() * 1000),
+        )
+        return {
+            "status": "applied",
+            "baseline_event_id": baseline.record.event_id,
+            "reason": "restored_operator_flat_baseline",
+            "economics_unresolved": True,
+        }
+
     ledger_recovery = (
         RithmicLedgerRecoveryService(
             profile=profile or "",
             account_id=account_id,
             reconcile_owned_orders=lambda owner_profile, owner_account_id: (
-                execution_engine.reconcile_owned_orders()
+                execution_engine.reconcile_owned_orders(
+                    startup_position_restorer=restore_startup_position_baseline
+                )
             ),
             now_seconds=lambda: execution_engine.clock.now(),
             publish_authoritative_balance=lambda **values: (
@@ -664,6 +753,8 @@ def build_rithmic_runtime_owners(
         clear_polling_stop=stop_event.clear,
         restart_generic_worker=callbacks.start_order_event_stream,
         run_when_submissions_drained=execution_engine.run_when_submissions_drained,
+        db_session_factory=getattr(execution_engine, "_db_session_factory", None),
+        authoritative_account_scope_matches=authoritative_account_scope_matches,
         logger=logger,
     )
 

@@ -324,9 +324,16 @@ class ExecutionEngine:
                 self._latch_fill_position_cache_failure()
             return summary
 
-    def reconcile_owned_orders(self, *, snapshot_loader=None) -> dict[str, object]:
+    def reconcile_owned_orders(
+        self, *, snapshot_loader=None, startup_position_restorer=None
+    ) -> dict[str, object]:
+        if startup_position_restorer is None:
+            return self._order_reconciler.reconcile_owned_orders(
+                snapshot_loader=snapshot_loader
+            )
         return self._order_reconciler.reconcile_owned_orders(
-            snapshot_loader=snapshot_loader
+            snapshot_loader=snapshot_loader,
+            startup_position_restorer=startup_position_restorer,
         )
 
     def portfolio_exposure_snapshot(

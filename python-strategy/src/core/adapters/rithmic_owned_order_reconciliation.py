@@ -105,6 +105,7 @@ class RithmicOwnedOrderReconciler:
         self,
         *,
         snapshot_loader: Callable[..., Any] | None = None,
+        startup_position_restorer: Callable[..., dict[str, object]] | None = None,
     ) -> dict[str, object]:
         """Repair recent FluxTrade-owned orders from one Rithmic snapshot."""
         if self.context.db_session_factory is None:
@@ -276,12 +277,27 @@ class RithmicOwnedOrderReconciler:
             snapshot,
             expected_account_id=account_id,
         )
+        position_correction = None
+        if startup_position_restorer is not None:
+            position_correction = startup_position_restorer(
+                snapshot=snapshot,
+                recovery=self._recovery_payload(orders, plan, external_orders),
+                ledger_verification=ledger_verification,
+            )
+            if position_correction.get("status") == "applied":
+                ledger_verification = self._verify_ledger(
+                    orders,
+                    snapshot,
+                    expected_account_id=account_id,
+                )
         payload = self._recovery_payload(
             orders,
             plan,
             external_orders,
             ledger_verification,
         )
+        if position_correction is not None:
+            payload["position_correction"] = position_correction
         return self._write_recovery_audit(payload, phase="completed")
 
     def _write_identity_failure_audit(

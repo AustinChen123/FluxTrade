@@ -963,6 +963,7 @@ def test_runtime_handle_routes_execution_dispatch_to_current_owners() -> None:
         actor="ops",
         reason="drill",
         operation_id="operation-1",
+        operator_origin=False,
     )
 
     second_exit = MagicMock()
@@ -986,6 +987,7 @@ def test_runtime_handle_routes_execution_dispatch_to_current_owners() -> None:
         actor="ops",
         reason=None,
         operation_id=None,
+        operator_origin=False,
     )
 
 
@@ -1052,11 +1054,13 @@ def test_emergency_flatten_dispatcher_uses_current_rithmic_owner() -> None:
         actor="ops",
         reason="drill",
         operation_id="operation-1",
+        operator_origin=False,
     )
     second.execute.assert_called_once_with(
         actor="operator",
         reason=None,
         operation_id=None,
+        operator_origin=False,
     )
     assert owners.requires_authoritative_flatten_verification() is True
 

@@ -82,6 +82,7 @@ def test_kill_switch_preserves_exact_success_order_and_arguments() -> None:
         actor="operator@example.com",
         reason="manual halt",
         operation_id="halt-1",
+        operator_origin=True,
     )
     classify.assert_called_once_with(
         {"complete": True},

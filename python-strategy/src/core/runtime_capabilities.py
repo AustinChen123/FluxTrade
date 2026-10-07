@@ -273,6 +273,7 @@ class RuntimeCapabilities(Protocol):
         actor: str,
         reason: str | None,
         operation_id: str | None = None,
+        operator_origin: bool = False,
     ) -> dict[str, Any]: ...
 
     def requires_authoritative_flatten_verification(self) -> bool: ...
@@ -404,6 +405,7 @@ class NoopRuntimeCapabilities:
         actor: str,
         reason: str | None,
         operation_id: str | None = None,
+        operator_origin: bool = False,
     ) -> dict[str, Any]:
         return fallback()
 
