@@ -431,8 +431,8 @@ pub(super) fn update_pending_from_event(
                 });
                 return Ok(());
             }
-            match event.status.as_str() {
-                "cancelled" => complete_or_restore_cancel(
+            match event.notification_type.as_str() {
+                "cancel" => complete_or_restore_cancel(
                     pending,
                     request_key,
                     basket_id,
@@ -441,10 +441,34 @@ pub(super) fn update_pending_from_event(
                     deadline,
                     reply,
                 ),
-                "cancel_rejected" => {
+                "reject" => {
+                    let _ = reply.send(Err(anyhow::anyhow!(
+                        "Rithmic order became terminal before cancellation"
+                    )));
+                }
+                "fill" if event.status == "quantity_unresolved" => {
+                    *pending = Some(Pending::Cancel {
+                        request_key,
+                        basket_id,
+                        response_accepted,
+                        terminal_seen,
+                        deadline,
+                        reply,
+                    });
+                }
+                _ if event.status == "cancelled" => complete_or_restore_cancel(
+                    pending,
+                    request_key,
+                    basket_id,
+                    response_accepted,
+                    true,
+                    deadline,
+                    reply,
+                ),
+                _ if event.status == "cancel_rejected" => {
                     let _ = reply.send(Err(anyhow::anyhow!("Rithmic cancel was rejected")));
                 }
-                "filled" | "rejected" => {
+                _ if matches!(event.status.as_str(), "filled" | "rejected") => {
                     let _ = reply.send(Err(anyhow::anyhow!(
                         "Rithmic order became terminal before cancellation"
                     )));

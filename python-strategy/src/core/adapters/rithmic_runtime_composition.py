@@ -33,6 +33,9 @@ from src.core.adapters.rithmic_order_event_lifecycle import (
 from src.core.adapters.rithmic_order_event_stream import (
     RithmicOrderEventStreamService,
 )
+from src.core.adapters.rithmic_order_observation import (
+    _resolve_sparse_live_order_event,
+)
 from src.core.adapters.rithmic_order_reconnect import (
     RithmicOrderReconnectService,
 )
@@ -144,8 +147,33 @@ class RithmicRuntimeBootstrap:
     ) -> dict[str, object]:
         """Apply generic events or delegate native protection to Rithmic."""
         if not self.is_rithmic_runtime:
-            return apply_event()
-        return process_native_protection_event(repository, event, apply_event)
+            return apply_event(event)
+        normalized_event = event
+        if event.status == "quantity_unresolved":
+            identity = self.order_account_identity
+            if identity is None:
+                return {
+                    "action": "unresolved_rithmic_sparse_quantity",
+                    "unresolved": True,
+                    "status": event.status,
+                }
+            normalized_event = _resolve_sparse_live_order_event(
+                repository,
+                event,
+                account_profile=identity.account_profile,
+                account_id=identity.account_id,
+            )
+            if normalized_event is None:
+                return {
+                    "action": "unresolved_rithmic_sparse_quantity",
+                    "unresolved": True,
+                    "status": event.status,
+                }
+        return process_native_protection_event(
+            repository,
+            normalized_event,
+            apply_event,
+        )
 
     def audit_pending_protection_fill(
         self,

@@ -17,6 +17,7 @@ def _classify_status(
     *,
     notification_type: str | None = None,
     unfilled_quantity: Decimal | None = None,
+    allow_live_implicit_progress: bool = False,
 ) -> _StatusInterpretation:
     """Classify only supported status/quantity evidence; unknown stays unresolved."""
     notification = str(notification_type or "").strip().upper()
@@ -39,6 +40,20 @@ def _classify_status(
     normalized = _normalize_status_text(status)
     fully_filled = filled_quantity == quantity
     incomplete = filled_quantity < quantity
+
+    if (
+        allow_live_implicit_progress
+        and notification in {"STATUS", "MODIFY", "TRIGGER"}
+        and not normalized
+    ):
+        return _StatusInterpretation(
+            "filled"
+            if fully_filled
+            else "partially_filled"
+            if filled_quantity
+            else "open",
+            fully_filled,
+        )
 
     # ExchangeOrderNotification FILL carries cumulative progress; its raw status
     # is not authoritative. The native decoder uses the same quantity boundary.
@@ -173,6 +188,7 @@ def _normalize_status(
     *,
     notification_type: str | None = None,
     unfilled_quantity: Decimal | None = None,
+    allow_live_implicit_progress: bool = False,
 ) -> str | None:
     return _classify_status(
         status,
@@ -180,6 +196,7 @@ def _normalize_status(
         order_quantity,
         notification_type=notification_type,
         unfilled_quantity=unfilled_quantity,
+        allow_live_implicit_progress=allow_live_implicit_progress,
     ).economic_status
 
 

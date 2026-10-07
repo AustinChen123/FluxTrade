@@ -21,13 +21,13 @@ class _NativeProtectionOrder(Protocol):
 def process_native_protection_event(
     repository: IOrderRepository,
     event: ExchangeOrderEvent,
-    apply_event: Callable[[], dict[str, object]],
+    apply_event: Callable[[ExchangeOrderEvent], dict[str, object]],
 ) -> dict[str, object]:
     """Apply one event while preserving Rithmic native-protection identity."""
     identity_failure = _identity_failure(repository, event)
     if identity_failure is not None:
         return identity_failure
-    return _verify_confirmation(repository, event, apply_event())
+    return _verify_confirmation(repository, event, apply_event(event))
 
 
 def _identity_failure(

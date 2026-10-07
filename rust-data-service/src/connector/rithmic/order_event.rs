@@ -22,9 +22,11 @@ pub(crate) struct OrderEvent {
     pub(crate) exchange: String,
     pub(crate) symbol: String,
     pub(crate) status: String,
+    pub(crate) raw_status: Option<String>,
     pub(crate) notification_type: String,
     pub(crate) transaction_type: TransactionType,
     pub(crate) quantity: Option<Decimal>,
+    pub(crate) unfilled_quantity: Option<Decimal>,
     pub(crate) price: Option<Decimal>,
     pub(crate) trigger_price: Option<Decimal>,
     pub(crate) price_type: Option<String>,
@@ -89,9 +91,11 @@ pub(crate) fn decode_order_event(
         exchange: required_text(response.exchange, "exchange")?,
         symbol: required_text(response.symbol, "symbol")?,
         status,
+        raw_status: response.status,
         notification_type: notify_type.as_str_name().to_ascii_lowercase(),
         transaction_type: transaction_type(response.transaction_type)?,
         quantity,
+        unfilled_quantity,
         price: optional_nonnegative_decimal(response.price, "order price")?,
         trigger_price: optional_nonnegative_decimal(response.trigger_price, "trigger price")?,
         price_type: optional_exchange_price_type(response.price_type)?,
@@ -136,6 +140,15 @@ fn classify_status(
             unfilled <= quantity,
             "Rithmic unfilled size exceeds order quantity"
         );
+    }
+    if quantity.is_none()
+        && cumulative_filled.is_some_and(|filled| filled > Decimal::ZERO)
+        && matches!(
+            notify_type,
+            NotifyType::Fill | NotifyType::Cancel | NotifyType::Reject
+        )
+    {
+        return Ok("quantity_unresolved".to_string());
     }
     let status = match notify_type {
         NotifyType::Fill => {
@@ -202,8 +215,9 @@ fn classify_fill_progress(
         None => Ok("open".to_string()),
         Some(filled) if filled.is_zero() => Ok("open".to_string()),
         Some(filled) => {
-            let quantity =
-                quantity.context("Rithmic order event with fills omitted order quantity")?;
+            let Some(quantity) = quantity else {
+                return Ok("quantity_unresolved".to_string());
+            };
             if filled == quantity {
                 Ok("filled".to_string())
             } else {
@@ -231,10 +245,17 @@ fn normalize_status(
             Some(filled) if quantity.is_some_and(|quantity| filled < quantity) => {
                 "partially_filled"
             }
+            Some(filled) if quantity.is_none() && filled > Decimal::ZERO => "quantity_unresolved",
             Some(_) => anyhow::bail!("Rithmic open status conflicts with cumulative fill"),
         },
         "partial" | "partially_filled" | "partiallyfilled" => {
-            let quantity = quantity.context("Rithmic partial status omitted order quantity")?;
+            let Some(quantity) = quantity else {
+                ensure!(
+                    cumulative_filled.is_some_and(|filled| filled > Decimal::ZERO),
+                    "Rithmic partial status conflicts with cumulative fill"
+                );
+                return Ok("quantity_unresolved".to_string());
+            };
             ensure!(
                 cumulative_filled
                     .is_some_and(|filled| { filled > Decimal::ZERO && filled < quantity }),
@@ -243,7 +264,13 @@ fn normalize_status(
             "partially_filled"
         }
         "complete" | "completed" | "filled" => {
-            let quantity = quantity.context("Rithmic complete status omitted order quantity")?;
+            let Some(quantity) = quantity else {
+                ensure!(
+                    cumulative_filled.is_some_and(|filled| filled > Decimal::ZERO),
+                    "Rithmic complete status is not fully filled"
+                );
+                return Ok("quantity_unresolved".to_string());
+            };
             ensure!(
                 cumulative_filled == Some(quantity),
                 "Rithmic complete status is not fully filled"

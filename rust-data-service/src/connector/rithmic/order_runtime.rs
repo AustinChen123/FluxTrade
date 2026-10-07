@@ -1639,9 +1639,11 @@ mod tests {
             exchange: "CME".to_string(),
             symbol: "MNQU6".to_string(),
             status: status.to_string(),
+            raw_status: Some(status.to_string()),
             notification_type: "status".to_string(),
             transaction_type: TransactionType::Buy,
             quantity: Some(dec!(1)),
+            unfilled_quantity: Some(dec!(1)),
             price: None,
             trigger_price: None,
             price_type: None,
@@ -2317,6 +2319,90 @@ mod tests {
 
         assert!(rx.recv().unwrap().is_err());
         assert!(pending.is_none());
+    }
+
+    #[test]
+    fn sparse_cancel_and_reject_keep_official_terminal_notification_behavior() {
+        for response_first in [true, false] {
+            let (mut pending, cancel_rx) = pending_cancel();
+            let mut sparse_cancel = event("quantity_unresolved", "basket-1");
+            sparse_cancel.notification_type = "cancel".to_string();
+            sparse_cancel.cumulative_filled_quantity = Some(dec!(1));
+            sparse_cancel.quantity = None;
+            sparse_cancel.unfilled_quantity = Some(dec!(1));
+            if response_first {
+                if let Some(Pending::Cancel {
+                    request_key,
+                    basket_id,
+                    reply,
+                    ..
+                }) = pending.take()
+                {
+                    complete_or_restore_cancel(
+                        &mut pending,
+                        request_key,
+                        basket_id,
+                        true,
+                        false,
+                        Instant::now() + COMMAND_TIMEOUT,
+                        reply,
+                    );
+                }
+                update_pending_from_event(&mut pending, &sparse_cancel).unwrap();
+            } else {
+                update_pending_from_event(&mut pending, &sparse_cancel).unwrap();
+                if let Some(Pending::Cancel {
+                    request_key,
+                    basket_id,
+                    reply,
+                    terminal_seen,
+                    ..
+                }) = pending.take()
+                {
+                    complete_or_restore_cancel(
+                        &mut pending,
+                        request_key,
+                        basket_id,
+                        true,
+                        terminal_seen,
+                        Instant::now() + COMMAND_TIMEOUT,
+                        reply,
+                    );
+                }
+            }
+            assert!(pending.is_none());
+            assert!(cancel_rx.recv().unwrap().is_ok());
+        }
+
+        let (mut pending, reject_rx) = pending_cancel();
+        let mut sparse_reject = event("quantity_unresolved", "basket-1");
+        sparse_reject.notification_type = "reject".to_string();
+        sparse_reject.cumulative_filled_quantity = Some(dec!(1));
+        sparse_reject.quantity = None;
+        sparse_reject.unfilled_quantity = Some(dec!(1));
+        update_pending_from_event(&mut pending, &sparse_reject).unwrap();
+        assert!(pending.is_none());
+        assert!(reject_rx
+            .recv()
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("terminal before cancellation"));
+    }
+
+    #[test]
+    fn sparse_fill_does_not_complete_pending_cancel() {
+        let (mut pending, rx) = pending_cancel();
+        let mut sparse = event("quantity_unresolved", "basket-1");
+        sparse.notification_type = "fill".to_string();
+        sparse.cumulative_filled_quantity = Some(dec!(1));
+        sparse.quantity = None;
+        sparse.unfilled_quantity = None;
+
+        update_pending_from_event(&mut pending, &sparse).unwrap();
+
+        assert!(pending.is_some());
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

@@ -52,6 +52,10 @@ def event(**overrides):
         "price_type": "stop_market",
         "bracket_type": "target_and_stop_static",
         "notification_type": "STATUS",
+        "raw_status": "OPEN",
+        "quantity": "2",
+        "unfilled_quantity": "1",
+        "transaction_type": "BUY",
         "cumulative_filled_quantity": "1.12345678901234567890123456789",
         "cumulative_average_price": "20000.2500000000000000000000001",
         "last_fill_quantity": "0.12345678901234567890123456789",
@@ -443,6 +447,10 @@ def test_event_projection_preserves_provider_account_and_exact_decimals():
             "price_type": "stop_market",
             "bracket_type": "target_and_stop_static",
             "notification_type": "STATUS",
+            "raw_status": "OPEN",
+            "quantity": "2",
+            "unfilled_quantity": "1",
+            "transaction_type": "BUY",
         },
     )
     assert projected.cumulative_filled_quantity is not None
@@ -465,6 +473,28 @@ def test_event_projection_preserves_provider_account_and_exact_decimals():
         projected.last_fill_price.as_tuple()
         == Decimal("20000.1250000000000000000000001").as_tuple()
     )
+
+
+def test_event_projection_preserves_sparse_presence_and_native_side_evidence():
+    projected = project_rithmic_order_event(
+        event(
+            status="quantity_unresolved",
+            raw_status=None,
+            quantity=None,
+            unfilled_quantity=None,
+            transaction_type="SHORT_SELL",
+        ),
+        product_id=PRODUCT_ID,
+        client_order_id="client-1",
+        native_identity=NATIVE_IDENTITY,
+    )
+
+    assert projected.status == "quantity_unresolved"
+    assert projected.raw is not None
+    assert projected.raw["raw_status"] is None
+    assert projected.raw["quantity"] is None
+    assert projected.raw["unfilled_quantity"] is None
+    assert projected.raw["transaction_type"] == "SHORT_SELL"
 
 
 @pytest.mark.parametrize(

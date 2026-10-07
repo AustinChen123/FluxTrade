@@ -2,7 +2,12 @@ from decimal import Decimal
 
 import pytest
 
-from src.core.adapters.rithmic_order_status import _classify_status
+from src.core.adapters.rithmic_order_status import (
+    _classify_status,
+    _normalize_snapshot_status,
+    _normalize_status,
+)
+from src.core.interfaces.exchange import ExchangeError
 
 
 @pytest.mark.parametrize(
@@ -166,3 +171,48 @@ def test_complete_notification_does_not_override_invalid_quantity_evidence(
 def test_unknown_raw_status_stays_unresolved_without_special_notification(status):
     result = _classify_status(status, Decimal("0"), Decimal("2"))
     assert (result.economic_status, result.terminal_order) == (None, None)
+
+
+@pytest.mark.parametrize(
+    ("notification", "filled", "expected"),
+    [
+        ("STATUS", "0", "open"),
+        ("STATUS", "1", "partially_filled"),
+        ("STATUS", "2", "filled"),
+        ("MODIFY", "1", "partially_filled"),
+        ("TRIGGER", "2", "filled"),
+    ],
+)
+def test_live_implicit_progress_is_explicitly_opt_in(notification, filled, expected):
+    assert (
+        _normalize_status(
+            "",
+            Decimal(filled),
+            Decimal("2"),
+            notification_type=notification,
+        )
+        is None
+    )
+    assert (
+        _normalize_status(
+            "",
+            Decimal(filled),
+            Decimal("2"),
+            notification_type=notification,
+            allow_live_implicit_progress=True,
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize("notification", ["STATUS", "MODIFY", "TRIGGER", None])
+def test_snapshot_classifier_does_not_enable_live_implicit_progress(notification):
+    with pytest.raises(
+        ExchangeError, match="unsupported_rithmic_order_snapshot_status"
+    ):
+        _normalize_snapshot_status(
+            "",
+            Decimal("1"),
+            Decimal("2"),
+            notification_type=notification,
+        )

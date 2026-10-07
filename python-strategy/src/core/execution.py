@@ -843,8 +843,8 @@ class ExecutionEngine:
             result = self._order_event_processor(
                 self.order_manager.repo,
                 event,
-                lambda: self._order_event_applier.process_exchange_order_event(
-                    event,
+                lambda chosen_event: self._order_event_applier.process_exchange_order_event(
+                    chosen_event,
                     allow_remote_side_effects=allow_remote_side_effects,
                 ),
             )

@@ -20,7 +20,7 @@ if TYPE_CHECKING:
     from src.core.runtime_environment import RuntimeEnvironment
 
 
-OrderEventApply = Callable[[], dict[str, object]]
+OrderEventApply = Callable[[ExchangeOrderEvent], dict[str, object]]
 PendingProtectionFillResult = list[dict[str, object]] | None
 
 
@@ -48,7 +48,7 @@ def process_order_event_without_venue_policy(
     apply_event: OrderEventApply,
 ) -> dict[str, object]:
     """Apply an order event when no venue-specific projection is selected."""
-    return apply_event()
+    return apply_event(event)
 
 
 def audit_pending_protection_without_venue_policy(

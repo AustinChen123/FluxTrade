@@ -68,11 +68,15 @@ pub struct PyOrderEvent {
     #[pyo3(get)]
     pub status: String,
     #[pyo3(get)]
+    pub raw_status: Option<String>,
+    #[pyo3(get)]
     pub notification_type: String,
     #[pyo3(get)]
     pub transaction_type: String,
     #[pyo3(get)]
     pub quantity: Option<String>,
+    #[pyo3(get)]
+    pub unfilled_quantity: Option<String>,
     #[pyo3(get)]
     pub price: Option<String>,
     #[pyo3(get)]
@@ -107,9 +111,11 @@ impl From<OrderEvent> for PyOrderEvent {
             exchange: value.exchange,
             symbol: value.symbol,
             status: value.status,
+            raw_status: value.raw_status,
             notification_type: value.notification_type,
             transaction_type: transaction_type_name(value.transaction_type).to_string(),
             quantity: value.quantity.map(|quantity| quantity.to_string()),
+            unfilled_quantity: decimal_text(value.unfilled_quantity),
             price: decimal_text(value.price),
             trigger_price: decimal_text(value.trigger_price),
             price_type: value.price_type,
@@ -404,6 +410,175 @@ mod tests {
             "20000.25"
         );
         assert!(decimal("nan", "price").is_err());
+    }
+
+    #[test]
+    fn sparse_order_event_binding_preserves_quantity_presence_and_native_context() {
+        use crate::rithmic_ledger::ledger::AccountIdentity;
+
+        let event = OrderEvent {
+            account: AccountIdentity {
+                fcm_id: "FCM".to_string(),
+                ib_id: "IB".to_string(),
+                account_id: "ACCOUNT".to_string(),
+            },
+            client_order_id: Some("client-1".to_string()),
+            window_name: None,
+            originator_window_name: None,
+            basket_id: "basket-1".to_string(),
+            original_basket_id: None,
+            linked_basket_ids: None,
+            exchange_order_id: None,
+            exchange: "CME".to_string(),
+            symbol: "NQU6".to_string(),
+            status: "quantity_unresolved".to_string(),
+            raw_status: Some("COMPLETE".to_string()),
+            notification_type: "fill".to_string(),
+            transaction_type: TransactionType::ShortSell,
+            quantity: None,
+            unfilled_quantity: Some(Decimal::ONE),
+            price: None,
+            trigger_price: None,
+            price_type: None,
+            bracket_type: None,
+            last_fill_quantity: Some(Decimal::ONE),
+            last_fill_price: Some(Decimal::new(25, 2)),
+            cumulative_filled_quantity: Some(Decimal::ONE),
+            cumulative_average_price: Some(Decimal::new(25, 2)),
+            timestamp_ms: Some(1_700_000_000_000),
+        };
+        Python::with_gil(|py| {
+            let projected = Py::new(py, PyOrderEvent::from(event)).unwrap();
+            assert_eq!(
+                projected
+                    .getattr(py, "status")
+                    .unwrap()
+                    .extract::<String>(py)
+                    .unwrap(),
+                "quantity_unresolved"
+            );
+            assert_eq!(
+                projected
+                    .getattr(py, "raw_status")
+                    .unwrap()
+                    .extract::<Option<String>>(py)
+                    .unwrap()
+                    .as_deref(),
+                Some("COMPLETE")
+            );
+            assert_eq!(
+                projected
+                    .getattr(py, "quantity")
+                    .unwrap()
+                    .extract::<Option<String>>(py)
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                projected
+                    .getattr(py, "unfilled_quantity")
+                    .unwrap()
+                    .extract::<Option<String>>(py)
+                    .unwrap()
+                    .as_deref(),
+                Some("1")
+            );
+            assert_eq!(
+                projected
+                    .getattr(py, "transaction_type")
+                    .unwrap()
+                    .extract::<String>(py)
+                    .unwrap(),
+                "SHORT_SELL"
+            );
+        });
+    }
+
+    #[test]
+    fn sparse_official_payload_reaches_durable_python_fill_pipeline() {
+        use crate::rithmic_ledger::{
+            ledger::AccountIdentity,
+            order_event::decode_order_event,
+            protocol::{exchange_order_notification::TransactionType, ExchangeOrderNotification},
+        };
+        use prost::Message;
+
+        let encode = |total_fill: i32,
+                      unfilled: i32,
+                      raw_status: &str,
+                      fill_price: f64,
+                      average_price: f64| {
+            let mut payload = Vec::new();
+            ExchangeOrderNotification {
+                template_id: 352,
+                notify_type: Some(
+                    crate::rithmic_ledger::protocol::exchange_order_notification::NotifyType::Fill
+                        as i32,
+                ),
+                is_snapshot: Some(false),
+                user_tag: Some("rithmic-client".to_string()),
+                fcm_id: Some("FCM".to_string()),
+                ib_id: Some("IB".to_string()),
+                account_id: Some("ACCOUNT".to_string()),
+                basket_id: Some("rithmic-basket".to_string()),
+                exchange: Some("CME".to_string()),
+                symbol: Some("NQU6".to_string()),
+                status: Some(raw_status.to_string()),
+                transaction_type: Some(TransactionType::Buy as i32),
+                quantity: None,
+                total_fill_size: Some(total_fill),
+                total_unfilled_size: Some(unfilled),
+                fill_size: Some(1),
+                fill_price: Some(fill_price),
+                avg_fill_price: Some(average_price),
+                ..Default::default()
+            }
+            .encode(&mut payload)
+            .unwrap();
+            payload
+        };
+        let account = AccountIdentity {
+            fcm_id: "FCM".to_string(),
+            ib_id: "IB".to_string(),
+            account_id: "ACCOUNT".to_string(),
+        };
+        let partial =
+            decode_order_event(&encode(1, 1, "OPEN", 20_000.25, 20_000.25), &account).unwrap();
+        let full =
+            decode_order_event(&encode(2, 0, "COMPLETE", 20_001.25, 20_000.75), &account).unwrap();
+        assert_eq!(partial.status, "quantity_unresolved");
+        assert_eq!(partial.quantity, None);
+        assert_eq!(full.status, "filled");
+        assert_eq!(full.quantity, Some(Decimal::from(2)));
+        Python::with_gil(|py| {
+            let sys = PyModule::import(py, "sys").unwrap();
+            let paths = sys.getattr("path").unwrap();
+            let version_info = sys.getattr("version_info").unwrap();
+            let major: u8 = version_info.get_item(0).unwrap().extract().unwrap();
+            let minor: u8 = version_info.get_item(1).unwrap().extract().unwrap();
+            let repository_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .expect("rust-data-service should be inside the repository");
+            for path in [
+                repository_root.join(format!(
+                    "python-strategy/.venv/lib/python{major}.{minor}/site-packages"
+                )),
+                repository_root.join("python-strategy"),
+                repository_root.join("python-strategy/tests"),
+            ] {
+                paths
+                    .call_method1("insert", (0, path.to_string_lossy().as_ref()))
+                    .unwrap();
+            }
+            let native_partial = Py::new(py, PyOrderEvent::from(partial)).unwrap();
+            let native_full = Py::new(py, PyOrderEvent::from(full)).unwrap();
+            let probe = PyModule::import(py, "rithmic_native_pipeline_probe").unwrap();
+            probe
+                .getattr("verify_native_pipeline")
+                .unwrap()
+                .call1((native_partial, native_full))
+                .unwrap();
+        });
     }
 
     #[test]

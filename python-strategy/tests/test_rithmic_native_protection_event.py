@@ -108,15 +108,16 @@ def _event(**changes) -> ExchangeOrderEvent:
 
 def test_default_runtime_bootstrap_applies_generic_event_once() -> None:
     apply_event = MagicMock(return_value={"action": "generic"})
+    event = _event()
 
     result = DefaultRuntimeBootstrap().process_order_event(
         _Repository(),
-        _event(),
+        event,
         apply_event,
     )
 
     assert result == {"action": "generic"}
-    apply_event.assert_called_once_with()
+    apply_event.assert_called_once_with(event)
 
 
 def test_generic_execution_has_no_rithmic_native_event_policy() -> None:
@@ -150,7 +151,7 @@ def test_non_native_events_apply_once_without_provider_projection(order, event) 
     result = process_native_protection_event(repository, event, apply_event)
 
     assert result == {"action": "ignored"}
-    apply_event.assert_called_once_with()
+    apply_event.assert_called_once_with(event)
     repository.update_order_mock.assert_not_called()
 
 
@@ -234,14 +235,15 @@ def test_ineligible_or_identity_invalid_post_projection_does_not_persist(
     repository = _Repository(order)
     apply_event = MagicMock(return_value=result)
 
+    event = _event(raw=raw)
     projected = process_native_protection_event(
         repository,
-        _event(raw=raw),
+        event,
         apply_event,
     )
 
     assert projected["action"] == expected_action
-    apply_event.assert_called_once_with()
+    apply_event.assert_called_once_with(event)
     repository.update_order_mock.assert_not_called()
     assert order.trigger_price == Decimal("99.00")
 
@@ -255,7 +257,8 @@ def test_invalid_remote_price_fails_without_persistence(raw_price) -> None:
         return_value={"action": "applied", "state": "open", "order_id": "order-1"}
     )
 
-    result = process_native_protection_event(repository, _event(raw=raw), apply_event)
+    event = _event(raw=raw)
+    result = process_native_protection_event(repository, event, apply_event)
 
     assert result["action"] == "unresolved_native_protection_price_missing"
     repository.update_order_mock.assert_not_called()
@@ -304,7 +307,7 @@ def test_native_confirmation_projects_and_persists_exactly_once(
     result = process_native_protection_event(repository, _event(), apply_event)
 
     assert result["action"] == expected_action
-    apply_event.assert_called_once_with()
+    apply_event.assert_called_once_with(_event())
     repository.update_order_mock.assert_called_once_with(order)
     assert order.intent_payload is not original_payload
     assert order.intent_payload is not None
@@ -347,7 +350,7 @@ def test_take_profit_uses_limit_price_and_confirms() -> None:
     result = process_native_protection_event(
         repository,
         event,
-        lambda: {"action": "applied", "state": "open", "order_id": "order-1"},
+        lambda _event: {"action": "applied", "state": "open", "order_id": "order-1"},
     )
 
     assert result["action"] == "applied"

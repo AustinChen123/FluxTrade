@@ -33,6 +33,7 @@ from src.core.adapters.rithmic_native_bracket import audit_native_bracket_fill
 from src.core.adapters.rithmic_native_protection_event import (
     process_native_protection_event,
 )
+from src.core.adapters.rithmic_runtime_composition import RithmicRuntimeBootstrap
 from src.core import execution as execution_module
 from src.core.execution import ExecutionEngine, ExitDecision
 from src.core import execution_journal
@@ -52,6 +53,7 @@ from src.core.models import (
 from src.core.runtime_capabilities import OrderAccountIdentity
 from src.core.orm_models import (
     Order as StoredOrder,
+    Position as StoredPosition,
     SignalAudit,
     Strategy as StoredStrategy,
     SystemEvent,
@@ -233,6 +235,500 @@ def _entry_fill_event(entry) -> ExchangeOrderEvent:
         fee=Decimal("0"),
         fee_asset="USDT",
     )
+
+
+def _sparse_rithmic_event(
+    *,
+    notification: str = "FILL",
+    cumulative: Decimal = Decimal("1"),
+    unfilled: Decimal | None = Decimal("1"),
+    raw_status: str | None = "OPEN",
+    transaction_type: str = "BUY",
+    client_order_id: str | None = "rithmic-client",
+    product_id: str = "RITHMIC:NQ-202609",
+    basket_id: str = "rithmic-basket",
+    account_id: str = "ACCOUNT",
+    cumulative_average: Decimal = Decimal("20000.25"),
+    last_quantity: Decimal = Decimal("1"),
+    last_price: Decimal = Decimal("20000.25"),
+) -> ExchangeOrderEvent:
+    return ExchangeOrderEvent(
+        status="quantity_unresolved",
+        product_id=product_id,
+        client_order_id=client_order_id,
+        exchange_order_id=basket_id,
+        cumulative_filled_quantity=cumulative,
+        cumulative_average_price=cumulative_average,
+        last_fill_quantity=last_quantity,
+        last_fill_price=last_price,
+        raw={
+            "account_id": account_id,
+            "quantity": None,
+            "unfilled_quantity": unfilled,
+            "raw_status": raw_status,
+            "notification_type": notification,
+            "transaction_type": transaction_type,
+        },
+    )
+
+
+def _rithmic_sparse_execution(
+    *,
+    sqlite_order_session_factory,
+    mock_clock,
+    mock_exchange_adapter,
+    order_factory,
+    status: str = OrderStatus.SUBMITTED.value,
+    acked_at=None,
+    filled_quantity: Decimal | None = Decimal("0"),
+    side: str = "buy",
+    bootstrap: RithmicRuntimeBootstrap | None = None,
+):
+    repository = LiveOrderRepository(
+        db_session_factory=sqlite_order_session_factory,
+        account_profile="orders",
+        account_id="ACCOUNT",
+    )
+    order = order_factory(
+        order_id="rithmic-order",
+        exchange_order_id="rithmic-basket",
+        strategy_id="test_strategy",
+        product_id="RITHMIC:NQ-202609",
+        exchange_id="RITHMIC",
+        side=side,
+        quantity=Decimal("2"),
+        status=status,
+        filled_quantity=filled_quantity,
+        filled_price=(
+            Decimal("20000.25")
+            if filled_quantity is not None and filled_quantity > 0
+            else Decimal("0")
+        ),
+        client_order_id="rithmic-client",
+        account_profile="orders",
+        account_id="ACCOUNT",
+    )
+    order.acked_at = acked_at
+    repository.add_order(order)
+    if filled_quantity is None:
+        order.filled_quantity = None
+        repository.update_order(order)
+    mock_exchange_adapter.place_order = MagicMock(
+        side_effect=AssertionError("sparse event processing must not submit orders")
+    )
+    runtime = bootstrap or RithmicRuntimeBootstrap(
+        order_account_identity=OrderAccountIdentity("orders", "ACCOUNT"),
+        is_rithmic_runtime=True,
+    )
+    engine = ExecutionEngine(
+        db_session=None,
+        clock=mock_clock,
+        adapter=mock_exchange_adapter,
+        order_repository=repository,
+        db_session_factory=sqlite_order_session_factory,
+        is_backtest=True,
+        order_event_processor=runtime.process_order_event,
+    )
+    return engine, repository, order
+
+
+def test_sparse_rithmic_fill_uses_acknowledged_quantity_and_durable_delta(
+    sqlite_order_session_factory,
+    mock_clock,
+    mock_exchange_adapter,
+    order_factory,
+):
+    engine, repository, order = _rithmic_sparse_execution(
+        sqlite_order_session_factory=sqlite_order_session_factory,
+        mock_clock=mock_clock,
+        mock_exchange_adapter=mock_exchange_adapter,
+        order_factory=order_factory,
+    )
+    partial = _sparse_rithmic_event(
+        cumulative=Decimal("1"),
+        unfilled=Decimal("1"),
+        last_quantity=Decimal("1"),
+    )
+    full = _sparse_rithmic_event(
+        cumulative=Decimal("2"),
+        unfilled=Decimal("0"),
+        raw_status="COMPLETE",
+        cumulative_average=Decimal("20000.75"),
+        last_quantity=Decimal("1"),
+        last_price=Decimal("20001.25"),
+    )
+
+    first = engine.process_exchange_order_event(partial)
+    second = engine.process_exchange_order_event(full)
+    replay = engine.process_exchange_order_event(full)
+
+    assert first["action"] == second["action"] == replay["action"] == "applied"
+    assert first["fill_quantity"] == Decimal("1")
+    assert second["fill_quantity"] == Decimal("1")
+    assert replay["fill_quantity"] == Decimal("0")
+    stored = repository.get_order(order.id)
+    assert stored is not None
+    assert stored.status == OrderStatus.FILLED.value
+    assert stored.filled_quantity == Decimal("2")
+    assert stored.filled_price == Decimal("20000.75")
+    with sqlite_order_session_factory() as session:
+        trades = session.query(StoredTrade).filter_by(order_id=order.id).all()
+        assert [(trade.quantity, trade.price) for trade in trades] == [
+            (Decimal("1"), Decimal("20000.25")),
+            (Decimal("1"), Decimal("20001.25")),
+        ]
+    mock_exchange_adapter.place_order.assert_not_called()
+
+
+def test_sparse_reject_partial_fill_survives_failed_state_reload_and_replay(
+    sqlite_order_session_factory,
+    mock_clock,
+    mock_exchange_adapter,
+    order_factory,
+):
+    engine, repository, order = _rithmic_sparse_execution(
+        sqlite_order_session_factory=sqlite_order_session_factory,
+        mock_clock=mock_clock,
+        mock_exchange_adapter=mock_exchange_adapter,
+        order_factory=order_factory,
+    )
+    reject = _sparse_rithmic_event(
+        notification="REJECT",
+        cumulative=Decimal("1"),
+        unfilled=Decimal("1"),
+        raw_status="REJECTED",
+    )
+
+    first = engine.process_exchange_order_event(reject)
+    reloaded = LiveOrderRepository(
+        db_session_factory=sqlite_order_session_factory,
+        account_profile="orders",
+        account_id="ACCOUNT",
+    )
+    restarted = ExecutionEngine(
+        db_session=None,
+        clock=mock_clock,
+        adapter=mock_exchange_adapter,
+        order_repository=reloaded,
+        db_session_factory=sqlite_order_session_factory,
+        is_backtest=True,
+        order_event_processor=RithmicRuntimeBootstrap(
+            OrderAccountIdentity("orders", "ACCOUNT"), True
+        ).process_order_event,
+    )
+    replay = restarted.process_exchange_order_event(reject)
+
+    assert first["action"] == replay["action"] == "applied"
+    assert first["fill_quantity"] == Decimal("1")
+    assert replay["fill_quantity"] == Decimal("0")
+    stored = reloaded.get_order(order.id)
+    assert stored is not None
+    assert stored.status == OrderStatus.FAILED.value.lower()
+    assert stored.acked_at is None
+    assert stored.filled_quantity == Decimal("1")
+    with sqlite_order_session_factory() as session:
+        assert session.query(StoredTrade).filter_by(order_id=order.id).count() == 1
+    mock_exchange_adapter.place_order.assert_not_called()
+
+
+def test_sparse_rithmic_failed_order_without_local_fill_or_ack_is_unresolved(
+    sqlite_order_session_factory,
+    mock_clock,
+    mock_exchange_adapter,
+    order_factory,
+):
+    engine, repository, order = _rithmic_sparse_execution(
+        sqlite_order_session_factory=sqlite_order_session_factory,
+        mock_clock=mock_clock,
+        mock_exchange_adapter=mock_exchange_adapter,
+        order_factory=order_factory,
+        status=OrderStatus.FAILED.value,
+        filled_quantity=None,
+    )
+
+    result = engine.process_exchange_order_event(_sparse_rithmic_event())
+
+    assert result["action"] == "unresolved_rithmic_sparse_quantity"
+    stored = repository.get_order(order.id)
+    assert stored is not None
+    assert stored.status == OrderStatus.FAILED.value
+    assert stored.filled_quantity is None
+    with sqlite_order_session_factory() as session:
+        assert session.query(StoredTrade).filter_by(order_id=order.id).count() == 0
+    mock_exchange_adapter.place_order.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("status", "raw_changes", "runtime_profile"),
+    [
+        (OrderStatus.NEW.value, {}, "orders"),
+        (OrderStatus.SUBMITTED_UNCONFIRMED.value, {}, "orders"),
+        (OrderStatus.FAILED.value, {}, "orders"),
+        (OrderStatus.SUBMITTED.value, {"account_id": "OTHER"}, "orders"),
+        (OrderStatus.SUBMITTED.value, {"transaction_type": "SELL"}, "orders"),
+        (OrderStatus.SUBMITTED.value, {"client_order_id": "other-client"}, "orders"),
+        (OrderStatus.SUBMITTED.value, {"product_id": "RITHMIC:ES-202609"}, "orders"),
+        (OrderStatus.SUBMITTED.value, {}, "other-profile"),
+    ],
+)
+def test_sparse_rithmic_fill_is_unresolved_without_exact_acknowledged_identity(
+    sqlite_order_session_factory,
+    mock_clock,
+    mock_exchange_adapter,
+    order_factory,
+    status,
+    raw_changes,
+    runtime_profile,
+):
+    runtime = RithmicRuntimeBootstrap(
+        order_account_identity=OrderAccountIdentity(runtime_profile, "ACCOUNT"),
+        is_rithmic_runtime=True,
+    )
+    engine, repository, order = _rithmic_sparse_execution(
+        sqlite_order_session_factory=sqlite_order_session_factory,
+        mock_clock=mock_clock,
+        mock_exchange_adapter=mock_exchange_adapter,
+        order_factory=order_factory,
+        status=status,
+        bootstrap=runtime,
+    )
+    before = repository.get_order(order.id)
+    assert before is not None
+    event = _sparse_rithmic_event(**raw_changes)
+
+    result = engine.process_exchange_order_event(event)
+
+    assert result["action"] == "unresolved_rithmic_sparse_quantity"
+    assert result["unresolved"] is True
+    after = repository.get_order(order.id)
+    assert after is not None
+    assert after.exchange_order_id == before.exchange_order_id
+    assert after.status == before.status
+    assert after.filled_quantity == before.filled_quantity == Decimal("0")
+    with sqlite_order_session_factory() as session:
+        assert session.query(StoredTrade).filter_by(order_id=order.id).count() == 0
+    mock_exchange_adapter.place_order.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("changes", "side", "status", "acked_at", "expected_status", "expected_fill"),
+    [
+        (
+            {"notification": "CANCEL", "raw_status": "CANCELLED"},
+            "buy",
+            OrderStatus.SUBMITTED.value,
+            None,
+            OrderStatus.CANCELLED.value,
+            Decimal("1"),
+        ),
+        (
+            {"notification": "STATUS", "raw_status": None},
+            "buy",
+            OrderStatus.SUBMITTED.value,
+            None,
+            OrderStatus.PARTIALLY_FILLED.value,
+            Decimal("1"),
+        ),
+        (
+            {"notification": "STATUS", "raw_status": "OPEN"},
+            "buy",
+            OrderStatus.SUBMITTED.value,
+            None,
+            OrderStatus.PARTIALLY_FILLED.value,
+            Decimal("1"),
+        ),
+        (
+            {"notification": "MODIFY", "raw_status": None},
+            "buy",
+            OrderStatus.SUBMITTED.value,
+            None,
+            OrderStatus.PARTIALLY_FILLED.value,
+            Decimal("1"),
+        ),
+        (
+            {"notification": "TRIGGER", "raw_status": None},
+            "buy",
+            OrderStatus.SUBMITTED.value,
+            None,
+            OrderStatus.PARTIALLY_FILLED.value,
+            Decimal("1"),
+        ),
+        (
+            {"notification": "STATUS", "raw_status": "PARTIAL"},
+            "buy",
+            OrderStatus.SUBMITTED.value,
+            None,
+            OrderStatus.PARTIALLY_FILLED.value,
+            Decimal("1"),
+        ),
+        (
+            {
+                "notification": "STATUS",
+                "raw_status": "COMPLETE",
+                "cumulative": Decimal("2"),
+                "unfilled": Decimal("0"),
+                "last_quantity": Decimal("1"),
+                "last_price": Decimal("20001.25"),
+                "cumulative_average": Decimal("20000.75"),
+            },
+            "buy",
+            OrderStatus.SUBMITTED.value,
+            None,
+            OrderStatus.FILLED.value,
+            Decimal("2"),
+        ),
+        (
+            {"notification": "FILL", "client_order_id": None},
+            "buy",
+            OrderStatus.SUBMITTED.value,
+            None,
+            OrderStatus.PARTIALLY_FILLED.value,
+            Decimal("1"),
+        ),
+        (
+            {"notification": "FILL", "transaction_type": "SELL"},
+            "sell",
+            OrderStatus.SUBMITTED.value,
+            None,
+            OrderStatus.PARTIALLY_FILLED.value,
+            Decimal("1"),
+        ),
+        (
+            {"notification": "FILL", "transaction_type": "SHORT_SELL"},
+            "sell",
+            OrderStatus.SUBMITTED.value,
+            None,
+            OrderStatus.PARTIALLY_FILLED.value,
+            Decimal("1"),
+        ),
+        (
+            {"notification": "FILL"},
+            "buy",
+            OrderStatus.FAILED.value,
+            datetime(2024, 1, 1, tzinfo=timezone.utc),
+            OrderStatus.PARTIALLY_FILLED.value,
+            Decimal("1"),
+        ),
+    ],
+)
+def test_sparse_rithmic_resolver_applies_only_supported_live_evidence(
+    sqlite_order_session_factory,
+    mock_clock,
+    mock_exchange_adapter,
+    order_factory,
+    changes,
+    side,
+    status,
+    acked_at,
+    expected_status,
+    expected_fill,
+):
+    engine, repository, order = _rithmic_sparse_execution(
+        sqlite_order_session_factory=sqlite_order_session_factory,
+        mock_clock=mock_clock,
+        mock_exchange_adapter=mock_exchange_adapter,
+        order_factory=order_factory,
+        side=side,
+        status=status,
+        acked_at=acked_at,
+    )
+    event = _sparse_rithmic_event(**changes)
+
+    result = engine.process_exchange_order_event(event)
+
+    assert result["action"] == "applied"
+    assert result["fill_quantity"] == expected_fill
+    stored = repository.get_order(order.id)
+    assert stored is not None
+    assert stored.status == expected_status
+    assert stored.filled_quantity == expected_fill
+    with sqlite_order_session_factory() as session:
+        trades = session.query(StoredTrade).filter_by(order_id=order.id).all()
+        assert sum((trade.quantity for trade in trades), Decimal("0")) == expected_fill
+    mock_exchange_adapter.place_order.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("changes", "prefill", "expected_action"),
+    [
+        ({"basket_id": "wrong-basket"}, False, "unresolved_rithmic_sparse_quantity"),
+        ({"basket_id": None}, False, "unresolved_rithmic_sparse_quantity"),
+        (
+            {"notification": "FILL", "unfilled": Decimal("0")},
+            False,
+            "unresolved_rithmic_sparse_quantity",
+        ),
+        (
+            {"notification": "FILL", "cumulative": Decimal("3"), "unfilled": None},
+            False,
+            "unresolved_rithmic_sparse_quantity",
+        ),
+        (
+            {
+                "notification": "FILL",
+                "cumulative": Decimal("1"),
+                "last_price": None,
+                "cumulative_average": None,
+            },
+            False,
+            "unresolved_missing_fill_price",
+        ),
+        (
+            {
+                "notification": "FILL",
+                "cumulative": Decimal("0.5"),
+                "unfilled": Decimal("1.5"),
+                "last_quantity": Decimal("0.5"),
+            },
+            True,
+            "unresolved_local_fill_exceeds_exchange",
+        ),
+    ],
+)
+def test_sparse_rithmic_invalid_evidence_has_no_financial_mutation(
+    sqlite_order_session_factory,
+    mock_clock,
+    mock_exchange_adapter,
+    order_factory,
+    changes,
+    prefill,
+    expected_action,
+):
+    engine, repository, order = _rithmic_sparse_execution(
+        sqlite_order_session_factory=sqlite_order_session_factory,
+        mock_clock=mock_clock,
+        mock_exchange_adapter=mock_exchange_adapter,
+        order_factory=order_factory,
+    )
+    if prefill:
+        first = engine.process_exchange_order_event(_sparse_rithmic_event())
+        assert first["fill_quantity"] == Decimal("1")
+
+    def financial_state():
+        stored = repository.get_order(order.id)
+        assert stored is not None
+        with sqlite_order_session_factory() as session:
+            trades = session.query(StoredTrade).filter_by(order_id=order.id).all()
+            positions = (
+                session.query(StoredPosition)
+                .filter_by(product_id=order.product_id)
+                .all()
+            )
+            return (
+                stored.filled_quantity,
+                stored.filled_price,
+                tuple((trade.quantity, trade.price, trade.fee) for trade in trades),
+                tuple(
+                    (position.quantity, position.entry_price) for position in positions
+                ),
+            )
+
+    before = financial_state()
+    result = engine.process_exchange_order_event(_sparse_rithmic_event(**changes))
+
+    assert result["action"] == expected_action
+    assert financial_state() == before
+    mock_exchange_adapter.place_order.assert_not_called()
 
 
 def test_atomic_fill_replay_submits_each_pending_protection_once(

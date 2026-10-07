@@ -1126,26 +1126,28 @@ mod tests {
     #[test]
     fn sparse_live_events_only_require_quantity_for_fill_semantics() {
         use protocol::exchange_order_notification::NotifyType;
-        let event = |notify_type, status: Option<&str>, filled: Option<i32>| {
-            codec::encode(&protocol::ExchangeOrderNotification {
-                template_id: EXCHANGE_ORDER_NOTIFICATION,
-                notify_type: Some(notify_type as i32),
-                is_snapshot: Some(false),
-                fcm_id: Some("FCM".to_string()),
-                ib_id: Some("IB".to_string()),
-                account_id: Some("ACCOUNT".to_string()),
-                basket_id: Some("basket-1".to_string()),
-                exchange: Some("CME".to_string()),
-                symbol: Some("NQU6".to_string()),
-                status: status.map(str::to_string),
-                transaction_type: Some(
-                    protocol::exchange_order_notification::TransactionType::Buy as i32,
-                ),
-                total_fill_size: filled,
-                ..Default::default()
-            })
-            .unwrap()
-        };
+        let event =
+            |notify_type, status: Option<&str>, filled: Option<i32>, unfilled: Option<i32>| {
+                codec::encode(&protocol::ExchangeOrderNotification {
+                    template_id: EXCHANGE_ORDER_NOTIFICATION,
+                    notify_type: Some(notify_type as i32),
+                    is_snapshot: Some(false),
+                    fcm_id: Some("FCM".to_string()),
+                    ib_id: Some("IB".to_string()),
+                    account_id: Some("ACCOUNT".to_string()),
+                    basket_id: Some("basket-1".to_string()),
+                    exchange: Some("CME".to_string()),
+                    symbol: Some("NQU6".to_string()),
+                    status: status.map(str::to_string),
+                    transaction_type: Some(
+                        protocol::exchange_order_notification::TransactionType::Buy as i32,
+                    ),
+                    total_fill_size: filled,
+                    total_unfilled_size: unfilled,
+                    ..Default::default()
+                })
+                .unwrap()
+            };
 
         for (notify_type, status, filled, expected) in [
             (NotifyType::Status, Some("OPEN"), Some(0), "open"),
@@ -1158,20 +1160,35 @@ mod tests {
             (NotifyType::NotCancelled, None, Some(0), "cancel_rejected"),
         ] {
             let decoded =
-                decode_order_event(&event(notify_type, status, filled), &account()).unwrap();
+                decode_order_event(&event(notify_type, status, filled, None), &account()).unwrap();
             assert_eq!(decoded.status, expected);
             assert_eq!(decoded.quantity, None);
         }
 
-        for payload in [
-            event(NotifyType::Fill, Some("COMPLETE"), Some(1)),
-            event(NotifyType::Status, Some("PARTIAL"), Some(1)),
-            event(NotifyType::Status, Some("COMPLETE"), Some(1)),
-            event(NotifyType::Status, None, Some(1)),
-            event(NotifyType::Generic, None, Some(0)),
-            event(NotifyType::Cancel, None, Some(1)),
-            event(NotifyType::Reject, None, Some(1)),
+        for (notify_type, raw_status, unfilled) in [
+            (NotifyType::Fill, Some("COMPLETE"), None),
+            (NotifyType::Fill, Some("OPEN"), Some(1)),
+            (NotifyType::Status, Some("PARTIAL"), None),
+            (NotifyType::Status, Some("COMPLETE"), None),
+            (NotifyType::Status, None, None),
+            (NotifyType::Modify, None, Some(1)),
+            (NotifyType::Trigger, None, None),
+            (NotifyType::Generic, Some("PARTIAL"), None),
+            (NotifyType::Cancel, None, Some(1)),
+            (NotifyType::Reject, None, Some(1)),
         ] {
+            let payload = event(notify_type, raw_status, Some(1), unfilled);
+            let decoded = decode_order_event(&payload, &account()).unwrap();
+            assert_eq!(decoded.status, "quantity_unresolved");
+            assert_eq!(decoded.quantity, None);
+            assert_eq!(decoded.raw_status.as_deref(), raw_status);
+            assert_eq!(
+                decoded.unfilled_quantity,
+                unfilled.map(rust_decimal::Decimal::from)
+            );
+        }
+
+        for payload in [event(NotifyType::Generic, None, Some(0), None)] {
             assert!(decode_order_event(&payload, &account()).is_err());
         }
     }
@@ -1226,11 +1243,9 @@ mod tests {
         }
         for (quantity, filled, unfilled) in [
             (None, None, Some(0)),
-            (None, Some(1), None),
             (None, None, None),
             (None, Some(0), Some(0)),
             (None, Some(-1), Some(0)),
-            (None, Some(1), Some(1)),
             (None, Some(1), Some(-1)),
             (Some(0), Some(1), Some(0)),
             (Some(-1), Some(1), Some(0)),
@@ -1243,9 +1258,11 @@ mod tests {
             .is_err());
         }
         for notify in [NotifyType::Status, NotifyType::Cancel, NotifyType::Reject] {
-            assert!(
-                decode_order_event(&event(notify, None, Some(1), Some(0)), &account()).is_err()
-            );
+            let decoded =
+                decode_order_event(&event(notify, None, Some(1), Some(0)), &account()).unwrap();
+            assert_eq!(decoded.status, "quantity_unresolved");
+            assert_eq!(decoded.quantity, None);
+            assert_eq!(decoded.unfilled_quantity, Some(Decimal::ZERO));
         }
     }
 

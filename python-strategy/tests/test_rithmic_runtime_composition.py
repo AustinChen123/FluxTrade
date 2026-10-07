@@ -293,7 +293,7 @@ def test_non_rithmic_bootstrap_applies_generic_order_event_once() -> None:
     assert bootstrap.process_order_event(repository, event, apply_event) == {
         "action": "applied"
     }
-    apply_event.assert_called_once_with()
+    apply_event.assert_called_once_with(event)
 
     assert (
         bootstrap.audit_pending_protection_fill(
@@ -340,6 +340,49 @@ def test_rithmic_bootstrap_delegates_order_event_to_provider_owner(monkeypatch) 
         "action": "provider"
     }
     process_event.assert_called_once_with(repository, event, apply_event)
+
+
+def test_sparse_rithmic_event_without_scoped_durable_order_stays_unresolved() -> None:
+    bootstrap = prepare_rithmic_runtime_bootstrap(
+        adapter=_rithmic_adapter(),
+        adapter_config={"rithmic_recovery_account_id": "ACCOUNT"},
+        audit_external_orders=True,
+        account_service=MagicMock(spec=AccountService),
+        runtime_environment=RuntimeEnvironment("test"),
+    )
+    repository = MagicMock()
+    repository.get_order_by_exchange_order_id.return_value = None
+    event = ExchangeOrderEvent(
+        status="quantity_unresolved",
+        product_id="RITHMIC:NQ-202609",
+        client_order_id="client-1",
+        exchange_order_id="basket-1",
+        cumulative_filled_quantity=Decimal("1"),
+        raw={
+            "account_id": "ACCOUNT",
+            "quantity": None,
+            "unfilled_quantity": Decimal("1"),
+            "raw_status": "OPEN",
+            "notification_type": "FILL",
+            "transaction_type": "BUY",
+        },
+    )
+    apply_event = MagicMock()
+
+    result = bootstrap.process_order_event(repository, event, apply_event)
+
+    assert result == {
+        "action": "unresolved_rithmic_sparse_quantity",
+        "unresolved": True,
+        "status": "quantity_unresolved",
+    }
+    assert RithmicOrderEventStreamService.requires_reconciliation(result)
+    repository.get_order_by_exchange_order_id.assert_called_once_with(
+        "basket-1",
+        exchange_id="RITHMIC",
+        product_id="RITHMIC:NQ-202609",
+    )
+    apply_event.assert_not_called()
 
 
 def test_rithmic_bootstrap_delegates_fill_audit_to_provider_owner(monkeypatch) -> None:
