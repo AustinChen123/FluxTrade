@@ -4,8 +4,8 @@ use crate::rithmic_ledger::{
         TransactionType,
     },
     ledger_runtime::{
-        connect_diagnostics, is_retryable_snapshot_error, LedgerSnapshotFailure, RecoveryQuery,
-        RemoteLedgerSnapshot,
+        connect_diagnostics, is_retryable_snapshot_error, session_failure_diagnostics,
+        LedgerSnapshotFailure, RecoveryQuery, RemoteLedgerSnapshot,
     },
     profile_lock::ProfileLease,
 };
@@ -353,6 +353,8 @@ fn runtime_error(py: Python<'_>, error: anyhow::Error) -> PyErr {
         .unwrap_or(UNCLASSIFIED_FAILURE);
     let retryable = failure == PROFILE_LEASE_FAILURE || is_retryable_snapshot_error(&error);
     let (connect_phase, connect_failure_kind) = connect_diagnostics(failure, &error);
+    let (session_failure_reason, provider_response_code) =
+        session_failure_diagnostics(failure, &error);
     let target = PyRuntimeError::new_err("Rithmic ledger snapshot failed")
         .into_value(py)
         .into_bound(py)
@@ -362,6 +364,8 @@ fn runtime_error(py: Python<'_>, error: anyhow::Error) -> PyErr {
         retryable,
         connect_phase,
         connect_failure_kind,
+        session_failure_reason,
+        provider_response_code,
         target,
     )
 }
@@ -371,6 +375,8 @@ fn project_runtime_error_target(
     retryable: bool,
     connect_phase: &'static str,
     connect_failure_kind: &'static str,
+    session_failure_reason: &'static str,
+    provider_response_code: Option<u32>,
     target: Bound<'_, PyAny>,
 ) -> PyErr {
     if set_diagnostic_attributes(
@@ -379,6 +385,8 @@ fn project_runtime_error_target(
         retryable,
         connect_phase,
         connect_failure_kind,
+        session_failure_reason,
+        provider_response_code,
     )
     .is_err()
     {
@@ -393,6 +401,8 @@ fn set_diagnostic_attributes(
     retryable: bool,
     connect_phase: &'static str,
     connect_failure_kind: &'static str,
+    session_failure_reason: &'static str,
+    provider_response_code: Option<u32>,
 ) -> PyResult<()> {
     let [stage, stable_error_code, safe_cause] = failure.safe_fields();
     target
@@ -402,6 +412,8 @@ fn set_diagnostic_attributes(
         .and_then(|_| target.setattr("retryable", retryable))
         .and_then(|_| target.setattr("connect_phase", connect_phase))
         .and_then(|_| target.setattr("connect_failure_kind", connect_failure_kind))
+        .and_then(|_| target.setattr("session_failure_reason", session_failure_reason))
+        .and_then(|_| target.setattr("provider_response_code", provider_response_code))
 }
 
 #[cfg(test)]
@@ -522,6 +534,22 @@ unclassified_internal|unclassified_ledger_snapshot_failure|ledger snapshot faile
                         .unwrap(),
                     "unclassified"
                 );
+                assert_eq!(
+                    value
+                        .getattr("session_failure_reason")
+                        .unwrap()
+                        .extract::<String>()
+                        .unwrap(),
+                    "unclassified"
+                );
+                assert_eq!(
+                    value
+                        .getattr("provider_response_code")
+                        .unwrap()
+                        .extract::<Option<u32>>()
+                        .unwrap(),
+                    None
+                );
             }
         });
     }
@@ -554,6 +582,7 @@ unclassified_internal|unclassified_ledger_snapshot_failure|ledger snapshot faile
                     ("safe_cause", cause),
                     ("connect_phase", "discovery_exchange"),
                     ("connect_failure_kind", "handshake_rejected"),
+                    ("session_failure_reason", "handshake_rejected"),
                 ] {
                     let actual = value
                         .getattr(attribute)
@@ -568,8 +597,58 @@ unclassified_internal|unclassified_ledger_snapshot_failure|ledger snapshot faile
                     .unwrap()
                     .extract::<bool>()
                     .unwrap());
+                assert_eq!(
+                    value
+                        .getattr("provider_response_code")
+                        .unwrap()
+                        .extract::<Option<u32>>()
+                        .unwrap(),
+                    None
+                );
             });
         }
+    }
+
+    #[test]
+    fn decoded_login_failure_survives_nested_chain_and_projects_only_static_data() {
+        let source = crate::rithmic_ledger::ledger_runtime::scripted_login_failure("13")
+            .context(LedgerSnapshotFailure::ORDER_CONNECT);
+
+        Python::with_gil(|py| {
+            let error = runtime_error(py, source);
+            let value = error.value(py);
+            assert_eq!(value.to_string(), "Rithmic ledger snapshot failed");
+            assert_eq!(
+                value
+                    .getattr("session_failure_reason")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "response_code_rejected"
+            );
+            assert_eq!(
+                value
+                    .getattr("provider_response_code")
+                    .unwrap()
+                    .extract::<Option<u32>>()
+                    .unwrap(),
+                Some(13)
+            );
+            assert_eq!(
+                value
+                    .getattr("retryable")
+                    .unwrap()
+                    .extract::<bool>()
+                    .unwrap(),
+                false
+            );
+            assert!(!value.to_string().contains("provider-secret"));
+            assert!(!value
+                .getattr("safe_cause")
+                .unwrap()
+                .to_string()
+                .contains("provider-secret"));
+        });
     }
 
     #[test]
@@ -584,6 +663,8 @@ unclassified_internal|unclassified_ledger_snapshot_failure|ledger snapshot faile
                 false,
                 "discovery_exchange",
                 "handshake_rejected",
+                "handshake_rejected",
+                None,
                 target,
             );
             let value = error.value(py);
@@ -651,6 +732,22 @@ unclassified_internal|unclassified_ledger_snapshot_failure|ledger snapshot faile
             );
             assert_eq!(
                 value
+                    .getattr("session_failure_reason")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "unclassified"
+            );
+            assert_eq!(
+                value
+                    .getattr("provider_response_code")
+                    .unwrap()
+                    .extract::<Option<u32>>()
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                value
                     .getattr("connect_failure_kind")
                     .unwrap()
                     .extract::<String>()
@@ -676,6 +773,18 @@ class FailsConnectFailureKind(RuntimeError):
         if name == "connect_failure_kind":
             raise RuntimeError("connect kind sentinel")
         super().__setattr__(name, value)
+
+class FailsSessionFailureReason(RuntimeError):
+    def __setattr__(self, name, value):
+        if name == "session_failure_reason":
+            raise RuntimeError("session reason sentinel")
+        super().__setattr__(name, value)
+
+class FailsProviderResponseCode(RuntimeError):
+    def __setattr__(self, name, value):
+        if name == "provider_response_code":
+            raise RuntimeError("provider code sentinel")
+        super().__setattr__(name, value)
 "#,
         )
         .unwrap();
@@ -690,7 +799,12 @@ class FailsConnectFailureKind(RuntimeError):
                 module_name.as_c_str(),
             )
             .unwrap();
-            for class_name in ["FailsConnectPhase", "FailsConnectFailureKind"] {
+            for class_name in [
+                "FailsConnectPhase",
+                "FailsConnectFailureKind",
+                "FailsSessionFailureReason",
+                "FailsProviderResponseCode",
+            ] {
                 let target = module
                     .getattr(class_name)
                     .unwrap()
@@ -701,6 +815,8 @@ class FailsConnectFailureKind(RuntimeError):
                     false,
                     "discovery_exchange",
                     "handshake_rejected",
+                    "handshake_rejected",
+                    None,
                     target.into_any(),
                 );
                 let value = error.value(py);
@@ -722,6 +838,8 @@ class FailsConnectFailureKind(RuntimeError):
                     "retryable",
                     "connect_phase",
                     "connect_failure_kind",
+                    "session_failure_reason",
+                    "provider_response_code",
                 ] {
                     assert!(!value.hasattr(attribute).unwrap());
                 }
@@ -737,6 +855,8 @@ class FailsConnectFailureKind(RuntimeError):
                 true,
                 "unclassified",
                 "unclassified",
+                "unclassified",
+                None,
                 py.None().into_bound(py),
             );
             let value = error.value(py);
@@ -846,7 +966,7 @@ class FailsConnectFailureKind(RuntimeError):
             .contains(".build()\n            .context(RUNTIME_INITIALIZATION_FAILURE)?"));
         let runtime_error = source.split_once("fn runtime_error").unwrap().1;
         assert!(runtime_error.contains(
-            "project_runtime_error_target(\n        failure,\n        retryable,\n        connect_phase,\n        connect_failure_kind,\n        target,\n    )"
+            "project_runtime_error_target(\n        failure,\n        retryable,\n        connect_phase,\n        connect_failure_kind,\n        session_failure_reason,\n        provider_response_code,\n        target,\n    )"
         ));
     }
 

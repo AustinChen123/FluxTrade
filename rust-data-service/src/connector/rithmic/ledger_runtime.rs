@@ -5,7 +5,7 @@ use super::{
         FillSnapshot, InstrumentPositionSnapshot, LoginInfo, OrderHistoryEvent, OrderSnapshot,
         OrderSnapshotEvent, PnlSnapshotEvent,
     },
-    session::Plant,
+    session::{self, Plant},
     transport::{self, ConnectionEvent, MaintenanceGuard, RithmicConnection},
 };
 use anyhow::{ensure, Context, Result};
@@ -119,6 +119,19 @@ pub(crate) fn connect_diagnostics(
     )
 }
 
+#[allow(dead_code)]
+pub(crate) fn session_failure_diagnostics(
+    failure: LedgerSnapshotFailure,
+    error: &anyhow::Error,
+) -> (&'static str, Option<u32>) {
+    if failure != LedgerSnapshotFailure::ORDER_CONNECT
+        && failure != LedgerSnapshotFailure::PNL_CONNECT
+    {
+        return ("unclassified", None);
+    }
+    session::failure_diagnostics(error)
+}
+
 #[cfg(test)]
 #[allow(dead_code)]
 pub(crate) async fn scripted_connect_failure(failure: LedgerSnapshotFailure) -> anyhow::Error {
@@ -165,6 +178,45 @@ pub(crate) async fn scripted_connect_failure(failure: LedgerSnapshotFailure) -> 
     };
     server.await.unwrap();
     error
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn scripted_login_failure(rp_code: &str) -> anyhow::Error {
+    use super::{codec, protocol, session::LoginParameters};
+
+    let login = LoginParameters::new(
+        "test-user".to_string(),
+        "test-password".to_string(),
+        "test-system".to_string(),
+        "FluxTrade".to_string(),
+        "0.1.0".to_string(),
+        Plant::Order,
+    )
+    .unwrap();
+    let mut session = super::session::RithmicSession::new(login);
+    session.begin_system_info().unwrap();
+    let system_info = codec::encode(&protocol::ResponseRithmicSystemInfo {
+        template_id: 17,
+        rp_code: vec!["0".to_string()],
+        system_name: vec!["test-system".to_string()],
+        ..Default::default()
+    })
+    .unwrap();
+    session.accept_system_info(&system_info).unwrap();
+    session.mark_reconnected().unwrap();
+    session.begin_login().unwrap();
+    let response = codec::encode(&protocol::ResponseLogin {
+        template_id: 11,
+        rp_code: vec![rp_code.to_string(), "provider-secret".to_string()],
+        heartbeat_interval: Some(30.0),
+        ..Default::default()
+    })
+    .unwrap();
+    session
+        .accept_login(&response)
+        .unwrap_err()
+        .context("nested caller context")
 }
 
 #[cfg(test)]
