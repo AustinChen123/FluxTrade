@@ -5,8 +5,51 @@ use anyhow::{ensure, Context, Result};
 use super::{codec, protocol};
 
 #[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-struct FatalSessionError(String);
+#[error("{message}")]
+struct FatalSessionError {
+    message: String,
+    reason: SessionFailureReason,
+    provider_response_code: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionFailureReason {
+    ResponseCodeRejected,
+    ResponseCodeMissing,
+    HeartbeatIntervalMissing,
+    HeartbeatIntervalInvalid,
+    ForcedLogout,
+    HandshakeRejected,
+    SystemUnavailable,
+}
+
+impl SessionFailureReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ResponseCodeRejected => "response_code_rejected",
+            Self::ResponseCodeMissing => "response_code_missing",
+            Self::HeartbeatIntervalMissing => "heartbeat_interval_missing",
+            Self::HeartbeatIntervalInvalid => "heartbeat_interval_invalid",
+            Self::ForcedLogout => "forced_logout",
+            Self::HandshakeRejected => "handshake_rejected",
+            Self::SystemUnavailable => "system_unavailable",
+        }
+    }
+}
+
+impl FatalSessionError {
+    fn new(
+        message: impl Into<String>,
+        reason: SessionFailureReason,
+        provider_response_code: Option<u32>,
+    ) -> Self {
+        Self {
+            message: message.into(),
+            reason,
+            provider_response_code,
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 #[error("{source}")]
@@ -21,6 +64,14 @@ pub(crate) fn is_fatal_session_error(error: &anyhow::Error) -> bool {
         .any(|source| source.downcast_ref::<FatalSessionError>().is_some())
 }
 
+pub(crate) fn failure_diagnostics(error: &anyhow::Error) -> (&'static str, Option<u32>) {
+    error
+        .chain()
+        .find_map(|source| source.downcast_ref::<FatalSessionError>())
+        .map(|fatal| (fatal.reason.as_str(), fatal.provider_response_code))
+        .unwrap_or(("unclassified", None))
+}
+
 pub(crate) fn is_retryable_session_error(error: &anyhow::Error) -> bool {
     error
         .chain()
@@ -29,7 +80,7 @@ pub(crate) fn is_retryable_session_error(error: &anyhow::Error) -> bool {
 
 pub(crate) fn is_handshake_rejection(error: &(dyn std::error::Error + 'static)) -> bool {
     matches!(error.downcast_ref::<FatalSessionError>(), Some(error)
-        if error.0 == "stable_error_code=rithmic_handshake_rejected")
+        if error.reason == SessionFailureReason::HandshakeRejected)
 }
 
 const SYSTEM_INFO_REQUEST: i32 = 16;
@@ -159,8 +210,10 @@ impl RithmicSession {
             let response: protocol::ResponseRithmicSystemInfo = codec::decode(frame)?;
             ensure_handshake_success(&response.rp_code, "system-info")?;
             if !response.system_name.contains(&self.login.system_name) {
-                return Err(FatalSessionError(
-                    "configured Rithmic system is unavailable".to_string(),
+                return Err(FatalSessionError::new(
+                    "configured Rithmic system is unavailable",
+                    SessionFailureReason::SystemUnavailable,
+                    None,
                 )
                 .into());
             }
@@ -203,7 +256,11 @@ impl RithmicSession {
             let response: protocol::ResponseLogin = codec::decode(frame)?;
             ensure_handshake_success(&response.rp_code, "login")?;
             let seconds = response.heartbeat_interval.ok_or_else(|| {
-                FatalSessionError("Rithmic login response omitted heartbeat_interval".to_string())
+                FatalSessionError::new(
+                    "Rithmic login response omitted heartbeat_interval",
+                    SessionFailureReason::HeartbeatIntervalMissing,
+                    None,
+                )
             })?;
             let interval = validated_heartbeat_interval(seconds)?;
             self.heartbeat_interval = Some(interval);
@@ -285,16 +342,29 @@ impl RithmicSession {
 
     fn accept_handshake_reject(&mut self, frame: &[u8]) -> Result<()> {
         expect_template(frame, REJECT)?;
-        let _: protocol::Reject = codec::decode(frame)?;
+        let response: protocol::Reject = codec::decode(frame)?;
         self.state = SessionState::Failed;
-        Err(FatalSessionError("stable_error_code=rithmic_handshake_rejected".to_string()).into())
+        Err(FatalSessionError::new(
+            "stable_error_code=rithmic_handshake_rejected",
+            SessionFailureReason::HandshakeRejected,
+            response
+                .rp_code
+                .first()
+                .and_then(|code| canonical_non_success_code(code)),
+        )
+        .into())
     }
 
     fn accept_forced_logout(&mut self, frame: &[u8]) -> Result<()> {
         expect_template(frame, FORCED_LOGOUT)?;
         let _: protocol::ForcedLogout = codec::decode(frame)?;
         self.state = SessionState::Failed;
-        Err(FatalSessionError("Rithmic forced the session to log out".to_string()).into())
+        Err(FatalSessionError::new(
+            "Rithmic forced the session to log out",
+            SessionFailureReason::ForcedLogout,
+            None,
+        )
+        .into())
     }
 
     fn require_state(&self, expected: SessionState) -> Result<()> {
@@ -329,22 +399,33 @@ fn heartbeat_request() -> protocol::RequestHeartbeat {
 
 fn validated_heartbeat_interval(seconds: f64) -> Result<Duration> {
     if !seconds.is_finite() || seconds <= 0.0 {
-        return Err(FatalSessionError(
-            "Rithmic heartbeat_interval must be finite and positive".to_string(),
+        return Err(FatalSessionError::new(
+            "Rithmic heartbeat_interval must be finite and positive",
+            SessionFailureReason::HeartbeatIntervalInvalid,
+            None,
         )
         .into());
     }
-    let interval = Duration::try_from_secs_f64(seconds)
-        .map_err(|_| FatalSessionError("Rithmic heartbeat_interval is out of range".to_string()))?;
+    let interval = Duration::try_from_secs_f64(seconds).map_err(|_| {
+        FatalSessionError::new(
+            "Rithmic heartbeat_interval is out of range",
+            SessionFailureReason::HeartbeatIntervalInvalid,
+            None,
+        )
+    })?;
     if interval.is_zero() {
-        return Err(FatalSessionError(
-            "Rithmic heartbeat_interval is below timer resolution".to_string(),
+        return Err(FatalSessionError::new(
+            "Rithmic heartbeat_interval is below timer resolution",
+            SessionFailureReason::HeartbeatIntervalInvalid,
+            None,
         )
         .into());
     }
     Instant::now().checked_add(interval).ok_or_else(|| {
-        anyhow::Error::new(FatalSessionError(
-            "Rithmic heartbeat_interval exceeds timer range".to_string(),
+        anyhow::Error::new(FatalSessionError::new(
+            "Rithmic heartbeat_interval exceeds timer range",
+            SessionFailureReason::HeartbeatIntervalInvalid,
+            None,
         ))
     })?;
     Ok(interval)
@@ -394,9 +475,11 @@ pub(super) fn classify_response_codes(
 
 fn ensure_handshake_success(rp_codes: &[String], phase: &str) -> Result<()> {
     let code = rp_codes.first().ok_or_else(|| {
-        FatalSessionError(format!(
-            "Rithmic {phase} handshake response omitted rp_code"
-        ))
+        FatalSessionError::new(
+            format!("Rithmic {phase} handshake response omitted rp_code"),
+            SessionFailureReason::ResponseCodeMissing,
+            None,
+        )
     })?;
     if code != "0" {
         let safe_code = code
@@ -404,9 +487,22 @@ fn ensure_handshake_success(rp_codes: &[String], phase: &str) -> Result<()> {
             .map(|value| value.to_string())
             .unwrap_or_else(|_| "unrecognized".to_string());
         let message = format!("Rithmic {phase} handshake response code {safe_code}");
-        return Err(FatalSessionError(message).into());
+        return Err(FatalSessionError::new(
+            message,
+            SessionFailureReason::ResponseCodeRejected,
+            canonical_non_success_code(code),
+        )
+        .into());
     }
     Ok(())
+}
+
+fn canonical_non_success_code(code: &str) -> Option<u32> {
+    if code.is_empty() || !code.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let value = code.parse::<u32>().ok()?;
+    (value != 0 && value.to_string() == code).then_some(value)
 }
 
 #[cfg(test)]
@@ -604,6 +700,7 @@ mod tests {
             .unwrap_err();
         assert!(is_fatal_session_error(&error));
         assert_eq!(session.state(), SessionState::Failed);
+        assert_eq!(failure_diagnostics(&error), ("system_unavailable", None));
     }
 
     #[test]
@@ -618,6 +715,10 @@ mod tests {
         assert!(!error.chain().any(is_handshake_rejection));
         assert!(error.to_string().contains("system-info"));
         assert_eq!(session.state(), SessionState::Failed);
+        assert_eq!(
+            failure_diagnostics(&error),
+            ("response_code_rejected", Some(9))
+        );
     }
 
     #[test]
@@ -646,6 +747,10 @@ mod tests {
         );
         assert!(!error.to_string().contains("session unavailable"));
         assert_eq!(session.state(), SessionState::Failed);
+        assert_eq!(
+            failure_diagnostics(&error),
+            ("response_code_rejected", Some(13))
+        );
     }
 
     #[test]
@@ -671,9 +776,10 @@ mod tests {
         .unwrap();
         let mut system_info_session = RithmicSession::new(login(Plant::Ticker));
         system_info_session.begin_system_info().unwrap();
-        assert!(system_info_session
+        let error = system_info_session
             .accept_system_info(&empty_system_info)
-            .is_err());
+            .unwrap_err();
+        assert_eq!(failure_diagnostics(&error), ("response_code_missing", None));
         assert_eq!(system_info_session.state(), SessionState::Failed);
 
         let empty_login = codec::encode(&protocol::ResponseLogin {
@@ -689,7 +795,8 @@ mod tests {
             .unwrap();
         login_session.mark_reconnected().unwrap();
         login_session.begin_login().unwrap();
-        assert!(login_session.accept_login(&empty_login).is_err());
+        let error = login_session.accept_login(&empty_login).unwrap_err();
+        assert_eq!(failure_diagnostics(&error), ("response_code_missing", None));
         assert_eq!(login_session.state(), SessionState::Failed);
 
         let empty_heartbeat = codec::encode(&protocol::ResponseHeartbeat {
@@ -710,7 +817,8 @@ mod tests {
         .unwrap();
         let mut logout_session = activate(Plant::Ticker);
         logout_session.begin_logout().unwrap();
-        assert!(logout_session.accept_logout(&empty_logout).is_err());
+        let error = logout_session.accept_logout(&empty_logout).unwrap_err();
+        assert_eq!(failure_diagnostics(&error), ("unclassified", None));
         assert_eq!(logout_session.state(), SessionState::Failed);
     }
 
@@ -738,7 +846,56 @@ mod tests {
                 .accept_login(&login_response(interval, "0"))
                 .unwrap_err();
             assert!(is_fatal_session_error(&error));
+            assert_eq!(
+                failure_diagnostics(&error).0,
+                if interval.is_none() {
+                    "heartbeat_interval_missing"
+                } else {
+                    "heartbeat_interval_invalid"
+                }
+            );
             assert_eq!(session.state(), SessionState::Failed);
+        }
+    }
+
+    #[test]
+    fn decoded_login_code_diagnostics_are_canonical_and_survive_nested_context() {
+        for (rp_code, expected) in [
+            ("7", Some(7)),
+            ("4294967295", Some(u32::MAX)),
+            ("0", None),
+            ("07", None),
+            ("+7", None),
+            ("4294967296", None),
+            ("٧", None),
+            ("provider-secret-7", None),
+        ] {
+            let mut session = RithmicSession::new(login(Plant::Ticker));
+            session.begin_system_info().unwrap();
+            session
+                .accept_system_info(&system_info(&["test-system"], "0"))
+                .unwrap();
+            session.mark_reconnected().unwrap();
+            session.begin_login().unwrap();
+            let response = login_response(Some(30.0), rp_code);
+            let result = session.accept_login(&response);
+            if rp_code == "0" {
+                assert!(result.is_ok());
+                assert_eq!(session.state(), SessionState::Active);
+            } else {
+                let error = result.expect_err("non-success login code must fail");
+                assert_eq!(session.state(), SessionState::Failed);
+                assert_eq!(
+                    failure_diagnostics(&error),
+                    ("response_code_rejected", expected)
+                );
+
+                let nested = error.context("outer caller context");
+                assert_eq!(
+                    failure_diagnostics(&nested),
+                    ("response_code_rejected", expected)
+                );
+            }
         }
     }
 
@@ -776,6 +933,7 @@ mod tests {
         assert!(is_fatal_session_error(&error));
         assert!(!error.chain().any(is_handshake_rejection));
         assert_eq!(terminated.state(), SessionState::Failed);
+        assert_eq!(failure_diagnostics(&error), ("forced_logout", None));
     }
 
     #[test]
@@ -822,13 +980,21 @@ mod tests {
             "provider-detail-sentinel",
         ];
 
-        for (user_msg, rp_code) in [
+        for (user_msg, rp_code, expected_code) in [
             (
                 vec![SENTINELS[0].to_string()],
                 vec![SENTINELS[1].to_string(), SENTINELS[2].to_string()],
+                None,
             ),
-            (vec![String::new()], vec![String::new()]),
-            (vec![], vec![]),
+            (
+                vec![],
+                vec!["42".to_string(), SENTINELS[2].to_string()],
+                Some(42),
+            ),
+            (vec![], vec!["042".to_string()], None),
+            (vec![], vec!["4294967296".to_string()], None),
+            (vec![String::new()], vec![String::new()], None),
+            (vec![], vec![], None),
         ] {
             let reject = codec::encode(&protocol::Reject {
                 template_id: REJECT,
@@ -847,6 +1013,10 @@ mod tests {
 
                 assert!(is_fatal_session_error(&error));
                 assert!(error.chain().any(is_handshake_rejection));
+                assert_eq!(
+                    failure_diagnostics(&error),
+                    ("handshake_rejected", expected_code)
+                );
                 assert_eq!(session.state(), SessionState::Failed);
                 assert_eq!(error.root_cause().to_string(), SAFE_MESSAGE);
                 assert_eq!(
