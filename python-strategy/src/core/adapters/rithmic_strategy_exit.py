@@ -15,7 +15,11 @@ from src.core.adapters.rithmic_recovery import (
 from src.core.adapters.rithmic_order_event_lifecycle import (
     RithmicOrderEventLifecycleGate,
 )
+from src.core.adapters.rithmic_order_observation import (
+    project_rithmic_order_snapshot,
+)
 from src.core.execution import ExecutionEngine, ExitDecision
+from src.core.interfaces.exchange import ExchangeError
 from src.core.models import OrderStatus, Position, Signal, SignalType
 
 
@@ -75,7 +79,6 @@ class RithmicStrategyExitService:
         signal: Signal,
         position_quantity: Decimal,
     ) -> dict[str, object]:
-        verified = False
         order_event_stopped = False
         operation_failed = False
         outcome: dict[str, object] | None = None
@@ -86,86 +89,116 @@ class RithmicStrategyExitService:
             order_event_stopped = True
 
             self.assert_leadership()
-            self.adapter.start_order_event_stream()
-            cancelled_orders = self._cancel_active_orders(signal)
-
-            snapshot = self._load_snapshot()
-            if any(rithmic_order_may_be_working(order) for order in snapshot.orders):
-                raise RuntimeError("rithmic_strategy_exit_working_orders_remain")
-            positions = self.adapter.positions_from_ledger_snapshot(snapshot)
-            reconciliation = self._reconcile(snapshot)
-            if reconciliation.get("auto_resume_safe") is not True:
+            initial_snapshot = self._load_snapshot()
+            initial_reconciliation = self._reconcile(initial_snapshot)
+            if initial_reconciliation.get("auto_resume_safe") is not True:
                 raise RuntimeError(
                     "rithmic_strategy_exit_preflight_reconciliation_blocked"
                 )
-            self.assert_leadership()
-            self._publish_positions(positions)
-            remote_position = next(
-                (
-                    position
-                    for position in positions
-                    if position.product_id == signal.product_id
-                ),
-                None,
+
+            cancellation_targets, new_orders = self._cancellation_targets(
+                signal,
+                initial_snapshot,
             )
-            if remote_position is not None:
-                remote_side = str(
-                    getattr(remote_position.side, "value", remote_position.side)
-                ).upper()
-                expected_side = (
-                    "LONG" if signal.type == SignalType.EXIT_LONG else "SHORT"
-                )
-                if (
-                    remote_side != expected_side
-                    or remote_position.quantity > position_quantity
-                ):
-                    raise RuntimeError(
-                        "rithmic_strategy_exit_position_drift:"
-                        f"expected_side={expected_side} remote_side={remote_side} "
-                        f"expected_quantity={position_quantity} "
-                        f"remote_quantity={remote_position.quantity}"
+            for order in new_orders:
+                self.assert_leadership()
+                self.execution_engine.order_manager.fail_order(order, "strategy_exit")
+                cancelled_orders += 1
+
+            post_cancel_snapshot = initial_snapshot
+            post_cancel_reconciliation = initial_reconciliation
+            positions: list[Position]
+            remote_position: Position | None
+            if cancellation_targets:
+                self.adapter.start_order_event_stream()
+                cancel_error: ExchangeError | None = None
+                terminal_targets: list[tuple[Any, Any]] = []
+                for order, remote in cancellation_targets:
+                    self.assert_leadership()
+                    try:
+                        cancelled = self.adapter.cancel_order(
+                            cast(str, remote.basket_id),
+                            order.product_id,
+                            order_type=order.type,
+                        )
+                    except ExchangeError as error:
+                        cancel_error = error
+                        terminal_targets.append((order, remote))
+                        break
+                    if not cancelled:
+                        raise RuntimeError(
+                            f"rithmic_strategy_exit_cancel_failed:order_id={order.id}"
+                        )
+                    cancelled_orders += 1
+                    terminal_targets.append((order, remote))
+
+                try:
+                    post_cancel_snapshot = self._load_snapshot()
+                    post_cancel_reconciliation = self._reconcile(post_cancel_snapshot)
+                    self._validate_post_cancel_snapshot(
+                        post_cancel_snapshot,
+                        post_cancel_reconciliation,
+                        terminal_targets,
                     )
+                    positions = self.adapter.positions_from_ledger_snapshot(
+                        post_cancel_snapshot
+                    )
+                    remote_position = self._validate_exit_position(
+                        signal,
+                        position_quantity,
+                        positions,
+                    )
+                except Exception as verification_error:
+                    if cancel_error is not None:
+                        raise cancel_error from verification_error
+                    raise
+            else:
+                self._validate_post_cancel_snapshot(
+                    initial_snapshot,
+                    initial_reconciliation,
+                    [],
+                )
+                positions = self.adapter.positions_from_ledger_snapshot(
+                    initial_snapshot
+                )
+                remote_position = self._validate_exit_position(
+                    signal,
+                    position_quantity,
+                    positions,
+                )
+            if remote_position is not None:
                 self.assert_leadership()
                 self.adapter.start_order_event_stream()
                 self.execution_engine.exit_authoritative_position(
                     signal.product_id,
                     account_id=self.adapter.account_id,
                 )
-
-            for _attempt in range(6):
-                self.assert_leadership()
                 snapshot = self._load_snapshot()
+                reconciliation = self._reconcile(snapshot)
+                self._validate_post_cancel_snapshot(snapshot, reconciliation, [])
                 remaining_positions = self.adapter.positions_from_ledger_snapshot(
                     snapshot
                 )
-                if any(
-                    rithmic_order_may_be_working(order) for order in snapshot.orders
-                ):
-                    continue
-                reconciliation = self._reconcile(snapshot)
                 self.assert_leadership()
-                self._publish_positions(remaining_positions)
                 target_position = next(
                     (
-                        position
-                        for position in remaining_positions
-                        if position.product_id == signal.product_id
+                        p
+                        for p in remaining_positions
+                        if p.product_id == signal.product_id
                     ),
                     None,
                 )
-                if (
-                    target_position is None
-                    and reconciliation.get("auto_resume_safe") is True
-                ):
-                    verified = True
-                    outcome = {
-                        "status": "verified_flat",
-                        "cancelled_orders": cancelled_orders,
-                        "product_id": signal.product_id,
-                    }
-                    break
-            if not verified:
-                raise RuntimeError("rithmic_strategy_exit_flat_not_verified")
+                if target_position is not None:
+                    raise RuntimeError("rithmic_strategy_exit_flat_not_verified")
+                self._publish_positions(remaining_positions)
+            else:
+                self.assert_leadership()
+                self._publish_positions(positions)
+            outcome = {
+                "status": "verified_flat",
+                "cancelled_orders": cancelled_orders,
+                "product_id": signal.product_id,
+            }
         except Exception as error:
             operation_failed = True
             self.lockdown(
@@ -191,7 +224,41 @@ class RithmicStrategyExitService:
             raise RuntimeError("rithmic_strategy_exit_outcome_missing")
         return outcome
 
-    def _cancel_active_orders(self, signal: Signal) -> int:
+    @staticmethod
+    def _validate_exit_position(
+        signal: Signal,
+        position_quantity: Decimal,
+        positions: list[Position],
+    ) -> Position | None:
+        remote_position = next(
+            (
+                position
+                for position in positions
+                if position.product_id == signal.product_id
+            ),
+            None,
+        )
+        if remote_position is not None:
+            remote_side = str(
+                getattr(remote_position.side, "value", remote_position.side)
+            ).upper()
+            expected_side = "LONG" if signal.type == SignalType.EXIT_LONG else "SHORT"
+            if (
+                remote_side != expected_side
+                or remote_position.quantity > position_quantity
+            ):
+                raise RuntimeError(
+                    f"rithmic_strategy_exit_position_drift:expected_side={expected_side} "
+                    f"remote_side={remote_side} expected_quantity={position_quantity} "
+                    f"remote_quantity={remote_position.quantity}"
+                )
+        return remote_position
+
+    def _cancellation_targets(
+        self,
+        signal: Signal,
+        snapshot: object,
+    ) -> tuple[list[tuple[Any, Any]], list[Any]]:
         active_statuses = {
             OrderStatus.NEW.value,
             OrderStatus.SUBMITTED_UNCONFIRMED.value,
@@ -208,44 +275,86 @@ class RithmicStrategyExitService:
             if (
                 order.strategy_id == signal.strategy_id
                 and order.product_id == signal.product_id
+                and str(getattr(order, "exchange_id", "RITHMIC")).casefold()
+                == "rithmic"
+                and getattr(order, "account_profile", self.profile) == self.profile
+                and getattr(order, "account_id", self.account_id) == self.account_id
             ):
                 active_orders.append(order)
-        cancelled_orders = 0
+        cancellation_targets: list[tuple[Any, Any]] = []
+        new_orders: list[Any] = []
         for order in active_orders:
-            self.assert_leadership()
             if order.status == OrderStatus.NEW.value:
-                self.execution_engine.order_manager.fail_order(
-                    order,
-                    "strategy_exit",
-                )
-                cancelled_orders += 1
+                new_orders.append(order)
                 continue
-            if not order.client_order_id:
+            basket_id = str(getattr(order, "exchange_order_id", None) or "").strip()
+            if not basket_id:
                 raise RuntimeError(
                     f"rithmic_strategy_exit_cancel_identity_missing:order_id={order.id}"
                 )
-            remote = self.adapter.get_order_by_client_id(
-                order.client_order_id,
-                order.product_id,
-                order_type=order.type,
-            )
-            if remote is None:
+            remote_matches = [
+                remote
+                for remote in getattr(snapshot, "orders", ())
+                if str(getattr(remote, "basket_id", "")) == basket_id
+            ]
+            if len(remote_matches) != 1:
                 raise RuntimeError(
-                    f"rithmic_strategy_exit_cancel_lookup_missing:order_id={order.id}"
+                    f"rithmic_strategy_exit_cancel_identity_ambiguous:order_id={order.id}"
                 )
-            if remote.status in {"filled", "cancelled", "rejected"}:
+            remote = remote_matches[0]
+            projected = project_rithmic_order_snapshot(
+                remote,
+                account_id=self.account_id,
+            )
+            if projected.exchange_order_id != basket_id:
+                raise RuntimeError(
+                    f"rithmic_strategy_exit_cancel_identity_mismatch:order_id={order.id}"
+                )
+            if not rithmic_order_may_be_working(remote):
                 continue
-            self.assert_leadership()
-            if not self.adapter.cancel_order(
-                cast(str, remote.exchange_order_id),
-                order.product_id,
-                order_type=order.type,
+            cancellation_targets.append((order, remote))
+        return cancellation_targets, new_orders
+
+    def _validate_post_cancel_snapshot(
+        self,
+        snapshot: object,
+        reconciliation: dict[str, object],
+        terminal_targets: list[tuple[Any, Any]],
+    ) -> None:
+        if reconciliation.get("auto_resume_safe") is not True:
+            raise RuntimeError(
+                "rithmic_strategy_exit_post_cancel_reconciliation_blocked"
+            )
+        if any(
+            rithmic_order_may_be_working(order)
+            for order in getattr(snapshot, "orders", ())
+        ):
+            raise RuntimeError("rithmic_strategy_exit_working_orders_remain")
+        for order, remote in terminal_targets:
+            basket_id = str(remote.basket_id)
+            matches = [
+                current
+                for current in getattr(snapshot, "orders", ())
+                if str(getattr(current, "basket_id", "")) == basket_id
+            ]
+            if len(matches) > 1 or (
+                matches and rithmic_order_may_be_working(matches[0])
             ):
                 raise RuntimeError(
-                    f"rithmic_strategy_exit_cancel_failed:order_id={order.id}"
+                    f"rithmic_strategy_exit_cancel_not_terminal:order_id={order.id}"
                 )
-            cancelled_orders += 1
-        return cancelled_orders
+            reconciled_order = self.execution_engine.order_manager.repo.get_order(
+                order.id
+            )
+            if reconciled_order is None or reconciled_order.status not in {
+                OrderStatus.FILLED.value,
+                OrderStatus.CANCELLED.value,
+                OrderStatus.FAILED.value,
+                OrderStatus.LIQUIDATED.value,
+            }:
+                raise RuntimeError(
+                    f"rithmic_strategy_exit_cancel_not_terminal:order_id={order.id}"
+                )
 
     def _load_snapshot(self):
         self.adapter.close()
