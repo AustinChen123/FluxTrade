@@ -295,8 +295,12 @@ impl RithmicSession {
         let result = (|| {
             expect_template(frame, HEARTBEAT_RESPONSE)?;
             let response: protocol::ResponseHeartbeat = codec::decode(frame)?;
-            ensure_success(&response.rp_code)
-                .map_err(|source| anyhow::Error::new(RetryableSessionError { source }))
+            if response.rp_code.is_empty() {
+                Ok(())
+            } else {
+                ensure_success(&response.rp_code)
+                    .map_err(|source| anyhow::Error::new(RetryableSessionError { source }))
+            }
         })();
         self.finish_response(result, SessionState::Active)
     }
@@ -767,6 +771,60 @@ mod tests {
     }
 
     #[test]
+    fn active_heartbeat_accepts_absent_code_but_keeps_present_codes_strict() {
+        for plant in [Plant::Ticker, Plant::Order, Plant::History, Plant::Pnl] {
+            let empty = codec::encode(&protocol::ResponseHeartbeat {
+                template_id: HEARTBEAT_RESPONSE,
+                ..Default::default()
+            })
+            .unwrap();
+            let mut session = activate(plant);
+            session.accept_heartbeat(&empty).unwrap();
+            assert_eq!(session.state(), SessionState::Active);
+
+            for rp_code in ["0", "9", "", "unknown"] {
+                let response = heartbeat_response(rp_code);
+                let mut session = activate(plant);
+                match rp_code {
+                    "0" => {
+                        session.accept_heartbeat(&response).unwrap();
+                        assert_eq!(session.state(), SessionState::Active);
+                    }
+                    _ => {
+                        let error = session.accept_heartbeat(&response).unwrap_err();
+                        assert!(is_retryable_session_error(&error));
+                        assert_eq!(session.state(), SessionState::Failed);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn absent_code_compatibility_does_not_relax_heartbeat_state_or_frame_validation() {
+        let empty = codec::encode(&protocol::ResponseHeartbeat {
+            template_id: HEARTBEAT_RESPONSE,
+            ..Default::default()
+        })
+        .unwrap();
+        let mut not_active = RithmicSession::new(login(Plant::Ticker));
+        assert!(not_active.accept_heartbeat(&empty).is_err());
+
+        let wrong_template = codec::encode(&protocol::ResponseHeartbeat {
+            template_id: 18,
+            ..Default::default()
+        })
+        .unwrap();
+        let mut active = activate(Plant::Ticker);
+        assert!(active.accept_heartbeat(&wrong_template).is_err());
+        assert_eq!(active.state(), SessionState::Failed);
+
+        let mut active = activate(Plant::Ticker);
+        assert!(active.accept_heartbeat(&[0xff]).is_err());
+        assert_eq!(active.state(), SessionState::Failed);
+    }
+
+    #[test]
     fn missing_response_code_fails_closed_in_each_response_state() {
         let empty_system_info = codec::encode(&protocol::ResponseRithmicSystemInfo {
             template_id: SYSTEM_INFO_RESPONSE,
@@ -805,10 +863,10 @@ mod tests {
         })
         .unwrap();
         let mut heartbeat_session = activate(Plant::Ticker);
-        assert!(heartbeat_session
+        heartbeat_session
             .accept_heartbeat(&empty_heartbeat)
-            .is_err());
-        assert_eq!(heartbeat_session.state(), SessionState::Failed);
+            .unwrap();
+        assert_eq!(heartbeat_session.state(), SessionState::Active);
 
         let empty_logout = codec::encode(&protocol::ResponseLogout {
             template_id: LOGOUT_RESPONSE,

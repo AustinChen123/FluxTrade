@@ -1319,7 +1319,6 @@ mod tests {
                 .send(Message::Binary(
                     codec::encode(&protocol::ResponseHeartbeat {
                         template_id: 19,
-                        rp_code: vec!["0".to_string()],
                         ..Default::default()
                     })
                     .unwrap()
@@ -1338,7 +1337,6 @@ mod tests {
                 .send(Message::Binary(
                     codec::encode(&protocol::ResponseHeartbeat {
                         template_id: 19,
-                        rp_code: vec!["0".to_string()],
                         ..Default::default()
                     })
                     .unwrap()
@@ -1376,6 +1374,37 @@ mod tests {
             panic!("expected Rithmic payload event");
         };
         assert_eq!(codec::template_id(&payload).unwrap(), 12);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unsolicited_heartbeat_does_not_confirm_or_refresh_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut socket = serve_handshake(&listener, 30.0).await;
+            send_heartbeat_response(&mut socket).await;
+            socket
+                .send(Message::Binary(
+                    codec::encode(&protocol::ResponseHeartbeat {
+                        template_id: 19,
+                        ..Default::default()
+                    })
+                    .unwrap()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+        });
+
+        let mut connection = connect(&url, login(), Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            connection.next_event().await.unwrap(),
+            ConnectionEvent::HeartbeatConfirmed
+        );
+        assert!(connection.next_event().await.is_err());
         server.await.unwrap();
     }
 
