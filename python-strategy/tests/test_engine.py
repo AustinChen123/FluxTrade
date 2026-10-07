@@ -109,7 +109,6 @@ from src.core.execution import ExecutionEngine, ExitDecision
 from src.core.interfaces.exchange import (
     ExchangeError,
     ExchangeOrderEvent,
-    ExchangeOrderSnapshot,
     NetworkError,
 )
 from src.core.strategy_state_manager import (
@@ -9407,27 +9406,11 @@ def test_rithmic_strategy_exit_uses_native_exit_and_verifies_flat(
         "RITHMIC:NQ-202609",
         account_id="ACCOUNT",
     )
-    assert engine.account_service.replace_positions_for_products.call_args_list == [
-        call(
-            [
-                Position(
-                    strategy_id="LIVE",
-                    product_id="RITHMIC:NQ-202609",
-                    side=PositionSide.LONG,
-                    quantity=Decimal(remote_quantity),
-                    entry_price=Decimal("20000"),
-                    unrealized_pnl=Decimal("0"),
-                )
-            ],
-            ("RITHMIC:NQ-202609",),
-            timestamp_ms=engine.execution_engine.clock.now() * 1000,
-        ),
-        call(
-            [],
-            ("RITHMIC:NQ-202609",),
-            timestamp_ms=engine.execution_engine.clock.now() * 1000,
-        ),
-    ]
+    engine.account_service.replace_positions_for_products.assert_called_once_with(
+        [],
+        ("RITHMIC:NQ-202609",),
+        timestamp_ms=engine.execution_engine.clock.now() * 1000,
+    )
     engine._start_exchange_order_event_stream.assert_called_once_with()
 
 
@@ -9663,48 +9646,94 @@ def test_portfolio_exit_resolves_current_worker_after_acquiring_gate(engine_fact
     engine._start_exchange_order_event_stream.assert_not_called()
 
 
-def test_rithmic_strategy_exit_cancels_protection_before_native_exit(engine):
+def test_rithmic_strategy_exit_cancels_protection_before_native_exit(
+    engine,
+    order_factory,
+):
     adapter = _rithmic_adapter_for_reconnect_test()
     engine.execution_engine.adapter = adapter
     engine._runtime_profile = "test"
     engine._runtime_account_id = "ACCOUNT"
     engine.order_event_thread = None
-    protection = SimpleNamespace(
-        id="protection-1",
+    protection = order_factory(
+        order_id="protection-1",
         strategy_id="strategy",
         product_id="RITHMIC:NQ-202609",
         status=OrderStatus.SUBMITTED.value,
         client_order_id="strategy-execution-sl-1",
-        exchange_id="rithmic",
-        type="stop_loss",
+        exchange_id="RITHMIC",
+        order_type="stop_loss",
+        exchange_order_id="basket-1",
+        account_profile="test",
+        account_id="ACCOUNT",
     )
     engine.execution_engine.list_recoverable_client_orders = MagicMock(
         return_value=[protection]
     )
-    engine.execution_engine.order_manager.repo.list_orders_by_statuses = MagicMock(
-        return_value=[protection]
-    )
-    adapter.get_order_by_client_id = MagicMock(
-        return_value=ExchangeOrderSnapshot(
-            client_order_id=protection.client_order_id,
-            exchange_order_id="basket-1",
-            status="partially_filled",
-        )
-    )
-    adapter.cancel_order = MagicMock(return_value=True)
-    engine.execution_engine.exit_authoritative_position = MagicMock(return_value=True)
+    repository = engine.execution_engine.order_manager.repo
+    repository.add_order(protection)
+    adapter.get_order_by_client_id = MagicMock()
     operation_order = []
-    engine.execution_engine.reconcile_owned_orders = MagicMock(
+    adapter.cancel_order = MagicMock(
+        side_effect=lambda *_args, **_kwargs: operation_order.append("cancel") or True
+    )
+    engine.execution_engine.exit_authoritative_position = MagicMock(
         side_effect=lambda *_args, **_kwargs: (
-            operation_order.append("reconcile") or {"auto_resume_safe": True}
+            operation_order.append("native-exit") or True
         )
     )
+    reconciliation_count = 0
+
+    def reconcile(*_args, **_kwargs):
+        nonlocal reconciliation_count
+        reconciliation_count += 1
+        operation_order.append(f"reconcile-{reconciliation_count}")
+        if reconciliation_count == 2:
+            protection.status = OrderStatus.CANCELLED.value
+        return {"auto_resume_safe": True}
+
+    engine.execution_engine.reconcile_owned_orders = MagicMock(side_effect=reconcile)
     engine._publish_authoritative_account_summary = MagicMock()
     engine._start_exchange_order_event_stream = MagicMock()
     engine.account_service.replace_positions_for_products = MagicMock(
         side_effect=lambda *_args, **_kwargs: operation_order.append("replace")
     )
     _install_rithmic_strategy_exit_service(engine, adapter)
+    snapshots = [
+        _rithmic_emergency_snapshot(
+            net_quantity="0.5",
+            orders=[_rithmic_exit_order_snapshot("basket-1")],
+        ),
+        _rithmic_emergency_snapshot(
+            net_quantity="0.5",
+            orders=[
+                _rithmic_exit_order_snapshot(
+                    "basket-1",
+                    status="CANCELLED",
+                    notification_type="CANCEL",
+                )
+            ],
+        ),
+        _rithmic_emergency_snapshot(),
+    ]
+    snapshot_index = 0
+
+    snapshot_load_context = []
+
+    def load_snapshot(profile, account_id, *args, **kwargs):
+        nonlocal snapshot_index
+        snapshot_load_context.append((profile, account_id))
+        operation_order.append("snapshot")
+        snapshot = snapshots[snapshot_index]
+        snapshot_index += 1
+        return snapshot
+
+    positions_from_snapshot = adapter.positions_from_ledger_snapshot
+    adapter.positions_from_ledger_snapshot = MagicMock(
+        side_effect=lambda snapshot: (
+            operation_order.append("verify") or positions_from_snapshot(snapshot)
+        )
+    )
     signal = Signal(
         strategy_id="strategy",
         product_id="RITHMIC:NQ-202609",
@@ -9722,10 +9751,7 @@ def test_rithmic_strategy_exit_cancels_protection_before_native_exit(engine):
 
     with patch(
         "src.core.adapters.rithmic_strategy_exit.load_rithmic_recovery_snapshot",
-        side_effect=[
-            _rithmic_emergency_snapshot(net_quantity="0.5"),
-            _rithmic_emergency_snapshot(),
-        ],
+        side_effect=load_snapshot,
     ):
         result = engine._venue_runtime.execute_strategy_exit(signal, decision)
 
@@ -9740,10 +9766,30 @@ def test_rithmic_strategy_exit_cancels_protection_before_native_exit(engine):
         account_id="ACCOUNT",
     )
     assert operation_order == [
-        "reconcile",
+        "snapshot",
+        "reconcile-1",
+        "cancel",
+        "snapshot",
+        "reconcile-2",
+        "verify",
+        "native-exit",
+        "snapshot",
+        "reconcile-3",
+        "verify",
         "replace",
-        "reconcile",
-        "replace",
+    ]
+    adapter.get_order_by_client_id.assert_not_called()
+    assert snapshot_load_context == [
+        ("test", "ACCOUNT"),
+        ("test", "ACCOUNT"),
+        ("test", "ACCOUNT"),
+    ]
+    assert engine.account_service.replace_positions_for_products.call_args_list == [
+        call(
+            [],
+            ("RITHMIC:NQ-202609",),
+            timestamp_ms=engine.execution_engine.clock.now() * 1000,
+        )
     ]
 
 
@@ -10427,19 +10473,39 @@ def test_rithmic_portfolio_exit_schedules_flatten_after_protection_mutation(
         assert compensation_calls == []
 
 
-def test_rithmic_strategy_exit_blocks_when_remote_order_remains_working(engine):
+def test_rithmic_strategy_exit_blocks_when_remote_order_remains_working(
+    engine,
+    order_factory,
+):
     adapter = _rithmic_adapter_for_reconnect_test()
     engine.execution_engine.adapter = adapter
     engine._runtime_profile = "test"
     engine._runtime_account_id = "ACCOUNT"
     engine.order_event_thread = None
-    engine.execution_engine.list_recoverable_client_orders = MagicMock(return_value=[])
-    engine.execution_engine.order_manager.repo.list_orders_by_statuses = MagicMock(
-        return_value=[]
+    working_order = order_factory(
+        order_id="working-protection",
+        strategy_id="strategy",
+        product_id="RITHMIC:NQ-202609",
+        exchange_id="RITHMIC",
+        order_type="stop_loss",
+        status=OrderStatus.SUBMITTED.value,
+        exchange_order_id="working-1",
+        client_order_id="working-protection-tag",
+        account_profile="test",
+        account_id="ACCOUNT",
     )
+    engine.execution_engine.list_recoverable_client_orders = MagicMock(
+        return_value=[working_order]
+    )
+    engine.execution_engine.order_manager.repo.add_order(working_order)
+    engine.execution_engine.reconcile_owned_orders = MagicMock(
+        return_value={"auto_resume_safe": True}
+    )
+    adapter.cancel_order = MagicMock(return_value=True)
     engine.execution_engine.exit_authoritative_position = MagicMock()
     engine._start_exchange_order_event_stream = MagicMock()
     engine._detect_external_order_drift = MagicMock()
+    engine.account_service.replace_positions_for_products = MagicMock()
     _install_rithmic_strategy_exit_service(engine, adapter)
     signal = Signal(
         strategy_id="strategy",
@@ -10459,10 +10525,16 @@ def test_rithmic_strategy_exit_blocks_when_remote_order_remains_working(engine):
     with (
         patch(
             "src.core.adapters.rithmic_strategy_exit.load_rithmic_recovery_snapshot",
-            return_value=_rithmic_emergency_snapshot(
-                net_quantity="1",
-                orders=[SimpleNamespace(basket_id="working-1")],
-            ),
+            side_effect=[
+                _rithmic_emergency_snapshot(
+                    net_quantity="1",
+                    orders=[_rithmic_exit_order_snapshot("working-1")],
+                ),
+                _rithmic_emergency_snapshot(
+                    net_quantity="1",
+                    orders=[_rithmic_exit_order_snapshot("working-1")],
+                ),
+            ],
         ),
         pytest.raises(
             RuntimeError,
@@ -10472,8 +10544,16 @@ def test_rithmic_strategy_exit_blocks_when_remote_order_remains_working(engine):
         engine._venue_runtime.execute_strategy_exit(signal, decision)
 
     engine.execution_engine.exit_authoritative_position.assert_not_called()
-    engine._detect_external_order_drift.assert_called_once()
+    engine._detect_external_order_drift.assert_called_once_with(
+        "rithmic_strategy_exit_requires_reconciliation:RuntimeError"
+    )
     engine._start_exchange_order_event_stream.assert_called_once_with()
+    adapter.cancel_order.assert_called_once_with(
+        "working-1",
+        "RITHMIC:NQ-202609",
+        order_type="stop_loss",
+    )
+    engine.account_service.replace_positions_for_products.assert_not_called()
 
 
 @pytest.mark.parametrize("operation_id", [None, "operation-1"])
