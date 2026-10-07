@@ -9206,7 +9206,11 @@ def _install_rithmic_portfolio_exit_factory(
     return emergency_flatten
 
 
-def _rithmic_emergency_snapshot(*, net_quantity=None, orders=None):
+def _rithmic_emergency_snapshot(
+    *,
+    net_quantity=None,
+    orders=None,
+):
     positions = []
     if net_quantity is not None:
         positions.append(
@@ -9222,6 +9226,25 @@ def _rithmic_emergency_snapshot(*, net_quantity=None, orders=None):
         account_id="ACCOUNT",
         positions=positions,
         orders=orders or [],
+    )
+
+
+def _rithmic_exit_order_snapshot(
+    basket_id: str,
+    *,
+    status: str = "OPEN",
+    notification_type: str = "OPEN",
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        basket_id=basket_id,
+        exchange_order_id=basket_id,
+        client_order_id=None,
+        status=status,
+        notification_type=notification_type,
+        quantity="1",
+        filled_quantity="0",
+        unfilled_quantity="1",
+        average_fill_price=None,
     )
 
 
@@ -9867,6 +9890,205 @@ def test_rithmic_portfolio_exit_reduces_only_owned_sleeve(
     engine._detect_external_order_drift.assert_not_called()
 
 
+def test_rithmic_portfolio_exit_plans_current_baskets_and_preserves_scope(
+    engine,
+):
+    adapter = _rithmic_adapter_for_reconnect_test()
+    adapter.cancel_order = MagicMock(return_value=True)
+    adapter.get_order_by_client_id = MagicMock()
+    engine.execution_engine.adapter = adapter
+    engine._runtime_profile = "test"
+    engine._runtime_account_id = "ACCOUNT"
+    engine.order_event_thread = None
+    _install_rithmic_portfolio_exit_factory(engine, adapter)
+    target = SimpleNamespace(
+        id="owned-stop",
+        strategy_id="portfolio_v1.sleeve_a",
+        product_id="RITHMIC:NQ-202609",
+        status=OrderStatus.SUBMITTED.value,
+        client_order_id="parent-tag-not-child-tag",
+        exchange_id="RITHMIC",
+        account_profile="test",
+        account_id="ACCOUNT",
+        exchange_order_id="current-basket",
+        type="stop_loss",
+    )
+    local_new = SimpleNamespace(
+        **{
+            **vars(target),
+            "id": "new-local",
+            "status": OrderStatus.NEW.value,
+            "client_order_id": "unsubmitted-child-tag",
+            "exchange_order_id": None,
+        }
+    )
+    terminal = SimpleNamespace(
+        **{
+            **vars(target),
+            "id": "terminal-stop",
+            "status": OrderStatus.PARTIALLY_FILLED.value,
+            "client_order_id": "terminal-tag",
+            "exchange_order_id": "terminal-basket",
+        }
+    )
+    wrong_scope = [
+        SimpleNamespace(
+            **{**vars(target), "id": "other-strategy", "strategy_id": "other"}
+        ),
+        SimpleNamespace(
+            **{**vars(target), "id": "other-product", "product_id": "RITHMIC:ES-202609"}
+        ),
+        SimpleNamespace(
+            **{
+                **vars(target),
+                "id": "other-account",
+                "account_id": "OTHER",
+                "exchange_order_id": None,
+            }
+        ),
+        SimpleNamespace(
+            **{
+                **vars(target),
+                "id": "other-profile",
+                "account_profile": "other",
+                "exchange_order_id": None,
+            }
+        ),
+        SimpleNamespace(
+            **{
+                **vars(target),
+                "id": "other-venue",
+                "exchange_id": "BINANCE",
+                "exchange_order_id": None,
+            }
+        ),
+    ]
+    rows = [target, local_new, terminal, *wrong_scope]
+    engine.execution_engine.order_manager.repo.list_orders_by_statuses = MagicMock(
+        return_value=rows
+    )
+    fail_order = MagicMock(wraps=engine.execution_engine.order_manager.fail_order)
+    engine.execution_engine.order_manager.fail_order = fail_order
+    service = engine._venue_runtime.portfolio_exit_factory(
+        lambda _strategy_id: "portfolio_v1"
+    )
+    history = [
+        _rithmic_exit_order_snapshot("current-basket"),
+        _rithmic_exit_order_snapshot("current-basket"),
+    ]
+    snapshot = _rithmic_emergency_snapshot(
+        orders=[
+            _rithmic_exit_order_snapshot("current-basket"),
+            _rithmic_exit_order_snapshot(
+                "terminal-basket",
+                status="CANCELLED",
+                notification_type="CANCEL",
+            ),
+            _rithmic_exit_order_snapshot("external-basket"),
+        ],
+    )
+    snapshot.order_history = history
+    mark_compensation = MagicMock()
+
+    count, identities = service._cancel_strategy_orders(
+        Signal(
+            strategy_id="portfolio_v1.sleeve_a",
+            product_id="RITHMIC:NQ-202609",
+            timeframe="1m",
+            timestamp=1_700_000_000_000,
+            type=SignalType.EXIT_LONG,
+            quantity=Decimal("1"),
+        ),
+        snapshot,
+        mark_compensation_required=mark_compensation,
+    )
+
+    assert count == 2
+    assert identities == {"current-basket"}
+    adapter.cancel_order.assert_called_once_with(
+        "current-basket",
+        "RITHMIC:NQ-202609",
+        order_type="stop_loss",
+    )
+    adapter.get_order_by_client_id.assert_not_called()
+    fail_order.assert_called_once_with(local_new, "strategy_exit")
+    mark_compensation.assert_called_once_with()
+
+
+@pytest.mark.parametrize("duplicate_current_basket", [False, True])
+def test_rithmic_portfolio_exit_validates_all_targets_before_mutation(
+    engine,
+    duplicate_current_basket,
+):
+    adapter = _rithmic_adapter_for_reconnect_test()
+    adapter.cancel_order = MagicMock(return_value=True)
+    adapter.get_order_by_client_id = MagicMock()
+    engine.execution_engine.adapter = adapter
+    engine._runtime_profile = "test"
+    engine._runtime_account_id = "ACCOUNT"
+    engine.order_event_thread = None
+    _install_rithmic_portfolio_exit_factory(engine, adapter)
+    valid = SimpleNamespace(
+        id="valid-stop",
+        strategy_id="portfolio_v1.sleeve_a",
+        product_id="RITHMIC:NQ-202609",
+        status=OrderStatus.SUBMITTED.value,
+        client_order_id="valid-parent-tag",
+        exchange_id="RITHMIC",
+        account_profile="test",
+        account_id="ACCOUNT",
+        exchange_order_id="valid-basket",
+        type="stop_loss",
+    )
+    new_order = SimpleNamespace(
+        **{
+            **vars(valid),
+            "id": "new-local",
+            "status": OrderStatus.NEW.value,
+            "exchange_order_id": None,
+        }
+    )
+    invalid = SimpleNamespace(
+        **{**vars(valid), "id": "invalid-stop", "exchange_order_id": "missing-basket"}
+    )
+    engine.execution_engine.order_manager.repo.list_orders_by_statuses = MagicMock(
+        return_value=[new_order, valid, invalid]
+    )
+    fail_order = MagicMock()
+    engine.execution_engine.order_manager.fail_order = fail_order
+    service = engine._venue_runtime.portfolio_exit_factory(
+        lambda _strategy_id: "portfolio_v1"
+    )
+    current_orders = [_rithmic_exit_order_snapshot("valid-basket")]
+    if duplicate_current_basket:
+        current_orders.extend(
+            [
+                _rithmic_exit_order_snapshot("missing-basket"),
+                _rithmic_exit_order_snapshot("missing-basket"),
+            ]
+        )
+    mark_compensation = MagicMock()
+
+    with pytest.raises(RuntimeError, match="cancel_identity_ambiguous"):
+        service._cancel_strategy_orders(
+            Signal(
+                strategy_id="portfolio_v1.sleeve_a",
+                product_id="RITHMIC:NQ-202609",
+                timeframe="1m",
+                timestamp=1_700_000_000_000,
+                type=SignalType.EXIT_LONG,
+                quantity=Decimal("1"),
+            ),
+            _rithmic_emergency_snapshot(orders=current_orders),
+            mark_compensation_required=mark_compensation,
+        )
+
+    fail_order.assert_not_called()
+    adapter.cancel_order.assert_not_called()
+    adapter.get_order_by_client_id.assert_not_called()
+    mark_compensation.assert_not_called()
+
+
 def test_rithmic_portfolio_exit_does_not_reduce_another_sleeve_after_own_fill(
     engine,
     mock_strategy_class,
@@ -10128,7 +10350,22 @@ def test_rithmic_portfolio_exit_schedules_flatten_after_protection_mutation(
 
     with patch(
         "src.core.adapters.rithmic_portfolio_exit.load_rithmic_recovery_snapshot",
-        return_value=_rithmic_emergency_snapshot(net_quantity="1"),
+        side_effect=[
+            _rithmic_emergency_snapshot(
+                net_quantity="1",
+                orders=[_rithmic_exit_order_snapshot("stop-basket")],
+            ),
+            _rithmic_emergency_snapshot(
+                net_quantity="1",
+                orders=[
+                    _rithmic_exit_order_snapshot(
+                        "stop-basket",
+                        status="CANCELLED",
+                        notification_type="CANCEL",
+                    )
+                ],
+            ),
+        ],
     ):
         worker = threading.Thread(target=run_exit, daemon=True)
         worker.start()
@@ -10146,6 +10383,7 @@ def test_rithmic_portfolio_exit_schedules_flatten_after_protection_mutation(
         "RITHMIC:NQ-202609",
         order_type="stop_loss",
     )
+    adapter.get_order_by_client_id.assert_not_called()
     engine.execution_engine.submit_verified_net_reduction.assert_not_called()
     engine._venue_runtime.emergency_flatten.schedule_portfolio_exit_compensation.assert_called_once_with(
         "rithmic_portfolio_exit_requires_reconciliation:RuntimeError"

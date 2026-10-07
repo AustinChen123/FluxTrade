@@ -3,7 +3,7 @@ from __future__ import annotations
 from decimal import Decimal
 import logging
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Callable
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -11,6 +11,7 @@ import pytest
 from src.core.adapters.rithmic_order_event_lifecycle import (
     RithmicOrderEventLifecycleGate,
 )
+from src.core.adapters.rithmic_portfolio_exit import RithmicPortfolioExitService
 from src.core.adapters.rithmic_adapter import RithmicExchangeAdapter
 from src.core.adapters.rithmic_strategy_exit import RithmicStrategyExitService
 from src.core.execution import ExecutionEngine
@@ -162,6 +163,7 @@ def _actual_sql_exit_runtime(
     *,
     strategy_id: str = "strategy",
     order: Any = None,
+    ledger_positions: Callable[[], list[Position]] | None = None,
 ) -> tuple[RithmicStrategyExitService, LiveOrderRepository, Any, Any, Any]:
     SystemEvent.__table__.create(factory.kw["bind"], checkfirst=True)
     with factory() as session:
@@ -203,12 +205,16 @@ def _actual_sql_exit_runtime(
     adapter.start_order_event_stream = MagicMock()
     adapter.cancel_order = MagicMock(return_value=True)
     account_service = SimpleNamespace(
-        get_all_positions=lambda: [
-            position
-            for side in ("BUY", "SELL")
-            if (position := repository.get_position(strategy_id, PRODUCT, side))
-            is not None
-        ]
+        get_all_positions=(
+            ledger_positions
+            if ledger_positions is not None
+            else lambda: [
+                position
+                for side in ("BUY", "SELL")
+                if (position := repository.get_position(strategy_id, PRODUCT, side))
+                is not None
+            ]
+        )
     )
     engine = ExecutionEngine(
         db_session=None,
@@ -235,6 +241,88 @@ def _actual_sql_exit_runtime(
         logger=logging.getLogger("test.rithmic_strategy_exit.sql"),
     )
     return service, repository, adapter, engine, publisher
+
+
+class _SyntheticPositionCache:
+    """Store the Decimal projection supplied by OrderManager's Lua boundary."""
+
+    def __init__(self) -> None:
+        self.positions: dict[tuple[str, str], tuple[Decimal, Decimal]] = {}
+
+    def set_position(
+        self,
+        strategy_id: str,
+        product_id: str,
+        quantity: Decimal,
+        entry_price: Decimal,
+    ) -> None:
+        self.positions[(strategy_id, product_id)] = (quantity, entry_price)
+
+    def hgetall(self, key: str) -> dict[str, str]:
+        prefix = "state:position:"
+        strategy_id, product_id = key[len(prefix) :].split(":", 1)
+        value = self.positions.get((strategy_id, product_id))
+        if value is None:
+            return {}
+        quantity, entry_price = value
+        return {"quantity": str(quantity), "entry_price": str(entry_price)}
+
+    def store_script_projection(self, *, args: list[str]) -> str:
+        strategy_id, product_id = args[:2]
+        self.set_position(
+            strategy_id,
+            product_id,
+            Decimal(args[8]),
+            Decimal(args[9]),
+        )
+        return "OK"
+
+    def get_position_for_exit(
+        self,
+        strategy_id: str,
+        product_id: str,
+    ) -> Position | None:
+        value = self.positions.get((strategy_id, product_id))
+        if value is None:
+            return None
+        quantity, entry_price = value
+        if quantity == 0:
+            return None
+        return Position(
+            strategy_id=strategy_id,
+            product_id=product_id,
+            side=PositionSide.LONG if quantity > 0 else PositionSide.SHORT,
+            quantity=abs(quantity),
+            entry_price=entry_price,
+            unrealized_pnl=Decimal("0"),
+        )
+
+    def get_all_positions(self) -> list[Position]:
+        positions = []
+        for strategy_id, product_id in self.positions:
+            position = self.get_position_for_exit(strategy_id, product_id)
+            if position is not None:
+                positions.append(position)
+        return positions
+
+
+def _actual_sql_portfolio_exit_service(adapter, engine):
+    return RithmicPortfolioExitService(
+        adapter=adapter,
+        execution_engine=engine,
+        account_service=SimpleNamespace(
+            get_position_for_exit=lambda *_args: _position()
+        ),
+        profile="test",
+        account_id="ACCOUNT",
+        operation_gate=RithmicOrderEventLifecycleGate(),
+        stop_order_event_stream=MagicMock(return_value=True),
+        assert_leadership=MagicMock(),
+        restart_order_stream=MagicMock(),
+        lockdown=MagicMock(),
+        schedule_emergency_flatten=MagicMock(),
+        portfolio_id_for_sleeve=lambda _strategy_id: "portfolio",
+    )
 
 
 def test_valid_request_enters_operation_gate_before_money_path() -> None:
@@ -1118,6 +1206,919 @@ def test_owned_partial_fill_persists_before_cancel_and_flat_drift_stays_blocked(
         engine.exit_authoritative_position.assert_not_called()
         assert loader.call_count == 1
         publisher.replace_positions_for_products.assert_not_called()
+
+
+def test_portfolio_exit_uses_sql_order_after_owned_partial_fill_reconciliation(
+    sqlite_order_session_factory,
+    order_factory,
+    mock_clock,
+) -> None:
+    order = order_factory(
+        order_id="owned-parent",
+        strategy_id="strategy",
+        product_id=PRODUCT,
+        exchange_id="RITHMIC",
+        order_type="market",
+        side="buy",
+        quantity=Decimal("2"),
+        status=OrderStatus.SUBMITTED.value,
+        timestamp=1_700_000_000_000,
+        client_order_id="flux-parent",
+        exchange_order_id="basket-parent",
+        account_profile="test",
+        account_id="ACCOUNT",
+    )
+    _, repository, adapter, engine, _ = _actual_sql_exit_runtime(
+        sqlite_order_session_factory,
+        mock_clock,
+        order=order,
+    )
+    remote = SimpleNamespace(
+        basket_id="basket-parent",
+        exchange_order_id="exchange-parent",
+        original_basket_id=None,
+        client_order_id=None,
+        transaction_type="BUY",
+        exchange="CME",
+        symbol="NQU6",
+        quantity="2",
+        filled_quantity="1",
+        unfilled_quantity="1",
+        average_fill_price="20000.25",
+        status="PARTIALLY_FILLED",
+        notification_type="FILL",
+        price=None,
+        price_type=None,
+        trigger_price=None,
+        bracket_type=None,
+        timestamp_ms=1_700_000_001_000,
+        completion_reason=None,
+    )
+    fill = SimpleNamespace(
+        basket_id="basket-parent",
+        exchange_order_id="exchange-parent",
+        fill_id="fill-1",
+        exchange="CME",
+        symbol="NQU6",
+        transaction_type="BUY",
+        fill_quantity="1",
+        fill_price="20000.25",
+        timestamp_ms=1_700_000_001_000,
+    )
+    snapshot = SimpleNamespace(
+        account_id="ACCOUNT",
+        account_currency="USD",
+        orders=[remote],
+        order_history=[remote],
+        fills=[fill],
+        positions=[
+            SimpleNamespace(
+                exchange="CME",
+                symbol="NQU6",
+                net_quantity="1",
+                average_open_fill_price="20000.25",
+                open_pnl="0",
+            )
+        ],
+        account_summary=SimpleNamespace(account_balance="100000"),
+    )
+
+    reconciliation = engine.reconcile_owned_orders(
+        snapshot_loader=lambda *_args, **_kwargs: snapshot
+    )
+
+    assert reconciliation["auto_resume_safe"] is True
+    persisted = repository.get_order("owned-parent")
+    assert persisted is not None
+    assert persisted.status == OrderStatus.PARTIALLY_FILLED.value
+    assert persisted.exchange_order_id == "basket-parent"
+    assert persisted.filled_quantity == Decimal("1")
+    with sqlite_order_session_factory() as session:
+        trades = session.query(StoredTrade).filter_by(order_id="owned-parent").all()
+    assert len(trades) == 1
+    assert trades[0].quantity == Decimal("1")
+    assert trades[0].price == Decimal("20000.25")
+
+    adapter.get_order_by_client_id = MagicMock()
+    portfolio_exit = _actual_sql_portfolio_exit_service(adapter, engine)
+    cancelled_count, cancelled_baskets = portfolio_exit._cancel_strategy_orders(
+        _signal(),
+        snapshot,
+        mark_compensation_required=MagicMock(),
+    )
+
+    assert cancelled_count == 1
+    assert cancelled_baskets == {"basket-parent"}
+    adapter.cancel_order.assert_called_once_with(
+        "basket-parent",
+        PRODUCT,
+        order_type="market",
+    )
+    adapter.get_order_by_client_id.assert_not_called()
+
+
+def test_portfolio_exit_actual_reconciler_blocks_unsafe_sql_order_snapshot(
+    sqlite_order_session_factory,
+    order_factory,
+    mock_clock,
+) -> None:
+    order = order_factory(
+        order_id="owned-parent",
+        strategy_id="strategy",
+        product_id=PRODUCT,
+        exchange_id="RITHMIC",
+        order_type="market",
+        side="buy",
+        quantity=Decimal("2"),
+        status=OrderStatus.SUBMITTED.value,
+        timestamp=1_700_000_000_000,
+        client_order_id="flux-parent",
+        exchange_order_id="basket-parent",
+        account_profile="test",
+        account_id="ACCOUNT",
+    )
+    _, repository, adapter, engine, _ = _actual_sql_exit_runtime(
+        sqlite_order_session_factory,
+        mock_clock,
+        order=order,
+    )
+    remote = SimpleNamespace(
+        basket_id="basket-parent",
+        exchange_order_id="exchange-parent",
+        original_basket_id=None,
+        client_order_id="flux-parent",
+        transaction_type="BUY",
+        exchange="ICE",
+        symbol="NQU6",
+        quantity="2",
+        filled_quantity="0",
+        unfilled_quantity="2",
+        average_fill_price=None,
+        status="OPEN",
+        notification_type="OPEN",
+        price=None,
+        price_type=None,
+        trigger_price=None,
+        bracket_type=None,
+        timestamp_ms=1_700_000_001_000,
+        completion_reason=None,
+    )
+    snapshot = SimpleNamespace(
+        account_id="ACCOUNT",
+        account_currency="USD",
+        orders=[remote],
+        order_history=[remote],
+        fills=[],
+        positions=[
+            SimpleNamespace(
+                exchange="CME",
+                symbol="NQU6",
+                net_quantity="1",
+                average_open_fill_price="20000.25",
+                open_pnl="0",
+            )
+        ],
+        account_summary=SimpleNamespace(account_balance="100000"),
+    )
+    portfolio_exit = _actual_sql_portfolio_exit_service(adapter, engine)
+    portfolio_exit._load_snapshot = MagicMock(return_value=snapshot)
+    adapter.cancel_order = MagicMock(return_value=True)
+    reconciliation_results = []
+    reconcile_owned_orders = engine.reconcile_owned_orders
+
+    def record_reconciliation(**kwargs):
+        result = reconcile_owned_orders(**kwargs)
+        reconciliation_results.append(result)
+        return result
+
+    engine.reconcile_owned_orders = record_reconciliation
+
+    with pytest.raises(
+        RuntimeError,
+        match="rithmic_portfolio_exit_preflight_reconciliation_blocked",
+    ):
+        portfolio_exit._verified_preflight_position(
+            _signal(),
+            expected_side="LONG",
+            exit_quantity=Decimal("1"),
+        )
+
+    persisted = repository.get_order("owned-parent")
+    assert persisted is not None
+    assert persisted.status == OrderStatus.SUBMITTED.value
+    assert persisted.exchange_order_id == "basket-parent"
+    assert len(reconciliation_results) == 6
+    assert all(result["auto_resume_safe"] is False for result in reconciliation_results)
+    adapter.cancel_order.assert_not_called()
+
+
+@pytest.mark.parametrize("remote_child_tag", [None, "entry-parent-tag"])
+def test_portfolio_exit_cancels_reconciled_native_child_without_child_tag(
+    sqlite_order_session_factory,
+    order_factory,
+    mock_clock,
+    remote_child_tag,
+) -> None:
+    order = order_factory(
+        order_id="owned-child",
+        strategy_id="strategy",
+        product_id=PRODUCT,
+        exchange_id="RITHMIC",
+        order_type="stop_loss",
+        side="sell",
+        quantity=Decimal("1"),
+        status=OrderStatus.SUBMITTED.value,
+        timestamp=1_700_000_000_000,
+        client_order_id="local-child-tag",
+        exchange_order_id=None,
+        account_profile="test",
+        account_id="ACCOUNT",
+    )
+    order.intent_payload = {
+        "placement_mode": "attach-at-entry",
+        "native_leg_type": "stop_loss",
+        "native_parent_basket_id": "basket-parent",
+        "native_parent_client_order_id": "entry-parent-tag",
+    }
+    _, repository, adapter, engine, _ = _actual_sql_exit_runtime(
+        sqlite_order_session_factory,
+        mock_clock,
+        order=order,
+    )
+    remote = SimpleNamespace(
+        basket_id="basket-child",
+        exchange_order_id="exchange-child",
+        original_basket_id="basket-parent",
+        client_order_id=remote_child_tag,
+        transaction_type="SELL",
+        exchange="CME",
+        symbol="NQU6",
+        quantity="1",
+        filled_quantity="0",
+        unfilled_quantity="1",
+        average_fill_price=None,
+        status="OPEN",
+        notification_type="OPEN",
+        price=None,
+        price_type="stop_market",
+        trigger_price="19998.25",
+        bracket_type=None,
+        timestamp_ms=1_700_000_001_000,
+        completion_reason=None,
+    )
+    snapshot = SimpleNamespace(
+        account_id="ACCOUNT",
+        account_currency="USD",
+        orders=[remote],
+        order_history=[remote],
+        fills=[],
+        positions=[],
+        account_summary=SimpleNamespace(account_balance="100000"),
+    )
+    reconciliation = engine.reconcile_owned_orders(
+        snapshot_loader=lambda *_args, **_kwargs: snapshot
+    )
+    assert reconciliation["auto_resume_safe"] is True
+    persisted = repository.get_order("owned-child")
+    assert persisted is not None
+    assert persisted.exchange_order_id == "basket-child"
+
+    adapter.get_order_by_client_id = MagicMock()
+    portfolio_exit = _actual_sql_portfolio_exit_service(adapter, engine)
+    cancelled_count, cancelled_baskets = portfolio_exit._cancel_strategy_orders(
+        _signal(),
+        snapshot,
+        mark_compensation_required=MagicMock(),
+    )
+
+    assert cancelled_count == 1
+    assert cancelled_baskets == {"basket-child"}
+    adapter.cancel_order.assert_called_once_with(
+        "basket-child",
+        PRODUCT,
+        order_type="stop_loss",
+    )
+    adapter.get_order_by_client_id.assert_not_called()
+
+
+def test_portfolio_execute_reconciles_protective_sell_and_repairs_child_basket(
+    sqlite_order_session_factory,
+    order_factory,
+    mock_clock,
+) -> None:
+    position_cache = _SyntheticPositionCache()
+    position_cache.set_position("strategy", PRODUCT, Decimal("3"), Decimal("20000.25"))
+    position_cache.set_position("other-sleeve", PRODUCT, Decimal("2"), Decimal("20001"))
+    protective = order_factory(
+        order_id="protective-sell",
+        strategy_id="strategy",
+        product_id=PRODUCT,
+        exchange_id="RITHMIC",
+        order_type="stop_loss",
+        side="sell",
+        quantity=Decimal("2"),
+        status=OrderStatus.SUBMITTED.value,
+        timestamp=1_700_000_000_000,
+        client_order_id="protective-parent",
+        exchange_order_id="protective-basket",
+        account_profile="test",
+        account_id="ACCOUNT",
+    )
+    child = order_factory(
+        order_id="native-child",
+        strategy_id="strategy",
+        product_id=PRODUCT,
+        exchange_id="RITHMIC",
+        order_type="stop_loss",
+        side="sell",
+        quantity=Decimal("1"),
+        status=OrderStatus.SUBMITTED.value,
+        timestamp=1_700_000_000_001,
+        client_order_id="local-child-tag",
+        exchange_order_id=None,
+        account_profile="test",
+        account_id="ACCOUNT",
+    )
+    child.intent_payload = {
+        "placement_mode": "attach-at-entry",
+        "native_leg_type": "stop_loss",
+        "native_parent_basket_id": "parent-basket",
+        "native_parent_client_order_id": "parent-tag",
+    }
+    _, repository, adapter, engine, _ = _actual_sql_exit_runtime(
+        sqlite_order_session_factory,
+        mock_clock,
+        order=protective,
+        ledger_positions=position_cache.get_all_positions,
+    )
+    repository.add_order(child)
+    engine.order_manager.is_backtest = False
+    engine.order_manager.redis_client = position_cache
+    engine.order_manager.update_position_script = position_cache.store_script_projection
+
+    def remote_order(
+        basket_id: str,
+        *,
+        status: str,
+        notification: str,
+        quantity: str,
+        filled: str,
+        unfilled: str,
+        transaction_type: str = "SELL",
+        original_basket_id: str | None = None,
+        client_order_id: str | None = None,
+        timestamp_ms: int = 1_700_000_001_000,
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            basket_id=basket_id,
+            exchange_order_id=f"exchange-{basket_id}",
+            original_basket_id=original_basket_id,
+            client_order_id=client_order_id,
+            transaction_type=transaction_type,
+            exchange="CME",
+            symbol="NQU6",
+            quantity=quantity,
+            filled_quantity=filled,
+            unfilled_quantity=unfilled,
+            average_fill_price="20000.25" if filled != "0" else None,
+            status=status,
+            notification_type=notification,
+            price=None,
+            price_type="stop_market",
+            trigger_price="19998.25",
+            bracket_type=None,
+            timestamp_ms=timestamp_ms,
+            completion_reason=None,
+        )
+
+    protective_filled = remote_order(
+        "protective-basket",
+        status="FILLED",
+        notification="FILL",
+        quantity="2",
+        filled="2",
+        unfilled="0",
+        timestamp_ms=1_700_000_001_000,
+    )
+    child_open = remote_order(
+        "repaired-child-basket",
+        status="OPEN",
+        notification="OPEN",
+        quantity="1",
+        filled="0",
+        unfilled="1",
+        original_basket_id="parent-basket",
+        timestamp_ms=1_700_000_001_000,
+    )
+    child_cancelled = remote_order(
+        "repaired-child-basket",
+        status="CANCELLED",
+        notification="CANCEL",
+        quantity="1",
+        filled="0",
+        unfilled="1",
+        original_basket_id="parent-basket",
+        timestamp_ms=1_700_000_002_000,
+    )
+    fill = SimpleNamespace(
+        basket_id="protective-basket",
+        exchange_order_id="exchange-protective-basket",
+        fill_id="protective-fill-1",
+        exchange="CME",
+        symbol="NQU6",
+        transaction_type="SELL",
+        fill_quantity="2",
+        fill_price="20000.25",
+        timestamp_ms=1_700_000_001_000,
+    )
+
+    def snapshot(orders, order_history, net_quantity: str):
+        return SimpleNamespace(
+            account_id="ACCOUNT",
+            account_currency="USD",
+            orders=orders,
+            order_history=order_history,
+            fills=[fill],
+            positions=[
+                SimpleNamespace(
+                    exchange="CME",
+                    symbol="NQU6",
+                    net_quantity=net_quantity,
+                    average_open_fill_price="20000.25",
+                    open_pnl="0",
+                )
+            ],
+            account_summary=SimpleNamespace(account_balance="100000"),
+        )
+
+    unsafe_snapshot = snapshot([], [], "3")
+    unsafe_snapshot.account_id = "OTHER-ACCOUNT"
+    snapshots = [
+        unsafe_snapshot,
+        snapshot([child_open], [protective_filled, child_open], "3"),
+        snapshot(
+            [],
+            [protective_filled, child_open, child_cancelled],
+            "3",
+        ),
+        snapshot(
+            [],
+            [protective_filled, child_open, child_cancelled],
+            "2",
+        ),
+    ]
+    service = _actual_sql_portfolio_exit_service(adapter, engine)
+    service.account_service.get_position_for_exit = position_cache.get_position_for_exit
+    exit_order_ids: list[str] = []
+
+    def submit_reduction(signal, decision, *, candle, preflight_remote_quantity):
+        exit_order = order_factory(
+            order_id="portfolio-exit",
+            strategy_id=signal.strategy_id,
+            product_id=signal.product_id,
+            exchange_id="RITHMIC",
+            order_type="market",
+            side="sell",
+            quantity=decision.quantity,
+            status=OrderStatus.SUBMITTED.value,
+            timestamp=1_700_000_003_000,
+            client_order_id="portfolio-exit-tag",
+            exchange_order_id="portfolio-exit-basket",
+            account_profile="test",
+            account_id="ACCOUNT",
+        )
+        repository.add_order(exit_order)
+        engine.order_manager.record_fill_delta(
+            exit_order,
+            Decimal("20000.25"),
+            decision.quantity,
+            decision.quantity,
+            Decimal("20000.25"),
+            terminal_status=OrderStatus.FILLED,
+        )
+        exit_order_ids.append(str(exit_order.id))
+        return str(exit_order.id)
+
+    engine.submit_verified_net_reduction = MagicMock(side_effect=submit_reduction)
+    engine.record_verified_net_reduction = MagicMock()
+    reconcile_results = []
+    positions_after_reconciliation = []
+    order_state_after_reconciliation = []
+    reconcile = engine.reconcile_owned_orders
+
+    def record_reconciliation(**kwargs):
+        result = reconcile(**kwargs)
+        reconcile_results.append(result)
+        positions_after_reconciliation.append(
+            position_cache.get_position_for_exit("strategy", PRODUCT)
+        )
+        order_state_after_reconciliation.append(
+            (
+                repository.get_order("protective-sell"),
+                repository.get_order("native-child"),
+            )
+        )
+        return result
+
+    engine.reconcile_owned_orders = record_reconciliation
+    active_row_queries = []
+    list_orders = repository.list_orders_by_statuses
+
+    def record_active_rows(statuses):
+        rows = list_orders(statuses)
+        active_row_queries.append(
+            (
+                len(reconcile_results),
+                [(row.id, row.status, row.exchange_order_id) for row in rows],
+            )
+        )
+        return rows
+
+    snapshot_index = 0
+
+    def load_snapshot(*_args, **_kwargs):
+        nonlocal snapshot_index
+        snapshot = snapshots[min(snapshot_index, len(snapshots) - 1)]
+        snapshot_index += 1
+        return snapshot
+
+    with (
+        patch(
+            "src.core.adapters.rithmic_portfolio_exit.load_rithmic_recovery_snapshot",
+            side_effect=load_snapshot,
+        ) as loader,
+        patch.object(
+            repository,
+            "list_orders_by_statuses",
+            side_effect=record_active_rows,
+        ),
+    ):
+        result = service.execute(_signal(), _decision(), candle=None)
+
+    persisted_protective = repository.get_order("protective-sell")
+    persisted_child = repository.get_order("native-child")
+    assert persisted_protective is not None
+    assert persisted_protective.status == OrderStatus.FILLED.value
+    assert persisted_protective.filled_quantity == Decimal("2")
+    assert persisted_child is not None
+    assert persisted_child.status == OrderStatus.CANCELLED.value
+    assert persisted_child.exchange_order_id == "repaired-child-basket"
+    with sqlite_order_session_factory() as session:
+        trades = session.query(StoredTrade).filter_by(order_id="protective-sell").all()
+    assert len(trades) == 1
+    assert trades[0].quantity == Decimal("2")
+    assert trades[0].price == Decimal("20000.25")
+    assert [
+        None if position is None else (position.side, position.quantity)
+        for position in positions_after_reconciliation
+    ] == [
+        (PositionSide.LONG, Decimal("3")),
+        (PositionSide.LONG, Decimal("1")),
+        (PositionSide.LONG, Decimal("1")),
+        None,
+    ]
+    assert [result["auto_resume_safe"] for result in reconcile_results] == [
+        False,
+        True,
+        True,
+        True,
+    ]
+    unsafe_protective, unsafe_child = order_state_after_reconciliation[0]
+    assert unsafe_protective is not None
+    assert unsafe_protective.status == OrderStatus.SUBMITTED.value
+    assert unsafe_protective.filled_quantity == Decimal("0")
+    assert unsafe_child is not None
+    assert unsafe_child.status == OrderStatus.SUBMITTED.value
+    assert unsafe_child.exchange_order_id is None
+    repaired_protective, repaired_child = order_state_after_reconciliation[1]
+    assert repaired_protective is not None
+    assert repaired_protective.status == OrderStatus.FILLED.value
+    assert repaired_child is not None
+    assert repaired_child.exchange_order_id == "repaired-child-basket"
+    other_position = position_cache.get_position_for_exit("other-sleeve", PRODUCT)
+    assert other_position is not None
+    assert other_position.quantity == Decimal("2")
+    assert len(active_row_queries) == 1
+    assert active_row_queries[0][0] == 2
+    assert {row[0] for row in active_row_queries[0][1]} == {"native-child"}
+    assert active_row_queries[0][1][0][2] == "repaired-child-basket"
+    assert result["status"] == "verified_portfolio_reduction"
+    assert loader.call_count == 4
+    assert adapter.cancel_order.call_args_list == [
+        call("repaired-child-basket", PRODUCT, order_type="stop_loss"),
+    ]
+    engine.submit_verified_net_reduction.assert_called_once_with(
+        _signal(),
+        _decision(),
+        candle=None,
+        preflight_remote_quantity=Decimal("3"),
+    )
+    assert exit_order_ids == ["portfolio-exit"]
+    with sqlite_order_session_factory() as session:
+        exit_trades = (
+            session.query(StoredTrade).filter_by(order_id="portfolio-exit").all()
+        )
+    assert len(exit_trades) == 1
+    assert exit_trades[0].quantity == Decimal("1")
+
+
+def test_portfolio_execute_blocks_reduction_while_cancelled_basket_works(
+    sqlite_order_session_factory,
+    order_factory,
+    mock_clock,
+) -> None:
+    order = order_factory(
+        order_id="owned-stop",
+        strategy_id="strategy",
+        product_id=PRODUCT,
+        exchange_id="RITHMIC",
+        order_type="stop_loss",
+        side="sell",
+        quantity=Decimal("1"),
+        status=OrderStatus.SUBMITTED.value,
+        timestamp=1_700_000_000_000,
+        client_order_id="owned-parent-tag",
+        exchange_order_id="owned-basket",
+        account_profile="test",
+        account_id="ACCOUNT",
+    )
+    _, repository, adapter, engine, _ = _actual_sql_exit_runtime(
+        sqlite_order_session_factory,
+        mock_clock,
+        order=order,
+        ledger_positions=lambda: [
+            Position(
+                strategy_id="strategy",
+                product_id=PRODUCT,
+                side=PositionSide.LONG,
+                quantity=Decimal("3"),
+                entry_price=Decimal("20000.25"),
+                unrealized_pnl=Decimal("0"),
+            )
+        ],
+    )
+    remote = SimpleNamespace(
+        basket_id="owned-basket",
+        exchange_order_id="exchange-owned-basket",
+        original_basket_id=None,
+        client_order_id="owned-parent-tag",
+        transaction_type="SELL",
+        exchange="CME",
+        symbol="NQU6",
+        quantity="1",
+        filled_quantity="0",
+        unfilled_quantity="1",
+        average_fill_price=None,
+        status="OPEN",
+        notification_type="OPEN",
+        price=None,
+        price_type="stop_market",
+        trigger_price="19998.25",
+        bracket_type=None,
+        timestamp_ms=1_700_000_001_000,
+        completion_reason=None,
+    )
+    snapshot = SimpleNamespace(
+        account_id="ACCOUNT",
+        account_currency="USD",
+        orders=[remote],
+        order_history=[remote],
+        fills=[],
+        positions=[
+            SimpleNamespace(
+                exchange="CME",
+                symbol="NQU6",
+                net_quantity="3",
+                average_open_fill_price="20000.25",
+                open_pnl="0",
+            )
+        ],
+        account_summary=SimpleNamespace(account_balance="100000"),
+    )
+    service = _actual_sql_portfolio_exit_service(adapter, engine)
+    service.account_service.get_position_for_exit = MagicMock(return_value=_position())
+    engine.submit_verified_net_reduction = MagicMock(
+        side_effect=AssertionError("working target must block reduction")
+    )
+    reconciliation_results = []
+    reconcile = engine.reconcile_owned_orders
+
+    def record_reconciliation(**kwargs):
+        result = reconcile(**kwargs)
+        reconciliation_results.append(result)
+        return result
+
+    engine.reconcile_owned_orders = record_reconciliation
+    with (
+        patch(
+            "src.core.adapters.rithmic_portfolio_exit.load_rithmic_recovery_snapshot",
+            return_value=snapshot,
+        ) as loader,
+        pytest.raises(
+            RuntimeError,
+            match="rithmic_portfolio_exit_preflight_reconciliation_blocked",
+        ),
+    ):
+        service.execute(_signal(), _decision(), candle=None)
+
+    persisted = repository.get_order("owned-stop")
+    assert persisted is not None
+    assert persisted.status == OrderStatus.SUBMITTED.value
+    assert persisted.exchange_order_id == "owned-basket"
+    assert len(reconciliation_results) == 7
+    assert all(
+        result["auto_resume_safe"] is True for result in reconciliation_results
+    ), reconciliation_results
+    assert loader.call_count == 7
+    adapter.cancel_order.assert_called_once_with(
+        "owned-basket", PRODUCT, order_type="stop_loss"
+    )
+    engine.submit_verified_net_reduction.assert_not_called()
+
+
+def test_portfolio_execute_ignores_other_sleeve_basket_after_target_terminal(
+    sqlite_order_session_factory,
+    order_factory,
+    mock_clock,
+) -> None:
+    target = order_factory(
+        order_id="owned-stop",
+        strategy_id="strategy",
+        product_id=PRODUCT,
+        exchange_id="RITHMIC",
+        order_type="stop_loss",
+        side="sell",
+        quantity=Decimal("1"),
+        status=OrderStatus.SUBMITTED.value,
+        timestamp=1_700_000_000_000,
+        client_order_id="owned-child-tag",
+        exchange_order_id="owned-basket",
+        account_profile="test",
+        account_id="ACCOUNT",
+    )
+    _, repository, adapter, engine, _ = _actual_sql_exit_runtime(
+        sqlite_order_session_factory,
+        mock_clock,
+        order=target,
+    )
+    with sqlite_order_session_factory() as session:
+        if session.get(StoredStrategy, "other-sleeve") is None:
+            session.add(StoredStrategy(id="other-sleeve", name="Other Sleeve"))
+            session.commit()
+    other = order_factory(
+        order_id="other-stop",
+        strategy_id="other-sleeve",
+        product_id=PRODUCT,
+        exchange_id="RITHMIC",
+        order_type="stop_loss",
+        side="sell",
+        quantity=Decimal("1"),
+        status=OrderStatus.SUBMITTED.value,
+        timestamp=1_700_000_000_001,
+        client_order_id="other-child-tag",
+        exchange_order_id="other-basket",
+        account_profile="test",
+        account_id="ACCOUNT",
+    )
+    repository.add_order(other)
+
+    def remote_order(
+        basket_id: str,
+        status: str,
+        notification: str,
+        *,
+        client_order_id: str,
+        timestamp_ms: int,
+    ):
+        return SimpleNamespace(
+            basket_id=basket_id,
+            exchange_order_id=f"exchange-{basket_id}",
+            original_basket_id="shared-parent-basket",
+            client_order_id=client_order_id,
+            transaction_type="SELL",
+            exchange="CME",
+            symbol="NQU6",
+            quantity="1",
+            filled_quantity="0",
+            unfilled_quantity="1",
+            average_fill_price=None,
+            status=status,
+            notification_type=notification,
+            price=None,
+            price_type="stop_market",
+            trigger_price="19998.25",
+            bracket_type=None,
+            timestamp_ms=timestamp_ms,
+            completion_reason=None,
+        )
+
+    target_open = remote_order(
+        "owned-basket",
+        "OPEN",
+        "OPEN",
+        client_order_id="owned-child-tag",
+        timestamp_ms=1_700_000_001_000,
+    )
+    other_open = remote_order(
+        "other-basket",
+        "OPEN",
+        "OPEN",
+        client_order_id="owned-child-tag",
+        timestamp_ms=1_700_000_001_000,
+    )
+    assert other_open.client_order_id == target_open.client_order_id
+    assert other_open.basket_id != target_open.basket_id
+    target_terminal = remote_order(
+        "owned-basket",
+        "CANCELLED",
+        "CANCEL",
+        client_order_id="owned-child-tag",
+        timestamp_ms=1_700_000_002_000,
+    )
+    snapshots = [
+        SimpleNamespace(
+            account_id="ACCOUNT",
+            account_currency="USD",
+            orders=[target_open, other_open],
+            order_history=[target_open, other_open],
+            fills=[],
+            positions=[
+                SimpleNamespace(
+                    exchange="CME",
+                    symbol="NQU6",
+                    net_quantity="3",
+                    average_open_fill_price="20000.25",
+                    open_pnl="0",
+                )
+            ],
+            account_summary=SimpleNamespace(account_balance="100000"),
+        ),
+        SimpleNamespace(
+            account_id="ACCOUNT",
+            account_currency="USD",
+            orders=[other_open],
+            order_history=[target_open, target_terminal, other_open],
+            fills=[],
+            positions=[
+                SimpleNamespace(
+                    exchange="CME",
+                    symbol="NQU6",
+                    net_quantity="3",
+                    average_open_fill_price="20000.25",
+                    open_pnl="0",
+                )
+            ],
+            account_summary=SimpleNamespace(account_balance="100000"),
+        ),
+        SimpleNamespace(
+            account_id="ACCOUNT",
+            account_currency="USD",
+            orders=[other_open],
+            order_history=[target_open, target_terminal, other_open],
+            fills=[],
+            positions=[
+                SimpleNamespace(
+                    exchange="CME",
+                    symbol="NQU6",
+                    net_quantity="2",
+                    average_open_fill_price="20000.25",
+                    open_pnl="0",
+                )
+            ],
+            account_summary=SimpleNamespace(account_balance="100000"),
+        ),
+    ]
+    service = _actual_sql_portfolio_exit_service(adapter, engine)
+    local_position = _position()
+    service.account_service.get_position_for_exit = MagicMock(
+        side_effect=[local_position, local_position, None]
+    )
+    engine.submit_verified_net_reduction = MagicMock(return_value="exit-order")
+    engine.record_verified_net_reduction = MagicMock()
+    # Isolate the post-cancel basket identity gate: owned reconciliation can
+    # independently block on unrelated account-wide observations.
+    engine.reconcile_owned_orders = MagicMock(return_value={"auto_resume_safe": True})
+    with patch(
+        "src.core.adapters.rithmic_portfolio_exit.load_rithmic_recovery_snapshot",
+        side_effect=snapshots,
+    ) as loader:
+        result = service.execute(_signal(), _decision(), candle=None)
+
+    assert result["status"] == "verified_portfolio_reduction"
+    assert loader.call_count == 3
+    adapter.cancel_order.assert_called_once_with(
+        "owned-basket", PRODUCT, order_type="stop_loss"
+    )
+    persisted_other = repository.get_order("other-stop")
+    assert persisted_other is not None
+    assert persisted_other.status == OrderStatus.SUBMITTED.value
+    assert persisted_other.exchange_order_id == "other-basket"
+    engine.submit_verified_net_reduction.assert_called_once_with(
+        _signal(),
+        _decision(),
+        candle=None,
+        preflight_remote_quantity=Decimal("3"),
+    )
 
 
 @pytest.mark.parametrize(

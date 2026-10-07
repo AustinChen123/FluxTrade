@@ -7,6 +7,9 @@ from decimal import Decimal
 from typing import Any
 
 from src.core.adapters.rithmic_adapter import RithmicExchangeAdapter
+from src.core.adapters.rithmic_cancel_target_planner import (
+    _plan_rithmic_cancellation_targets,
+)
 from src.core.adapters.rithmic_recovery import (
     load_rithmic_recovery_snapshot,
     rithmic_order_may_be_working,
@@ -134,7 +137,7 @@ class RithmicPortfolioExitService:
                 if signal.type == SignalType.EXIT_LONG
                 else "SHORT"
             )
-            self._verified_preflight_position(
+            initial_snapshot, _, _ = self._verified_preflight_position(
                 signal,
                 expected_side=expected_side,
                 exit_quantity=exit_quantity,
@@ -142,11 +145,11 @@ class RithmicPortfolioExitService:
             self.assert_leadership()
             self.adapter.start_order_event_stream()
             cancelled_orders, cancelled_identities = self._cancel_strategy_orders(
-                signal.strategy_id,
-                signal.product_id,
+                signal,
+                initial_snapshot,
                 mark_compensation_required=mark_compensation_required,
             )
-            _, remote_quantity = self._verified_preflight_position(
+            _, _, remote_quantity = self._verified_preflight_position(
                 signal,
                 expected_side=expected_side,
                 exit_quantity=exit_quantity,
@@ -256,10 +259,8 @@ class RithmicPortfolioExitService:
         *,
         expected_side: str,
         exit_quantity: Decimal,
-        cancelled_identities: (
-            set[tuple[str | None, str | None]] | None
-        ) = None,
-    ) -> tuple[object, Decimal]:
+        cancelled_identities: set[str] | None = None,
+    ) -> tuple[object, object, Decimal]:
         identities = cancelled_identities or set()
         for _attempt in range(6):
             self.assert_leadership()
@@ -297,7 +298,7 @@ class RithmicPortfolioExitService:
                 expected_side=expected_side,
                 exit_quantity=exit_quantity,
             )
-            return position, remote_quantity
+            return snapshot, position, remote_quantity
         raise RuntimeError(
             "rithmic_portfolio_exit_preflight_reconciliation_blocked"
         )
@@ -359,109 +360,60 @@ class RithmicPortfolioExitService:
 
     def _cancel_strategy_orders(
         self,
-        strategy_id: str,
-        product_id: str,
+        signal: Signal,
+        snapshot: object,
         *,
         mark_compensation_required: Callable[[], None],
-    ) -> tuple[int, set[tuple[str | None, str | None]]]:
+    ) -> tuple[int, set[str]]:
         active_statuses = {
             OrderStatus.NEW.value,
             OrderStatus.SUBMITTED_UNCONFIRMED.value,
             OrderStatus.SUBMITTED.value,
             OrderStatus.PARTIALLY_FILLED.value,
         }
-        active_orders: list[Any] = []
-        for order_record in (
+        active_orders = (
             self.execution_engine.order_manager.repo.list_orders_by_statuses(
                 active_statuses
             )
-        ):
-            order: Any = order_record
-            if (
-                order.strategy_id == strategy_id
-                and order.product_id == product_id
-            ):
-                active_orders.append(order)
+        )
+        cancellation_targets, new_orders = _plan_rithmic_cancellation_targets(
+            active_orders,
+            snapshot,
+            strategy_id=signal.strategy_id,
+            product_id=signal.product_id,
+            profile=self.profile,
+            account_id=self.account_id,
+        )
         cancelled_orders = 0
-        identities: set[tuple[str | None, str | None]] = set()
-        for order in active_orders:
-            identities.add(
-                (
-                    str(order.exchange_order_id)
-                    if getattr(order, "exchange_order_id", None)
-                    else None,
-                    str(order.client_order_id)
-                    if order.client_order_id
-                    else None,
-                )
-            )
+        identities: set[str] = set()
+        for order in new_orders:
             self.assert_leadership()
-            if order.status == OrderStatus.NEW.value:
-                self.execution_engine.order_manager.fail_order(
-                    order,
-                    "strategy_exit",
-                )
-                cancelled_orders += 1
-                continue
-            if not order.client_order_id:
-                raise RuntimeError(
-                    "rithmic_strategy_exit_cancel_identity_missing:"
-                    f"order_id={order.id}"
-                )
-            remote = self.adapter.get_order_by_client_id(
-                order.client_order_id,
-                order.product_id,
-                order_type=order.type,
-            )
-            if remote is None:
-                raise RuntimeError(
-                    "rithmic_strategy_exit_cancel_lookup_missing:"
-                    f"order_id={order.id}"
-                )
-            if remote.status in {"filled", "cancelled", "rejected"}:
-                continue
-            if not remote.exchange_order_id:
-                raise RuntimeError(
-                    "rithmic_strategy_exit_remote_identity_missing:"
-                    f"order_id={order.id}"
-                )
+            self.execution_engine.order_manager.fail_order(order, "strategy_exit")
+            cancelled_orders += 1
+        for order, remote in cancellation_targets:
+            basket_id = str(remote.basket_id)
             self.assert_leadership()
             mark_compensation_required()
             if not self.adapter.cancel_order(
-                remote.exchange_order_id,
+                basket_id,
                 order.product_id,
                 order_type=order.type,
             ):
                 raise RuntimeError(
-                    "rithmic_strategy_exit_cancel_failed:"
-                    f"order_id={order.id}"
+                    f"rithmic_strategy_exit_cancel_failed:order_id={order.id}"
                 )
+            identities.add(basket_id)
             cancelled_orders += 1
         return cancelled_orders, identities
 
     @staticmethod
     def _identities_still_working(
         snapshot,
-        identities: set[tuple[str | None, str | None]],
+        identities: set[str],
     ) -> bool:
         for remote in snapshot.orders:
-            remote_basket = (
-                str(remote.basket_id) if remote.basket_id else None
-            )
-            remote_client = (
-                str(remote.client_order_id)
-                if remote.client_order_id
-                else None
-            )
             if not rithmic_order_may_be_working(remote):
                 continue
-            if any(
-                (basket_id is not None and basket_id == remote_basket)
-                or (
-                    client_order_id is not None
-                    and client_order_id == remote_client
-                )
-                for basket_id, client_order_id in identities
-            ):
+            if str(getattr(remote, "basket_id", "")) in identities:
                 return True
         return False
