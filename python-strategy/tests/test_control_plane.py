@@ -2415,7 +2415,10 @@ def test_kill_switch_happy_path_returns_202_and_publishes():
     assert channel == "cmd:strategy:control"
     published = json.loads(raw_payload)
     assert published["command"] == "KILL_SWITCH"
-    assert "params" in published
+    assert published["params"] == {
+        "actor": "api_key",
+        "reason": None,
+    }
 
 
 def test_kill_switch_reason_forwarded_in_publish():
@@ -2434,6 +2437,144 @@ def test_kill_switch_reason_forwarded_in_publish():
     _, raw_payload = redis.publish.call_args.args
     published = json.loads(raw_payload)
     assert published["params"].get("reason") == "eod_risk_drill"
+
+
+@pytest.mark.parametrize(
+    "auth_headers",
+    [
+        {"x-api-key": "secret"},
+        {"Authorization": "Bearer secret"},
+    ],
+)
+def test_kill_switch_api_preserves_supplied_idempotency_key(auth_headers):
+    from unittest.mock import MagicMock
+
+    redis = MagicMock()
+    redis.publish.return_value = 1
+    app = _kill_switch_app(redis_client=redis)
+
+    response = app.handle(
+        "POST",
+        "/ops/kill-switch",
+        headers={**auth_headers, "Idempotency-Key": "api-stop-1"},
+    )
+
+    assert response.status_code == 202
+    assert response.body == {
+        "status": "accepted",
+        "operation_id": "api-stop-1",
+    }
+    _, raw_payload = redis.publish.call_args.args
+    assert json.loads(raw_payload)["params"] == {
+        "actor": "api_key",
+        "idempotency_key": "api-stop-1",
+        "reason": None,
+    }
+
+
+@pytest.mark.parametrize(
+    "auth_headers",
+    [
+        {"x-api-key": "secret"},
+        {"Authorization": "Bearer secret"},
+    ],
+)
+def test_kill_switch_api_operation_id_reaches_ops_service(auth_headers):
+    from contextlib import nullcontext
+    from unittest.mock import MagicMock
+
+    from src.core.ops_command_service import OpsCommandService
+    from src.core.strategy_command_dispatch_service import (
+        StrategyCommandDispatchService,
+    )
+
+    redis = MagicMock()
+    redis.publish.return_value = 1
+    app = _kill_switch_app(redis_client=redis)
+    run_kill_switch = MagicMock()
+    clear_kill_switch = MagicMock()
+    assert_leadership = MagicMock()
+    service = OpsCommandService(
+        operation_lock=nullcontext,
+        kill_switch_operation_completed=MagicMock(return_value=False),
+        halt_for_kill_switch=MagicMock(),
+        persist_lockdown_database=MagicMock(),
+        persist_lockdown_redis=MagicMock(),
+        run_kill_switch=run_kill_switch,
+        mark_kill_switch_halted=MagicMock(),
+        requires_authoritative_verification=MagicMock(return_value=False),
+        kill_switch_result_is_complete=MagicMock(return_value=False),
+        mark_kill_switch_operation_completed=MagicMock(),
+        prepare_kill_switch_clear=MagicMock(),
+        assert_leadership=MagicMock(),
+        clear_kill_switch=clear_kill_switch,
+        persist_clear_database=MagicMock(),
+        persist_clear_redis=MagicMock(),
+        clear_local_halt=MagicMock(),
+        finalize_external_drift_clear=MagicMock(),
+        event_logger=MagicMock(return_value=MagicMock()),
+    )
+
+    response = app.handle(
+        "POST",
+        "/ops/kill-switch",
+        json.dumps({"reason": "operator recovery"}),
+        headers={**auth_headers, "Idempotency-Key": "api-recovery-1"},
+    )
+
+    assert response.status_code == 202
+    _, raw_payload = redis.publish.call_args.args
+    command = json.loads(raw_payload)
+    assert command["command"] == "KILL_SWITCH"
+    dispatcher = StrategyCommandDispatchService(
+        assert_leadership=assert_leadership,
+        scan_strategies=MagicMock(),
+        test_run_strategy=MagicMock(),
+        ops_command_service=lambda: service,
+        assert_strategy_command_allowed=MagicMock(),
+        claim_strategy_command_operation=MagicMock(return_value=True),
+        mark_strategy_command_operation_completed=MagicMock(),
+        command_router=MagicMock(),
+        event_logger=MagicMock(return_value=MagicMock()),
+    )
+    dispatcher.dispatch(command)
+
+    assert_leadership.assert_called_once_with()
+    run_kill_switch.assert_called_once_with(
+        actor="api_key",
+        reason="operator recovery",
+        operation_id="api-recovery-1",
+        operator_origin=True,
+    )
+    clear_kill_switch.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "idempotency_key",
+    ["", " leading-space", "embedded space", "重複鍵", "x" * 129],
+)
+@pytest.mark.parametrize(
+    "auth_headers",
+    [
+        {"x-api-key": "secret"},
+        {"Authorization": "Bearer secret"},
+    ],
+)
+def test_kill_switch_api_rejects_invalid_idempotency_key(idempotency_key, auth_headers):
+    from unittest.mock import MagicMock
+
+    redis = MagicMock()
+    app = _kill_switch_app(redis_client=redis)
+
+    response = app.handle(
+        "POST",
+        "/ops/kill-switch",
+        headers={**auth_headers, "Idempotency-Key": idempotency_key},
+    )
+
+    assert response.status_code == 400
+    assert response.body == {"error": "idempotency_key_invalid"}
+    redis.publish.assert_not_called()
 
 
 def test_clear_kill_switch_returns_202_and_publishes_manual_release():

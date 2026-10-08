@@ -753,13 +753,11 @@ class ControlPlaneApp:
             return HttpResponse(422, {"error": "validation_error"})
         if require_confirmation and payload.get("confirm") is not True:
             return HttpResponse(403, {"error": "confirmation_required"})
-        idempotency_key = None
-        if require_confirmation:
-            idempotency_key = _extract_idempotency_key(headers)
-            if idempotency_key is None:
-                return HttpResponse(400, {"error": "idempotency_key_required"})
-            if not _valid_idempotency_key(idempotency_key):
-                return HttpResponse(400, {"error": "idempotency_key_invalid"})
+        idempotency_key = _extract_idempotency_key(headers)
+        if require_confirmation and idempotency_key is None:
+            return HttpResponse(400, {"error": "idempotency_key_required"})
+        if idempotency_key is not None and not _valid_idempotency_key(idempotency_key):
+            return HttpResponse(400, {"error": "idempotency_key_invalid"})
         command = {
             "command": "KILL_SWITCH",
             "params": {
