@@ -14,7 +14,7 @@ from src.core.backtest.spider_execution_input import (
     SpiderExecutionInput,
     validate_spider_execution_input,
 )
-from src.core.backtest.spider_run_artifacts import canonical_bytes
+from src.core.backtest.spider_run_artifacts import _decimal_text, canonical_bytes
 from src.core.backtest import spider_policy_protocol as policy_protocol
 
 
@@ -23,6 +23,103 @@ _REASONS = (
     "EXIT_REJECTED", "NOTIFICATION_PENDING", "POLL_PENDING", "NATIVE_TERMINAL",
     "EXECUTION_FAILURE",
 )
+
+
+def _financial_decimal(value: object) -> D:
+    if type(value) is D:
+        result = value
+    elif type(value) is str:
+        result = D(_decimal_text(value))
+    else:
+        raise ValueError("INVALID_ARTIFACT")
+    if not result.is_finite():
+        raise ValueError("INVALID_ARTIFACT")
+    return result
+
+
+def _classify_paid_endpoint_result(
+    request_identity: Mapping[str, Any],
+    owner_evidence: dict[str, Any] | None,
+    actions: Sequence[Mapping[str, Any]],
+    scheduler_observation: Mapping[str, Any],
+    paid_observation: Mapping[str, Any],
+    failure: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Purely project admitted run facts into the frozen paid result DTO."""
+    current_evidence_complete = paid_observation["current_evidence_complete"] is True
+    positions = deepcopy(_snapshot_rows(owner_evidence, "positions")) if current_evidence_complete else None
+    working_orders = deepcopy(_snapshot_rows(owner_evidence, "open_orders")) if current_evidence_complete else None
+    pending_deliveries = [deepcopy(row["key"]) for row in paid_observation["pending_paid_deliveries"]]
+    polls = [
+        dict(poll_id=row["poll_id"], continuation_id=row["continuation_id"],
+             status=row["status"], awaiting=row["awaiting"])
+        for row in scheduler_observation["polls"]
+        if row["status"] == "IN_PROGRESS" and row["awaiting"] is not None
+    ]
+    detached_actions = [deepcopy(dict(action)) for action in actions]
+    pending_actions = [row["action_id"] for row in detached_actions
+                       if row["classification"] == "PENDING"]
+    pending_sends = [row["group_id"] for row in paid_observation["send_dependencies"]
+                     if row["state"] == "PENDING"]
+    pending_cancels = set(paid_observation["pending_cancel_order_ids"])
+    roles_by_order = {row["order_id"]: row["role"] for row in paid_observation["order_roles"]}
+    working_exit_orders: set[str] = set()
+    for row in working_orders or []:
+        if isinstance(row, dict):
+            order_id = row.get("order_id")
+            if isinstance(order_id, str) and roles_by_order.get(order_id) == "EXIT":
+                working_exit_orders.add(order_id)
+    pending_actions.extend(
+        row["action_id"] for row in detached_actions
+        if row["role"] == "EXIT" and row["order_id"] in working_exit_orders
+        and row["action_id"] not in pending_actions
+    )
+    reasons = _reason_codes(
+        actions=detached_actions,
+        pending_deliveries=pending_deliveries,
+        pending_polls=polls,
+        positions=positions,
+        orders=working_orders,
+        scheduler_terminal=scheduler_observation["gate"] == "FAILED",
+        execution_failure=failure is not None,
+        pending_sends=pending_sends,
+        pending_cancels=pending_cancels,
+        native_terminal=paid_observation["native_terminal"],
+        working_exit_orders=working_exit_orders,
+    )
+    inspection_state = (owner_evidence or {}).get("inspection")
+    liquidated = ((inspection_state or {}).get("lifecycle") in
+                  ("LIQUIDATED_FLAT", "LIQUIDATED_INSOLVENT"))
+    if failure is not None:
+        status = "FAILED"
+    elif liquidated:
+        status = (inspection_state or {})["lifecycle"]
+    elif _paid_flat(positions, working_orders, pending_actions, pending_deliveries, polls,
+                    pending_cancels=pending_cancels, pending_sends=pending_sends):
+        status = "PAID_FLAT"
+    else:
+        status = "INCOMPLETE"
+    if status == "PAID_FLAT":
+        reasons = []
+    return dict(
+        schema_version="spider_paid_endpoint_result_v1",
+        run_contract_sha256=request_identity["run_contract_sha256"],
+        policy_end_ms=request_identity["policy_end_ms"],
+        settlement_end_ms=request_identity["settlement_end_ms"],
+        generation=request_identity["generation"],
+        status=status,
+        owner_evidence=deepcopy(owner_evidence),
+        actions=detached_actions,
+        pending_obligations=dict(
+            positions=positions,
+            working_orders=working_orders,
+            pending_actions=pending_actions,
+            pending_deliveries=sorted(pending_deliveries, key=_key_sort),
+            pending_polls=sorted(polls, key=lambda row: (row["poll_id"], row["continuation_id"])),
+        ),
+        reasons=reasons,
+        failure=deepcopy(failure) if status == "FAILED" else None,
+    )
 
 
 @dataclass
@@ -267,6 +364,111 @@ class PaidEndpoint:
         if action["role"] == "EXIT" and classification == "REJECTED":
             self.rejected_exit_products.add(action["product_id"])
 
+    def _paid_observation(
+        self, composition: Any, scheduler_observation: Mapping[str, Any],
+        *, current_evidence_complete: bool, failure: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        pending_source_groups = []
+        pending_paid_deliveries = []
+        for key in scheduler_observation["pending_keys"]:
+            queue_class = key["queue_class"]
+            if queue_class not in _QUEUE_LABELS:
+                raise ValueError("INVALID_SCHEMA")
+            queue_index = _QUEUE_LABELS.index(queue_class)
+            record = composition._records.get((queue_index, key["stable_id"]))
+            if queue_class == "SOURCE_GROUP":
+                if record is not None and record["item"].get("kind") == "SOURCE_GROUP":
+                    pending_source_groups.append(dict(
+                        key=deepcopy(key), group=deepcopy(record["item"]["group"]),
+                    ))
+            elif queue_class == "DELIVERY" and record is not None:
+                delivery = record["item"].get("delivery")
+                if not isinstance(delivery, dict):
+                    continue
+                delivery_id = delivery["delivery_id"]
+                if delivery_id in self.pending_delivery_ids:
+                    cancel_action = self.cancel_ack_action_by_delivery.get(delivery_id)
+                    pending_paid_deliveries.append(dict(
+                        key=deepcopy(key), delivery=deepcopy(delivery),
+                        role=self.delivery_roles.get(delivery_id),
+                        cancel_action_id=cancel_action["action_id"] if cancel_action is not None else None,
+                    ))
+        send_dependencies = []
+        for dependency in sorted(
+            composition._historical_send_dependencies.values(), key=lambda row: row["group_id"],
+        ):
+            binding = dependency.get("binding")
+            send_dependencies.append(dict(
+                client_order_id=dependency["client_order_id"],
+                product_id=dependency["product_id"],
+                strategy_id=dependency["strategy_id"],
+                group_id=dependency["group_id"],
+                event_id=dependency["event_id"],
+                state=dependency["state"],
+                binding=(dict(
+                    client_order_id=binding["client_order_id"],
+                    order_id=binding["order_id"],
+                    product_id=binding["product_id"],
+                    strategy_id=binding["strategy_id"],
+                ) if isinstance(binding, dict) else None),
+                role=dependency["role"],
+            ))
+        terminal_fact = None
+        last_popped = scheduler_observation["last_popped"]
+        terminal = scheduler_observation["terminal"]
+        if failure is not None and last_popped is not None and terminal is not None:
+            queue_class = last_popped["queue_class"]
+            if queue_class not in _QUEUE_LABELS:
+                raise ValueError("INVALID_SCHEMA")
+            queue_index = _QUEUE_LABELS.index(queue_class)
+            record = composition._records.get((queue_index, last_popped["stable_id"]))
+            kind = record["item"].get("kind") if record is not None else None
+            record_terminal = any(
+                row["key"] == last_popped
+                and row["kind"] == kind
+                and row["stable_id"] == last_popped["stable_id"]
+                and row["classification"] == "TERMINAL"
+                for row in scheduler_observation["records"]
+            )
+            terminal_matches = (
+                terminal["kind"] == kind
+                and terminal["stable_id"] == last_popped["stable_id"]
+                and terminal["classification"] == "TERMINAL"
+            )
+            if kind in ("SOURCE_GROUP", "DELIVERY") and record_terminal and terminal_matches:
+                item = record["item"]
+                result = record.get("result")
+                delivery = item.get("delivery") if kind == "DELIVERY" else None
+                delivery_id = delivery.get("delivery_id") if isinstance(delivery, dict) else None
+                cancel_action = (self.cancel_ack_action_by_delivery.get(delivery_id)
+                                 if isinstance(delivery_id, str) else None)
+                group_result = (result.get("group_result") if isinstance(result, dict) else None)
+                if group_result is None:
+                    group_result = terminal.get("group_result")
+                terminal_fact = dict(
+                    key=deepcopy(last_popped), kind=kind,
+                    source_group=deepcopy(item.get("group")) if kind == "SOURCE_GROUP" else None,
+                    delivery=deepcopy(delivery),
+                    group_result=deepcopy(group_result),
+                    failure=deepcopy(failure["primary"]),
+                    role=self.delivery_roles.get(delivery_id) if delivery_id is not None else None,
+                    cancel_action_id=(cancel_action["action_id"] if cancel_action is not None else None),
+                )
+        return dict(
+            schema_version="spider_paid_observation_v1",
+            run_contract_sha256=self.contract_hash,
+            observed_at=scheduler_observation["current_time"],
+            current_evidence_complete=current_evidence_complete,
+            native_terminal=composition._paid_native_terminal,
+            send_dependencies=send_dependencies,
+            order_roles=[dict(order_id=order_id, role=role)
+                         for order_id, role in sorted(self.roles_by_order.items())],
+            pending_cancel_order_ids=sorted(composition._paid_cancel_pending_orders),
+            pending_source_groups=pending_source_groups,
+            pending_paid_deliveries=pending_paid_deliveries,
+            terminal_fact=terminal_fact,
+        )
+
     def result(self, composition: Any) -> dict[str, Any]:
         cutoff = (composition._current_time if composition._terminal is not None
                   else self.settlement_end_ms * 16 + 6)
@@ -317,88 +519,24 @@ class PaidEndpoint:
                            observed_at=composition._current_time)
             owner_evidence = self.last_owner_evidence
             cutoff = self.last_cutoff if owner_evidence is not None else None
-
-        inspection_state = (owner_evidence or {}).get("inspection")
-        positions = _snapshot_rows(owner_evidence, "positions") if current_evidence_complete else None
-        working_orders = _snapshot_rows(owner_evidence, "open_orders") if current_evidence_complete else None
-        observation = composition._scheduler_observation()
-        pending_keys = observation["pending"]
-        pending_deliveries = [
-            _scheduler_key(key) for key in pending_keys
-            if _record_kind(composition, key) == "DELIVERY"
-            and composition._records[(key[1], key[3])]["item"]["delivery"]["delivery_id"]
-            in self.pending_delivery_ids
-        ]
-        polls = [
-            dict(poll_id=poll_id, continuation_id=continuation,
-                 status=record.observation.status,
-                 awaiting=_awaiting(record.observation.awaiting))
-            for continuation, poll_id in composition._continuations.items()
-            for record in (composition._polls[poll_id],)
-            if record.observation.status == "IN_PROGRESS" and record.observation.awaiting is not None
-        ]
-        pending_actions = [row["action_id"] for row in self.actions
-                           if row["classification"] == "PENDING"]
-        pending_sends = [dep["group_id"] for dep in composition._historical_send_dependencies.values()
-                         if dep["state"] == "PENDING"]
-        working_exit_orders: set[str] = set()
-        for row in working_orders or []:
-            if isinstance(row, dict):
-                order_id = row.get("order_id")
-                if isinstance(order_id, str) and self.roles_by_order.get(order_id) == "EXIT":
-                    working_exit_orders.add(order_id)
-        pending_actions.extend(
-            row["action_id"] for row in self.actions
-            if row["role"] == "EXIT" and row["order_id"] in working_exit_orders
-            and row["action_id"] not in pending_actions
+        scheduler_observation = composition._public_scheduler_observation()
+        paid_observation = self._paid_observation(
+            composition, scheduler_observation,
+            current_evidence_complete=current_evidence_complete, failure=failure,
         )
-        reasons = _reason_codes(
-            actions=self.actions,
-            pending_deliveries=pending_deliveries,
-            pending_polls=polls,
-            positions=positions,
-            orders=working_orders,
-            scheduler_terminal=composition._terminal is not None,
-            execution_failure=failure is not None,
-            pending_sends=pending_sends,
-            pending_cancels=composition._paid_cancel_pending_orders,
-            native_terminal=composition._paid_native_terminal,
-            working_exit_orders=working_exit_orders,
-        )
-        liquidated = ((inspection_state or {}).get("lifecycle") in
-                      ("LIQUIDATED_FLAT", "LIQUIDATED_INSOLVENT"))
-        if failure is not None:
-            status = "FAILED"
-        elif liquidated:
-            status = (inspection_state or {})["lifecycle"]
-        elif _paid_flat(positions, working_orders, pending_actions, pending_deliveries, polls,
-                        pending_cancels=composition._paid_cancel_pending_orders,
-                        pending_sends=pending_sends):
-            status = "PAID_FLAT"
-        else:
-            status = "INCOMPLETE"
-        if status == "PAID_FLAT":
-            reasons = []
-        result = dict(
-            schema_version="spider_paid_endpoint_result_v1",
-            run_contract_sha256=self.contract_hash,
-            policy_end_ms=self.policy_end_ms,
-            settlement_end_ms=self.settlement_end_ms,
-            generation=self.generation,
-            status=status,
-            owner_evidence=owner_evidence,
-            actions=deepcopy(self.actions),
-            pending_obligations=dict(
-                positions=positions,
-                working_orders=working_orders,
-                pending_actions=pending_actions,
-                pending_deliveries=sorted(pending_deliveries, key=_key_sort),
-                pending_polls=sorted(polls, key=lambda row: (row["poll_id"], row["continuation_id"])),
+        return _classify_paid_endpoint_result(
+            request_identity=dict(
+                run_contract_sha256=self.contract_hash,
+                policy_end_ms=self.policy_end_ms,
+                settlement_end_ms=self.settlement_end_ms,
+                generation=self.generation,
             ),
-            reasons=reasons,
-            failure=failure if status == "FAILED" else None,
+            owner_evidence=owner_evidence,
+            actions=self.actions,
+            scheduler_observation=scheduler_observation,
+            paid_observation=paid_observation,
+            failure=failure,
         )
-        return result
 
 
 def _error(error: Exception, composition: Any) -> dict[str, Any]:
@@ -428,30 +566,10 @@ def _snapshot_rows(owner: dict[str, Any] | None, key: str) -> list[dict[str, Any
     return rows if isinstance(rows, list) else None
 
 
-def _scheduler_key(key: tuple[Any, ...]) -> dict[str, Any]:
-    return dict(visible_at=key[0], queue_class=_QUEUE_LABELS[key[1]],
-                schedule_sequence=key[2], stable_id=key[3])
-
-
 _QUEUE_LABELS = (
     "SOURCE_GROUP", "SNAPSHOT_CAPTURE", "DELIVERY", "HISTORICAL_MARKET_STEP",
     "HISTORICAL_MARKET_CACHE", "HISTORICAL_TIMER", "PAID_ENDPOINT_DRAIN",
 )
-
-
-def _record_kind(composition: Any, key: tuple[Any, ...]) -> str | None:
-    record = composition._records.get((key[1], key[3]))
-    return None if record is None else record["item"].get("kind")
-
-
-def _awaiting(stage: dict[str, Any] | None) -> str | None:
-    if stage is None:
-        return None
-    request = stage.get("snapshot_request")
-    if not isinstance(request, dict):
-        return None
-    kind = request.get("snapshot_kind")
-    return "EARN_IF_DUE" if kind == "EARN" else kind
 
 
 def _key_sort(row: dict[str, Any]) -> tuple[Any, ...]:
@@ -482,7 +600,7 @@ def _reason_codes(**state: Any) -> list[str]:
         if state["execution_failure"]:
             reasons.add("EXECUTION_FAILURE")
     else:
-        if any(row.get("position_contracts") != 0 for row in state["positions"]):
+        if any(_financial_decimal(row.get("position_contracts")) != 0 for row in state["positions"]):
             reasons.add("RESIDUAL_POSITION")
     if state["scheduler_terminal"]:
         reasons.add("EXECUTION_FAILURE")
@@ -496,7 +614,8 @@ def _paid_flat(positions: object, orders: object, actions: list[object],
                pending_cancels: set[str], pending_sends: list[str]) -> bool:
     if not isinstance(positions, list) or not isinstance(orders, list):
         return False
-    if any(row.get("position_contracts") != 0 for row in positions if isinstance(row, dict)):
+    if any(_financial_decimal(row.get("position_contracts")) != 0
+           for row in positions if isinstance(row, dict)):
         return False
     if orders or deliveries or polls or pending_cancels or pending_sends:
         return False

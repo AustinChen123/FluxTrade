@@ -3,12 +3,16 @@
 from copy import deepcopy
 from dataclasses import replace
 from decimal import Decimal as D
+from hashlib import sha256
 from typing import Any, cast
 
 import pytest
 
+import src.core.backtest.spider_paid_endpoint as paid_endpoint_module
 from src.core.backtest.synthetic_scenario_replay import _ReplayComposition, _ScheduleError
-from src.core.backtest.spider_paid_endpoint import PaidEndpoint, _paid_flat
+from src.core.backtest.spider_paid_endpoint import (
+    PaidEndpoint, _classify_paid_endpoint_result, _financial_decimal, _paid_flat,
+)
 from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_canonical
 from test_spider_paid_endpoint_native import _seeded_two_product_run
 from test_spider_execution_input import _input
@@ -26,6 +30,90 @@ def _endpoint(composition: _ReplayComposition) -> PaidEndpoint:
     endpoint = composition._paid_endpoint
     assert endpoint is not None
     return endpoint
+
+
+def _result_sha256(result: dict[str, Any]) -> str:
+    return sha256(canonical_bytes(result)).hexdigest()
+
+
+def _native_account_rows(composition: _ReplayComposition, tag: str) -> tuple[Any, Any, Any]:
+    cutoff = composition._current_time
+    result = composition.capture_owner_evidence(
+        cutoff,
+        composition._paid_snapshot_request("TRADING", cutoff, tag + "_TRADING"),
+        composition._paid_snapshot_request("POSITIONS", cutoff, tag + "_POSITIONS"),
+        composition._paid_snapshot_request("OPEN_ORDERS", cutoff, tag + "_ORDERS"),
+    )["owner_evidence"]
+    return tuple(
+        result[name + "_fact"]["immutable_payload"]
+        for name in ("trading", "positions", "open_orders")
+    )
+
+
+def _failed_result_with_real_classifier_facts(
+    monkeypatch: pytest.MonkeyPatch, composition: _ReplayComposition,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    captured: list[tuple[Any, ...]] = []
+
+    def capture_classifier_facts(**kwargs):
+        args = tuple(kwargs[key] for key in (
+            "request_identity", "owner_evidence", "actions", "scheduler_observation",
+            "paid_observation", "failure",
+        ))
+        before = deepcopy(args)
+        result = _classify_paid_endpoint_result(**kwargs)
+        assert args == before
+        captured.append(before)
+        return result
+
+    monkeypatch.setattr(paid_endpoint_module, "_classify_paid_endpoint_result", capture_classifier_facts)
+    endpoint = _endpoint(composition)
+    result = endpoint.result(composition)
+    assert len(captured) == 1
+    assert result["status"] == "FAILED"
+    assert result["owner_evidence"]["cutoff"] == composition._current_time
+    assert result["failure"]["evidence_error"] is None
+    assert result["failure"]["observed_at"] == composition._current_time
+
+    facts = cast(list[Any], decode_canonical(canonical_bytes(list(captured[0]))))
+    before_reclassification = canonical_bytes(facts)
+    reconstructed = _classify_paid_endpoint_result(*facts)
+    assert canonical_bytes(facts) == before_reclassification
+    assert canonical_bytes(reconstructed) == canonical_bytes(result)
+    return result, facts[4]
+
+
+def test_native_paid_result_bytes_match_preextract_baselines(monkeypatch):
+    request = _seeded_two_product_run()
+    composition = _ReplayComposition._from_execution_run(request)
+    assert composition._dispatch_due(request.historical_input.range_end_ms * 16 + 6)["classification"] == "SUCCESS"
+    assert _result_sha256(_endpoint(composition).result(composition)) == (
+        "0482af005feb8004e51b513a38393b5b73e035a4798e565154ea3e2a52b6061a"
+    )
+
+    request = _seeded_two_product_run()
+    request = replace(request, policy_end_ms=request.policy_end_ms + 59_000)
+    composition = _ReplayComposition._from_execution_run(request)
+    assert composition._dispatch_due(request.historical_input.range_end_ms * 16 + 6)["classification"] == "SUCCESS"
+    assert _result_sha256(_endpoint(composition).result(composition)) == (
+        "341a20b9ed87c5f9b9583d567c20af93dece87e7fd4a979d5e9dba88c891c0ca"
+    )
+
+    composition = _ReplayComposition._from_execution_run(_input())
+    composition._stop_scheduler(_ScheduleError("injected scheduler failure"), "POLL", "baseline-failure")
+    assert _result_sha256(_endpoint(composition).result(composition)) == (
+        "ab4c42159cf727e68a1bf74fcdb2b6a02a2a4de768776ddceb7e7fa94dfbb179"
+    )
+
+    composition = _ReplayComposition._from_execution_run(_input())
+
+    def fail_capture(*_args):
+        raise RuntimeError("baseline evidence unavailable")
+
+    monkeypatch.setattr(composition, "capture_owner_evidence", fail_capture)
+    assert _result_sha256(_endpoint(composition).result(composition)) == (
+        "07828c674e871b6c89288619774511bd8884eca65afcc57f84c6c873df673335"
+    )
 
 
 def test_public_scheduler_renderer_matches_capture_and_never_reads_native(monkeypatch):
@@ -103,6 +191,254 @@ def test_public_scheduler_renderer_preserves_paid_queue_poll_and_failed_terminal
 
     assert not contains_tuple(failed)
     assert decode_canonical(canonical_bytes(failed)) == failed
+
+
+def test_pure_paid_classifier_roundtrips_decimal_inputs_without_mutation():
+    def classify(quantity, orders=None):
+        request_identity = dict(
+            run_contract_sha256="a" * 64, policy_end_ms=10,
+            settlement_end_ms=20, generation=0,
+        )
+        owner_evidence = dict(
+            inspection=dict(lifecycle="RISK_STABLE"),
+            positions_fact=dict(immutable_payload=dict(
+                outcome="SUCCESS", rows=[dict(position_contracts=quantity)],
+            )),
+            open_orders_fact=dict(immutable_payload=dict(outcome="SUCCESS", rows=orders or [])),
+        )
+        actions = []
+        scheduler_observation = dict(
+            current_time=320, gate="RUNNING", terminal=None, last_popped=None,
+            pending_keys=[], records=[], polls=[], callback_actions=[],
+        )
+        paid_observation = dict(
+            schema_version="spider_paid_observation_v1",
+            run_contract_sha256="a" * 64,
+            observed_at=320, current_evidence_complete=True, native_terminal=None,
+            send_dependencies=[], order_roles=[], pending_cancel_order_ids=[],
+            pending_source_groups=[], pending_paid_deliveries=[], terminal_fact=None,
+        )
+        inputs = deepcopy((request_identity, owner_evidence, actions,
+                           scheduler_observation, paid_observation))
+        result = _classify_paid_endpoint_result(
+            request_identity, owner_evidence, actions, scheduler_observation,
+            paid_observation, None,
+        )
+        assert inputs == (request_identity, owner_evidence, actions,
+                          scheduler_observation, paid_observation)
+        return result
+
+    zero_decimal = classify(D("0"))
+    zero_string = classify("0")
+    assert zero_decimal["status"] == zero_string["status"] == "PAID_FLAT"
+    assert canonical_bytes(zero_decimal) == canonical_bytes(zero_string)
+
+    residual_decimal = classify(D("0.05"))
+    residual_string = classify("0.05")
+    assert residual_decimal["status"] == residual_string["status"] == "INCOMPLETE"
+    assert residual_decimal["reasons"] == residual_string["reasons"] == ["RESIDUAL_POSITION"]
+    assert canonical_bytes(residual_decimal) == canonical_bytes(residual_string)
+    assert canonical_bytes(classify(D("-0.05"))) == canonical_bytes(classify("-0.05"))
+
+    working_order = dict(order_id="GRID-1", remaining_quantity_contracts=D("0.2"))
+    input_orders = [working_order]
+    open_order_result = classify(D("0"), input_orders)
+    assert open_order_result["pending_obligations"]["working_orders"] == [working_order]
+    assert open_order_result["pending_obligations"]["working_orders"] is not input_orders
+    open_order_result["pending_obligations"]["working_orders"][0]["remaining_quantity_contracts"] = D("99")
+    assert working_order["remaining_quantity_contracts"] == D("0.2")
+
+    owner_rows = [dict(position_contracts=D("0.05"))]
+    owner_evidence = dict(
+        inspection=dict(lifecycle="RISK_STABLE"),
+        positions_fact=dict(immutable_payload=dict(outcome="SUCCESS", rows=owner_rows)),
+        open_orders_fact=dict(immutable_payload=dict(outcome="SUCCESS", rows=[])),
+    )
+    result = _classify_paid_endpoint_result(
+        dict(run_contract_sha256="a" * 64, policy_end_ms=10, settlement_end_ms=20, generation=0),
+        owner_evidence, [],
+        dict(current_time=320, gate="RUNNING", terminal=None, last_popped=None,
+             pending_keys=[], records=[], polls=[], callback_actions=[]),
+        dict(schema_version="spider_paid_observation_v1", run_contract_sha256="a" * 64,
+             observed_at=320, current_evidence_complete=True, native_terminal=None,
+             send_dependencies=[], order_roles=[], pending_cancel_order_ids=[], pending_source_groups=[],
+             pending_paid_deliveries=[], terminal_fact=None),
+        None,
+    )
+    assert result["pending_obligations"]["positions"] is not owner_rows
+    result["pending_obligations"]["positions"][0]["position_contracts"] = D("99")
+    assert owner_rows[0]["position_contracts"] == D("0.05")
+
+    for invalid in (False, 0.0, "00", "-0", "1.0", D("NaN"), D("Infinity")):
+        with pytest.raises(ValueError, match="INVALID_ARTIFACT"):
+            _financial_decimal(invalid)
+
+
+@pytest.mark.parametrize("terminal_kind,terminal_id", [("POLL", "later-poll"), ("DELIVERY", "later-delivery")])
+def test_paid_observation_omits_nonterminal_prior_source_as_terminal_fact(terminal_kind, terminal_id):
+    composition = _ReplayComposition._from_execution_run(_input())
+    endpoint = _endpoint(composition)
+    scheduler = composition._public_scheduler_observation()
+    source_key = dict(visible_at=600, queue_class="SOURCE_GROUP", schedule_sequence=0, stable_id="source-1")
+    composition._records[(0, "source-1")] = dict(
+        key=(600, 0, 0, "source-1"),
+        item=dict(kind="SOURCE_GROUP", group=dict(group_id="source-1")),
+        result=dict(kind="SOURCE_GROUP", stable_id="source-1", classification="SUCCESS"),
+    )
+    scheduler["last_popped"] = source_key
+    scheduler["gate"] = "FAILED"
+    scheduler["records"].append(dict(
+        key=source_key, kind="SOURCE_GROUP", stable_id="source-1", classification="SUCCESS",
+    ))
+    scheduler["terminal"] = dict(
+        kind=terminal_kind, stable_id=terminal_id, classification="TERMINAL", reason="later failure",
+    )
+    observation = endpoint._paid_observation(
+        composition, scheduler, current_evidence_complete=False,
+        failure=dict(primary=dict(kind="SCHEDULER", reason="later failure", native_failure=None)),
+    )
+    assert observation["terminal_fact"] is None
+
+
+def test_paid_observation_requires_actual_terminal_record_classification():
+    composition = _ReplayComposition._from_execution_run(_input())
+    endpoint = _endpoint(composition)
+    scheduler = composition._public_scheduler_observation()
+    source_key = dict(visible_at=600, queue_class="SOURCE_GROUP", schedule_sequence=0, stable_id="source-1")
+    composition._records[(0, "source-1")] = dict(
+        key=(600, 0, 0, "source-1"),
+        item=dict(kind="SOURCE_GROUP", group=dict(group_id="source-1")),
+        result=dict(kind="SOURCE_GROUP", stable_id="source-1", classification="SUCCESS"),
+    )
+    scheduler["last_popped"] = source_key
+    scheduler["records"].append(dict(
+        key=source_key, kind="SOURCE_GROUP", stable_id="source-1", classification="SUCCESS",
+    ))
+    scheduler["gate"] = "FAILED"
+    scheduler["terminal"] = dict(
+        kind="SOURCE_GROUP", stable_id="source-1", classification="TERMINAL", reason="source fault",
+    )
+    observation = endpoint._paid_observation(
+        composition, scheduler, current_evidence_complete=False,
+        failure=dict(primary=dict(kind="SCHEDULER", reason="source fault", native_failure=None)),
+    )
+    assert observation["terminal_fact"] is None
+
+
+def test_actual_native_source_group_fault_is_retained_as_terminal_fact(monkeypatch):
+    request = _seeded_two_product_run()
+    composition = _ReplayComposition._from_execution_run(request)
+    policy_cut = request.policy_end_ms * 16 + 7
+    assert composition._dispatch_due(policy_cut)["classification"] == "SUCCESS"
+    financial_before = _native_account_rows(composition, "SOURCE_FAULT_BEFORE")
+    pending = next(
+        record for record in composition._records.values()
+        if record["item"].get("kind") == "SOURCE_GROUP"
+        and record["item"]["group"]["members"][0]["kind"] == "INTENT"
+    )
+    group = pending["item"]["group"]
+    original_config = group["members"][0]["payload"]["config_id"]
+    group["members"][0]["payload"]["config_id"] = "NOT-THE-ADMITTED-CONFIG"
+    assert original_config != group["members"][0]["payload"]["config_id"]
+    expected_group = deepcopy(group)
+
+    dispatch = composition._dispatch_due(request.historical_input.range_end_ms * 16 + 6)
+    assert dispatch["classification"] == "TERMINAL"
+    result, observation = _failed_result_with_real_classifier_facts(monkeypatch, composition)
+    assert result["failure"]["primary"]["reason"] == dispatch["reason"]
+    terminal_fact = observation["terminal_fact"]
+    assert terminal_fact is not None
+    assert terminal_fact["kind"] == "SOURCE_GROUP"
+    assert canonical_bytes(terminal_fact["source_group"]) == canonical_bytes(expected_group)
+    assert terminal_fact["group_result"]["classification"] == "FAULT"
+    assert terminal_fact["failure"] == result["failure"]["primary"]
+    assert _native_account_rows(composition, "SOURCE_FAULT_AFTER") == financial_before
+
+
+def test_native_committed_send_with_binding_lookup_failure_retains_native_fact(monkeypatch):
+    request = _seeded_two_product_run()
+    composition = _ReplayComposition._from_execution_run(request)
+    assert composition._dispatch_due(request.policy_end_ms * 16 + 7)["classification"] == "SUCCESS"
+    source_record = next(
+        record for record in composition._records.values()
+        if record["item"].get("kind") == "SOURCE_GROUP"
+        and record["item"]["group"]["members"][0]["kind"] == "INTENT"
+    )
+    group = source_record["item"]["group"]
+    expected_group = deepcopy(group)
+    dependency = composition._historical_send_dependencies[group["group_id"]]
+    client = composition._codec
+
+    class BindingLookupFails:
+        def __getattr__(self, name):
+            if name == "historical_order_binding":
+                return lambda *_args: None
+            return getattr(client, name)
+
+    monkeypatch.setattr(composition, "_codec", BindingLookupFails())
+    dispatch = composition._dispatch_due(request.historical_input.range_end_ms * 16 + 6)
+    assert dispatch["classification"] == "TERMINAL"
+    assert dependency["state"] == "PENDING"
+    assert dependency["binding"] is None
+    assert not any(key[3] == group["group_id"] for key in composition._queue)
+    open_orders_payload = cast(Any, _native_account_rows(composition, "BINDING_FAILURE")[2])
+    open_orders = cast(list[dict[str, Any]], open_orders_payload["rows"])
+    assert open_orders
+    assert any(row["product_id"] == group["members"][0]["payload"]["product_id"]
+               for row in open_orders)
+
+    result, observation = _failed_result_with_real_classifier_facts(monkeypatch, composition)
+    assert result["failure"]["primary"]["reason"] == dispatch["reason"]
+    terminal_fact = observation["terminal_fact"]
+    assert terminal_fact is not None
+    assert terminal_fact["kind"] == "SOURCE_GROUP"
+    assert terminal_fact["group_result"]["classification"] == "COMMITTED"
+    assert canonical_bytes(terminal_fact["source_group"]) == canonical_bytes(expected_group)
+    assert terminal_fact["failure"] == result["failure"]["primary"]
+    assert observation["send_dependencies"][0]["state"] == "PENDING"
+
+
+def test_popped_paid_cancel_ack_callback_failure_retains_cancel_obligation(monkeypatch):
+    request = _seeded_two_product_run(with_working_order=True)
+    composition = _ReplayComposition._from_execution_run(request)
+    endpoint = _endpoint(composition)
+    from src.core.backtest.synthetic_scenario_replay import _CallbackPrefix
+
+    original_capture = composition._capture_callback
+
+    def fail_cancel_ack(delivery):
+        if delivery["payload_kind"] == "TRANSPORT_ACK":
+            return _CallbackPrefix((), RuntimeError("injected cancel ACK callback failure"))
+        return original_capture(delivery)
+
+    monkeypatch.setattr(composition, "_capture_callback", fail_cancel_ack)
+    dispatch = composition._dispatch_due(request.historical_input.range_end_ms * 16 + 6)
+    assert dispatch["classification"] == "TERMINAL"
+    assert dispatch["reason"] == "CALLBACK_FAILED"
+    result, observation = _failed_result_with_real_classifier_facts(monkeypatch, composition)
+    assert result["failure"]["primary"]["reason"] == dispatch["reason"]
+    scheduler = composition._public_scheduler_observation()
+    terminal_fact = observation["terminal_fact"]
+    assert terminal_fact is not None
+    assert terminal_fact["kind"] == "DELIVERY"
+    assert terminal_fact["delivery"]["payload_kind"] == "TRANSPORT_ACK"
+    assert terminal_fact["failure"] == result["failure"]["primary"]
+    assert terminal_fact["cancel_action_id"] is not None
+    assert terminal_fact["role"] is None
+    assert observation["pending_cancel_order_ids"] == ["PAID-SEED-ORDER-A"]
+    assert not any(row == terminal_fact["key"] for row in scheduler["pending_keys"])
+    assert any(action["action_id"] == terminal_fact["cancel_action_id"]
+               for action in endpoint.actions)
+    cancel_effects = [
+        record["result"]["group_result"]
+        for record in composition._records.values()
+        if record["item"].get("kind") == "SOURCE_GROUP"
+        and record["item"]["group"]["members"][0]["kind"] == "CANCEL_EFFECT"
+    ]
+    assert len(cancel_effects) == 1
+    assert cancel_effects[0]["classification"] == "COMMITTED"
+    assert not any(row["order_id"] == "PAID-SEED-ORDER-A"
+                   for row in cast(Any, _native_account_rows(composition, "ACK_FAILED")[2])["rows"])
 
 
 def test_started_poll_completes_after_cutoff_without_source_control():
@@ -379,10 +715,16 @@ def test_pre_cut_generated_send_keeps_original_native_acceptance_after_cutoff():
     assert endpoint.result(composition)["status"] == "PAID_FLAT"
 
 
-def test_native_liquidation_remains_terminal_without_paid_exit_resurrection():
+@pytest.mark.parametrize(("cash", "expected_status", "expected_digest"), [
+    ("50", "LIQUIDATED_INSOLVENT", "0de36665a7443250bc611e1c8e55133a498fd44de5a53835a801eedbe9527006"),
+    ("99.003", "LIQUIDATED_FLAT", "c6de1a054a6fe31069352354d21b6dcadd7b2f3e56df8fd5966411f91b3c99a1"),
+])
+def test_native_liquidation_remains_terminal_without_paid_exit_resurrection(
+    cash, expected_status, expected_digest,
+):
     run = _valid_run()
     configuration = _p2_configuration()
-    configuration["cash"] = "50"
+    configuration["cash"] = cash
     configuration["positions"] = [dict(
         product_id="A-USDT-SWAP", side="LONG", quantity_contracts="1",
         lots=[dict(seed_execution_id="LIQUIDATION-SEED", seed_sequence=0,
@@ -390,7 +732,7 @@ def test_native_liquidation_remains_terminal_without_paid_exit_resurrection():
     )]
     run = _run_with_configuration(run, configuration)
     run = replace(run, initial_account_state=_initial_account_state(
-        cash="50", positions=configuration["positions"],
+        cash=cash, positions=configuration["positions"],
     ), initial_policy_cache=_policy_cache(running=False))
     trade = tuple(replace(row, open=D("1"), high=D("1"), low=D("1"), close=D("1"))
                   if row.product_id == "A-USDT-SWAP" and row.bar_open_ms == run.range_start_ms else row
@@ -406,10 +748,11 @@ def test_native_liquidation_remains_terminal_without_paid_exit_resurrection():
     assert dispatch["classification"] == "SUCCESS", (dispatch, composition._terminal)
     result = _endpoint(composition).result(composition)
 
-    assert result["status"] == "LIQUIDATED_INSOLVENT"
+    assert result["status"] == expected_status
+    assert _result_sha256(result) == expected_digest
     assert result["reasons"] == ["NATIVE_TERMINAL"]
-    assert result["owner_evidence"]["inspection"]["lifecycle"] == "LIQUIDATED_INSOLVENT"
-    assert composition._paid_native_terminal == "LIQUIDATED_INSOLVENT"
+    assert result["owner_evidence"]["inspection"]["lifecycle"] == expected_status
+    assert composition._paid_native_terminal == expected_status
     assert result["actions"] == []
     assert not any(
         record["item"].get("kind") == "SOURCE_GROUP"
