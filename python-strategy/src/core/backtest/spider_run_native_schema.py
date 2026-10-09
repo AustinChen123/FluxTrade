@@ -325,6 +325,7 @@ def historical_market_result(
     *,
     context: ConfigurationContext | None,
     historical_context: object,
+    expected_run_contract_hash: str | None = None,
 ) -> None:
     context = _context(context)
     _require(context is not None)
@@ -345,7 +346,10 @@ def historical_market_result(
     model = _enum(request["model_id"], _HISTORICAL_MODELS)
     _require(model == historical["model_id"] and request["model_version"] == str(historical["model_version"]))
     _require(request["schema_version"] == "historical_node_v1")
-    _require(_text(request["run_contract_hash"], r"[0-9a-f]{64}") == historical["historical_input_sha256"])
+    expected_hash = historical["historical_input_sha256"]
+    if expected_run_contract_hash is not None:
+        expected_hash = _hash(expected_run_contract_hash)
+    _require(_text(request["run_contract_hash"], r"[0-9a-f]{64}") == expected_hash)
     raw_open = _integer(request["bar_open_ms"])
     _require(raw_open < 2**59 and request["bar_duration_ms"] == 60_000)
     step = _integer(request["step_index"])

@@ -22,6 +22,7 @@ _FAILURES = "UNSUPPORTED_CONFIGURATION PERSISTENCE_FAILED CALLBACK_FAILED NATIVE
 _P1_RUN_CONTRACT = "SPIDER_SYNTHETIC_P1_RUN_V1"
 _P2_RUN_CONTRACT = "SPIDER_SYNTHETIC_P2_CONFIGURED_RUN_V1"
 _P3_RUN_CONTRACT = "SPIDER_HISTORICAL_RESEARCH_RUN_V1"
+_PAID_RUN_CONTRACT = "SPIDER_PAID_RESEARCH_RUN_V1"
 _P3_SELECTOR = "SPIDER_HISTORICAL_RESEARCH_RUN_V1"
 _HISTORICAL_MODELS = ("OHLC4_OPEN_HIGH_LOW_CLOSE_V1", "OHLC4_OPEN_LOW_HIGH_CLOSE_V1")
 
@@ -44,6 +45,16 @@ class HistoricalContext(NamedTuple):
     coverage_sha256: str
     model_id: str
     model_version: int
+
+
+class ExecutionContext(NamedTuple):
+    schema_version: str
+    policy_id: str
+    endpoint_policy_id: str
+    execution_input_sha256: str
+    policy_end_ms: int
+    settlement_end_ms: int
+    generation: int
 
 
 def _require(condition: bool) -> None:
@@ -157,6 +168,30 @@ def _historical_context(value: object) -> dict[str, object]:
     return historical_context(value)._asdict()
 
 
+def execution_context(value: object) -> ExecutionContext:
+    """Validate the closed identity/cutoff context shared by paid artifacts."""
+    if type(value) is ExecutionContext:
+        row = value._asdict()
+    else:
+        row = _object(
+            value,
+            "schema_version policy_id endpoint_policy_id execution_input_sha256 policy_end_ms settlement_end_ms generation",
+        )
+    _enum(row["schema_version"], ["spider_execution_context_v1"])
+    _enum(row["policy_id"], ["SPIDER_HOST_ORIGINAL_PAID_V1"])
+    _enum(row["endpoint_policy_id"], ["PAID_CLOSE_RESEARCH_V1"])
+    _text(row["execution_input_sha256"], r"[0-9a-f]{64}")
+    policy_end = _integer(row["policy_end_ms"])
+    settlement_end = _integer(row["settlement_end_ms"])
+    generation = _integer(row["generation"])
+    _require(policy_end < settlement_end and generation == 0)
+    return ExecutionContext(
+        cast(str, row["schema_version"]), cast(str, row["policy_id"]),
+        cast(str, row["endpoint_policy_id"]), cast(str, row["execution_input_sha256"]),
+        policy_end, settlement_end, generation,
+    )
+
+
 def _artifact_contexts(value: object) -> tuple[ConfigurationContext | None, HistoricalContext | None]:
     _require(type(value) is dict)
     row = cast(dict[str, object], value)
@@ -257,11 +292,15 @@ def _boundary(value: object) -> None:
         _text(row["barrier_id"])
 
 
-def _attempt(row: dict[str, object]) -> None:
-    _object(row, "schema_version run_id run_contract_id registration_state requested_scenario_selector registration_failure input_contract_hashes planned_coverage " + " ".join(_IDENTITIES), "configuration_context historical_context")
+def _attempt(row: dict[str, object], *, paid_execution: bool = False) -> None:
+    required = "schema_version run_id run_contract_id registration_state requested_scenario_selector registration_failure input_contract_hashes planned_coverage " + " ".join(_IDENTITIES)
+    optional = "configuration_context historical_context"
+    if paid_execution:
+        required += " execution_context"
+    _object(row, required, optional)
     context = _optional_context(row)
     historical = _optional_historical_context(row)
-    run_contract = _enum(row["run_contract_id"], [_P1_RUN_CONTRACT, _P2_RUN_CONTRACT, _P3_RUN_CONTRACT])
+    run_contract = _enum(row["run_contract_id"], [_P1_RUN_CONTRACT, _P2_RUN_CONTRACT, _P3_RUN_CONTRACT, *([_PAID_RUN_CONTRACT] if paid_execution else [])])
     _text(row["requested_scenario_selector"], r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
     state = _enum(row["registration_state"], ["VALIDATED", "REJECTED"])
     hashes, coverage = _list(row["input_contract_hashes"]), _list(row["planned_coverage"])
@@ -292,14 +331,20 @@ def _attempt(row: dict[str, object]) -> None:
     for key, value in account.items():
         if key != "subaccount" or value is not None:
             _text(value)
-    if run_contract == _P3_RUN_CONTRACT:
+    if run_contract in (_P3_RUN_CONTRACT, _PAID_RUN_CONTRACT):
         _require(account["venue"] == "SPIDER_HISTORICAL_RESEARCH")
         _require(account["environment"] == "RESEARCH_ONLY")
         _require("subaccount" not in account or account["subaccount"] is None)
         assert historical is not None
-        _require(row["requested_scenario_selector"] == _P3_SELECTOR)
-        _require(row["scenario_plan_id"] == _P3_SELECTOR)
-        _require(row["scenario_plan_sha256"] == historical["historical_input_sha256"])
+        if run_contract == _P3_RUN_CONTRACT:
+            _require(row["requested_scenario_selector"] == _P3_SELECTOR)
+            _require(row["scenario_plan_id"] == _P3_SELECTOR)
+            _require(row["scenario_plan_sha256"] == historical["historical_input_sha256"])
+        else:
+            _require(paid_execution and row["requested_scenario_selector"] == _PAID_RUN_CONTRACT
+                     and row["scenario_plan_id"] == _PAID_RUN_CONTRACT)
+            _require(row["registration_state"] == "VALIDATED" and row["registration_failure"] is None)
+            _require(row["scenario_plan_sha256"] == execution_context(row["execution_context"]).execution_input_sha256)
     for key in _HASHES:
         _text(row[key], "[0-9a-f]{64}")
     _require(len(hashes) == len(_HASH_NAMES))
@@ -307,19 +352,19 @@ def _attempt(row: dict[str, object]) -> None:
         entry = _object(item, "name sha256")
         _require(entry["name"] == name)
         _text(entry["sha256"], "[0-9a-f]{64}")
-    expected_ordering = "HISTORICAL_ORDER_V1" if run_contract == _P3_RUN_CONTRACT else "S_order_v1"
-    expected_cost = "SPIDER_HISTORICAL_RESEARCH_COSTS_V1" if run_contract == _P3_RUN_CONTRACT else "SPIDER_SYNTHETIC_COSTS_V1"
+    expected_ordering = "HISTORICAL_ORDER_V1" if run_contract in (_P3_RUN_CONTRACT, _PAID_RUN_CONTRACT) else "S_order_v1"
+    expected_cost = "SPIDER_HISTORICAL_RESEARCH_COSTS_V1" if run_contract in (_P3_RUN_CONTRACT, _PAID_RUN_CONTRACT) else "SPIDER_SYNTHETIC_COSTS_V1"
     _require(row["ordering_contract_id"] == expected_ordering)
     _require(row["cost_contract_id"] == expected_cost)
     expected_funding = (
-        "HISTORICAL_FUNDING_DISABLED" if run_contract == _P3_RUN_CONTRACT
+        "HISTORICAL_FUNDING_DISABLED" if run_contract in (_P3_RUN_CONTRACT, _PAID_RUN_CONTRACT)
         else "SYNTHETIC_P1_NO_FUNDING_INPUT_OR_CLAIM" if run_contract == _P1_RUN_CONTRACT
         else "SYNTHETIC_P2_NO_FUNDING_INPUT_OR_CLAIM"
     )
     _require(row["funding_exclusion"] == expected_funding)
     _require(row["artifact_encoding"] == "artifact_encoding_v1")
-    if run_contract == _P3_RUN_CONTRACT:
-        _require(row["terminal_policy"] == "MTM_PRESERVE_OPEN_V1")
+    if run_contract in (_P3_RUN_CONTRACT, _PAID_RUN_CONTRACT):
+        _require(row["terminal_policy"] == ("PAID_CLOSE_RESEARCH_V1" if run_contract == _PAID_RUN_CONTRACT else "MTM_PRESERVE_OPEN_V1"))
         _require(bool(coverage))
     else:
         _enum(row["terminal_policy"], _TERMINALS)
@@ -330,11 +375,15 @@ def _attempt(row: dict[str, object]) -> None:
         barrier = _text(entry["barrier_id"])
         _require(barrier not in seen)
         seen.add(barrier)
-        _enum(entry["record_kind"], _P3_COVERAGE_KINDS if run_contract == _P3_RUN_CONTRACT else _KINDS)
+        coverage_kinds = [*_P3_COVERAGE_KINDS, *( ["PAID_ENDPOINT_DRAIN"] if paid_execution else [])]
+        _enum(entry["record_kind"], coverage_kinds if run_contract in (_P3_RUN_CONTRACT, _PAID_RUN_CONTRACT) else _KINDS)
 
 
-def _status(row: dict[str, object]) -> None:
-    _object(row, "schema_version run_id state processed_boundary persisted_boundary failure_reason primary_failure", "configuration_context historical_context")
+def _status(row: dict[str, object], *, paid_execution: bool = False) -> None:
+    required = "schema_version run_id state processed_boundary persisted_boundary failure_reason primary_failure"
+    if paid_execution:
+        required += " execution_context"
+    _object(row, required, "configuration_context historical_context")
     configuration = _optional_context(row)
     historical = _optional_historical_context(row)
     _require(historical is None or configuration is not None)
