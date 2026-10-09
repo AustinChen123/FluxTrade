@@ -393,6 +393,10 @@ export function validateToolchain(snapshot) {
       "node_modules/nanoid": [
         "3.3.18",
         "sha512-DTg4MJbGMWkfi6VZFdNt2/caMbQy4Ou+Op/hJQvGEWcnVfoA1QA+xzRKAzw9jD6+GVOOeYr/mIcuDSdug6F6+w=="
+      ],
+      "node_modules/source-map-js": [
+        "1.2.2",
+        "sha512-KGj/8Y43x35aZVDtt+J4mK1hoLGHULMYfSkODJNQjNDC3oW1PqPoxMwo0pLUsWM/UEGzON/NxeHywEfNXNP3Vw=="
       ]
     };
     for (const [name, [version, integrity]] of Object.entries(lockContracts)) {
@@ -611,6 +615,8 @@ describe("frontend toolchain contract", () => {
       (value) => { value.fixtures.documentCounts.extra = 1; },
       (value) => { value.packageJson.dependencies.nanoid = "3.3.18"; },
       (value) => { value.packageJson.overrides = { nanoid: "3.3.18" }; },
+      (value) => { value.packageLock.packages["node_modules/source-map-js"].version = "1.2.1"; },
+      (value) => { value.packageLock.packages["node_modules/source-map-js"].integrity = "sha512-UXWMKhLOwVKb728IUtQPXxfYU+usdybtUrK/8uGE8CQMvrhOpwvzDBwj0QhSL7MQc7vIsISBG8VQ8+IDQxpfQA=="; },
       (value) => { value.playwrightConfig.projects[0].use.channel = "chrome"; }
     ];
     const selectedLockPaths = [
@@ -620,7 +626,8 @@ describe("frontend toolchain contract", () => {
       "node_modules/playwright/node_modules/fsevents",
       "node_modules/@types/node",
       "node_modules/undici-types",
-      "node_modules/nanoid"
+      "node_modules/nanoid",
+      "node_modules/source-map-js"
     ].flatMap((name) => [
       ["packageLock", "packages", name, "version"],
       ["packageLock", "packages", name, "integrity"]
