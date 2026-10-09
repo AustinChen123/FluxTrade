@@ -437,6 +437,88 @@ mod tests {
     }
 
     #[test]
+    fn planned_restart_requires_valid_clean_marker_and_never_renews_same_id() {
+        let start = Instant::now();
+        let mut grace = PlannedRestartGrace::default();
+
+        assert_eq!(
+            grace.observe_marker(
+                Some(r#"{"state":"CLEAN","boot_id":"boot-a"}"#),
+                1_000,
+                start
+            ),
+            GraceUpdate::Started
+        );
+        assert_eq!(
+            grace.observe_marker(
+                Some(r#"{"state":"CLEAN","boot_id":"boot-a"}"#),
+                2_000,
+                start + Duration::from_secs(20)
+            ),
+            GraceUpdate::Retained
+        );
+        assert!(grace.missing_is_suppressed(start + Duration::from_secs(29)));
+        assert!(!grace.missing_is_suppressed(start + Duration::from_secs(30)));
+        assert!(grace.missing_expired(start + Duration::from_secs(30)));
+
+        assert_eq!(
+            grace.observe_marker(
+                Some(r#"{"state":"CLEAN","boot_id":"boot-a"}"#),
+                3_000,
+                start + Duration::from_secs(31)
+            ),
+            GraceUpdate::Retained
+        );
+        assert!(grace.missing_expired(start + Duration::from_secs(31)));
+    }
+
+    #[test]
+    fn planned_restart_keeps_deadline_across_new_unclean_marker_and_needs_new_heartbeat() {
+        let start = Instant::now();
+        let mut grace = PlannedRestartGrace::default();
+        grace.observe_marker(
+            Some(r#"{"state":"CLEAN","boot_id":"boot-a"}"#),
+            10_000,
+            start,
+        );
+
+        assert_eq!(
+            grace.observe_marker(
+                Some(r#"{"state":"UNCLEAN","boot_id":"boot-b"}"#),
+                12_000,
+                start + Duration::from_secs(10)
+            ),
+            GraceUpdate::Retained
+        );
+        assert!(!grace.confirm_restart_progress(Some("9999"), 12_001));
+        assert!(grace.active.is_some());
+        assert!(grace.confirm_restart_progress(Some("12001"), 12_001));
+        assert!(grace.active.is_none());
+    }
+
+    #[test]
+    fn missing_or_invalid_boot_evidence_cancels_grace() {
+        for marker in [
+            None,
+            Some("not-json"),
+            Some(r#"{"state":"CLEAN","boot_id":""}"#),
+            Some(r#"{"state":"UNKNOWN","boot_id":"boot-a"}"#),
+        ] {
+            let mut grace = PlannedRestartGrace::default();
+            grace.observe_marker(
+                Some(r#"{"state":"CLEAN","boot_id":"boot-a"}"#),
+                1_000,
+                Instant::now(),
+            );
+            assert_eq!(
+                grace.observe_marker(marker, 1_100, Instant::now()),
+                GraceUpdate::Cancelled
+            );
+            assert!(!grace.missing_is_suppressed(Instant::now()));
+        }
+    }
+
+    #[test]
     fn integrated_decision_expires_unarmed_grace_and_never_masks_present_failures() {
         let start = Instant::now();
         let mut grace = PlannedRestartGrace::default();
@@ -544,6 +626,189 @@ mod tests {
         task.abort();
         let _: () = conn
             .del(&[test_heartbeat_key, test_state_key, live_state_key])
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated Redis provided through B3_TEST_REDIS_URL"]
+    async fn clean_boot_marker_suppresses_missing_heartbeat_only_during_restart_grace() {
+        let redis_url = std::env::var("B3_TEST_REDIS_URL")
+            .expect("B3_TEST_REDIS_URL must point to an isolated Redis");
+        let client = redis::Client::open(redis_url.as_str()).unwrap();
+        let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+        let environment = RuntimeEnvironment::new("test").unwrap();
+        let heartbeat_key = environment.key("heartbeat:python");
+        let boot_state_key = environment.key("system:engine_boot_state");
+        let system_state_key = environment.key("system:state");
+
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        conn.set::<_, _, ()>(&system_state_key, "OK").await.unwrap();
+        conn.set::<_, _, ()>(&heartbeat_key, now_ms.to_string())
+            .await
+            .unwrap();
+        conn.set::<_, _, ()>(
+            &boot_state_key,
+            r#"{"state":"CLEAN","boot_id":"isolated-restart-test"}"#,
+        )
+        .await
+        .unwrap();
+        let watchdog =
+            Watchdog::new(&redis_url, environment, EmergencyMitigation::LockdownOnly).unwrap();
+        let task = tokio::spawn(watchdog.run());
+        sleep(Duration::from_millis(1_200)).await;
+        let _: () = conn.del(&heartbeat_key).await.unwrap();
+        sleep(Duration::from_millis(1_200)).await;
+        conn.set::<_, _, ()>(
+            &boot_state_key,
+            r#"{"state":"UNCLEAN","boot_id":"next-isolated-restart-test"}"#,
+        )
+        .await
+        .unwrap();
+        sleep(Duration::from_secs(6)).await;
+
+        let state: String = conn.get(&system_state_key).await.unwrap();
+        assert_eq!(state, "OK");
+        timeout(Duration::from_secs(25), async {
+            loop {
+                let state: Option<String> = conn.get(&system_state_key).await.unwrap();
+                if state.as_deref() == Some("LOCKDOWN") {
+                    break;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("planned restart deadline must trigger without a new missing window");
+        task.abort();
+        let _: () = conn
+            .del(&[heartbeat_key, boot_state_key, system_state_key])
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated Redis provided through B3_TEST_REDIS_URL"]
+    async fn fresh_restart_heartbeat_completes_grace_without_clearing_existing_lockdown() {
+        let redis_url = std::env::var("B3_TEST_REDIS_URL")
+            .expect("B3_TEST_REDIS_URL must point to an isolated Redis");
+        let client = redis::Client::open(redis_url.as_str()).unwrap();
+        let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+        let environment = RuntimeEnvironment::new("test").unwrap();
+        let heartbeat_key = environment.key("heartbeat:python");
+        let boot_state_key = environment.key("system:engine_boot_state");
+        let system_state_key = environment.key("system:state");
+
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        conn.set::<_, _, ()>(&system_state_key, "OK").await.unwrap();
+        conn.set::<_, _, ()>(&heartbeat_key, now_ms.to_string())
+            .await
+            .unwrap();
+        conn.set::<_, _, ()>(
+            &boot_state_key,
+            r#"{"state":"CLEAN","boot_id":"success-restart-a"}"#,
+        )
+        .await
+        .unwrap();
+
+        let watchdog = Watchdog::new(
+            &redis_url,
+            environment.clone(),
+            EmergencyMitigation::LockdownOnly,
+        )
+        .unwrap();
+        let task = tokio::spawn(watchdog.run());
+        sleep(Duration::from_millis(1_200)).await;
+        let _: () = conn.del(&heartbeat_key).await.unwrap();
+        sleep(Duration::from_secs(6)).await;
+        conn.set::<_, _, ()>(
+            &boot_state_key,
+            r#"{"state":"UNCLEAN","boot_id":"success-restart-b"}"#,
+        )
+        .await
+        .unwrap();
+        let resumed_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        conn.set::<_, _, ()>(&heartbeat_key, resumed_at_ms.to_string())
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(1_200)).await;
+
+        let state: String = conn.get(&system_state_key).await.unwrap();
+        assert_eq!(state, "OK");
+        assert!(
+            !task.is_finished(),
+            "watchdog remains active after recovery"
+        );
+        task.abort();
+        let _ = task.await;
+
+        conn.set::<_, _, ()>(&system_state_key, "LOCKDOWN")
+            .await
+            .unwrap();
+        conn.set::<_, _, ()>(&heartbeat_key, resumed_at_ms.to_string())
+            .await
+            .unwrap();
+        conn.set::<_, _, ()>(
+            &boot_state_key,
+            r#"{"state":"CLEAN","boot_id":"locked-restart-c"}"#,
+        )
+        .await
+        .unwrap();
+        let watchdog =
+            Watchdog::new(&redis_url, environment, EmergencyMitigation::LockdownOnly).unwrap();
+        let task = tokio::spawn(watchdog.run());
+        sleep(Duration::from_millis(1_200)).await;
+        let state: String = conn.get(&system_state_key).await.unwrap();
+        assert_eq!(state, "LOCKDOWN");
+        task.abort();
+        let _ = task.await;
+        let _: () = conn
+            .del(&[heartbeat_key, boot_state_key, system_state_key])
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated Redis provided through B3_TEST_REDIS_URL"]
+    async fn boot_marker_read_error_keeps_watchdog_supervised_failure_behavior() {
+        let redis_url = std::env::var("B3_TEST_REDIS_URL")
+            .expect("B3_TEST_REDIS_URL must point to an isolated Redis");
+        let client = redis::Client::open(redis_url.as_str()).unwrap();
+        let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+        let environment = RuntimeEnvironment::new("test").unwrap();
+        let heartbeat_key = environment.key("heartbeat:python");
+        let boot_state_key = environment.key("system:engine_boot_state");
+        let system_state_key = environment.key("system:state");
+        conn.set::<_, _, ()>(&system_state_key, "OK").await.unwrap();
+        conn.set::<_, _, ()>(&heartbeat_key, "0").await.unwrap();
+        conn.rpush::<_, _, ()>(&boot_state_key, "invalid-type")
+            .await
+            .unwrap();
+
+        let watchdog =
+            Watchdog::new(&redis_url, environment, EmergencyMitigation::LockdownOnly).unwrap();
+        let task = tokio::spawn(watchdog.run());
+        let result = timeout(Duration::from_secs(3), task)
+            .await
+            .expect("watchdog must exit on boot-marker Redis read error")
+            .expect("watchdog task must not panic");
+        let error = result.expect_err("wrong-type boot marker must fail the watchdog read");
+        assert!(error
+            .to_string()
+            .contains("Watchdog failed to read engine boot state from Redis"));
+        let state: String = conn.get(&system_state_key).await.unwrap();
+        assert_eq!(state, "OK");
+        let _: () = conn
+            .del(&[heartbeat_key, boot_state_key, system_state_key])
             .await
             .unwrap();
     }
