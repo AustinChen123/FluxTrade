@@ -2038,7 +2038,7 @@ class TestEngineInit:
         engine.startup()
 
         assert isinstance(engine._venue_runtime, NoopRuntimeCapabilities)
-        assert phase_mocks["_restore_active_strategies_on_startup"].called is restores
+        phase_mocks["_restore_active_strategies_on_startup"].assert_called_once_with()
         assert engine._startup_lock_cause == blocking_reason
         assert engine._halt_for_kill_switch.call_count == (1 if restores else 2)
         phase_mocks["_start_heartbeat"].assert_called_once_with()
@@ -2253,6 +2253,55 @@ class TestEngineInit:
             "startup_restore_class_missing",
             actor="system",
         )
+
+    @pytest.mark.parametrize(
+        "runtime_mapping", ["strategy_instances", "portfolio_instances"]
+    )
+    def test_startup_restore_skips_existing_runtime_identity_under_lifecycle_lock(
+        self,
+        engine,
+        runtime_mapping,
+    ):
+        existing = MagicMock()
+        getattr(engine, runtime_mapping)["alpha"] = existing
+        engine._strategy_activation.activate_locked = MagicMock()
+
+        result = engine.activate_strategy(
+            "alpha",
+            actor="system",
+            reason="startup_restore",
+            force=True,
+        )
+
+        assert result is True
+        engine._strategy_activation.activate_locked.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "status", [StrategyStatus.STOPPED.value, StrategyStatus.ERROR.value]
+    )
+    def test_startup_restore_rechecks_durable_status_despite_force(
+        self, engine, status
+    ):
+        state = MagicMock(status=status)
+        db = MagicMock()
+        db.query.return_value.filter.return_value.first.return_value = state
+        engine._db_session_factory = lambda: nullcontext(db)
+        engine._strategy_activation._hydration.warm_up = MagicMock()
+        engine._strategy_activation._transition_to_running = MagicMock()
+        engine._strategy_activation._transition_to_error = MagicMock()
+
+        result = engine.activate_strategy(
+            "alpha",
+            actor="system",
+            reason="startup_restore",
+            force=True,
+        )
+
+        assert result is False
+        assert state.status == status
+        engine._strategy_activation._hydration.warm_up.assert_not_called()
+        engine._strategy_activation._transition_to_running.assert_not_called()
+        engine._strategy_activation._transition_to_error.assert_not_called()
 
     def test_startup_restore_delegates_with_current_engine_dependencies(self, engine):
         engine.activate_strategy = MagicMock()
@@ -4970,7 +5019,7 @@ class TestHeartbeatRecording:
         gate.arm.assert_not_called()
         assert engine._halt_for_kill_switch.call_count == 2
         assert engine._startup_lock_cause == "synthetic_venue_reconciliation_blocked"
-        engine._restore_active_strategies_on_startup.assert_not_called()
+        engine._restore_active_strategies_on_startup.assert_called_once_with()
 
     @pytest.mark.parametrize("summary", [0, "", []])
     def test_falsey_malformed_rithmic_startup_remains_locked_and_continues(
@@ -7252,7 +7301,7 @@ class TestPersistentKillSwitchState:
 
         assert engine._resume_after_kill_switch.called is resumes
         engine.ops_safety.kill_switch.assert_not_called()
-        assert engine._restore_active_strategies_on_startup.called is resumes
+        engine._restore_active_strategies_on_startup.assert_called_once_with()
 
     def test_generic_reconciliation_cannot_auto_resume_unclean_startup(self, engine):
         engine._startup_auto_recovery_allowed = True
@@ -7319,7 +7368,7 @@ class TestPersistentKillSwitchState:
         assert engine._kill_switch_halted is True
         assert engine.execution_engine._submissions_halted is True
 
-    def test_startup_recovers_lockdown_without_restoring_strategies(self, engine):
+    def test_startup_restores_strategies_while_persisted_lockdown_remains(self, engine):
         engine.redis_client.get.return_value = "LOCKDOWN"
         engine.ops_safety.kill_switch = MagicMock(return_value={})
         engine._reconcile_balance = MagicMock()
@@ -7337,7 +7386,7 @@ class TestPersistentKillSwitchState:
             actor="startup_recovery",
             reason="persisted_lockdown",
         )
-        engine._restore_active_strategies_on_startup.assert_not_called()
+        engine._restore_active_strategies_on_startup.assert_called_once_with()
 
     def test_startup_does_not_recover_after_concurrent_manual_clear(self, engine):
         def cleared_after_read():
@@ -8286,7 +8335,7 @@ class TestExchangeOrderEventThread:
         engine.startup()
 
         assert engine._halt_for_kill_switch.call_count == 2
-        engine._restore_active_strategies_on_startup.assert_not_called()
+        engine._restore_active_strategies_on_startup.assert_called_once_with()
         assert engine._startup_lock_cause == "rithmic_reconciliation_blocked"
 
     def test_event_stream_starts_and_applies_events(self, engine):
@@ -8425,7 +8474,7 @@ class TestExchangeOrderEventThread:
         engine._halt_for_kill_switch.assert_called_once_with()
         engine.execution_engine.latch_order_event_stream_failure.assert_called_once_with()
 
-    def test_start_failure_keeps_recovery_surfaces_and_skips_strategy_restore(
+    def test_start_failure_keeps_recovery_surfaces_and_restores_strategies_while_halted(
         self,
         engine,
     ) -> None:
@@ -8452,7 +8501,7 @@ class TestExchangeOrderEventThread:
         engine._start_command_listener.assert_called_once_with()
         engine._start_heartbeat.assert_called_once_with()
         engine.scan_strategies.assert_called_once_with()
-        engine._restore_active_strategies_on_startup.assert_not_called()
+        engine._restore_active_strategies_on_startup.assert_called_once_with()
         engine.execution_engine.latch_order_event_stream_failure.assert_called_once_with()
 
     @pytest.mark.parametrize(

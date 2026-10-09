@@ -1215,3 +1215,104 @@ def test_restart_restore_warms_and_blocks_duplicate_entry_with_real_session(
     assert audits[0].risk_status == "REJECT"
     assert audits[0].risk_message is not None
     assert "existing_position_entry_duplicate" in audits[0].risk_message
+
+
+def test_locked_startup_restores_active_strategy_without_broker_mutation(
+    engine_factory,
+    sqlite_lifecycle_session_factory,
+):
+    session_factory = sqlite_lifecycle_session_factory
+    with session_factory() as session:
+        session.add(Strategy(id="s1", name="Strategy 1"))
+        session.add_all(make_orm_candles())
+        session.add(
+            StrategyState(
+                strategy_id="s1",
+                status=StrategyStatus.ACTIVE.value,
+                config_json='{"product_id":"BINANCE:BTCUSDT-PERP"}',
+                version=0,
+            )
+        )
+        session.commit()
+
+    adapter = MagicMock()
+    engine = engine_factory(
+        db_session_factory=session_factory,
+        account_service=RestartAccountService(),
+        adapter=adapter,
+    )
+    engine.loaded_classes["s1"] = EmittingStrategy
+    engine._check_system_state = MagicMock(return_value=True)
+    engine._startup_auto_recovery_allowed = False
+    engine._startup_lock_cause = "explicit_lockdown"
+    engine._run_ops_kill_switch = MagicMock()
+    engine._start_command_listener = MagicMock()
+    engine._reconcile_startup_balance = MagicMock()
+    engine._start_strategy_state_subscriber_on_startup = MagicMock()
+    engine._reconcile_recoverable_orders_on_startup = MagicMock(return_value={})
+    engine._start_exchange_order_event_stream = MagicMock()
+    engine._start_heartbeat = MagicMock()
+    engine.scan_strategies = MagicMock()
+
+    engine.startup()
+
+    restored = engine.strategy_instances["s1"]
+    assert len(restored.candles_received) == 10
+    assert engine._kill_switch_halted is True
+    assert engine.execution_engine._submissions_halted is True
+    adapter.place_order.assert_not_called()
+    adapter.cancel_order.assert_not_called()
+    adapter.cancel_all_orders.assert_not_called()
+
+
+@pytest.mark.parametrize("next_status", [StrategyStatus.STOPPED, StrategyStatus.ERROR])
+def test_startup_restore_does_not_resurrect_state_changed_after_active_query(
+    engine_factory,
+    sqlite_lifecycle_session_factory,
+    next_status,
+):
+    session_factory = sqlite_lifecycle_session_factory
+    with session_factory() as session:
+        session.add(Strategy(id="s1", name="Strategy 1"))
+        session.add_all(make_orm_candles())
+        session.add(
+            StrategyState(
+                strategy_id="s1",
+                status=StrategyStatus.ACTIVE.value,
+                config_json='{"product_id":"BINANCE:BTCUSDT-PERP"}',
+                version=0,
+            )
+        )
+        session.commit()
+
+    engine = engine_factory(
+        db_session_factory=session_factory,
+        account_service=RestartAccountService(),
+    )
+    engine.loaded_classes["s1"] = EmittingStrategy
+    engine._strategy_state_manager.initialize_cache_from_db()
+    activate = engine.activate_strategy
+
+    def race_state_change(strategy_id: str, **kwargs: object):
+        if next_status is StrategyStatus.STOPPED:
+            engine._strategy_state_manager.transition_to_stopped(
+                strategy_id,
+                actor="operator",
+                reason="concurrent stop",
+            )
+        else:
+            engine._strategy_state_manager.transition_to_error(
+                strategy_id,
+                "concurrent error",
+                actor="operator",
+            )
+        return activate(strategy_id, **kwargs)
+
+    engine.activate_strategy = race_state_change
+    engine._restore_active_strategies_on_startup()
+
+    assert "s1" not in engine.strategy_instances
+    with session_factory() as session:
+        state = session.get(StrategyState, "s1")
+    assert state is not None
+    assert state.status == next_status.value

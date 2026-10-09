@@ -446,7 +446,12 @@ class StrategyActivationService:
                 StrategyStatus.STOPPED,
                 StrategyStatus.DISCOVERED,
             }
-            if state is None or (state.status not in startable and not force):
+            startup_restore = actor == "system" and reason == "startup_restore"
+            if (
+                state is None
+                or (startup_restore and state.status != StrategyStatus.ACTIVE.value)
+                or (state.status not in startable and not force)
+            ):
                 self._logger.error(
                     "Strategy %s is not in startable state (Current: %s)",
                     strategy_id,

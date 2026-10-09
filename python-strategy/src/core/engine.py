@@ -907,8 +907,7 @@ class StrategyEngine:
 
         # Initial scan to discover strategies
         run_phase(self.scan_strategies)
-        if not self._kill_switch_halted:
-            run_phase(self._restore_active_strategies_on_startup)
+        run_phase(self._restore_active_strategies_on_startup)
 
     def _initialize_strategy_state_cache_on_startup(self) -> None:
         """Load strategy lifecycle state into the manager cache."""
@@ -1138,6 +1137,18 @@ class StrategyEngine:
     ) -> bool | StrategyStartDisposition:
         """Instantiate/register a strategy and transition it to ACTIVE."""
         with self._strategy_lifecycle_lock(strategy_id):
+            if actor == "system" and reason == "startup_restore":
+                with self._strategy_lock:
+                    already_instantiated = (
+                        strategy_id in self.strategy_instances
+                        or strategy_id in self.portfolio_instances
+                    )
+                if already_instantiated:
+                    logger.info(
+                        "Startup restore skipped existing runtime identity %s",
+                        strategy_id,
+                    )
+                    return True
             return self._strategy_activation.activate_locked(
                 strategy_id,
                 artifact_cls=self._get_loaded_strategy_class(strategy_id),
