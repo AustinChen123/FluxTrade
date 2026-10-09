@@ -32,7 +32,8 @@ _PROGRAM = tuple("python-strategy/src/core/backtest/" + name + ".py" for name in
     "synthetic_scenario_codec", "synthetic_scenario_replay", "synthetic_policy_dispatch", "spider_policy", "spider_policy_protocol", "spider_run_admission",
     "spider_run_artifacts", "spider_run_completion_schema", "spider_run_envelope_schema", "spider_run_evidence",
     "spider_run_native_schema", "spider_run_reconciliation_schema", "spider_run_store", "spider_scenario_plan_liquidation",
-    "spider_scenario_plan_o03", "spider_scenario_plan_scheduled", "spider_scenario_plans", "spider_scenario_run"))
+    "spider_scenario_plan_o03", "spider_scenario_plan_scheduled", "spider_scenario_plans", "spider_scenario_run",
+    "spider_execution_input", "spider_paid_endpoint"))
 _POLICY = "eb6ab34d8685fb59e286f5ffda8af24cbecf3e5ab2c729c585ccdca797cac336"
 _P3_POLICY_SOURCE = "4dbf2bdbee87d4100004fe5b14a93f597e64a9bca6525ed2902afd3476ee40ec"
 _P2_SELECTOR = "SPIDER_P2_CONFIGURED_SCALE_V1"

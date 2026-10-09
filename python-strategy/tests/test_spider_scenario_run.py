@@ -90,9 +90,9 @@ def queue_frozen_h03_order(composition: run._ReplayComposition, value: Historica
     )
 
 
-def frozen_h03_factory(original: Callable[[object], run._ReplayComposition]):
-    def with_frozen_order(run: object) -> run._ReplayComposition:
-        composition = original(run)
+def frozen_h03_factory(original: Callable[..., run._ReplayComposition]):
+    def with_frozen_order(run: object, *, paid_endpoint=None) -> run._ReplayComposition:
+        composition = original(run, paid_endpoint=paid_endpoint)
         queue_frozen_h03_order(composition, cast(HistoricalRunInput, run))
         return composition
 
@@ -155,8 +155,10 @@ def test_real_runs_registration_order_exact_artifacts_and_one_admission(tmp_path
     attempt = read(tmp_path, "r1", "attempt.json")[0]
     assert attempt["native_artifact_sha256"] == sha256(Path(wire.loaded_native_artifact_path()).read_bytes()).hexdigest()
     records = [(name.encode(), sha256((run._ROOT / name).read_bytes()).digest()) for name in sorted(run._PROGRAM)]
-    assert len(records) == len(set(run._PROGRAM)) == 18
+    assert len(records) == len(set(run._PROGRAM)) == 20
     assert "python-strategy/src/core/backtest/synthetic_policy_dispatch.py" in run._PROGRAM
+    assert "python-strategy/src/core/backtest/spider_execution_input.py" in run._PROGRAM
+    assert "python-strategy/src/core/backtest/spider_paid_endpoint.py" in run._PROGRAM
     assert attempt["program_sha256"] == sha256(b"".join(len(name).to_bytes(8, "big") + name + digest for name, digest in records)).hexdigest()
 
 
@@ -1300,8 +1302,10 @@ def test_configured_runner_projects_finalizes_and_admits_exact_forty_barriers(tm
     assert finalizes[0]["reconciliation"]["result"] == "OK"
     assert admissions[0][0]["decision"] == "ACCEPT" and admissions[0][1] == admissions[0][2]
     assert len(owners) == 1
-    assert len(run._PROGRAM) == 18
+    assert len(run._PROGRAM) == 20
     assert "python-strategy/src/core/backtest/synthetic_policy_dispatch.py" in run._PROGRAM
+    assert "python-strategy/src/core/backtest/spider_execution_input.py" in run._PROGRAM
+    assert "python-strategy/src/core/backtest/spider_paid_endpoint.py" in run._PROGRAM
     records = [(name.encode(), sha256((run._ROOT / name).read_bytes()).digest())
                for name in sorted((*run._PROGRAM, "python-strategy/src/core/backtest/spider_configured_scale_input.py"))]
     expected_program = sha256(b"".join(len(name).to_bytes(8, "big") + name + digest for name, digest in records)).hexdigest()

@@ -18,6 +18,8 @@ from src.core.backtest.spider_historical_input import (
 )
 from src.core.backtest.spider_policy import Policy
 from src.core.backtest.synthetic_policy_dispatch import apply_policy_payload
+from src.core.backtest.spider_paid_endpoint import PaidEndpoint
+from src.core.backtest.spider_run_artifacts import decode_canonical
 
 
 def _pairing_check(condition: bool) -> None:
@@ -352,9 +354,27 @@ class _ReplayComposition:
         self._historical_run: object | None = None
         self._historical_bars: dict[tuple[int, str], tuple[HistoricalBar, HistoricalBar]] = {}
         self._historical_step_sequence = 0
+        self._paid_endpoint: PaidEndpoint | None = None
+        self._paid_role_by_client: dict[str, str] = {}
+        self._paid_cancel_attempted_orders: set[str] = set()
+        self._paid_cancel_pending_orders: set[str] = set()
+        self._paid_terminal_reason: str | None = None
+        self._paid_native_terminal: str | None = None
 
     @classmethod
-    def _from_historical_run(cls, run: object) -> "_ReplayComposition":
+    def _from_execution_run(cls, request: object) -> "_ReplayComposition":
+        """Admit a paid wrapper before deriving any native account or event identity."""
+        from src.core.backtest.spider_execution_input import SpiderExecutionInput
+
+        if type(request) is not SpiderExecutionInput:
+            raise ValueError("UNSUPPORTED_CONFIGURATION")
+        paid_endpoint = PaidEndpoint.admit(request)
+        return cls._from_historical_run(request.historical_input, paid_endpoint=paid_endpoint)
+
+    @classmethod
+    def _from_historical_run(
+        cls, run: object, *, paid_endpoint: PaidEndpoint | None = None,
+    ) -> "_ReplayComposition":
         """Admit and project a P3 run fully before constructing its sole owner."""
         from src.core.backtest.spider_historical_replay import (
             _historical_market_item,
@@ -379,9 +399,12 @@ class _ReplayComposition:
             configuration=configuration,
         )
         _restore_initial_policy(composition, historical_run, prepared)
-        composition._historical_poll_range = (historical_run.range_start_ms, historical_run.range_end_ms)
+        composition._paid_endpoint = paid_endpoint
+        poll_end = paid_endpoint.policy_end_ms if paid_endpoint is not None else historical_run.range_end_ms
+        composition._historical_poll_range = (historical_run.range_start_ms, poll_end)
         composition._historical_order_contract = dict(
-            run_contract_hash=prepared.contract_hash,
+            run_contract_hash=(paid_endpoint.contract_hash if paid_endpoint is not None
+                               else prepared.contract_hash),
             config_id=prepared.configuration["config_id"],
             strategy_identity=historical_run.strategy_identity,
             order_accept_delay_ms=historical_run.order_accept_delay_ms,
@@ -389,6 +412,7 @@ class _ReplayComposition:
             cancel_ack_delay_ms=historical_run.cancel_ack_delay_ms,
             order_notice_delay_ms=historical_run.order_notice_delay_ms,
             range_end_ms=historical_run.range_end_ms,
+            policy_end_ms=poll_end,
         )
         composition._historical_run = historical_run
         marks = {(bar.bar_open_ms, bar.product_id): bar for bar in historical_run.mark_bars}
@@ -403,9 +427,10 @@ class _ReplayComposition:
             result = composition._enqueue(_historical_market_item(snapshot, sequence))
             if result["classification"] != "PENDING":
                 raise ValueError("INVALID_SCHEMA")
-        for sequence, raw_at in enumerate(range(historical_run.range_start_ms + 5_000, historical_run.range_end_ms, 5_000)):
+        for sequence, raw_at in enumerate(range(historical_run.range_start_ms + 5_000, poll_end, 5_000)):
+            prefix = f"PAID_{paid_endpoint.contract_hash[:16]}_" if paid_endpoint is not None else "P3_"
             item = dict(kind="HISTORICAL_TIMER", schedule_sequence=sequence,
-                        stable_id=f"P3_TIMER_{raw_at}", raw_at=raw_at)
+                        stable_id=f"{prefix}TIMER_{raw_at}", raw_at=raw_at)
             result = composition._enqueue(item)
             if result["classification"] != "PENDING":
                 raise ValueError("INVALID_SCHEMA")
@@ -416,6 +441,23 @@ class _ReplayComposition:
         if result["classification"] != "PENDING":
             raise ValueError("INVALID_SCHEMA")
         composition._historical_step_sequence = 1
+        if paid_endpoint is not None:
+            admitted_endpoint = composition._paid_endpoint
+            if admitted_endpoint is None:
+                raise ValueError("INVALID_SCHEMA")
+            configuration_rows = cast(dict[str, Any], prepared.configuration)
+            for seed_order in cast(list[dict[str, Any]], configuration_rows["orders"]):
+                composition._paid_role_by_client[seed_order["client_order_id"]] = "GRID"
+                admitted_endpoint.roles_by_order[seed_order["order_id"]] = "GRID"
+            marker = dict(
+                kind="PAID_ENDPOINT_DRAIN",
+                stable_id=f"PAID_DRAIN_{paid_endpoint.contract_hash[:16]}",
+                raw_at=paid_endpoint.policy_end_ms,
+                run_contract_hash=paid_endpoint.contract_hash,
+            )
+            result = composition._enqueue(marker)
+            if result["classification"] != "PENDING":
+                raise ValueError("INVALID_SCHEMA")
         return composition
 
     def _historical_node_item(
@@ -501,7 +543,30 @@ class _ReplayComposition:
     @staticmethod
     def _queue_label(queue_class: int) -> str:
         return ("SOURCE_GROUP", "SNAPSHOT_CAPTURE", "DELIVERY", "HISTORICAL_MARKET_STEP",
-                "HISTORICAL_MARKET_CACHE", "HISTORICAL_TIMER")[queue_class]
+                "HISTORICAL_MARKET_CACHE", "HISTORICAL_TIMER", "PAID_ENDPOINT_DRAIN")[queue_class]
+
+    def _paid_source_control_enabled(self, visible_at: int) -> bool:
+        paid = self._paid_endpoint
+        return paid is None or (
+            self._paid_native_terminal is None and paid.source_enabled(visible_at)
+        )
+
+    def _paid_snapshot_request(self, kind: str, cutoff: int, prefix: str) -> dict[str, Any]:
+        return dict(
+            schema_version="snapshot_request_v1",
+            account_key=deepcopy(self._account),
+            snapshot_id=f"{prefix}_{kind}",
+            snapshot_kind=kind,
+            capture_mode="OWNER_CURRENT",
+            captured_at=cutoff,
+        )
+
+    @staticmethod
+    def _paid_error_payload(error: Exception) -> dict[str, Any] | None:
+        return wire._native_failure(error)
+
+    def _paid_inspection(self) -> wire.Inspection:
+        return self._codec.inspect_state()
 
     def _historical_audit_delivery(self, delivery: wire.Delivery) -> bool:
         poll_notice = (self._historical_poll_range is not None
@@ -678,13 +743,31 @@ class _ReplayComposition:
                 sequence, stable, raw = row["schedule_sequence"], row["stable_id"], row["raw_at"]
                 sequence_bytes = policy_protocol._plan_sequence(sequence)
                 stable_bytes = policy_protocol._event_id(stable)
+                timer_prefix = (f"PAID_{self._paid_endpoint.contract_hash[:16]}_"
+                                if self._paid_endpoint is not None else "P3_")
                 if (type(raw) is not int or raw < self._historical_poll_range[0]
                         or raw >= self._historical_poll_range[1] or raw % 5_000 != self._historical_poll_range[0] % 5_000
-                        or stable != f"P3_TIMER_{raw}"):
+                        or stable != f"{timer_prefix}TIMER_{raw}"):
                     raise _ScheduleError("INVALID_SCHEMA")
                 at = raw * 16 + 9
                 content = sequence_bytes + stable_bytes + policy_protocol._event_integer(raw)
                 account, cls = self._account, 5
+            elif kind == "PAID_ENDPOINT_DRAIN":
+                row = cast(dict[str, Any], policy_protocol._event_object(
+                    item, "kind stable_id raw_at run_contract_hash"
+                ))
+                paid = self._paid_endpoint
+                if paid is None:
+                    raise _ScheduleError("INVALID_SCHEMA")
+                sequence, stable, raw = 0, row["stable_id"], row["raw_at"]
+                if (type(raw) is not int or raw != paid.policy_end_ms
+                        or row["run_contract_hash"] != paid.contract_hash
+                        or stable != f"PAID_DRAIN_{paid.contract_hash[:16]}"):
+                    raise _ScheduleError("INVALID_SCHEMA")
+                at = raw * 16 + 7
+                content = (policy_protocol._plan_hash(paid.contract_hash)
+                           + policy_protocol._event_integer(raw))
+                account, cls = self._account, 6
             else:
                 raise _ScheduleError("INVALID_SCHEMA")
             if policy_protocol._plan_account(account) != policy_protocol._plan_account(self._account):
@@ -699,7 +782,7 @@ class _ReplayComposition:
                 return dict(key=(at, cls, sequence, stable), content=content, item=deepcopy(item), plan=None,
                             raw_time_ms=historical_cache_raw_time,
                             result=dict(kind=kind, stable_id=stable, classification="PENDING"))
-            if kind == "HISTORICAL_TIMER":
+            if kind in ("HISTORICAL_TIMER", "PAID_ENDPOINT_DRAIN"):
                 return dict(key=(at, cls, sequence, stable), content=content, item=deepcopy(item), plan=None,
                             raw_time_ms=raw,
                             result=dict(kind=kind, stable_id=stable, classification="PENDING"))
@@ -757,10 +840,10 @@ class _ReplayComposition:
             return self._admit_set([(item, plan)])[0]
         except Exception as exc:
             kind = item.get("kind") if isinstance(item, dict) else "QUEUE"
-            kind = kind if isinstance(kind, str) and kind in ("SOURCE_GROUP", "SNAPSHOT_CAPTURE", "DELIVERY", "HISTORICAL_MARKET_STEP", "HISTORICAL_MARKET_CACHE", "HISTORICAL_TIMER") else "QUEUE"
+            kind = kind if isinstance(kind, str) and kind in ("SOURCE_GROUP", "SNAPSHOT_CAPTURE", "DELIVERY", "HISTORICAL_MARKET_STEP", "HISTORICAL_MARKET_CACHE", "HISTORICAL_TIMER", "PAID_ENDPOINT_DRAIN") else "QUEUE"
             field, identity = {"SOURCE_GROUP": ("group", "group_id"), "SNAPSHOT_CAPTURE": ("request", "snapshot_id"), "DELIVERY": ("delivery", "delivery_id"), "HISTORICAL_MARKET_STEP": ("", "stable_id"), "HISTORICAL_MARKET_CACHE": ("", "stable_id"), "HISTORICAL_TIMER": ("", "stable_id")}.get(kind or "", ("", ""))
             value = item.get(field) if isinstance(item, dict) else None
-            if kind in ("HISTORICAL_MARKET_STEP", "HISTORICAL_MARKET_CACHE", "HISTORICAL_TIMER"):
+            if kind in ("HISTORICAL_MARKET_STEP", "HISTORICAL_MARKET_CACHE", "HISTORICAL_TIMER", "PAID_ENDPOINT_DRAIN"):
                 value = item
             return self._stop_scheduler(exc, kind, value.get(identity) if isinstance(value, dict) else None)
 
@@ -808,6 +891,9 @@ class _ReplayComposition:
             prefix = _CallbackPrefix((), None)
             self._audit[delivery["delivery_id"]] = []
             self._callback_evidence(record, prefix, [], "CONSUMER_DEDUPLICATED")
+            if self._paid_endpoint is not None:
+                self._paid_endpoint.pending_delivery_ids.discard(delivery["delivery_id"])
+                self._paid_endpoint.progress(self, "DELIVERY")
             return []
         next_stage = None
         if delivery.get("continuation_id") is not None:
@@ -860,6 +946,14 @@ class _ReplayComposition:
         self._admit_set(derived)
         if execution_fact_id is not None:
             self._p3_execution_notice_delivered_facts.add(execution_fact_id)
+        if self._paid_endpoint is not None:
+            self._paid_endpoint.pending_delivery_ids.discard(delivery["delivery_id"])
+            action = self._paid_endpoint.cancel_ack_action_by_delivery.pop(delivery["delivery_id"], None)
+            if action is not None:
+                order_id = action.get("order_id")
+                if isinstance(order_id, str):
+                    self._paid_cancel_pending_orders.discard(order_id)
+            self._paid_endpoint.progress(self, "DELIVERY")
         return deepcopy(events)
 
     def _historical_order_children(self, record, policy_events, audit_events):
@@ -922,7 +1016,7 @@ class _ReplayComposition:
                     dependency = dict(
                         client_order_id=order["clOrdId"], product_id=product_id,
                         strategy_id=contract["strategy_identity"], group_id=None,
-                        event_id=None, state="PENDING", binding=None,
+                        event_id=None, state="PENDING", binding=None, role="GRID",
                     )
                 else:
                     if event["kind"] != "cancel" or not order.get("ordId"):
@@ -964,6 +1058,8 @@ class _ReplayComposition:
                     dependency["event_id"] = event_id
                     self._historical_send_dependencies[group_id] = dependency
                     self._historical_send_by_client[client_id] = dependency
+                    if self._paid_endpoint is not None:
+                        self._paid_role_by_client[client_id] = "GRID"
                 if kind == "CANCEL_REQUEST":
                     if target_order_id is None:
                         raise _ScheduleError("INVALID_SCHEMA")
@@ -975,12 +1071,21 @@ class _ReplayComposition:
                         contract["run_contract_hash"], delivery["delivery_id"],
                         "CANCEL_EFFECT_GROUP", ordinal,
                     )
-                    self._historical_cancel_effects[group_id] = dict(
+                    cancel_spec = dict(
                         parent_raw=parent_raw, request_event_id=event_id,
                         effect_event_id=effect_event_id, effect_group_id=effect_group_id,
                         target_order_id=target_order_id, product_id=order["instId"],
                         strategy_id=contract["strategy_identity"], reason="EXPLICIT_SCENARIO",
                     )
+                    if self._paid_endpoint is not None:
+                        action = self._paid_endpoint.new_action(
+                            role="DRAIN_CANCEL", product_id=order["instId"],
+                            order_id=None, effective_at=acceptance_raw * 16 + 3,
+                        )
+                        self._paid_endpoint.bind_group(action, group_id)
+                        cancel_spec["paid_action_id"] = action["action_id"]
+                        self._paid_endpoint.cancel_action_by_request[group_id] = action
+                    self._historical_cancel_effects[group_id] = cancel_spec
                 sequence += 1
         self._historical_order_sequence = sequence
         return groups
@@ -1031,6 +1136,40 @@ class _ReplayComposition:
         resolved = self._resolve_historical_cancel_target(
             spec["target_order_id"], spec["product_id"], spec["strategy_id"]
         )
+        if self._paid_endpoint is not None:
+            action = self._paid_endpoint.cancel_action_by_request.get(group_id)
+            run = cast(Any, self._historical_run)
+            bound_sends = [
+                dependency["binding"]
+                for dependency in self._historical_send_by_client.values()
+                if isinstance(dependency.get("binding"), dict)
+                and dependency["binding"].get("order_id") == resolved
+            ]
+            if bound_sends:
+                scope_matches = (
+                    len(bound_sends) == 1
+                    and bound_sends[0].get("product_id") == spec["product_id"]
+                    and bound_sends[0].get("strategy_id") == spec["strategy_id"]
+                )
+            else:
+                configuration = decode_canonical(run.configuration_bytes)
+                seeded_orders = configuration.get("orders") if isinstance(configuration, dict) else None
+                matching_seeds = [
+                    row for row in seeded_orders
+                    if isinstance(row, dict) and row.get("order_id") == resolved
+                ] if isinstance(seeded_orders, list) else []
+                scope_matches = (
+                    len(matching_seeds) == 1
+                    and matching_seeds[0].get("product_id") == spec["product_id"]
+                    and matching_seeds[0].get("strategy_id") == spec["strategy_id"]
+                )
+            if (action is None or action["order_id"] not in (None, resolved)
+                    or self._paid_endpoint.roles_by_order.get(resolved) != "GRID"
+                    or not scope_matches):
+                raise _ScheduleError("DEPENDENCY_BINDING_CONFLICT")
+            action["order_id"] = resolved
+            self._paid_cancel_attempted_orders.add(resolved)
+            self._paid_cancel_pending_orders.add(resolved)
         # Both causal records are admitted from this exact resolved value.
         targets[0]["target_order_id"] = resolved
         spec["target_order_id"] = resolved
@@ -1086,6 +1225,15 @@ class _ReplayComposition:
             group_effective_at=effective_at, declared_member_count=1, members=[member],
         )
         policy_protocol._plan_group(group, self._configured_product_ids)
+        if self._paid_endpoint is not None and spec.get("paid_action_id") is not None:
+            effect_action = self._paid_endpoint.new_action(
+                role="DRAIN_CANCEL", product_id=spec["product_id"],
+                order_id=spec["target_order_id"],
+                effective_at=effective_at,
+                parent_action_id=spec["paid_action_id"],
+            )
+            self._paid_endpoint.bind_group(effect_action, spec["effect_group_id"])
+            self._paid_endpoint.cancel_action_by_effect[spec["effect_group_id"]] = effect_action
         return dict(kind="SOURCE_GROUP", schedule_sequence=sequence, group=group)
 
     def _historical_cancel_ack_item(self, group):
@@ -1120,6 +1268,11 @@ class _ReplayComposition:
         ))
         delivery = self._codec.build_delivery(projection)
         self._p3_cancel_ack_deliveries.add(delivery["delivery_id"])
+        if self._paid_endpoint is not None:
+            effect_action = self._paid_endpoint.cancel_action_by_effect.get(group["group_id"])
+            if effect_action is not None:
+                self._paid_endpoint.pending_delivery_ids.add(delivery["delivery_id"])
+                self._paid_endpoint.cancel_ack_action_by_delivery[delivery["delivery_id"]] = effect_action
         self._historical_notice_sequence += 1
         return dict(kind="DELIVERY", delivery=delivery)
 
@@ -1155,6 +1308,11 @@ class _ReplayComposition:
                                 action["native_failure"] = native
                         raise
                     result["group_result"] = group
+                    if self._paid_endpoint is not None:
+                        self._paid_endpoint.record_group(key[3], group)
+                        lifecycle = group.get("lifecycle_after")
+                        if lifecycle in ("LIQUIDATED_FLAT", "LIQUIDATED_INSOLVENT"):
+                            self._paid_native_terminal = lifecycle
                     for action in actions:
                         action["group_result"] = deepcopy(group)
                     record["result"] = deepcopy(result)
@@ -1170,7 +1328,18 @@ class _ReplayComposition:
                             binding = self._codec.historical_order_binding(
                                 stamp["event_id"], stamp["source_sequence"]
                             )
+                            if binding is None:
+                                raise _ScheduleError("DEPENDENCY_BINDING_CONFLICT")
                             self._commit_historical_send_binding(dependency, binding)
+                            if self._paid_endpoint is not None:
+                                role = self._paid_role_by_client.get(dependency["client_order_id"])
+                                if role is not None:
+                                    self._paid_endpoint.roles_by_order[binding["order_id"]] = role
+                                    if role == "EXIT":
+                                        action = self._paid_endpoint.action_by_group.get(dependency["group_id"])
+                                        if action is None:
+                                            raise _ScheduleError("DEPENDENCY_BINDING_CONFLICT")
+                                        action["order_id"] = binding["order_id"]
                         elif classification == "REJECTED":
                             dependency["state"] = "REJECTED"
                         else:
@@ -1180,7 +1349,13 @@ class _ReplayComposition:
                         and item["group"]["members"][0]["kind"] == "CANCEL_REQUEST"
                     )
                     if is_historical_request:
-                        effect_item = self._historical_cancel_effect_item(key[3])
+                        if self._paid_endpoint is not None and group["classification"] == "REJECTED":
+                            spec = self._historical_cancel_effects.pop(key[3], None)
+                            if spec is not None:
+                                self._paid_cancel_pending_orders.discard(spec["target_order_id"])
+                            effect_item = None
+                        else:
+                            effect_item = self._historical_cancel_effect_item(key[3])
                         if effect_item is not None and group["classification"] == "COMMITTED":
                             queued_effect = self._admit_set([(effect_item, None)])[0]
                             if queued_effect["classification"] != "PENDING":
@@ -1197,6 +1372,14 @@ class _ReplayComposition:
                         if queued_ack["classification"] != "PENDING":
                             record["result"] = deepcopy(self._terminal or queued_ack)
                             return deepcopy(record["result"])
+                    if (self._paid_endpoint is not None
+                            and is_historical_effect
+                            and group["classification"] == "REJECTED"):
+                        targets = item["group"]["members"][0]["payload"]["effects"]
+                        if targets and isinstance(targets[0].get("target_order_id"), str):
+                            self._paid_cancel_pending_orders.discard(targets[0]["target_order_id"])
+                    if self._paid_endpoint is not None:
+                        self._paid_endpoint.progress(self, "SOURCE_GROUP")
                 elif kind == "SNAPSHOT_CAPTURE":
                     fact = self._codec.capture_snapshot(item["request"])
                     self._evidence("SNAPSHOT_FACT", key, dict(purpose="POLL", request=item["request"], fact=fact))
@@ -1221,6 +1404,10 @@ class _ReplayComposition:
                             or historical_result["effective_at"] != key[0]):
                         raise _ScheduleError("INVALID_SCHEMA")
                     result["historical_result"] = deepcopy(historical_result)
+                    if self._paid_endpoint is not None:
+                        lifecycle = historical_result.get("owner_evidence", {}).get("lifecycle")
+                        if lifecycle in ("LIQUIDATED_FLAT", "LIQUIDATED_INSOLVENT"):
+                            self._paid_native_terminal = lifecycle
                     if working_orders is not None:
                         contract = self._historical_order_contract
                         if contract is None:
@@ -1251,6 +1438,12 @@ class _ReplayComposition:
                                     visible_at=visible_at,
                                 ))
                                 delivery = self._codec.build_delivery(projection)
+                                if self._paid_endpoint is not None:
+                                    role = self._paid_endpoint.roles_by_order.get(fill["order_id"])
+                                    if role is None:
+                                        raise _ScheduleError("DEPENDENCY_BINDING_CONFLICT")
+                                    self._paid_endpoint.pending_delivery_ids.add(delivery["delivery_id"])
+                                    self._paid_endpoint.delivery_roles[delivery["delivery_id"]] = role
                                 source_fact_id = delivery["source_fact_id"]
                                 payload = cast(dict[str, Any], deepcopy(delivery["immutable_payload"]))
                                 known_payload = self._p3_execution_notice_facts.get(
@@ -1283,13 +1476,23 @@ class _ReplayComposition:
                             return deepcopy(record["result"])
                         if enqueue_next:
                             self._historical_step_sequence += 1
+                        if self._paid_endpoint is not None:
+                            self._paid_endpoint.progress(self, "HISTORICAL_MARKET_STEP")
                 elif kind == "HISTORICAL_TIMER":
-                    plan = self._historical_poll_plan(record["raw_time_ms"], key[2])
-                    result = self._begin_poll(plan)
-                    result.update(kind=kind, stable_id=key[3])
-                    record["result"] = deepcopy(result)
-                    if result["classification"] == "TERMINAL":
-                        return deepcopy(result)
+                    if self._paid_endpoint is not None and self._paid_native_terminal is not None:
+                        result["status"] = "NATIVE_TERMINAL"
+                    else:
+                        plan = self._historical_poll_plan(record["raw_time_ms"], key[2])
+                        result = self._begin_poll(plan)
+                        result.update(kind=kind, stable_id=key[3])
+                        record["result"] = deepcopy(result)
+                        if result["classification"] == "TERMINAL":
+                            return deepcopy(result)
+                elif kind == "PAID_ENDPOINT_DRAIN":
+                    if self._paid_endpoint is None:
+                        raise _ScheduleError("INVALID_SCHEMA")
+                    self._paid_endpoint.start_drain(self)
+                    self._paid_endpoint.progress(self, "PAID_ENDPOINT_DRAIN")
                 else:
                     snapshot = item["snapshot"]
                     self._policy.apply_market(snapshot.policy_markets())
@@ -1317,8 +1520,9 @@ class _ReplayComposition:
         start, end = self._historical_poll_range
         if type(raw_at) is not int or not start <= raw_at < end:
             raise _ScheduleError("INVALID_SCHEMA")
-        poll_id = f"P3_POLL_{raw_at}"
-        continuation = f"P3_CONT_{raw_at}"
+        prefix = f"PAID_{self._paid_endpoint.contract_hash[:16]}_" if self._paid_endpoint is not None else "P3_"
+        poll_id = f"{prefix}POLL_{raw_at}"
+        continuation = f"{prefix}CONT_{raw_at}"
         result: dict[str, Any] = dict(account_key=deepcopy(self._account), poll_id=poll_id,
                                       issued_at=raw_at, continuation_id=continuation)
         earn_due = raw_at - self._policy.last_earn_ms > 60_000
@@ -1440,12 +1644,14 @@ class _ReplayComposition:
         for key in ("payload_kind", "occurrence_index", "schedule_sequence", "visible_at", "continuation_id"):
             _poll_check(delivery.get(key) == projection.get(key))
         policy, start = self._policy, len(self._policy.events)
+        source_enabled = self._paid_source_control_enabled(cast(int, delivery["visible_at"]))
         error = None
         try:
-            if self._historical_poll_range is not None:
+            if self._historical_poll_range is not None and source_enabled:
                 policy.now_ms = (cast(int, delivery["visible_at"]) - 6) // 16
-            self._apply_payload(delivery)
-            if record.index == len(record.stages) - 1:
+            if source_enabled:
+                self._apply_payload(delivery)
+            if source_enabled and record.index == len(record.stages) - 1:
                 policy.raise_leverage()
                 if policy.running and not policy.ws_open:
                     policy.emit("check_websocket")
@@ -1460,12 +1666,14 @@ class _ReplayComposition:
             error = exc
         record.index += 1
         next_stage = None if error or record.index == len(record.stages) else record.stages[record.index]
-        prefix = _CallbackPrefix(tuple(deepcopy(policy.events[start:])), error)
+        prefix = _CallbackPrefix(tuple(deepcopy(policy.events[start:])) if source_enabled else (), error)
         status = "CALLBACK_FAILED" if error else "COMPLETED" if next_stage is None else "IN_PROGRESS"
         record.observation = _PollObservation(status, next_stage, prefix)
         return _PollResult(deepcopy(record.observation), next_stage=deepcopy(next_stage))
 
     def _capture_callback(self, delivery: wire.Delivery) -> _CallbackPrefix:
+        if not self._paid_source_control_enabled(cast(int, delivery["visible_at"])):
+            return _CallbackPrefix((), None)
         start = len(self._policy.events)
         error = None
         try:
