@@ -9,7 +9,7 @@ import pytest
 
 from src.core.backtest.synthetic_scenario_replay import _ReplayComposition, _ScheduleError
 from src.core.backtest.spider_paid_endpoint import PaidEndpoint, _paid_flat
-from src.core.backtest.spider_run_artifacts import decode_canonical
+from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_canonical
 from test_spider_paid_endpoint_native import _seeded_two_product_run
 from test_spider_execution_input import _input
 from test_spider_historical_input import (
@@ -26,6 +26,83 @@ def _endpoint(composition: _ReplayComposition) -> PaidEndpoint:
     endpoint = composition._paid_endpoint
     assert endpoint is not None
     return endpoint
+
+
+def test_public_scheduler_renderer_matches_capture_and_never_reads_native(monkeypatch):
+    composition = _ReplayComposition._from_execution_run(_input())
+    cutoff = composition._current_time
+    rendered = composition._public_scheduler_observation()
+    captured = composition.capture_owner_evidence(
+        cutoff,
+        composition._paid_snapshot_request("TRADING", cutoff, "RENDER_TRADING"),
+        composition._paid_snapshot_request("POSITIONS", cutoff, "RENDER_POSITIONS"),
+        composition._paid_snapshot_request("OPEN_ORDERS", cutoff, "RENDER_ORDERS"),
+    )
+    assert canonical_bytes(rendered) == canonical_bytes(captured["scheduler_observation"])
+
+    class NativeAccessForbidden:
+        def inspect_state(self):
+            raise AssertionError("renderer attempted native inspection")
+
+        def capture_snapshot(self, *_args):
+            raise AssertionError("renderer attempted native capture")
+
+    monkeypatch.setattr(composition, "_codec", NativeAccessForbidden())
+    assert canonical_bytes(rendered) == canonical_bytes(composition._public_scheduler_observation())
+
+
+def test_public_scheduler_renderer_preserves_paid_queue_poll_and_failed_terminal():
+    original = _input()
+    request = replace(
+        original,
+        policy_end_ms=original.historical_input.range_start_ms + 5_010,
+    )
+    composition = _ReplayComposition._from_execution_run(request)
+    initial = composition._public_scheduler_observation()
+    assert set(initial) == {
+        "current_time", "last_popped", "gate", "terminal", "pending_keys", "records", "polls", "callback_actions",
+    }
+    assert any(row["queue_class"] == "PAID_ENDPOINT_DRAIN" for row in initial["pending_keys"])
+
+    policy_end = request.policy_end_ms
+    dispatch = composition._dispatch_due(policy_end * 16 + 7)
+    assert dispatch["classification"] == "SUCCESS", (dispatch, composition._terminal)
+    composition._audit["RENDER_DELIVERY"] = [dict(actions=[dict(
+        group_id="RENDER_GROUP", status="SUBMITTED", group_result=None, native_failure=None,
+    )])]
+    running = composition._public_scheduler_observation()
+    assert running["gate"] == "RUNNING"
+    assert running["records"]
+    assert set(running["records"][0]) == {"key", "kind", "stable_id", "classification"}
+    assert running["polls"]
+    assert isinstance(running["callback_actions"], list)
+    assert running["callback_actions"] == [dict(
+        delivery_id="RENDER_DELIVERY", event_index=0, action_index=0,
+        group_id="RENDER_GROUP", status="SUBMITTED", group_result=None,
+        native_failure=None,
+    )]
+    assert all(row["status"] in ("PAUSED", "IN_PROGRESS", "COMPLETED", "CALLBACK_FAILED")
+               for row in running["polls"])
+
+    composition._stop_scheduler(_ScheduleError("injected scheduler failure"), "POLL", "renderer-failure")
+    failed = composition._public_scheduler_observation()
+    assert failed["gate"] == "FAILED"
+    assert failed["terminal"]["stable_id"] == "renderer-failure"
+    assert failed["terminal"]["reason"] == "injected scheduler failure"
+    assert isinstance(failed["records"], list)
+    assert isinstance(failed["callback_actions"], list)
+
+    def contains_tuple(value):
+        if isinstance(value, tuple):
+            return True
+        if isinstance(value, dict):
+            return any(contains_tuple(key) or contains_tuple(item) for key, item in value.items())
+        if isinstance(value, list):
+            return any(contains_tuple(item) for item in value)
+        return False
+
+    assert not contains_tuple(failed)
+    assert decode_canonical(canonical_bytes(failed)) == failed
 
 
 def test_started_poll_completes_after_cutoff_without_source_control():

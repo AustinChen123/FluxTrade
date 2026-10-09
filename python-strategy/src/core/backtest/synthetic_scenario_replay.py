@@ -496,18 +496,8 @@ class _ReplayComposition:
                       working_orders=deepcopy(working_orders)),
         )
 
-    def capture_owner_evidence(self, cutoff, trading_request, positions_request, open_orders_request):
-        """Observe the owner and scheduler without dispatching or emitting a barrier."""
-        _poll_check(type(cutoff) is int and 0 <= cutoff < 2**63)
-        requests = deepcopy((trading_request, positions_request, open_orders_request))
-        for kind, request in zip(("TRADING", "POSITIONS", "OPEN_ORDERS"), requests, strict=True):
-            policy_protocol._plan_snapshot(request)
-            _poll_check(request["capture_mode"] == "OWNER_CURRENT" and request["snapshot_kind"] == kind
-                        and request["captured_at"] == cutoff and request["account_key"] == self._account)
-        owner: dict[str, Any] = dict(cutoff=cutoff, inspection=self._codec.inspect_state())
-        for kind, request in zip(("trading", "positions", "open_orders"), requests, strict=True):
-            owner[kind + "_request"] = request
-            owner[kind + "_fact"] = self._codec.capture_snapshot(deepcopy(request))
+    def _public_scheduler_observation(self) -> dict[str, Any]:
+        """Render public scheduler facts without native access or state mutation."""
         def key(value):
             return dict(visible_at=value[0], queue_class=self._queue_label(value[1]),
                         schedule_sequence=value[2], stable_id=value[3])
@@ -538,6 +528,21 @@ class _ReplayComposition:
                            records=[dict(key=key(record["key"]), **{name: record["result"][name] for name in ("kind", "stable_id", "classification")})
                                     for _, record in sorted(self._records.items())],
                            polls=sorted(polls, key=lambda row: (row["poll_id"], row["continuation_id"])), callback_actions=actions)
+        return deepcopy(observation)
+
+    def capture_owner_evidence(self, cutoff, trading_request, positions_request, open_orders_request):
+        """Observe the owner and scheduler without dispatching or emitting a barrier."""
+        _poll_check(type(cutoff) is int and 0 <= cutoff < 2**63)
+        requests = deepcopy((trading_request, positions_request, open_orders_request))
+        for kind, request in zip(("TRADING", "POSITIONS", "OPEN_ORDERS"), requests, strict=True):
+            policy_protocol._plan_snapshot(request)
+            _poll_check(request["capture_mode"] == "OWNER_CURRENT" and request["snapshot_kind"] == kind
+                        and request["captured_at"] == cutoff and request["account_key"] == self._account)
+        owner: dict[str, Any] = dict(cutoff=cutoff, inspection=self._codec.inspect_state())
+        for kind, request in zip(("trading", "positions", "open_orders"), requests, strict=True):
+            owner[kind + "_request"] = request
+            owner[kind + "_fact"] = self._codec.capture_snapshot(deepcopy(request))
+        observation = self._public_scheduler_observation()
         return deepcopy(dict(owner_evidence=owner, scheduler_observation=observation))
 
     @staticmethod
