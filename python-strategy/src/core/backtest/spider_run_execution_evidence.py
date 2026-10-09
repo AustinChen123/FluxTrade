@@ -267,22 +267,76 @@ def _journal_check(run_id: str, attempt: dict[str, Any], status: dict[str, Any],
     }
     terminal_key = scheduler["last_popped"] if scheduler["gate"] == "FAILED" else None
     planned_keys = _coverage_keys(coverage, request)
-    plan_matches = True
-    for key in expected_records:
-        observed = observed_records.get(key)
-        expected_key = planned_keys[key]
-        if observed is None:
-            plan_matches = plan_matches and endpoint["status"] == "FAILED" and terminal_key is not None \
-                and expected_key > _key(terminal_key)
-        elif endpoint["status"] == "FAILED" and terminal_key is not None:
-            if _key(observed["key"]) < _key(terminal_key):
-                plan_matches = plan_matches and observed["classification"] == "SUCCESS"
-            elif observed["key"] == terminal_key:
-                plan_matches = plan_matches and observed["classification"] == "TERMINAL"
+    initial_cut = request.historical_input.range_start_ms * 16
+    failure = endpoint["failure"]
+    observation = report["paid_observation"]
+    initial_capture_failure = (
+        not journal
+        and status["processed_boundary"] is None and status["persisted_boundary"] is None
+        and endpoint["status"] == "FAILED" and endpoint["owner_evidence"] is None
+        and report["initial_owner_evidence"] is None and report["source_evidence_refs"] == []
+        and failure is not None and failure["primary"]["kind"] == "OWNER_EVIDENCE"
+        and failure["primary"]["reason"] == "EVIDENCE_FAILED" and failure["evidence_error"] is not None
+        and failure["observed_at"] == initial_cut
+        and observation["current_evidence_complete"] is False
+        and observation["observed_at"] == initial_cut
+        and not endpoint["actions"]
+        and not observation["send_dependencies"] and not observation["pending_cancel_order_ids"]
+        and not observation["pending_source_groups"] and not observation["pending_paid_deliveries"]
+        and observation["terminal_fact"] is None
+        and scheduler["current_time"] == initial_cut and scheduler["gate"] == "RUNNING"
+        and scheduler["last_popped"] is None and scheduler["terminal"] is None
+        and not scheduler["polls"] and not scheduler["callback_actions"]
+    )
+    if initial_capture_failure:
+        # At construction, the first market step, snapshots, timers and paid
+        # drain are queued; later market steps are causally enqueued by earlier
+        # steps and therefore are not yet observable at this zero-event prefix.
+        market_steps = [key for key in expected_records if key[0] == "HISTORICAL_MARKET_STEP"]
+        initial_identities = {
+            key for key in expected_records
+            if key[0] in ("HISTORICAL_MARKET_CACHE", "HISTORICAL_TIMER", "PAID_ENDPOINT_DRAIN")
+        }
+        if market_steps:
+            initial_identities.add(min(market_steps, key=lambda key: planned_keys[key]))
+        actual_identities = [(row["kind"], row["stable_id"]) for row in records]
+        initial_records_match = len(actual_identities) == len(set(actual_identities)) \
+            and set(actual_identities) == initial_identities
+        for row in records:
+            identity = row["kind"], row["stable_id"]
+            expected_key = planned_keys.get(identity)
+            initial_records_match = (initial_records_match and expected_key is not None
+                                     and row["classification"] == "PENDING"
+                                     and _same(row["key"], dict(
+                                         visible_at=expected_key[0],
+                                         queue_class=("HISTORICAL_MARKET_STEP" if expected_key[1] == 3
+                                                      else "HISTORICAL_MARKET_CACHE" if expected_key[1] == 4
+                                                      else "HISTORICAL_TIMER" if expected_key[1] == 5
+                                                      else "PAID_ENDPOINT_DRAIN"),
+                                         schedule_sequence=expected_key[2], stable_id=expected_key[3],
+                                     )))
+        expected_pending = sorted(
+            (planned_keys[identity] for identity in initial_identities),
+        )
+        pending_matches = [_key(key) for key in scheduler["pending_keys"]] == expected_pending
+        plan_matches = initial_records_match and pending_matches
+    else:
+        plan_matches = True
+        for key in expected_records:
+            observed = observed_records.get(key)
+            expected_key = planned_keys[key]
+            if observed is None:
+                plan_matches = plan_matches and endpoint["status"] == "FAILED" and terminal_key is not None \
+                    and expected_key > _key(terminal_key)
+            elif endpoint["status"] == "FAILED" and terminal_key is not None:
+                if _key(observed["key"]) < _key(terminal_key):
+                    plan_matches = plan_matches and observed["classification"] == "SUCCESS"
+                elif observed["key"] == terminal_key:
+                    plan_matches = plan_matches and observed["classification"] == "TERMINAL"
+                else:
+                    plan_matches = plan_matches and observed["classification"] == "PENDING"
             else:
-                plan_matches = plan_matches and observed["classification"] == "PENDING"
-        else:
-            plan_matches = plan_matches and observed["classification"] == "SUCCESS"
+                plan_matches = plan_matches and observed["classification"] == "SUCCESS"
     records_by_key = {canonical_bytes(row["key"]): row for row in records}
     journal_observed = all(canonical_bytes(row["scheduler_key"]) in records_by_key for row in journal)
     return (

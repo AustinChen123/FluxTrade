@@ -451,6 +451,83 @@ def test_actual_native_failed_prefixes_keep_terminal_facts_and_reconcile(failure
     assert result["result"] == "OK", [(row["name"], row["result"]) for row in result["checks"]]
 
 
+def _initial_capture_failure_bundle(monkeypatch):
+    request = _seeded_two_product_run()
+    template, facts = _bundle(request)
+    composition = _ReplayComposition._from_execution_run(request)
+
+    def fail_initial_capture(*_args):
+        raise RuntimeError("injected initial owner capture failure")
+
+    monkeypatch.setattr(composition, "capture_owner_evidence", fail_initial_capture)
+    endpoint_owner = composition._paid_endpoint
+    assert endpoint_owner is not None
+    endpoint = endpoint_owner.result(composition)
+    scheduler = composition._public_scheduler_observation()
+    paid_observation = endpoint_owner._paid_observation(
+        composition, scheduler, current_evidence_complete=False, failure=endpoint["failure"],
+    )
+    assert endpoint["status"] == "FAILED" and endpoint["owner_evidence"] is None
+    assert endpoint["failure"]["primary"]["kind"] == "OWNER_EVIDENCE"
+    assert endpoint["failure"]["evidence_error"] is not None
+    assert scheduler["current_time"] == request.historical_input.range_start_ms * 16
+    assert scheduler["last_popped"] is scheduler["terminal"] is None
+    attempt = cast(dict[str, Any], decode_jsonl(template["attempt.json"])[0])
+    status = cast(dict[str, Any], decode_jsonl(template["status.json"])[0])
+    status.update(state="RUNNING", processed_boundary=None, persisted_boundary=None,
+                  failure_reason=None, primary_failure=None)
+    report = dict(
+        schema_version="spider_execution_report_v1", run_id=facts["run_id"],
+        initial_owner_evidence=None, scheduler_observation=scheduler,
+        paid_observation=paid_observation, paid_endpoint=endpoint, source_evidence_refs=[],
+    )
+    artifacts = {
+        "attempt.json": encode_jsonl([attempt]), "status.json": encode_jsonl([status]),
+        "journal.jsonl": b"", "execution_input.json": template["execution_input.json"],
+        "paid_endpoint.json": canonical_paid_bytes(endpoint, facts["context"], facts["configured"]),
+        "report.jsonl": encode_jsonl([report]),
+    }
+    return artifacts, facts, endpoint
+
+
+def test_actual_initial_capture_failure_is_a_truthful_zero_journal_prefix(monkeypatch):
+    artifacts, facts, endpoint = _initial_capture_failure_bundle(monkeypatch)
+    result = evidence.build_execution_reconciliation(facts["run_id"], artifacts)
+    assert endpoint["status"] == "FAILED"
+    assert result["evidence_scope"] == "FAILED_PREFIX"
+    assert result["result"] == "OK", [(row["name"], row["result"]) for row in result["checks"]]
+    assert artifacts["journal.jsonl"] == b""
+    status = decode_jsonl(artifacts["status.json"])[0]
+    assert status["processed_boundary"] is status["persisted_boundary"] is None
+
+
+@pytest.mark.parametrize("mutation", ["progress", "wrong_cut", "missing_fault", "erase_pending"])
+def test_zero_journal_prefix_rejects_fabricated_initial_evidence(mutation, monkeypatch):
+    artifacts, facts, endpoint = _initial_capture_failure_bundle(monkeypatch)
+    report = cast(dict[str, Any], decode_jsonl(artifacts["report.jsonl"])[0])
+    if mutation == "progress":
+        report["scheduler_observation"]["records"][0]["classification"] = "SUCCESS"
+    elif mutation == "wrong_cut":
+        report["scheduler_observation"]["current_time"] += 16
+        report["paid_observation"]["observed_at"] += 16
+        endpoint["failure"]["observed_at"] += 16
+        _sync_endpoint(artifacts, facts, endpoint)
+        report = cast(dict[str, Any], decode_jsonl(artifacts["report.jsonl"])[0])
+        report["scheduler_observation"]["current_time"] += 16
+        report["paid_observation"]["observed_at"] += 16
+    elif mutation == "missing_fault":
+        endpoint["failure"]["primary"]["kind"] = "SCHEDULER"
+        _sync_endpoint(artifacts, facts, endpoint)
+        report = cast(dict[str, Any], decode_jsonl(artifacts["report.jsonl"])[0])
+    else:
+        report["scheduler_observation"]["records"].pop()
+        report["scheduler_observation"]["pending_keys"].pop()
+    artifacts["report.jsonl"] = encode_jsonl([report])
+    result = evidence.build_execution_reconciliation(facts["run_id"], artifacts)
+    failed = {row["name"] for row in result["checks"] if row["result"] == "FAILED"}
+    assert "JOURNAL_FRONTIER" in failed
+
+
 def test_actual_native_earn_snapshot_terminal_without_callback_result_reconciles(monkeypatch):
     run = _valid_run()
     request = replace(_input(run), policy_end_ms=run.range_start_ms + 30_000)
