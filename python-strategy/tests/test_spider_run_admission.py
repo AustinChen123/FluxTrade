@@ -345,4 +345,5 @@ def test_import_boundary():
         "hashlib", "json", "typing", "src.core.backtest.spider_run_artifacts", "src.core.backtest.spider_run_completion_schema",
         "src.core.backtest.spider_historical_input",
         "src.core.backtest.spider_run_envelope_schema", "src.core.backtest.spider_run_evidence",
-        "src.core.backtest.spider_run_reconciliation_schema", "src.core.backtest.spider_scenario_plans"}
+        "src.core.backtest.spider_run_reconciliation_schema", "src.core.backtest.spider_scenario_plans",
+        "src.core.backtest.spider_run_execution_schema", "src.core.backtest.spider_run_execution_evidence"}

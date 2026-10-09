@@ -18,6 +18,15 @@ from src.core.backtest.spider_historical_input import (
     HistoricalInputError as _HistoricalInputError,
     _validate_historical_run_link,
 )
+from src.core.backtest.spider_run_execution_schema import (
+    _COMPLETION_ARTIFACTS as _EXECUTION_COMPLETION_ARTIFACTS,
+    _SCHEMA as _EXECUTION_SCHEMA,
+    execution_context_from_input as _execution_context_from_input,
+    validate_execution_artifact as _validate_execution_artifact,
+)
+from src.core.backtest.spider_run_execution_evidence import (
+    build_execution_reconciliation as _build_execution_reconciliation,
+)
 
 _NAMES = tuple(name for name, _ in _ARTIFACTS)
 _ALL = (*_NAMES, "completion.json")
@@ -30,6 +39,8 @@ _P2_SELECTOR = "SPIDER_P2_CONFIGURED_SCALE_V1"
 _P2_RUN_CONTRACT = "SPIDER_SYNTHETIC_P2_CONFIGURED_RUN_V1"
 _DIAGNOSTIC = ("completion.json", "status.json", "journal.jsonl")
 _FRONTIER = ("attempt.json", "status.json", "journal.jsonl", "completion.json")
+_EXECUTION_NAMES = tuple(name for name, _, _ in _EXECUTION_COMPLETION_ARTIFACTS)
+_EXECUTION_ALL = (*_EXECUTION_NAMES, "completion.json")
 
 
 class _Unsafe(Exception):
@@ -103,8 +114,38 @@ def _run_id(value: _Any) -> bool:
 
 def _diagnose(directory: int) -> dict[str, _Any]:
     try:
-        status = _decode(_capture(directory, "status.json"), "status.json")
-        journal = _decode(_capture(directory, "journal.jsonl"), "journal.jsonl")
+        status_raw = _capture(directory, "status.json")
+        journal_raw = _capture(directory, "journal.jsonl")
+        status = _decode(status_raw, "status.json")
+        journal = _decode(journal_raw, "journal.jsonl")
+        if type(status) is dict and status.get("schema_version") == _EXECUTION_SCHEMA["status.json"]:
+            try:
+                _validate_execution_artifact(
+                    "status.json", status_raw, execution_context=status["execution_context"],
+                )
+                _validate_execution_artifact(
+                    "journal.jsonl", journal_raw,
+                    execution_context=status["execution_context"],
+                    configuration=status["configuration_context"],
+                    historical=status["historical_context"],
+                )
+            except (ValueError, KeyError, TypeError) as error:
+                if isinstance(error, ValueError) and error.args != ("INVALID_ARTIFACT",):
+                    raise
+            else:
+                persisted = (dict(ordinal=len(journal), journal_seq=len(journal), barrier_id=journal[-1]["barrier_id"])
+                             if journal else None)
+                processed = status["processed_boundary"]
+                advanced = (processed is not None and processed["ordinal"] == processed["journal_seq"] > len(journal)
+                            and processed["ordinal"] > (persisted["ordinal"] if persisted is not None else 0))
+                matching = status["persisted_boundary"] == persisted and all(
+                    row["run_id"] == status["run_id"] for row in journal
+                )
+                failed_persistence = (status["state"] == "FAILED"
+                                      and status["failure_reason"] == "PERSISTENCE_FAILED")
+                if matching and advanced and (failed_persistence or status["state"] == "RUNNING"):
+                    return _reject("INCOMPLETE_PERSISTENCE", _DIAGNOSTIC)
+            return _reject("MISSING_COMPLETE_MANIFEST", _DIAGNOSTIC)
         _validate(_artifact, status)
         _validate(_journal, journal)
         if status["schema_version"] != "spider_status_v1":
@@ -126,6 +167,154 @@ def _diagnose(directory: int) -> dict[str, _Any]:
     return _reject("MISSING_COMPLETE_MANIFEST", _DIAGNOSTIC)
 
 
+def _admit_execution(directory: int, manifest: dict[str, _Any], completion_raw: bytes) -> dict[str, _Any]:
+    unsafe = []
+    for name in _EXECUTION_NAMES:
+        try:
+            _regular(directory, name)
+        except _Unsafe:
+            unsafe.append(name)
+        except OSError:
+            pass
+    if unsafe:
+        return _reject("UNSAFE_ARTIFACT_PATH", tuple(unsafe))
+
+    captured: dict[str, bytes] = {"completion.json": completion_raw}
+    bad = []
+    for name in _EXECUTION_NAMES:
+        try:
+            limit = _P3_JOURNAL_LIMIT if name == "journal.jsonl" else _LIMIT
+            captured[name] = _capture(
+                directory, name, exclusive=name == "execution_input.json", limit=limit,
+            )
+        except _Unsafe:
+            unsafe.append(name)
+        except (OSError, _Oversize):
+            bad.append(name)
+    if unsafe:
+        return _reject("UNSAFE_ARTIFACT_PATH", tuple(name for name in _EXECUTION_NAMES if name in unsafe))
+    if bad:
+        return _reject("ARTIFACT_MISMATCH", tuple(name for name in _EXECUTION_NAMES if name in bad))
+
+    values: dict[str, _Any] = {}
+    metadata = {entry["path"]: entry for entry in manifest["artifacts"]}
+    unsupported: list[str] = []
+    for name in _EXECUTION_NAMES:
+        data = captured[name]
+        entry = metadata[name]
+        if (len(data) != entry["byte_count"] or _sha256(data).hexdigest() != entry["sha256"]):
+            bad.append(name)
+            continue
+        try:
+            if name == "execution_input.json":
+                value = _decode_canonical(data)
+                if type(value) is not dict:
+                    unsupported.append(name)
+                    continue
+                count = 1
+            else:
+                value = _decode(data, name)
+                count = len(value) if name.endswith(".jsonl") else 1
+            if count != entry["row_count"]:
+                bad.append(name)
+                continue
+            values[name] = value
+        except _Invalid:
+            bad.append(name)
+        except (_JSONDecodeError, UnicodeDecodeError):
+            (unsupported if name == "execution_input.json" else bad).append(name)
+        except ValueError as error:
+            if error.args != ("INVALID_ARTIFACT",):
+                raise
+            (unsupported if name == "execution_input.json" else bad).append(name)
+        except KeyError:
+            bad.append(name)
+    if bad:
+        return _reject("ARTIFACT_MISMATCH", tuple(name for name in _EXECUTION_NAMES if name in bad))
+    if unsupported:
+        return _reject("UNSUPPORTED_SCHEMA", tuple(name for name in _EXECUTION_NAMES if name in unsupported))
+
+    run_id = manifest["run_id"]
+    input_row = values["execution_input.json"]
+    historical_input = input_row.get("historical_input") if type(input_row) is dict else None
+    if (type(historical_input) is dict and "run_id" in historical_input
+            and (not _run_id(historical_input["run_id"]) or historical_input["run_id"] != run_id)):
+        return _reject("RUN_ID_MISMATCH", ("execution_input.json",))
+    bad = []
+    for name in _EXECUTION_NAMES:
+        if name in ("execution_input.json", "paid_endpoint.json"):
+            continue
+        value = values[name]
+        rows = value if name.endswith(".jsonl") else [value]
+        for row in rows:
+            if (type(row) is dict and "run_id" in row
+                    and (not _run_id(row["run_id"]) or row["run_id"] != run_id)):
+                bad.append(name)
+                break
+    if bad:
+        return _reject("RUN_ID_MISMATCH", tuple(name for name in _EXECUTION_NAMES if name in bad))
+
+    try:
+        execution = _execution_context_from_input(captured["execution_input.json"])
+    except _HistoricalInputError:
+        return _reject("UNSUPPORTED_SCHEMA", ("execution_input.json",))
+    except ValueError as error:
+        if error.args != ("INVALID_ARTIFACT",):
+            raise
+        return _reject("UNSUPPORTED_SCHEMA", ("execution_input.json",))
+    attempt = values["attempt.json"]
+    if type(attempt) is not dict:
+        return _reject("UNSUPPORTED_SCHEMA", ("attempt.json",))
+    configuration = attempt.get("configuration_context")
+    historical = attempt.get("historical_context")
+    unsupported = []
+    for name in _EXECUTION_NAMES:
+        try:
+            _validate_execution_artifact(
+                name, captured[name], execution_context=execution,
+                configuration=configuration,
+                historical=historical,
+                journal_rows=(len(values["journal.jsonl"])
+                              if name == "reconciliation.json" and type(values["journal.jsonl"]) is list
+                              else None),
+            )
+        except ValueError as error:
+            if error.args != ("INVALID_ARTIFACT",):
+                raise
+            unsupported.append(name)
+        except (KeyError, TypeError, IndexError):
+            unsupported.append(name)
+    if unsupported:
+        return _reject("UNSUPPORTED_SCHEMA", tuple(name for name in _EXECUTION_NAMES if name in unsupported))
+
+    journal = values["journal.jsonl"]
+    status = values["status.json"]
+    frontier = (dict(ordinal=len(journal), journal_seq=len(journal), barrier_id=journal[-1]["barrier_id"])
+                if journal else None)
+    if (status["state"] != "COMPLETE"
+            or status["processed_boundary"] != frontier
+            or status["persisted_boundary"] != frontier
+            or manifest["processed_boundary"] != frontier
+            or manifest["persisted_boundary"] != frontier):
+        return _reject("INCOMPLETE_PERSISTENCE", _FRONTIER)
+
+    try:
+        computed = _build_execution_reconciliation(run_id, captured)
+    except _ProjectionError:
+        return _reject("ENDPOINT_RECONCILIATION_FAILED", _EXECUTION_ALL)
+    except ValueError as error:
+        if error.args != ("INVALID_ARTIFACT",):
+            raise
+        return _reject("ENDPOINT_RECONCILIATION_FAILED", _EXECUTION_ALL)
+    supplied = values["reconciliation.json"]
+    if (computed["result"] != "OK" or any(row["result"] != "OK" for row in computed["checks"])
+            or _bytes(computed) != _bytes(supplied)):
+        return _reject("ENDPOINT_RECONCILIATION_FAILED", _EXECUTION_ALL)
+    ordered = {name: values[name] for name in _EXECUTION_NAMES}
+    ordered["completion.json"] = manifest
+    return dict(decision="ACCEPT", artifacts=ordered)
+
+
 def _admit(directory: int) -> dict[str, _Any]:
     try:
         raw = _capture(directory, "completion.json")
@@ -139,6 +328,19 @@ def _admit(directory: int) -> dict[str, _Any]:
         return _reject("INVALID_MANIFEST", ("completion.json",))
     try:
         manifest = _decode(raw, "completion.json")
+        if (type(manifest) is dict
+                and manifest.get("schema_version") == _EXECUTION_SCHEMA["completion.json"]):
+            try:
+                _validate_execution_artifact(
+                    "completion.json", raw, execution_context=manifest["execution_context"],
+                )
+            except ValueError as error:
+                if error.args != ("INVALID_ARTIFACT",):
+                    raise
+                return _reject("INVALID_MANIFEST", ("completion.json",))
+            except (KeyError, TypeError, IndexError):
+                return _reject("INVALID_MANIFEST", ("completion.json",))
+            return _admit_execution(directory, manifest, raw)
         _validate(_completion, manifest)
     except _Invalid:
         return _reject("INVALID_MANIFEST", ("completion.json",))
