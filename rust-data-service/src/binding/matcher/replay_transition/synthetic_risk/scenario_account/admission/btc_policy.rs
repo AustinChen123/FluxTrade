@@ -72,6 +72,13 @@ pub(super) fn evaluate(
     if let Role::Rejected(reason) = role {
         return Ok((evidence, Some(reason)));
     }
+    let (spec, _) = scenario.resolve(product, input.effective_at)?;
+    if intent.order_type == OrderType::Market
+        && intent.reduce_only
+        && intent.quantity < spec.minimum
+    {
+        return Ok((evidence, Some("MINIMUM_ORDER_QUANTITY")));
+    }
     let post = candidate_draft.reservation()?;
     let post_safe = maintenance_state(
         !input.positions.is_empty(),

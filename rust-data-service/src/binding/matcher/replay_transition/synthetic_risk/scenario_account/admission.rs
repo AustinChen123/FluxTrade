@@ -583,6 +583,7 @@ impl ScenarioAccount {
             }
             OrderType::Unsupported => return Err("UNSUPPORTED_ORDER_TYPE"),
         };
+        let mut deferred_minimum_candidate = false;
         let (spec_version, rule_data_version) = match &self.profile {
             ProfileContext::P1O03 => {
                 if intent.product != ProfileProduct::Pa
@@ -625,7 +626,12 @@ impl ScenarioAccount {
             ProfileContext::BtcEthScenario { scenario, .. } => {
                 let (spec, tier) =
                     scenario.resolve(intent.product.btc()?, envelope.effective_at)?;
-                if intent.quantity < spec.minimum
+                deferred_minimum_candidate = historical
+                    && intent.order_type == OrderType::Market
+                    && intent.reduce_only
+                    && intent.quantity < spec.minimum;
+                if (intent.quantity < spec.minimum && !deferred_minimum_candidate)
+                    || intent.quantity <= Decimal::ZERO
                     || !aligned(intent.quantity, spec.lot)
                     || price <= Decimal::ZERO
                     || !aligned(price, spec.tick)
@@ -643,7 +649,7 @@ impl ScenarioAccount {
                 ..
             }
         ) && self.cash < Decimal::from(995);
-        if !below_floor {
+        if !below_floor && !deferred_minimum_candidate {
             draft.orders.insert(
                 order_id.clone(),
                 RestingOrder {
@@ -668,7 +674,9 @@ impl ScenarioAccount {
                 },
             );
         }
-        hook(PrepareStage::OrderDrafted)?;
+        if !deferred_minimum_candidate {
+            hook(PrepareStage::OrderDrafted)?;
+        }
         let (evaluation, reason_code) = if below_floor {
             (Evaluation::MinCash(self.cash), Some("MIN_CASH"))
         } else {
