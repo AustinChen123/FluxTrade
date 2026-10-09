@@ -2,12 +2,14 @@ use crate::connector::emergency::EmergencyMitigation;
 use crate::environment::RuntimeEnvironment;
 use anyhow::Context;
 use redis::AsyncCommands;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::collections::HashSet;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
 const HEARTBEAT_STALE_AFTER_MS: i64 = 5_000;
 const HEARTBEAT_MISSING_LIMIT: u32 = 5;
+const PLANNED_RESTART_GRACE: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Default)]
 struct HeartbeatMonitor {
@@ -70,10 +72,159 @@ impl HeartbeatMonitor {
     }
 }
 
+#[derive(Debug)]
+struct PlannedRestart {
+    boot_id: String,
+    observed_at_ms: i64,
+    deadline: Instant,
+}
+
+#[derive(Debug, Default)]
+struct PlannedRestartGrace {
+    active: Option<PlannedRestart>,
+    seen_clean_boot_ids: HashSet<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum GraceUpdate {
+    None,
+    Started,
+    Retained,
+    Cancelled,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct HeartbeatDecision {
+    trigger: bool,
+    missing_suppressed: bool,
+    grace_expired: bool,
+}
+
+fn decide_heartbeat_action(
+    observation: &HeartbeatObservation,
+    grace: &PlannedRestartGrace,
+    now: Instant,
+) -> HeartbeatDecision {
+    let heartbeat_missing = matches!(
+        observation,
+        HeartbeatObservation::WaitingForInitial
+            | HeartbeatObservation::Missing { .. }
+            | HeartbeatObservation::TriggerMissing { .. }
+    );
+    let grace_expired = heartbeat_missing && grace.missing_expired(now);
+    if grace_expired {
+        return HeartbeatDecision {
+            trigger: true,
+            missing_suppressed: false,
+            grace_expired: true,
+        };
+    }
+    if heartbeat_missing && grace.missing_is_suppressed(now) {
+        return HeartbeatDecision {
+            trigger: false,
+            missing_suppressed: true,
+            grace_expired: false,
+        };
+    }
+    let trigger = matches!(
+        observation,
+        HeartbeatObservation::TriggerMissing { .. }
+            | HeartbeatObservation::TriggerInvalid { .. }
+            | HeartbeatObservation::TriggerStale { .. }
+    );
+    HeartbeatDecision {
+        trigger,
+        missing_suppressed: false,
+        grace_expired: false,
+    }
+}
+
+impl PlannedRestartGrace {
+    fn observe_marker(
+        &mut self,
+        marker: Option<&str>,
+        observed_at_ms: i64,
+        now: Instant,
+    ) -> GraceUpdate {
+        let parsed = marker.and_then(parse_boot_marker);
+        let Some((state, boot_id)) = parsed else {
+            return if self.active.take().is_some() {
+                GraceUpdate::Cancelled
+            } else {
+                GraceUpdate::None
+            };
+        };
+
+        match state.as_str() {
+            "UNCLEAN" => GraceUpdate::Retained,
+            "CLEAN" => {
+                if self
+                    .active
+                    .as_ref()
+                    .is_some_and(|restart| restart.boot_id == boot_id)
+                {
+                    return GraceUpdate::Retained;
+                }
+                if !self.seen_clean_boot_ids.insert(boot_id.clone()) {
+                    return GraceUpdate::Retained;
+                }
+                self.active = Some(PlannedRestart {
+                    boot_id,
+                    observed_at_ms,
+                    deadline: now + PLANNED_RESTART_GRACE,
+                });
+                GraceUpdate::Started
+            }
+            _ => unreachable!("parse_boot_marker accepts only CLEAN or UNCLEAN"),
+        }
+    }
+
+    fn confirm_restart_progress(&mut self, heartbeat: Option<&str>, now_ms: i64) -> bool {
+        let Some(restart) = self.active.as_ref() else {
+            return false;
+        };
+        let Some(raw_timestamp) = heartbeat else {
+            return false;
+        };
+        let Ok(timestamp_ms) = raw_timestamp.parse::<i64>() else {
+            return false;
+        };
+        let age_ms = now_ms.saturating_sub(timestamp_ms);
+        if timestamp_ms <= restart.observed_at_ms || age_ms > HEARTBEAT_STALE_AFTER_MS {
+            return false;
+        }
+        self.active = None;
+        true
+    }
+
+    fn missing_is_suppressed(&self, now: Instant) -> bool {
+        self.active
+            .as_ref()
+            .is_some_and(|restart| now < restart.deadline)
+    }
+
+    fn missing_expired(&self, now: Instant) -> bool {
+        self.active
+            .as_ref()
+            .is_some_and(|restart| now >= restart.deadline)
+    }
+}
+
+fn parse_boot_marker(marker: &str) -> Option<(String, String)> {
+    let payload: serde_json::Value = serde_json::from_str(marker).ok()?;
+    let state = payload.get("state")?.as_str()?;
+    let boot_id = payload.get("boot_id")?.as_str()?;
+    if !matches!(state, "CLEAN" | "UNCLEAN") || boot_id.is_empty() {
+        return None;
+    }
+    Some((state.to_owned(), boot_id.to_owned()))
+}
+
 pub struct Watchdog {
     redis_client: redis::Client,
     mitigation: EmergencyMitigation,
     heartbeat_monitor: HeartbeatMonitor,
+    planned_restart_grace: PlannedRestartGrace,
     environment: RuntimeEnvironment,
 }
 
@@ -88,12 +239,14 @@ impl Watchdog {
             redis_client,
             mitigation,
             heartbeat_monitor: HeartbeatMonitor::default(),
+            planned_restart_grace: PlannedRestartGrace::default(),
             environment,
         })
     }
 
     pub async fn run(mut self) -> anyhow::Result<()> {
         let heartbeat_key = self.environment.key("heartbeat:python");
+        let boot_state_key = self.environment.key("system:engine_boot_state");
         let system_state_key = self.environment.key("system:state");
         let alert_key = self.environment.key("system:alert");
         info!(
@@ -115,42 +268,63 @@ impl Watchdog {
 
             let heartbeat_value =
                 heartbeat_res.context("Watchdog failed to read heartbeat from Redis")?;
+            let boot_state_res: redis::RedisResult<Option<String>> =
+                conn.get(&boot_state_key).await;
+            let boot_state =
+                boot_state_res.context("Watchdog failed to read engine boot state from Redis")?;
             let now_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as i64;
+            let grace_update = self.planned_restart_grace.observe_marker(
+                boot_state.as_deref(),
+                now_ms,
+                Instant::now(),
+            );
+            match grace_update {
+                GraceUpdate::Started => info!("Watchdog observed planned Python shutdown; bounded restart grace started"),
+                GraceUpdate::Cancelled => warn!("Watchdog planned restart grace cancelled because boot evidence is unavailable or invalid"),
+                GraceUpdate::None | GraceUpdate::Retained => {}
+            }
             let observation = self
                 .heartbeat_monitor
                 .observe(heartbeat_value.as_deref(), now_ms);
-            let trigger = match observation {
-                HeartbeatObservation::WaitingForInitial => false,
-                HeartbeatObservation::Healthy { newly_armed } => {
-                    if newly_armed {
-                        info!("Watchdog armed after the first fresh Python heartbeat");
-                    }
-                    false
+            let restart_confirmed = self
+                .planned_restart_grace
+                .confirm_restart_progress(heartbeat_value.as_deref(), now_ms);
+            if restart_confirmed {
+                info!("Watchdog observed fresh Python heartbeat after planned restart");
+            }
+            let now = Instant::now();
+            let decision = decide_heartbeat_action(&observation, &self.planned_restart_grace, now);
+            if decision.grace_expired {
+                error!("Watchdog planned restart grace expired without a fresh Python heartbeat");
+            }
+            if decision.missing_suppressed {
+                warn!("Watchdog heartbeat missing during bounded planned restart grace");
+            }
+            if let HeartbeatObservation::Healthy { newly_armed } = &observation {
+                if *newly_armed {
+                    info!("Watchdog armed after the first fresh Python heartbeat");
                 }
-                HeartbeatObservation::Missing { count } => {
+            }
+            match &observation {
+                HeartbeatObservation::Missing { count }
+                | HeartbeatObservation::TriggerMissing { count }
+                    if !decision.missing_suppressed && !decision.grace_expired =>
+                {
                     warn!("Watchdog: Heartbeat missing (count: {})", count);
-                    false
                 }
-                HeartbeatObservation::Invalid { count } => {
+                HeartbeatObservation::Invalid { count }
+                | HeartbeatObservation::TriggerInvalid { count } => {
                     warn!("Watchdog: Invalid heartbeat format (count: {})", count);
-                    false
-                }
-                HeartbeatObservation::TriggerMissing { count } => {
-                    warn!("Watchdog: Heartbeat missing (count: {})", count);
-                    true
-                }
-                HeartbeatObservation::TriggerInvalid { count } => {
-                    warn!("Watchdog: Invalid heartbeat format (count: {})", count);
-                    true
                 }
                 HeartbeatObservation::TriggerStale { age_ms } => {
                     warn!("Watchdog: Heartbeat stale (age: {}ms)", age_ms);
-                    true
                 }
-            };
+                _ => {}
+            }
+            let trigger = decision.trigger;
 
             if trigger {
                 error!("🚨 WATCHDOG TRIGGERED: Python heartbeat failure!");
@@ -259,6 +433,71 @@ mod tests {
         assert_eq!(
             malformed.observe(Some("invalid"), 10_000),
             HeartbeatObservation::TriggerInvalid { count: 6 }
+        );
+    }
+
+    #[test]
+    fn integrated_decision_expires_unarmed_grace_and_never_masks_present_failures() {
+        let start = Instant::now();
+        let mut grace = PlannedRestartGrace::default();
+        grace.observe_marker(
+            Some(r#"{"state":"CLEAN","boot_id":"boot-a"}"#),
+            10_000,
+            start,
+        );
+
+        let before_deadline = decide_heartbeat_action(
+            &HeartbeatObservation::WaitingForInitial,
+            &grace,
+            start + Duration::from_secs(29),
+        );
+        assert_eq!(
+            before_deadline,
+            HeartbeatDecision {
+                trigger: false,
+                missing_suppressed: true,
+                grace_expired: false,
+            }
+        );
+        let at_deadline = decide_heartbeat_action(
+            &HeartbeatObservation::WaitingForInitial,
+            &grace,
+            start + Duration::from_secs(30),
+        );
+        assert_eq!(
+            at_deadline,
+            HeartbeatDecision {
+                trigger: true,
+                missing_suppressed: false,
+                grace_expired: true,
+            }
+        );
+
+        let stale = decide_heartbeat_action(
+            &HeartbeatObservation::TriggerStale { age_ms: 6_000 },
+            &grace,
+            start + Duration::from_secs(5),
+        );
+        assert_eq!(
+            stale,
+            HeartbeatDecision {
+                trigger: true,
+                missing_suppressed: false,
+                grace_expired: false,
+            }
+        );
+        let malformed = decide_heartbeat_action(
+            &HeartbeatObservation::TriggerInvalid { count: 6 },
+            &grace,
+            start + Duration::from_secs(5),
+        );
+        assert_eq!(
+            malformed,
+            HeartbeatDecision {
+                trigger: true,
+                missing_suppressed: false,
+                grace_expired: false,
+            }
         );
     }
 
