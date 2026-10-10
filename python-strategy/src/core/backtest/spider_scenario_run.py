@@ -52,7 +52,11 @@ _PAID_SELECTOR = "SPIDER_PAID_RESEARCH_RUN_V1"
 _PAID_RUN_CONTRACT = _PAID_SELECTOR
 _PAID_PROGRAM = (*_P3_PROGRAM,
                  "python-strategy/src/core/backtest/spider_run_execution_schema.py",
-                 "python-strategy/src/core/backtest/spider_run_execution_evidence.py")
+                 "python-strategy/src/core/backtest/spider_run_execution_evidence.py",
+                 "python-strategy/src/core/backtest/spider_formal_runner.py",
+                 "python-strategy/src/core/backtest_runner.py",
+                 "python-strategy/src/core/research_backtest_runner.py",
+                 "python-strategy/examples/run_spider_scenario_replay.py")
 
 
 def _paid_durability_unknown(error: Exception) -> bool:

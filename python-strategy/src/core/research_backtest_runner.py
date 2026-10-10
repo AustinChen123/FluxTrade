@@ -43,7 +43,9 @@ from src.core.backtest.run_evidence import (
     strategy_configuration_contract,
 )
 from src.core.backtest.spider_formal_runner import (
+    SpiderExecutionFormalResult,
     SpiderFormalRunResult,
+    _invoke_spider_execution,
     _invoke_spider_historical,
 )
 from src.core.backtest.loader import get_candles_generator
@@ -128,6 +130,18 @@ class ResearchBacktestRunner:
     - Preserves full-runner ordering: existing orders fill before new signals.
     - Does not apply RiskManager checks, DB writes, signal audits, or reports.
     """
+
+    @staticmethod
+    def run_spider_execution(
+        *, output_root: str, run_id: str, execution_input: bytes,
+    ) -> SpiderExecutionFormalResult:
+        """Run the shared paid Spider lifecycle without the candle runner."""
+        return _invoke_spider_execution(
+            output_root=output_root,
+            run_id=run_id,
+            execution_input=execution_input,
+            runner_kind="research",
+        )
 
     @staticmethod
     def run_spider_historical(

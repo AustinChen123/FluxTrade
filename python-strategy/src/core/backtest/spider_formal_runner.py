@@ -16,6 +16,10 @@ from src.core.backtest import spider_scenario_run
 _PROJECTION_SCHEMA = "spider_p02_projection_v1"
 _P3_CONTRACT = "SPIDER_HISTORICAL_RESEARCH_RUN_V1"
 _REPORT_CHECK = "REPORT_PROJECTION_MATCH"
+_EXECUTION_PROJECTION_SCHEMA = "spider_execution_projection_v1"
+_EXECUTION_RESULT_STATUSES = (
+    "PAID_FLAT", "INCOMPLETE", "LIQUIDATED_FLAT", "LIQUIDATED_INSOLVENT", "FAILED",
+)
 
 
 class SpiderProjectionIntegrityError(ValueError):
@@ -71,6 +75,64 @@ class SpiderFormalRunResult:
     @property
     def schema_version(self) -> str:
         return "spider_formal_run_result_v1"
+
+    @property
+    def report_rows(self) -> list[dict[str, object]] | None:
+        if self._report_rows_json is None:
+            return None
+        rows = json.loads(self._report_rows_json)
+        if type(rows) is not list or any(type(row) is not dict for row in rows):
+            raise SpiderProjectionIntegrityError
+        return cast(list[dict[str, object]], rows)
+
+
+@dataclass(frozen=True, slots=True)
+class SpiderExecutionProjection:
+    """Immutable canonical paid execution projection and content identity."""
+
+    canonical_json: bytes
+    sha256: str
+
+    def __post_init__(self) -> None:
+        if type(self.canonical_json) is not bytes or sha256(self.canonical_json).hexdigest() != self.sha256:
+            raise SpiderProjectionIntegrityError
+
+    @property
+    def value(self) -> dict[str, object]:
+        try:
+            decoded = json.loads(self.canonical_json)
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            raise SpiderProjectionIntegrityError from error
+        if type(decoded) is not dict:
+            raise SpiderProjectionIntegrityError
+        return cast(dict[str, object], decoded)
+
+    @property
+    def report_rows(self) -> list[dict[str, object]]:
+        rows = self.value["report_rows"]
+        if type(rows) is not list or any(type(row) is not dict for row in rows):
+            raise SpiderProjectionIntegrityError
+        return cast(list[dict[str, object]], rows)
+
+
+@dataclass(frozen=True, slots=True)
+class SpiderExecutionFormalResult:
+    """Typed, detached result for an admitted paid execution research run."""
+
+    runner_kind: Literal["full", "research"]
+    run_id: str
+    outcome: Literal["ADMITTED", "REJECTED", "FAILED", "DURABILITY_UNKNOWN"]
+    reason: str | None
+    admission: Literal["ACCEPT"] | None
+    endpoint_status: Literal[
+        "PAID_FLAT", "INCOMPLETE", "LIQUIDATED_FLAT", "LIQUIDATED_INSOLVENT", "FAILED",
+    ] | None
+    projection: SpiderExecutionProjection | None
+    _report_rows_json: bytes | None = field(default=None, repr=False)
+
+    @property
+    def schema_version(self) -> str:
+        return "spider_execution_formal_result_v1"
 
     @property
     def report_rows(self) -> list[dict[str, object]] | None:
@@ -177,6 +239,57 @@ def _projection_from_admitted_artifacts(artifacts: object) -> SpiderP02Projectio
     return SpiderP02Projection(encoded, sha256(encoded).hexdigest())
 
 
+def _execution_projection_value(artifacts: dict[str, Any]) -> dict[str, object]:
+    attempt = artifacts["attempt.json"]
+    status = artifacts["status.json"]
+    journal = artifacts["journal.jsonl"]
+    execution_input = artifacts["execution_input.json"]
+    paid_endpoint = artifacts["paid_endpoint.json"]
+    report_rows = artifacts["report.jsonl"]
+    reconciliation = artifacts["reconciliation.json"]
+    completion = artifacts["completion.json"]
+
+    normalized_endpoint = cast(dict[str, object], _without_run_id(paid_endpoint))
+    normalized_reconciliation = cast(dict[str, object], _without_run_id(reconciliation))
+    normalized_completion = cast(dict[str, object], _without_run_id(completion))
+    completion_artifacts = normalized_completion["artifacts"]
+    if type(completion_artifacts) is not list:
+        raise SpiderProjectionIntegrityError
+    for item in completion_artifacts:
+        if type(item) is not dict:
+            raise SpiderProjectionIntegrityError
+        entry = cast(dict[str, object], item)
+        entry.pop("sha256", None)
+        entry.pop("byte_count", None)
+    normalized_completion["endpoint_state_digest"] = normalized_endpoint
+    normalized_completion["reconciliation_digest"] = normalized_reconciliation
+
+    return {
+        "schema_version": _EXECUTION_PROJECTION_SCHEMA,
+        "attempt": _without_run_id(attempt),
+        "status": _without_run_id(status),
+        "journal": _without_run_id(journal),
+        "execution_input": _without_run_id(execution_input),
+        "paid_endpoint": normalized_endpoint,
+        "report_rows": _without_run_id(report_rows),
+        "reconciliation": normalized_reconciliation,
+        "completion": normalized_completion,
+    }
+
+
+def _execution_projection_from_admitted_artifacts(artifacts: object) -> SpiderExecutionProjection:
+    if type(artifacts) is not dict:
+        raise SpiderProjectionIntegrityError
+    try:
+        value = _execution_projection_value(cast(dict[str, Any], artifacts))
+        encoded = canonical_bytes(value)
+    except (KeyError, TypeError, ValueError) as error:
+        if isinstance(error, SpiderProjectionIntegrityError):
+            raise
+        raise SpiderProjectionIntegrityError from error
+    return SpiderExecutionProjection(encoded, sha256(encoded).hexdigest())
+
+
 def project_admitted_spider_run(
     directory: str | PathLike[str],
 ) -> SpiderP02Projection | None:
@@ -223,4 +336,52 @@ def _invoke_spider_historical(
         return SpiderFormalRunResult(runner_kind, run_id, "FAILED", reason, None, None)
     return SpiderFormalRunResult(
         runner_kind, run_id, "ADMITTED", None, "ACCEPT", projection, report_rows_json,
+    )
+
+
+def _invoke_spider_execution(
+    *, output_root: str, run_id: str, execution_input: bytes,
+    runner_kind: Literal["full", "research"],
+) -> SpiderExecutionFormalResult:
+    """Run the shared paid lifecycle once and project only shared admission."""
+    run_result = spider_scenario_run.run_spider_scenario(
+        output_root, run_id, "SPIDER_PAID_RESEARCH_RUN_V1", execution_input=execution_input,
+    )
+    outcome = cast(Literal["ADMITTED", "REJECTED", "FAILED", "DURABILITY_UNKNOWN"], run_result["outcome"])
+    reason = cast(str | None, run_result["reason"])
+    endpoint_status = cast(
+        Literal["PAID_FLAT", "INCOMPLETE", "LIQUIDATED_FLAT", "LIQUIDATED_INSOLVENT", "FAILED"] | None,
+        run_result["endpoint_status"],
+    )
+    if outcome != "ADMITTED":
+        return SpiderExecutionFormalResult(
+            runner_kind, run_id, outcome, reason, None, endpoint_status, None,
+        )
+
+    admission = admit_spider_run(Path(output_root) / run_id)
+    if admission.get("decision") != "ACCEPT":
+        return SpiderExecutionFormalResult(
+            runner_kind, run_id, "FAILED", cast(str | None, admission.get("reason")),
+            None, endpoint_status, None,
+        )
+    artifacts = admission.get("artifacts")
+    try:
+        projection = _execution_projection_from_admitted_artifacts(artifacts)
+        if type(artifacts) is not dict:
+            raise SpiderProjectionIntegrityError
+        report_rows_json = canonical_bytes(cast(dict[str, Any], artifacts)["report.jsonl"])
+    except (KeyError, TypeError, ValueError) as error:
+        reason = (str(error) if isinstance(error, SpiderProjectionIntegrityError)
+                 else "FORMAL_PROJECTION_INTEGRITY_FAILED")
+        return SpiderExecutionFormalResult(
+            runner_kind, run_id, "FAILED", reason, None, endpoint_status, None,
+        )
+    if endpoint_status not in _EXECUTION_RESULT_STATUSES:
+        return SpiderExecutionFormalResult(
+            runner_kind, run_id, "FAILED", "FORMAL_PROJECTION_INTEGRITY_FAILED",
+            None, None, None,
+        )
+    return SpiderExecutionFormalResult(
+        runner_kind, run_id, "ADMITTED", reason, "ACCEPT", endpoint_status,
+        projection, report_rows_json,
     )
