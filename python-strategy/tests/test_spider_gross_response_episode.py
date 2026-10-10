@@ -9,7 +9,7 @@ from typing import Any, cast
 
 import pytest
 
-from src.core.backtest.spider_gross_response import propose_reductions
+from src.core.backtest.spider_gross_response import GrossResponseEpisode, _observation_state, propose_reductions
 from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_canonical
 from src.core.backtest.synthetic_scenario_replay import _ReplayComposition
 from test_spider_gross_execution_input import _over_cap_gross_input
@@ -49,6 +49,26 @@ def _with_minimums(request, minimums: dict[str, str]):
             market["minSz"] = minimums[market["product_id"]]
     history = replace(history, initial_policy_cache=canonical_bytes(cache))
     return replace(request, execution_input=replace(execution, historical_input=history))
+
+
+@pytest.mark.parametrize(("state", "active", "settlement", "failure", "expected"), [
+    ("RESTRICTED", True, False, False, "RESTRICTED"),
+    ("RESTRICTED", True, True, False, "INCOMPLETE"),
+    ("RECOVERED", False, True, False, "RECOVERED"),
+    ("LIQUIDATED_FLAT", False, True, False, "LIQUIDATED_FLAT"),
+    ("RESTRICTED", True, True, True, "FAILED"),
+])
+def test_observation_state_helper_preserves_existing_mapping(
+    state: str, active: bool, settlement: bool, failure: bool, expected: str,
+):
+    episode = GrossResponseEpisode("a" * 64, "strategy", ("A-USDT-SWAP",))
+    episode.state = state
+    episode.active = active
+    result = episode.observation(settlement_complete=settlement, terminal_failure=failure)
+    assert result["current_state"] == expected
+    assert result["current_state"] == _observation_state(
+        state, active, settlement_complete=settlement, terminal_failure=failure,
+    )
 
 
 def _with_later_mark(request, value: str, *, offset_ms: int = 60_000):

@@ -20,10 +20,13 @@ from src.core.backtest.spider_historical_input import (
 )
 from src.core.backtest.spider_run_execution_schema import (
     _COMPLETION_ARTIFACTS as _EXECUTION_COMPLETION_ARTIFACTS,
+    _GROSS_COMPLETION_ARTIFACTS,
+    _GROSS_SCHEMA,
     _SCHEMA as _EXECUTION_SCHEMA,
     _FLOATING_COMPLETION_ARTIFACTS,
     _FLOATING_SCHEMA,
     execution_context_from_input as _execution_context_from_input,
+    gross_execution_context_from_input as _gross_execution_context_from_input,
     floating_exit_context_from_input as _floating_exit_context_from_input,
     validate_execution_artifact as _validate_execution_artifact,
 )
@@ -46,6 +49,8 @@ _EXECUTION_NAMES = tuple(name for name, _, _ in _EXECUTION_COMPLETION_ARTIFACTS)
 _EXECUTION_ALL = (*_EXECUTION_NAMES, "completion.json")
 _FLOATING_NAMES = tuple(name for name, _, _ in _FLOATING_COMPLETION_ARTIFACTS)
 _FLOATING_ALL = (*_FLOATING_NAMES, "completion.json")
+_GROSS_NAMES = tuple(name for name, _, _ in _GROSS_COMPLETION_ARTIFACTS)
+_GROSS_ALL = (*_GROSS_NAMES, "completion.json")
 
 
 class _Unsafe(Exception):
@@ -123,7 +128,9 @@ def _diagnose(directory: int) -> dict[str, _Any]:
         journal_raw = _capture(directory, "journal.jsonl")
         status = _decode(status_raw, "status.json")
         journal = _decode(journal_raw, "journal.jsonl")
-        if type(status) is dict and status.get("schema_version") == _EXECUTION_SCHEMA["status.json"]:
+        if type(status) is dict and status.get("schema_version") in (
+            _EXECUTION_SCHEMA["status.json"], _GROSS_SCHEMA["status.json"],
+        ):
             try:
                 _validate_execution_artifact(
                     "status.json", status_raw, execution_context=status["execution_context"],
@@ -173,9 +180,12 @@ def _diagnose(directory: int) -> dict[str, _Any]:
 
 
 def _admit_execution(directory: int, manifest: dict[str, _Any], completion_raw: bytes,
-                     *, floating_exit: bool = False) -> dict[str, _Any]:
-    names = _FLOATING_NAMES if floating_exit else _EXECUTION_NAMES
-    all_names = _FLOATING_ALL if floating_exit else _EXECUTION_ALL
+                     *, floating_exit: bool = False,
+                     gross_execution: bool = False) -> dict[str, _Any]:
+    names = (_GROSS_NAMES if gross_execution else
+             _FLOATING_NAMES if floating_exit else _EXECUTION_NAMES)
+    all_names = (_GROSS_ALL if gross_execution else
+                 _FLOATING_ALL if floating_exit else _EXECUTION_ALL)
     unsafe = []
     for name in names:
         try:
@@ -245,7 +255,7 @@ def _admit_execution(directory: int, manifest: dict[str, _Any], completion_raw: 
     run_id = manifest["run_id"]
     input_row = values["execution_input.json"]
     historical_input = input_row.get("historical_input") if type(input_row) is dict else None
-    if floating_exit and type(input_row) is dict and type(input_row.get("execution_input")) is dict:
+    if (floating_exit or gross_execution) and type(input_row) is dict and type(input_row.get("execution_input")) is dict:
         historical_input = input_row["execution_input"].get("historical_input")
     if (type(historical_input) is dict and "run_id" in historical_input
             and (not _run_id(historical_input["run_id"]) or historical_input["run_id"] != run_id)):
@@ -262,11 +272,16 @@ def _admit_execution(directory: int, manifest: dict[str, _Any], completion_raw: 
                 bad.append(name)
                 break
     if bad:
-        return _reject("RUN_ID_MISMATCH", tuple(name for name in _EXECUTION_NAMES if name in bad))
+        return _reject("RUN_ID_MISMATCH", tuple(name for name in names if name in bad))
 
     try:
-        execution = (_floating_exit_context_from_input(captured["execution_input.json"])
-                     if floating_exit else _execution_context_from_input(captured["execution_input.json"]))
+        execution = (
+            _gross_execution_context_from_input(captured["execution_input.json"])
+            if gross_execution else
+            _floating_exit_context_from_input(captured["execution_input.json"])
+            if floating_exit else
+            _execution_context_from_input(captured["execution_input.json"])
+        )
     except _HistoricalInputError:
         return _reject("UNSUPPORTED_SCHEMA", ("execution_input.json",))
     except ValueError as error:
@@ -344,6 +359,7 @@ def _admit(directory: int) -> dict[str, _Any]:
         if (type(manifest) is dict
                 and manifest.get("schema_version") in (
                     _EXECUTION_SCHEMA["completion.json"], _FLOATING_SCHEMA["completion.json"],
+                    _GROSS_SCHEMA["completion.json"],
                 )):
             try:
                 _validate_execution_artifact(
@@ -355,7 +371,11 @@ def _admit(directory: int) -> dict[str, _Any]:
                 return _reject("INVALID_MANIFEST", ("completion.json",))
             except (KeyError, TypeError, IndexError):
                 return _reject("INVALID_MANIFEST", ("completion.json",))
-            return _admit_execution(directory, manifest, raw, floating_exit=floating_exit)
+            gross_execution = manifest.get("schema_version") == _GROSS_SCHEMA["completion.json"]
+            return _admit_execution(
+                directory, manifest, raw, floating_exit=floating_exit,
+                gross_execution=gross_execution,
+            )
         _validate(_completion, manifest)
     except _Invalid:
         return _reject("INVALID_MANIFEST", ("completion.json",))

@@ -88,7 +88,8 @@ def _policy_market(value: object) -> None:
     _enum(market["state"], ["live"])
 
 
-def _scheduler_result(value: object, *, expected_kind: str | None = None) -> None:
+def _scheduler_result(value: object, *, expected_kind: str | None = None,
+                      gross_cut_evidence: bool = False) -> None:
     row = _object_keys(value, "kind stable_id classification",
                        "market_snapshot group_result gross_group_control events callbacks reason native_failure")
     kind = _text(row["kind"])
@@ -108,13 +109,42 @@ def _scheduler_result(value: object, *, expected_kind: str | None = None) -> Non
         group_result(row["group_result"])
     if "gross_group_control" in row:
         gross_group_control(row["gross_group_control"])
-    for name in ("events", "callbacks"):
-        if name in row:
-            _list(row[name])
+    if "events" in row:
+        _list(row["events"])
+    if "callbacks" in row:
+        callbacks = row["callbacks"]
+        if gross_cut_evidence and row["classification"] == "TERMINAL":
+            _require(type(callbacks) is dict)
+            for delivery_id, audit_events in cast(dict[object, object], callbacks).items():
+                _text(delivery_id, r"[0-9a-f]{64}")
+                for event in _list(audit_events):
+                    _audit_event(event)
+        else:
+            _list(callbacks)
     if "reason" in row:
         _text(row["reason"])
     if "native_failure" in row and row["native_failure"] is not None:
         _object(row["native_failure"], "kind reason")
+
+
+def _audit_event(value: object) -> None:
+    event = _object(value, "event", "actions disposition")
+    envelope._policy_event(event["event"])
+    if "actions" in event:
+        for action in _list(event["actions"]):
+            row = _object(action, "status group_id", "group_result native_failure")
+            _enum(row["status"], ["UNSUBMITTED", "SUBMITTED"])
+            if row["group_id"] is not None:
+                _text(row["group_id"])
+            if row.get("group_result") is not None:
+                from src.core.backtest.spider_run_native_schema import group_result
+                group_result(row["group_result"])
+            if row.get("native_failure") is not None:
+                failure = _object(row["native_failure"], "reason poisoned")
+                _text(failure["reason"])
+                _require(type(failure["poisoned"]) is bool)
+    if "disposition" in event:
+        _enum(event["disposition"], ["NONE", "ALL", "PARTIAL"])
 
 
 def _send_dependency(value: object) -> None:
@@ -243,7 +273,7 @@ def _scheduler_key_list(value: object) -> None:
     _text(key[3])
 
 
-def _operation_state(value: object) -> None:
+def _operation_state(value: object, *, gross_cut_evidence: bool = False) -> None:
     row = _object(value, "actions product_operations pending_delivery_ids pending_deliveries delivery_roles cancel_action_ids send_dependencies cancel_effects cancel_pending_order_ids gross_response")
     for action in _list(row["actions"]):
         item = _object(action, "action_id parent_action_id role product_id order_id group_id effective_at classification result")
@@ -292,7 +322,7 @@ def _operation_state(value: object) -> None:
         delivery = _object(item, "key delivery result role cancel_action_id")
         _scheduler_key_list(delivery["key"])
         _delivery(delivery["delivery"])
-        _scheduler_result(delivery["result"])
+        _scheduler_result(delivery["result"], gross_cut_evidence=gross_cut_evidence)
         if delivery["role"] is not None:
             _enum(delivery["role"], ["GRID", "EXIT", "DRAIN_CANCEL", "GROSS_CANCEL", "GROSS_REDUCTION"])
         if delivery["cancel_action_id"] is not None:
@@ -368,11 +398,15 @@ def _native_state(value: object) -> None:
     _text(admission["bound_scope"])
     _enum(admission["risk_policy_id"], ["CURRENT_MARK_GROSS_CAP_TWO_V1"])
     _text(admission["valuation_context_id"], r"[0-9a-f]{64}")
-    ratio = _object(admission["gross_ratio"], "numerator denominator")
-    _decimal(ratio["numerator"])
-    _decimal(ratio["denominator"])
     for name in ("cap", "effective_equity", "fee_hold", "gross", "net", "order_loss_hold", "worst_gross"):
         _decimal(admission[name])
+    effective_equity = Decimal(str(admission["effective_equity"]))
+    if effective_equity <= 0:
+        _require(admission["gross_ratio"] is None)
+    else:
+        ratio = _object(admission["gross_ratio"], "numerator denominator")
+        _decimal(ratio["numerator"])
+        _decimal(ratio["denominator"])
     _decimal(admission["equity_floor"], nullable=True)
     _require(type(row["current_admission_state_ready"]) is bool)
     products = _list(row["products"])
@@ -399,7 +433,7 @@ def _native_state(value: object) -> None:
         _require(type(item["cancel_pending"]) is bool and type(item["verified_reducing"]) is bool)
 
 
-def _proposal(value: object) -> None:
+def _proposal(value: object, *, gross_cut_evidence: bool = False) -> None:
     row = _object(value, "policy_id parameters scope native_state_digest account_version valuation_context_id state estimated_fee_rate estimated_reduction_gross estimated_fee estimated_equity_after rows reason proposal_context")
     _enum(row["policy_id"], ["PROPORTIONAL_PAID_GROSS_TARGET_V1"])
     params = _object(row["parameters"], "trigger_cap target_cap allocation quantity_rounding")
@@ -431,10 +465,10 @@ def _proposal(value: object) -> None:
             _text(result["reason"])
     context = _object(row["proposal_context"], "source_state operation_state")
     _source_state(context["source_state"])
-    _operation_state(context["operation_state"])
+    _operation_state(context["operation_state"], gross_cut_evidence=gross_cut_evidence)
 
 
-def _episode(value: object) -> None:
+def _episode(value: object, *, gross_cut_evidence: bool = False) -> None:
     row = _object(value, "sequence trigger_key trigger_state rounds state reason recovered_key recovery_state remaining_obligations")
     _integer(row["sequence"])
     scheduler_key(row["trigger_key"], nullable=True)
@@ -451,7 +485,7 @@ def _episode(value: object) -> None:
         if round_row["sequence"] is not None:
             _integer(round_row["sequence"])
         scheduler_key(round_row["proposal_key"], nullable=True)
-        _proposal(round_row["proposal"])
+        _proposal(round_row["proposal"], gross_cut_evidence=gross_cut_evidence)
         for action_id in _list(round_row["action_ids"]):
             _text(action_id)
         scheduler_key(round_row["completion_key"], nullable=True)
@@ -460,13 +494,21 @@ def _episode(value: object) -> None:
     if row["remaining_obligations"] is not None:
         for item in _list(row["remaining_obligations"]):
             obligation = _object(item, "operation_state native_state")
-            _operation_state(obligation["operation_state"])
+            _operation_state(obligation["operation_state"], gross_cut_evidence=gross_cut_evidence)
             _native_state(obligation["native_state"])
 
 
 def gross_observation(value: object, *, expected_hash: str | None = None) -> None:
-    row = _object(value, "schema_version run_contract_sha256 policy_id response_parameters authorization_scope observations episodes peak_ratio overlimit_intervals overlimit_duration_ms current_state reason")
-    _enum(row["schema_version"], ["spider_gross_response_observation_v1"])
+    _require(type(value) is dict)
+    raw = cast(dict[str, object], value)
+    schema_version = raw.get("schema_version")
+    cut_evidence = schema_version == "spider_gross_response_observation_v2"
+    fields = "schema_version run_contract_sha256 policy_id response_parameters authorization_scope observations episodes peak_ratio overlimit_intervals overlimit_duration_ms current_state reason"
+    if cut_evidence:
+        fields += " final_obligation_state"
+    row = _object(value, fields)
+    _enum(row["schema_version"], ["spider_gross_response_observation_v1",
+                                  "spider_gross_response_observation_v2"])
     run_hash = _text(row["run_contract_sha256"], r"[0-9a-f]{64}")
     _require(expected_hash is None or run_hash == expected_hash)
     _enum(row["policy_id"], ["PROPORTIONAL_PAID_GROSS_TARGET_V1"])
@@ -481,7 +523,10 @@ def gross_observation(value: object, *, expected_hash: str | None = None) -> Non
     products = [_text(item) for item in _list(scope["ordered_products"])]
     _require(bool(products) and len(products) == len(set(products)))
     for item in _list(row["observations"]):
-        observation = _object(item, "key observed_at native_state before_state after_state reason episode_sequence")
+        observation_fields = "key observed_at native_state before_state after_state reason episode_sequence"
+        if cut_evidence:
+            observation_fields += " operation_state"
+        observation = _object(item, observation_fields)
         scheduler_key(observation["key"], nullable=True)
         _integer(observation["observed_at"])
         _native_state(observation["native_state"])
@@ -491,9 +536,11 @@ def gross_observation(value: object, *, expected_hash: str | None = None) -> Non
             _text(observation["reason"])
         if observation["episode_sequence"] is not None:
             _integer(observation["episode_sequence"])
+        if cut_evidence and observation["operation_state"] is not None:
+            _operation_state(observation["operation_state"], gross_cut_evidence=cut_evidence)
     sequences = []
     for episode in _list(row["episodes"]):
-        _episode(episode)
+        _episode(episode, gross_cut_evidence=cut_evidence)
         sequences.append(cast(dict[str, object], episode)["sequence"])
     _require(sequences == sorted(set(sequences)))
     peak = row["peak_ratio"]
@@ -513,6 +560,18 @@ def gross_observation(value: object, *, expected_hash: str | None = None) -> Non
     _enum(row["current_state"], _STATES)
     if row["reason"] is not None:
         _text(row["reason"])
+    if cut_evidence:
+        _final_obligation_state(row["final_obligation_state"])
+
+
+def _final_obligation_state(value: object) -> None:
+    if value is None:
+        return
+    final = _object(value, "operation_state native_state observed_at key")
+    _operation_state(final["operation_state"], gross_cut_evidence=True)
+    _native_state(final["native_state"])
+    _integer(final["observed_at"])
+    scheduler_key(final["key"], nullable=True)
 
 
 def execution_report(value: object, *, execution: GrossExecutionContext,

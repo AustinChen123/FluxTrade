@@ -17,10 +17,14 @@ from src.core.backtest.spider_run_reconciliation_schema import reconciliation as
 from src.core.backtest.spider_historical_input import _validate_historical_run_link
 from src.core.backtest.spider_run_execution_schema import (
     _COMPLETION_ARTIFACTS as _EXECUTION_COMPLETION_ARTIFACTS,
+    _GROSS_COMPLETION_ARTIFACTS,
     _FLOATING_COMPLETION_ARTIFACTS,
+    _GROSS_SCHEMA as _GROSS_EXECUTION_SCHEMA,
     _SCHEMA as _EXECUTION_SCHEMA,
+    canonical_gross_paid_bytes,
     canonical_paid_bytes,
     execution_context_from_input,
+    gross_execution_context_from_input,
     floating_exit_context_from_input,
     validate_execution_artifact,
 )
@@ -33,12 +37,17 @@ from src.core.backtest.spider_floating_exit_input import (
     decode_spider_floating_exit_input,
     validate_spider_floating_exit_input,
 )
+from src.core.backtest.spider_gross_execution_input import (
+    decode_spider_gross_execution_input,
+    validate_spider_gross_execution_input,
+)
 from src.core.backtest.spider_run_artifacts import (
     _HASH_NAMES,
     configuration_context as validate_configuration_context,
     decode_canonical,
     execution_context as validate_execution_context,
     floating_exit_context as validate_floating_exit_context,
+    gross_execution_context as validate_gross_execution_context,
     historical_context as validate_historical_context,
 )
 from src.core.backtest.spider_historical_input import historical_context_for_input
@@ -110,19 +119,25 @@ class SpiderRunStore:
         self._execution_historical: dict[str, Any] | None = None
         self._execution_input: bytes | None = None
         self._floating_exit = False
+        self._gross_execution = False
 
     def _is_execution(self) -> bool:
         return self._attempt.get("run_contract_id") in (
             "SPIDER_PAID_RESEARCH_RUN_V1", "SPIDER_FLOATING_EXIT_RESEARCH_RUN_V1",
+            "SPIDER_GROSS_PROTECTED_RESEARCH_RUN_V1",
         )
 
     def _execution_schema(self) -> dict[str, str]:
+        if self._gross_execution:
+            return _GROSS_EXECUTION_SCHEMA
         if self._floating_exit:
             from src.core.backtest.spider_run_execution_schema import _FLOATING_SCHEMA
             return _FLOATING_SCHEMA
         return _EXECUTION_SCHEMA
 
     def _execution_completion_artifacts(self):
+        if self._gross_execution:
+            return _GROSS_COMPLETION_ARTIFACTS
         return _FLOATING_COMPLETION_ARTIFACTS if self._floating_exit else _EXECUTION_COMPLETION_ARTIFACTS
 
     @classmethod
@@ -203,10 +218,17 @@ class SpiderRunStore:
         return raw
 
     def _execution_registration(self, attempt: dict[str, Any], raw: bytes, *,
-                                floating_exit: bool = False) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+                                floating_exit: bool = False,
+                                gross_execution: bool = False) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
         if type(raw) is not bytes:
             raise ValueError("INVALID_ARTIFACT")
-        if floating_exit:
+        if gross_execution:
+            gross_request = decode_spider_gross_execution_input(raw)
+            wrapper_hash = validate_spider_gross_execution_input(gross_request)
+            request = gross_request.execution_input
+            execution = gross_execution_context_from_input(raw)
+            context = validate_gross_execution_context(execution)
+        elif floating_exit:
             floating_request = decode_spider_floating_exit_input(raw)
             wrapper_hash = validate_spider_floating_exit_input(floating_request)
             request = floating_request.execution_input
@@ -234,11 +256,14 @@ class SpiderRunStore:
         if (attempt["run_id"] != self._run_id
                 or attempt["configuration_context"] != configuration
                 or attempt["historical_context"] != historical
-                or attempt["execution_context"] != context._asdict()
+                or attempt["execution_context"] != (execution if gross_execution else context._asdict())
                 or attempt["account_key"] != dict(
                     venue="SPIDER_HISTORICAL_RESEARCH", environment="RESEARCH_ONLY", account=run.account_key,
                 )
-                or attempt["profile_id"] != "SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1"
+                or attempt["profile_id"] != (
+                    "SYNTHETIC_CONFIGURED_GROSS_ADMISSION_V1" if gross_execution
+                    else "SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1"
+                )
                 or attempt["scenario_plan_sha256"] != wrapper_hash
                 or attempt["policy_source_sha256"] != run.policy_source_sha256
                 or [entry["name"] for entry in attempt["input_contract_hashes"]] != list(_HASH_NAMES)
@@ -256,29 +281,35 @@ class SpiderRunStore:
     def register(
         self, attempt: dict[str, Any], *, historical_input: bytes | None = None,
         execution_input: bytes | None = None, floating_exit_input: bytes | None = None,
+        gross_execution_input: bytes | None = None,
     ) -> str:
         self._allowed("CREATED")
         floating_exit = floating_exit_input is not None
-        if floating_exit and execution_input is not None:
+        gross_execution = gross_execution_input is not None
+        if sum((floating_exit, gross_execution, execution_input is not None)) > 1:
             raise ValueError("INVALID_ARTIFACT")
-        paid = execution_input is not None or floating_exit
+        paid = execution_input is not None or floating_exit or gross_execution
         if paid:
-            raw = floating_exit_input if floating_exit else execution_input
+            raw = (gross_execution_input if gross_execution else
+                   floating_exit_input if floating_exit else execution_input)
             if historical_input is not None:
                 raise ValueError("INVALID_ARTIFACT")
             if (type(attempt) is not dict
                     or attempt.get("schema_version") != (
+                        _GROSS_EXECUTION_SCHEMA["attempt.json"] if gross_execution else
                         "spider_floating_exit_attempt_v1" if floating_exit else "spider_execution_attempt_v1"
                     )
                     or attempt.get("run_contract_id") != (
-                        "SPIDER_FLOATING_EXIT_RESEARCH_RUN_V1" if floating_exit
-                        else "SPIDER_PAID_RESEARCH_RUN_V1"
+                        "SPIDER_GROSS_PROTECTED_RESEARCH_RUN_V1" if gross_execution else
+                        "SPIDER_FLOATING_EXIT_RESEARCH_RUN_V1" if floating_exit else
+                        "SPIDER_PAID_RESEARCH_RUN_V1"
                     )
                     or attempt.get("registration_state") != "VALIDATED"):
                 raise ValueError("INVALID_ARTIFACT")
             try:
                 execution_context, configuration_context, historical_context_value = self._execution_registration(
                     attempt, cast(bytes, raw), floating_exit=floating_exit,
+                    gross_execution=gross_execution,
                 )
             except (ValueError, KeyError, TypeError, IndexError) as error:
                 raise ValueError("INVALID_ARTIFACT") from error
@@ -287,6 +318,7 @@ class SpiderRunStore:
             self._execution_historical = historical_context_value
             self._execution_input = cast(bytes, raw)
             self._floating_exit = floating_exit
+            self._gross_execution = gross_execution
             self._publish("execution_input.json", cast(bytes, raw))
             self._publish("attempt.json", canonical_bytes(attempt) + b"\n")
             self._attempt = deepcopy(attempt)
@@ -418,8 +450,12 @@ class SpiderRunStore:
         if not self._is_execution():
             raise RuntimeError("INVALID_STORE_OPERATION")
         assert self._execution_context is not None and self._execution_configuration is not None
-        raw = (canonical_bytes(endpoint) + b"\n" if self._floating_exit else
-               canonical_paid_bytes(endpoint, self._execution_context, self._execution_configuration))
+        raw = (
+            canonical_bytes(endpoint) + b"\n" if self._floating_exit else
+            canonical_gross_paid_bytes(endpoint, self._execution_context, self._execution_configuration)
+            if self._gross_execution else
+            canonical_paid_bytes(endpoint, self._execution_context, self._execution_configuration)
+        )
         if self._floating_exit:
             validate_execution_artifact("paid_endpoint.json", raw,
                                         execution_context=self._execution_context,
@@ -442,8 +478,11 @@ class SpiderRunStore:
                 historical=self._execution_historical, journal_rows=journal_rows,
             )
             if name == "execution_input.json":
-                request = (decode_spider_floating_exit_input(raw).execution_input
-                           if self._floating_exit else decode_spider_execution_input(raw))
+                request = (
+                    decode_spider_gross_execution_input(raw).execution_input if self._gross_execution else
+                    decode_spider_floating_exit_input(raw).execution_input if self._floating_exit else
+                    decode_spider_execution_input(raw)
+                )
                 if request.historical_input.run_id != self._run_id:
                     raise ValueError("INVALID_ARTIFACT")
                 rows = [value]
@@ -475,8 +514,12 @@ class SpiderRunStore:
         if type(report) is not list or len(report) != 1:
             raise ValueError("INVALID_ARTIFACT")
         report_raw = b"".join(canonical_bytes(row) + b"\n" for row in report)
-        endpoint_raw = (canonical_bytes(endpoint) + b"\n" if self._floating_exit else
-                        canonical_paid_bytes(endpoint, self._execution_context, self._execution_configuration))
+        endpoint_raw = (
+            canonical_bytes(endpoint) + b"\n" if self._floating_exit else
+            canonical_gross_paid_bytes(endpoint, self._execution_context, self._execution_configuration)
+            if self._gross_execution else
+            canonical_paid_bytes(endpoint, self._execution_context, self._execution_configuration)
+        )
         if self._floating_exit:
             validate_execution_artifact("paid_endpoint.json", endpoint_raw,
                                         execution_context=self._execution_context,

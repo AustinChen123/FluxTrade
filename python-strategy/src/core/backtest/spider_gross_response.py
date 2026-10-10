@@ -675,13 +675,11 @@ class GrossResponseEpisode:
     def observation(
         self, *, settlement_complete: bool = False, terminal_failure: bool = False,
     ) -> dict[str, Any]:
-        reported_state = self.state
-        if terminal_failure:
-            reported_state = "FAILED"
-        elif settlement_complete and self.active and reported_state not in (
-            "FAILED", "LIQUIDATED_FLAT", "LIQUIDATED_INSOLVENT", "RECOVERED",
-        ):
-            reported_state = "INCOMPLETE"
+        reported_state = _observation_state(
+            self.state, self.active,
+            settlement_complete=settlement_complete,
+            terminal_failure=terminal_failure,
+        )
         return dict(
             schema_version="spider_gross_response_observation_v1",
             run_contract_sha256=self.contract_hash,
@@ -691,3 +689,18 @@ class GrossResponseEpisode:
             current_state=reported_state,
             reason=self.reason,
         )
+
+
+def _observation_state(
+    state: str, active: bool, *, settlement_complete: bool = False,
+    terminal_failure: bool = False,
+) -> str:
+    """Map captured gross progress to its existing readonly endpoint state."""
+    reported_state = state
+    if terminal_failure:
+        reported_state = "FAILED"
+    elif settlement_complete and active and reported_state not in (
+        "FAILED", "LIQUIDATED_FLAT", "LIQUIDATED_INSOLVENT", "RECOVERED",
+    ):
+        reported_state = "INCOMPLETE"
+    return reported_state

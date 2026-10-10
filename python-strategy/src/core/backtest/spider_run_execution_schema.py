@@ -71,6 +71,7 @@ _REASONS = (
     "EXIT_REJECTED", "NOTIFICATION_PENDING", "POLL_PENDING", "NATIVE_TERMINAL",
     "EXECUTION_FAILURE",
 )
+_GROSS_REASONS = (*_REASONS, "GROSS_RESPONSE_PENDING")
 _CHECKS = (
     "INPUT_IDENTITY", "JOURNAL_FRONTIER", "OWNER_SCOPE_AND_CHAIN", "SNAPSHOT_DIGESTS",
     "ACTION_BINDINGS", "ENDPOINT_CLASSIFICATION", "REPORT_PROJECTION",
@@ -503,8 +504,9 @@ def _paid_endpoint(value: object, execution: ExecutionContext | FloatingExitCont
     polls = [envelope.poll(item) for item in _list(obligations["pending_polls"])]
     _ordered(polls)
     _require(len({item[0] for item in polls}) == len(polls) == len({item[1] for item in polls}))
-    reasons = [_enum(item, _REASONS) for item in _list(row["reasons"])]
-    _require(reasons == sorted(set(reasons), key=_REASONS.index))
+    reason_codes = _GROSS_REASONS if isinstance(execution, GrossExecutionContext) else _REASONS
+    reasons = [_enum(item, reason_codes) for item in _list(row["reasons"])]
+    _require(reasons == sorted(set(reasons), key=reason_codes.index))
     if status == "FAILED":
         _paid_failure(row["failure"], context=context,
                       gross_profile=isinstance(execution, GrossExecutionContext))

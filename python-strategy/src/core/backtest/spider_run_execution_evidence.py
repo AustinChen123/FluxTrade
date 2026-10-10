@@ -27,6 +27,10 @@ from src.core.backtest.spider_floating_exit_input import (
     decode_spider_floating_exit_input,
     validate_spider_floating_exit_input,
 )
+from src.core.backtest.spider_gross_execution_input import (
+    decode_spider_gross_execution_input,
+    validate_spider_gross_execution_input,
+)
 from src.core.backtest.spider_floating_exit_policy import decide_floating_exits
 from src.core.backtest.spider_bayes_replay import prepare_closed15m_source14
 from src.core.backtest.spider_historical_input import (
@@ -40,6 +44,7 @@ from src.core.backtest.spider_run_artifacts import (
     ConfigurationContext,
     ExecutionContext,
     FloatingExitContext,
+    GrossExecutionContext,
     canonical_bytes,
     canonical_decimal_text,
     configuration_context,
@@ -47,16 +52,20 @@ from src.core.backtest.spider_run_artifacts import (
     decode_jsonl,
     execution_context,
     floating_exit_context,
+    gross_execution_context,
     historical_context,
 )
 from src.core.backtest.spider_run_execution_schema import (
     _COMPLETION_ARTIFACTS,
+    _GROSS_COMPLETION_ARTIFACTS,
     _FLOATING_COMPLETION_ARTIFACTS,
     _SCHEMA,
     _FLOATING_SCHEMA,
+    _GROSS_SCHEMA,
     _CHECKS,
     execution_context_from_input,
     floating_exit_context_from_input,
+    gross_execution_context_from_input,
     validate_execution_artifact,
 )
 from src.core.backtest.spider_run_evidence import (
@@ -92,6 +101,8 @@ def _decode_file(artifacts: Mapping[str, bytes], filename: str) -> object:
         _require(type(value) is dict)
         if cast(dict[str, object], value).get("schema_version") == "spider_floating_exit_input_v1":
             return decode_spider_floating_exit_input(raw)
+        if cast(dict[str, object], value).get("schema_version") == "spider_gross_execution_input_v1":
+            return decode_spider_gross_execution_input(raw).execution_input
         return decode_spider_execution_input(raw)
     rows = decode_jsonl(raw)
     if filename.endswith(".jsonl"):
@@ -240,10 +251,12 @@ def _paid_delivery_origins(journal: list[dict[str, Any]], request: SpiderExecuti
 
 def _input_check(run_id: str, attempt: dict[str, Any], status: dict[str, Any],
                  report: dict[str, Any], endpoint: dict[str, Any],
-                 request: SpiderExecutionInput, context: ExecutionContext | FloatingExitContext,
+                 request: SpiderExecutionInput,
+                 context: ExecutionContext | FloatingExitContext | GrossExecutionContext,
                  configured: ConfigurationContext, history: object,
                  *, contract_hash: str | None = None,
-                 floating_exit: bool = False) -> bool:
+                 floating_exit: bool = False, gross_execution: bool = False,
+                 execution_context_wire: dict[str, object] | None = None) -> bool:
     run = request.historical_input
     wrapper_hash = contract_hash or validate_spider_execution_input(request)
     try:
@@ -255,15 +268,19 @@ def _input_check(run_id: str, attempt: dict[str, Any], status: dict[str, Any],
     return (
         run.run_id == run_id == attempt["run_id"] == status["run_id"] == report["run_id"]
         and attempt["run_contract_id"] == (
-            "SPIDER_FLOATING_EXIT_RESEARCH_RUN_V1" if floating_exit
-            else "SPIDER_PAID_RESEARCH_RUN_V1"
+            "SPIDER_GROSS_PROTECTED_RESEARCH_RUN_V1" if gross_execution else
+            "SPIDER_FLOATING_EXIT_RESEARCH_RUN_V1" if floating_exit else
+            "SPIDER_PAID_RESEARCH_RUN_V1"
         )
         and attempt["registration_state"] == "VALIDATED"
         and attempt["scenario_plan_sha256"] == wrapper_hash == context.execution_input_sha256
         and attempt["policy_source_sha256"] == BASE_POLICY_SOURCE_SHA256
         and cast(dict[str, Any], config)["config_id"] == configured.config_id
         and attempt["account_key"] == account
-        and attempt["profile_id"] == "SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1"
+        and attempt["profile_id"] == (
+            "SYNTHETIC_CONFIGURED_GROSS_ADMISSION_V1" if gross_execution
+            else "SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1"
+        )
         and configured.products == run.ordered_products
         and attempt["configuration_context"] == configured._asdict() | {"products": list(configured.products)}
         and attempt["historical_context"] == history
@@ -278,7 +295,12 @@ def _input_check(run_id: str, attempt: dict[str, Any], status: dict[str, Any],
         and all(len(row["sha256"]) == 64 for row in hashes)
         and endpoint["run_contract_sha256"] == wrapper_hash
         and report["paid_endpoint"] == endpoint
-        and status["execution_context"] == context._asdict()
+        and attempt["execution_context"] == (
+            execution_context_wire if gross_execution else context._asdict()
+        )
+        and status["execution_context"] == (
+            execution_context_wire if gross_execution else context._asdict()
+        )
     )
 
 
@@ -471,7 +493,7 @@ def _owner_checks(attempt: dict[str, Any], initial: object, endpoint: dict[str, 
 def _action_bindings(attempt: dict[str, Any], journal: list[dict[str, Any]],
                      report: dict[str, Any], endpoint: dict[str, Any],
                      request: SpiderExecutionInput, *, contract_hash: str | None = None,
-                     floating_exit: bool = False) -> bool:
+                     floating_exit: bool = False, gross_execution: bool = False) -> bool:
     scheduler = report["scheduler_observation"]
     cutoff = scheduler["current_time"]
     paid_prefix = f"PAID_{(contract_hash or validate_spider_execution_input(request))[:16]}"
@@ -481,7 +503,7 @@ def _action_bindings(attempt: dict[str, Any], journal: list[dict[str, Any]],
         and _action_bindings_for_mode(
             attempt, journal, report, endpoint, request, mode,
             contract_hash=contract_hash or validate_spider_execution_input(request),
-            floating_exit=floating_exit,
+            floating_exit=floating_exit, gross_execution=gross_execution,
         )
         for mode in _HistoricalSequenceMode
     )
@@ -491,7 +513,7 @@ def _action_bindings_for_mode(attempt: dict[str, Any], journal: list[dict[str, A
                               report: dict[str, Any], endpoint: dict[str, Any],
                               request: SpiderExecutionInput,
                               mode: _HistoricalSequenceMode, *, contract_hash: str,
-                              floating_exit: bool) -> bool:
+                              floating_exit: bool, gross_execution: bool = False) -> bool:
     observation = report["paid_observation"]
     scheduler = report["scheduler_observation"]
     actions = endpoint["actions"]
@@ -560,7 +582,7 @@ def _action_bindings_for_mode(attempt: dict[str, Any], journal: list[dict[str, A
             result = row["payload"]["result"]
             if action["classification"] != result["classification"] or not _same(action["result"], result):
                 return False
-        if action["role"] == "EXIT":
+        if action["role"] == "EXIT" or (gross_execution and action["role"] == "GROSS_REDUCTION"):
             payload = member["payload"]
             if (member["kind"] != "INTENT" or payload["product_id"] != action["product_id"]
                     or payload["strategy_id"] != request.historical_input.strategy_identity
@@ -573,19 +595,21 @@ def _action_bindings_for_mode(attempt: dict[str, Any], journal: list[dict[str, A
                         or dependency["binding"] is None
                         or dependency["binding"]["order_id"] != action["order_id"]):
                     return False
-        elif action["role"] == "DRAIN_CANCEL" and member["kind"] == "CANCEL_REQUEST":
+        elif (action["role"] == "DRAIN_CANCEL"
+              or (gross_execution and action["role"] == "GROSS_CANCEL")) and member["kind"] == "CANCEL_REQUEST":
             targets = member["payload"]["targets"]
             if len(targets) != 1 or action["parent_action_id"] is not None:
                 return False
             target_order_id = targets[0]["target_order_id"]
             if action["order_id"] not in (None, target_order_id):
                 return False
-        elif action["role"] == "DRAIN_CANCEL" and member["kind"] == "CANCEL_EFFECT":
+        elif (action["role"] == "DRAIN_CANCEL"
+              or (gross_execution and action["role"] == "GROSS_CANCEL")) and member["kind"] == "CANCEL_EFFECT":
             effects = member["payload"]["effects"]
             if len(effects) != 1 or action["order_id"] != effects[0]["target_order_id"]:
                 return False
             parent = action_by_id.get(action["parent_action_id"])
-            if (parent is None or parent["role"] != "DRAIN_CANCEL"
+            if (parent is None or parent["role"] != action["role"]
                     or parent["parent_action_id"] is not None
                     or parent["effective_at"] > action["effective_at"]):
                 return False
@@ -600,7 +624,7 @@ def _action_bindings_for_mode(attempt: dict[str, Any], journal: list[dict[str, A
                 return False
         else:
             return False
-    if floating_exit:
+    if floating_exit or gross_execution:
         for sequence, action in enumerate(actions):
             expected_id = "PAID_ACTION_" + sha256(canonical_bytes({
                 "run_contract_sha256": contract_hash,
@@ -609,7 +633,7 @@ def _action_bindings_for_mode(attempt: dict[str, Any], journal: list[dict[str, A
             })).hexdigest()
             if action["action_id"] != expected_id:
                 return False
-    elif action_admission_keys != sorted(action_admission_keys):
+    if not floating_exit and action_admission_keys != sorted(action_admission_keys):
         return False
     seed = decode_canonical(request.historical_input.initial_account_state)
     seed_orders = cast(dict[str, Any], seed)["orders"]
@@ -640,7 +664,9 @@ def _action_bindings_for_mode(attempt: dict[str, Any], journal: list[dict[str, A
                 return False
             product_by_order[native_order["order_id"]] = native_order["product_id"]
     for action in actions:
-        if action["role"] == "DRAIN_CANCEL":
+        if action["role"] == "DRAIN_CANCEL" or (
+            gross_execution and action["role"] == "GROSS_CANCEL"
+        ):
             source = source_group_for(action)
             if source is None:
                 return False
@@ -812,13 +838,13 @@ def _action_bindings_for_mode(attempt: dict[str, Any], journal: list[dict[str, A
     expected_pending_actions = {row["action_id"] for row in actions if row["classification"] == "PENDING"}
     working = endpoint["pending_obligations"]["working_orders"]
     if working is not None:
-        live_exit_orders = {
+        live_paid_orders = {
             row["order_id"] for row in working
             if role_rows.get(row["order_id"]) == "EXIT"
         }
         expected_pending_actions.update(
             row["action_id"] for row in actions
-            if row["role"] == "EXIT" and row["order_id"] in live_exit_orders
+            if row["role"] == "EXIT" and row["order_id"] in live_paid_orders
         )
     if pending_action_ids != expected_pending_actions:
         return False
@@ -827,14 +853,18 @@ def _action_bindings_for_mode(attempt: dict[str, Any], journal: list[dict[str, A
         item["cancel_action_id"] for item in observation["pending_paid_deliveries"]
         if item["delivery"]["payload_kind"] == "TRANSPORT_ACK"
         and item["cancel_action_id"] in by_action
-        and by_action[item["cancel_action_id"]]["role"] == "DRAIN_CANCEL"
+        and by_action[item["cancel_action_id"]]["role"] in (
+            ("DRAIN_CANCEL", "GROSS_CANCEL") if gross_execution else ("DRAIN_CANCEL",)
+        )
         and by_action[item["cancel_action_id"]]["classification"] == "COMMITTED"
         and by_action[item["cancel_action_id"]]["order_id"] is not None
     }
     for order_id in observation["pending_cancel_order_ids"]:
         if role_rows.get(order_id) != "GRID":
             return False
-        if not any(row["role"] == "DRAIN_CANCEL" and row["order_id"] == order_id
+        if not any(row["role"] in (
+                    ("DRAIN_CANCEL", "GROSS_CANCEL") if gross_execution else ("DRAIN_CANCEL",)
+                ) and row["order_id"] == order_id
                    and (row["classification"] == "PENDING" or row["action_id"] in pending_action_ids
                         or row["action_id"] in pending_ack_action_ids)
                    for row in actions):
@@ -842,7 +872,9 @@ def _action_bindings_for_mode(attempt: dict[str, Any], journal: list[dict[str, A
             if terminal is None or terminal["cancel_action_id"] not in by_action:
                 return False
             cancel_action = by_action[terminal["cancel_action_id"]]
-            if cancel_action["role"] != "DRAIN_CANCEL" or cancel_action["order_id"] != order_id:
+            if (cancel_action["role"] not in (
+                    ("DRAIN_CANCEL", "GROSS_CANCEL") if gross_execution else ("DRAIN_CANCEL",)
+                ) or cancel_action["order_id"] != order_id):
                 return False
     terminal = observation["terminal_fact"]
     scheduler_terminal = scheduler["terminal"]
@@ -913,7 +945,9 @@ def _action_bindings_for_mode(attempt: dict[str, Any], journal: list[dict[str, A
                 return False
             if delivery["payload_kind"] == "TRANSPORT_ACK":
                 action = by_action.get(terminal["cancel_action_id"])
-                if action is None or action["role"] != "DRAIN_CANCEL" or action["order_id"] is None:
+                if (action is None or action["role"] not in (
+                        ("DRAIN_CANCEL", "GROSS_CANCEL") if gross_execution else ("DRAIN_CANCEL",)
+                    ) or action["order_id"] is None):
                     return False
                 if not any(
                     row["record_kind"] == "SOURCE_GROUP_RESULT"
@@ -1278,10 +1312,13 @@ def _floating_batches_match(observation: dict[str, Any], request: object,
         return False
 
 
-def _completion_check(completion: dict[str, Any] | None, context: ExecutionContext | FloatingExitContext,
+def _completion_check(completion: dict[str, Any] | None,
+                      context: ExecutionContext | FloatingExitContext | GrossExecutionContext,
                       run_id: str, endpoint: dict[str, Any], reconciliation: dict[str, Any],
                       status: dict[str, Any], attempt: dict[str, Any],
-                      artifacts: Mapping[str, bytes], *, floating_exit: bool = False) -> bool:
+                      artifacts: Mapping[str, bytes], *, floating_exit: bool = False,
+                      gross_execution: bool = False,
+                      execution_context_wire: dict[str, object] | None = None) -> bool:
     if completion is None:
         return True
     if completion["run_id"] != run_id or completion["endpoint_status"] != endpoint["status"]:
@@ -1301,6 +1338,7 @@ def _completion_check(completion: dict[str, Any] | None, context: ExecutionConte
         return False
     metadata = completion["artifacts"]
     expected_names = [row[0] for row in (
+        _GROSS_COMPLETION_ARTIFACTS if gross_execution else
         _FLOATING_COMPLETION_ARTIFACTS if floating_exit else _COMPLETION_ARTIFACTS
     )]
     if [row["path"] for row in metadata] != expected_names:
@@ -1310,10 +1348,12 @@ def _completion_check(completion: dict[str, Any] | None, context: ExecutionConte
         row_count = (1 if row["path"] == "execution_input.json" else len(decode_jsonl(raw)))
         if row["sha256"] != sha256(raw).hexdigest() or row["byte_count"] != len(raw) or row["row_count"] != row_count:
             return False
-        schema = _FLOATING_SCHEMA if floating_exit else _SCHEMA
+        schema = _GROSS_SCHEMA if gross_execution else _FLOATING_SCHEMA if floating_exit else _SCHEMA
         if row["schema_version"] != schema[row["path"]]:
             return False
-    return completion["execution_context"] == context._asdict()
+    return completion["execution_context"] == (
+        execution_context_wire if gross_execution else context._asdict()
+    )
 
 
 def build_execution_reconciliation(run_id: str, artifacts: Mapping[str, bytes]) -> dict[str, Any]:
@@ -1331,15 +1371,26 @@ def build_execution_reconciliation(run_id: str, artifacts: Mapping[str, bytes]) 
     raw_input = artifacts["execution_input.json"]
     encoded_input = decode_canonical(raw_input)
     _require(type(encoded_input) is dict)
-    floating_exit = cast(dict[str, object], encoded_input).get("schema_version") == "spider_floating_exit_input_v1"
-    if floating_exit:
+    input_schema = cast(dict[str, object], encoded_input).get("schema_version")
+    gross_execution = input_schema == "spider_gross_execution_input_v1"
+    floating_exit = input_schema == "spider_floating_exit_input_v1"
+    execution_context_wire: dict[str, object] | None = None
+    gross_request = None
+    floating_request = None
+    if gross_execution:
+        gross_request = decode_spider_gross_execution_input(raw_input)
+        request = gross_request.execution_input
+        wrapper_hash = validate_spider_gross_execution_input(gross_request)
+        execution_context_wire = gross_execution_context_from_input(raw_input)
+        context = gross_execution_context(execution_context_wire)
+        artifact_schema = _GROSS_SCHEMA
+    elif floating_exit:
         floating_request = decode_spider_floating_exit_input(raw_input)
         wrapper_hash = validate_spider_floating_exit_input(floating_request)
         request = floating_request.execution_input
         context = floating_exit_context(floating_exit_context_from_input(raw_input))
         artifact_schema = _FLOATING_SCHEMA
     else:
-        floating_request = None
         request = decode_spider_execution_input(raw_input)
         wrapper_hash = validate_spider_execution_input(request)
         context = execution_context(execution_context_from_input(raw_input))
@@ -1376,11 +1427,12 @@ def build_execution_reconciliation(run_id: str, artifacts: Mapping[str, bytes]) 
     identity_ok = _input_check(
         run_id, attempt, status, report, endpoint, request, context, configured,
         history._asdict(), contract_hash=wrapper_hash, floating_exit=floating_exit,
+        gross_execution=gross_execution, execution_context_wire=execution_context_wire,
     )
     frontier_ok = _journal_check(run_id, attempt, status, journal, report, request, wrapper_hash, endpoint)
     action_ok = _action_bindings(
         attempt, journal, report, endpoint, request, contract_hash=wrapper_hash,
-        floating_exit=floating_exit,
+        floating_exit=floating_exit, gross_execution=gross_execution,
     )
     request_identity = dict(run_contract_sha256=context.execution_input_sha256,
                             policy_end_ms=context.policy_end_ms, settlement_end_ms=context.settlement_end_ms,
@@ -1389,12 +1441,23 @@ def build_execution_reconciliation(run_id: str, artifacts: Mapping[str, bytes]) 
         request_identity, endpoint["owner_evidence"], endpoint["actions"],
         report["scheduler_observation"], report["paid_observation"], endpoint["failure"],
     )
+    if gross_execution:
+        rebuilt_endpoint["schema_version"] = "spider_gross_paid_endpoint_result_v1"
     endpoint_ok = _same(rebuilt_endpoint, endpoint)
-    report_ok = _report_projection(
-        report, endpoint, journal,
-        floating_request=floating_request,
-        floating_hash=wrapper_hash if floating_exit else None,
-    )
+    if gross_execution:
+        from src.core.backtest.spider_gross_execution_evidence import gross_report_projection
+
+        assert gross_request is not None
+        report_ok = (
+            _report_projection(report, endpoint, journal)
+            and gross_report_projection(report, endpoint, gross_request, wrapper_hash, journal)
+        )
+    else:
+        report_ok = _report_projection(
+            report, endpoint, journal,
+            floating_request=floating_request,
+            floating_hash=wrapper_hash if floating_exit else None,
+        )
     checks = [dict(name=name, result="OK" if ok else "FAILED", evidence_refs=_CHECK_REFS[name])
               for name, ok in zip(_CHECKS, (identity_ok, frontier_ok, owner_ok, snapshots_ok,
                                            action_ok, endpoint_ok, report_ok), strict=True)]
@@ -1410,5 +1473,7 @@ def build_execution_reconciliation(run_id: str, artifacts: Mapping[str, bytes]) 
     if "completion.json" in artifacts:
         completion = cast(dict[str, Any], _decode_file(artifacts, "completion.json"))
         _require(_completion_check(completion, context, run_id, endpoint, reconciliation,
-                                   status, attempt, artifacts, floating_exit=floating_exit))
+                                   status, attempt, artifacts, floating_exit=floating_exit,
+                                   gross_execution=gross_execution,
+                                   execution_context_wire=execution_context_wire))
     return reconciliation

@@ -15,6 +15,7 @@ from src.core.backtest.spider_gross_response import (
 )
 
 _ROOT_SCHEMA = "spider_gross_response_observation_v1"
+_CUT_ROOT_SCHEMA = "spider_gross_response_observation_v2"
 _QUEUE_LABELS = (
     "SOURCE_GROUP", "SNAPSHOT_CAPTURE", "DELIVERY", "HISTORICAL_MARKET_STEP",
     "HISTORICAL_MARKET_CACHE", "HISTORICAL_TIMER", "PAID_ENDPOINT_DRAIN",
@@ -331,8 +332,9 @@ def project_gross_observation(
     endpoint_projection: dict[str, Any] | None = None,
     settlement_key: dict[str, Any] | None = None,
     final_facts: dict[str, Any] | None = None,
+    include_cut_evidence: bool = False,
 ) -> dict[str, Any] | None:
-    """Build the formal twelve-field gross projection without mutating owner facts."""
+    """Build a detached v1 projection, or opt into v2 same-cut operation facts."""
     if episode is None:
         return None
     if endpoint_projection is None:
@@ -399,6 +401,7 @@ def project_gross_observation(
     )
     if (type(state) is not str or (reason is not None and type(reason) is not str)):
         raise ValueError("INVALID_ENDPOINT_PROJECTION")
+    final_cut_facts = _final_obligation_state(final_facts) if include_cut_evidence else None
     eligible_latest = False
     if episodes_by_sequence:
         latest = episodes_by_sequence[max(episodes_by_sequence)]
@@ -410,27 +413,35 @@ def project_gross_observation(
         ) and (episode.active or state == "FAILED")):
             latest["state"] = state
             latest["reason"] = reason
-    if (episodes_by_sequence and final_facts is not None
-            and eligible_latest and (episode.active or state == "FAILED")):
+    if (episodes_by_sequence and eligible_latest
+            and (episode.active or state == "FAILED")):
         latest_sequence = max(episodes_by_sequence)
         latest = episodes_by_sequence[latest_sequence]
-        facts_observation = {
-            "proposal_context": {"operations": final_facts.get("operations")},
-            "native_state": final_facts.get("native_state"),
-        }
-        clear, operations, native = _obligation_facts(facts_observation)
-        if clear is True:
-            latest["remaining_obligations"] = []
-        elif clear is False:
-            latest["remaining_obligations"] = [{
-                "operation_state": deepcopy(operations),
-                "native_state": deepcopy(native),
-            }]
-        else:
+        if include_cut_evidence and final_cut_facts is None:
             latest["remaining_obligations"] = None
+        elif include_cut_evidence or final_facts is not None:
+            selected_final_facts = final_cut_facts if include_cut_evidence else final_facts
+            assert selected_final_facts is not None
+            facts_observation = {
+                "proposal_context": {"operations": (
+                    selected_final_facts["operation_state"] if include_cut_evidence
+                    else selected_final_facts.get("operations")
+                )},
+                "native_state": selected_final_facts.get("native_state"),
+            }
+            clear, operations, native = _obligation_facts(facts_observation)
+            if clear is True:
+                latest["remaining_obligations"] = []
+            elif clear is False:
+                latest["remaining_obligations"] = [{
+                    "operation_state": deepcopy(operations),
+                    "native_state": deepcopy(native),
+                }]
+            else:
+                latest["remaining_obligations"] = None
     intervals, duration = _overlimit(rows, settlement_key)
     return {
-        "schema_version": _ROOT_SCHEMA,
+        "schema_version": _CUT_ROOT_SCHEMA if include_cut_evidence else _ROOT_SCHEMA,
         "run_contract_sha256": episode.contract_hash,
         "policy_id": POLICY_ID,
         "response_parameters": {
@@ -453,6 +464,12 @@ def project_gross_observation(
                 "after_state": row["after_state"],
                 "reason": row["reason"],
                 "episode_sequence": row.get("episode_sequence"),
+                **({
+                    "operation_state": deepcopy(
+                        row.get("proposal_context", {}).get("operations")
+                        if isinstance(row.get("proposal_context"), dict) else None
+                    ),
+                } if include_cut_evidence else {}),
             }
             for row in rows
         ],
@@ -462,4 +479,43 @@ def project_gross_observation(
         "overlimit_duration_ms": duration,
         "current_state": state,
         "reason": reason,
+        **({
+            "final_obligation_state": final_cut_facts,
+        } if include_cut_evidence else {}),
+    }
+
+
+def _final_obligation_state(final_facts: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Copy explicitly supplied final-cut owner facts; never infer a missing cut."""
+    if final_facts is None:
+        return None
+    operations = final_facts.get("operations")
+    native = final_facts.get("native_state")
+    observed_at = final_facts.get("current_time")
+    key = final_facts.get("last_popped")
+    if (not isinstance(operations, dict) or not isinstance(native, dict)
+            or type(observed_at) is not int):
+        return None
+    if key is not None:
+        if isinstance(key, (tuple, list)) and len(key) == 4:
+            visible_at, queue_class, sequence, stable_id = key
+            if type(queue_class) is int and 0 <= queue_class < len(_QUEUE_LABELS):
+                key = dict(visible_at=visible_at, queue_class=_QUEUE_LABELS[queue_class],
+                           schedule_sequence=sequence, stable_id=stable_id)
+        elif isinstance(key, dict) and type(key.get("queue_class")) is int:
+            queue_class = key["queue_class"]
+            if 0 <= queue_class < len(_QUEUE_LABELS):
+                key = dict(key, queue_class=_QUEUE_LABELS[queue_class])
+        if (not isinstance(key, dict) or set(key) != {
+                "visible_at", "queue_class", "schedule_sequence", "stable_id",
+        } or type(key.get("visible_at")) is not int
+                or key.get("queue_class") not in _QUEUE_LABELS
+                or type(key.get("schedule_sequence")) is not int
+                or type(key.get("stable_id")) is not str):
+            return None
+    return {
+        "operation_state": deepcopy(operations),
+        "native_state": deepcopy(native),
+        "observed_at": observed_at,
+        "key": deepcopy(key),
     }

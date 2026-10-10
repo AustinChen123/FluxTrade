@@ -175,6 +175,23 @@ def test_actual_pending_reduction_notice_is_not_reported_as_round_completion():
     assert rounds[-1]["completion_key"] is None
     assert endpoint.pending_delivery_ids
 
+    cut_report = project_gross_observation(
+        request, endpoint.gross_response,
+        endpoint_projection={
+            "current_state": endpoint.gross_response.state,
+            "reason": endpoint.gross_response.reason,
+        },
+        include_cut_evidence=True,
+    )
+    assert cut_report is not None
+    assert cut_report["final_obligation_state"] is None
+    assert cut_report["episodes"][-1]["remaining_obligations"] is None
+    assert any(
+        row["operation_state"] is not None
+        and row["operation_state"]["pending_delivery_ids"]
+        for row in cut_report["observations"]
+    )
+
 
 def test_final_cut_uses_explicit_same_owner_operation_and_native_facts():
     request = _over_cap_gross_input(
@@ -198,6 +215,33 @@ def test_final_cut_uses_explicit_same_owner_operation_and_native_facts():
     assert remaining
     assert remaining[0]["native_state"] == native_state
     assert remaining[0]["operation_state"] == final_facts["operations"]
+
+    cut_report = project_gross_observation(
+        request, episode,
+        endpoint_projection=episode.observation(),
+        final_facts={
+            "operations": final_facts["operations"],
+            "native_state": native_state,
+            "current_time": composition._current_time,
+            "last_popped": composition._last_popped,
+        },
+        include_cut_evidence=True,
+    )
+    assert cut_report is not None
+    assert cut_report["schema_version"] == "spider_gross_response_observation_v2"
+    assert set(cut_report) == set(report) | {"final_obligation_state"}
+    assert all(set(row) == {
+        "key", "observed_at", "native_state", "before_state", "after_state",
+        "reason", "episode_sequence", "operation_state",
+    } for row in cut_report["observations"])
+    cut = cut_report["final_obligation_state"]
+    assert cut is not None and composition._last_popped is not None
+    assert cut["operation_state"] == final_facts["operations"]
+    assert cut["native_state"] == native_state
+    assert cut["observed_at"] == composition._current_time
+    assert cut["key"]["visible_at"] == composition._last_popped[0]
+    assert cut["observed_at"] >= cut["key"]["visible_at"]
+    assert cut_report["episodes"][0]["remaining_obligations"] == report["episodes"][0]["remaining_obligations"]
 
 
 def test_actual_wait_capacity_proposal_is_retained_without_fake_round():
@@ -457,9 +501,14 @@ def test_true_callback_failure_report_preserves_failed_cut_and_pending_notice(mo
         final_facts={
             "operations": final_facts["operations"],
             "native_state": final_native_state,
+            "current_time": composition._current_time,
+            "last_popped": composition._last_popped,
         },
+        include_cut_evidence=True,
     )
     assert report is not None and report["current_state"] == "FAILED"
+    assert report["schema_version"] == "spider_gross_response_observation_v2"
+    assert report["final_obligation_state"] is not None
     assert report["reason"] == accepted["gross_response"]["reason"]
     assert report["episodes"][0]["rounds"][-1]["completion_key"] is None
     assert report["episodes"][0]["remaining_obligations"]
@@ -498,8 +547,16 @@ def test_native_economic_terminal_report_preserves_terminal_state(cash: str, exp
     accepted = endpoint.result(composition)
     report = project_gross_observation(
         request, endpoint.gross_response, endpoint_projection=accepted["gross_response"],
+        final_facts={
+            "operations": endpoint.gross_response._proposal_context(endpoint, composition)["operations"],
+            "native_state": composition._codec.gross_response_projection(),
+            "current_time": composition._current_time,
+            "last_popped": composition._last_popped,
+        },
+        include_cut_evidence=True,
     )
     assert report is not None and report["current_state"] == expected
+    assert report["schema_version"] == "spider_gross_response_observation_v2"
     assert report["peak_ratio"] is not None
     assert report["peak_ratio"]["denominator"] > 0
     if expected == "LIQUIDATED_INSOLVENT":
