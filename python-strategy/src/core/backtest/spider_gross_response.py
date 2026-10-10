@@ -49,6 +49,49 @@ def gross_response_contract_hash(request: SpiderGrossExecutionInput) -> str:
     return validate_spider_gross_execution_input(request)
 
 
+def gross_obligations_clear(
+    endpoint: Any, composition: Any, native_state: dict[str, Any],
+) -> bool:
+    """Single pure predicate for currently unresolved gross-response obligations."""
+    if any(action["role"] in ("GROSS_CANCEL", "GROSS_REDUCTION")
+           and action["classification"] == "PENDING" for action in endpoint.actions):
+        return False
+    if any(endpoint.delivery_roles.get(delivery_id) in ("GRID", "GROSS_REDUCTION", "GROSS_CANCEL")
+           for delivery_id in endpoint.pending_delivery_ids):
+        return False
+    if any(
+        delivery_id in endpoint.pending_delivery_ids
+        and action.get("role") == "GROSS_CANCEL"
+        for delivery_id, action in endpoint.cancel_ack_action_by_delivery.items()
+    ):
+        return False
+    if any(
+        endpoint.roles_by_order.get(order_id) == "GROSS_CANCEL"
+        or any(
+            action["role"] == "GROSS_CANCEL" and action["order_id"] == order_id
+            and action["classification"] == "COMMITTED"
+            for action in endpoint.actions
+        )
+        for order_id in composition._paid_cancel_pending_orders
+    ):
+        return False
+    if any(dep["role"] in ("GRID", "GROSS_REDUCTION") and dep["state"] == "PENDING"
+           for dep in composition._historical_send_dependencies.values()):
+        return False
+    orders = native_state.get("orders")
+    if not isinstance(orders, list):
+        raise ValueError("INVALID_SCHEMA")
+    if any(isinstance(order, dict) and order.get("cancel_pending") is True
+           for order in orders):
+        return False
+    return not any(
+        isinstance(order, dict)
+        and endpoint.roles_by_order.get(order.get("order_id"))
+        in ("GROSS_CANCEL", "GROSS_REDUCTION")
+        for order in orders
+    )
+
+
 @dataclass(frozen=True)
 class GrossResponseProposal:
     state: str
@@ -547,43 +590,7 @@ class GrossResponseEpisode:
     def _obligations_clear(
         endpoint: Any, composition: Any, native_state: dict[str, Any],
     ) -> bool:
-        if any(action["role"] in ("GROSS_CANCEL", "GROSS_REDUCTION")
-               and action["classification"] == "PENDING" for action in endpoint.actions):
-            return False
-        if any(endpoint.delivery_roles.get(delivery_id) in ("GRID", "GROSS_REDUCTION", "GROSS_CANCEL")
-               for delivery_id in endpoint.pending_delivery_ids):
-            return False
-        if any(
-            delivery_id in endpoint.pending_delivery_ids
-            and action.get("role") == "GROSS_CANCEL"
-            for delivery_id, action in endpoint.cancel_ack_action_by_delivery.items()
-        ):
-            return False
-        if any(
-            endpoint.roles_by_order.get(order_id) == "GROSS_CANCEL"
-            or any(
-                action["role"] == "GROSS_CANCEL" and action["order_id"] == order_id
-                and action["classification"] == "COMMITTED"
-                for action in endpoint.actions
-            )
-            for order_id in composition._paid_cancel_pending_orders
-        ):
-            return False
-        if any(dep["role"] in ("GRID", "GROSS_REDUCTION") and dep["state"] == "PENDING"
-               for dep in composition._historical_send_dependencies.values()):
-            return False
-        orders = native_state.get("orders")
-        if not isinstance(orders, list):
-            raise ValueError("INVALID_SCHEMA")
-        if any(isinstance(order, dict) and order.get("cancel_pending") is True
-               for order in orders):
-            return False
-        return not any(
-            isinstance(order, dict)
-            and endpoint.roles_by_order.get(order.get("order_id"))
-            in ("GROSS_CANCEL", "GROSS_REDUCTION")
-            for order in orders
-        )
+        return gross_obligations_clear(endpoint, composition, native_state)
 
     @staticmethod
     def gross_drain_obligations_clear(endpoint: Any, composition: Any) -> bool:
