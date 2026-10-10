@@ -23,7 +23,8 @@ fn boundary(reason: Fault) -> BoundaryError {
         | "INVALID_HISTORICAL_BAR"
         | "INVALID_HISTORICAL_TIME"
         | "INVALID_HISTORICAL_ORDER_SNAPSHOT"
-        | "HISTORICAL_MARKET_OWNER_UNSUPPORTED" => BoundaryError::Input(reason),
+        | "HISTORICAL_MARKET_OWNER_UNSUPPORTED"
+        | "UNSUPPORTED_GROSS_PROFILE" => BoundaryError::Input(reason),
         "UNSUPPORTED_COST_PROFILE" => BoundaryError::Input(reason),
         "UNKNOWN_RECEIPT_REFERENCE" => BoundaryError::Lookup(reason),
         "SNAPSHOT_ID_CONFLICT" | "DELIVERY_ID_CONFLICT" => BoundaryError::Conflict(reason),
@@ -84,6 +85,16 @@ impl Session {
         self.guarded(false, |s| {
             s.owner
                 .historical_source_cost_projection()
+                .and_then(|value| value.canonical().map_err(|_| "NATIVE_INVARIANT"))
+                .map_err(boundary)
+        })
+    }
+    fn gross_admission_projection(&mut self) -> Reply {
+        if !self.owner.is_gross_admission_profile() {
+            return Err(BoundaryError::Input("UNSUPPORTED_GROSS_PROFILE"));
+        }
+        self.guarded(false, |s| {
+            gross_admission::project(&s.owner)
                 .and_then(|value| value.canonical().map_err(|_| "NATIVE_INVARIANT"))
                 .map_err(boundary)
         })

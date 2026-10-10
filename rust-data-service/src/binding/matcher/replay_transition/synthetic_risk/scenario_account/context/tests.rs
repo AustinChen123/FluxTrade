@@ -29,12 +29,15 @@ pub(in super::super) fn activation(owner: &ScenarioAccount, at: i64, rows: Rows)
             },
         ),
         expected_before: owner.valuation_context_id,
-        expected_after: owner_context_id(
+        expected_after: owner_context_id_with_policy(
             scenario,
             marks,
             at,
             owner.seed_effective_at,
             &owner.config_id,
+            owner
+                .is_gross_admission_profile()
+                .then_some(gross_admission::POLICY_ID),
         )
         .unwrap(),
         rows,

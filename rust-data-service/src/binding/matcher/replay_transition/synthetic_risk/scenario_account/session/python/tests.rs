@@ -43,6 +43,23 @@ valid = factory(configured, key, configuration)
 facts = json.loads(valid.inspect_state())
 assert facts['profile_id'] == configured and facts['config_id'] == 'py-config'
 assert factory(profile_id=configured, account_key=key, configuration=configuration).inspect_state() == valid.inspect_state()
+gross_profile = 'SYNTHETIC_CONFIGURED_GROSS_ADMISSION_V1'
+gross = factory(gross_profile, key, configuration)
+gross_projection = json.loads(gross._gross_admission_projection())
+assert set(gross_projection) == {'schema_version','risk_policy_id','bound_scope','account_key',
+    'account_version','valuation_context_id','cap','effective_equity','gross','net','worst_gross',
+    'order_loss_hold','fee_hold','equity_floor','gross_ratio','bound_reason'}
+assert gross_projection['schema_version'] == 'spider_gross_admission_projection_v1'
+assert gross_projection['risk_policy_id'] == 'CURRENT_MARK_GROSS_CAP_TWO_V1'
+assert gross_projection['cap'] == '2' and gross_projection['gross_ratio'] == {'denominator':'10','numerator':'0'}
+assert json.loads(gross.inspect_state())['profile_id'] == gross_profile
+failure(lambda: valid._gross_admission_projection(), native.ScenarioReplayInputError, 'UNSUPPORTED_GROSS_PROFILE')
+assert valid.inspect_state() == valid.inspect_state()
+invalid_fee = json.loads(configuration)
+invalid_fee['products'][0]['taker_fee_rate'] = '2'
+invalid_fee = json.dumps(invalid_fee)
+assert factory(configured, key, invalid_fee).inspect_state()
+failure(lambda: factory(gross_profile, key, invalid_fee), native.ScenarioReplayInputError, 'INVALID_SCHEMA')
 class Text(str): pass
 assert json.loads(factory(Text(configured), Text(key), Text(configuration)).inspect_state())['config_id'] == 'py-config'
 for call in [lambda: factory(configured, key), lambda: factory(configured, key, None),

@@ -68,6 +68,9 @@ pub(super) fn fixture_intent_for_product(
 
 mod btc_policy;
 #[cfg(test)]
+#[path = "admission/gross_admission_tests.rs"]
+mod gross_admission_tests;
+#[cfg(test)]
 pub(super) mod inspection_tests;
 pub(super) mod wire;
 
@@ -120,6 +123,16 @@ pub(super) struct OrderIntent {
 }
 
 impl OrderIntent {
+    pub(super) fn gross_inputs(&self) -> (&ProfileProduct, Side, Decimal, bool, OrderType) {
+        (
+            &self.product,
+            self.side,
+            self.quantity,
+            self.reduce_only,
+            self.order_type,
+        )
+    }
+
     #[cfg(test)]
     pub(super) fn historical_market_fixture(
         owner: &ScenarioAccount,
@@ -246,6 +259,7 @@ pub(super) struct AdmissionResult {
     evaluation: Evaluation,
     created_at_event_id: String,
     order_type: OrderType,
+    gross_decision: Option<gross_admission::Decision>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -436,6 +450,12 @@ impl ScenarioAccount {
             e.presence(r.accepted_order.is_some());
             if let Some(order) = &r.accepted_order {
                 order_facts(e, order)?;
+            }
+            if self.is_gross_admission_profile() {
+                e.presence(r.gross_decision.is_some());
+                if let Some(decision) = &r.gross_decision {
+                    decision.encode(e);
+                }
             }
         }
         Ok(())
@@ -691,6 +711,7 @@ impl ScenarioAccount {
         if !deferred_minimum_candidate {
             hook(PrepareStage::OrderDrafted)?;
         }
+        let mut gross_decision = None;
         let (evaluation, reason_code) = if below_floor {
             (Evaluation::MinCash(self.cash), Some("MIN_CASH"))
         } else {
@@ -711,7 +732,12 @@ impl ScenarioAccount {
                     (Evaluation::GoldenCapacity(projection), reason)
                 }
                 ProfileContext::BtcEthScenario { .. } => {
-                    let (evidence, reason) = btc_policy::evaluate(self, &draft, intent, price)?;
+                    let (evidence, mut reason) = btc_policy::evaluate(self, &draft, intent, price)?;
+                    if self.is_gross_admission_profile() && reason.is_none() {
+                        let decision = gross_admission::evaluate(self, &draft, intent)?;
+                        reason = decision.reason;
+                        gross_decision = Some(decision);
+                    }
                     (Evaluation::BtcEth(evidence), reason)
                 }
             }
@@ -744,6 +770,7 @@ impl ScenarioAccount {
             evaluation,
             created_at_event_id: envelope.event_id.into(),
             order_type: intent.order_type,
+            gross_decision,
         };
         draft
             .intent_results

@@ -3,6 +3,7 @@ use super::*;
 mod configured;
 
 pub(super) const CONFIGURED_PROFILE: &str = "SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1";
+pub(super) const GROSS_CONFIGURED_PROFILE: &str = "SYNTHETIC_CONFIGURED_GROSS_ADMISSION_V1";
 
 pub(in super::super) fn construct(
     profile: &str,
@@ -12,6 +13,10 @@ pub(in super::super) fn construct(
     key.validate().map_err(|_| "INVALID_SCHEMA")?;
     if profile == CONFIGURED_PROFILE {
         return configured::construct(configuration.ok_or("INVALID_SCHEMA")?, key)
+            .map_err(|_| "INVALID_SCHEMA");
+    }
+    if profile == GROSS_CONFIGURED_PROFILE {
+        return configured::construct_gross(configuration.ok_or("INVALID_SCHEMA")?, key)
             .map_err(|_| "INVALID_SCHEMA");
     }
     if configuration.is_some() {

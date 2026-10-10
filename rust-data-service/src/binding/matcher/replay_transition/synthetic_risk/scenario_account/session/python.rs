@@ -101,6 +101,9 @@ impl PySession {
     fn _historical_cost_projection(&mut self) -> PyResult<String> {
         self.inner.historical_cost_projection().map_err(error)
     }
+    fn _gross_admission_projection(&mut self) -> PyResult<String> {
+        self.inner.gross_admission_projection().map_err(error)
+    }
 }
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PySession>()?;

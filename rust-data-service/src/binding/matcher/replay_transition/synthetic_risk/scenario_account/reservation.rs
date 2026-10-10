@@ -18,6 +18,7 @@ pub(super) struct ProductReservation {
     pub position_value: Decimal,
     pub long_remaining_value: Decimal,
     pub short_remaining_value: Decimal,
+    pub worst_value: Decimal,
     pub exposure_margin: Decimal,
 }
 
@@ -31,6 +32,9 @@ pub(super) struct Snapshot {
     pub total_fee_hold: Decimal,
     pub used_margin: Decimal,
     pub available_margin: Decimal,
+    pub gross: Decimal,
+    pub net: Decimal,
+    pub worst_gross: Decimal,
 }
 
 pub(super) fn calculate(
@@ -38,6 +42,16 @@ pub(super) fn calculate(
     orders: &[&SeedOrder],
     scenario: &FrozenScenario,
     marks: &[Mark],
+) -> Result<Snapshot, Fault> {
+    calculate_with_gross(input, orders, scenario, marks, false)
+}
+
+pub(super) fn calculate_with_gross(
+    input: &ValuationInput,
+    orders: &[&SeedOrder],
+    scenario: &FrozenScenario,
+    marks: &[Mark],
+    include_gross: bool,
 ) -> Result<Snapshot, Fault> {
     let mut ids = BTreeSet::new();
     let mut resting = Vec::new();
@@ -63,6 +77,9 @@ pub(super) fn calculate(
         total_fee_hold: Decimal::ZERO,
         used_margin: Decimal::ZERO,
         available_margin: Decimal::ZERO,
+        gross: Decimal::ZERO,
+        net: Decimal::ZERO,
+        worst_gross: Decimal::ZERO,
     };
     for product in scenario.products() {
         let (spec, _) = scenario.resolve(&product, input.effective_at)?;
@@ -137,6 +154,18 @@ pub(super) fn calculate(
             Some(Side::Long) => add(value, long)?.max(add(short, -value)?),
             Some(Side::Short) => add(long, -value)?.max(add(value, short)?),
         };
+        if include_gross {
+            snapshot.gross = add(snapshot.gross, value)?;
+            snapshot.net = add(
+                snapshot.net,
+                if position.is_some_and(|p| p.side == Side::Short) {
+                    -value
+                } else {
+                    value
+                },
+            )?;
+            snapshot.worst_gross = add(snapshot.worst_gross, worst)?;
+        }
         let exposure = if scenario.configured.is_some() {
             let position_contracts = position.map_or(Decimal::ZERO, |p| p.contracts);
             let absolute = |v: Decimal| if v < Decimal::ZERO { -v } else { v };
@@ -164,6 +193,7 @@ pub(super) fn calculate(
             position_value: value,
             long_remaining_value: long,
             short_remaining_value: short,
+            worst_value: worst,
             exposure_margin: exposure,
         });
     }
