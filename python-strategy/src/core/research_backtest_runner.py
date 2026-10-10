@@ -45,9 +45,11 @@ from src.core.backtest.run_evidence import (
 from src.core.backtest.spider_formal_runner import (
     SpiderExecutionFormalResult,
     SpiderFloatingExitFormalResult,
+    SpiderGrossExecutionFormalResult,
     SpiderFormalRunResult,
     _invoke_spider_execution,
     _invoke_spider_floating_exit,
+    _invoke_spider_gross_execution,
     _invoke_spider_historical,
 )
 from src.core.backtest.loader import get_candles_generator
@@ -132,6 +134,18 @@ class ResearchBacktestRunner:
     - Preserves full-runner ordering: existing orders fill before new signals.
     - Does not apply RiskManager checks, DB writes, signal audits, or reports.
     """
+
+    @staticmethod
+    def run_spider_gross_execution(
+        *, output_root: str, run_id: str, gross_execution_input: bytes,
+    ) -> SpiderGrossExecutionFormalResult:
+        """Run one shared protected gross-response research scenario."""
+        return _invoke_spider_gross_execution(
+            output_root=output_root,
+            run_id=run_id,
+            gross_execution_input=gross_execution_input,
+            runner_kind="research",
+        )
 
     @staticmethod
     def run_spider_floating_exit(
