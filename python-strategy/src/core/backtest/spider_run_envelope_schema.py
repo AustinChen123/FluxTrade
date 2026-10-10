@@ -4,9 +4,11 @@ from typing import cast
 
 from src.core.backtest import spider_run_native_schema as native
 from src.core.backtest.spider_run_artifacts import (
-    ConfigurationContext, _artifact_contexts, _boolean, _boundary, _decimal_text,
+    ConfigurationContext, FloatingExitContext, _artifact_contexts, _boolean, _boundary, _decimal_text,
     _enum, _historical_context, _integer, _list, _object, _P3_COVERAGE_KINDS,
-    _require, _terminal_policy, _text, execution_context as validate_execution_context,
+    _require, _terminal_policy, _text, artifact_execution_context,
+    execution_context as validate_execution_context,
+    floating_exit_context as validate_floating_exit_context,
 )
 
 _CLASSES = ["SOURCE_GROUP", "SNAPSHOT_CAPTURE", "DELIVERY"]
@@ -170,7 +172,8 @@ def callback_result(value: object) -> None:
 
 
 def journal_record(value: object, *, execution: object | None = None) -> None:
-    validated_execution = validate_execution_context(execution) if execution is not None else None
+    validated_execution = artifact_execution_context(execution) if execution is not None else None
+    floating_exit = type(validated_execution) is FloatingExitContext
     required = "schema_version run_id journal_seq barrier_id record_kind scheduler_key causal_parent_ids effective_at visible_at account_version_before account_version_after payload"
     optional = "configuration_context historical_context"
     if validated_execution is not None:
@@ -178,9 +181,14 @@ def journal_record(value: object, *, execution: object | None = None) -> None:
         optional = "configuration_context historical_context"
     row = _object(value, required, optional)
     context = _context(row)
-    _enum(row["schema_version"], ["spider_execution_journal_record_v1"] if validated_execution is not None else ["spider_journal_record_v1"])
+    expected_schema = ("spider_floating_exit_journal_record_v1" if floating_exit else
+                       "spider_execution_journal_record_v1" if validated_execution is not None else
+                       "spider_journal_record_v1")
+    _enum(row["schema_version"], [expected_schema])
     if validated_execution is not None:
-        _require(validate_execution_context(row["execution_context"]) == validated_execution)
+        row_execution = (validate_floating_exit_context(row["execution_context"]) if floating_exit
+                         else validate_execution_context(row["execution_context"]))
+        _require(row_execution == validated_execution)
         _require("configuration_context" in row and "historical_context" in row)
     _text(row["run_id"], "[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
     _require(_integer(row["journal_seq"]) > 0)
@@ -241,7 +249,7 @@ def journal_record(value: object, *, execution: object | None = None) -> None:
 
 
 def journal(value: object, *, execution: object | None = None) -> None:
-    validated_execution = validate_execution_context(execution) if execution is not None else None
+    validated_execution = artifact_execution_context(execution) if execution is not None else None
     barriers: list[str] = []
     for sequence, item in enumerate(_list(value), 1):
         journal_record(item, execution=validated_execution)

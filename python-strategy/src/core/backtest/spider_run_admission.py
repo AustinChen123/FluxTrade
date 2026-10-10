@@ -21,7 +21,10 @@ from src.core.backtest.spider_historical_input import (
 from src.core.backtest.spider_run_execution_schema import (
     _COMPLETION_ARTIFACTS as _EXECUTION_COMPLETION_ARTIFACTS,
     _SCHEMA as _EXECUTION_SCHEMA,
+    _FLOATING_COMPLETION_ARTIFACTS,
+    _FLOATING_SCHEMA,
     execution_context_from_input as _execution_context_from_input,
+    floating_exit_context_from_input as _floating_exit_context_from_input,
     validate_execution_artifact as _validate_execution_artifact,
 )
 from src.core.backtest.spider_run_execution_evidence import (
@@ -41,6 +44,8 @@ _DIAGNOSTIC = ("completion.json", "status.json", "journal.jsonl")
 _FRONTIER = ("attempt.json", "status.json", "journal.jsonl", "completion.json")
 _EXECUTION_NAMES = tuple(name for name, _, _ in _EXECUTION_COMPLETION_ARTIFACTS)
 _EXECUTION_ALL = (*_EXECUTION_NAMES, "completion.json")
+_FLOATING_NAMES = tuple(name for name, _, _ in _FLOATING_COMPLETION_ARTIFACTS)
+_FLOATING_ALL = (*_FLOATING_NAMES, "completion.json")
 
 
 class _Unsafe(Exception):
@@ -167,9 +172,12 @@ def _diagnose(directory: int) -> dict[str, _Any]:
     return _reject("MISSING_COMPLETE_MANIFEST", _DIAGNOSTIC)
 
 
-def _admit_execution(directory: int, manifest: dict[str, _Any], completion_raw: bytes) -> dict[str, _Any]:
+def _admit_execution(directory: int, manifest: dict[str, _Any], completion_raw: bytes,
+                     *, floating_exit: bool = False) -> dict[str, _Any]:
+    names = _FLOATING_NAMES if floating_exit else _EXECUTION_NAMES
+    all_names = _FLOATING_ALL if floating_exit else _EXECUTION_ALL
     unsafe = []
-    for name in _EXECUTION_NAMES:
+    for name in names:
         try:
             _regular(directory, name)
         except _Unsafe:
@@ -181,7 +189,7 @@ def _admit_execution(directory: int, manifest: dict[str, _Any], completion_raw: 
 
     captured: dict[str, bytes] = {"completion.json": completion_raw}
     bad = []
-    for name in _EXECUTION_NAMES:
+    for name in names:
         try:
             limit = _P3_JOURNAL_LIMIT if name == "journal.jsonl" else _LIMIT
             captured[name] = _capture(
@@ -192,14 +200,14 @@ def _admit_execution(directory: int, manifest: dict[str, _Any], completion_raw: 
         except (OSError, _Oversize):
             bad.append(name)
     if unsafe:
-        return _reject("UNSAFE_ARTIFACT_PATH", tuple(name for name in _EXECUTION_NAMES if name in unsafe))
+        return _reject("UNSAFE_ARTIFACT_PATH", tuple(name for name in names if name in unsafe))
     if bad:
-        return _reject("ARTIFACT_MISMATCH", tuple(name for name in _EXECUTION_NAMES if name in bad))
+        return _reject("ARTIFACT_MISMATCH", tuple(name for name in names if name in bad))
 
     values: dict[str, _Any] = {}
     metadata = {entry["path"]: entry for entry in manifest["artifacts"]}
     unsupported: list[str] = []
-    for name in _EXECUTION_NAMES:
+    for name in names:
         data = captured[name]
         entry = metadata[name]
         if (len(data) != entry["byte_count"] or _sha256(data).hexdigest() != entry["sha256"]):
@@ -230,18 +238,20 @@ def _admit_execution(directory: int, manifest: dict[str, _Any], completion_raw: 
         except KeyError:
             bad.append(name)
     if bad:
-        return _reject("ARTIFACT_MISMATCH", tuple(name for name in _EXECUTION_NAMES if name in bad))
+        return _reject("ARTIFACT_MISMATCH", tuple(name for name in names if name in bad))
     if unsupported:
-        return _reject("UNSUPPORTED_SCHEMA", tuple(name for name in _EXECUTION_NAMES if name in unsupported))
+        return _reject("UNSUPPORTED_SCHEMA", tuple(name for name in names if name in unsupported))
 
     run_id = manifest["run_id"]
     input_row = values["execution_input.json"]
     historical_input = input_row.get("historical_input") if type(input_row) is dict else None
+    if floating_exit and type(input_row) is dict and type(input_row.get("execution_input")) is dict:
+        historical_input = input_row["execution_input"].get("historical_input")
     if (type(historical_input) is dict and "run_id" in historical_input
             and (not _run_id(historical_input["run_id"]) or historical_input["run_id"] != run_id)):
         return _reject("RUN_ID_MISMATCH", ("execution_input.json",))
     bad = []
-    for name in _EXECUTION_NAMES:
+    for name in names:
         if name in ("execution_input.json", "paid_endpoint.json"):
             continue
         value = values[name]
@@ -255,7 +265,8 @@ def _admit_execution(directory: int, manifest: dict[str, _Any], completion_raw: 
         return _reject("RUN_ID_MISMATCH", tuple(name for name in _EXECUTION_NAMES if name in bad))
 
     try:
-        execution = _execution_context_from_input(captured["execution_input.json"])
+        execution = (_floating_exit_context_from_input(captured["execution_input.json"])
+                     if floating_exit else _execution_context_from_input(captured["execution_input.json"]))
     except _HistoricalInputError:
         return _reject("UNSUPPORTED_SCHEMA", ("execution_input.json",))
     except ValueError as error:
@@ -268,7 +279,7 @@ def _admit_execution(directory: int, manifest: dict[str, _Any], completion_raw: 
     configuration = attempt.get("configuration_context")
     historical = attempt.get("historical_context")
     unsupported = []
-    for name in _EXECUTION_NAMES:
+    for name in names:
         try:
             _validate_execution_artifact(
                 name, captured[name], execution_context=execution,
@@ -285,7 +296,7 @@ def _admit_execution(directory: int, manifest: dict[str, _Any], completion_raw: 
         except (KeyError, TypeError, IndexError):
             unsupported.append(name)
     if unsupported:
-        return _reject("UNSUPPORTED_SCHEMA", tuple(name for name in _EXECUTION_NAMES if name in unsupported))
+        return _reject("UNSUPPORTED_SCHEMA", tuple(name for name in names if name in unsupported))
 
     journal = values["journal.jsonl"]
     status = values["status.json"]
@@ -301,16 +312,16 @@ def _admit_execution(directory: int, manifest: dict[str, _Any], completion_raw: 
     try:
         computed = _build_execution_reconciliation(run_id, captured)
     except _ProjectionError:
-        return _reject("ENDPOINT_RECONCILIATION_FAILED", _EXECUTION_ALL)
+        return _reject("ENDPOINT_RECONCILIATION_FAILED", all_names)
     except ValueError as error:
         if error.args != ("INVALID_ARTIFACT",):
             raise
-        return _reject("ENDPOINT_RECONCILIATION_FAILED", _EXECUTION_ALL)
+        return _reject("ENDPOINT_RECONCILIATION_FAILED", all_names)
     supplied = values["reconciliation.json"]
     if (computed["result"] != "OK" or any(row["result"] != "OK" for row in computed["checks"])
             or _bytes(computed) != _bytes(supplied)):
-        return _reject("ENDPOINT_RECONCILIATION_FAILED", _EXECUTION_ALL)
-    ordered = {name: values[name] for name in _EXECUTION_NAMES}
+        return _reject("ENDPOINT_RECONCILIATION_FAILED", all_names)
+    ordered = {name: values[name] for name in names}
     ordered["completion.json"] = manifest
     return dict(decision="ACCEPT", artifacts=ordered)
 
@@ -328,8 +339,12 @@ def _admit(directory: int) -> dict[str, _Any]:
         return _reject("INVALID_MANIFEST", ("completion.json",))
     try:
         manifest = _decode(raw, "completion.json")
+        floating_exit = (type(manifest) is dict
+                         and manifest.get("schema_version") == _FLOATING_SCHEMA["completion.json"])
         if (type(manifest) is dict
-                and manifest.get("schema_version") == _EXECUTION_SCHEMA["completion.json"]):
+                and manifest.get("schema_version") in (
+                    _EXECUTION_SCHEMA["completion.json"], _FLOATING_SCHEMA["completion.json"],
+                )):
             try:
                 _validate_execution_artifact(
                     "completion.json", raw, execution_context=manifest["execution_context"],
@@ -340,7 +355,7 @@ def _admit(directory: int) -> dict[str, _Any]:
                 return _reject("INVALID_MANIFEST", ("completion.json",))
             except (KeyError, TypeError, IndexError):
                 return _reject("INVALID_MANIFEST", ("completion.json",))
-            return _admit_execution(directory, manifest, raw)
+            return _admit_execution(directory, manifest, raw, floating_exit=floating_exit)
         _validate(_completion, manifest)
     except _Invalid:
         return _reject("INVALID_MANIFEST", ("completion.json",))

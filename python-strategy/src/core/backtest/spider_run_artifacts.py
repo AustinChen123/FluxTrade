@@ -23,6 +23,7 @@ _P1_RUN_CONTRACT = "SPIDER_SYNTHETIC_P1_RUN_V1"
 _P2_RUN_CONTRACT = "SPIDER_SYNTHETIC_P2_CONFIGURED_RUN_V1"
 _P3_RUN_CONTRACT = "SPIDER_HISTORICAL_RESEARCH_RUN_V1"
 _PAID_RUN_CONTRACT = "SPIDER_PAID_RESEARCH_RUN_V1"
+_FLOATING_RUN_CONTRACT = "SPIDER_FLOATING_EXIT_RESEARCH_RUN_V1"
 _P3_SELECTOR = "SPIDER_HISTORICAL_RESEARCH_RUN_V1"
 _HISTORICAL_MODELS = ("OHLC4_OPEN_HIGH_LOW_CLOSE_V1", "OHLC4_OPEN_LOW_HIGH_CLOSE_V1")
 
@@ -52,6 +53,21 @@ class ExecutionContext(NamedTuple):
     policy_id: str
     endpoint_policy_id: str
     execution_input_sha256: str
+    policy_end_ms: int
+    settlement_end_ms: int
+    generation: int
+
+
+class FloatingExitContext(NamedTuple):
+    schema_version: str
+    policy_id: str
+    decision_policy_id: str
+    model_id: str
+    observation_projection_id: str
+    source_study_sha256: str
+    endpoint_policy_id: str
+    execution_input_sha256: str
+    base_execution_input_sha256: str
     policy_end_ms: int
     settlement_end_ms: int
     generation: int
@@ -169,7 +185,7 @@ def _historical_context(value: object) -> dict[str, object]:
 
 
 def execution_context(value: object) -> ExecutionContext:
-    """Validate the closed identity/cutoff context shared by paid artifacts."""
+    """Validate the original closed paid-family execution context."""
     if type(value) is ExecutionContext:
         row = value._asdict()
     else:
@@ -189,6 +205,49 @@ def execution_context(value: object) -> ExecutionContext:
         cast(str, row["schema_version"]), cast(str, row["policy_id"]),
         cast(str, row["endpoint_policy_id"]), cast(str, row["execution_input_sha256"]),
         policy_end, settlement_end, generation,
+    )
+
+
+def artifact_execution_context(value: object) -> ExecutionContext | FloatingExitContext:
+    """Dispatch only between the two closed execution-context families."""
+    if type(value) is FloatingExitContext or (
+        type(value) is dict
+        and cast(dict[str, object], value).get("schema_version") == "spider_floating_exit_context_v1"
+    ):
+        return floating_exit_context(value)
+    return execution_context(value)
+
+
+def floating_exit_context(value: object) -> FloatingExitContext:
+    """Validate the fixed candidate identity carried by candidate artifacts."""
+    if type(value) is FloatingExitContext:
+        row = value._asdict()
+    else:
+        row = _object(
+            value,
+            "schema_version policy_id decision_policy_id model_id observation_projection_id source_study_sha256 endpoint_policy_id execution_input_sha256 base_execution_input_sha256 policy_end_ms settlement_end_ms generation",
+        )
+    _enum(row["schema_version"], ["spider_floating_exit_context_v1"])
+    _enum(row["policy_id"], ["SPIDER_SOURCE_FLOATING_EXIT_PAID_V1"])
+    _enum(row["decision_policy_id"], [
+        "FIXED_REMAINING_COST_TP_V1", "BAYES_REMAINING_COST_RISK_V1",
+    ])
+    _enum(row["model_id"], ["CHAT_BAYES_FORWARD_DECIMAL_V1"])
+    _enum(row["observation_projection_id"], ["CHAT_BAYES_CLOSED15M_SOURCE14_V1"])
+    _enum(row["source_study_sha256"], ["cc5bd45253f8d1f999c4437c944e5bf066fd8c61c30fbae64f0b68f47fb2da6c"])
+    _enum(row["endpoint_policy_id"], ["PAID_CLOSE_RESEARCH_V1"])
+    _text(row["execution_input_sha256"], r"[0-9a-f]{64}")
+    _text(row["base_execution_input_sha256"], r"[0-9a-f]{64}")
+    policy_end = _integer(row["policy_end_ms"])
+    settlement_end = _integer(row["settlement_end_ms"])
+    generation = _integer(row["generation"])
+    _require(policy_end < settlement_end and generation == 0)
+    return FloatingExitContext(
+        cast(str, row["schema_version"]), cast(str, row["policy_id"]),
+        cast(str, row["decision_policy_id"]), cast(str, row["model_id"]),
+        cast(str, row["observation_projection_id"]), cast(str, row["source_study_sha256"]),
+        cast(str, row["endpoint_policy_id"]), cast(str, row["execution_input_sha256"]),
+        cast(str, row["base_execution_input_sha256"]), policy_end, settlement_end, generation,
     )
 
 
@@ -292,15 +351,20 @@ def _boundary(value: object) -> None:
         _text(row["barrier_id"])
 
 
-def _attempt(row: dict[str, object], *, paid_execution: bool = False) -> None:
+def _attempt(row: dict[str, object], *, paid_execution: bool = False,
+             floating_exit: bool = False) -> None:
     required = "schema_version run_id run_contract_id registration_state requested_scenario_selector registration_failure input_contract_hashes planned_coverage " + " ".join(_IDENTITIES)
     optional = "configuration_context historical_context"
-    if paid_execution:
+    if paid_execution or floating_exit:
         required += " execution_context"
     _object(row, required, optional)
     context = _optional_context(row)
     historical = _optional_historical_context(row)
-    run_contract = _enum(row["run_contract_id"], [_P1_RUN_CONTRACT, _P2_RUN_CONTRACT, _P3_RUN_CONTRACT, *([_PAID_RUN_CONTRACT] if paid_execution else [])])
+    run_contract = _enum(row["run_contract_id"], [
+        _P1_RUN_CONTRACT, _P2_RUN_CONTRACT, _P3_RUN_CONTRACT,
+        *([_PAID_RUN_CONTRACT] if paid_execution else []),
+        *([_FLOATING_RUN_CONTRACT] if floating_exit else []),
+    ])
     _text(row["requested_scenario_selector"], r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
     state = _enum(row["registration_state"], ["VALIDATED", "REJECTED"])
     hashes, coverage = _list(row["input_contract_hashes"]), _list(row["planned_coverage"])
@@ -331,7 +395,7 @@ def _attempt(row: dict[str, object], *, paid_execution: bool = False) -> None:
     for key, value in account.items():
         if key != "subaccount" or value is not None:
             _text(value)
-    if run_contract in (_P3_RUN_CONTRACT, _PAID_RUN_CONTRACT):
+    if run_contract in (_P3_RUN_CONTRACT, _PAID_RUN_CONTRACT, _FLOATING_RUN_CONTRACT):
         _require(account["venue"] == "SPIDER_HISTORICAL_RESEARCH")
         _require(account["environment"] == "RESEARCH_ONLY")
         _require("subaccount" not in account or account["subaccount"] is None)
@@ -340,11 +404,16 @@ def _attempt(row: dict[str, object], *, paid_execution: bool = False) -> None:
             _require(row["requested_scenario_selector"] == _P3_SELECTOR)
             _require(row["scenario_plan_id"] == _P3_SELECTOR)
             _require(row["scenario_plan_sha256"] == historical["historical_input_sha256"])
-        else:
+        elif run_contract == _PAID_RUN_CONTRACT:
             _require(paid_execution and row["requested_scenario_selector"] == _PAID_RUN_CONTRACT
                      and row["scenario_plan_id"] == _PAID_RUN_CONTRACT)
             _require(row["registration_state"] == "VALIDATED" and row["registration_failure"] is None)
             _require(row["scenario_plan_sha256"] == execution_context(row["execution_context"]).execution_input_sha256)
+        else:
+            _require(floating_exit and row["requested_scenario_selector"] == _FLOATING_RUN_CONTRACT
+                     and row["scenario_plan_id"] == _FLOATING_RUN_CONTRACT)
+            _require(row["registration_state"] == "VALIDATED" and row["registration_failure"] is None)
+            _require(row["scenario_plan_sha256"] == floating_exit_context(row["execution_context"]).execution_input_sha256)
     for key in _HASHES:
         _text(row[key], "[0-9a-f]{64}")
     _require(len(hashes) == len(_HASH_NAMES))
@@ -352,19 +421,19 @@ def _attempt(row: dict[str, object], *, paid_execution: bool = False) -> None:
         entry = _object(item, "name sha256")
         _require(entry["name"] == name)
         _text(entry["sha256"], "[0-9a-f]{64}")
-    expected_ordering = "HISTORICAL_ORDER_V1" if run_contract in (_P3_RUN_CONTRACT, _PAID_RUN_CONTRACT) else "S_order_v1"
-    expected_cost = "SPIDER_HISTORICAL_RESEARCH_COSTS_V1" if run_contract in (_P3_RUN_CONTRACT, _PAID_RUN_CONTRACT) else "SPIDER_SYNTHETIC_COSTS_V1"
+    expected_ordering = "HISTORICAL_ORDER_V1" if run_contract in (_P3_RUN_CONTRACT, _PAID_RUN_CONTRACT, _FLOATING_RUN_CONTRACT) else "S_order_v1"
+    expected_cost = "SPIDER_HISTORICAL_RESEARCH_COSTS_V1" if run_contract in (_P3_RUN_CONTRACT, _PAID_RUN_CONTRACT, _FLOATING_RUN_CONTRACT) else "SPIDER_SYNTHETIC_COSTS_V1"
     _require(row["ordering_contract_id"] == expected_ordering)
     _require(row["cost_contract_id"] == expected_cost)
     expected_funding = (
-        "HISTORICAL_FUNDING_DISABLED" if run_contract in (_P3_RUN_CONTRACT, _PAID_RUN_CONTRACT)
+        "HISTORICAL_FUNDING_DISABLED" if run_contract in (_P3_RUN_CONTRACT, _PAID_RUN_CONTRACT, _FLOATING_RUN_CONTRACT)
         else "SYNTHETIC_P1_NO_FUNDING_INPUT_OR_CLAIM" if run_contract == _P1_RUN_CONTRACT
         else "SYNTHETIC_P2_NO_FUNDING_INPUT_OR_CLAIM"
     )
     _require(row["funding_exclusion"] == expected_funding)
     _require(row["artifact_encoding"] == "artifact_encoding_v1")
-    if run_contract in (_P3_RUN_CONTRACT, _PAID_RUN_CONTRACT):
-        _require(row["terminal_policy"] == ("PAID_CLOSE_RESEARCH_V1" if run_contract == _PAID_RUN_CONTRACT else "MTM_PRESERVE_OPEN_V1"))
+    if run_contract in (_P3_RUN_CONTRACT, _PAID_RUN_CONTRACT, _FLOATING_RUN_CONTRACT):
+        _require(row["terminal_policy"] == ("PAID_CLOSE_RESEARCH_V1" if run_contract in (_PAID_RUN_CONTRACT, _FLOATING_RUN_CONTRACT) else "MTM_PRESERVE_OPEN_V1"))
         _require(bool(coverage))
     else:
         _enum(row["terminal_policy"], _TERMINALS)
@@ -375,13 +444,14 @@ def _attempt(row: dict[str, object], *, paid_execution: bool = False) -> None:
         barrier = _text(entry["barrier_id"])
         _require(barrier not in seen)
         seen.add(barrier)
-        coverage_kinds = [*_P3_COVERAGE_KINDS, *( ["PAID_ENDPOINT_DRAIN"] if paid_execution else [])]
-        _enum(entry["record_kind"], coverage_kinds if run_contract in (_P3_RUN_CONTRACT, _PAID_RUN_CONTRACT) else _KINDS)
+        coverage_kinds = [*_P3_COVERAGE_KINDS, *( ["PAID_ENDPOINT_DRAIN"] if paid_execution or floating_exit else [])]
+        _enum(entry["record_kind"], coverage_kinds if run_contract in (_P3_RUN_CONTRACT, _PAID_RUN_CONTRACT, _FLOATING_RUN_CONTRACT) else _KINDS)
 
 
-def _status(row: dict[str, object], *, paid_execution: bool = False) -> None:
+def _status(row: dict[str, object], *, paid_execution: bool = False,
+            floating_exit: bool = False) -> None:
     required = "schema_version run_id state processed_boundary persisted_boundary failure_reason primary_failure"
-    if paid_execution:
+    if paid_execution or floating_exit:
         required += " execution_context"
     _object(row, required, "configuration_context historical_context")
     configuration = _optional_context(row)

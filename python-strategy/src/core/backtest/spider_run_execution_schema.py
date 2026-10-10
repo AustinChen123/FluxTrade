@@ -15,9 +15,14 @@ from src.core.backtest.spider_execution_input import (
     decode_spider_execution_input,
     validate_spider_execution_input,
 )
+from src.core.backtest.spider_floating_exit_input import (
+    decode_spider_floating_exit_input,
+    validate_spider_floating_exit_input,
+)
 from src.core.backtest.spider_run_artifacts import (
     ConfigurationContext,
     ExecutionContext,
+    FloatingExitContext,
     HistoricalContext,
     _HASH_NAMES,
     _P3_COVERAGE_KINDS,
@@ -33,6 +38,7 @@ from src.core.backtest.spider_run_artifacts import (
     decode_jsonl,
     encode_jsonl,
     execution_context as validate_execution_context,
+    floating_exit_context as validate_floating_exit_context,
     historical_context,
     _status,
 )
@@ -70,6 +76,22 @@ _COMPLETION_ARTIFACTS = (
     ("report.jsonl", "spider_execution_report_v1", 1),
     ("reconciliation.json", "spider_execution_reconciliation_v1", 1),
 )
+_FLOATING_SCHEMA = {
+    "attempt.json": "spider_floating_exit_attempt_v1",
+    "status.json": "spider_floating_exit_status_v1",
+    "journal.jsonl": "spider_floating_exit_journal_record_v1",
+    "execution_input.json": "spider_floating_exit_input_v1",
+    "paid_endpoint.json": "spider_paid_endpoint_result_v1",
+    "report.jsonl": "spider_floating_exit_report_v1",
+    "reconciliation.json": "spider_floating_exit_reconciliation_v1",
+    "completion.json": "spider_floating_exit_completion_v1",
+}
+_FLOATING_COMPLETION_ARTIFACTS = tuple(
+    (name, schema, None if name == "journal.jsonl" else 1)
+    for name, schema in _FLOATING_SCHEMA.items() if name != "completion.json"
+)
+_FLOATING_CONTRACT = "SPIDER_FLOATING_EXIT_RESEARCH_RUN_V1"
+_FLOATING_TERMINAL = "PAID_CLOSE_RESEARCH_V1"
 
 
 def _context_pair(row: dict[str, object]) -> tuple[ConfigurationContext, HistoricalContext]:
@@ -93,37 +115,73 @@ def execution_context_from_input(raw: bytes) -> dict[str, object]:
     )
 
 
-def _required_context(value: object | None) -> ExecutionContext:
+def floating_exit_context_from_input(raw: bytes) -> dict[str, object]:
+    value = decode_spider_floating_exit_input(raw)
+    candidate_hash = validate_spider_floating_exit_input(value)
+    base_hash = validate_spider_execution_input(value.execution_input)
+    run = value.execution_input
+    return dict(
+        schema_version="spider_floating_exit_context_v1",
+        policy_id=value.policy_id,
+        decision_policy_id=value.decision_policy_id,
+        model_id=value.model_id,
+        observation_projection_id="CHAT_BAYES_CLOSED15M_SOURCE14_V1",
+        source_study_sha256="cc5bd45253f8d1f999c4437c944e5bf066fd8c61c30fbae64f0b68f47fb2da6c",
+        endpoint_policy_id=run.endpoint_policy_id,
+        execution_input_sha256=candidate_hash,
+        base_execution_input_sha256=base_hash,
+        policy_end_ms=run.policy_end_ms,
+        settlement_end_ms=run.historical_input.range_end_ms,
+        generation=run.generation,
+    )
+
+
+def _required_context(value: object | None) -> ExecutionContext | FloatingExitContext:
     _require(value is not None)
+    if type(value) is FloatingExitContext or (
+        type(value) is dict
+        and cast(dict[str, object], value).get("schema_version") == "spider_floating_exit_context_v1"
+    ):
+        return validate_floating_exit_context(value)
     return validate_execution_context(value)
 
 
-def _embedded_execution(row: dict[str, object], expected: ExecutionContext) -> None:
-    _require(validate_execution_context(row["execution_context"]) == expected)
+def _embedded_execution(row: dict[str, object], expected: ExecutionContext | FloatingExitContext) -> None:
+    embedded = (validate_floating_exit_context(row["execution_context"])
+                if type(expected) is FloatingExitContext
+                else validate_execution_context(row["execution_context"]))
+    _require(embedded == expected)
 
 
-def _paid_attempt(value: object, expected: ExecutionContext | None) -> None:
+def _paid_attempt(value: object, expected: ExecutionContext | FloatingExitContext | None,
+                  *, floating_exit: bool = False) -> None:
     _require(type(value) is dict)
     row = cast(dict[str, object], value)
-    _require(row.get("schema_version") == _SCHEMA["attempt.json"])
+    schema = _FLOATING_SCHEMA if floating_exit else _SCHEMA
+    _require(row.get("schema_version") == schema["attempt.json"])
     _text(row.get("run_id"), r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
-    _attempt(row, paid_execution=True)
-    embedded = validate_execution_context(row["execution_context"])
+    _attempt(row, paid_execution=not floating_exit, floating_exit=floating_exit)
+    embedded = (validate_floating_exit_context(row["execution_context"]) if floating_exit
+                else validate_execution_context(row["execution_context"]))
     if expected is not None:
         _require(embedded == expected)
-    _require(row["run_contract_id"] == "SPIDER_PAID_RESEARCH_RUN_V1")
+    _require(row["run_contract_id"] == (_FLOATING_CONTRACT if floating_exit else "SPIDER_PAID_RESEARCH_RUN_V1"))
     _require(row["registration_state"] == "VALIDATED" and row["registration_failure"] is None)
     _require(row["scenario_plan_sha256"] == embedded.execution_input_sha256)
-    _require(row["terminal_policy"] == "PAID_CLOSE_RESEARCH_V1")
+    _require(row["terminal_policy"] == _FLOATING_TERMINAL if floating_exit
+             else row["terminal_policy"] == "PAID_CLOSE_RESEARCH_V1")
 
 
-def _paid_status(value: object, expected: ExecutionContext | None) -> None:
+def _paid_status(value: object, expected: ExecutionContext | FloatingExitContext | None,
+                 *, floating_exit: bool = False) -> None:
     _require(type(value) is dict)
     row = cast(dict[str, object], value)
-    _require(row.get("schema_version") == _SCHEMA["status.json"])
+    schema = _FLOATING_SCHEMA if floating_exit else _SCHEMA
+    _require(row.get("schema_version") == schema["status.json"])
     _text(row.get("run_id"), r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
-    _status(row, paid_execution=True)
-    embedded = validate_execution_context(row["execution_context"])
+    _status(row, paid_execution=not floating_exit, floating_exit=floating_exit)
+    embedded = (validate_floating_exit_context(row["execution_context"]) if floating_exit
+                else validate_execution_context(row["execution_context"]))
     if expected is not None:
         _require(embedded == expected)
     _require("configuration_context" in row and "historical_context" in row)
@@ -131,13 +189,14 @@ def _paid_status(value: object, expected: ExecutionContext | None) -> None:
     historical_context(row["historical_context"])
 
 
-def _paid_journal(value: object, execution: ExecutionContext,
+def _paid_journal(value: object, execution: ExecutionContext | FloatingExitContext,
                   context: ConfigurationContext, historical: HistoricalContext) -> None:
     rows = _list(value)
     envelope.journal(rows, execution=execution)
     for item in rows:
         row = cast(dict[str, object], item)
-        _require(row["schema_version"] == _SCHEMA["journal.jsonl"])
+        schema = _FLOATING_SCHEMA if isinstance(execution, FloatingExitContext) else _SCHEMA
+        _require(row["schema_version"] == schema["journal.jsonl"])
         _embedded_execution(row, execution)
         _require("configuration_context" in row and "historical_context" in row)
         _require(configuration_context(row["configuration_context"]) == context)
@@ -221,7 +280,7 @@ def _delivery_key(value: object) -> tuple[int, int, int, str]:
     return _key(value)
 
 
-def _paid_observation(value: object, execution: ExecutionContext, context: ConfigurationContext) -> None:
+def _paid_observation(value: object, execution: ExecutionContext | FloatingExitContext, context: ConfigurationContext) -> None:
     row = _object(
         value,
         "schema_version run_contract_sha256 observed_at current_evidence_complete native_terminal send_dependencies order_roles pending_cancel_order_ids pending_source_groups pending_paid_deliveries terminal_fact",
@@ -312,7 +371,7 @@ def _paid_observation(value: object, execution: ExecutionContext, context: Confi
             _require(delivery["payload_kind"] == "TRANSPORT_ACK")
 
 
-def _paid_endpoint(value: object, execution: ExecutionContext, context: ConfigurationContext) -> None:
+def _paid_endpoint(value: object, execution: ExecutionContext | FloatingExitContext, context: ConfigurationContext) -> None:
     row = _object(value, "schema_version run_contract_sha256 policy_end_ms settlement_end_ms generation status owner_evidence actions pending_obligations reasons failure")
     _enum(row["schema_version"], [_SCHEMA["paid_endpoint.json"]])
     _require(_text(row["run_contract_sha256"], r"[0-9a-f]{64}") == execution.execution_input_sha256)
@@ -358,15 +417,52 @@ def _scheduler(value: object) -> None:
     envelope.scheduler_observation(value, historical=True, paid_execution=True)
 
 
-def _report(value: object, execution: ExecutionContext, context: ConfigurationContext) -> None:
-    row = _object(value, "schema_version run_id initial_owner_evidence scheduler_observation paid_observation paid_endpoint source_evidence_refs")
-    _enum(row["schema_version"], [_SCHEMA["report.jsonl"]])
+def _floating_observation(value: object, execution: FloatingExitContext,
+                          products: tuple[str, ...]) -> None:
+    row = _object(value, "schema_version run_contract_sha256 decision_batches product_exits")
+    _enum(row["schema_version"], ["spider_floating_exit_observation_v1"])
+    _require(_text(row["run_contract_sha256"], r"[0-9a-f]{64}") == execution.execution_input_sha256)
+    _list(row["decision_batches"])
+    exits = _list(row["product_exits"])
+    identities = []
+    for item in exits:
+        progress = _object(item, "product_id reason requested_at status completed_at")
+        identities.append(_enum(progress["product_id"], products))
+        _enum(progress["reason"], ["TP", "RISK"])
+        _integer(progress["requested_at"])
+        _enum(progress["status"], [
+            "EXITING", "EXITED", "INCOMPLETE", "FAILED",
+            "LIQUIDATED_FLAT", "LIQUIDATED_INSOLVENT",
+        ])
+        if progress["completed_at"] is not None:
+            _integer(progress["completed_at"])
+    _require(identities == [product for product in products if product in identities])
+    _require(len(identities) == len(set(identities)))
+
+
+def _report(value: object, execution: ExecutionContext | FloatingExitContext,
+            context: ConfigurationContext, *, floating_exit: bool = False) -> None:
+    required = "schema_version run_id initial_owner_evidence scheduler_observation paid_observation paid_endpoint source_evidence_refs"
+    if floating_exit:
+        required += " floating_observation"
+    row = _object(value, required)
+    schema = _FLOATING_SCHEMA if floating_exit else _SCHEMA
+    _enum(row["schema_version"], [schema["report.jsonl"]])
     _text(row["run_id"], r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
     if row["initial_owner_evidence"] is not None:
         envelope.owner_evidence(row["initial_owner_evidence"], context=context)
     _scheduler(row["scheduler_observation"])
     _paid_observation(row["paid_observation"], execution, context)
     _paid_endpoint(row["paid_endpoint"], execution, context)
+    if floating_exit:
+        _require(isinstance(execution, FloatingExitContext))
+        if row["floating_observation"] is None:
+            _require(row["initial_owner_evidence"] is None
+                     and cast(dict[str, object], row["paid_endpoint"])["status"] == "FAILED")
+        else:
+            _floating_observation(
+                row["floating_observation"], cast(FloatingExitContext, execution), context.products,
+            )
     _require(row["initial_owner_evidence"] is not None
              or cast(dict[str, object], row["paid_endpoint"])["status"] == "FAILED")
     refs = [_text(item, r"journal:[1-9][0-9]*") for item in _list(row["source_evidence_refs"])]
@@ -381,15 +477,19 @@ def _refs(value: object, journal_rows: int | None = None) -> None:
             _require(match is not None and (journal_rows is None or int(match.group(1)) <= journal_rows))
         else:
             target, marker, pointer = ref.partition("#")
-            _require(bool(marker) and target in {"artifact:" + name for name in _FAMILY_FILES} | {"artifact:completion.json"})
+            _require(bool(marker) and target in ({"artifact:" + name for name in _FAMILY_FILES}
+                                                  | {"artifact:" + name for name in _FLOATING_SCHEMA}
+                                                  | {"artifact:completion.json"}))
             _require(not pointer or pointer.startswith("/"))
             _require(re.search(r"~(?![01])", pointer) is None)
     _require(len(refs) == len(set(refs)))
 
 
-def _reconciliation(value: object, run_id: str, journal_rows: int | None) -> None:
+def _reconciliation(value: object, run_id: str, journal_rows: int | None,
+                    *, floating_exit: bool = False) -> None:
     row = _object(value, "schema_version run_id result evidence_scope checks")
-    _enum(row["schema_version"], [_SCHEMA["reconciliation.json"]])
+    schema = _FLOATING_SCHEMA if floating_exit else _SCHEMA
+    _enum(row["schema_version"], [schema["reconciliation.json"]])
     _require(_text(row["run_id"], r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}") == run_id)
     _enum(row["result"], ["OK", "FAILED"])
     _enum(row["evidence_scope"], ["COMPLETE_RUN", "FAILED_PREFIX"])
@@ -402,15 +502,18 @@ def _reconciliation(value: object, run_id: str, journal_rows: int | None) -> Non
         _refs(check["evidence_refs"], journal_rows)
 
 
-def _completion(value: object, execution: ExecutionContext, run_id: str) -> None:
+def _completion(value: object, execution: ExecutionContext | FloatingExitContext,
+                run_id: str, *, floating_exit: bool = False) -> None:
     row = _object(
         value,
         "schema_version run_id state terminal_reason input_contract_hashes planned_coverage processed_boundary persisted_boundary endpoint_state_digest reconciliation_digest artifacts configuration_context historical_context execution_context endpoint_status evidence_scope",
     )
-    _enum(row["schema_version"], [_SCHEMA["completion.json"]])
+    schema = _FLOATING_SCHEMA if floating_exit else _SCHEMA
+    completion_artifacts = _FLOATING_COMPLETION_ARTIFACTS if floating_exit else _COMPLETION_ARTIFACTS
+    _enum(row["schema_version"], [schema["completion.json"]])
     _require(_text(row["run_id"], r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}") == run_id)
     _enum(row["state"], ["COMPLETE"])
-    _enum(row["terminal_reason"], ["PAID_CLOSE_RESEARCH_V1"])
+    _enum(row["terminal_reason"], [_FLOATING_TERMINAL if floating_exit else "PAID_CLOSE_RESEARCH_V1"])
     _text(row["endpoint_state_digest"], r"[0-9a-f]{64}")
     _text(row["reconciliation_digest"], r"[0-9a-f]{64}")
     for name in ("processed_boundary", "persisted_boundary"):
@@ -438,11 +541,11 @@ def _completion(value: object, execution: ExecutionContext, run_id: str) -> None
     _enum(row["endpoint_status"], _RESULT_STATUSES)
     _enum(row["evidence_scope"], ["COMPLETE_RUN", "FAILED_PREFIX"])
     artifacts = _list(row["artifacts"])
-    _require(len(artifacts) == len(_COMPLETION_ARTIFACTS))
-    for item, (path, schema, fixed_rows) in zip(artifacts, _COMPLETION_ARTIFACTS, strict=True):
+    _require(len(artifacts) == len(completion_artifacts))
+    for item, (path, artifact_schema, fixed_rows) in zip(artifacts, completion_artifacts, strict=True):
         artifact = _object(item, "path schema_version sha256 byte_count row_count")
         _enum(artifact["path"], [path])
-        _enum(artifact["schema_version"], [schema])
+        _enum(artifact["schema_version"], [artifact_schema])
         _text(artifact["sha256"], r"[0-9a-f]{64}")
         _integer(artifact["byte_count"])
         rows = _integer(artifact["row_count"])
@@ -464,19 +567,33 @@ def validate_execution_artifact(
     `execution_context` is required for all artifacts except execution_input.json
     and is validated before it can authorize the native market hash.
     """
-    _enum(filename, _FAMILY_FILES)
+    floating_exit = (
+        execution_context is not None
+        and (
+            type(execution_context) is FloatingExitContext
+            or (type(execution_context) is dict
+                and execution_context.get("schema_version") == "spider_floating_exit_context_v1")
+        )
+    )
+    _enum(filename, tuple(_FLOATING_SCHEMA) if floating_exit else _FAMILY_FILES)
     _require(type(raw) is bytes)
     if filename == "execution_input.json":
-        value = decode_spider_execution_input(raw)
-        expected_hash = validate_spider_execution_input(value)
-        if execution_context is not None:
-            expected = validate_execution_context(execution_context)
-            _require(expected.execution_input_sha256 == expected_hash
-                     and expected.policy_end_ms == value.policy_end_ms
-                     and expected.settlement_end_ms == value.historical_input.range_end_ms
-                     and expected.generation == value.generation
-                     and expected.policy_id == value.policy_id
-                     and expected.endpoint_policy_id == value.endpoint_policy_id)
+        if floating_exit:
+            value = decode_spider_floating_exit_input(raw)
+            expected = validate_floating_exit_context(execution_context) if execution_context is not None else None
+            expected_context = floating_exit_context_from_input(raw)
+            _require(expected is None or expected._asdict() == expected_context)
+        else:
+            value = decode_spider_execution_input(raw)
+            expected_hash = validate_spider_execution_input(value)
+            if execution_context is not None:
+                expected = validate_execution_context(execution_context)
+                _require(expected.execution_input_sha256 == expected_hash
+                         and expected.policy_end_ms == value.policy_end_ms
+                         and expected.settlement_end_ms == value.historical_input.range_end_ms
+                         and expected.generation == value.generation
+                         and expected.policy_id == value.policy_id
+                         and expected.endpoint_policy_id == value.endpoint_policy_id)
         return value
     expected = _required_context(execution_context)
     if filename in ("attempt.json", "status.json", "paid_endpoint.json", "reconciliation.json", "completion.json"):
@@ -488,9 +605,9 @@ def validate_execution_artifact(
     else:
         raise ValueError("INVALID_ARTIFACT")
     if filename == "attempt.json":
-        _paid_attempt(value, expected)
+        _paid_attempt(value, expected, floating_exit=floating_exit)
     elif filename == "status.json":
-        _paid_status(value, expected)
+        _paid_status(value, expected, floating_exit=floating_exit)
     elif filename == "journal.jsonl":
         _require(configuration is not None and historical is not None)
         _paid_journal(value, expected, configuration_context(configuration), historical_context(historical))
@@ -501,13 +618,13 @@ def validate_execution_artifact(
         rows = _list(value)
         _require(len(rows) == 1)
         _require(configuration is not None)
-        _report(rows[0], expected, configuration_context(configuration))
+        _report(rows[0], expected, configuration_context(configuration), floating_exit=floating_exit)
     elif filename == "reconciliation.json":
         row = cast(dict[str, object], value)
-        _reconciliation(row, cast(str, row.get("run_id")), journal_rows)
+        _reconciliation(row, cast(str, row.get("run_id")), journal_rows, floating_exit=floating_exit)
     else:
         row = cast(dict[str, object], value)
-        _completion(row, expected, cast(str, row.get("run_id")))
+        _completion(row, expected, cast(str, row.get("run_id")), floating_exit=floating_exit)
     return value
 
 

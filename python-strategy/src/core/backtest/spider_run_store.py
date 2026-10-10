@@ -17,9 +17,11 @@ from src.core.backtest.spider_run_reconciliation_schema import reconciliation as
 from src.core.backtest.spider_historical_input import _validate_historical_run_link
 from src.core.backtest.spider_run_execution_schema import (
     _COMPLETION_ARTIFACTS as _EXECUTION_COMPLETION_ARTIFACTS,
+    _FLOATING_COMPLETION_ARTIFACTS,
     _SCHEMA as _EXECUTION_SCHEMA,
     canonical_paid_bytes,
     execution_context_from_input,
+    floating_exit_context_from_input,
     validate_execution_artifact,
 )
 from src.core.backtest.spider_run_execution_evidence import build_execution_reconciliation
@@ -27,11 +29,16 @@ from src.core.backtest.spider_execution_input import (
     decode_spider_execution_input,
     validate_spider_execution_input,
 )
+from src.core.backtest.spider_floating_exit_input import (
+    decode_spider_floating_exit_input,
+    validate_spider_floating_exit_input,
+)
 from src.core.backtest.spider_run_artifacts import (
     _HASH_NAMES,
     configuration_context as validate_configuration_context,
     decode_canonical,
     execution_context as validate_execution_context,
+    floating_exit_context as validate_floating_exit_context,
     historical_context as validate_historical_context,
 )
 from src.core.backtest.spider_historical_input import historical_context_for_input
@@ -102,6 +109,21 @@ class SpiderRunStore:
         self._execution_configuration: dict[str, Any] | None = None
         self._execution_historical: dict[str, Any] | None = None
         self._execution_input: bytes | None = None
+        self._floating_exit = False
+
+    def _is_execution(self) -> bool:
+        return self._attempt.get("run_contract_id") in (
+            "SPIDER_PAID_RESEARCH_RUN_V1", "SPIDER_FLOATING_EXIT_RESEARCH_RUN_V1",
+        )
+
+    def _execution_schema(self) -> dict[str, str]:
+        if self._floating_exit:
+            from src.core.backtest.spider_run_execution_schema import _FLOATING_SCHEMA
+            return _FLOATING_SCHEMA
+        return _EXECUTION_SCHEMA
+
+    def _execution_completion_artifacts(self):
+        return _FLOATING_COMPLETION_ARTIFACTS if self._floating_exit else _EXECUTION_COMPLETION_ARTIFACTS
 
     @classmethod
     def create(cls, output_root: str, run_id: str) -> "SpiderRunStore":
@@ -140,10 +162,10 @@ class SpiderRunStore:
         _sync(self._path)
 
     def _status(self, state: str, reason: str | None = None, primary: dict | None = None) -> dict[str, Any]:
-        if self._attempt.get("run_contract_id") == "SPIDER_PAID_RESEARCH_RUN_V1":
+        if self._is_execution():
             assert self._execution_context is not None
             value = dict(
-                schema_version="spider_execution_status_v1", run_id=self._run_id, state=state,
+                schema_version=self._execution_schema()["status.json"], run_id=self._run_id, state=state,
                 processed_boundary=deepcopy(self._processed), persisted_boundary=deepcopy(self._persisted),
                 failure_reason=reason, primary_failure=deepcopy(primary),
                 configuration_context=deepcopy(self._execution_configuration),
@@ -180,16 +202,24 @@ class SpiderRunStore:
             raise ValueError("INVALID_ARTIFACT") from error
         return raw
 
-    def _execution_registration(self, attempt: dict[str, Any], raw: bytes) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    def _execution_registration(self, attempt: dict[str, Any], raw: bytes, *,
+                                floating_exit: bool = False) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
         if type(raw) is not bytes:
             raise ValueError("INVALID_ARTIFACT")
-        request = decode_spider_execution_input(raw)
-        wrapper_hash = validate_spider_execution_input(request)
+        if floating_exit:
+            floating_request = decode_spider_floating_exit_input(raw)
+            wrapper_hash = validate_spider_floating_exit_input(floating_request)
+            request = floating_request.execution_input
+            execution = floating_exit_context_from_input(raw)
+            context = validate_floating_exit_context(execution)
+        else:
+            request = decode_spider_execution_input(raw)
+            wrapper_hash = validate_spider_execution_input(request)
+            execution = execution_context_from_input(raw)
+            context = validate_execution_context(execution)
         run = request.historical_input
         if run.run_id != self._run_id:
             raise ValueError("INVALID_ARTIFACT")
-        execution = execution_context_from_input(raw)
-        context = validate_execution_context(execution)
         validate_execution_artifact("attempt.json", canonical_bytes(attempt) + b"\n", execution_context=execution)
         configuration_value = decode_canonical(run.configuration_bytes)
         if type(configuration_value) is not dict:
@@ -225,28 +255,39 @@ class SpiderRunStore:
 
     def register(
         self, attempt: dict[str, Any], *, historical_input: bytes | None = None,
-        execution_input: bytes | None = None,
+        execution_input: bytes | None = None, floating_exit_input: bytes | None = None,
     ) -> str:
         self._allowed("CREATED")
-        paid = execution_input is not None
+        floating_exit = floating_exit_input is not None
+        if floating_exit and execution_input is not None:
+            raise ValueError("INVALID_ARTIFACT")
+        paid = execution_input is not None or floating_exit
         if paid:
+            raw = floating_exit_input if floating_exit else execution_input
             if historical_input is not None:
                 raise ValueError("INVALID_ARTIFACT")
-            if (type(attempt) is not dict or attempt.get("schema_version") != "spider_execution_attempt_v1"
-                    or attempt.get("run_contract_id") != "SPIDER_PAID_RESEARCH_RUN_V1"
+            if (type(attempt) is not dict
+                    or attempt.get("schema_version") != (
+                        "spider_floating_exit_attempt_v1" if floating_exit else "spider_execution_attempt_v1"
+                    )
+                    or attempt.get("run_contract_id") != (
+                        "SPIDER_FLOATING_EXIT_RESEARCH_RUN_V1" if floating_exit
+                        else "SPIDER_PAID_RESEARCH_RUN_V1"
+                    )
                     or attempt.get("registration_state") != "VALIDATED"):
                 raise ValueError("INVALID_ARTIFACT")
             try:
                 execution_context, configuration_context, historical_context_value = self._execution_registration(
-                    attempt, execution_input,
+                    attempt, cast(bytes, raw), floating_exit=floating_exit,
                 )
             except (ValueError, KeyError, TypeError, IndexError) as error:
                 raise ValueError("INVALID_ARTIFACT") from error
             self._execution_context = execution_context
             self._execution_configuration = configuration_context
             self._execution_historical = historical_context_value
-            self._execution_input = execution_input
-            self._publish("execution_input.json", execution_input)
+            self._execution_input = cast(bytes, raw)
+            self._floating_exit = floating_exit
+            self._publish("execution_input.json", cast(bytes, raw))
             self._publish("attempt.json", canonical_bytes(attempt) + b"\n")
             self._attempt = deepcopy(attempt)
             self._publish("status.json", canonical_bytes(self._status("RUNNING")) + b"\n")
@@ -288,7 +329,7 @@ class SpiderRunStore:
         _boundary(boundary)
         ordinal = self._persisted["ordinal"] + 1 if self._persisted else 1
         historical = self._attempt["run_contract_id"] == _P3_RUN_CONTRACT
-        paid = self._attempt["run_contract_id"] == "SPIDER_PAID_RESEARCH_RUN_V1"
+        paid = self._is_execution()
         coverage = self._attempt["planned_coverage"]
         if historical:
             valid_kind = record_kind in ("SOURCE_GROUP_RESULT", "SNAPSHOT_FACT", "DELIVERY_ATTEMPT",
@@ -325,7 +366,7 @@ class SpiderRunStore:
 
     def append_journal(self, row: dict[str, Any]) -> None:
         self._allowed("RUNNING")
-        paid = self._attempt["run_contract_id"] == "SPIDER_PAID_RESEARCH_RUN_V1"
+        paid = self._is_execution()
         journal_record(row, execution=self._execution_context if paid else None)
         boundary = dict(ordinal=row["journal_seq"], journal_seq=row["journal_seq"], barrier_id=row["barrier_id"])
         historical = self._attempt["run_contract_id"] == _P3_RUN_CONTRACT
@@ -374,10 +415,15 @@ class SpiderRunStore:
     def publish_paid_diagnostic(self, endpoint: dict[str, Any]) -> None:
         """Persist a known paid DTO through the store's ordinary no-clobber path."""
         self._allowed("RUNNING", "FAILED")
-        if self._attempt.get("run_contract_id") != "SPIDER_PAID_RESEARCH_RUN_V1":
+        if not self._is_execution():
             raise RuntimeError("INVALID_STORE_OPERATION")
         assert self._execution_context is not None and self._execution_configuration is not None
-        raw = canonical_paid_bytes(endpoint, self._execution_context, self._execution_configuration)
+        raw = (canonical_bytes(endpoint) + b"\n" if self._floating_exit else
+               canonical_paid_bytes(endpoint, self._execution_context, self._execution_configuration))
+        if self._floating_exit:
+            validate_execution_artifact("paid_endpoint.json", raw,
+                                        execution_context=self._execution_context,
+                                        configuration=self._execution_configuration)
         self._publish("paid_endpoint.json", raw)
 
     def _execution_reread(self, name: str, *, journal_rows: int | None = None) -> tuple[Any, dict[str, Any], bytes]:
@@ -396,7 +442,9 @@ class SpiderRunStore:
                 historical=self._execution_historical, journal_rows=journal_rows,
             )
             if name == "execution_input.json":
-                if decode_spider_execution_input(raw).historical_input.run_id != self._run_id:
+                request = (decode_spider_floating_exit_input(raw).execution_input
+                           if self._floating_exit else decode_spider_execution_input(raw))
+                if request.historical_input.run_id != self._run_id:
                     raise ValueError("INVALID_ARTIFACT")
                 rows = [value]
             elif name.endswith(".jsonl"):
@@ -413,7 +461,7 @@ class SpiderRunStore:
                 raise
             raise SpiderRunStoreError("ENDPOINT_RECONCILIATION_FAILED") from error
         metadata = dict(
-            path=name, schema_version=_EXECUTION_SCHEMA[name], sha256=sha256(raw).hexdigest(),
+            path=name, schema_version=self._execution_schema()[name], sha256=sha256(raw).hexdigest(),
             byte_count=len(raw), row_count=1 if name == "execution_input.json" else len(rows),
         )
         return value, metadata, raw
@@ -427,7 +475,12 @@ class SpiderRunStore:
         if type(report) is not list or len(report) != 1:
             raise ValueError("INVALID_ARTIFACT")
         report_raw = b"".join(canonical_bytes(row) + b"\n" for row in report)
-        endpoint_raw = canonical_paid_bytes(endpoint, self._execution_context, self._execution_configuration)
+        endpoint_raw = (canonical_bytes(endpoint) + b"\n" if self._floating_exit else
+                        canonical_paid_bytes(endpoint, self._execution_context, self._execution_configuration))
+        if self._floating_exit:
+            validate_execution_artifact("paid_endpoint.json", endpoint_raw,
+                                        execution_context=self._execution_context,
+                                        configuration=self._execution_configuration)
         recon_raw = canonical_bytes(reconciliation) + b"\n"
         validate_execution_artifact(
             "reconciliation.json", recon_raw, execution_context=self._execution_context,
@@ -441,7 +494,8 @@ class SpiderRunStore:
                           ("report.jsonl", report_raw)):
             self._publish(name, raw)
 
-        reread_names = [name for name, _, _ in _EXECUTION_COMPLETION_ARTIFACTS]
+        completion_artifacts = self._execution_completion_artifacts()
+        reread_names = [name for name, _, _ in completion_artifacts]
         reread: dict[str, Any] = {}
         metadata: list[dict[str, Any]] = []
         artifacts: dict[str, bytes] = {}
@@ -464,7 +518,7 @@ class SpiderRunStore:
             raise SpiderRunStoreError("ENDPOINT_RECONCILIATION_FAILED")
         assert self._execution_configuration is not None and self._execution_historical is not None
         manifest = dict(
-            schema_version="spider_execution_completion_v1", run_id=self._run_id, state="COMPLETE",
+            schema_version=self._execution_schema()["completion.json"], run_id=self._run_id, state="COMPLETE",
             terminal_reason="PAID_CLOSE_RESEARCH_V1",
             input_contract_hashes=self._attempt["input_contract_hashes"],
             planned_coverage=self._attempt["planned_coverage"],
@@ -530,7 +584,7 @@ class SpiderRunStore:
 
     def finalize(self, endpoint: dict, reconciliation: dict, report: list) -> str:
         self._allowed("RUNNING")
-        if self._attempt.get("run_contract_id") == "SPIDER_PAID_RESEARCH_RUN_V1":
+        if self._is_execution():
             return self._finalize_execution(endpoint, reconciliation, report)
         historical = self._attempt.get("run_contract_id") == _P3_RUN_CONTRACT
         frontier_ready = (self._persisted is not None and self._processed == self._persisted

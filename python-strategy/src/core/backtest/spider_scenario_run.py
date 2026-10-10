@@ -1,12 +1,14 @@
 """Bounded single-run orchestration over the existing durability and runtime owners."""
 
 from copy import deepcopy as _copy
+from decimal import Decimal as _Decimal
 from hashlib import sha256 as _sha256
+import logging as _logging
 from pathlib import Path as _Path
 from typing import Any as _Any, cast as _cast
 
 from src.core.backtest import spider_policy_protocol as _protocol, spider_scenario_plans as _plans, synthetic_scenario_codec as _wire
-from src.core.backtest.spider_run_artifacts import _HASHES, _HASH_NAMES, _IDENTITIES, _configuration_context as _context_payload, _object, _require, _text, canonical_bytes as _bytes, decode_canonical as _decode, encode_jsonl as _jsonl, validate_artifact as _validate
+from src.core.backtest.spider_run_artifacts import _HASHES, _HASH_NAMES, _IDENTITIES, _configuration_context as _context_payload, _object, _require, _text, canonical_bytes as _bytes, canonical_decimal_text as _decimal_text, decode_canonical as _decode, encode_jsonl as _jsonl, validate_artifact as _validate
 from src.core.backtest.spider_run_envelope_schema import endpoint as _endpoint, journal as _journal
 from src.core.backtest.spider_run_evidence import ReconciliationProjectionError as _ProjectionError, build_endpoint_artifacts as _build
 from src.core.backtest.spider_run_admission import admit_spider_run as _admit
@@ -14,8 +16,14 @@ from src.core.backtest.spider_run_store import SpiderRunStore as _Store, SpiderR
 from src.core.backtest.synthetic_scenario_replay import _ReplayComposition, ReplayPersistenceError as _PersistenceError, _ScheduleError
 from src.core.backtest.spider_paid_endpoint import _classify_paid_endpoint_result as _classify_paid, _error as _paid_error
 from src.core.backtest.spider_run_execution_schema import canonical_paid_bytes as _paid_bytes, execution_context_from_input as _execution_context_from_input, validate_execution_artifact as _validate_execution_artifact
+from src.core.backtest.spider_run_execution_schema import floating_exit_context_from_input as _floating_context_from_input
 from src.core.backtest.spider_run_execution_evidence import build_execution_reconciliation as _build_execution_reconciliation, _expected_coverage as _paid_coverage
 from src.core.backtest.spider_execution_input import decode_spider_execution_input as _decode_execution_input, validate_spider_execution_input as _validate_execution_input
+from src.core.backtest.spider_execution_input import encode_spider_execution_input as _encode_execution_input
+from src.core.backtest.spider_floating_exit_input import (
+    decode_spider_floating_exit_input as _decode_floating_input,
+    validate_spider_floating_exit_input as _validate_floating_input,
+)
 from src.core.backtest.spider_historical_input import (
     SCHEMA_ID as _P3_SELECTOR,
     HistoricalInputError as _HistoricalInputError,
@@ -57,6 +65,14 @@ _PAID_PROGRAM = (*_P3_PROGRAM,
                  "python-strategy/src/core/backtest_runner.py",
                  "python-strategy/src/core/research_backtest_runner.py",
                  "python-strategy/examples/run_spider_scenario_replay.py")
+_FLOATING_SELECTOR = "SPIDER_FLOATING_EXIT_RESEARCH_RUN_V1"
+_FLOATING_PROGRAM = tuple(dict.fromkeys((*_PAID_PROGRAM, *(
+    "python-strategy/src/core/backtest/" + name + ".py" for name in (
+        "spider_bayes_model", "spider_bayes_replay", "spider_floating_exit_input",
+        "spider_floating_exit_host", "spider_floating_exit_policy",
+    )
+))))
+_LOGGER = _logging.getLogger(__name__)
 
 
 def _paid_durability_unknown(error: Exception) -> bool:
@@ -197,6 +213,36 @@ def _paid_configuration(raw: bytes, run_id: str):
         terminal_policy="PAID_CLOSE_RESEARCH_V1",
         execution_context=execution,
         planned_coverage=_paid_coverage(request, wrapper_hash),
+    )
+    _validate_execution_artifact("attempt.json", _bytes(attempt) + b"\n", execution_context=execution)
+    return request, bundle, attempt
+
+
+def _floating_configuration(raw: bytes, run_id: str):
+    request = _decode_floating_input(raw)
+    if request.execution_input.historical_input.run_id != run_id:
+        raise _HistoricalInputError("floating-exit run id does not match invocation")
+    contract_hash = _validate_floating_input(request)
+    base_raw = _encode_execution_input(request.execution_input)
+    _, bundle, attempt = _paid_configuration(base_raw, run_id)
+    program = _sha256()
+    if len(_FLOATING_PROGRAM) != len(set(_FLOATING_PROGRAM)):
+        raise RuntimeError("DUPLICATE_PROGRAM_SOURCE")
+    for name in sorted(_FLOATING_PROGRAM):
+        encoded = name.encode()
+        program.update(len(encoded).to_bytes(8, "big") + encoded + _sha256((_ROOT / name).read_bytes()).digest())
+    hashes = [contract_hash, program.hexdigest(), attempt["native_artifact_sha256"], _P3_POLICY_SOURCE]
+    execution = _floating_context_from_input(raw)
+    attempt.update(
+        **dict(zip(_HASHES, hashes, strict=True)),
+        input_contract_hashes=[dict(name=name, sha256=value) for name, value in zip(_HASH_NAMES, hashes, strict=True)],
+        schema_version="spider_floating_exit_attempt_v1",
+        run_contract_id=_FLOATING_SELECTOR,
+        requested_scenario_selector=_FLOATING_SELECTOR,
+        scenario_plan_id=_FLOATING_SELECTOR,
+        terminal_policy="PAID_CLOSE_RESEARCH_V1",
+        execution_context=execution,
+        planned_coverage=_paid_coverage(request.execution_input, contract_hash),
     )
     _validate_execution_artifact("attempt.json", _bytes(attempt) + b"\n", execution_context=execution)
     return request, bundle, attempt
@@ -534,8 +580,44 @@ def _execute_historical(store, attempt, run: _HistoricalRunInput):
     return None if admitted["decision"] == "ACCEPT" else admitted["reason"]
 
 
-def _execute_paid(store, request, attempt, execution_input: bytes, result_state: dict[str, _Any]):
-    composition = _ReplayComposition._from_execution_run(request)
+def _floating_report_observation(composition, request):
+    host = composition._floating_exit_host
+    endpoint = composition._paid_endpoint
+    if host is None or endpoint is None:
+        raise RuntimeError("MISSING_FLOATING_EXIT_HOST")
+    host_observation = host.observation()
+    product_exits = []
+    for product_id in request.execution_input.historical_input.ordered_products:
+        if product_id not in endpoint.product_operations:
+            continue
+        progress = endpoint.product_exit_progress(composition, product_id)
+        product_exits.append({
+            "product_id": progress["product_id"], "reason": progress["reason"],
+            "requested_at": progress["requested_at"], "status": progress["status"],
+            "completed_at": progress["completed_at"],
+        })
+    def wire_value(value):
+        if isinstance(value, _Decimal):
+            return _decimal_text(value)
+        if type(value) is dict:
+            return {key: wire_value(item) for key, item in value.items()}
+        if type(value) in (list, tuple):
+            return [wire_value(item) for item in value]
+        return value
+
+    return _normalized(dict(
+        schema_version="spider_floating_exit_observation_v1",
+        run_contract_sha256=host.contract_hash,
+        decision_batches=wire_value(host_observation["batches"]),
+        product_exits=product_exits,
+    ))
+
+
+def _execute_paid(store, request, attempt, execution_input: bytes, result_state: dict[str, _Any],
+                  *, floating_exit: bool = False):
+    composition = (_ReplayComposition._from_floating_exit_run(request) if floating_exit
+                   else _ReplayComposition._from_execution_run(request))
+    run_request = request.execution_input if floating_exit else request
     endpoint = composition._paid_endpoint
     if endpoint is None:
         raise RuntimeError("MISSING_PAID_ENDPOINT")
@@ -554,7 +636,7 @@ def _execute_paid(store, request, attempt, execution_input: bytes, result_state:
 
     initial_capture: dict[str, _Any] | None = None
     initial_error: Exception | None = None
-    start_cutoff = request.historical_input.range_start_ms * 16
+    start_cutoff = run_request.historical_input.range_start_ms * 16
     try:
         initial_capture = capture(start_cutoff, "PAID_INITIAL_" + endpoint.contract_hash[:16])
     except Exception as error:
@@ -625,7 +707,8 @@ def _execute_paid(store, request, attempt, execution_input: bytes, result_state:
             effective = key["visible_at"]
         ordinal = len(journal) + 1
         row = dict(
-            schema_version="spider_execution_journal_record_v1", run_id=attempt["run_id"],
+            schema_version=("spider_floating_exit_journal_record_v1" if floating_exit
+                            else "spider_execution_journal_record_v1"), run_id=attempt["run_id"],
             journal_seq=ordinal, barrier_id=key["stable_id"], record_kind=kind,
             scheduler_key=key, causal_parent_ids=[], effective_at=effective,
             visible_at=key["visible_at"], account_version_before=before_version,
@@ -650,7 +733,7 @@ def _execute_paid(store, request, attempt, execution_input: bytes, result_state:
 
     composition._evidence_callback = persist
     if initial_error is None:
-        composition._dispatch_due(request.historical_input.range_end_ms * 16 + 6)
+        composition._dispatch_due(run_request.historical_input.range_end_ms * 16 + 6)
         if persistence_error and _paid_durability_unknown(persistence_error[-1]):
             raise _StoreError("PUBLICATION_DURABILITY_UNKNOWN", "PERSISTENCE_FAILED")
         paid_result = endpoint.result(composition)
@@ -734,24 +817,28 @@ def _execute_paid(store, request, attempt, execution_input: bytes, result_state:
         failure=failed,
     )
     report = [dict(
-        schema_version="spider_execution_report_v1", run_id=attempt["run_id"],
+        schema_version=("spider_floating_exit_report_v1" if floating_exit
+                        else "spider_execution_report_v1"), run_id=attempt["run_id"],
         initial_owner_evidence=(initial_capture["owner_evidence"] if initial_capture is not None else None),
         scheduler_observation=scheduler, paid_observation=paid_observation,
         paid_endpoint=paid_result,
         source_evidence_refs=[f"journal:{row['journal_seq']}" for row in journal],
     )]
+    if floating_exit:
+        report[0]["floating_observation"] = _floating_report_observation(composition, request)
     raw_files = {
         name: (store._path / name).read_bytes()
         for name in ("attempt.json", "status.json", "journal.jsonl", "execution_input.json")
     }
-    raw_files["paid_endpoint.json"] = _paid_bytes(paid_result, execution, configuration)
+    raw_files["paid_endpoint.json"] = (
+        _bytes(paid_result) + b"\n" if floating_exit
+        else _paid_bytes(paid_result, execution, configuration)
+    )
     raw_files["report.jsonl"] = _jsonl(_cast(list[object], report))
     reconciliation = _build_execution_reconciliation(attempt["run_id"], raw_files)
     if reconciliation["result"] != "OK":
         store.publish_paid_diagnostic(paid_result)
-        store.publish_failure("ENDPOINT_RECONCILIATION_FAILED", dict(
-            kind="RECONCILIATION", reason="ENDPOINT_RECONCILIATION_FAILED",
-        ))
+        store.publish_failure("ENDPOINT_RECONCILIATION_FAILED", None)
         return dict(outcome="FAILED", reason="ENDPOINT_RECONCILIATION_FAILED")
     if store.finalize(paid_result, reconciliation, report) != "COMPLETE_PUBLISHED":
         raise RuntimeError("INVALID_STORE_ACKNOWLEDGEMENT")
@@ -763,7 +850,7 @@ def _execute_paid(store, request, attempt, execution_input: bytes, result_state:
 
 def _invoke(
     output_root, run_id, selector, select, historical_input: bytes | None = None,
-    execution_input: bytes | None = None,
+    execution_input: bytes | None = None, floating_exit_input: bytes | None = None,
 ):
     try:
         _text(output_root)
@@ -774,19 +861,23 @@ def _invoke(
     except (ValueError, UnicodeError):
         raise ValueError("INVALID_INVOCATION") from None
     store = None
+    floating_invocation = selector == _FLOATING_SELECTOR or floating_exit_input is not None
     paid_invocation = selector == _PAID_SELECTOR or execution_input is not None
+    if floating_invocation and paid_invocation:
+        return dict(run_id=run_id, outcome="REJECTED", reason="UNSUPPORTED_CONFIGURATION",
+                    endpoint_status=None)
     paid_state: dict[str, _Any] = {}
 
     def response(outcome, reason):
         value = dict(run_id=run_id, outcome=outcome, reason=reason)
-        if paid_invocation:
+        if paid_invocation or floating_invocation:
             value["endpoint_status"] = (paid_state.get("paid_endpoint") or {}).get("status")
         return value
 
     def failed(error):
-        if paid_invocation and _paid_durability_unknown(error):
+        if (paid_invocation or floating_invocation) and _paid_durability_unknown(error):
             return response("DURABILITY_UNKNOWN", "PUBLICATION_DURABILITY_UNKNOWN")
-        if (paid_invocation and store is not None and paid_state.get("paid_endpoint") is not None
+        if ((paid_invocation or floating_invocation) and store is not None and paid_state.get("paid_endpoint") is not None
                 and error.reason != "PUBLICATION_DURABILITY_UNKNOWN"
                 and store._state in ("RUNNING", "FAILED")
                 and not (store._path / "paid_endpoint.json").exists()):
@@ -805,6 +896,16 @@ def _invoke(
     historical_attempt = None
     paid_request = None
     paid_attempt = None
+    floating_request = None
+    floating_attempt = None
+    if floating_invocation:
+        if (selector != _FLOATING_SELECTOR or historical_input is not None
+                or execution_input is not None or type(floating_exit_input) is not bytes):
+            return response("REJECTED", "UNSUPPORTED_CONFIGURATION")
+        try:
+            floating_request, _, floating_attempt = _floating_configuration(floating_exit_input, run_id)
+        except (OSError, ValueError, TypeError, KeyError, IndexError):
+            return response("REJECTED", "UNSUPPORTED_CONFIGURATION")
     if paid_invocation:
         if (selector != _PAID_SELECTOR or historical_input is not None
                 or type(execution_input) is not bytes):
@@ -829,6 +930,15 @@ def _invoke(
                 raise RuntimeError("INVALID_STORE_ACKNOWLEDGEMENT")
             result = _execute_paid(store, paid_request, paid_attempt, execution_input, paid_state)
             return response(result["outcome"], result["reason"])
+        if floating_request is not None:
+            assert floating_attempt is not None and floating_exit_input is not None
+            if store.register(floating_attempt, floating_exit_input=floating_exit_input) != "NATIVE_CONSTRUCTION_ALLOWED":
+                raise RuntimeError("INVALID_STORE_ACKNOWLEDGEMENT")
+            result = _execute_paid(
+                store, floating_request, floating_attempt, floating_exit_input,
+                paid_state, floating_exit=True,
+            )
+            return response(result["outcome"], result["reason"])
         if historical_run is not None:
             assert historical_attempt is not None
             if store.register(historical_attempt, historical_input=historical_input) != "NATIVE_CONSTRUCTION_ALLOWED":
@@ -852,7 +962,7 @@ def _invoke(
     except Exception as error:
         native = _wire._native_failure(error)
         reason = "NATIVE_FAULT" if native else "ENDPOINT_RECONCILIATION_FAILED" if isinstance(error, _ProjectionError) else "UNEXPECTED_EXCEPTION"
-        if (paid_invocation and store is not None and paid_state.get("paid_endpoint") is not None
+        if ((paid_invocation or floating_invocation) and store is not None and paid_state.get("paid_endpoint") is not None
                 and store._state in ("RUNNING", "FAILED")
                 and not (store._path / "paid_endpoint.json").exists()):
             try:
@@ -864,6 +974,10 @@ def _invoke(
                 store.publish_failure(reason, dict(kind="NATIVE", reason=native["reason"]) if native else None)
             except _StoreError as newer:
                 return failed(newer)
+        if floating_invocation:
+            if native is None and not isinstance(error, _ProjectionError):
+                _LOGGER.exception("floating-exit research invocation failed")
+            return response("FAILED", reason)
         if native or isinstance(error, _ProjectionError):
             return response("FAILED", reason)
         raise
@@ -872,10 +986,11 @@ def _invoke(
 def run_spider_scenario(
     output_root: str, run_id: str, scenario_selector: str,
     historical_input: bytes | None = None, *, execution_input: bytes | None = None,
+    floating_exit_input: bytes | None = None,
 ) -> dict[str, _Any]:
     """Run only a CLI-approved fixed recipe and admit its exact persisted output."""
     return _invoke(output_root, run_id, scenario_selector, _plans.cli_plan_bundle,
-                   historical_input, execution_input)
+                   historical_input, execution_input, floating_exit_input)
 
 
 def _run_o03(output_root: str, run_id: str, scenario_selector: str) -> dict[str, _Any]:
