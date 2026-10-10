@@ -139,6 +139,7 @@ class PaidEndpoint:
     rejected_exit_products: set[str] = field(default_factory=set)
     drain_started: bool = False
     exit_products: set[str] = field(default_factory=set)
+    product_operations: dict[str, dict[str, Any]] = field(default_factory=dict)
     last_owner_evidence: dict[str, Any] | None = None
     last_cutoff: int | None = None
 
@@ -160,6 +161,265 @@ class PaidEndpoint:
 
     def source_enabled(self, visible_at: int) -> bool:
         return type(visible_at) is int and visible_at < self.policy_end_ms * 16 + 6
+
+    def product_source_enabled(self, visible_at: int, product_id: str) -> bool:
+        return self.source_enabled(visible_at) and product_id not in self.exit_products
+
+    def request_product_exit(
+        self, composition: Any, product_id: object, reason: object,
+    ) -> dict[str, Any]:
+        if (composition._paid_endpoint is not self
+                or composition._historical_run is not self.request.historical_input):
+            raise ValueError("INVALID_EXECUTION_SCOPE")
+        if type(product_id) is not str or product_id not in composition._configured_product_ids:
+            raise ValueError("UNKNOWN_PRODUCT")
+        if type(reason) is not str or reason not in ("TP", "RISK"):
+            raise ValueError("INVALID_EXIT_REASON")
+        current_time = composition._current_time
+        if type(current_time) is not int:
+            raise ValueError("INVALID_EXIT_TIME")
+        previous = self.product_operations.get(product_id)
+        if previous is not None:
+            return self.product_exit_progress(composition, product_id)
+        run = composition._historical_run
+        if run is None:
+            raise ValueError("INVALID_EXECUTION_SCOPE")
+        start_at = run.range_start_ms * 16 + 6
+        policy_end = self.policy_end_ms * 16 + 6
+        if (
+            composition._terminal is not None
+            or composition._paid_native_terminal is not None
+            or self.drain_started
+            or not start_at <= current_time < policy_end
+        ):
+            raise ValueError("PRODUCT_EXIT_NOT_AVAILABLE")
+
+        self.product_operations[product_id] = dict(
+            product_id=product_id,
+            first_reason=reason,
+            requested_at=current_time,
+            status="EXITING",
+            completed_at=None,
+            positions=None,
+            working_orders=None,
+        )
+        self.exit_products.add(product_id)
+        composition._project_paid_source_rows(current_time)
+        self._advance_product_exit(composition, product_id)
+        return self.product_exit_progress(composition, product_id)
+
+    def product_exit_progress(self, composition: Any, product_id: str) -> dict[str, Any]:
+        operation = self.product_operations[product_id]
+        pending_actions = [
+            deepcopy(action) for action in self.actions
+            if action["product_id"] == product_id
+            and action["classification"] == "PENDING"
+        ]
+        status = operation["status"]
+        if status == "EXITING" and composition._current_time >= self.settlement_end_ms * 16 + 6:
+            status = "INCOMPLETE"
+        if composition._terminal is not None:
+            status = "FAILED"
+        elif composition._paid_native_terminal is not None:
+            status = composition._paid_native_terminal
+        return deepcopy(dict(
+            schema_version="spider_product_exit_progress_v1",
+            product_id=operation["product_id"],
+            reason=operation["first_reason"],
+            requested_at=operation["requested_at"],
+            status=status,
+            positions=operation["positions"],
+            working_orders=operation["working_orders"],
+            pending_actions=pending_actions,
+            pending_sends=operation.get("pending_sends", []),
+            pending_deliveries=operation.get("pending_deliveries", []),
+            completed_at=operation["completed_at"],
+        ))
+
+    def _advance_product_exit(self, composition: Any, product_id: str) -> None:
+        operation = self.product_operations[product_id]
+        if composition._terminal is not None:
+            operation["status"] = "FAILED"
+            return
+
+        popped = composition._last_popped
+        capture_key = (composition._current_time, tuple(popped) if popped is not None else None)
+        if capture_key != operation.get("position_capture_key"):
+            operation["positions"] = self._capture_product_position(composition, product_id)
+            operation["position_capture_key"] = capture_key
+
+        orders = composition._codec.historical_working_orders()
+        operation["working_orders"] = [
+            deepcopy(order) for order in orders if order["product_id"] == product_id
+        ]
+        dependencies = tuple(composition._historical_send_dependencies.values())
+        pending_sends = [
+            dependency for dependency in dependencies
+            if dependency["product_id"] == product_id and dependency["state"] == "PENDING"
+        ]
+        operation["pending_sends"] = [deepcopy(dependency) for dependency in pending_sends]
+        queued_source_cancels = self._queued_source_cancel_order_ids(composition, product_id)
+        pending_cancel_orders = {
+            order_id for order_id in composition._paid_cancel_pending_orders
+            if self._order_product(composition, order_id) == product_id
+        }
+        pending_cancel_orders.update(queued_source_cancels)
+        pending_deliveries = self._product_pending_deliveries(composition, product_id)
+        operation["pending_deliveries"] = pending_deliveries
+        if composition._paid_native_terminal is not None:
+            operation["status"] = composition._paid_native_terminal
+            return
+        if operation["status"] in ("EXITED", "INCOMPLETE"):
+            return
+        if product_id in self.rejected_exit_products:
+            operation["status"] = "INCOMPLETE"
+            return
+        cancel_items = [
+            (self._cancel_group(composition, order), None)
+            for order in orders
+            if order["product_id"] == product_id
+            and self._grid_order(composition, order)
+            and order["order_id"] not in composition._paid_cancel_attempted_orders
+            and order["order_id"] not in queued_source_cancels
+        ]
+        if cancel_items:
+            composition._admit_set(cancel_items)
+            return
+
+        if pending_sends or pending_cancel_orders or pending_deliveries:
+            return
+
+        positions = operation["positions"]
+
+        working_exits = [
+            order for order in operation["working_orders"]
+            if self.roles_by_order.get(order["order_id"]) == "EXIT"
+        ]
+        quantity = positions[0]["position_contracts"] if positions else D(0)
+        if quantity == 0:
+            if not operation["working_orders"] and not [
+                action for action in self.actions
+                if action["product_id"] == product_id and action["classification"] == "PENDING"
+            ]:
+                operation["status"] = "EXITED"
+                operation["completed_at"] = composition._current_time
+            return
+        if working_exits:
+            return
+        if composition._current_time >= self.settlement_end_ms * 16 + 6:
+            operation["status"] = "INCOMPLETE"
+            return
+        if type(quantity) is not D or not quantity.is_finite():
+            raise ValueError("INVALID_SCHEMA")
+        composition._admit_set([(self._exit_group(composition, product_id, quantity), None)])
+
+    def _capture_product_position(
+        self, composition: Any, product_id: str,
+    ) -> list[dict[str, Any]]:
+        request = composition._paid_snapshot_request(
+            "POSITIONS", composition._current_time,
+            self._product_progress_snapshot_prefix(composition, product_id),
+        )
+        fact = composition._codec.capture_snapshot(request)
+        payload = fact.get("immutable_payload")
+        if not isinstance(payload, dict) or payload.get("outcome") != "SUCCESS":
+            raise ValueError("POSITION_SNAPSHOT_FAILED")
+        rows = payload.get("rows")
+        if not isinstance(rows, list):
+            raise ValueError("INVALID_SCHEMA")
+        positions = [deepcopy(row) for row in rows if row.get("product_id") == product_id]
+        if len(positions) > 1:
+            raise ValueError("POSITION_SNAPSHOT_FAILED")
+        return positions
+
+    def _product_progress_snapshot_prefix(self, composition: Any, product_id: str) -> str:
+        popped = composition._last_popped
+        suffix = (
+            f"{composition._current_time}_{popped[2]}_{popped[3]}"
+            if popped is not None else f"{composition._current_time}_INITIAL"
+        )
+        product_hash = sha256(product_id.encode("utf-8")).hexdigest()[:12]
+        return f"PAID_PRODUCT_{self.contract_hash[:12]}_{product_hash}_{suffix}"
+
+    def _order_product(self, composition: Any, order_id: str) -> str | None:
+        for action in self.actions:
+            if action["role"] == "DRAIN_CANCEL" and action["order_id"] == order_id:
+                return action["product_id"]
+        for order in composition._codec.historical_working_orders():
+            if order["order_id"] == order_id:
+                return order["product_id"]
+        return None
+
+    def _queued_source_cancel_order_ids(
+        self, composition: Any, product_id: str,
+    ) -> set[str]:
+        pending: set[str] = set()
+        for spec in composition._historical_cancel_effects.values():
+            if spec["product_id"] != product_id:
+                continue
+            target = spec["target_order_id"]
+            if (target in self.roles_by_order
+                    or any(order["order_id"] == target
+                           for order in composition._codec.historical_working_orders())):
+                pending.add(target)
+                continue
+            dependency = composition._historical_send_by_client.get(target)
+            binding = dependency.get("binding") if isinstance(dependency, dict) else None
+            if isinstance(binding, dict) and binding.get("product_id") == product_id:
+                pending.add(binding["order_id"])
+            elif isinstance(dependency, dict) and dependency.get("product_id") == product_id:
+                pending.add(target)
+        return pending
+
+    def _delivery_product(
+        self, composition: Any, delivery_id: str,
+    ) -> str | None:
+        cancel_action = self.cancel_ack_action_by_delivery.get(delivery_id)
+        if cancel_action is not None:
+            return cancel_action["product_id"]
+        for record in composition._records.values():
+            if record["item"].get("kind") != "DELIVERY":
+                continue
+            delivery = record["item"]["delivery"]
+            if delivery["delivery_id"] != delivery_id:
+                continue
+            payload = delivery.get("immutable_payload")
+            if isinstance(payload, dict):
+                product_id = payload.get("product_id")
+                return product_id if isinstance(product_id, str) else None
+        return None
+
+    def _product_pending_deliveries(
+        self, composition: Any, product_id: str,
+    ) -> list[dict[str, Any]]:
+        pending = []
+        for delivery_id in sorted(self.pending_delivery_ids):
+            cancel_action = self.cancel_ack_action_by_delivery.get(delivery_id)
+            if cancel_action is not None:
+                matches = cancel_action["product_id"] == product_id
+                delivery = None
+            else:
+                delivery = next(
+                    (
+                        record["item"].get("delivery")
+                        for record in composition._records.values()
+                        if record["item"].get("kind") == "DELIVERY"
+                        and record["item"]["delivery"]["delivery_id"] == delivery_id
+                    ),
+                    None,
+                )
+                matches = (
+                    isinstance(delivery, dict)
+                    and isinstance(delivery.get("immutable_payload"), dict)
+                    and delivery["immutable_payload"].get("product_id") == product_id
+                )
+            if matches:
+                pending.append(dict(
+                    delivery_id=delivery_id,
+                    role=self.delivery_roles.get(delivery_id),
+                    cancel_action_id=(cancel_action["action_id"] if cancel_action is not None else None),
+                ))
+        return pending
 
     def new_action(
         self, *, role: str, product_id: str, effective_at: int,
@@ -204,37 +464,55 @@ class PaidEndpoint:
         # A send accepted after the cutoff remains a native obligation. Wait for
         # its original effective event and binding rather than dropping it.
         if any(dep["state"] == "PENDING"
+               and dep["product_id"] not in self.exit_products
                for dep in composition._historical_send_dependencies.values()):
             return
         orders = composition._codec.historical_working_orders()
         items = [(self._cancel_group(composition, order), None) for order in orders
                  if self._grid_order(composition, order)
+                 and order["product_id"] not in self.exit_products
                  and order["order_id"] not in composition._paid_cancel_attempted_orders]
         if items:
             composition._admit_set(items)
 
     def progress(self, composition: Any, cause: str) -> None:
-        if (not self.drain_started or composition._paid_native_terminal is not None
+        if (composition._terminal is not None
                 or cause not in ("SOURCE_GROUP", "DELIVERY", "HISTORICAL_MARKET_STEP", "PAID_ENDPOINT_DRAIN")):
+            return
+        for product_id in self.product_operations:
+            self._advance_product_exit(composition, product_id)
+        if composition._paid_native_terminal is not None:
+            return
+        if not self.drain_started:
             return
         if self.has_unbound_cancel():
             return
         if any(dep["state"] == "PENDING"
+               and dep["product_id"] not in self.exit_products
                for dep in composition._historical_send_dependencies.values()):
             return
         orders = composition._codec.historical_working_orders()
-        if not composition._paid_cancel_pending_orders and not self.pending_delivery_ids:
+        pending_cancel_orders = {
+            order_id for order_id in composition._paid_cancel_pending_orders
+            if self._order_product(composition, order_id) not in self.exit_products
+        }
+        pending_deliveries = {
+            delivery_id for delivery_id in self.pending_delivery_ids
+            if self._delivery_product(composition, delivery_id) not in self.exit_products
+        }
+        if not pending_cancel_orders and not pending_deliveries:
             cancel_items = []
             for order in orders:
                 if order["order_id"] not in self.roles_by_order:
                     raise ValueError("DEPENDENCY_BINDING_CONFLICT")
                 if (self._grid_order(composition, order)
+                        and order["product_id"] not in self.exit_products
                         and order["order_id"] not in composition._paid_cancel_attempted_orders):
                     cancel_items.append((self._cancel_group(composition, order), None))
             if cancel_items:
                 composition._admit_set(cancel_items)
                 return
-        if composition._paid_cancel_pending_orders or self.pending_delivery_ids:
+        if pending_cancel_orders or pending_deliveries:
             return
         request = composition._paid_snapshot_request(
             "POSITIONS", composition._current_time,
@@ -256,7 +534,8 @@ class PaidEndpoint:
             quantity, product_id = position["position_contracts"], position["product_id"]
             if type(quantity) is not D or not quantity.is_finite():
                 raise ValueError("INVALID_SCHEMA")
-            if quantity == 0 or product_id in exits_working or product_id in self.rejected_exit_products:
+            if (quantity == 0 or product_id in self.exit_products
+                    or product_id in exits_working or product_id in self.rejected_exit_products):
                 continue
             exit_items.append((self._exit_group(composition, product_id, quantity), None))
         if exit_items:

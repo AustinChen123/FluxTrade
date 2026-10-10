@@ -550,11 +550,22 @@ class _ReplayComposition:
         return ("SOURCE_GROUP", "SNAPSHOT_CAPTURE", "DELIVERY", "HISTORICAL_MARKET_STEP",
                 "HISTORICAL_MARKET_CACHE", "HISTORICAL_TIMER", "PAID_ENDPOINT_DRAIN")[queue_class]
 
-    def _paid_source_control_enabled(self, visible_at: int) -> bool:
+    def _paid_source_control_enabled(self, visible_at: int, product_id: str | None = None) -> bool:
         paid = self._paid_endpoint
-        return paid is None or (
-            self._paid_native_terminal is None and paid.source_enabled(visible_at)
-        )
+        if paid is None:
+            return True
+        if self._paid_native_terminal is not None or not paid.source_enabled(visible_at):
+            return False
+        if product_id is None:
+            return True
+        return paid.product_source_enabled(visible_at, product_id)
+
+    def _project_paid_source_rows(self, visible_at: int) -> None:
+        if self._paid_endpoint is None:
+            return
+        for row in self._policy.rows:
+            if not self._paid_source_control_enabled(visible_at, row["name"]):
+                row["active"] = "false"
 
     def _paid_snapshot_request(self, kind: str, cutoff: int, prefix: str) -> dict[str, Any]:
         return dict(
@@ -986,6 +997,19 @@ class _ReplayComposition:
                 child_ordinal += 1
                 dependency: dict[str, Any] | None = None
                 target_order_id: str | None = None
+                product_id = order.get("instId")
+                if self._paid_endpoint is not None:
+                    configured_products = self._configured_product_ids
+                    if (type(product_id) is not str
+                            or configured_products is None
+                            or product_id not in configured_products):
+                        raise _ScheduleError("INVALID_SCHEMA")
+                if (self._paid_endpoint is not None
+                        and not self._paid_source_control_enabled(visible, product_id)):
+                    audit_events[event_index]["actions"][order_index]["status"] = (
+                        "SUPPRESSED_PRODUCT_EXIT"
+                    )
+                    continue
                 acceptance_raw = parent_raw + delay
                 if acceptance_raw >= end:
                     if self._historical_run is not None:
@@ -1655,6 +1679,7 @@ class _ReplayComposition:
             if self._historical_poll_range is not None and source_enabled:
                 policy.now_ms = (cast(int, delivery["visible_at"]) - 6) // 16
             if source_enabled:
+                self._project_paid_source_rows(cast(int, delivery["visible_at"]))
                 self._apply_payload(delivery)
             if source_enabled and record.index == len(record.stages) - 1:
                 policy.raise_leverage()
@@ -1677,11 +1702,15 @@ class _ReplayComposition:
         return _PollResult(deepcopy(record.observation), next_stage=deepcopy(next_stage))
 
     def _capture_callback(self, delivery: wire.Delivery) -> _CallbackPrefix:
+        if (self._paid_endpoint is not None
+                and self._paid_endpoint.delivery_roles.get(delivery["delivery_id"]) == "EXIT"):
+            return _CallbackPrefix((), None)
         if not self._paid_source_control_enabled(cast(int, delivery["visible_at"])):
             return _CallbackPrefix((), None)
         start = len(self._policy.events)
         error = None
         try:
+            self._project_paid_source_rows(cast(int, delivery["visible_at"]))
             self._apply_payload(delivery)
         except Exception as exc:
             error = exc
