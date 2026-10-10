@@ -19,15 +19,22 @@ from src.core.backtest.spider_floating_exit_input import (
     decode_spider_floating_exit_input,
     validate_spider_floating_exit_input,
 )
+from src.core.backtest.spider_gross_execution_input import (
+    decode_spider_gross_execution_input,
+    validate_spider_gross_execution_input,
+)
+from src.core.backtest import spider_gross_artifact_schema as gross_schema
 from src.core.backtest.spider_run_artifacts import (
     ConfigurationContext,
     ExecutionContext,
     FloatingExitContext,
+    GrossExecutionContext,
     HistoricalContext,
     _HASH_NAMES,
     _P3_COVERAGE_KINDS,
     _attempt,
     _boundary,
+    decode_canonical,
     _enum,
     _integer,
     _list,
@@ -39,6 +46,7 @@ from src.core.backtest.spider_run_artifacts import (
     encode_jsonl,
     execution_context as validate_execution_context,
     floating_exit_context as validate_floating_exit_context,
+    gross_execution_context as validate_gross_execution_context,
     historical_context,
     _status,
 )
@@ -92,6 +100,21 @@ _FLOATING_COMPLETION_ARTIFACTS = tuple(
 )
 _FLOATING_CONTRACT = "SPIDER_FLOATING_EXIT_RESEARCH_RUN_V1"
 _FLOATING_TERMINAL = "PAID_CLOSE_RESEARCH_V1"
+_GROSS_CONTRACT = "SPIDER_GROSS_PROTECTED_RESEARCH_RUN_V1"
+_GROSS_SCHEMA = {
+    "attempt.json": "spider_gross_execution_attempt_v1",
+    "status.json": "spider_gross_execution_status_v1",
+    "journal.jsonl": "spider_gross_execution_journal_record_v1",
+    "execution_input.json": "spider_gross_execution_input_v1",
+    "paid_endpoint.json": "spider_gross_paid_endpoint_result_v1",
+    "report.jsonl": "spider_gross_execution_report_v1",
+    "reconciliation.json": "spider_gross_execution_reconciliation_v1",
+    "completion.json": "spider_gross_execution_completion_v1",
+}
+_GROSS_COMPLETION_ARTIFACTS = tuple(
+    (name, schema, None if name == "journal.jsonl" else 1)
+    for name, schema in _GROSS_SCHEMA.items() if name != "completion.json"
+)
 
 
 def _context_pair(row: dict[str, object]) -> tuple[ConfigurationContext, HistoricalContext]:
@@ -136,8 +159,45 @@ def floating_exit_context_from_input(raw: bytes) -> dict[str, object]:
     )
 
 
-def _required_context(value: object | None) -> ExecutionContext | FloatingExitContext:
+def gross_execution_context_from_input(raw: bytes) -> dict[str, object]:
+    """Validate wrapper bytes and derive its full closed gross context."""
+    value = decode_spider_gross_execution_input(raw)
+    gross_hash = validate_spider_gross_execution_input(value)
+    base_hash = validate_spider_execution_input(value.execution_input)
+    run = value.execution_input
+    return dict(
+        schema_version="spider_gross_execution_context_v1",
+        policy_id=value.policy_id,
+        native_profile_id=value.native_profile_id,
+        admission_policy_id=value.admission_policy_id,
+        response_policy_id=value.response_policy_id,
+        response_parameters=dict(
+            trigger_cap=str(value.response_parameters.trigger_cap),
+            target_cap=str(value.response_parameters.target_cap),
+            allocation=value.response_parameters.allocation,
+            quantity_rounding=value.response_parameters.quantity_rounding,
+        ),
+        authorization_scope=dict(
+            kind="RUN_STRATEGY_OWNED_LOTS_AND_ORDERS_V1",
+            strategy_id=value.authorization_scope.strategy_id,
+            ordered_products=list(value.authorization_scope.ordered_products),
+        ),
+        model_id=None,
+        endpoint_policy_id=run.endpoint_policy_id,
+        execution_input_sha256=gross_hash,
+        base_execution_input_sha256=base_hash,
+        policy_end_ms=run.policy_end_ms,
+        settlement_end_ms=run.historical_input.range_end_ms,
+        generation=run.generation,
+    )
+
+
+def _required_context(value: object | None) -> ExecutionContext | FloatingExitContext | GrossExecutionContext:
     _require(value is not None)
+    if type(value) is GrossExecutionContext or (
+        type(value) is dict and value.get("schema_version") == "spider_gross_execution_context_v1"
+    ):
+        return validate_gross_execution_context(value)
     if type(value) is FloatingExitContext or (
         type(value) is dict
         and cast(dict[str, object], value).get("schema_version") == "spider_floating_exit_context_v1"
@@ -146,10 +206,8 @@ def _required_context(value: object | None) -> ExecutionContext | FloatingExitCo
     return validate_execution_context(value)
 
 
-def _embedded_execution(row: dict[str, object], expected: ExecutionContext | FloatingExitContext) -> None:
-    embedded = (validate_floating_exit_context(row["execution_context"])
-                if type(expected) is FloatingExitContext
-                else validate_execution_context(row["execution_context"]))
+def _embedded_execution(row: dict[str, object], expected: ExecutionContext | FloatingExitContext | GrossExecutionContext) -> None:
+    embedded = (_required_context(row["execution_context"]))
     _require(embedded == expected)
 
 
@@ -172,6 +230,22 @@ def _paid_attempt(value: object, expected: ExecutionContext | FloatingExitContex
              else row["terminal_policy"] == "PAID_CLOSE_RESEARCH_V1")
 
 
+def _gross_attempt(value: object, expected: GrossExecutionContext | None) -> None:
+    _require(type(value) is dict)
+    row = cast(dict[str, object], value)
+    _attempt(row, gross_execution=True)
+    _require(row["schema_version"] == _GROSS_SCHEMA["attempt.json"])
+    _text(row["run_id"], r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
+    embedded = validate_gross_execution_context(row["execution_context"])
+    _require(expected is None or embedded == expected)
+    _require(row["run_contract_id"] == _GROSS_CONTRACT
+             and row["requested_scenario_selector"] == _GROSS_CONTRACT
+             and row["scenario_plan_id"] == _GROSS_CONTRACT
+             and row["scenario_plan_sha256"] == embedded.execution_input_sha256
+             and row["profile_id"] == embedded.native_profile_id
+             and row["terminal_policy"] == "PAID_CLOSE_RESEARCH_V1")
+
+
 def _paid_status(value: object, expected: ExecutionContext | FloatingExitContext | None,
                  *, floating_exit: bool = False) -> None:
     _require(type(value) is dict)
@@ -189,13 +263,27 @@ def _paid_status(value: object, expected: ExecutionContext | FloatingExitContext
     historical_context(row["historical_context"])
 
 
-def _paid_journal(value: object, execution: ExecutionContext | FloatingExitContext,
+def _gross_status(value: object, expected: GrossExecutionContext | None) -> None:
+    _require(type(value) is dict)
+    row = cast(dict[str, object], value)
+    _status(row, gross_execution=True)
+    _require(row["schema_version"] == _GROSS_SCHEMA["status.json"])
+    _text(row["run_id"], r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
+    embedded = validate_gross_execution_context(row["execution_context"])
+    _require(expected is None or embedded == expected)
+    _require("configuration_context" in row and "historical_context" in row)
+    configuration_context(row["configuration_context"])
+    historical_context(row["historical_context"])
+
+
+def _paid_journal(value: object, execution: ExecutionContext | FloatingExitContext | GrossExecutionContext,
                   context: ConfigurationContext, historical: HistoricalContext) -> None:
     rows = _list(value)
     envelope.journal(rows, execution=execution)
     for item in rows:
         row = cast(dict[str, object], item)
-        schema = _FLOATING_SCHEMA if isinstance(execution, FloatingExitContext) else _SCHEMA
+        schema = (_GROSS_SCHEMA if isinstance(execution, GrossExecutionContext)
+                  else _FLOATING_SCHEMA if isinstance(execution, FloatingExitContext) else _SCHEMA)
         _require(row["schema_version"] == schema["journal.jsonl"])
         _embedded_execution(row, execution)
         _require("configuration_context" in row and "historical_context" in row)
@@ -221,18 +309,18 @@ def _failure(value: object, *, context: ConfigurationContext | None = None) -> N
         _text(failure["reason"])
 
 
-def _paid_failure(value: object, *, context: ConfigurationContext) -> None:
+def _paid_failure(value: object, *, context: ConfigurationContext, gross_profile: bool = False) -> None:
     row = _object(value, "primary evidence_error inspection inspection_error observed_at")
     _failure(row["primary"], context=context)
     for key in ("evidence_error", "inspection_error"):
         if row[key] is not None:
             _failure(row[key], context=context)
     if row["inspection"] is not None:
-        native.inspection(row["inspection"], context=context)
+        native.inspection(row["inspection"], context=context, gross_profile=gross_profile)
     _integer(row["observed_at"])
 
 
-def _actions(value: object, *, context: ConfigurationContext) -> None:
+def _actions(value: object, *, context: ConfigurationContext, gross_execution: bool = False) -> None:
     identities: list[str] = []
     for item in _list(value):
         row = _object(item, "action_id parent_action_id role product_id order_id group_id effective_at classification result")
@@ -240,7 +328,8 @@ def _actions(value: object, *, context: ConfigurationContext) -> None:
         identities.append(action_id)
         if row["parent_action_id"] is not None:
             _text(row["parent_action_id"])
-        role = _enum(row["role"], _ACTIONS)
+        allowed_roles = _ACTIONS + (("GROSS_CANCEL", "GROSS_REDUCTION") if gross_execution else ())
+        role = _enum(row["role"], allowed_roles)
         _enum(row["product_id"], context.products)
         if row["order_id"] is not None:
             _text(row["order_id"])
@@ -280,12 +369,13 @@ def _delivery_key(value: object) -> tuple[int, int, int, str]:
     return _key(value)
 
 
-def _paid_observation(value: object, execution: ExecutionContext | FloatingExitContext, context: ConfigurationContext) -> None:
+def _paid_observation(value: object, execution: ExecutionContext | FloatingExitContext | GrossExecutionContext, context: ConfigurationContext) -> None:
     row = _object(
         value,
         "schema_version run_contract_sha256 observed_at current_evidence_complete native_terminal send_dependencies order_roles pending_cancel_order_ids pending_source_groups pending_paid_deliveries terminal_fact",
     )
-    _enum(row["schema_version"], ["spider_paid_observation_v1"])
+    _enum(row["schema_version"], ["spider_gross_paid_observation_v1" if isinstance(execution, GrossExecutionContext)
+                                   else "spider_paid_observation_v1"])
     _require(_text(row["run_contract_sha256"], r"[0-9a-f]{64}") == execution.execution_input_sha256)
     _integer(row["observed_at"])
     _require(type(row["current_evidence_complete"]) is bool)
@@ -294,6 +384,8 @@ def _paid_observation(value: object, execution: ExecutionContext | FloatingExitC
     dependencies: list[str] = []
     clients: set[str] = set()
     orders: set[str] = set()
+    observation_roles = _ROLES + (("GROSS_CANCEL", "GROSS_REDUCTION")
+                                  if isinstance(execution, GrossExecutionContext) else ())
     for item in _list(row["send_dependencies"]):
         dep = _object(item, "client_order_id product_id strategy_id group_id event_id state binding role")
         client = _text(dep["client_order_id"])
@@ -304,7 +396,8 @@ def _paid_observation(value: object, execution: ExecutionContext | FloatingExitC
         _text(dep["strategy_id"])
         _text(dep["event_id"])
         _enum(dep["state"], ["PENDING", "COMMITTED", "REJECTED"])
-        _enum(dep["role"], _ROLES)
+        send_roles = _ROLES + (("GROSS_CANCEL", "GROSS_REDUCTION") if isinstance(execution, GrossExecutionContext) else ())
+        _enum(dep["role"], send_roles)
         binding = dep["binding"]
         if dep["state"] == "COMMITTED":
             bind = _object(binding, "client_order_id order_id product_id strategy_id")
@@ -319,7 +412,8 @@ def _paid_observation(value: object, execution: ExecutionContext | FloatingExitC
     role_rows: list[tuple[str, str]] = []
     for item in _list(row["order_roles"]):
         role = _object(item, "order_id role")
-        role_rows.append((_text(role["order_id"]), _enum(role["role"], _ROLES)))
+        delivery_roles = _ROLES + (("GROSS_CANCEL", "GROSS_REDUCTION") if isinstance(execution, GrossExecutionContext) else ())
+        role_rows.append((_text(role["order_id"]), _enum(role["role"], delivery_roles)))
     _require(role_rows == sorted(set(role_rows)))
     cancel_ids = [_text(item) for item in _list(row["pending_cancel_order_ids"])]
     _require(cancel_ids == sorted(set(cancel_ids)))
@@ -339,7 +433,7 @@ def _paid_observation(value: object, execution: ExecutionContext | FloatingExitC
         delivery_keys.append(key)
         native.delivery(pending["delivery"], context=context)
         if pending["role"] is not None:
-            _enum(pending["role"], _ROLES)
+            _enum(pending["role"], observation_roles)
         if pending["cancel_action_id"] is not None:
             _text(pending["cancel_action_id"])
             delivery = cast(dict[str, object], pending["delivery"])
@@ -362,7 +456,7 @@ def _paid_observation(value: object, execution: ExecutionContext | FloatingExitC
             native.group_result(terminal["group_result"])
         _failure(terminal["failure"], context=context)
         if terminal["role"] is not None:
-            _enum(terminal["role"], _ROLES)
+            _enum(terminal["role"], observation_roles)
         if terminal["cancel_action_id"] is not None:
             _text(terminal["cancel_action_id"])
         if terminal["cancel_action_id"] is not None:
@@ -371,9 +465,11 @@ def _paid_observation(value: object, execution: ExecutionContext | FloatingExitC
             _require(delivery["payload_kind"] == "TRANSPORT_ACK")
 
 
-def _paid_endpoint(value: object, execution: ExecutionContext | FloatingExitContext, context: ConfigurationContext) -> None:
+def _paid_endpoint(value: object, execution: ExecutionContext | FloatingExitContext | GrossExecutionContext, context: ConfigurationContext) -> None:
     row = _object(value, "schema_version run_contract_sha256 policy_end_ms settlement_end_ms generation status owner_evidence actions pending_obligations reasons failure")
-    _enum(row["schema_version"], [_SCHEMA["paid_endpoint.json"]])
+    artifact_schema = (_GROSS_SCHEMA if isinstance(execution, GrossExecutionContext) else
+                       _FLOATING_SCHEMA if isinstance(execution, FloatingExitContext) else _SCHEMA)
+    _enum(row["schema_version"], [artifact_schema["paid_endpoint.json"]])
     _require(_text(row["run_contract_sha256"], r"[0-9a-f]{64}") == execution.execution_input_sha256)
     _require(_integer(row["policy_end_ms"]) == execution.policy_end_ms)
     _require(_integer(row["settlement_end_ms"]) == execution.settlement_end_ms)
@@ -381,10 +477,12 @@ def _paid_endpoint(value: object, execution: ExecutionContext | FloatingExitCont
     status = _enum(row["status"], _RESULT_STATUSES)
     owner = row["owner_evidence"]
     if owner is not None:
-        envelope.owner_evidence(owner, context=context)
+        envelope.owner_evidence(owner, context=context,
+                                gross_profile=isinstance(execution, GrossExecutionContext))
     else:
         _require(status == "FAILED")
-    _actions(row["actions"], context=context)
+    _actions(row["actions"], context=context,
+             gross_execution=isinstance(execution, GrossExecutionContext))
     obligations = _object(row["pending_obligations"], "positions working_orders pending_actions pending_deliveries pending_polls")
     if obligations["positions"] is not None:
         _position_rows(obligations["positions"], context=context)
@@ -408,7 +506,8 @@ def _paid_endpoint(value: object, execution: ExecutionContext | FloatingExitCont
     reasons = [_enum(item, _REASONS) for item in _list(row["reasons"])]
     _require(reasons == sorted(set(reasons), key=_REASONS.index))
     if status == "FAILED":
-        _paid_failure(row["failure"], context=context)
+        _paid_failure(row["failure"], context=context,
+                      gross_profile=isinstance(execution, GrossExecutionContext))
     else:
         _require(row["failure"] is None and owner is not None)
 
@@ -567,6 +666,17 @@ def validate_execution_artifact(
     `execution_context` is required for all artifacts except execution_input.json
     and is validated before it can authorize the native market hash.
     """
+    gross_execution = (
+        execution_context is not None
+        and (type(execution_context) is GrossExecutionContext
+             or (type(execution_context) is dict
+                 and execution_context.get("schema_version") == "spider_gross_execution_context_v1"))
+    )
+    if filename == "execution_input.json" and execution_context is None:
+        decoded_input = decode_canonical(raw) if type(raw) is bytes else None
+        gross_execution = (type(decoded_input) is dict
+                           and cast(dict[str, object], decoded_input).get("schema_version")
+                           == "spider_gross_execution_input_v1")
     floating_exit = (
         execution_context is not None
         and (
@@ -575,10 +685,17 @@ def validate_execution_artifact(
                 and execution_context.get("schema_version") == "spider_floating_exit_context_v1")
         )
     )
-    _enum(filename, tuple(_FLOATING_SCHEMA) if floating_exit else _FAMILY_FILES)
+    family_schema = (_GROSS_SCHEMA if gross_execution else
+                     _FLOATING_SCHEMA if floating_exit else _SCHEMA)
+    _enum(filename, tuple(family_schema) if gross_execution or floating_exit else _FAMILY_FILES)
     _require(type(raw) is bytes)
     if filename == "execution_input.json":
-        if floating_exit:
+        if gross_execution:
+            value = decode_spider_gross_execution_input(raw)
+            expected = validate_gross_execution_context(execution_context) if execution_context is not None else None
+            expected_context = gross_execution_context_from_input(raw)
+            _require(expected is None or expected == validate_gross_execution_context(expected_context))
+        elif floating_exit:
             value = decode_spider_floating_exit_input(raw)
             expected = validate_floating_exit_context(execution_context) if execution_context is not None else None
             expected_context = floating_exit_context_from_input(raw)
@@ -604,10 +721,14 @@ def validate_execution_artifact(
         value = decode_jsonl(raw)
     else:
         raise ValueError("INVALID_ARTIFACT")
-    if filename == "attempt.json":
-        _paid_attempt(value, expected, floating_exit=floating_exit)
+    if filename == "attempt.json" and gross_execution:
+        _gross_attempt(value, cast(GrossExecutionContext, expected))
+    elif filename == "status.json" and gross_execution:
+        _gross_status(value, cast(GrossExecutionContext, expected))
+    elif filename == "attempt.json":
+        _paid_attempt(value, cast(ExecutionContext | FloatingExitContext, expected), floating_exit=floating_exit)
     elif filename == "status.json":
-        _paid_status(value, expected, floating_exit=floating_exit)
+        _paid_status(value, cast(ExecutionContext | FloatingExitContext, expected), floating_exit=floating_exit)
     elif filename == "journal.jsonl":
         _require(configuration is not None and historical is not None)
         _paid_journal(value, expected, configuration_context(configuration), historical_context(historical))
@@ -618,14 +739,56 @@ def validate_execution_artifact(
         rows = _list(value)
         _require(len(rows) == 1)
         _require(configuration is not None)
-        _report(rows[0], expected, configuration_context(configuration), floating_exit=floating_exit)
+        if gross_execution:
+            gross_schema.execution_report(
+                rows[0], execution=cast(GrossExecutionContext, expected),
+                configuration=configuration_context(configuration),
+            )
+            report_row = cast(dict[str, object], rows[0])
+            _paid_observation(report_row["paid_observation"], expected,
+                              configuration_context(configuration))
+            _paid_endpoint(report_row["paid_endpoint"], expected,
+                           configuration_context(configuration))
+        else:
+            _report(rows[0], cast(ExecutionContext | FloatingExitContext, expected),
+                    configuration_context(configuration), floating_exit=floating_exit)
     elif filename == "reconciliation.json":
         row = cast(dict[str, object], value)
-        _reconciliation(row, cast(str, row.get("run_id")), journal_rows, floating_exit=floating_exit)
+        if gross_execution:
+            gross_schema.reconciliation(
+                row, cast(str, row.get("run_id")), journal_rows=journal_rows,
+                validate_refs=_refs,
+            )
+        else:
+            _reconciliation(row, cast(str, row.get("run_id")), journal_rows, floating_exit=floating_exit)
     else:
         row = cast(dict[str, object], value)
-        _completion(row, expected, cast(str, row.get("run_id")), floating_exit=floating_exit)
+        if gross_execution:
+            gross_schema.completion(row, execution=cast(GrossExecutionContext, expected),
+                                    run_id=cast(str, row.get("run_id")),
+                                    artifact_schemas=_GROSS_COMPLETION_ARTIFACTS)
+        else:
+            _completion(row, cast(ExecutionContext | FloatingExitContext, expected),
+                        cast(str, row.get("run_id")), floating_exit=floating_exit)
     return value
+
+
+def validate_gross_paid_endpoint(value: object, execution: object, context: object) -> None:
+    _paid_endpoint(value, validate_gross_execution_context(execution), configuration_context(context))
+
+
+def validate_gross_report(value: object, execution: object, context: object) -> None:
+    validate_execution_artifact(
+        "report.jsonl", encode_jsonl([value]), execution_context=execution,
+        configuration=context,
+    )
+
+
+def canonical_gross_paid_bytes(value: object, execution: object, context: object) -> bytes:
+    raw = encode_jsonl([cast(object, value)])
+    row = decode_jsonl(raw)[0]
+    validate_gross_paid_endpoint(row, execution, context)
+    return raw
 
 
 def validate_paid_endpoint(value: object, execution: object, context: object) -> None:

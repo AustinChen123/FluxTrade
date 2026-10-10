@@ -62,12 +62,15 @@ def _profile_config_identity(
     context: ConfigurationContext | None,
     *,
     p1_config_id: str | None = None,
+    gross_profile: bool = False,
 ) -> bool:
     profile = _text(profile_id)
     config = _text(config_id)
     context = _context(context)
     if context is not None:
-        return profile == _CONFIGURED_PROFILE and config == context.config_id
+        allowed = ("SYNTHETIC_CONFIGURED_GROSS_ADMISSION_V1" if gross_profile
+                   else _CONFIGURED_PROFILE)
+        return profile == allowed and config == context.config_id
     return profile in _PROFILES and (p1_config_id is None or config == p1_config_id)
 
 
@@ -306,12 +309,14 @@ def delivery(value: object, *, context: ConfigurationContext | None = None) -> N
         snapshot_payload(row["immutable_payload"], native_kind, context=context)
 
 
-def inspection(value: object, *, context: ConfigurationContext | None = None) -> None:
+def inspection(value: object, *, context: ConfigurationContext | None = None,
+               gross_profile: bool = False) -> None:
     context = _context(context)
     row = _object(value, "schema_version account_key profile_id config_id account_version valuation_context_id gate lifecycle cash gross_realized total_fees positions_digest orders_digest reservations_digest owner_state_digest", "gate_failure")
     _enum(row["schema_version"], ["inspect_state_v1"])
     account(row["account_key"])
-    _require(_profile_config_identity(row["profile_id"], row["config_id"], context))
+    _require(_profile_config_identity(row["profile_id"], row["config_id"], context,
+                                      gross_profile=gross_profile))
     _integer(row["account_version"])
     _fields(row, "valuation_context_id positions_digest orders_digest reservations_digest owner_state_digest", _hash)
     _enum(row["gate"], ["RUNNING", "FAILED"])
@@ -326,6 +331,7 @@ def historical_market_result(
     context: ConfigurationContext | None,
     historical_context: object,
     expected_run_contract_hash: str | None = None,
+    gross_profile: bool = False,
 ) -> None:
     context = _context(context)
     _require(context is not None)
@@ -421,10 +427,12 @@ def historical_market_result(
     before = row["owner_inspection_before"]
     after = row["owner_inspection_after"]
     for inspection_value in (before, after):
-        inspection(inspection_value, context=context)
+        inspection(inspection_value, context=context, gross_profile=gross_profile)
         inspection_row = cast(dict[str, object], inspection_value)
+        expected_profile = ("SYNTHETIC_CONFIGURED_GROSS_ADMISSION_V1" if gross_profile
+                            else _CONFIGURED_PROFILE)
         _require(inspection_row["account_key"] == account_key
-                 and inspection_row["profile_id"] == _CONFIGURED_PROFILE)
+                 and inspection_row["profile_id"] == expected_profile)
     _require(result["owner_evidence"] == after)
     before_row, after_row = cast(dict[str, object], before), cast(dict[str, object], after)
     _require(_integer(after_row["account_version"]) >= _integer(before_row["account_version"]))
