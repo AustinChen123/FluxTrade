@@ -17,6 +17,7 @@ import pytest
 from src.core.backtest import spider_scenario_run as run, synthetic_scenario_codec as wire
 from src.core.backtest import spider_configured_scale_input as scale
 from src.core.backtest import spider_policy as spider_policy
+from src.core.backtest import spider_policy_protocol as policy_protocol
 from src.core.backtest import spider_run_store as storage
 from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_canonical, decode_jsonl
 from src.core.backtest.spider_run_admission import admit_spider_run
@@ -617,6 +618,78 @@ def test_historical_post_mutation_capture_failure_preserves_unpersisted_frontier
         assert processed["barrier_id"].startswith("P3_MARKET_")
     assert not (directory / "completion.json").exists()
     assert admit_spider_run(directory)["reason"] == "INCOMPLETE_PERSISTENCE"
+
+
+@pytest.mark.parametrize(("sequence_mix", "admitted"), [
+    ("legacy", True), ("disjoint", True), ("mixed", False),
+])
+def test_h03_formal_run_requires_poll_and_native_delivery_sequence_mode_to_match(
+    tmp_path, monkeypatch, sequence_mix, admitted,
+):
+    value, raw = frozen_h03_input(f"h03-delivery-mode-{sequence_mix}")
+    install_frozen_h03_order(monkeypatch)
+    original_sequence = policy_protocol.historical_delivery_sequence
+
+    def producer_sequence(mode, kind, counter):
+        if sequence_mix == "legacy" or (
+            sequence_mix == "mixed" and kind is policy_protocol.HistoricalDeliveryKind.NATIVE
+        ):
+            mode = policy_protocol.HistoricalSequenceMode.LEGACY_SHARED_SEQUENCE_V1
+        return original_sequence(mode, kind, counter)
+
+    monkeypatch.setattr(policy_protocol, "historical_delivery_sequence", producer_sequence)
+    result = run.run_spider_scenario(str(tmp_path), value.run_id, run._P3_SELECTOR, raw)
+    if not admitted:
+        assert result == dict(run_id=value.run_id, outcome="FAILED",
+                              reason="ENDPOINT_RECONCILIATION_FAILED"), read(
+                                  tmp_path, value.run_id, "status.json",
+                              )
+        assert not (tmp_path / value.run_id / "completion.json").exists()
+        return
+
+    assert result == dict(run_id=value.run_id, outcome="ADMITTED", reason=None)
+    admitted_run = admit_spider_run(tmp_path / value.run_id)
+    assert admitted_run["decision"] == "ACCEPT"
+    journal = admitted_run["artifacts"]["journal.jsonl"]
+    fills = [fill for row in journal if row["record_kind"] == "HISTORICAL_MARKET_RESULT"
+             for product in row["payload"]["result"]["products"] for fill in product["fills"]]
+    assert fills
+    assert any(row["record_kind"] == "CALLBACK_RESULT" for row in journal)
+    endpoint = admitted_run["artifacts"]["endpoint.json"]
+    observation = endpoint["scheduler_observation"]
+    assert observation["polls"]
+    native_mode = (policy_protocol.HistoricalSequenceMode.LEGACY_SHARED_SEQUENCE_V1
+                   if sequence_mix == "legacy" else
+                   policy_protocol.HistoricalSequenceMode.HISTORICAL_DISJOINT_SEQUENCE_V1)
+    native_counter = 0
+    for row in journal:
+        if row["record_kind"] != "HISTORICAL_MARKET_RESULT":
+            continue
+        result = row["payload"]["result"]
+        for product in result["products"]:
+            for fill in product["fills"]:
+                sequence = original_sequence(
+                    native_mode, policy_protocol.HistoricalDeliveryKind.NATIVE, native_counter,
+                )
+                visible_at = (result["raw_time_ms"] + 2) * 16 + 6
+                native_counter += 1
+                matches = [record for record in observation["records"]
+                           if record["kind"] == "DELIVERY"
+                           and record["key"]["queue_class"] == "DELIVERY"
+                           and record["key"]["visible_at"] == visible_at
+                           and record["key"]["schedule_sequence"] == sequence]
+                assert len(matches) == 1
+                record = matches[0]
+                attempts = [item["payload"]["delivery"] for item in journal
+                            if item["record_kind"] == "DELIVERY_ATTEMPT"
+                            and item["payload"]["delivery"]["payload_kind"] == "EXECUTION_FACT"
+                            and item["payload"]["delivery"]["source_fact_id"] == fill["source_event_id"]
+                            and item["payload"]["delivery"]["occurrence_index"] == fill["occurrence_index"]]
+                if visible_at > observation["current_time"]:
+                    assert record["classification"] == "PENDING" and not attempts
+                    assert record["key"] in observation["pending_keys"]
+                else:
+                    assert record["classification"] == "SUCCESS" and len(attempts) == 1
 
 
 def test_historical_sigkill_after_durable_market_marker_then_clean_new_run(tmp_path, monkeypatch):

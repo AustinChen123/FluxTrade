@@ -1292,7 +1292,11 @@ class _ReplayComposition:
             reference=dict(namespace="SOURCE", fact_id=stamp["event_id"]),
             payload_kind="TRANSPORT_ACK",
             occurrence_index=0,
-            schedule_sequence=self._historical_notice_sequence,
+            schedule_sequence=policy_protocol.historical_delivery_sequence(
+                policy_protocol.HistoricalSequenceMode.HISTORICAL_DISJOINT_SEQUENCE_V1,
+                policy_protocol.HistoricalDeliveryKind.NATIVE,
+                self._historical_notice_sequence,
+            ),
             visible_at=visible_at,
         ))
         delivery = self._codec.build_delivery(projection)
@@ -1463,7 +1467,11 @@ class _ReplayComposition:
                                     reference=dict(namespace="SOURCE", fact_id=fill["source_event_id"]),
                                     payload_kind="EXECUTION_FACT",
                                     occurrence_index=fill["occurrence_index"],
-                                    schedule_sequence=self._historical_notice_sequence,
+                                    schedule_sequence=policy_protocol.historical_delivery_sequence(
+                                        policy_protocol.HistoricalSequenceMode.HISTORICAL_DISJOINT_SEQUENCE_V1,
+                                        policy_protocol.HistoricalDeliveryKind.NATIVE,
+                                        self._historical_notice_sequence,
+                                    ),
                                     visible_at=visible_at,
                                 ))
                                 delivery = self._codec.build_delivery(projection)
@@ -1590,7 +1598,11 @@ class _ReplayComposition:
                     schema_version="delivery_projection_v1",
                     reference=dict(namespace="SNAPSHOT", fact_id=snapshot_id),
                     payload_kind=payload_kind, occurrence_index=capture_sequence,
-                    schedule_sequence=capture_sequence, visible_at=(raw_at + visible_offset) * 16 + 6,
+                    schedule_sequence=policy_protocol.historical_delivery_sequence(
+                        policy_protocol.HistoricalSequenceMode.HISTORICAL_DISJOINT_SEQUENCE_V1,
+                        policy_protocol.HistoricalDeliveryKind.POLL,
+                        capture_sequence,
+                    ), visible_at=(raw_at + visible_offset) * 16 + 6,
                     continuation_id=continuation,
                 ),
             )

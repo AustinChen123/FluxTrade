@@ -11,6 +11,11 @@ from decimal import Decimal
 from hashlib import sha256
 from typing import Any, cast
 
+from src.core.backtest.spider_policy_protocol import (
+    HistoricalDeliveryKind as _HistoricalDeliveryKind,
+    HistoricalSequenceMode as _HistoricalSequenceMode,
+    historical_delivery_sequence as _historical_delivery_sequence,
+)
 from src.core.backtest.spider_execution_input import (
     BASE_POLICY_SOURCE_SHA256,
     SpiderExecutionInput,
@@ -41,7 +46,10 @@ from src.core.backtest.spider_run_execution_schema import (
     execution_context_from_input,
     validate_execution_artifact,
 )
-from src.core.backtest.spider_run_evidence import _historical_snapshot_matches
+from src.core.backtest.spider_run_evidence import (
+    _historical_polls_endpoint_mode_compatible,
+    _historical_snapshot_matches,
+)
 
 _CHECK_REFS: dict[str, list[str]] = {
     "INPUT_IDENTITY": ["artifact:attempt.json#/input_contract_hashes", "artifact:execution_input.json#"],
@@ -161,7 +169,8 @@ def _group_has_intent(group: object, dependency: dict[str, Any]) -> bool:
 
 
 def _paid_delivery_origins(journal: list[dict[str, Any]], request: SpiderExecutionInput,
-                          roles: dict[str, str], actions_by_group: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+                          roles: dict[str, str], actions_by_group: dict[str, dict[str, Any]],
+                          mode: _HistoricalSequenceMode) -> list[dict[str, Any]]:
     """Project native fill/cancel facts into the existing ordered delivery keys."""
     sequence = 0
     origins = []
@@ -176,15 +185,17 @@ def _paid_delivery_origins(journal: list[dict[str, Any]], request: SpiderExecuti
                                   + Decimal(fill["quantity_contracts"]))
                     cumulative_by_order[fill["order_id"]] = cumulative
                     role = roles.get(fill["order_id"])
-                    if role is not None:
-                        origins.append(dict(
-                            visible_at=visible_at, schedule_sequence=sequence,
-                            payload_kind="EXECUTION_FACT", source_fact_id=fill["source_event_id"],
-                            occurrence_index=fill["occurrence_index"], order_id=fill["order_id"],
-                            product_id=product["product_id"], price=fill["price"],
-                            quantity=cumulative, effective_at=result["effective_at"],
-                            role=role, cancel_action_id=None,
-                        ))
+                    origins.append(dict(
+                        visible_at=visible_at,
+                        schedule_sequence=_historical_delivery_sequence(
+                            mode, _HistoricalDeliveryKind.NATIVE, sequence,
+                        ),
+                        payload_kind="EXECUTION_FACT", source_fact_id=fill["source_event_id"],
+                        occurrence_index=fill["occurrence_index"], order_id=fill["order_id"],
+                        product_id=product["product_id"], price=fill["price"],
+                        quantity=cumulative, effective_at=result["effective_at"],
+                        role=role, cancel_action_id=None, paid_obligation=role is not None,
+                    ))
                     sequence += 1
         elif row["record_kind"] == "SOURCE_GROUP_RESULT":
             group = row["payload"]["request"]
@@ -193,16 +204,19 @@ def _paid_delivery_origins(journal: list[dict[str, Any]], request: SpiderExecuti
             if (len(members) == 1 and members[0]["kind"] == "CANCEL_EFFECT"
                     and result["classification"] == "COMMITTED"):
                 action = actions_by_group.get(group["group_id"])
-                if action is not None:
-                    stamp = members[0]["stamp"]
-                    visible_at = (stamp["effective_at"] // 16
-                                  + request.historical_input.cancel_ack_delay_ms) * 16 + 6
-                    origins.append(dict(
-                        visible_at=visible_at, schedule_sequence=sequence,
-                        payload_kind="TRANSPORT_ACK", source_fact_id=stamp["event_id"],
-                        occurrence_index=0, order_id=action["order_id"], role=None,
-                        cancel_action_id=action["action_id"],
-                    ))
+                stamp = members[0]["stamp"]
+                visible_at = (stamp["effective_at"] // 16
+                              + request.historical_input.cancel_ack_delay_ms) * 16 + 6
+                origins.append(dict(
+                    visible_at=visible_at,
+                    schedule_sequence=_historical_delivery_sequence(
+                        mode, _HistoricalDeliveryKind.NATIVE, sequence,
+                    ),
+                    payload_kind="TRANSPORT_ACK", source_fact_id=stamp["event_id"],
+                    occurrence_index=0, order_id=action["order_id"] if action is not None else None,
+                    role=None, cancel_action_id=action["action_id"] if action is not None else None,
+                    paid_obligation=action is not None,
+                ))
                 sequence += 1
     return origins
 
@@ -435,6 +449,21 @@ def _owner_checks(attempt: dict[str, Any], initial: object, endpoint: dict[str, 
 def _action_bindings(attempt: dict[str, Any], journal: list[dict[str, Any]],
                      report: dict[str, Any], endpoint: dict[str, Any],
                      request: SpiderExecutionInput) -> bool:
+    scheduler = report["scheduler_observation"]
+    cutoff = scheduler["current_time"]
+    paid_prefix = f"PAID_{validate_spider_execution_input(request)[:16]}"
+    allow_terminal = endpoint["status"] == "FAILED" and scheduler["gate"] == "FAILED"
+    return any(
+        _historical_polls_endpoint_mode_compatible(scheduler, cutoff, mode, paid_prefix, allow_terminal)
+        and _action_bindings_for_mode(attempt, journal, report, endpoint, request, mode)
+        for mode in _HistoricalSequenceMode
+    )
+
+
+def _action_bindings_for_mode(attempt: dict[str, Any], journal: list[dict[str, Any]],
+                              report: dict[str, Any], endpoint: dict[str, Any],
+                              request: SpiderExecutionInput,
+                              mode: _HistoricalSequenceMode) -> bool:
     observation = report["paid_observation"]
     scheduler = report["scheduler_observation"]
     actions = endpoint["actions"]
@@ -648,7 +677,7 @@ def _action_bindings(attempt: dict[str, Any], journal: list[dict[str, Any]],
     # effects, then bind each one to the scheduler's actual stable key and its
     # pending, consumed, or terminal public outcome. Observation arrays alone
     # cannot make an omitted notice look settled.
-    expected_deliveries = _paid_delivery_origins(journal, request, role_rows, actions_by_group)
+    expected_deliveries = _paid_delivery_origins(journal, request, role_rows, actions_by_group, mode)
     scheduler_deliveries = [row for row in scheduler["records"] if row["kind"] == "DELIVERY"]
     observation_deliveries = observation["pending_paid_deliveries"]
     matched_pending: set[bytes] = set()
@@ -670,6 +699,24 @@ def _action_bindings(attempt: dict[str, Any], journal: list[dict[str, Any]],
         if key["queue_class"] != "DELIVERY" or record["stable_id"] != key["stable_id"]:
             return False
         key_bytes = canonical_bytes(key)
+        if not origin["paid_obligation"]:
+            pending_key = any(canonical_bytes(item) == key_bytes for item in scheduler["pending_keys"])
+            callbacks = callbacks_by_key.get(key_bytes, [])
+            is_terminal = terminal_delivery is not None and terminal_delivery["key"] == key
+            if record["classification"] == "PENDING":
+                if not pending_key:
+                    return False
+            elif record["classification"] == "SUCCESS":
+                if pending_key or len(callbacks) != 1 or callbacks[0]["payload"]["outcome"] not in (
+                    "SUCCESS", "CONSUMER_DEDUPLICATED",
+                ):
+                    return False
+            elif record["classification"] == "TERMINAL":
+                if not is_terminal:
+                    return False
+            else:
+                return False
+            continue
         pending = [item for item in observation_deliveries
                    if canonical_bytes(item["key"]) == key_bytes]
         callbacks = callbacks_by_key.get(key_bytes, [])

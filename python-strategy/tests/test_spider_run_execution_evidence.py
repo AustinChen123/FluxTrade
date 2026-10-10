@@ -21,6 +21,7 @@ from src.core.backtest.spider_run_execution_schema import (
     execution_context_from_input,
 )
 from src.core.backtest.spider_run_artifacts import _HASH_NAMES
+from src.core.backtest import synthetic_scenario_replay as replay_module
 from src.core.backtest.synthetic_scenario_replay import _ReplayComposition
 from test_spider_execution_input import _input
 from test_spider_historical_input import (
@@ -222,6 +223,132 @@ def test_actual_native_paid_flat_bundle_reconciles_and_rebuilds_identically():
     assert canonical_bytes(first) == canonical_bytes(second)
     artifacts["reconciliation.json"] = encode_jsonl([first])
     assert canonical_bytes(evidence.build_execution_reconciliation(run_id, artifacts)) == canonical_bytes(first)
+
+
+def test_paid_legacy_shared_delivery_sequences_remain_readable(monkeypatch):
+    with monkeypatch.context() as producer_patch:
+        producer_patch.setattr(
+            replay_module.policy_protocol,
+            "historical_delivery_sequence",
+            lambda _mode, _kind, counter: counter,
+        )
+        artifacts, facts = _bundle()
+    result = evidence.build_execution_reconciliation(facts["run_id"], artifacts)
+    assert facts["paid"]["status"] == "PAID_FLAT"
+    assert result["result"] == "OK", [(row["name"], row["result"]) for row in result["checks"]]
+
+
+@pytest.mark.parametrize("with_working_order", [False, True])
+def test_paid_mixed_poll_and_native_delivery_modes_are_rejected(with_working_order):
+    request = _seeded_two_product_run(with_working_order=with_working_order)
+    request = replace(request, policy_end_ms=request.policy_end_ms + 30_000)
+    artifacts, facts = _bundle(request)
+    report = cast(dict[str, Any], decode_jsonl(artifacts["report.jsonl"])[0])
+    journal = cast(list[dict[str, Any]], decode_jsonl(artifacts["journal.jsonl"]))
+    scheduler = report["scheduler_observation"]
+    if with_working_order:
+        roles = {row["order_id"]: row["role"] for row in report["paid_observation"]["order_roles"]}
+        actions_by_group = {row["group_id"]: row for row in facts["paid"]["actions"]
+                            if row["group_id"] is not None}
+        origins = evidence._paid_delivery_origins(
+            journal, facts["request"], roles, actions_by_group,
+            evidence._HistoricalSequenceMode.HISTORICAL_DISJOINT_SEQUENCE_V1,
+        )
+        ack_origins = [origin for origin in origins if origin["payload_kind"] == "TRANSPORT_ACK"]
+        assert ack_origins
+        for origin in ack_origins:
+            deliveries = [row for row in scheduler["records"] if row["kind"] == "DELIVERY"
+                          and row["key"]["visible_at"] == origin["visible_at"]
+                          and row["key"]["schedule_sequence"] == origin["schedule_sequence"]]
+            assert len(deliveries) == 1 and deliveries[0]["classification"] == "SUCCESS"
+    delivery = None
+    capture_sequence = 0
+    for poll in scheduler["polls"]:
+        poll_prefix, _, poll_counter = poll["poll_id"].partition("_POLL_")
+        timer = next(row for row in scheduler["records"]
+                     if row["kind"] == "HISTORICAL_TIMER"
+                     and row["stable_id"] == f"{poll_prefix}_TIMER_{poll_counter}")
+        poll_time = int(poll_counter)
+        has_earn = any(row["kind"] == "SNAPSHOT_CAPTURE"
+                       and row["stable_id"] == f"{poll['poll_id']}_EARN" for row in scheduler["records"])
+        stage = "EARN" if has_earn else "TRADING"
+        capture = next((row for row in scheduler["records"]
+                        if row["kind"] == "SNAPSHOT_CAPTURE"
+                        and row["stable_id"] == f"{poll['poll_id']}_{stage}"
+                        and row["classification"] == "SUCCESS"), None)
+        if capture is None:
+            continue
+        capture_sequence = timer["key"]["schedule_sequence"] * 4
+        if capture_sequence == 0:
+            continue
+        delivery_time = (poll_time + 5) * 16 + 6
+        delivery = next((row for row in scheduler["records"]
+                         if row["kind"] == "DELIVERY"
+                         and row["key"]["visible_at"] == delivery_time
+                         and row["key"]["schedule_sequence"] == 2 * capture_sequence), None)
+        if delivery is not None and delivery["classification"] == "SUCCESS":
+            break
+        delivery = None
+    assert delivery is not None
+    old_key = deepcopy(delivery["key"])
+    delivery["key"]["schedule_sequence"] = capture_sequence
+    for row in journal:
+        if row["scheduler_key"] == old_key:
+            row["scheduler_key"]["schedule_sequence"] = capture_sequence
+    artifacts["report.jsonl"] = encode_jsonl([report])
+    artifacts["journal.jsonl"] = encode_jsonl(cast(list[object], journal))
+
+    paid_prefix = f"PAID_{validate_spider_execution_input(facts['request'])[:16]}"
+    modes = [evidence._historical_polls_endpoint_mode_compatible(
+        scheduler, scheduler["current_time"], mode, paid_prefix,
+    ) for mode in evidence._HistoricalSequenceMode]
+    assert modes == [False, False]
+    result = evidence.build_execution_reconciliation(facts["run_id"], artifacts)
+    failed = {row["name"] for row in result["checks"] if row["result"] == "FAILED"}
+    assert "ACTION_BINDINGS" in failed
+
+
+def test_paid_legacy_poll_with_native_grid_ack_mode_is_rejected(monkeypatch):
+    request = _seeded_two_product_run(with_working_order=True)
+    request = replace(request, policy_end_ms=request.policy_end_ms + 30_000)
+    native_sequence = replay_module.policy_protocol.historical_delivery_sequence
+    with monkeypatch.context() as producer_patch:
+        producer_patch.setattr(
+            replay_module.policy_protocol,
+            "historical_delivery_sequence",
+            lambda mode, kind, counter: counter if kind is evidence._HistoricalDeliveryKind.POLL
+            else native_sequence(mode, kind, counter),
+        )
+        artifacts, facts = _bundle(request)
+
+    report = cast(dict[str, Any], decode_jsonl(artifacts["report.jsonl"])[0])
+    scheduler = report["scheduler_observation"]
+    assert scheduler["polls"]
+    assert evidence._historical_polls_endpoint_mode_compatible(
+        scheduler, scheduler["current_time"], evidence._HistoricalSequenceMode.LEGACY_SHARED_SEQUENCE_V1,
+        f"PAID_{validate_spider_execution_input(request)[:16]}",
+    )
+    assert not evidence._historical_polls_endpoint_mode_compatible(
+        scheduler, scheduler["current_time"], evidence._HistoricalSequenceMode.HISTORICAL_DISJOINT_SEQUENCE_V1,
+        f"PAID_{validate_spider_execution_input(request)[:16]}",
+    )
+    roles = {row["order_id"]: row["role"] for row in report["paid_observation"]["order_roles"]}
+    actions_by_group = {row["group_id"]: row for row in facts["paid"]["actions"]
+                        if row["group_id"] is not None}
+    disjoint_origins = evidence._paid_delivery_origins(
+        facts["journal"], request, roles, actions_by_group,
+        evidence._HistoricalSequenceMode.HISTORICAL_DISJOINT_SEQUENCE_V1,
+    )
+    ack_origins = [origin for origin in disjoint_origins if origin["payload_kind"] == "TRANSPORT_ACK"]
+    assert ack_origins
+    for origin in ack_origins:
+        deliveries = [row for row in scheduler["records"] if row["kind"] == "DELIVERY"
+                      and row["key"]["visible_at"] == origin["visible_at"]
+                      and row["key"]["schedule_sequence"] == origin["schedule_sequence"]]
+        assert len(deliveries) == 1 and deliveries[0]["classification"] == "SUCCESS"
+    result = evidence.build_execution_reconciliation(facts["run_id"], artifacts)
+    failed = {row["name"] for row in result["checks"] if row["result"] == "FAILED"}
+    assert "ACTION_BINDINGS" in failed
 
 
 @pytest.mark.parametrize("offset_ms", [30_000, 59_000])
