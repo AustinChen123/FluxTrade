@@ -153,6 +153,20 @@ fn side_name(side: Side) -> &'static str {
 }
 
 impl Receipt {
+    pub(super) fn source_cost_receipt(&self) -> Result<super::super::SourceCostReceipt, Fault> {
+        if !matches!(self.fee_policy, FeePolicy::ConfiguredLiquidation(_)) {
+            return Err("NATIVE_INVARIANT");
+        }
+        Ok(super::super::SourceCostReceipt {
+            sequence: self.commit_sequence_before,
+            product: self.product.clone(),
+            before: Some(self.position_before.clone()),
+            after: self.position_after.clone(),
+            price: self.mark,
+            fee: self.fee,
+        })
+    }
+
     fn digest(&self) -> Result<Hash, Fault> {
         let mut e = Encoding::new("SYNTHETIC_LIQUIDATION");
         e.account(&self.account_key);

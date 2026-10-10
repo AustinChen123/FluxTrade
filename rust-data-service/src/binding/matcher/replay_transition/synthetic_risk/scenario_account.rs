@@ -22,6 +22,7 @@ mod min_cash;
 mod reservation;
 mod risk_transition;
 mod session;
+mod source_cost_projection;
 pub(crate) use session::register_python;
 mod snapshot;
 mod source;
@@ -159,6 +160,16 @@ struct ProductPosition {
     contracts: Decimal,
     lots: Vec<EntryLot>,
     entry_basis: Decimal,
+}
+
+#[derive(Clone)]
+struct SourceCostReceipt {
+    sequence: u64,
+    product: Product,
+    before: Option<ProductPosition>,
+    after: Option<ProductPosition>,
+    price: Decimal,
+    fee: Decimal,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

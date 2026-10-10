@@ -495,27 +495,29 @@ fn configured_aligned_tier_three_step_revalues_into_safe_tier_two() {
     let product = products[0].product.clone();
     products[0].taker_fee = d("0.02");
     products[0].liquidation_fee = d("0.00602");
+    products[0].specs[0].lot = d("0.01");
+    products[0].specs[0].minimum = d("0.01");
     products[0].tiers[0].tiers = vec![
         Tier {
             minimum: d("0"),
             maximum: d("0.5"),
             mmr: d("0.005"),
-            imr: d("0.1"),
-            max_leverage: d("10"),
+            imr: d("0.05"),
+            max_leverage: d("20"),
         },
         Tier {
             minimum: d("1"),
             maximum: d("1.5"),
             mmr: d("0.01"),
-            imr: d("0.1"),
-            max_leverage: d("10"),
+            imr: d("0.05"),
+            max_leverage: d("20"),
         },
         Tier {
-            minimum: d("2"),
+            minimum: d("1.5001"),
             maximum: d("100"),
             mmr: d("0.05"),
-            imr: d("0.1"),
-            max_leverage: d("10"),
+            imr: d("0.05"),
+            max_leverage: d("20"),
         },
     ];
     seed.positions.push(SeedPosition {
@@ -553,7 +555,26 @@ fn configured_aligned_tier_three_step_revalues_into_safe_tier_two() {
         ..fill_order.clone()
     };
     seed.orders = vec![fill_order, cancel_order];
-    let mut owner = ScenarioAccount::from_configured(&seed, d("10"), products).unwrap();
+    let mut owner = ScenarioAccount::from_configured(&seed, d("20"), products).unwrap();
+    let source_average = |owner: &ScenarioAccount| {
+        let canonical = owner
+            .historical_source_cost_projection()
+            .unwrap()
+            .canonical()
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&canonical).unwrap();
+        value["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["product_id"] == product.0.as_ref())
+            .unwrap()["average_open_price"]
+            .as_str()
+            .unwrap()
+            .parse::<Decimal>()
+            .unwrap()
+    };
+    assert_eq!(source_average(&owner), d("102"));
     let initial = owner.reservation().unwrap();
     assert!(initial.equity > initial.maintenance_margin);
     let candidate = configured_input(&owner, "FILL", "CFG-TIER3-TRIGGER", "0.5", "100", 501);
@@ -561,6 +582,17 @@ fn configured_aligned_tier_three_step_revalues_into_safe_tier_two() {
         owner.execute(&candidate),
         Ok(Reply::Committed { .. })
     ));
+    let after_add_average = (d("2") * d("102") + d("0.5") * d("100") + d("1")) / d("2.5");
+    assert_eq!(
+        source_average(&owner),
+        after_add_average,
+        "projection={}",
+        owner
+            .historical_source_cost_projection()
+            .unwrap()
+            .canonical()
+            .unwrap()
+    );
     let ordinary_fee = d("0.5") * d("100") * d("0.02");
     assert_eq!(owner.fees, ordinary_fee);
     assert_eq!(owner.liquidation_ids().count(), 0);
@@ -590,6 +622,111 @@ fn configured_aligned_tier_three_step_revalues_into_safe_tier_two() {
     assert_eq!(receipt.post_step_decision, StepDecision::RiskStable);
     assert_eq!(owner.positions.btc().unwrap()[&product].contracts, d("1.5"));
     assert_eq!(owner.transition.lifecycle, Lifecycle::RiskStable);
+    assert_eq!(source_average(&owner), after_add_average);
+
+    let later_intent = admission::fixture_intent_for_product(
+        &owner,
+        "POST-LIQUIDATION-ADD",
+        ProfileProduct::BtcEth(product.clone()),
+        Side::Long,
+        d("0.01"),
+        d("100"),
+    );
+    let later_admission =
+        admission::fixture_admit(&mut owner, "POST-LIQUIDATION-ADD-EVENT", 503, &later_intent)
+            .unwrap();
+    assert_eq!(later_admission.0, "accepted", "{:?}", later_admission.1);
+    let later_order = owner
+        .orders
+        .values()
+        .find(|order| order.facts.status == "OPEN")
+        .unwrap()
+        .facts
+        .order_id
+        .clone();
+    let later_fill = configured_input(
+        &owner,
+        &later_order,
+        "POST-LIQUIDATION-FILL",
+        "0.01",
+        "100",
+        504,
+    );
+    assert!(matches!(
+        owner.execute(&later_fill),
+        Ok(Reply::Committed { .. })
+    ));
+    let expected_after_later_add =
+        (d("1.5") * after_add_average + d("0.01") * d("100") + d("0.02")) / d("1.51");
+    assert_eq!(source_average(&owner), expected_after_later_add);
+}
+
+#[test]
+fn configured_source_cost_projection_reads_both_liquidated_terminal_states() {
+    for (cash, expected_lifecycle, expected_name) in [
+        ("50.1", Lifecycle::LiquidatedFlat, "LIQUIDATED_FLAT"),
+        ("3", Lifecycle::LiquidatedInsolvent, "LIQUIDATED_INSOLVENT"),
+    ] {
+        let (mut seed, mut products) = configured_tests::input(1);
+        let product = products[0].product.clone();
+        products[0].marks[0].valid_to = 501;
+        let mut updated_mark = products[0].marks[0].clone();
+        updated_mark.valid_from = 501;
+        updated_mark.valid_to = 3000;
+        updated_mark.price = d("50");
+        products[0].marks.push(updated_mark);
+        seed.cash = d(cash);
+        seed.positions = vec![SeedPosition {
+            product: product.clone(),
+            side: Side::Long,
+            contracts: d("1"),
+            lots: vec![SeedLot {
+                seed_execution_id: format!("TERMINAL-SEED-{cash}"),
+                seed_sequence: 0,
+                strategy_id: "strategy".into(),
+                contracts: d("1"),
+                entry: d("100"),
+            }],
+        }];
+        seed.orders.clear();
+        let mut owner = ScenarioAccount::from_configured(&seed, d("10"), products).unwrap();
+        let mark = activation(
+            &owner,
+            501,
+            context::Rows::Marks(vec![(product.clone(), 501, 3000, d("50"))]),
+        );
+        owner.activate_context(&mark).unwrap();
+        assert_eq!(owner.transition.lifecycle, expected_lifecycle);
+        assert!(owner.positions.is_empty());
+        assert_eq!(
+            owner.cash.is_sign_positive(),
+            expected_lifecycle == Lifecycle::LiquidatedFlat
+        );
+
+        let before_reads = owner.clone();
+        let first = owner
+            .historical_source_cost_projection()
+            .unwrap()
+            .canonical()
+            .unwrap();
+        let second = owner
+            .historical_source_cost_projection()
+            .unwrap()
+            .canonical()
+            .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(owner, before_reads);
+        let value: serde_json::Value = serde_json::from_str(&first).unwrap();
+        assert_eq!(value["lifecycle"], expected_name);
+        let row = value["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["product_id"] == product.0.as_ref())
+            .unwrap();
+        assert_eq!(row["signed_base_quantity"], "0");
+        assert_eq!(row["average_open_price"], "0");
+    }
 }
 
 fn mark_group(owner: &ScenarioAccount) -> Group {

@@ -1084,13 +1084,72 @@ fn configured_tier_subset_revalues_shared_risk_then_waits_for_cancel_effect() {
     let first = products[0].product.clone();
     let middle = products[1].product.clone();
     let last = products[2].product.clone();
-    configure_tier_change(&mut products[1], 600, "0.4");
+    products[1].specs[0].lot = d("0.25");
+    products[1].specs[0].minimum = d("0.25");
+    configure_tier_change(&mut products[1], 600, "0.005");
+    let lower_tier = Tier {
+        minimum: d("0"),
+        maximum: d("0.25"),
+        mmr: d("0.005"),
+        imr: d("0.1"),
+        max_leverage: d("10"),
+    };
+    let mut upper_tier = Tier {
+        minimum: d("0.5"),
+        maximum: d("100"),
+        mmr: d("0.005"),
+        imr: d("0.1"),
+        max_leverage: d("10"),
+    };
+    products[1].tiers[0].tiers = vec![lower_tier.clone(), upper_tier.clone()];
+    upper_tier.mmr = d("0.33");
+    upper_tier.imr = d("0.33");
+    products[1].tiers[1].tiers = vec![lower_tier, upper_tier];
     seed.positions = vec![
         configured_position(&first, "POSITION-FIRST", "0.5", 0),
-        configured_position(&middle, "POSITION-MIDDLE", "0.5", 1),
+        SeedPosition {
+            product: middle.clone(),
+            side: Side::Long,
+            contracts: d("0.5"),
+            lots: vec![
+                SeedLot {
+                    seed_execution_id: "POSITION-MIDDLE-A".into(),
+                    seed_sequence: 1,
+                    strategy_id: "strategy".into(),
+                    contracts: d("0.25"),
+                    entry: d("80"),
+                },
+                SeedLot {
+                    seed_execution_id: "POSITION-MIDDLE-B".into(),
+                    seed_sequence: 2,
+                    strategy_id: "strategy".into(),
+                    contracts: d("0.25"),
+                    entry: d("120"),
+                },
+            ],
+        },
     ];
     seed.orders = vec![configured_order(&last, "LAST-OPEN", "100")];
     let mut owner = ScenarioAccount::from_configured(&seed, d("10"), products).unwrap();
+    let source_row = |owner: &ScenarioAccount, target: &Product| {
+        let value: serde_json::Value = serde_json::from_str(
+            &owner
+                .historical_source_cost_projection()
+                .unwrap()
+                .canonical()
+                .unwrap(),
+        )
+        .unwrap();
+        value["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["product_id"] == target.0.as_ref())
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(source_row(&owner, &middle)["signed_base_quantity"], "0.5");
+    assert_eq!(source_row(&owner, &middle)["average_open_price"], "100.1");
     let before = owner.reservation().unwrap();
     assert_eq!(before.equity, d("16"));
     assert_eq!(before.maintenance_margin, d("0.5"));
@@ -1108,7 +1167,7 @@ fn configured_tier_subset_revalues_shared_risk_then_waits_for_cancel_effect() {
     );
     let receipt = owner.activate_context(&input).unwrap();
     assert_eq!(receipt.after.equity, d("16"));
-    assert_eq!(receipt.after.maintenance_margin, d("20.25"));
+    assert_eq!(receipt.after.maintenance_margin, d("16.75"));
     assert_eq!(receipt.after.used_margin, before.used_margin);
     assert_eq!(receipt.rows_before[1].1.version, "scale-tier-v1");
     assert_eq!(receipt.rows_after[1].1.version, "tier-v2");
@@ -1136,11 +1195,14 @@ fn configured_tier_subset_revalues_shared_risk_then_waits_for_cancel_effect() {
         .unwrap();
     assert_eq!(owner.orders["LAST-OPEN"].facts.status, "CANCELED");
     assert_eq!(owner.liquidation_ids().count(), 1);
-    assert!(!owner.positions.btc().unwrap().contains_key(&middle));
+    assert_eq!(owner.commit_sequence, 4);
+    assert_eq!(owner.positions.btc().unwrap()[&middle].contracts, d("0.25"));
+    assert_eq!(owner.positions.btc().unwrap()[&middle].entry_basis, d("30"));
     assert_eq!(owner.positions.btc().unwrap()[&first].contracts, d("0.5"));
     assert_eq!(owner.transition.lifecycle, Lifecycle::RiskStable);
-    assert_eq!(owner.commit_sequence, 3);
-    assert_eq!(owner.fees, d("0.05"));
+    assert_eq!(owner.fees, d("0.025"));
+    assert_eq!(source_row(&owner, &middle)["signed_base_quantity"], "0.25");
+    assert_eq!(source_row(&owner, &middle)["average_open_price"], "100.1");
 }
 
 #[test]

@@ -1,5 +1,26 @@
 use super::*;
 
+fn source_average(owner: &ScenarioAccount, product_id: &str) -> Decimal {
+    let value: serde_json::Value = serde_json::from_str(
+        &owner
+            .historical_source_cost_projection()
+            .unwrap()
+            .canonical()
+            .unwrap(),
+    )
+    .unwrap();
+    value["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["product_id"] == product_id)
+        .unwrap()["average_open_price"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
 #[test]
 fn configured_fee_fifo_reduction_is_exact_for_long_and_short() {
     for (
@@ -87,6 +108,16 @@ fn configured_fee_fifo_reduction_is_exact_for_long_and_short() {
         ));
         seed.orders[0].reduce_only = true;
         let mut owner = ScenarioAccount::from_configured(&seed, d("10"), rows).unwrap();
+        let initial_source_average = d("630") / d("6")
+            * if side == Side::Long {
+                d("1.002")
+            } else {
+                d("0.998")
+            };
+        assert_eq!(
+            source_average(&owner, product.0.as_ref()),
+            initial_source_average
+        );
         let initial = owner.reservation().unwrap();
         assert_eq!(
             (
@@ -115,6 +146,10 @@ fn configured_fee_fifo_reduction_is_exact_for_long_and_short() {
             (d(pnl1), d("0.945"), d(cash1), d("0.945"), d(pnl1))
         );
         let position = &owner.positions.btc().unwrap()[&product];
+        assert_eq!(
+            source_average(&owner, product.0.as_ref()),
+            initial_source_average
+        );
         assert_eq!(
             (
                 position.side,
@@ -206,6 +241,7 @@ fn configured_fee_fifo_reduction_is_exact_for_long_and_short() {
             )
         );
         assert!(receipt2.position_after.is_none());
+        assert_eq!(source_average(&owner, product.0.as_ref()), Decimal::ZERO);
         assert!(!owner.positions.btc().unwrap().contains_key(&product));
         assert_eq!(
             (
@@ -239,4 +275,116 @@ fn configured_fee_fifo_reduction_is_exact_for_long_and_short() {
         assert_eq!(owner.execute(&second), Ok(Reply::Duplicate(receipt2)));
         assert_eq!(owner, committed2);
     }
+}
+
+#[test]
+fn source_projection_tracks_committed_open_flat_and_reverse_reopen() {
+    let (mut seed, mut products) = super::super::super::super::configured_tests::input(1);
+    let product = products[0].product.clone();
+    products[0].taker_fee = d("0.001");
+    products[0].specs[0].lot = d("0.01");
+    products[0].specs[0].minimum = d("0.01");
+    let prototype = fixture().0.orders[0].clone();
+    seed.orders = [
+        ("SOURCE-LONG", Side::Long),
+        ("SOURCE-FLAT", Side::Short),
+        ("SOURCE-REOPEN", Side::Short),
+    ]
+    .into_iter()
+    .map(|(id, side)| SeedOrder {
+        order_id: id.into(),
+        intent_id: format!("I-{id}"),
+        client_id: format!("C-{id}"),
+        product: ProfileProduct::BtcEth(product.clone()),
+        side,
+        price: d("100"),
+        reduce_only: false,
+        original: d("0.5"),
+        filled: Decimal::ZERO,
+        canceled: Decimal::ZERO,
+        remaining: d("0.5"),
+        status: "OPEN".into(),
+        ..prototype.clone()
+    })
+    .collect();
+    let mut owner = ScenarioAccount::from_configured(&seed, d("10"), products).unwrap();
+
+    let opening = configured_input(&owner, "SOURCE-LONG", "SOURCE-X1", "0.5", "100", 501);
+    let first_receipt = committed(&mut owner, &opening);
+    assert_eq!(source_average(&owner, product.0.as_ref()), d("100.1"));
+    assert_eq!(owner.execute(&opening), Ok(Reply::Duplicate(first_receipt)));
+
+    let first_reduction = configured_input(&owner, "SOURCE-FLAT", "SOURCE-X2", "0.2", "100", 502);
+    committed(&mut owner, &first_reduction);
+    assert_eq!(source_average(&owner, product.0.as_ref()), d("100.1"));
+    let second_reduction = configured_input(&owner, "SOURCE-FLAT", "SOURCE-X3", "0.1", "100", 503);
+    committed(&mut owner, &second_reduction);
+    assert_eq!(source_average(&owner, product.0.as_ref()), d("100.1"));
+    let final_reduction = configured_input(&owner, "SOURCE-FLAT", "SOURCE-X4", "0.2", "100", 504);
+    committed(&mut owner, &final_reduction);
+    assert_eq!(source_average(&owner, product.0.as_ref()), Decimal::ZERO);
+
+    let reopening = configured_input(&owner, "SOURCE-REOPEN", "SOURCE-X5", "0.5", "100", 505);
+    committed(&mut owner, &reopening);
+    assert_eq!(source_average(&owner, product.0.as_ref()), d("99.9"));
+    assert_eq!(owner.fees, d("0.15"));
+}
+
+#[test]
+fn source_projection_carries_rounded_nonterminating_average_into_later_fill() {
+    let (mut seed, mut products) = super::super::super::super::configured_tests::input(1);
+    let product = products[0].product.clone();
+    products[0].taker_fee = d("0.001");
+    products[0].specs[0].lot = d("0.01");
+    products[0].specs[0].minimum = d("0.01");
+    let prototype = fixture().0.orders[0].clone();
+    seed.orders = ["SOURCE-OPEN", "SOURCE-ADD-1", "SOURCE-ADD-2"]
+        .into_iter()
+        .map(|id| {
+            configured_order(
+                &prototype,
+                id,
+                &product,
+                Side::Long,
+                "102",
+                if id == "SOURCE-OPEN" { "0.5" } else { "0.25" },
+            )
+        })
+        .collect();
+    let mut owner = ScenarioAccount::from_configured(&seed, d("10"), products).unwrap();
+
+    let opening = configured_input(&owner, "SOURCE-OPEN", "SOURCE-NONTERM-1", "0.5", "100", 501);
+    committed(&mut owner, &opening);
+    assert_eq!(source_average(&owner, product.0.as_ref()), d("100.1"));
+
+    let first_add = configured_input(
+        &owner,
+        "SOURCE-ADD-1",
+        "SOURCE-NONTERM-2",
+        "0.25",
+        "101",
+        502,
+    );
+    committed(&mut owner, &first_add);
+    let first_average = source_average(&owner, product.0.as_ref());
+    let first_expected = (d("0.5") * d("100.1") + d("0.25") * d("101") + d("0.02525")) / d("0.75");
+    assert_eq!(first_average, first_expected);
+    assert_ne!(first_average * d("0.75"), d("75.32525"));
+
+    let second_add = configured_input(
+        &owner,
+        "SOURCE-ADD-2",
+        "SOURCE-NONTERM-3",
+        "0.25",
+        "99",
+        503,
+    );
+    committed(&mut owner, &second_add);
+    let expected_after_second =
+        (d("0.75") * first_average + d("0.25") * d("99") + d("0.02475")) / d("1");
+    assert_eq!(
+        source_average(&owner, product.0.as_ref()),
+        expected_after_second
+    );
+    assert_eq!(owner.positions.btc().unwrap()[&product].contracts, d("1"));
 }

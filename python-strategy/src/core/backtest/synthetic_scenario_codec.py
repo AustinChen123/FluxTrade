@@ -354,6 +354,24 @@ class Inspection(TypedDict):
     owner_state_digest: str
 
 
+class SourceCostRow(TypedDict):
+    product_id: str
+    signed_base_quantity: Decimal
+    average_open_price: Decimal
+    estimated_exit_fee_rate: Decimal
+
+
+class SourceCostProjection(TypedDict):
+    schema_version: Literal["spider_source_cost_projection_v1"]
+    model_id: Literal["SOURCE_WEIGHTED_OPEN_COST_V1"]
+    account_key: Account
+    account_version: int
+    valuation_context_id: str
+    lifecycle: Lifecycle
+    seed_fee_provenance: Literal["MODELED_CONFIGURED_TAKER_RATE_V1"]
+    rows: list[SourceCostRow]
+
+
 HistoricalModel = Literal[
     "OHLC4_OPEN_HIGH_LOW_CLOSE_V1",
     "OHLC4_OPEN_LOW_HIGH_CLOSE_V1",
@@ -368,6 +386,7 @@ class _NativeSession(Protocol):
     def _historical_working_orders(self) -> str: ...
     def _historical_order_binding(self, event_id: str, source_sequence: int) -> str: ...
     def inspect_state(self) -> str: ...
+    def _historical_cost_projection(self) -> str: ...
 
 
 def _new_native_session(
@@ -458,7 +477,7 @@ class HistoricalNodeResult(TypedDict):
 
 
 _Json: TypeAlias = str | int | bool | None | list["_Json"] | dict[str, "_Json"]
-_MONEY = frozenset("mark price open high low close quantity_contracts remaining_quantity_contracts volume_contracts capacity discarded_volume market_slippage_bps reported_fee limit_price size_contracts fill_price original_size_contracts cumulative_filled_size_contracts contract_value lot_size minimum_size price_increment high_low_ratio earn equity available_equity position_contracts last_price notional_usd cash gross_realized total_fees".split())
+_MONEY = frozenset("mark price open high low close quantity_contracts remaining_quantity_contracts volume_contracts capacity discarded_volume market_slippage_bps reported_fee limit_price size_contracts fill_price original_size_contracts cumulative_filled_size_contracts contract_value lot_size minimum_size price_increment high_low_ratio earn equity available_equity position_contracts last_price notional_usd cash gross_realized total_fees signed_base_quantity average_open_price estimated_exit_fee_rate".split())
 _OPTIONAL = frozenset("subaccount source_sequence fee_asset reported_fee limit_price fixture_key continuation_id transport order_id message product_id side size_contracts".split())
 _INTEGER = frozenset("source_sequence effective_at scenario_ordinal valid_from valid_to matching_effective_at visible_at expected_account_version expected_order_version requested_at group_effective_at declared_member_count occurrence_index schedule_sequence captured_at captured_account_version snapshot_as_of snapshot_version execution_effective_at commit_account_version instrument_code created_at account_version account_version_before account_version_after bar_open_ms bar_duration_ms step_index order_version accepted_at accepted_source_sequence".split())
 
@@ -559,6 +578,9 @@ class ScenarioCodec:
 
     def inspect_state(self) -> Inspection:
         return cast(Inspection, _decode(self._session.inspect_state()))
+
+    def historical_cost_projection(self) -> SourceCostProjection:
+        return cast(SourceCostProjection, _decode(self._session._historical_cost_projection()))
 
 
 def _native_failure(exc: Exception) -> dict[str, str] | None:

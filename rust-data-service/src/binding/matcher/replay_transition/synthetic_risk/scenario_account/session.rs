@@ -24,6 +24,7 @@ fn boundary(reason: Fault) -> BoundaryError {
         | "INVALID_HISTORICAL_TIME"
         | "INVALID_HISTORICAL_ORDER_SNAPSHOT"
         | "HISTORICAL_MARKET_OWNER_UNSUPPORTED" => BoundaryError::Input(reason),
+        "UNSUPPORTED_COST_PROFILE" => BoundaryError::Input(reason),
         "UNKNOWN_RECEIPT_REFERENCE" => BoundaryError::Lookup(reason),
         "SNAPSHOT_ID_CONFLICT" | "DELIVERY_ID_CONFLICT" => BoundaryError::Conflict(reason),
         _ => BoundaryError::Invariant,
@@ -66,6 +67,26 @@ impl Session {
     }
     fn inspect_state(&mut self) -> Reply {
         self.guarded(false, |s| s.inspect_state_inner())
+    }
+    fn historical_cost_projection(&mut self) -> Reply {
+        if !matches!(
+            &self.owner.profile,
+            ProfileContext::BtcEthScenario {
+                scenario: FrozenScenario {
+                    configured: Some(_),
+                    ..
+                },
+                ..
+            }
+        ) {
+            return Err(BoundaryError::Input("UNSUPPORTED_COST_PROFILE"));
+        }
+        self.guarded(false, |s| {
+            s.owner
+                .historical_source_cost_projection()
+                .and_then(|value| value.canonical().map_err(|_| "NATIVE_INVARIANT"))
+                .map_err(boundary)
+        })
     }
     fn guarded(&mut self, mutation: bool, operation: impl FnOnce(&mut Self) -> Reply) -> Reply {
         if mutation && self.poisoned {

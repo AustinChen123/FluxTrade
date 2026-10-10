@@ -52,6 +52,20 @@ pub(super) fn fixture_intent(
     }
 }
 
+#[cfg(test)]
+pub(super) fn fixture_intent_for_product(
+    owner: &ScenarioAccount,
+    id: &str,
+    product: ProfileProduct,
+    side: Side,
+    quantity: Decimal,
+    price: Decimal,
+) -> OrderIntent {
+    let mut intent = fixture_intent(owner, id, side, quantity, price);
+    intent.product = product;
+    intent
+}
+
 mod btc_policy;
 #[cfg(test)]
 pub(super) mod inspection_tests;
