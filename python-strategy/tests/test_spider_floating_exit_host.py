@@ -205,7 +205,7 @@ def test_visible_native_tp_decision_routes_to_existing_reduce_only_exit(decision
     b_working_during_a_exit: list[dict[str, Any]] = []
     original_exit_group = endpoint._exit_group
 
-    def observe_exit_group(composition, product_id, quantity):
+    def observe_exit_group(composition, product_id, quantity, *, role: str = "EXIT"):
         operation = endpoint.product_operations.get(product_id)
         if operation is not None:
             position_rows = operation["positions"]
@@ -218,7 +218,7 @@ def test_visible_native_tp_decision_routes_to_existing_reduce_only_exit(decision
                 if order["product_id"] == PRODUCTS[1]
                 and endpoint.roles_by_order.get(order["order_id"]) == "GRID"
             )
-        return original_exit_group(composition, product_id, quantity)
+        return original_exit_group(composition, product_id, quantity, role=role)
 
     endpoint._exit_group = observe_exit_group
     composition._policy.paused = True  # Pausing after the request does not cancel its native exit.

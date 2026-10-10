@@ -35,6 +35,7 @@ H = "a" * 64
 
 def _capture(composition: _ReplayComposition, tag: str, cutoff: int | None = None) -> dict[str, Any]:
     cutoff = composition._current_time if cutoff is None else cutoff
+    assert cutoff is not None
     requests = [composition._paid_snapshot_request(kind, cutoff, tag)
                 for kind in ("TRADING", "POSITIONS", "OPEN_ORDERS")]
     return composition.capture_owner_evidence(cutoff, *requests)["owner_evidence"]

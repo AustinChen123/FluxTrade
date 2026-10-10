@@ -92,8 +92,10 @@ def queue_frozen_h03_order(composition: run._ReplayComposition, value: Historica
 
 
 def frozen_h03_factory(original: Callable[..., run._ReplayComposition]):
-    def with_frozen_order(run: object, *, paid_endpoint=None) -> run._ReplayComposition:
-        composition = original(run, paid_endpoint=paid_endpoint)
+    def with_frozen_order(
+        run: object, *, paid_endpoint=None, gross_response: bool = False,
+    ) -> run._ReplayComposition:
+        composition = original(run, paid_endpoint=paid_endpoint, gross_response=gross_response)
         queue_frozen_h03_order(composition, cast(HistoricalRunInput, run))
         return composition
 
