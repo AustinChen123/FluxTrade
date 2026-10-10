@@ -143,12 +143,14 @@ impl ScenarioAccount {
         if changes.is_empty() {
             return Ok(());
         }
-        let after = owner_context_id(
+        let after = owner_context_id_with_policy(
             scenario,
             marks,
             effective_at,
             self.seed_effective_at,
             &self.config_id,
+            self.is_gross_admission_profile()
+                .then_some(gross_admission::POLICY_ID),
         )?;
         let event_id = format!("P3-SPEC-ACTIVATION-{raw_time_ms}");
         self.activate_context(&context::Input {
@@ -320,12 +322,15 @@ impl ScenarioAccount {
             }
             let (scenario, _) = draft.btc_context()?;
             let before = draft.valuation_context_id;
-            let after = owner_context_id(
+            let after = owner_context_id_with_policy(
                 scenario,
                 &next_marks,
                 at,
                 draft.seed_effective_at,
                 &draft.config_id,
+                draft
+                    .is_gross_admission_profile()
+                    .then_some(gross_admission::POLICY_ID),
             )?;
             let mut row_markers = Vec::with_capacity(products.len());
             for product in &products {

@@ -15,6 +15,10 @@ mod event_limit;
 mod execution;
 mod golden_cancel;
 mod gross_admission;
+mod gross_response;
+#[cfg(test)]
+#[path = "scenario_account/gross_response_tests.rs"]
+mod gross_response_tests;
 mod group;
 mod historical;
 mod hypothetical_settlement;

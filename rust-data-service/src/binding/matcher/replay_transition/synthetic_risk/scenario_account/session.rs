@@ -99,6 +99,34 @@ impl Session {
                 .map_err(boundary)
         })
     }
+    fn gross_response_projection(&mut self) -> Reply {
+        if !self.owner.is_gross_admission_profile() {
+            return Err(BoundaryError::Input("UNSUPPORTED_GROSS_PROFILE"));
+        }
+        self.guarded(false, |s| {
+            gross_response::project(&s.owner)
+                .and_then(|value| value.canonical().map_err(|_| "NATIVE_INVARIANT"))
+                .map_err(boundary)
+        })
+    }
+    fn apply_gross_response_group(&mut self, request: &str, control: &str) -> Reply {
+        if !self.owner.is_gross_admission_profile() {
+            return Err(BoundaryError::Input("UNSUPPORTED_GROSS_PROFILE"));
+        }
+        let decoded = wire::decode(control).map_err(boundary)?;
+        let fields = decoded
+            .object(&["schema_version", "restricted"], &[])
+            .map_err(boundary)?;
+        if fields["schema_version"].text().map_err(boundary)?
+            != "spider_gross_response_group_control_v1"
+        {
+            return Err(BoundaryError::Input("INVALID_SCHEMA"));
+        }
+        let restricted = fields["restricted"].boolean().map_err(boundary)?;
+        self.guarded(true, |s| {
+            s.apply_group_inner_with_restriction(request, restricted)
+        })
+    }
     fn guarded(&mut self, mutation: bool, operation: impl FnOnce(&mut Self) -> Reply) -> Reply {
         if mutation && self.poisoned {
             return Err(BoundaryError::Invariant);
@@ -112,9 +140,14 @@ impl Session {
         result
     }
     fn apply_group_inner(&mut self, request: &str) -> Reply {
+        self.apply_group_inner_with_restriction(request, false)
+    }
+    fn apply_group_inner_with_restriction(&mut self, request: &str, restrict_risk: bool) -> Reply {
         let group = wire::group::decode_group(request, &self.owner).map_err(boundary)?;
         let before = self.owner.state_version;
-        let outcome = self.owner.apply_group_observed(&group, |_| Ok(()));
+        let outcome =
+            self.owner
+                .apply_group_observed_with_restriction(&group, restrict_risk, |_| Ok(()));
         self.group_result(&group, before, outcome)
     }
     fn group_result(

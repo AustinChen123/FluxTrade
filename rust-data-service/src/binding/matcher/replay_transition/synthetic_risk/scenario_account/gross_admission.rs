@@ -126,7 +126,7 @@ impl Decision {
     }
 }
 
-fn reducing_capacity(
+pub(super) fn reducing_capacity(
     owner: &ScenarioAccount,
     intent: &admission::OrderIntent,
 ) -> Result<Option<Decimal>, Fault> {
@@ -141,13 +141,33 @@ fn reducing_capacity(
     if side == position.side || quantity > position.contracts {
         return Ok(None);
     }
-    let committed = owner
+    let committed = committed_reducing(owner, product, position.side)?;
+    let residual = checked(position.contracts.checked_sub(committed))?.max(Decimal::ZERO);
+    Ok(Some(residual))
+}
+
+pub(super) fn closing_capacity(
+    owner: &ScenarioAccount,
+    product: &Product,
+    position_side: Side,
+    position_contracts: Decimal,
+) -> Result<Decimal, Fault> {
+    let committed = committed_reducing(owner, product, position_side)?;
+    Ok(checked(position_contracts.checked_sub(committed))?.max(Decimal::ZERO))
+}
+
+pub(super) fn committed_reducing(
+    owner: &ScenarioAccount,
+    product: &Product,
+    position_side: Side,
+) -> Result<Decimal, Fault> {
+    owner
         .orders
         .values()
         .filter(|order| {
-            order.facts.product == *product_value
+            order.facts.product == ProfileProduct::BtcEth(product.clone())
                 && order.facts.reduce_only
-                && order.facts.side != position.side
+                && order.facts.side != position_side
         })
         .try_fold(Decimal::ZERO, |sum, order| {
             if order.facts.projects_remainder("NATIVE_INVARIANT")? {
@@ -155,9 +175,43 @@ fn reducing_capacity(
             } else {
                 Ok(sum)
             }
-        })?;
-    let residual = checked(position.contracts.checked_sub(committed))?.max(Decimal::ZERO);
-    Ok(Some(residual))
+        })
+}
+
+pub(super) fn current_state_ready(
+    owner: &ScenarioAccount,
+    projection: &Projection,
+    reservation: &reservation::Snapshot,
+) -> Result<bool, Fault> {
+    if owner.gate != Gate::Running
+        || owner.transition.lifecycle != risk_transition::Lifecycle::RiskStable
+    {
+        return Ok(false);
+    }
+    if current_bound_reason(projection)?.is_some()
+        || projection.effective_equity <= reservation.maintenance_margin
+        || reservation.available_margin < Decimal::ZERO
+    {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn current_bound_reason(projection: &Projection) -> Result<Option<Fault>, Fault> {
+    if projection.effective_equity <= Decimal::ZERO {
+        return Ok(Some("GROSS_NON_POSITIVE_EQUITY"));
+    }
+    if projection.market_pending {
+        return Ok(Some("GROSS_PRICE_BOUND_UNAVAILABLE"));
+    }
+    let Some(equity_floor) = projection.equity_floor else {
+        return Ok(Some("GROSS_EQUITY_BOUND_NON_POSITIVE"));
+    };
+    if equity_floor <= Decimal::ZERO {
+        return Ok(Some("GROSS_EQUITY_BOUND_NON_POSITIVE"));
+    }
+    let cap = checked(Decimal::TWO.checked_mul(equity_floor))?;
+    Ok((projection.worst_gross > cap).then_some("GROSS_CAP_EXCEEDED"))
 }
 
 pub(super) fn evaluate(
@@ -183,19 +237,7 @@ pub(super) fn evaluate(
             reducing_exemption: reason.is_none(),
         });
     }
-    let reason = if projection.effective_equity <= Decimal::ZERO {
-        Some("GROSS_NON_POSITIVE_EQUITY")
-    } else if projection.market_pending {
-        Some("GROSS_PRICE_BOUND_UNAVAILABLE")
-    } else if projection
-        .equity_floor
-        .is_none_or(|floor| floor <= Decimal::ZERO)
-    {
-        Some("GROSS_EQUITY_BOUND_NON_POSITIVE")
-    } else {
-        let cap = checked(Decimal::TWO.checked_mul(projection.equity_floor.unwrap()))?;
-        (projection.worst_gross > cap).then_some("GROSS_CAP_EXCEEDED")
-    };
+    let reason = current_bound_reason(&projection)?;
     Ok(Decision {
         projection,
         reason,

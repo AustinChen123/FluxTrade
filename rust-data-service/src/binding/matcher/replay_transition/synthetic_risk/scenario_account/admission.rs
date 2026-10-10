@@ -66,6 +66,21 @@ pub(super) fn fixture_intent_for_product(
     intent
 }
 
+#[cfg(test)]
+pub(super) fn fixture_intent_for_product_role(
+    owner: &ScenarioAccount,
+    id: &str,
+    product: ProfileProduct,
+    side: Side,
+    quantity: Decimal,
+    price: Decimal,
+    reduce_only: bool,
+) -> OrderIntent {
+    let mut intent = fixture_intent_for_product(owner, id, product, side, quantity, price);
+    intent.reduce_only = reduce_only;
+    intent
+}
+
 mod btc_policy;
 #[cfg(test)]
 #[path = "admission/gross_admission_tests.rs"]
@@ -219,6 +234,28 @@ impl OrderIntent {
         ]);
         format!("scenario-order-v1:{digest:02x?}")
     }
+}
+
+#[cfg(test)]
+pub(super) fn historical_reducing_market_fixture(
+    owner: &ScenarioAccount,
+    intent_id: String,
+    client_order_id: String,
+    product_id: &'static str,
+    side: Side,
+    quantity: Decimal,
+) -> OrderIntent {
+    let mut intent = OrderIntent::historical_market_fixture(
+        owner,
+        intent_id,
+        client_order_id,
+        product_id,
+        side,
+        quantity,
+        None,
+    );
+    intent.reduce_only = true;
+    intent
 }
 
 struct Envelope<'a> {
@@ -480,14 +517,24 @@ impl ScenarioAccount {
         stamp: &risk_transition::cancel::Stamp,
         intent: &OrderIntent,
     ) -> Result<(Option<Fault>, String), Fault> {
+        self.group_admit_with_restriction(stamp, intent, false)
+    }
+
+    pub(super) fn group_admit_with_restriction(
+        &mut self,
+        stamp: &risk_transition::cancel::Stamp,
+        intent: &OrderIntent,
+        restrict_risk: bool,
+    ) -> Result<(Option<Fault>, String), Fault> {
         let result = self
-            .admit_stamped_checked(
+            .admit_stamped_with_restriction(
                 &Envelope {
                     event_id: &stamp.event_id,
                     effective_at: stamp.effective_at,
                     intent,
                 },
                 stamp,
+                restrict_risk,
                 |_| Ok(()),
             )?
             .result;
@@ -513,6 +560,16 @@ impl ScenarioAccount {
         stamp: &risk_transition::cancel::Stamp,
         hook: impl FnMut(PrepareStage) -> Result<(), Fault>,
     ) -> Result<Reply, Fault> {
+        self.admit_stamped_with_restriction(envelope, stamp, false, hook)
+    }
+
+    fn admit_stamped_with_restriction(
+        &mut self,
+        envelope: &Envelope<'_>,
+        stamp: &risk_transition::cancel::Stamp,
+        restrict_risk: bool,
+        hook: impl FnMut(PrepareStage) -> Result<(), Fault>,
+    ) -> Result<Reply, Fault> {
         if self.seed_intents.contains(&envelope.intent.intent_id) {
             return Err(self.source_failure("SEED_IDENTITY_CONFLICT"));
         }
@@ -530,7 +587,7 @@ impl ScenarioAccount {
         let historical = stamp.ordering_contract_id == "HISTORICAL_ORDER_V1"
             && matches!(self.profile, ProfileContext::BtcEthScenario { ref scenario, .. } if scenario.configured.is_some());
         let prepared = catch_unwind(AssertUnwindSafe(|| {
-            self.prepare_admission(envelope, historical, hook)
+            self.prepare_admission(envelope, historical, restrict_risk, hook)
         }))
         .map_err(|_| "ADMISSION_PANIC")
         .and_then(|result| result);
@@ -568,6 +625,7 @@ impl ScenarioAccount {
         &self,
         envelope: &Envelope<'_>,
         historical: bool,
+        restrict_risk: bool,
         mut hook: impl FnMut(PrepareStage) -> Result<(), Fault>,
     ) -> Result<Prepared, Fault> {
         let intent = envelope.intent;
@@ -741,6 +799,11 @@ impl ScenarioAccount {
                     (Evaluation::BtcEth(evidence), reason)
                 }
             }
+        };
+        let reason_code = if restrict_risk && !intent.reduce_only && reason_code.is_none() {
+            Some("GROSS_RESPONSE_PENDING")
+        } else {
+            reason_code
         };
         let accepted = reason_code.is_none();
         if accepted {
