@@ -16,12 +16,13 @@ from src.core.backtest.spider_execution_input import (
 )
 from src.core.backtest.spider_run_artifacts import _decimal_text, canonical_bytes
 from src.core.backtest import spider_policy_protocol as policy_protocol
+from src.core.backtest.spider_gross_response import GrossResponseEpisode
 
 
 _REASONS = (
     "PENDING_SEND", "CANCEL_PENDING", "EXIT_PENDING", "RESIDUAL_POSITION",
     "EXIT_REJECTED", "NOTIFICATION_PENDING", "POLL_PENDING", "NATIVE_TERMINAL",
-    "EXECUTION_FAILURE",
+    "EXECUTION_FAILURE", "GROSS_RESPONSE_PENDING",
 )
 
 
@@ -142,6 +143,7 @@ class PaidEndpoint:
     product_operations: dict[str, dict[str, Any]] = field(default_factory=dict)
     last_owner_evidence: dict[str, Any] | None = None
     last_cutoff: int | None = None
+    gross_response: GrossResponseEpisode | None = None
 
     @classmethod
     def admit(
@@ -433,7 +435,7 @@ class PaidEndpoint:
         self, *, role: str, product_id: str, effective_at: int,
         parent_action_id: str | None = None, order_id: str | None = None,
     ) -> dict[str, Any]:
-        if role not in ("DRAIN_CANCEL", "EXIT"):
+        if role not in ("DRAIN_CANCEL", "EXIT", "GROSS_CANCEL", "GROSS_REDUCTION"):
             raise ValueError("INVALID_SCHEMA")
         sequence = len(self.actions)
         identity = sha256(canonical_bytes({
@@ -522,6 +524,9 @@ class PaidEndpoint:
                 return
         if pending_cancel_orders or pending_deliveries:
             return
+        if (self.gross_response is not None
+                and not self.gross_response.gross_drain_obligations_clear(self, composition)):
+            return
         request = composition._paid_snapshot_request(
             "POSITIONS", composition._current_time,
             f"PAID_PROGRESS_{self.contract_hash[:16]}_{composition._last_popped[2]}_{composition._last_popped[3]}",
@@ -543,6 +548,7 @@ class PaidEndpoint:
             if type(quantity) is not D or not quantity.is_finite():
                 raise ValueError("INVALID_SCHEMA")
             if (quantity == 0 or product_id in self.exit_products
+                    or (self._gross_product_blocked(product_id) and not self.drain_started)
                     or product_id in exits_working or product_id in self.rejected_exit_products):
                 continue
             exit_items.append((self._exit_group(composition, product_id, quantity), None))
@@ -550,16 +556,28 @@ class PaidEndpoint:
             composition._admit_set(exit_items)
 
     def has_unbound_cancel(self) -> bool:
-        return any(action["role"] == "DRAIN_CANCEL" and action["order_id"] is None
+        return any(action["role"] in ("DRAIN_CANCEL", "GROSS_CANCEL") and action["order_id"] is None
                    and action["classification"] == "PENDING" for action in self.actions)
+
+    def _gross_product_blocked(self, product_id: str) -> bool:
+        episode = self.gross_response
+        return episode is not None and product_id in episode.blocked_products
+
+    def gross_response_checkpoint(self, composition: Any, cause: str) -> None:
+        episode = self.gross_response
+        if episode is None:
+            return
+        episode.checkpoint(self, composition, cause)
 
     def _grid_order(self, composition: Any, order: Any) -> bool:
         role = self.roles_by_order.get(order["order_id"])
-        if role not in ("GRID", "EXIT"):
+        if role not in ("GRID", "EXIT", "GROSS_REDUCTION"):
             raise ValueError("DEPENDENCY_BINDING_CONFLICT")
         return role == "GRID"
 
-    def _cancel_group(self, composition: Any, order: Any) -> dict[str, Any]:
+    def _cancel_group(
+        self, composition: Any, order: Any, *, role: str = "DRAIN_CANCEL",
+    ) -> dict[str, Any]:
         contract = composition._historical_order_contract
         if contract is None or order["order_id"] not in self.roles_by_order:
             raise ValueError("DEPENDENCY_BINDING_CONFLICT")
@@ -570,7 +588,7 @@ class PaidEndpoint:
         parent_id = f"PAID_DRAIN_{self.contract_hash[:16]}_{sequence}"
         request_id = policy_protocol._historical_child_id(self.contract_hash, parent_id, "CANCEL_REQUEST_EVENT", 0)
         group_id = policy_protocol._historical_child_id(self.contract_hash, parent_id, "CANCEL_REQUEST_GROUP", 0)
-        action = self.new_action(role="DRAIN_CANCEL", product_id=order["product_id"],
+        action = self.new_action(role=role, product_id=order["product_id"],
                                  order_id=order_id, effective_at=acceptance_raw * 16 + 3)
         self.bind_group(action, group_id)
         self.cancel_action_by_request[group_id] = action
@@ -593,29 +611,33 @@ class PaidEndpoint:
             target_order_id=order_id, product_id=order["product_id"],
             strategy_id=contract["strategy_identity"], reason="EXPLICIT_SCENARIO",
             paid_action_id=action["action_id"],
+            paid_action_role=role,
         )
         composition._historical_order_sequence += 1
         return dict(kind="SOURCE_GROUP", schedule_sequence=sequence, group=group)
 
-    def _exit_group(self, composition: Any, product_id: str, quantity: D) -> dict[str, Any]:
+    def _exit_group(
+        self, composition: Any, product_id: str, quantity: D, *, role: str = "EXIT",
+    ) -> dict[str, Any]:
         contract = composition._historical_order_contract
         if contract is None or quantity == 0:
             raise ValueError("INVALID_SCHEMA")
         parent_raw = composition._current_time // 16
         accepted_raw = parent_raw + contract["order_accept_delay_ms"]
         sequence = composition._historical_order_sequence
-        parent_id = f"PAID_EXIT_{self.contract_hash[:16]}_{sequence}"
+        action_name = "GROSS_REDUCTION" if role == "GROSS_REDUCTION" else "EXIT"
+        parent_id = f"PAID_{action_name}_{self.contract_hash[:16]}_{sequence}"
         event_id = policy_protocol._historical_child_id(self.contract_hash, parent_id, "ORDER_EVENT", 0)
         group_id = policy_protocol._historical_child_id(self.contract_hash, parent_id, "ORDER_GROUP", 0)
-        client_id = f"PAID-EXIT-{self.contract_hash[:16]}-{sequence}"
+        client_id = f"PAID-{action_name}-{self.contract_hash[:16]}-{sequence}"
         intent_id = policy_protocol._historical_child_id(self.contract_hash, parent_id, "ORDER_INTENT", 0)
-        action = self.new_action(role="EXIT", product_id=product_id,
+        action = self.new_action(role=role, product_id=product_id,
                                  effective_at=accepted_raw * 16 + 3)
         self.bind_group(action, group_id)
-        composition._paid_role_by_client[client_id] = "EXIT"
+        composition._paid_role_by_client[client_id] = role
         dependency = dict(client_order_id=client_id, product_id=product_id,
                           strategy_id=contract["strategy_identity"], group_id=group_id,
-                          event_id=event_id, state="PENDING", binding=None, role="EXIT")
+                          event_id=event_id, state="PENDING", binding=None, role=role)
         if client_id in composition._historical_send_by_client:
             raise ValueError("DUPLICATE_SEND_DEPENDENCY")
         composition._historical_send_dependencies[group_id] = dependency
@@ -650,6 +672,9 @@ class PaidEndpoint:
         action["result"] = result
         if action["role"] == "EXIT" and classification == "REJECTED":
             self.rejected_exit_products.add(action["product_id"])
+        elif (action["role"] == "GROSS_REDUCTION" and classification == "REJECTED"
+              and self.gross_response is not None):
+            self.gross_response.rejected_products.add(action["product_id"])
 
     def _paid_observation(
         self, composition: Any, scheduler_observation: Mapping[str, Any],
@@ -811,7 +836,7 @@ class PaidEndpoint:
             composition, scheduler_observation,
             current_evidence_complete=current_evidence_complete, failure=failure,
         )
-        return _classify_paid_endpoint_result(
+        result = _classify_paid_endpoint_result(
             request_identity=dict(
                 run_contract_sha256=self.contract_hash,
                 policy_end_ms=self.policy_end_ms,
@@ -824,6 +849,17 @@ class PaidEndpoint:
             paid_observation=paid_observation,
             failure=failure,
         )
+        if self.gross_response is not None:
+            result["gross_response"] = self.gross_response.observation(
+                settlement_complete=(
+                    composition._terminal is None
+                    and current_evidence_complete
+                    and cutoff is not None
+                    and cutoff >= self.settlement_end_ms * 16 + 6
+                ),
+                terminal_failure=composition._terminal is not None,
+            )
+        return result
 
 
 def _error(error: Exception, composition: Any) -> dict[str, Any]:
@@ -868,11 +904,17 @@ def _reason_codes(**state: Any) -> list[str]:
     actions = state["actions"]
     for action in actions:
         if action["classification"] == "PENDING":
-            reasons.add("CANCEL_PENDING" if action["role"] == "DRAIN_CANCEL" else "EXIT_PENDING")
-        elif action["role"] == "EXIT" and action["classification"] == "REJECTED":
+            if action["role"] in ("GROSS_CANCEL", "GROSS_REDUCTION"):
+                reasons.add("GROSS_RESPONSE_PENDING")
+            else:
+                reasons.add("CANCEL_PENDING" if action["role"] == "DRAIN_CANCEL" else "EXIT_PENDING")
+        elif action["role"] in ("EXIT", "GROSS_REDUCTION") and action["classification"] == "REJECTED":
             reasons.add("EXIT_REJECTED")
     if any(action["classification"] == "PENDING" and action["role"] == "EXIT" for action in actions):
         reasons.add("EXIT_PENDING")
+    if any(action["classification"] == "PENDING"
+           and action["role"] in ("GROSS_CANCEL", "GROSS_REDUCTION") for action in actions):
+        reasons.add("GROSS_RESPONSE_PENDING")
     if state["working_exit_orders"]:
         reasons.add("EXIT_PENDING")
     if state["pending_sends"]:

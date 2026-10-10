@@ -355,6 +355,7 @@ class _ReplayComposition:
         self._historical_bars: dict[tuple[int, str], tuple[HistoricalBar, HistoricalBar]] = {}
         self._historical_step_sequence = 0
         self._paid_endpoint: PaidEndpoint | None = None
+        self._gross_start_readiness_checked = False
         self._floating_exit_host = None
         self._paid_role_by_client: dict[str, str] = {}
         self._paid_cancel_attempted_orders: set[str] = set()
@@ -393,8 +394,29 @@ class _ReplayComposition:
         return composition
 
     @classmethod
+    def _from_gross_response_run(cls, request: object) -> "_ReplayComposition":
+        """Create the opt-in run-local gross-response composition."""
+        from src.core.backtest.spider_gross_execution_input import SpiderGrossExecutionInput
+        from src.core.backtest.spider_gross_response import GrossResponseEpisode
+
+        if type(request) is not SpiderGrossExecutionInput:
+            raise ValueError("UNSUPPORTED_CONFIGURATION")
+        episode = GrossResponseEpisode.admit(request)
+        paid_endpoint = PaidEndpoint.admit(
+            request.execution_input,
+            run_contract_hash=episode.contract_hash,
+        )
+        paid_endpoint.gross_response = episode
+        return cls._from_historical_run(
+            request.execution_input.historical_input,
+            paid_endpoint=paid_endpoint,
+            gross_response=True,
+        )
+
+    @classmethod
     def _from_historical_run(
         cls, run: object, *, paid_endpoint: PaidEndpoint | None = None,
+        gross_response: bool = False,
     ) -> "_ReplayComposition":
         """Admit and project a P3 run fully before constructing its sole owner."""
         from src.core.backtest.spider_historical_replay import (
@@ -415,7 +437,8 @@ class _ReplayComposition:
                         if version[key] is not None:
                             version[key] = cast(int, version[key]) * 16
         composition = cls(
-            "SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1",
+            "SYNTHETIC_CONFIGURED_GROSS_ADMISSION_V1"
+            if gross_response else "SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1",
             prepared.account,
             configuration=configuration,
         )
@@ -990,6 +1013,7 @@ class _ReplayComposition:
                 order_id = action.get("order_id")
                 if isinstance(order_id, str):
                     self._paid_cancel_pending_orders.discard(order_id)
+            self._paid_endpoint.gross_response_checkpoint(self, "DELIVERY")
             self._paid_endpoint.progress(self, "DELIVERY")
         return deepcopy(events)
 
@@ -1188,6 +1212,7 @@ class _ReplayComposition:
         )
         if self._paid_endpoint is not None:
             action = self._paid_endpoint.cancel_action_by_request.get(group_id)
+            expected_role = spec.get("paid_action_role", "DRAIN_CANCEL")
             run = cast(Any, self._historical_run)
             bound_sends = [
                 dependency["binding"]
@@ -1213,7 +1238,8 @@ class _ReplayComposition:
                     and matching_seeds[0].get("product_id") == spec["product_id"]
                     and matching_seeds[0].get("strategy_id") == spec["strategy_id"]
                 )
-            if (action is None or action["order_id"] not in (None, resolved)
+            if (action is None or action["role"] != expected_role
+                    or action["order_id"] not in (None, resolved)
                     or self._paid_endpoint.roles_by_order.get(resolved) != "GRID"
                     or not scope_matches):
                 raise _ScheduleError("DEPENDENCY_BINDING_CONFLICT")
@@ -1277,7 +1303,7 @@ class _ReplayComposition:
         policy_protocol._plan_group(group, self._configured_product_ids)
         if self._paid_endpoint is not None and spec.get("paid_action_id") is not None:
             effect_action = self._paid_endpoint.new_action(
-                role="DRAIN_CANCEL", product_id=spec["product_id"],
+                role=spec.get("paid_action_role", "DRAIN_CANCEL"), product_id=spec["product_id"],
                 order_id=spec["target_order_id"],
                 effective_at=effective_at,
                 parent_action_id=spec["paid_action_id"],
@@ -1338,6 +1364,15 @@ class _ReplayComposition:
             if type(until) is not int or not 0 <= until < 2**63 or until < self._current_time:
                 raise _ScheduleError("INVALID_SCHEMA")
             while self._queue and self._queue[0][0] <= until:
+                if (self._paid_endpoint is not None
+                        and self._paid_endpoint.gross_response is not None
+                        and not self._gross_start_readiness_checked):
+                    run = cast(Any, self._historical_run)
+                    start_visible = run.range_start_ms * 16 + 6
+                    if self._queue[0][0] >= start_visible:
+                        self._current_time = start_visible
+                        self._paid_endpoint.gross_response_checkpoint(self, "START_READINESS")
+                        self._gross_start_readiness_checked = True
                 key = heapq.heappop(self._queue)
                 self._current_time, self._last_popped = key[0], key
                 record = self._records[(key[1], key[3])]
@@ -1353,8 +1388,20 @@ class _ReplayComposition:
                     actions = [a for events in self._audit.values() for e in events for a in e.get("actions", []) if a["group_id"] == key[3]]
                     for action in actions:
                         action["status"] = "SUBMITTED"
+                    gross_control = None
                     try:
-                        group = self._codec.apply_group(item["group"])
+                        episode = (self._paid_endpoint.gross_response
+                                   if self._paid_endpoint is not None else None)
+                        if episode is None:
+                            group = self._codec.apply_group(item["group"])
+                        else:
+                            gross_control = dict(
+                                schema_version="spider_gross_response_group_control_v1",
+                                restricted=episode.active,
+                            )
+                            group = self._codec.apply_gross_response_group(
+                                item["group"], restricted=episode.active,
+                            )
                     except Exception as exc:
                         native = wire._native_failure(exc)
                         if native is not None:
@@ -1362,6 +1409,8 @@ class _ReplayComposition:
                                 action["native_failure"] = native
                         raise
                     result["group_result"] = group
+                    if gross_control is not None:
+                        result["gross_group_control"] = deepcopy(gross_control)
                     if self._paid_endpoint is not None:
                         self._paid_endpoint.record_group(key[3], group)
                         lifecycle = group.get("lifecycle_after")
@@ -1370,7 +1419,10 @@ class _ReplayComposition:
                     for action in actions:
                         action["group_result"] = deepcopy(group)
                     record["result"] = deepcopy(result)
-                    self._evidence("SOURCE_GROUP_RESULT", key, dict(request=item["group"], result=group))
+                    self._evidence("SOURCE_GROUP_RESULT", key, dict(
+                        request=item["group"], result=group,
+                        **({"gross_group_control": gross_control} if gross_control is not None else {}),
+                    ))
                     if group["classification"] == "FAULT":
                         record["result"] = self._stop_scheduler(_ScheduleError(cast(str, group.get("failure"))), kind, key[3], group=group)
                         return deepcopy(record["result"])
@@ -1389,7 +1441,7 @@ class _ReplayComposition:
                                 role = self._paid_role_by_client.get(dependency["client_order_id"])
                                 if role is not None:
                                     self._paid_endpoint.roles_by_order[binding["order_id"]] = role
-                                    if role == "EXIT":
+                                    if role in ("EXIT", "GROSS_REDUCTION"):
                                         action = self._paid_endpoint.action_by_group.get(dependency["group_id"])
                                         if action is None:
                                             raise _ScheduleError("DEPENDENCY_BINDING_CONFLICT")
@@ -1433,6 +1485,7 @@ class _ReplayComposition:
                         if targets and isinstance(targets[0].get("target_order_id"), str):
                             self._paid_cancel_pending_orders.discard(targets[0]["target_order_id"])
                     if self._paid_endpoint is not None:
+                        self._paid_endpoint.gross_response_checkpoint(self, "SOURCE_GROUP")
                         self._paid_endpoint.progress(self, "SOURCE_GROUP")
                 elif kind == "SNAPSHOT_CAPTURE":
                     fact = self._codec.capture_snapshot(item["request"])
@@ -1535,6 +1588,7 @@ class _ReplayComposition:
                         if enqueue_next:
                             self._historical_step_sequence += 1
                         if self._paid_endpoint is not None:
+                            self._paid_endpoint.gross_response_checkpoint(self, "MARKET_STEP")
                             self._paid_endpoint.progress(self, "HISTORICAL_MARKET_STEP")
                 elif kind == "HISTORICAL_TIMER":
                     if self._paid_endpoint is not None and self._paid_native_terminal is not None:
@@ -1559,6 +1613,16 @@ class _ReplayComposition:
                     result["market_snapshot"] = snapshot.detached()
                 record["result"] = deepcopy(result)
             self._current_time = until
+            if (self._paid_endpoint is not None
+                    and self._paid_endpoint.gross_response is not None
+                    and not self._gross_start_readiness_checked):
+                run = cast(Any, self._historical_run)
+                start_visible = run.range_start_ms * 16 + 6
+                if until >= start_visible:
+                    self._current_time = start_visible
+                    self._paid_endpoint.gross_response_checkpoint(self, "START_READINESS")
+                    self._gross_start_readiness_checked = True
+                    self._current_time = until
             return dict(kind="DISPATCH", stable_id=None, classification="SUCCESS")
         except _EvidenceCallbackError as exc:
             raise exc.original
@@ -1738,7 +1802,8 @@ class _ReplayComposition:
 
     def _capture_callback(self, delivery: wire.Delivery) -> _CallbackPrefix:
         if (self._paid_endpoint is not None
-                and self._paid_endpoint.delivery_roles.get(delivery["delivery_id"]) == "EXIT"):
+                and self._paid_endpoint.delivery_roles.get(delivery["delivery_id"])
+                in ("EXIT", "GROSS_REDUCTION")):
             return _CallbackPrefix((), None)
         if not self._paid_source_control_enabled(cast(int, delivery["visible_at"])):
             return _CallbackPrefix((), None)
@@ -1752,4 +1817,15 @@ class _ReplayComposition:
         return _CallbackPrefix(tuple(deepcopy(self._policy.events[start:])), error)
 
     def _apply_payload(self, delivery: wire.Delivery) -> None:
-        apply_policy_payload(self._policy, delivery)
+        excluded_order_ids = frozenset()
+        if (delivery["payload_kind"] == "OPEN_ORDER_SNAPSHOT"
+                and self._paid_endpoint is not None
+                and self._paid_endpoint.gross_response is not None):
+            excluded_order_ids = frozenset(
+                order_id
+                for order_id, role in self._paid_endpoint.roles_by_order.items()
+                if role == "GROSS_REDUCTION"
+            )
+        apply_policy_payload(
+            self._policy, delivery, excluded_order_ids=excluded_order_ids,
+        )

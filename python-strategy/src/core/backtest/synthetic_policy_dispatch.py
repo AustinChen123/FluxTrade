@@ -7,7 +7,12 @@ from src.core.backtest import synthetic_scenario_codec as wire
 from src.core.backtest.spider_policy import Policy, fmt
 
 
-def apply_policy_payload(policy: Policy, delivery: wire.Delivery) -> None:
+def apply_policy_payload(
+    policy: Policy,
+    delivery: wire.Delivery,
+    *,
+    excluded_order_ids: frozenset[str] = frozenset(),
+) -> None:
     kind = delivery["payload_kind"]
     payload = delivery["immutable_payload"]
     if kind == "EXECUTION_FACT":
@@ -102,5 +107,6 @@ def apply_policy_payload(policy: Policy, delivery: wire.Delivery) -> None:
                     cTime=str(row["created_at"]),
                 )
                 for row in orders["rows"]
+                if row["order_id"] not in excluded_order_ids
             ]
         )

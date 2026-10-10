@@ -3,7 +3,7 @@ import json
 from importlib.machinery import EXTENSION_SUFFIXES
 from collections.abc import Mapping
 from decimal import Decimal
-from typing import Literal, NotRequired, Protocol, TypeAlias, TypedDict, cast
+from typing import Any, Literal, NotRequired, Protocol, TypeAlias, TypedDict, cast
 
 import fluxtrade_core as _native
 
@@ -28,6 +28,7 @@ Profile = Literal[
     "SYNTHETIC_P1_LIQUIDATION_V1",
     "SYNTHETIC_P1_O03_V1",
     "SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1",
+    "SYNTHETIC_CONFIGURED_GROSS_ADMISSION_V1",
 ]
 Side = Literal["LONG", "SHORT"]
 ObservedSide = Literal["buy", "sell"]
@@ -380,6 +381,7 @@ HistoricalModel = Literal[
 
 class _NativeSession(Protocol):
     def apply_group(self, request: str) -> str: ...
+    def _apply_gross_response_group(self, request: str, control: str) -> str: ...
     def capture_snapshot(self, request: str) -> str: ...
     def build_delivery(self, request: str) -> str: ...
     def historical_market_step(self, request: str) -> str: ...
@@ -387,6 +389,7 @@ class _NativeSession(Protocol):
     def _historical_order_binding(self, event_id: str, source_sequence: int) -> str: ...
     def inspect_state(self) -> str: ...
     def _historical_cost_projection(self) -> str: ...
+    def _gross_response_projection(self) -> str: ...
 
 
 def _new_native_session(
@@ -561,6 +564,7 @@ class ScenarioCodec:
     def apply_group(self, request: Group) -> GroupResult:
         return cast(GroupResult, _decode(self._session.apply_group(_encode(request))))
 
+
     def capture_snapshot(self, request: SnapshotRequest) -> SnapshotFact:
         return cast(SnapshotFact, _decode(self._session.capture_snapshot(_encode(request))))
 
@@ -581,6 +585,21 @@ class ScenarioCodec:
 
     def historical_cost_projection(self) -> SourceCostProjection:
         return cast(SourceCostProjection, _decode(self._session._historical_cost_projection()))
+
+    def gross_response_projection(self) -> dict[str, Any]:
+        return cast(dict[str, Any], _decode(self._session._gross_response_projection()))
+
+    def apply_gross_response_group(self, request: Group, *, restricted: bool) -> GroupResult:
+        if type(restricted) is not bool:
+            raise _native.ScenarioReplayInputError("INVALID_SCHEMA")
+        control = _encode({
+            "schema_version": "spider_gross_response_group_control_v1",
+            "restricted": restricted,
+        })
+        return cast(
+            GroupResult,
+            _decode(self._session._apply_gross_response_group(_encode(request), control)),
+        )
 
 
 def _native_failure(exc: Exception) -> dict[str, str] | None:
