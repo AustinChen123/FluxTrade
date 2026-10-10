@@ -355,6 +355,7 @@ class _ReplayComposition:
         self._historical_bars: dict[tuple[int, str], tuple[HistoricalBar, HistoricalBar]] = {}
         self._historical_step_sequence = 0
         self._paid_endpoint: PaidEndpoint | None = None
+        self._floating_exit_host = None
         self._paid_role_by_client: dict[str, str] = {}
         self._paid_cancel_attempted_orders: set[str] = set()
         self._paid_cancel_pending_orders: set[str] = set()
@@ -370,6 +371,26 @@ class _ReplayComposition:
             raise ValueError("UNSUPPORTED_CONFIGURATION")
         paid_endpoint = PaidEndpoint.admit(request)
         return cls._from_historical_run(request.historical_input, paid_endpoint=paid_endpoint)
+
+    @classmethod
+    def _from_floating_exit_run(cls, request: object) -> "_ReplayComposition":
+        """Admit the distinct candidate identity before constructing its native owner."""
+        from src.core.backtest.spider_floating_exit_host import SpiderFloatingExitHost
+        from src.core.backtest.spider_floating_exit_input import SpiderFloatingExitInput
+
+        if type(request) is not SpiderFloatingExitInput:
+            raise ValueError("UNSUPPORTED_CONFIGURATION")
+        host = SpiderFloatingExitHost.admit(request)
+        paid_endpoint = PaidEndpoint.admit(
+            request.execution_input,
+            run_contract_hash=host.contract_hash,
+        )
+        composition = cls._from_historical_run(
+            request.execution_input.historical_input,
+            paid_endpoint=paid_endpoint,
+        )
+        composition._floating_exit_host = host
+        return composition
 
     @classmethod
     def _from_historical_run(
@@ -1533,6 +1554,8 @@ class _ReplayComposition:
                 else:
                     snapshot = item["snapshot"]
                     self._policy.apply_market(snapshot.policy_markets())
+                    if self._floating_exit_host is not None:
+                        self._floating_exit_host.on_market_cache(self, key[0])
                     result["market_snapshot"] = snapshot.detached()
                 record["result"] = deepcopy(result)
             self._current_time = until

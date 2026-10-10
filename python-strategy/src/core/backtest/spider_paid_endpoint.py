@@ -144,8 +144,16 @@ class PaidEndpoint:
     last_cutoff: int | None = None
 
     @classmethod
-    def admit(cls, request: SpiderExecutionInput) -> "PaidEndpoint":
-        return cls(request, validate_spider_execution_input(request))
+    def admit(
+        cls, request: SpiderExecutionInput, *, run_contract_hash: str | None = None,
+    ) -> "PaidEndpoint":
+        base_hash = validate_spider_execution_input(request)
+        if run_contract_hash is None:
+            run_contract_hash = base_hash
+        elif (type(run_contract_hash) is not str or len(run_contract_hash) != 64
+              or any(character not in "0123456789abcdef" for character in run_contract_hash)):
+            raise ValueError("INVALID_EXECUTION_SCOPE")
+        return cls(request, run_contract_hash)
 
     @property
     def policy_end_ms(self) -> int:
