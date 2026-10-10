@@ -16,12 +16,14 @@ def main(argv: list[str] | None = None) -> int:
     input_group = parser.add_mutually_exclusive_group()
     input_group.add_argument("--historical-input")
     input_group.add_argument("--execution-input")
+    input_group.add_argument("--floating-exit-input")
     args = parser.parse_args(argv)
     try:
         from src.core.backtest.spider_scenario_run import run_spider_scenario
 
         historical_input = None
         execution_input = None
+        floating_exit_input = None
         if args.historical_input is not None:
             try:
                 historical_input = Path(args.historical_input).read_bytes()
@@ -38,6 +40,15 @@ def main(argv: list[str] | None = None) -> int:
                 args.output_root, args.run_id, args.scenario_selector,
                 execution_input=execution_input,
             )
+        elif args.floating_exit_input is not None:
+            try:
+                floating_exit_input = Path(args.floating_exit_input).read_bytes()
+            except OSError:
+                floating_exit_input = b""
+            result = run_spider_scenario(
+                args.output_root, args.run_id, args.scenario_selector,
+                floating_exit_input=floating_exit_input,
+            )
         else:
             result = run_spider_scenario(args.output_root, args.run_id, args.scenario_selector)
     except Exception as error:
@@ -45,7 +56,7 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write("INVALID_INVOCATION\n" if invalid else "INTERNAL_FAILURE\n")
         return 2 if invalid else 3
     print(json.dumps(result, sort_keys=True, separators=(",", ":")))
-    if args.execution_input is not None:
+    if args.execution_input is not None or args.floating_exit_input is not None:
         if result["outcome"] == "REJECTED":
             return 2
         if result["outcome"] != "ADMITTED":
