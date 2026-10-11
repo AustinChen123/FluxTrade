@@ -143,6 +143,16 @@ def test_model_bootstrap_captures_initialized_source_and_native_basis():
     prepared = _prepare(run, _selection(run, confirmation), confirmation)
     inspection = cast(dict[str, object], prepared.owner_evidence["inspection"])
 
+    assert prepared.source_checkpoint_sha256 == (
+        "fed34bc9d78fcb7eca19f2eb3df16da2875f6feef32a0088fba5f6c7c97d7d82"
+    )
+    assert prepared.build_checkpoint_sha256 == (
+        "39bac23e0e71237c4b3394d4e7a5da6a037d75b89ef85626caa0619bba88c586"
+    )
+    assert prepared.initial_source_events_sha256 == (
+        "565e3e696dd35c831b2c4b9d26ffc35201bbcf55bac49b250ae5dea529b7de5c"
+    )
+
     assert prepared.runtime_selection["account_id"] == run.account_key
     assert inspection["account_key"] == {
         "venue": "SPIDER_HISTORICAL_RESEARCH",
