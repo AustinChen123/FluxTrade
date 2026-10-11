@@ -93,6 +93,37 @@ class TestOrderCreation:
 
         assert order.id in mock_order_repo.orders
 
+    def test_prepare_order_has_normal_creation_values_without_persisting(
+        self, mock_order_repo, mock_clock, signal_factory
+    ):
+        order_manager = OrderManager(mock_order_repo, mock_clock)
+        signal = signal_factory(product_id="BYBIT:ETHUSDT-PERP")
+
+        order = order_manager.prepare_order(
+            signal=signal,
+            side=OrderSide.BUY,
+            order_type="limit",
+            quantity=Decimal("0.25"),
+            price=Decimal("42000.5"),
+            client_order_id="client-prepared",
+            intent_payload={"quantity": Decimal("0.25")},
+        )
+
+        assert order.id
+        assert order.exchange_order_id is None
+        assert order.strategy_id == signal.strategy_id
+        assert order.product_id == signal.product_id
+        assert order.exchange_id == "BYBIT"
+        assert order.side == OrderSide.BUY
+        assert order.type == "limit"
+        assert order.quantity == Decimal("0.25")
+        assert order.price == Decimal("42000.5")
+        assert order.status == OrderStatus.NEW.value
+        assert order.timestamp == int(mock_clock.now() * 1000)
+        assert order.client_order_id == "client-prepared"
+        assert order.intent_payload == {"quantity": "0.25"}
+        assert order.id not in mock_order_repo.orders
+
     def test_order_timestamp_from_clock(self, mock_order_repo, mock_clock, signal_factory):
         """Order timestamp should come from clock."""
         mock_clock.set_time(1704153600.0)  # 2024-01-02 00:00:00 UTC

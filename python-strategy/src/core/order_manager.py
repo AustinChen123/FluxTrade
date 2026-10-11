@@ -82,6 +82,40 @@ class OrderManager:
         client_order_id: Optional[str] = None,
         intent_payload: Optional[dict] = None,
     ) -> Order:
+        new_order = self.prepare_order(
+            signal=signal,
+            side=side,
+            order_type=order_type,
+            quantity=quantity,
+            price=price,
+            trigger_price=trigger_price,
+            client_order_id=client_order_id,
+            intent_payload=intent_payload,
+        )
+
+        self.repo.add_order(new_order)
+        logger.info(
+            "Order created %s (%s %s %s %s)",
+            new_order.id,
+            side,
+            order_type,
+            quantity,
+            signal.product_id,
+        )
+        return new_order
+
+    def prepare_order(
+        self,
+        signal: Signal,
+        side: OrderSide | str,
+        order_type: str,
+        quantity: Decimal,
+        price: Optional[Decimal] = None,
+        trigger_price: Optional[Decimal] = None,
+        client_order_id: Optional[str] = None,
+        intent_payload: Optional[dict] = None,
+    ) -> Order:
+        """Build an unsaved Order with the normal creation semantics."""
         if side.lower() not in _VALID_SIDES:
             raise ValueError(
                 f"Invalid order side: {side!r}. Must be one of {_VALID_SIDES}"
@@ -126,16 +160,6 @@ class OrderManager:
                 if intent_payload is not None
                 else None
             ),
-        )
-
-        self.repo.add_order(new_order)
-        logger.info(
-            "Order created %s (%s %s %s %s)",
-            new_order.id,
-            side,
-            order_type,
-            quantity,
-            signal.product_id,
         )
         return new_order
 
