@@ -102,13 +102,29 @@ class LiveOrderRepository(IOrderRepository):
         if client_collision or exchange_collision:
             raise RuntimeError("order_account_identity_legacy_collision")
 
+    def _stage_order(self, db: Session, order: Order) -> None:
+        if self._account_profile is not None:
+            self._reject_legacy_collision(db, order)
+        ensure_product_registered(db, str(order.product_id))
+        db.add(order)
+
+    def stage_order_in_transaction(self, db: Session, order: Order) -> None:
+        """Stage a prepared order in a caller-owned PostgreSQL transaction."""
+        if (
+            not isinstance(db, Session)
+            or not db.is_active
+            or not db.in_transaction()
+            or db.get_bind().dialect.name != "postgresql"
+            or not isinstance(order, Order)
+        ):
+            raise RuntimeError("active_postgresql_order_transaction_required")
+        self._bind_order(order)
+        self._stage_order(db, order)
+
     def add_order(self, order: Order) -> None:
         self._bind_order(order)
         with self._db_session_factory() as db:
-            if self._account_profile is not None:
-                self._reject_legacy_collision(db, order)
-            ensure_product_registered(db, str(order.product_id))
-            db.add(order)
+            self._stage_order(db, order)
             db.commit()
             db.refresh(order)
 

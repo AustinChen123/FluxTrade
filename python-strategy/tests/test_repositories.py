@@ -305,6 +305,23 @@ class TestLiveOrderRepositoryBasics:
             assert persisted is not None
             assert persisted.product_id == "BINANCE:BTCUSDT-PERP"
 
+    def test_caller_transaction_staging_rejects_non_postgresql_session(
+        self, sqlite_order_session_factory, order_factory
+    ):
+        repo = LiveOrderRepository(db_session_factory=sqlite_order_session_factory)
+        order = order_factory(order_id="caller-stage-wrong-dialect")
+
+        with sqlite_order_session_factory() as session:
+            with session.begin():
+                with pytest.raises(
+                    RuntimeError,
+                    match="^active_postgresql_order_transaction_required$",
+                ):
+                    repo.stage_order_in_transaction(session, order)
+                assert session.in_transaction()
+
+        assert repo.get_order(order.id) is None
+
     def test_update_order_commits(
         self,
         sqlite_order_session_factory,
