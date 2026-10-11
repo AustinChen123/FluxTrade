@@ -47,7 +47,11 @@ from src.core.adapters.simulated import (
 from src.core.journal import StrategyJournal
 from src.core.redis_factory import create_redis_client
 from src.core.metrics import ACTIVE_STRATEGIES, BALANCE_USDT
-from src.core.command_router import CommandRouter, StrategyStartDisposition
+from src.core.command_router import (
+    CommandResult,
+    CommandRouter,
+    StrategyStartDisposition,
+)
 from src.core.health_monitor import HealthMonitor
 from src.core.engine_heartbeat_service import EngineHeartbeatService
 from src.core.engine_boot_state_service import EngineBootStateService
@@ -213,6 +217,8 @@ class StrategyEngine:
         ] = frozenset(),
         runtime_bootstrap_factory: RuntimeBootstrapFactory | None = None,
         runtime_capabilities_factory: RuntimeCapabilitiesFactory | None = None,
+        owned_strategy_command_handler: Callable[[dict], CommandResult | None]
+        | None = None,
         strategy_artifact_loader: Callable[
             [],
             dict[str, Type[BaseStrategy] | Type[PortfolioFactory] | str],
@@ -813,6 +819,7 @@ class StrategyEngine:
             ),
             command_router=lambda: self._command_router,
             event_logger=lambda: logger,
+            handle_owned_command=owned_strategy_command_handler,
         )
 
     def startup(

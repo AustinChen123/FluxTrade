@@ -28,6 +28,43 @@ def test_completion_marker_requires_exact_completed(command, completed):
     logger.warning.assert_not_called()
 
 
+@pytest.mark.parametrize("command", ["START", "STOP", "RELOAD", "RESUBMIT", "FORCE_RECOVER"])
+def test_owned_command_is_handled_before_generic_validation_claim_and_router(command):
+    events = []
+    service, router, _, logger = _service(events)
+    service._handle_owned_command = lambda data: events.append(
+        f"owned:{data['command']}"
+    ) or CommandResult(False, "owned rejection")
+
+    service.dispatch({"command": command, "params": {"id": "spider", "expected_version": -1}})
+
+    assert events == ["leadership", f"owned:{command}"]
+    router.handle.assert_not_called()
+    assert logger.warning.call_args.args == (
+        "Command %s failed: %s",
+        command,
+        "owned rejection",
+    )
+
+
+def test_non_owned_command_keeps_generic_validation_and_claim_path():
+    events = []
+    service, router, _, _logger = _service(events)
+    service._handle_owned_command = lambda _data: None
+
+    service.dispatch({
+        "command": "START",
+        "params": {
+            "id": "ordinary",
+            "expected_version": 3,
+            "idempotency_key": "ordinary-key",
+        },
+    })
+
+    assert events == ["leadership", "validate:ordinary:START:3", "claim", "route", "complete"]
+    router.handle.assert_called_once()
+
+
 @pytest.mark.parametrize("error", [RuntimeError("failure"), KeyboardInterrupt()])
 def test_exception_never_marks_completed(error):
     events = []
