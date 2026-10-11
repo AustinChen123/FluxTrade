@@ -10,6 +10,9 @@ from sqlalchemy.orm import sessionmaker
 from src.core.orm_models import Order, Product, Strategy
 from src.core.repositories import LiveOrderRepository
 from test_repositories import TestLiveOrderRepositoryTransactionParticipant as _Contract
+from test_migrations import fresh_pg_db as _migration_fresh_pg_db
+
+fresh_pg_db = _migration_fresh_pg_db
 
 pytest_plugins = ["test_migrations"]
 pytestmark = [
