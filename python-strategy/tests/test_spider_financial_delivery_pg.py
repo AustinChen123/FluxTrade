@@ -1,11 +1,13 @@
 """Actual Execution-to-repository TX A receipts on isolated PostgreSQL."""
 
 from decimal import Decimal
+import logging
 import os
+from threading import Event, Thread
 from typing import Any, cast
 
 import pytest
-from sqlalchemy import Engine, delete, func, select, update
+from sqlalchemy import Engine, delete, event, func, select, text, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from src.control_plane.spider_operation_http import SPIDER_OPERATION_REQUEST_PATH
@@ -27,6 +29,7 @@ from src.core.spider_management.runtime_owner import (
 )
 from src.core.spider_management.orm import (
     SpiderControlReceipt,
+    SpiderRuntimeBinding,
     SpiderRuntimeDelivery,
     SpiderRuntimeOperation,
     SpiderRuntimeScope,
@@ -50,8 +53,10 @@ pytestmark = [
 ]
 
 
-def _install_owner(engine: Engine):
-    run, specs, confirmation, prepared, operation_body = _install_evidence(engine)
+def _install_owner(engine: Engine, *, strategy_id: str = "spider-main"):
+    run, specs, confirmation, prepared, operation_body = _install_evidence(
+        engine, strategy_id=strategy_id
+    )
     app, _service, headers = _operation_http_app(sessionmaker(engine))
     proposal = SpiderOperationRequest.from_canonical_bytes(canonical_bytes(operation_body))
     proposal_response = app.handle(
@@ -92,7 +97,7 @@ def _install_owner(engine: Engine):
             "okx", "account-main"
         ),
     )
-    scope = RuntimeScopeKey("live", "account-main", "spider-main")
+    scope = RuntimeScopeKey("live", "account-main", strategy_id)
     owner = SpiderRuntimeOwner(
         sessionmaker(engine),
         order_manager,
@@ -110,7 +115,7 @@ def _install_owner(engine: Engine):
             "environment": scope.environment,
             "execution_scope_id": scope.execution_scope_id,
             "actor": "api_key",
-            "idempotency_key": "start-confirmation",
+            "idempotency_key": confirmed.idempotency_key,
             "expected_version": 7,
         },
     })
@@ -951,11 +956,19 @@ def test_postcommit_close_loss_is_resolved_by_original_trade_receipt_readback(
 
 
 def test_main_real_engine_restores_then_receives_fill_through_injected_participant(
-    operation_pg, monkeypatch
+    operation_pg, monkeypatch, caplog
 ):
     from src import main as main_module
     from src.core.engine import StrategyEngine
     from src.core.interfaces.exchange import ExchangeOrderEvent
+
+    owner_logger = logging.getLogger("src.core.spider_management.runtime_owner")
+    # Alembic fileConfig disables loggers imported before its migration fixture.
+    monkeypatch.setattr(owner_logger, "disabled", False)
+    if caplog.handler not in owner_logger.handlers:
+        monkeypatch.setattr(
+            owner_logger, "handlers", [*owner_logger.handlers, caplog.handler]
+        )
 
     engine_db = operation_pg
     (
@@ -1055,6 +1068,18 @@ def test_main_real_engine_restores_then_receives_fill_through_injected_participa
             ))
             consumer_event_results.append(result)
             consumer_order_ids.append(order_id)
+            with factory() as session:
+                assert session.scalar(
+                    select(SpiderRuntimeScope.last_consumed_sequence).where(
+                        SpiderRuntimeScope.strategy_id == scope.strategy_id
+                    )
+                ) == 0
+                assert session.scalar(
+                    select(SpiderRuntimeDelivery.disposition).where(
+                        SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                        SpiderRuntimeDelivery.sequence == 1,
+                    )
+                ) == "PENDING"
             # Malformed STOP envelopes carrying an owned identity must be
             # rejected by the owner and never reach generic StrategyState stop.
             owner = owners[0]
@@ -1257,12 +1282,155 @@ def test_main_real_engine_restores_then_receives_fill_through_injected_participa
             )
         )))
     provider_order_id = "main-composition-provider-order"
+    observer = execution._owned_order_event_observer
+    assert observer is not None
+    owners[0].observe_order_event(order_id)
+    with factory() as session:
+        assert session.scalar(
+            select(SpiderRuntimeScope.last_consumed_sequence).where(
+                SpiderRuntimeScope.strategy_id == scope.strategy_id
+            )
+        ) == 1
+    # Create a real pending suffix for the cross-scope proof regression while
+    # suppressing only the post-commit wake, as with a missed notification.
+    execution._owned_order_event_observer = None
     execution.process_exchange_order_event(ExchangeOrderEvent(
         status="open",
         product_id=order.product_id,
         client_order_id=order.client_order_id,
         exchange_order_id=provider_order_id,
     ))
+
+    # Establish a second legitimate stopped scope using the same admitted
+    # model/venue facts; its receipt must never prove scope A.
+    with engine_db.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO strategy(id,name,configuration_json) "
+                "VALUES (:id,:name,'{}')"
+            ),
+            {"id": "spider-other", "name": "Spider other"},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO strategy_state(strategy_id,status,config_json,version) "
+                "VALUES (:id,'ACTIVE','{}',7)"
+            ),
+            {"id": "spider-other"},
+        )
+    (
+        owner_b,
+        scope_b,
+        operation_b,
+        _order_manager_b,
+        _prepared_b,
+        initial_b,
+        confirmation_b,
+        _model_source_b,
+    ) = _install_owner(engine_db, strategy_id="spider-other")
+    owner_b._strategy_state_manager = actual_engine._strategy_state_manager
+    owner_b._lifecycle_lock = actual_engine._strategy_lifecycle_lock
+    owner_b._order_event_lock = execution._order_event_apply_lock
+    stop_b_results: list[CommandResult | None] = []
+    _owned_dispatch(owner_b, stop_b_results).dispatch({
+        "command": "STOP",
+        "strategy_id": scope_b.strategy_id,
+        "params": {
+            "strategy_id": scope_b.strategy_id,
+            "environment": scope_b.environment,
+            "execution_scope_id": scope_b.execution_scope_id,
+            "actor": "api_key",
+            "idempotency_key": "cross-scope-stop-b",
+            "expected_version": cast(int, initial_b["state_version"]),
+        },
+    })
+    assert len(stop_b_results) == 1 and stop_b_results[0] is not None
+    assert stop_b_results[0].success is True
+    readback_b = owner_b.readback(scope_b, operation_b)
+    assert readback_b is not None
+    with factory() as session:
+        a_control_receipt = session.execute(
+            select(
+                SpiderControlReceipt.request_payload,
+                SpiderControlReceipt.request_sha256,
+            ).where(
+                SpiderControlReceipt.environment == scope.environment,
+                SpiderControlReceipt.execution_scope_id == scope.execution_scope_id,
+                SpiderControlReceipt.strategy_id == scope.strategy_id,
+                SpiderControlReceipt.idempotency_key == "main-stop-key",
+            )
+        ).one()
+        b_request_payload = session.scalar(
+            select(SpiderControlReceipt.request_payload).where(
+                SpiderControlReceipt.environment == scope_b.environment,
+                SpiderControlReceipt.execution_scope_id == scope_b.execution_scope_id,
+                SpiderControlReceipt.strategy_id == scope_b.strategy_id,
+                SpiderControlReceipt.idempotency_key == "cross-scope-stop-b",
+            )
+        )
+    saved_a_request_payload = bytes(a_control_receipt.request_payload)
+    saved_a_request_hash = a_control_receipt.request_sha256
+    assert b_request_payload is not None
+    with factory.begin() as session:
+        session.execute(
+            update(SpiderControlReceipt)
+            .where(
+                SpiderControlReceipt.environment == scope.environment,
+                SpiderControlReceipt.execution_scope_id == scope.execution_scope_id,
+                SpiderControlReceipt.strategy_id == scope.strategy_id,
+                SpiderControlReceipt.idempotency_key == "main-stop-key",
+            )
+            .values(request_payload=bytes(b_request_payload))
+        )
+    caplog.clear()
+    owners[0].observe_order_event(order_id)
+    assert owners[0].readback(scope, operation_id) is None
+    assert "SPIDER_STOP_BACKLOG_UNAVAILABLE" in caplog.text
+    assert "reason=STOP_PROOF_UNAVAILABLE" in caplog.text
+    assert owner_b.readback(scope_b, operation_b) == readback_b
+    with factory() as session:
+        assert session.scalar(
+            select(SpiderRuntimeScope.last_consumed_sequence).where(
+                SpiderRuntimeScope.strategy_id == scope.strategy_id
+            )
+        ) == 1
+        assert session.scalar(
+            select(SpiderRuntimeDelivery.disposition).where(
+                SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                SpiderRuntimeDelivery.sequence == 2,
+            )
+        ) == "PENDING"
+        assert session.scalar(
+            select(SpiderRuntimeScope.last_consumed_sequence).where(
+                SpiderRuntimeScope.strategy_id == scope_b.strategy_id
+            )
+        ) == 0
+    with factory.begin() as session:
+        session.execute(
+            update(SpiderControlReceipt)
+            .where(
+                SpiderControlReceipt.environment == scope.environment,
+                SpiderControlReceipt.execution_scope_id == scope.execution_scope_id,
+                SpiderControlReceipt.strategy_id == scope.strategy_id,
+                SpiderControlReceipt.idempotency_key == "main-stop-key",
+            )
+            .values(
+                request_payload=saved_a_request_payload,
+                request_sha256=saved_a_request_hash,
+            )
+        )
+    assert owners[0].readback(scope, operation_id) is not None
+    # Restoring A's exact row proof permits consumption of only A's original
+    # pending suffix; the valid B receipt remains outside this cursor.
+    assert owners[0].restore_owned_runtimes() == frozenset({scope.strategy_id})
+    execution._owned_order_event_observer = observer
+    with factory() as session:
+        assert session.scalar(
+            select(SpiderRuntimeScope.last_consumed_sequence).where(
+                SpiderRuntimeScope.strategy_id == scope.strategy_id
+            )
+        ) == 2
+
     late_full = ExchangeOrderEvent(
         status="filled",
         product_id=order.product_id,
@@ -1276,8 +1444,227 @@ def test_main_real_engine_restores_then_receives_fill_through_injected_participa
         fee_asset="USDT",
         last_fill_exchange_trade_id="main-composition-late-trade",
     )
+    fail_flush = {"armed": True, "hit_staged_writes": False}
+
+    class FailAfterTxBFlush(Session):
+        def flush(self, objects=None) -> None:
+            staged_delivery = any(
+                isinstance(row, SpiderRuntimeDelivery)
+                and row.sequence == 3
+                and row.disposition == "SUPPRESSED"
+                and row.suppression_reason == "STOP_CONTROL"
+                for row in self.dirty
+            )
+            staged_scope = any(
+                isinstance(row, SpiderRuntimeScope)
+                and row.strategy_id == scope.strategy_id
+                and row.last_consumed_sequence == 3
+                for row in self.dirty
+            )
+            super().flush(objects)
+            if fail_flush["armed"] and staged_delivery and staged_scope:
+                assert self.scalar(
+                    select(SpiderRuntimeDelivery.disposition).where(
+                        SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                        SpiderRuntimeDelivery.sequence == 3,
+                    )
+                ) == "SUPPRESSED"
+                assert self.scalar(
+                    select(SpiderRuntimeScope.last_consumed_sequence).where(
+                        SpiderRuntimeScope.strategy_id == scope.strategy_id
+                    )
+                ) == 3
+                fail_flush["armed"] = False
+                fail_flush["hit_staged_writes"] = True
+                raise RuntimeError("injected TX B rollback after staged writes")
+
+    # Commit TX A but hold its notification, then prove corrupted binding and
+    # receipt facts leave the same pending suffix untouched.
+    execution._owned_order_event_observer = None
     assert execution.process_exchange_order_event(late_full)["action"] == "applied"
+    execution._owned_order_event_observer = observer
+    with factory() as session:
+        original_binding_client_id = session.scalar(
+            select(SpiderRuntimeBinding.source_client_order_id).where(
+                SpiderRuntimeBinding.local_order_id == order_id
+            )
+        )
+        original_delivery_hash = session.scalar(
+            select(SpiderRuntimeDelivery.content_sha256).where(
+                SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                SpiderRuntimeDelivery.sequence == 3,
+            )
+        )
+    assert original_binding_client_id is not None
+    assert original_delivery_hash is not None
+    with factory.begin() as session:
+        session.execute(
+            update(SpiderRuntimeBinding)
+            .where(SpiderRuntimeBinding.local_order_id == order_id)
+            .values(source_client_order_id="corrupted-original-binding")
+        )
+    caplog.clear()
+    owners[0].observe_order_event(order_id)
+    assert "SPIDER_STOP_BACKLOG_UNAVAILABLE" in caplog.text
+    assert "reason=INSTALL_OR_RECEIPT_PROOF_UNAVAILABLE" in caplog.text
+    with factory() as session:
+        assert session.scalar(
+            select(SpiderRuntimeScope.last_consumed_sequence).where(
+                SpiderRuntimeScope.strategy_id == scope.strategy_id
+            )
+        ) == 2
+        assert session.scalar(
+            select(SpiderRuntimeDelivery.disposition).where(
+                SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                SpiderRuntimeDelivery.sequence == 3,
+            )
+        ) == "PENDING"
+    with factory.begin() as session:
+        session.execute(
+            update(SpiderRuntimeBinding)
+            .where(SpiderRuntimeBinding.local_order_id == order_id)
+            .values(source_client_order_id=original_binding_client_id)
+        )
+        session.execute(
+            update(SpiderRuntimeDelivery)
+            .where(
+                SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                SpiderRuntimeDelivery.sequence == 3,
+            )
+            .values(content_sha256="0" * 64)
+        )
+    caplog.clear()
+    owners[0].observe_order_event(order_id)
+    assert "SPIDER_STOP_BACKLOG_UNAVAILABLE" in caplog.text
+    assert "reason=INSTALL_OR_RECEIPT_PROOF_UNAVAILABLE" in caplog.text
+    with factory() as session:
+        assert session.scalar(
+            select(SpiderRuntimeScope.last_consumed_sequence).where(
+                SpiderRuntimeScope.strategy_id == scope.strategy_id
+            )
+        ) == 2
+        assert session.scalar(
+            select(SpiderRuntimeDelivery.disposition).where(
+                SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                SpiderRuntimeDelivery.sequence == 3,
+            )
+        ) == "PENDING"
+    with factory.begin() as session:
+        session.execute(
+            update(SpiderRuntimeDelivery)
+            .where(
+                SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                SpiderRuntimeDelivery.sequence == 3,
+            )
+            .values(content_sha256=original_delivery_hash)
+        )
+
+    owners[0]._sessions = sessionmaker(engine_db, class_=FailAfterTxBFlush)
+    owners[0].observe_order_event(order_id)
+    assert fail_flush["armed"] is False
+    assert fail_flush["hit_staged_writes"] is True
+    with factory() as session:
+        assert session.scalar(
+            select(SpiderRuntimeScope.last_consumed_sequence).where(
+                SpiderRuntimeScope.strategy_id == scope.strategy_id
+            )
+        ) == 2
+        assert session.scalar(
+            select(SpiderRuntimeDelivery.disposition).where(
+                SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                SpiderRuntimeDelivery.sequence == 3,
+            )
+        ) == "PENDING"
+        assert session.scalar(
+            select(func.count()).select_from(Trade).where(
+                Trade.order_id == order_id,
+                Trade.exchange_trade_id == "main-composition-late-trade",
+            )
+        ) == 1
+    owners[0]._sessions = factory
+    assert owners[0].restore_owned_runtimes() == frozenset({scope.strategy_id})
+    with factory() as session:
+        assert session.scalar(
+            select(SpiderRuntimeScope.last_consumed_sequence).where(
+                SpiderRuntimeScope.strategy_id == scope.strategy_id
+            )
+        ) == 3
     execution.process_exchange_order_event(late_full)
+    with factory() as session:
+        assert session.scalar(
+            select(SpiderRuntimeScope.last_consumed_sequence).where(
+                SpiderRuntimeScope.strategy_id == scope.strategy_id
+            )
+        ) == 3
+
+    # Commit/close uncertainty on a second-product terminal-cancel receipt resolves
+    # through independent readback of the original sequence, without a write retry.
+    other_order_id = None
+    with factory() as session:
+        other_order_id = session.scalar(
+            select(Order.id)
+            .where(
+                Order.strategy_id == scope.strategy_id,
+                Order.product_id != order.product_id,
+            )
+            .order_by(Order.timestamp, Order.id)
+            .limit(1)
+        )
+    assert other_order_id is not None
+    other_order = execution.order_manager.repo.get_order(other_order_id)
+    assert other_order is not None
+    close_fault = {"armed": True}
+
+    class LoseCommittedTxBClose(Session):
+        def flush(self, objects=None) -> None:
+            has_delivery_write = any(
+                isinstance(row, SpiderRuntimeDelivery) for row in self.dirty
+            )
+            super().flush(objects)
+            if has_delivery_write:
+                self.info["txb_write_flushed"] = True
+
+        def close(self) -> None:
+            committed = self.info.get("txb_committed") is True
+            super().close()
+            if committed and close_fault["armed"]:
+                close_fault["armed"] = False
+                raise RuntimeError("injected committed TX B close loss")
+
+    def mark_txb_commit(session: Session) -> None:
+        if session.info.get("txb_write_flushed") is True:
+            session.info["txb_committed"] = True
+
+    event.listen(LoseCommittedTxBClose, "after_commit", mark_txb_commit)
+
+    owners[0]._sessions = sessionmaker(engine_db, class_=LoseCommittedTxBClose)
+    assert execution.process_exchange_order_event(ExchangeOrderEvent(
+        status="canceled",
+        product_id=other_order.product_id,
+        client_order_id=other_order.client_order_id,
+        exchange_order_id="main-composition-second-provider-order",
+    ))["action"] == "applied"
+    assert close_fault["armed"] is False
+    event.remove(LoseCommittedTxBClose, "after_commit", mark_txb_commit)
+    owners[0]._sessions = factory
+    with factory() as session:
+        assert session.scalar(
+            select(SpiderRuntimeScope.last_consumed_sequence).where(
+                SpiderRuntimeScope.strategy_id == scope.strategy_id
+            )
+        ) == 5
+        assert session.scalar(
+            select(func.count()).select_from(SpiderRuntimeDelivery).where(
+                SpiderRuntimeDelivery.strategy_id == scope.strategy_id
+            )
+        ) == 5
+        assert session.scalar(
+            select(func.count()).select_from(SpiderRuntimeDelivery).where(
+                SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                SpiderRuntimeDelivery.disposition == "SUPPRESSED",
+                SpiderRuntimeDelivery.suppression_reason == "STOP_CONTROL",
+            )
+        ) == 5
     with factory() as session:
         assert session.scalar(
             select(func.count()).select_from(Trade).where(Trade.order_id == order_id)
@@ -1288,6 +1675,245 @@ def test_main_real_engine_restores_then_receives_fill_through_injected_participa
                 SpiderRuntimeDelivery.local_order_id == order_id,
             )
         ) == delivery_count_before_late_fill[0] + 2
+        suppressed = session.execute(
+            select(
+                SpiderRuntimeDelivery.sequence,
+                SpiderRuntimeDelivery.disposition,
+                SpiderRuntimeDelivery.suppression_reason,
+            )
+            .where(SpiderRuntimeDelivery.strategy_id == scope.strategy_id)
+            .order_by(SpiderRuntimeDelivery.sequence)
+        ).all()
+        assert [row.sequence for row in suppressed] == [1, 2, 3, 4, 5]
+        assert all(
+            row.disposition == "SUPPRESSED" and row.suppression_reason == "STOP_CONTROL"
+            for row in suppressed
+        )
+        assert session.scalar(
+            select(SpiderRuntimeScope.last_consumed_sequence).where(
+                SpiderRuntimeScope.strategy_id == scope.strategy_id
+            )
+        ) == 5
+        assert session.scalar(
+            select(func.sum(Trade.quantity)).where(Trade.order_id == order_id)
+        ) == quantity
+        assert session.scalar(
+            select(func.sum(Trade.fee)).where(Trade.order_id == order_id)
+        ) == Decimal("0.01")
+        cancel_facts = session.scalars(
+            select(SpiderRuntimeDelivery.source_payload)
+            .where(
+                SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                SpiderRuntimeDelivery.local_order_id == other_order_id,
+            )
+            .order_by(SpiderRuntimeDelivery.sequence)
+        ).all()
+        assert len(cancel_facts) == 2
+        decoded_cancel_facts = [
+            cast(dict[str, Any], decode_canonical(bytes(payload)))
+            for payload in cancel_facts
+        ]
+        assert [row["kind"] for row in decoded_cancel_facts] == [
+            "ORDER_STATE",
+            "ORDER_STATE",
+        ]
+        assert decoded_cancel_facts[0]["before"]["exchange_order_id"] is None
+        assert decoded_cancel_facts[0]["after"]["exchange_order_id"] == (
+            "main-composition-second-provider-order"
+        )
+        assert decoded_cancel_facts[1]["before"]["exchange_order_id"] == (
+            "main-composition-second-provider-order"
+        )
+        assert decoded_cancel_facts[1]["after"]["status"] == "CANCELLED"
+
+    # A broken suppression proof is unavailable; restoring the exact saved
+    # value reuses the same readback predicate and restores the proved view.
+    caplog.clear()
+    with factory.begin() as session:
+        session.execute(
+            update(SpiderRuntimeDelivery)
+            .where(
+                SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                SpiderRuntimeDelivery.sequence == 2,
+            )
+            .values(suppression_reason="BROKEN")
+        )
+    assert owners[0].readback(scope, operation_id) is None
+    assert owners[0].restore_owned_runtimes() == frozenset({scope.strategy_id})
+    assert "Spider owned runtime readback unavailable for spider-main" in caplog.text
+    with factory.begin() as session:
+        session.execute(
+            update(SpiderRuntimeDelivery)
+            .where(
+                SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                SpiderRuntimeDelivery.sequence == 2,
+            )
+            .values(suppression_reason="STOP_CONTROL")
+        )
+    assert owners[0].readback(scope, operation_id) is not None
+    with factory() as session:
+        stop_request_hash = session.scalar(
+            select(SpiderControlReceipt.request_sha256).where(
+                SpiderControlReceipt.strategy_id == scope.strategy_id,
+                SpiderControlReceipt.idempotency_key == "main-stop-key",
+            )
+        )
+    assert stop_request_hash is not None
+    with factory.begin() as session:
+        session.execute(
+            update(SpiderControlReceipt)
+            .where(
+                SpiderControlReceipt.strategy_id == scope.strategy_id,
+                SpiderControlReceipt.idempotency_key == "main-stop-key",
+            )
+            .values(request_sha256="0" * 64)
+        )
+    assert owners[0].readback(scope, operation_id) is None
+    with factory.begin() as session:
+        session.execute(
+            update(SpiderControlReceipt)
+            .where(
+                SpiderControlReceipt.strategy_id == scope.strategy_id,
+                SpiderControlReceipt.idempotency_key == "main-stop-key",
+            )
+            .values(request_sha256=stop_request_hash)
+        )
+    assert owners[0].readback(scope, operation_id) is not None
+
+    # A missing current STOP proof blocks the next pending fact. Restoring the
+    # exact committed proof lets the same owner resume that finite frontier.
+    with factory() as session:
+        third_order_id = session.scalar(
+            select(Order.id)
+            .where(
+                Order.strategy_id == scope.strategy_id,
+                Order.id.not_in((order_id, other_order_id)),
+            )
+            .order_by(Order.timestamp, Order.id)
+            .limit(1)
+        )
+    assert third_order_id is not None
+    third_order = execution.order_manager.repo.get_order(third_order_id)
+    assert third_order is not None
+    with factory.begin() as session:
+        session.execute(
+            update(SpiderControlReceipt)
+            .where(
+                SpiderControlReceipt.strategy_id == scope.strategy_id,
+                SpiderControlReceipt.idempotency_key == "main-stop-key",
+            )
+            .values(request_sha256="0" * 64)
+        )
+    caplog.clear()
+    assert execution.process_exchange_order_event(ExchangeOrderEvent(
+        status="open",
+        product_id=third_order.product_id,
+        client_order_id=third_order.client_order_id,
+    ))["action"] == "applied"
+    assert "SPIDER_STOP_BACKLOG_UNAVAILABLE" in caplog.text
+    assert "reason=STOP_PROOF_UNAVAILABLE" in caplog.text
+    with factory() as session:
+        assert session.scalar(
+            select(SpiderRuntimeScope.last_consumed_sequence).where(
+                SpiderRuntimeScope.strategy_id == scope.strategy_id
+            )
+        ) == 5
+        assert session.scalar(
+            select(SpiderRuntimeDelivery.disposition).where(
+                SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                SpiderRuntimeDelivery.sequence == 6,
+            )
+        ) == "PENDING"
+    with factory.begin() as session:
+        session.execute(
+            update(SpiderControlReceipt)
+            .where(
+                SpiderControlReceipt.strategy_id == scope.strategy_id,
+                SpiderControlReceipt.idempotency_key == "main-stop-key",
+            )
+            .values(request_sha256=stop_request_hash)
+        )
+    owners[0].observe_order_event(third_order_id)
+    with factory() as session:
+        assert session.scalar(
+            select(SpiderRuntimeScope.last_consumed_sequence).where(
+                SpiderRuntimeScope.strategy_id == scope.strategy_id
+            )
+        ) == 6
+        assert session.scalar(
+            select(SpiderRuntimeDelivery.disposition).where(
+                SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                SpiderRuntimeDelivery.sequence == 6,
+            )
+        ) == "SUPPRESSED"
+
+    # DRAIN remains held: a real post-DRAIN TX A fact stays pending.
+    with factory() as session:
+        fourth_order_id = session.scalar(
+            select(Order.id)
+            .where(
+                Order.strategy_id == scope.strategy_id,
+                Order.id.not_in((order_id, other_order_id, third_order_id)),
+            )
+            .order_by(Order.timestamp, Order.id)
+            .limit(1)
+        )
+    assert fourth_order_id is not None
+    fourth_order = execution.order_manager.repo.get_order(fourth_order_id)
+    assert fourth_order is not None
+    with factory.begin() as session:
+        session.execute(
+            update(SpiderRuntimeScope)
+            .where(SpiderRuntimeScope.strategy_id == scope.strategy_id)
+            .values(control_mode="DRAIN")
+        )
+    assert execution.process_exchange_order_event(ExchangeOrderEvent(
+        status="open",
+        product_id=fourth_order.product_id,
+        client_order_id=fourth_order.client_order_id,
+    ))["action"] == "applied"
+    with factory() as session:
+        assert session.scalar(
+            select(SpiderRuntimeScope.last_consumed_sequence).where(
+                SpiderRuntimeScope.strategy_id == scope.strategy_id
+            )
+        ) == 6
+        assert session.scalar(
+            select(SpiderRuntimeDelivery.disposition).where(
+                SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                SpiderRuntimeDelivery.sequence == 7,
+            )
+        ) == "PENDING"
+    with factory.begin() as session:
+        session.execute(
+            update(SpiderRuntimeScope)
+            .where(SpiderRuntimeScope.strategy_id == scope.strategy_id)
+            .values(control_mode="STOP")
+        )
+    owners[0].observe_order_event(fourth_order_id)
+    with factory() as session:
+        assert session.scalar(
+            select(SpiderRuntimeScope.last_consumed_sequence).where(
+                SpiderRuntimeScope.strategy_id == scope.strategy_id
+            )
+        ) == 7
+
+    # Observer failure must not rewrite the already-applied duplicate event or
+    # latch the global order-event stream. No duplicate receipt/Trade is made.
+    execution._owned_order_event_observer = lambda _order_id: (_ for _ in ()).throw(
+        RuntimeError("injected observer failure")
+    )
+    assert execution.process_exchange_order_event(late_full)["action"] == "applied"
+    execution._owned_order_event_observer = observer
+    with factory() as session:
+        assert session.scalar(
+            select(func.count()).select_from(Trade).where(Trade.order_id == order_id)
+        ) == 2
+        assert session.scalar(
+            select(SpiderRuntimeScope.last_consumed_sequence).where(
+                SpiderRuntimeScope.strategy_id == scope.strategy_id
+            )
+        ) == 7
 
     # A second authorized STOP advances the lifecycle version after the real
     # late fill advanced the receiver barrier. Retrying the original key must
@@ -1309,9 +1935,51 @@ def test_main_real_engine_restores_then_receives_fill_through_injected_participa
         assert len(results) == 1 and results[0] is not None
         return cast(CommandResult, results[0])
 
+    observer_entered = Event()
+    release_observer = Event()
+    interleaved_result: list[dict[str, object]] = []
+
+    def delayed_observer(local_order_id: str) -> None:
+        observer_entered.set()
+        assert release_observer.wait(timeout=10)
+        observer(local_order_id)
+
+    execution._owned_order_event_observer = delayed_observer
+    interleaved_event = ExchangeOrderEvent(
+        status="canceled",
+        product_id=fourth_order.product_id,
+        client_order_id=fourth_order.client_order_id,
+    )
+    event_thread = Thread(
+        target=lambda: interleaved_result.append(
+            execution.process_exchange_order_event(interleaved_event)
+        )
+    )
+    event_thread.start()
+    assert observer_entered.wait(timeout=10)
+    with factory() as session:
+        assert session.scalar(
+            select(SpiderRuntimeDelivery.disposition).where(
+                SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                SpiderRuntimeDelivery.sequence == 8,
+            )
+        ) == "PENDING"
+        assert session.scalar(
+            select(SpiderRuntimeScope.last_consumed_sequence).where(
+                SpiderRuntimeScope.strategy_id == scope.strategy_id
+            )
+        ) == 7
     second_stop = dispatch_stop(
         "main-stop-key-b", cast(int, initial["state_version"]) + 1
     )
+    assert second_stop.success is True and second_stop.data is not None
+    assert second_stop.data["disposition"] == "COMPLETED"
+    release_observer.set()
+    event_thread.join(timeout=10)
+    assert not event_thread.is_alive()
+    assert len(interleaved_result) == 1
+    assert interleaved_result[0]["action"] == "applied"
+    execution._owned_order_event_observer = observer
     assert second_stop.success is True and second_stop.data is not None
     assert second_stop.data["disposition"] == "COMPLETED"
     with factory() as session:
@@ -1321,6 +1989,7 @@ def test_main_real_engine_restores_then_receives_fill_through_injected_participa
                 SpiderRuntimeScope.state_version,
                 SpiderRuntimeScope.control_barrier_sequence,
                 SpiderRuntimeScope.last_received_sequence,
+                SpiderRuntimeScope.last_consumed_sequence,
                 SpiderRuntimeScope.current_operation_id,
                 SpiderRuntimeScope.generation,
             ).where(SpiderRuntimeScope.strategy_id == scope.strategy_id)
@@ -1331,6 +2000,8 @@ def test_main_real_engine_restores_then_receives_fill_through_injected_participa
             )
         ) == 2
     assert after_b.control_mode == "STOP"
+    assert after_b.last_received_sequence == 8
+    assert after_b.last_consumed_sequence == 8
     assert after_b.state_version == cast(int, initial["state_version"]) + 2
     assert after_b.control_barrier_sequence == after_b.last_received_sequence
     assert after_b.control_barrier_sequence > stop_barriers[0]
@@ -1349,6 +2020,7 @@ def test_main_real_engine_restores_then_receives_fill_through_injected_participa
                 SpiderRuntimeScope.state_version,
                 SpiderRuntimeScope.control_barrier_sequence,
                 SpiderRuntimeScope.last_received_sequence,
+                SpiderRuntimeScope.last_consumed_sequence,
                 SpiderRuntimeScope.current_operation_id,
                 SpiderRuntimeScope.generation,
             ).where(SpiderRuntimeScope.strategy_id == scope.strategy_id)

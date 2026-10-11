@@ -139,6 +139,7 @@ class ExecutionEngine:
         pending_protection_fill_processor: PendingProtectionFillProcessor | None = None,
         entry_candle_freshness_enabled: bool = False,
         repository_transaction_participant: OrderTransactionParticipant | None = None,
+        owned_order_event_observer: Callable[[str], None] | None = None,
     ):
         _validate_order_transaction_participant_target(
             order_repository,
@@ -156,6 +157,7 @@ class ExecutionEngine:
         self._order_event_processor = (
             order_event_processor or process_order_event_without_venue_policy
         )
+        self._owned_order_event_observer = owned_order_event_observer
         self._pending_protection_fill_processor = (
             pending_protection_fill_processor
             or audit_pending_protection_without_venue_policy
@@ -876,7 +878,18 @@ class ExecutionEngine:
             )
             if result.get("action") == "applied_position_cache_failed":
                 self._latch_fill_position_cache_failure()
-            return result
+        if (
+            self._owned_order_event_observer is not None
+            and result.get("action") in {"applied", "applied_position_cache_failed"}
+            and type(result.get("order_id")) is str
+        ):
+            try:
+                self._owned_order_event_observer(cast(str, result["order_id"]))
+            except Exception:
+                self.logger.exception(
+                    "Owned order-event observer failed after committed financial application"
+                )
+        return result
 
     @property
     def fill_position_cache_failed(self) -> bool:

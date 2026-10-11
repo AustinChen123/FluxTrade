@@ -225,6 +225,7 @@ class StrategyEngine:
         | None = None,
         repository_transaction_participant: OrderTransactionParticipant | None = None,
         owned_runtime_restorer: Callable[[], frozenset[str]] | None = None,
+        owned_order_event_observer: Callable[[str], None] | None = None,
         strategy_artifact_loader: Callable[
             [],
             dict[str, Type[BaseStrategy] | Type[PortfolioFactory] | str],
@@ -449,6 +450,7 @@ class StrategyEngine:
                 runtime_bootstrap.audit_pending_protection_fill
             ),
             repository_transaction_participant=repository_transaction_participant,
+            owned_order_event_observer=owned_order_event_observer,
         )
         self._lifecycle_adapter = _EngineLifecycleAdapter(self)
         self._health_monitor = HealthMonitor(self._registry)

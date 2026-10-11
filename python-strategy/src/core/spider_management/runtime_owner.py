@@ -42,11 +42,13 @@ from src.core.spider_management.control_command import (
     SpiderControlCommandError,
     SpiderManagementCommand,
     SpiderControlWriteResult,
+    hydrate_control_receipt,
     verify_stop_in_transaction,
     write_stop_in_transaction,
 )
 from src.core.spider_management.orm import (
     SpiderConfigurationRequest,
+    SpiderControlReceipt,
     SpiderOperationRequestRow,
     SpiderRuntimeAction,
     SpiderRuntimeBinding,
@@ -168,6 +170,7 @@ class SpiderRuntimeOwner:
                             SpiderRuntimeScope.strategy_id == scope.strategy_id,
                         )
                     ).scalar_one_or_none()
+                self._drain_stopped_scope(scope)
                 if operation_id is not None and self.readback(scope, operation_id) is None:
                     logging.getLogger(__name__).warning(
                         "Spider owned runtime readback unavailable for %s",
@@ -179,6 +182,196 @@ class SpiderRuntimeOwner:
                     scope.strategy_id,
                 )
         return owned
+
+    def observe_order_event(self, local_order_id: str) -> None:
+        """Wake STOP-only receipt consumption after committed financial application."""
+        if type(local_order_id) is not str or not local_order_id:
+            return
+        try:
+            with self._sessions() as session:
+                if not isinstance(session, Session) or session.in_transaction() or not session.is_active:
+                    return
+                row = session.execute(
+                    select(
+                        SpiderRuntimeBinding.environment,
+                        SpiderRuntimeBinding.execution_scope_id,
+                        SpiderRuntimeBinding.strategy_id,
+                    ).where(SpiderRuntimeBinding.local_order_id == local_order_id)
+                ).mappings().one_or_none()
+            if row is None:
+                return
+            scope = self._owned_scopes.get(cast(str, row["strategy_id"]))
+            if scope is None or (scope.environment, scope.execution_scope_id) != (
+                row["environment"], row["execution_scope_id"]
+            ):
+                return
+            self._drain_stopped_scope(scope)
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Spider STOP delivery observer could not drain committed facts"
+            )
+
+    def _current_stop_proof(
+        self, session: Session, scope: RuntimeScopeKey, runtime: SpiderRuntimeScope
+    ) -> dict[str, object] | None:
+        table = SpiderControlReceipt.__table__
+        rows = session.execute(
+            select(table).where(
+                table.c.environment == scope.environment,
+                table.c.execution_scope_id == scope.execution_scope_id,
+                table.c.strategy_id == scope.strategy_id,
+                table.c.operation_id == runtime.current_operation_id,
+                table.c.generation == runtime.generation,
+                table.c.after_state_version == runtime.state_version,
+                table.c.outcome == "COMPLETED",
+            ).limit(2)
+        ).mappings().all()
+        if len(rows) != 1:
+            return None
+        try:
+            request, proof = hydrate_control_receipt(rows[0])
+        except SpiderControlCommandError:
+            return None
+        if (
+            (request.environment, request.execution_scope_id, request.strategy_id)
+            != (scope.environment, scope.execution_scope_id, scope.strategy_id)
+            or proof["operation_id"] != runtime.current_operation_id
+            or proof["generation"] != runtime.generation
+            or proof["after_state_version"] != runtime.state_version
+        ):
+            return None
+        return verify_stop_in_transaction(session, request)
+
+    @staticmethod
+    def _warn_stop_backlog_unavailable(
+        scope: RuntimeScopeKey, sequence: int | None, reason: str
+    ) -> None:
+        logging.getLogger(__name__).warning(
+            "SPIDER_STOP_BACKLOG_UNAVAILABLE strategy=%s sequence=%s reason=%s",
+            scope.strategy_id,
+            sequence,
+            reason,
+        )
+
+    def _drain_stopped_scope(self, scope: RuntimeScopeKey) -> None:
+        """Consume a finite committed STOP backlog, one caller-owned TX per row."""
+        try:
+            with self._sessions() as session:
+                if (
+                    not isinstance(session, Session)
+                    or session.in_transaction()
+                    or not session.is_active
+                    or session.get_bind().dialect.name != "postgresql"
+                ):
+                    self._warn_stop_backlog_unavailable(scope, None, "SESSION_UNAVAILABLE")
+                    return
+                snapshot = session.execute(
+                    select(
+                        SpiderRuntimeScope.current_operation_id,
+                        SpiderRuntimeScope.control_mode,
+                        SpiderRuntimeScope.last_consumed_sequence,
+                        SpiderRuntimeScope.last_received_sequence,
+                    ).where(
+                        SpiderRuntimeScope.environment == scope.environment,
+                        SpiderRuntimeScope.execution_scope_id == scope.execution_scope_id,
+                        SpiderRuntimeScope.strategy_id == scope.strategy_id,
+                    )
+                ).one_or_none()
+            if snapshot is None:
+                self._warn_stop_backlog_unavailable(scope, None, "RUNTIME_MISSING")
+                return
+            operation_id, control_mode, consumed, frontier = snapshot
+            if type(operation_id) is not str or type(consumed) is not int or type(frontier) is not int:
+                return
+            if control_mode != "STOP" or consumed >= frontier:
+                return
+            if self._order_event_lock is None:
+                self._warn_stop_backlog_unavailable(scope, None, "LOCK_UNAVAILABLE")
+                return
+            for sequence in range(consumed + 1, frontier + 1):
+                with cast(ContextManager[object], self._order_event_lock):
+                    try:
+                        with self._sessions() as session:
+                            if (
+                                not isinstance(session, Session)
+                                or session.in_transaction()
+                                or not session.is_active
+                                or session.get_bind().dialect.name != "postgresql"
+                            ):
+                                self._warn_stop_backlog_unavailable(
+                                    scope, sequence, "SESSION_UNAVAILABLE"
+                                )
+                                return
+                            with session.begin():
+                                self._configure_writer(session)
+                                runtime = session.execute(
+                                    select(SpiderRuntimeScope).where(
+                                        SpiderRuntimeScope.environment == scope.environment,
+                                        SpiderRuntimeScope.execution_scope_id == scope.execution_scope_id,
+                                        SpiderRuntimeScope.strategy_id == scope.strategy_id,
+                                    ).with_for_update()
+                                ).scalar_one_or_none()
+                                if runtime is None or runtime.current_operation_id != operation_id:
+                                    self._warn_stop_backlog_unavailable(
+                                        scope, sequence, "RUNTIME_IDENTITY_MISMATCH"
+                                    )
+                                    return
+                                if runtime.control_mode != "STOP":
+                                    return
+                                if (
+                                    runtime.last_consumed_sequence != sequence - 1
+                                    or runtime.last_received_sequence < sequence
+                                ):
+                                    self._warn_stop_backlog_unavailable(
+                                        scope, sequence, "RECEIPT_FRONTIER_MISMATCH"
+                                    )
+                                    return
+                                if self._current_stop_proof(session, scope, runtime) is None:
+                                    self._warn_stop_backlog_unavailable(
+                                        scope, sequence, "STOP_PROOF_UNAVAILABLE"
+                                    )
+                                    return
+                                if self.readback(scope, operation_id) is None:
+                                    self._warn_stop_backlog_unavailable(
+                                        scope, sequence, "INSTALL_OR_RECEIPT_PROOF_UNAVAILABLE"
+                                    )
+                                    return
+                                delivery = session.execute(
+                                    select(SpiderRuntimeDelivery).where(
+                                        SpiderRuntimeDelivery.environment == scope.environment,
+                                        SpiderRuntimeDelivery.execution_scope_id == scope.execution_scope_id,
+                                        SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                                        SpiderRuntimeDelivery.sequence == sequence,
+                                    ).with_for_update()
+                                ).scalar_one_or_none()
+                                if (
+                                    delivery is None
+                                    or delivery.disposition != "PENDING"
+                                    or delivery.suppression_reason is not None
+                                    or _digest_bytes(bytes(delivery.source_payload))
+                                    != delivery.content_sha256
+                                ):
+                                    self._warn_stop_backlog_unavailable(
+                                        scope, sequence, "DELIVERY_PROOF_UNAVAILABLE"
+                                    )
+                                    return
+                                delivery.disposition = "SUPPRESSED"
+                                delivery.suppression_reason = "STOP_CONTROL"
+                                runtime.last_consumed_sequence = sequence
+                    except Exception:
+                        # Commit/close uncertainty is resolved only by fresh proof below.
+                        pass
+                proved = self.readback(scope, operation_id)
+                consumed_after = None if proved is None else proved.get("consumed_sequence")
+                if type(consumed_after) is not int or consumed_after < sequence:
+                    self._warn_stop_backlog_unavailable(
+                        scope, sequence, "SUPPRESSION_COMMIT_UNPROVED"
+                    )
+                    return
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Spider STOP backlog restoration unavailable for %s", scope.strategy_id
+            )
 
     def handle_owned_command(self, message: dict) -> CommandResult | None:
         if type(message) is not dict:
@@ -885,22 +1078,38 @@ class SpiderRuntimeOwner:
                         .where(SpiderRuntimeAction.plan_id == plan.plan_id)
                     ).scalars().all())
                     scoped_receipts = session.execute(
-                        select(
-                            SpiderRuntimeDelivery.local_order_id,
-                            SpiderRuntimeDelivery.sequence,
-                        ).where(
+                        select(SpiderRuntimeDelivery).where(
                             SpiderRuntimeDelivery.environment == scope.environment,
                             SpiderRuntimeDelivery.execution_scope_id == scope.execution_scope_id,
                             SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
                         ).order_by(SpiderRuntimeDelivery.sequence)
-                    ).mappings().all()
+                    ).scalars().all()
                     if (
                         len(scoped_receipts) != runtime.last_received_sequence
                         or any(
-                            row["sequence"] != index
-                            or row["local_order_id"] not in plan_order_ids
+                            row.sequence != index
+                            or row.local_order_id not in plan_order_ids
+                            or (
+                                index <= runtime.last_consumed_sequence
+                                and (
+                                    row.disposition != "SUPPRESSED"
+                                    or row.suppression_reason != "STOP_CONTROL"
+                                )
+                            )
+                            or (
+                                index > runtime.last_consumed_sequence
+                                and (row.disposition != "PENDING" or row.suppression_reason is not None)
+                            )
                             for index, row in enumerate(scoped_receipts, 1)
                         )
+                    ):
+                        return None
+                    if (
+                        runtime.last_consumed_sequence > 0
+                        and runtime.control_mode != "STOP"
+                    ) or (
+                        runtime.control_mode == "STOP"
+                        and self._current_stop_proof(session, scope, runtime) is None
                     ):
                         return None
                     if _digest_bytes(runtime.source_checkpoint) != runtime.source_checkpoint_sha256:

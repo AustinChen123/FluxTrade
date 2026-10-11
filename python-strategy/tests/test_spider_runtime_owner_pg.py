@@ -58,17 +58,18 @@ pytestmark = [
 ]
 
 
-def _install_evidence(engine: Engine):
+def _install_evidence(engine: Engine, *, strategy_id: str = "spider-main"):
     run = replace(_admitted_run(), account_key="account-main")
     template = _confirmation(run).request
+    key_suffix = "" if strategy_id == "spider-main" else f"-{strategy_id}"
     configuration_store = SpiderConfigurationRequestStore(sessionmaker(engine))
     proposal = SpiderConfigurationRequest.from_fields(
         environment="live",
         execution_scope_id="account-main",
-        strategy_id="spider-main",
+        strategy_id=strategy_id,
         request_kind=SpiderConfigurationRequestKind.PROPOSAL,
         actor="operator",
-        idempotency_key="c2-proposal",
+        idempotency_key=f"c2-proposal{key_suffix}",
         expected_state_version=7,
         configuration=template.configuration.value,
     )
@@ -77,10 +78,10 @@ def _install_evidence(engine: Engine):
     confirmation = SpiderConfigurationRequest.from_fields(
         environment="live",
         execution_scope_id="account-main",
-        strategy_id="spider-main",
+        strategy_id=strategy_id,
         request_kind=SpiderConfigurationRequestKind.CONFIRMATION,
         actor="operator",
-        idempotency_key="start-confirmation",
+        idempotency_key=f"start-confirmation{key_suffix}",
         expected_state_version=7,
         configuration=template.configuration.value,
         proposal_request_id=proposal.request_id,
@@ -94,7 +95,7 @@ def _install_evidence(engine: Engine):
         "schema_version": "SPIDER_RUNTIME_SELECTION_V1",
         "environment": "live",
         "execution_scope_id": "account-main",
-        "strategy_id": "spider-main",
+        "strategy_id": strategy_id,
         "confirmation_request_id": confirmation.request_id,
         "configuration_sha256": confirmation.configuration.sha256,
         "host_contract_id": "SPIDER_DURABLE_HOST_V1",
@@ -118,7 +119,7 @@ def _install_evidence(engine: Engine):
     operation_body.update({
         "environment": "live",
         "execution_scope_id": "account-main",
-        "strategy_id": "spider-main",
+        "strategy_id": strategy_id,
         "actor": "api_key",
         "idempotency_key": "install-proposal",
     })

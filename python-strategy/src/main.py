@@ -316,10 +316,17 @@ def main(spider_composition: SpiderRuntimeComposition | None = None):
                         return
                     owner.participate_in_order_transaction(session, order, trade)
 
+                def observe_owned_order_event(order_id: str) -> None:
+                    owner = spider_owner_ref[0]
+                    if owner is None:
+                        raise RuntimeError("SPIDER_OWNER_UNAVAILABLE")
+                    owner.observe_order_event(order_id)
+
                 spider_callbacks = {
                     "owned_strategy_command_handler": handle_owned_command,
                     "owned_runtime_restorer": restore_owned_runtimes,
                     "repository_transaction_participant": participate_in_order_transaction,
+                    "owned_order_event_observer": observe_owned_order_event,
                 }
             engine = StrategyEngine(
                 db_session=db_session,
