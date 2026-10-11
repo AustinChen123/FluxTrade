@@ -36,6 +36,7 @@ from src.control_plane.ga_lifecycle import GaJobStatus
 from src.control_plane.jobs import JobStore
 from src.control_plane.ops_status_query import OpsStatusQuery
 from src.control_plane.profile_http_query import ProfileQueryService
+from src.control_plane.spider_configuration_http import SpiderConfigurationHttpService
 from src.core.market_data.profiles.read_repository import ProfileReadRepository
 from src.control_plane.server import serve
 from src.core.db import SessionLocal, get_engine
@@ -104,7 +105,20 @@ def build_control_plane_app(
     readiness_probe: Callable[[], None] | None = None,
     profile_query_service: ProfileQueryService | None = None,
     strategy_loader: Callable[[], Mapping[str, object]] | None = None,
+    spider_execution_scope_id: str | None = None,
 ) -> ControlPlaneApp:
+    configured_spider_scope = (
+        spider_execution_scope_id
+        if spider_execution_scope_id is not None
+        else os.getenv("CONTROL_PLANE_SPIDER_EXECUTION_SCOPE_ID")
+    )
+    spider_configuration_http_service = None
+    if configured_spider_scope is not None:
+        spider_configuration_http_service = SpiderConfigurationHttpService(
+            db_session_factory,
+            environment=RuntimeEnvironment.from_env().identity,
+            execution_scope_id=configured_spider_scope,
+        )
     if redis_client is None:
         redis_client = create_redis_client()
     invalidation_hub = ControlPlaneInvalidationHub()
@@ -224,6 +238,7 @@ def build_control_plane_app(
         backtest_results_query_service=backtest_results_query_service,
         invalidation_hub=invalidation_hub,
         ga_command_service=ga_command_service,
+        spider_configuration_http_service=spider_configuration_http_service,
         readiness_probe=(
             readiness_probe
             if readiness_probe is not None
