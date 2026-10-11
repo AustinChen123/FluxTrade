@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from hashlib import sha256
+from types import MappingProxyType
 from typing import ContextManager, cast
 
 from sqlalchemy import select, text
@@ -15,8 +17,9 @@ from src.core.backtest.spider_historical_input import HistoricalRunInput
 from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_canonical
 from src.core.client_order_id import market_signal_client_order_id
 from src.core.command_router import CommandResult
+from src.core.decimal_math import canonical_decimal_text
 from src.core.models import OrderSide, Signal, SignalType
-from src.core.orm_models import Order, StrategyState
+from src.core.orm_models import Order, StrategyState, Trade
 from src.core.order_manager import OrderManager
 from src.core.product_registry import InstrumentSpec
 from src.core.repositories import LiveOrderRepository
@@ -31,11 +34,16 @@ from src.core.spider_management.model_bootstrap import (
 )
 from src.core.spider_management.operation_request import SpiderOperationRequest
 from src.core.spider_management.operation_request_store import _mapping
+from src.core.spider_management.financial_delivery import (
+    stage_financial_receipt,
+    validate_order_receipt_chain,
+)
 from src.core.spider_management.orm import (
     SpiderConfigurationRequest,
     SpiderOperationRequestRow,
     SpiderRuntimeAction,
     SpiderRuntimeBinding,
+    SpiderRuntimeDelivery,
     SpiderRuntimeOperation,
     SpiderRuntimePlan,
     SpiderRuntimeScope,
@@ -56,6 +64,27 @@ class RuntimeScopeKey:
     environment: str
     execution_scope_id: str
     strategy_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class SpiderRuntimeComposition:
+    """Private trusted launcher input; absent input keeps ordinary startup."""
+
+    owned_scopes: tuple[RuntimeScopeKey, ...]
+    model_sources_by_confirmation: Mapping[str, ModelInstallSource]
+
+    def __post_init__(self) -> None:
+        if type(self.owned_scopes) is not tuple or not self.owned_scopes:
+            raise ValueError("Spider composition requires ordered owned scopes")
+        if len({row.strategy_id for row in self.owned_scopes}) != len(self.owned_scopes):
+            raise ValueError("Spider composition strategy scopes must be unique")
+        if not isinstance(self.model_sources_by_confirmation, Mapping):
+            raise ValueError("Spider model sources must be an explicit mapping")
+        object.__setattr__(
+            self,
+            "model_sources_by_confirmation",
+            MappingProxyType(dict(self.model_sources_by_confirmation)),
+        )
 
 
 class _ExistingInstallReadback(Exception):
@@ -85,6 +114,55 @@ class SpiderRuntimeOwner:
         self._model_sources = dict(model_sources_by_confirmation)
         self._lock_timeout_ms = lock_timeout_ms
         self._statement_timeout_ms = statement_timeout_ms
+
+    def participate_in_order_transaction(
+        self,
+        session: Session,
+        order: Order,
+        trade: Trade | None,
+    ) -> None:
+        """Record a bound financial fact in the repository's caller-owned TX."""
+        stage_financial_receipt(
+            session,
+            order,
+            trade,
+            {
+                strategy_id: (scope.environment, scope.execution_scope_id)
+                for strategy_id, scope in self._owned_scopes.items()
+            },
+        )
+
+    def restore_owned_runtimes(self) -> frozenset[str]:
+        """Validate committed owned projections before generic ACTIVE restore."""
+        owned = frozenset(self._owned_scopes)
+        for scope in self._owned_scopes.values():
+            try:
+                with self._sessions() as session:
+                    if (
+                        not isinstance(session, Session)
+                        or session.in_transaction()
+                        or not session.is_active
+                        or session.get_bind().dialect.name != "postgresql"
+                    ):
+                        raise RuntimeError("SPIDER_RESTORE_SESSION_UNAVAILABLE")
+                    operation_id = session.execute(
+                        select(SpiderRuntimeScope.current_operation_id).where(
+                            SpiderRuntimeScope.environment == scope.environment,
+                            SpiderRuntimeScope.execution_scope_id == scope.execution_scope_id,
+                            SpiderRuntimeScope.strategy_id == scope.strategy_id,
+                        )
+                    ).scalar_one_or_none()
+                if operation_id is not None and self.readback(scope, operation_id) is None:
+                    logging.getLogger(__name__).warning(
+                        "Spider owned runtime readback unavailable for %s",
+                        scope.strategy_id,
+                    )
+            except Exception:
+                logging.getLogger(__name__).warning(
+                    "Spider owned runtime restore unavailable for %s",
+                    scope.strategy_id,
+                )
+        return owned
 
     def handle_owned_command(self, message: dict) -> CommandResult | None:
         params = message.get("params")
@@ -580,6 +658,29 @@ class SpiderRuntimeOwner:
                         or plan.plan_status != "INCOMPLETE"
                     ):
                         return None
+                    plan_order_ids = set(session.execute(
+                        select(SpiderRuntimeAction.local_order_id)
+                        .where(SpiderRuntimeAction.plan_id == plan.plan_id)
+                    ).scalars().all())
+                    scoped_receipts = session.execute(
+                        select(
+                            SpiderRuntimeDelivery.local_order_id,
+                            SpiderRuntimeDelivery.sequence,
+                        ).where(
+                            SpiderRuntimeDelivery.environment == scope.environment,
+                            SpiderRuntimeDelivery.execution_scope_id == scope.execution_scope_id,
+                            SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                        ).order_by(SpiderRuntimeDelivery.sequence)
+                    ).mappings().all()
+                    if (
+                        len(scoped_receipts) != runtime.last_received_sequence
+                        or any(
+                            row["sequence"] != index
+                            or row["local_order_id"] not in plan_order_ids
+                            for index, row in enumerate(scoped_receipts, 1)
+                        )
+                    ):
+                        return None
                     if _digest_bytes(runtime.source_checkpoint) != runtime.source_checkpoint_sha256:
                         return None
                     if _digest_bytes(plan.manifest_payload) != plan.manifest_sha256:
@@ -588,6 +689,9 @@ class SpiderRuntimeOwner:
                     product_map = cast(dict[str, object], manifest["source_product_map"])
                     initial_manifest = cast(dict[str, object], manifest["initial_manifest"])
                     bootstrap_basis = cast(dict[str, object], manifest["bootstrap_basis"])
+                    runtime_selection = cast(
+                        dict[str, object], bootstrap_basis["runtime_selection"]
+                    )
                     if (
                         manifest.get("build_checkpoint_sha256") != runtime.source_checkpoint_sha256
                         or initial_manifest.get("build_checkpoint_sha256")
@@ -616,6 +720,8 @@ class SpiderRuntimeOwner:
                         .where(SpiderRuntimeAction.plan_id == plan.plan_id)
                         .order_by(SpiderRuntimeAction.candidate_ordinal)
                     ).all()
+                    if {order.id for _action, _binding, order in identity_rows} != plan_order_ids:
+                        return None
                     missing = decode_canonical(plan.missing_members)
                     if type(missing) is not list or len(identity_rows) != len(missing) or not missing:
                         return None
@@ -716,14 +822,45 @@ class SpiderRuntimeOwner:
                             or order.side != source_side
                             or order.price != _positive_decimal(source_price)
                             or order.quantity != _positive_decimal(source_quantity)
+                            or order.account_profile != runtime_selection.get("account_profile")
+                            or order.account_id != runtime_selection.get("account_id")
                             or order.client_order_id != intent.get("local_client_order_id")
                             or order.client_order_id == binding.source_client_order_id
                             or intent.get("source_client_order_id") != binding.source_client_order_id
                             or intent.get("provider_wire_client_order_id") != expected_wire_id
                             or intent.get("provider_binding_sha256") != _digest_bytes(wire_bytes)
                             or wire_binding != expected_binding
-                            or order.exchange_order_id is not None
                             or _digest_bytes(action.original_payload) != action.payload_sha256
+                        ):
+                            return None
+                        current_projection_row = session.execute(
+                            select(
+                                Order.status,
+                                Order.filled_quantity,
+                                Order.filled_price,
+                                Order.exchange_order_id,
+                            ).where(Order.id == order.id)
+                        ).mappings().one_or_none()
+                        if current_projection_row is None or not validate_order_receipt_chain(
+                            session,
+                            scope=_scope(scope),
+                            action=action,
+                            binding=binding,
+                            order_id=order.id,
+                            current_projection={
+                                "status": current_projection_row["status"],
+                                "filled_quantity": (
+                                    None
+                                    if current_projection_row["filled_quantity"] is None
+                                    else canonical_decimal_text(current_projection_row["filled_quantity"])
+                                ),
+                                "filled_price": (
+                                    None
+                                    if current_projection_row["filled_price"] is None
+                                    else canonical_decimal_text(current_projection_row["filled_price"])
+                                ),
+                                "exchange_order_id": current_projection_row["exchange_order_id"],
+                            },
                         ):
                             return None
                     return {
