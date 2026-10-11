@@ -37,6 +37,7 @@ from src.control_plane.jobs import JobStore
 from src.control_plane.ops_status_query import OpsStatusQuery
 from src.control_plane.profile_http_query import ProfileQueryService
 from src.control_plane.spider_configuration_http import SpiderConfigurationHttpService
+from src.control_plane.spider_operation_http import SpiderOperationHttpService
 from src.core.market_data.profiles.read_repository import ProfileReadRepository
 from src.control_plane.server import serve
 from src.core.db import SessionLocal, get_engine
@@ -113,10 +114,17 @@ def build_control_plane_app(
         else os.getenv("CONTROL_PLANE_SPIDER_EXECUTION_SCOPE_ID")
     )
     spider_configuration_http_service = None
+    spider_operation_http_service = None
     if configured_spider_scope is not None:
+        configured_environment = RuntimeEnvironment.from_env().identity
         spider_configuration_http_service = SpiderConfigurationHttpService(
             db_session_factory,
-            environment=RuntimeEnvironment.from_env().identity,
+            environment=configured_environment,
+            execution_scope_id=configured_spider_scope,
+        )
+        spider_operation_http_service = SpiderOperationHttpService(
+            db_session_factory,
+            environment=configured_environment,
             execution_scope_id=configured_spider_scope,
         )
     if redis_client is None:
@@ -239,6 +247,7 @@ def build_control_plane_app(
         invalidation_hub=invalidation_hub,
         ga_command_service=ga_command_service,
         spider_configuration_http_service=spider_configuration_http_service,
+        spider_operation_http_service=spider_operation_http_service,
         readiness_probe=(
             readiness_probe
             if readiness_probe is not None
