@@ -1,6 +1,8 @@
 """ORM metadata for immutable Spider configuration request evidence."""
 
 from sqlalchemy import (
+    BigInteger,
+    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -115,4 +117,344 @@ class SpiderConfigurationRequest(Base):
             "recorded_at = date_trunc('milliseconds', recorded_at)",
             name="ck_spider_config_recorded_at",
         ),
+    )
+
+
+class SpiderRuntimeOperation(Base):
+    __tablename__ = "spider_runtime_operation"
+
+    operation_id: Mapped[str] = mapped_column(String(64, collation="C"), primary_key=True)
+    environment: Mapped[str] = mapped_column(String(128, collation="C"), nullable=False)
+    execution_scope_id: Mapped[str] = mapped_column(String(128, collation="C"), nullable=False)
+    strategy_id: Mapped[str] = mapped_column(String(128, collation="C"), ForeignKey("strategy.id"), nullable=False)
+    actor: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    operation_key: Mapped[str] = mapped_column(String(128, collation="C"), nullable=False)
+    operation_core_sha256: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    operation_core_payload: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    configuration_request_id: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    phase: Mapped[str] = mapped_column(String(16), nullable=False, server_default="PREVIEW")
+    authorization_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    confirmation_request_id: Mapped[str | None] = mapped_column(String(64, collation="C"), nullable=True)
+    recorded_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        server_default=text("date_trunc('milliseconds', clock_timestamp())"),
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["configuration_request_id", "environment", "execution_scope_id", "strategy_id"],
+            ["spider_configuration_request.request_id", "spider_configuration_request.environment",
+             "spider_configuration_request.execution_scope_id", "spider_configuration_request.strategy_id"],
+            name="fk_spider_runtime_operation_configuration_scope",
+        ),
+        UniqueConstraint(
+            "operation_id", "environment", "execution_scope_id", "strategy_id",
+            name="uq_spider_runtime_operation_scope_ref",
+        ),
+        CheckConstraint("operation_id COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_runtime_operation_id"),
+        CheckConstraint("operation_core_sha256 COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_runtime_operation_core_hash"),
+        CheckConstraint("octet_length(operation_core_payload) BETWEEN 1 AND 1048576", name="ck_spider_runtime_operation_core_payload"),
+        CheckConstraint(
+            "phase IN ('PREVIEW', 'DRAIN', 'POSITION', 'RECONCILE', 'COMMIT', "
+            "'BUILD', 'RUN', 'INCOMPLETE', 'STOP')",
+            name="ck_spider_runtime_operation_phase",
+        ),
+        CheckConstraint("authorization_revision IS NULL OR authorization_revision BETWEEN 1 AND 2147483647", name="ck_spider_runtime_operation_revision"),
+        CheckConstraint("confirmation_request_id IS NULL OR confirmation_request_id COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_runtime_operation_confirmation"),
+        CheckConstraint("recorded_at = date_trunc('milliseconds', recorded_at)", name="ck_spider_runtime_operation_recorded_at"),
+    )
+
+
+class SpiderOperationRequestRow(Base):
+    __tablename__ = "spider_operation_request"
+
+    request_id: Mapped[str] = mapped_column(String(64, collation="C"), primary_key=True)
+    operation_id: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    environment: Mapped[str] = mapped_column(String(128, collation="C"), nullable=False)
+    execution_scope_id: Mapped[str] = mapped_column(String(128, collation="C"), nullable=False)
+    strategy_id: Mapped[str] = mapped_column(String(128, collation="C"), nullable=False)
+    request_kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    actor: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(128, collation="C"), nullable=False)
+    operation_key: Mapped[str] = mapped_column(String(128, collation="C"), nullable=False)
+    operation_core_sha256: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    authorization_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    proposal_request_id: Mapped[str | None] = mapped_column(String(64, collation="C"), nullable=True)
+    authorization_confirmed: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    request_payload: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    recorded_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        server_default=text("date_trunc('milliseconds', clock_timestamp())"),
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["operation_id", "environment", "execution_scope_id", "strategy_id"],
+            ["spider_runtime_operation.operation_id", "spider_runtime_operation.environment",
+             "spider_runtime_operation.execution_scope_id", "spider_runtime_operation.strategy_id"],
+            name="fk_spider_operation_request_operation_scope",
+        ),
+        ForeignKeyConstraint(
+            ["proposal_request_id", "operation_id", "environment", "execution_scope_id", "strategy_id"],
+            ["spider_operation_request.request_id", "spider_operation_request.operation_id",
+             "spider_operation_request.environment", "spider_operation_request.execution_scope_id",
+             "spider_operation_request.strategy_id"],
+            name="fk_spider_operation_request_proposal_scope",
+        ),
+        UniqueConstraint(
+            "operation_id", "environment", "execution_scope_id", "strategy_id", "actor", "idempotency_key",
+            name="uq_spider_operation_request_idempotency",
+        ),
+        UniqueConstraint(
+            "request_id", "operation_id", "environment", "execution_scope_id", "strategy_id",
+            name="uq_spider_operation_request_scope_ref",
+        ),
+        CheckConstraint("request_id COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_operation_request_id"),
+        CheckConstraint("operation_id COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_operation_request_operation_id"),
+        CheckConstraint("operation_core_sha256 COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_operation_request_core_hash"),
+        CheckConstraint("request_kind IN ('PROPOSAL', 'CONFIRMATION')", name="ck_spider_operation_request_kind"),
+        CheckConstraint("authorization_revision BETWEEN 1 AND 2147483647", name="ck_spider_operation_request_revision"),
+        CheckConstraint("octet_length(request_payload) BETWEEN 1 AND 1048576", name="ck_spider_operation_request_payload"),
+        CheckConstraint("authorization_confirmed = (request_kind = 'CONFIRMATION')", name="ck_spider_operation_request_confirmed"),
+        CheckConstraint("recorded_at = date_trunc('milliseconds', recorded_at)", name="ck_spider_operation_request_recorded_at"),
+    )
+
+
+class SpiderRuntimeScope(Base):
+    """Authoritative, exactly scoped installed Spider runtime projection."""
+
+    __tablename__ = "spider_runtime_scope"
+
+    environment: Mapped[str] = mapped_column(String(128, collation="C"), primary_key=True)
+    execution_scope_id: Mapped[str] = mapped_column(String(128, collation="C"), primary_key=True)
+    strategy_id: Mapped[str] = mapped_column(String(128, collation="C"), ForeignKey("strategy.id"), primary_key=True)
+    host_contract_id: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    host_contract_sha256: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    confirmation_request_id: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    configuration_sha256: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    state_version: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    control_mode: Mapped[str] = mapped_column(String(8, collation="C"), nullable=False)
+    current_operation_id: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    last_received_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+    last_consumed_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+    source_checkpoint: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    source_checkpoint_sha256: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    control_barrier_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+    initial_plan_id: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["confirmation_request_id", "environment", "execution_scope_id", "strategy_id"],
+            ["spider_configuration_request.request_id", "spider_configuration_request.environment",
+             "spider_configuration_request.execution_scope_id", "spider_configuration_request.strategy_id"],
+            name="fk_spider_runtime_scope_confirmation",
+        ),
+        ForeignKeyConstraint(
+            ["current_operation_id", "environment", "execution_scope_id", "strategy_id"],
+            ["spider_runtime_operation.operation_id", "spider_runtime_operation.environment",
+             "spider_runtime_operation.execution_scope_id", "spider_runtime_operation.strategy_id"],
+            name="fk_spider_runtime_scope_operation",
+        ),
+        ForeignKeyConstraint(
+            ["initial_plan_id", "current_operation_id", "environment", "execution_scope_id", "strategy_id"],
+            ["spider_runtime_plan.plan_id", "spider_runtime_plan.operation_id",
+             "spider_runtime_plan.environment", "spider_runtime_plan.execution_scope_id",
+             "spider_runtime_plan.strategy_id"],
+            name="fk_spider_runtime_scope_initial_plan",
+        ),
+        CheckConstraint("host_contract_id = 'SPIDER_DURABLE_HOST_V1'", name="ck_spider_runtime_scope_host"),
+        CheckConstraint("host_contract_sha256 COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_runtime_scope_host_hash"),
+        CheckConstraint("confirmation_request_id COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_runtime_scope_confirmation_id"),
+        CheckConstraint("configuration_sha256 COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_runtime_scope_configuration_hash"),
+        CheckConstraint("generation BETWEEN 1 AND 9223372036854775807", name="ck_spider_runtime_scope_generation"),
+        CheckConstraint("state_version BETWEEN 0 AND 2147483647", name="ck_spider_runtime_scope_state_version"),
+        CheckConstraint("control_mode IN ('RUN', 'STOP', 'DRAIN')", name="ck_spider_runtime_scope_control"),
+        CheckConstraint("current_operation_id COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_runtime_scope_operation_id"),
+        CheckConstraint("last_received_sequence >= 0 AND last_consumed_sequence BETWEEN 0 AND last_received_sequence", name="ck_spider_runtime_scope_sequences"),
+        CheckConstraint("octet_length(source_checkpoint) BETWEEN 1 AND 1048576", name="ck_spider_runtime_scope_checkpoint"),
+        CheckConstraint("source_checkpoint_sha256 COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_runtime_scope_checkpoint_hash"),
+        CheckConstraint("control_barrier_sequence >= 0", name="ck_spider_runtime_scope_barrier"),
+        CheckConstraint("initial_plan_id COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_runtime_scope_plan_id"),
+    )
+
+
+class SpiderRuntimePlan(Base):
+    """Immutable initial candidate/action evidence for one installed generation."""
+
+    __tablename__ = "spider_runtime_plan"
+
+    plan_id: Mapped[str] = mapped_column(String(64, collation="C"), primary_key=True)
+    environment: Mapped[str] = mapped_column(String(128, collation="C"), nullable=False)
+    execution_scope_id: Mapped[str] = mapped_column(String(128, collation="C"), nullable=False)
+    strategy_id: Mapped[str] = mapped_column(String(128, collation="C"), nullable=False)
+    operation_id: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    configuration_sha256: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    source_checkpoint_sha256: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    specification_sha256: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    observed_input_sha256: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    tape_cursor: Mapped[str] = mapped_column(String(256, collation="C"), nullable=False)
+    manifest_payload: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    manifest_sha256: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    plan_status: Mapped[str] = mapped_column(String(12, collation="C"), nullable=False)
+    missing_members: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["operation_id", "environment", "execution_scope_id", "strategy_id"],
+            ["spider_runtime_operation.operation_id", "spider_runtime_operation.environment",
+             "spider_runtime_operation.execution_scope_id", "spider_runtime_operation.strategy_id"],
+            name="fk_spider_runtime_plan_operation",
+        ),
+        UniqueConstraint("plan_id", "environment", "execution_scope_id", "strategy_id", name="uq_spider_runtime_plan_scope_ref"),
+        UniqueConstraint("plan_id", "operation_id", "environment", "execution_scope_id", "strategy_id", name="uq_spider_runtime_plan_operation_ref"),
+        CheckConstraint("plan_id COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_runtime_plan_id"),
+        CheckConstraint("operation_id COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_runtime_plan_operation_id"),
+        CheckConstraint("generation > 0", name="ck_spider_runtime_plan_generation"),
+        CheckConstraint("configuration_sha256 COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_runtime_plan_configuration_hash"),
+        CheckConstraint("source_checkpoint_sha256 COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_runtime_plan_source_hash"),
+        CheckConstraint("specification_sha256 COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_runtime_plan_specification_hash"),
+        CheckConstraint("observed_input_sha256 COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_runtime_plan_observed_hash"),
+        CheckConstraint("octet_length(manifest_payload) BETWEEN 1 AND 1048576", name="ck_spider_runtime_plan_manifest"),
+        CheckConstraint("manifest_sha256 COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_runtime_plan_manifest_hash"),
+        CheckConstraint("plan_status IN ('INCOMPLETE', 'COMPLETE')", name="ck_spider_runtime_plan_status"),
+        CheckConstraint("octet_length(missing_members) BETWEEN 1 AND 1048576", name="ck_spider_runtime_plan_missing_members"),
+    )
+
+
+class SpiderRuntimeAction(Base):
+    """One immutable admitted action in a source-ordered Spider plan."""
+
+    __tablename__ = "spider_runtime_action"
+
+    action_id: Mapped[str] = mapped_column(String(64, collation="C"), primary_key=True)
+    plan_id: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    environment: Mapped[str] = mapped_column(String(128, collation="C"), nullable=False)
+    execution_scope_id: Mapped[str] = mapped_column(String(128, collation="C"), nullable=False)
+    strategy_id: Mapped[str] = mapped_column(String(128, collation="C"), nullable=False)
+    trigger_delivery_id: Mapped[str | None] = mapped_column(String(64, collation="C"), nullable=True)
+    parent_action_id: Mapped[str | None] = mapped_column(String(64, collation="C"), nullable=True)
+    generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    configuration_sha256: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    role: Mapped[str] = mapped_column(String(32, collation="C"), nullable=False)
+    product_id: Mapped[str] = mapped_column(String(128, collation="C"), nullable=False)
+    local_order_id: Mapped[str] = mapped_column(String(36, collation="C"), nullable=False)
+    original_payload: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    payload_sha256: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    candidate_ordinal: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    transmission_group: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    transmission_ordinal: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    outcome_state: Mapped[str] = mapped_column(String(16, collation="C"), nullable=False)
+    outcome_reference: Mapped[str | None] = mapped_column(String(64, collation="C"), nullable=True)
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["plan_id", "environment", "execution_scope_id", "strategy_id"],
+            ["spider_runtime_plan.plan_id", "spider_runtime_plan.environment",
+             "spider_runtime_plan.execution_scope_id", "spider_runtime_plan.strategy_id"],
+            name="fk_spider_runtime_action_plan",
+        ),
+        ForeignKeyConstraint(
+            ["parent_action_id", "environment", "execution_scope_id", "strategy_id"],
+            ["spider_runtime_action.action_id", "spider_runtime_action.environment",
+             "spider_runtime_action.execution_scope_id", "spider_runtime_action.strategy_id"],
+            name="fk_spider_runtime_action_parent",
+        ),
+        ForeignKeyConstraint(["local_order_id"], ["order.id"], name="fk_spider_runtime_action_order"),
+        UniqueConstraint("action_id", "environment", "execution_scope_id", "strategy_id", name="uq_spider_runtime_action_scope_ref"),
+        UniqueConstraint("plan_id", "candidate_ordinal", name="uq_spider_runtime_action_candidate"),
+        CheckConstraint("action_id COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_runtime_action_id"),
+        CheckConstraint("trigger_delivery_id IS NULL OR trigger_delivery_id COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_runtime_action_trigger"),
+        CheckConstraint("generation > 0", name="ck_spider_runtime_action_generation"),
+        CheckConstraint("configuration_sha256 COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_runtime_action_configuration_hash"),
+        CheckConstraint("role COLLATE \"C\" = 'GRID'", name="ck_spider_runtime_action_role"),
+        CheckConstraint("octet_length(original_payload) BETWEEN 1 AND 1048576", name="ck_spider_runtime_action_payload"),
+        CheckConstraint("payload_sha256 COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_runtime_action_payload_hash"),
+        CheckConstraint("candidate_ordinal >= 0 AND transmission_group >= 0 AND transmission_ordinal >= 0", name="ck_spider_runtime_action_ordinals"),
+        CheckConstraint("outcome_state IN ('UNSENT', 'SEND_UNKNOWN', 'ACCEPTED', 'REJECTED', 'TERMINAL')", name="ck_spider_runtime_action_outcome"),
+        CheckConstraint("outcome_reference IS NULL OR outcome_reference COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_runtime_action_outcome_ref"),
+    )
+
+
+class SpiderRuntimeBinding(Base):
+    """Exact source/canonical dual identity for an original local Order."""
+
+    __tablename__ = "spider_runtime_binding"
+
+    action_id: Mapped[str] = mapped_column(String(64, collation="C"), primary_key=True)
+    environment: Mapped[str] = mapped_column(String(128, collation="C"), nullable=False)
+    execution_scope_id: Mapped[str] = mapped_column(String(128, collation="C"), nullable=False)
+    strategy_id: Mapped[str] = mapped_column(String(128, collation="C"), nullable=False)
+    local_order_id: Mapped[str] = mapped_column(String(36, collation="C"), nullable=False)
+    source_product_id: Mapped[str] = mapped_column(String(128, collation="C"), nullable=False)
+    canonical_product_id: Mapped[str] = mapped_column(String(128, collation="C"), nullable=False)
+    source_client_order_id: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    product_map_sha256: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["action_id", "environment", "execution_scope_id", "strategy_id"],
+            ["spider_runtime_action.action_id", "spider_runtime_action.environment",
+             "spider_runtime_action.execution_scope_id", "spider_runtime_action.strategy_id"],
+            name="fk_spider_runtime_binding_action",
+        ),
+        ForeignKeyConstraint(["local_order_id"], ["order.id"], name="fk_spider_runtime_binding_order"),
+        UniqueConstraint("local_order_id", name="uq_spider_runtime_binding_order"),
+        CheckConstraint("action_id COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_runtime_binding_action_id"),
+        CheckConstraint("octet_length(source_client_order_id) BETWEEN 1 AND 64", name="ck_spider_runtime_binding_source_client_id"),
+        CheckConstraint("product_map_sha256 COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_runtime_binding_map_hash"),
+    )
+
+
+class SpiderRuntimeDelivery(Base):
+    """Durable scoped financial receipt staged with its Order/Trade fact."""
+
+    __tablename__ = "spider_runtime_delivery"
+
+    environment: Mapped[str] = mapped_column(String(128, collation="C"), primary_key=True)
+    execution_scope_id: Mapped[str] = mapped_column(String(128, collation="C"), primary_key=True)
+    strategy_id: Mapped[str] = mapped_column(String(128, collation="C"), primary_key=True)
+    sequence: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    delivery_id: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    content_sha256: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    kind: Mapped[str] = mapped_column(String(32, collation="C"), nullable=False)
+    local_order_id: Mapped[str] = mapped_column(String(36, collation="C"), nullable=False)
+    trade_id: Mapped[str | None] = mapped_column(String(64, collation="C"), nullable=True)
+    action_id: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    configuration_sha256: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    role: Mapped[str] = mapped_column(String(32, collation="C"), nullable=False)
+    source_payload: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    visible_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
+    elapsed_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    disposition: Mapped[str] = mapped_column(String(12, collation="C"), nullable=False, server_default="PENDING")
+    suppression_reason: Mapped[str | None] = mapped_column(String(64, collation="C"), nullable=True)
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["environment", "execution_scope_id", "strategy_id"],
+            ["spider_runtime_scope.environment", "spider_runtime_scope.execution_scope_id", "spider_runtime_scope.strategy_id"],
+            name="fk_spider_runtime_delivery_scope",
+        ),
+        ForeignKeyConstraint(
+            ["action_id", "environment", "execution_scope_id", "strategy_id"],
+            ["spider_runtime_action.action_id", "spider_runtime_action.environment",
+             "spider_runtime_action.execution_scope_id", "spider_runtime_action.strategy_id"],
+            name="fk_spider_runtime_delivery_action",
+        ),
+        ForeignKeyConstraint(["local_order_id"], ["order.id"], name="fk_spider_runtime_delivery_order"),
+        ForeignKeyConstraint(["trade_id"], ["trade.id"], name="fk_spider_runtime_delivery_trade"),
+        UniqueConstraint("delivery_id", "environment", "execution_scope_id", "strategy_id", name="uq_spider_runtime_delivery_identity"),
+        CheckConstraint("sequence > 0", name="ck_spider_runtime_delivery_sequence"),
+        CheckConstraint("delivery_id COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_runtime_delivery_id"),
+        CheckConstraint("content_sha256 COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_runtime_delivery_hash"),
+        CheckConstraint("generation > 0", name="ck_spider_runtime_delivery_generation"),
+        CheckConstraint("configuration_sha256 COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_runtime_delivery_configuration_hash"),
+        CheckConstraint("role COLLATE \"C\" = 'GRID'", name="ck_spider_runtime_delivery_role"),
+        CheckConstraint("octet_length(source_payload) BETWEEN 1 AND 1048576", name="ck_spider_runtime_delivery_payload"),
+        CheckConstraint("visible_at >= TIMESTAMPTZ '0001-01-01 00:00:00+00' AND visible_at < TIMESTAMPTZ '10000-01-01 00:00:00+00' AND visible_at = date_trunc('milliseconds', visible_at)", name="ck_spider_runtime_delivery_visible_at"),
+        CheckConstraint("elapsed_ms IS NULL OR elapsed_ms >= 0", name="ck_spider_runtime_delivery_elapsed"),
+        CheckConstraint("disposition IN ('PENDING', 'CONSUMED', 'SUPPRESSED')", name="ck_spider_runtime_delivery_disposition"),
+        CheckConstraint("suppression_reason IS NULL OR disposition = 'SUPPRESSED'", name="ck_spider_runtime_delivery_suppression"),
     )

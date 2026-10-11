@@ -1,0 +1,127 @@
+"""Guard the ownership of existing configuration and operation ORM metadata."""
+
+from src.core.spider_management.orm import (
+    SpiderConfigurationRequest,
+    SpiderOperationRequestRow,
+    SpiderRuntimeAction,
+    SpiderRuntimeBinding,
+    SpiderRuntimeDelivery,
+    SpiderRuntimeOperation,
+    SpiderRuntimePlan,
+    SpiderRuntimeScope,
+)
+
+
+def test_spider_configuration_columns_and_constraints_remain_on_configuration_table():
+    configuration = SpiderConfigurationRequest.__table__
+    operation = SpiderOperationRequestRow.__table__
+    runtime = SpiderRuntimeOperation.__table__
+    runtime_scope = SpiderRuntimeScope.__table__
+    runtime_plan = SpiderRuntimePlan.__table__
+    runtime_action = SpiderRuntimeAction.__table__
+    runtime_binding = SpiderRuntimeBinding.__table__
+    runtime_delivery = SpiderRuntimeDelivery.__table__
+
+    assert set(configuration.columns.keys()) == {
+        "request_id",
+        "environment",
+        "execution_scope_id",
+        "strategy_id",
+        "request_kind",
+        "actor",
+        "idempotency_key",
+        "expected_state_version",
+        "configuration_payload",
+        "configuration_sha256",
+        "proposal_request_id",
+        "recorded_at",
+    }
+    assert set(operation.columns.keys()) == {
+        "request_id",
+        "operation_id",
+        "environment",
+        "execution_scope_id",
+        "strategy_id",
+        "request_kind",
+        "actor",
+        "idempotency_key",
+        "operation_key",
+        "operation_core_sha256",
+        "authorization_revision",
+        "proposal_request_id",
+        "authorization_confirmed",
+        "request_payload",
+        "recorded_at",
+    }
+    assert "configuration_payload" not in operation.columns
+    assert "operation_key" not in configuration.columns
+    config_constraints = {constraint.name for constraint in configuration.constraints}
+    operation_constraints = {constraint.name for constraint in operation.constraints}
+    assert "ck_spider_config_request_kind" in config_constraints
+    assert "fk_spider_config_request_proposal_scope" in config_constraints
+    assert "ck_spider_config_request_kind" not in operation_constraints
+    assert "fk_spider_config_request_proposal_scope" not in operation_constraints
+    assert "configuration_request_id" in runtime.columns
+    assert set(runtime_scope.columns.keys()) >= {
+        "environment", "execution_scope_id", "strategy_id", "generation",
+        "current_operation_id", "source_checkpoint", "initial_plan_id",
+    }
+    assert set(runtime_plan.columns.keys()) >= {
+        "plan_id", "operation_id", "manifest_payload", "manifest_sha256",
+        "plan_status", "missing_members",
+    }
+    assert set(runtime_action.columns.keys()) >= {
+        "action_id", "plan_id", "candidate_ordinal", "local_order_id",
+        "original_payload", "outcome_state",
+    }
+    assert set(runtime_binding.columns.keys()) >= {
+        "action_id", "local_order_id", "source_product_id",
+        "canonical_product_id", "product_map_sha256",
+    }
+    assert set(runtime_delivery.columns.keys()) >= {
+        "sequence", "delivery_id", "local_order_id", "trade_id",
+        "source_payload", "disposition",
+    }
+
+
+def test_operation_phase_check_matches_the_closed_e4_phase_set():
+    operation = SpiderRuntimeOperation.__table__
+    phase_check = next(
+        constraint for constraint in operation.constraints
+        if constraint.name == "ck_spider_runtime_operation_phase"
+    )
+    assert str(phase_check.sqltext) == (
+        "phase IN ('PREVIEW', 'DRAIN', 'POSITION', 'RECONCILE', 'COMMIT', "
+        "'BUILD', 'RUN', 'INCOMPLETE', 'STOP')"
+    )
+
+
+def test_runtime_checks_match_closed_e4_bounds_and_outcome_tokens():
+    tables = {
+        table.name: table
+        for table in (
+            SpiderRuntimeScope.__table__,
+            SpiderRuntimeAction.__table__,
+            SpiderRuntimeDelivery.__table__,
+        )
+    }
+
+    def check(table_name, constraint_name):
+        return next(
+            constraint
+            for constraint in tables[table_name].constraints
+            if constraint.name == constraint_name
+        )
+
+    assert str(
+        check("spider_runtime_scope", "ck_spider_runtime_scope_state_version").sqltext
+    ) == "state_version BETWEEN 0 AND 2147483647"
+    assert str(
+        check("spider_runtime_action", "ck_spider_runtime_action_payload").sqltext
+    ) == "octet_length(original_payload) BETWEEN 1 AND 1048576"
+    assert str(
+        check("spider_runtime_delivery", "ck_spider_runtime_delivery_payload").sqltext
+    ) == "octet_length(source_payload) BETWEEN 1 AND 1048576"
+    assert str(
+        check("spider_runtime_action", "ck_spider_runtime_action_outcome").sqltext
+    ) == "outcome_state IN ('UNSENT', 'SEND_UNKNOWN', 'ACCEPTED', 'REJECTED', 'TERMINAL')"
