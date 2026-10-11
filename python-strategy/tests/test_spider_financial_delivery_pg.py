@@ -4,11 +4,12 @@ from decimal import Decimal
 from hashlib import sha256
 import logging
 import os
-from threading import Event, Thread
+from threading import Event, RLock, Thread
 from typing import Any, cast
 
 import pytest
 from sqlalchemy import Engine, delete, event, func, select, text, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from src.control_plane.spider_operation_http import SPIDER_OPERATION_REQUEST_PATH
@@ -28,13 +29,20 @@ from src.core.spider_management.runtime_owner import (
     SpiderRuntimeComposition,
     SpiderRuntimeOwner,
 )
+from src.core.adapters.okx_spider_transport import (
+    OkxSpiderBatchTransport,
+    classify_okx_batch_response,
+)
 from src.core.spider_management.orm import (
+    SpiderRuntimeAction,
     SpiderControlReceipt,
     SpiderRuntimeBinding,
     SpiderRuntimeDelivery,
     SpiderRuntimeOperation,
     SpiderRuntimePlan,
     SpiderRuntimeScope,
+    SpiderRuntimeTapeIndex,
+    SpiderRuntimeTransmission,
 )
 from test_migrations import fresh_pg_db as _migration_fresh_pg_db
 from test_spider_operation_request_pg import (
@@ -133,6 +141,97 @@ def _install_owner(engine: Engine, *, strategy_id: str = "spider-main"):
         readback,
         confirmed,
         ModelInstallSource(run, specs, "okx"),
+    )
+
+
+def _saved_initial_place_request(engine: Engine, scope: RuntimeScopeKey):
+    with Session(engine) as session:
+        runtime = session.execute(
+            select(SpiderRuntimeScope).where(
+                SpiderRuntimeScope.environment == scope.environment,
+                SpiderRuntimeScope.execution_scope_id == scope.execution_scope_id,
+                SpiderRuntimeScope.strategy_id == scope.strategy_id,
+            )
+        ).scalar_one()
+        plan = session.execute(
+            select(SpiderRuntimePlan).where(
+                SpiderRuntimePlan.plan_id == runtime.initial_plan_id,
+            )
+        ).scalar_one()
+        rows = session.execute(
+            select(SpiderRuntimeAction, SpiderRuntimeBinding, Order)
+            .join(SpiderRuntimeBinding, SpiderRuntimeBinding.action_id == SpiderRuntimeAction.action_id)
+            .join(Order, Order.id == SpiderRuntimeAction.local_order_id)
+            .where(SpiderRuntimeAction.plan_id == plan.plan_id)
+            .order_by(SpiderRuntimeAction.candidate_ordinal)
+        ).all()
+        assert rows
+        source_group = rows[0][0].transmission_group
+        group_rows = [row for row in rows if row[0].transmission_group == source_group]
+        ordered_ids = [row[0].action_id for row in group_rows]
+        group_id = sha256(canonical_bytes({
+            "domain": "SPIDER_TRANSMISSION_GROUP_V1",
+            "scope": {
+                "environment": scope.environment,
+                "execution_scope_id": scope.execution_scope_id,
+                "strategy_id": scope.strategy_id,
+            },
+            "operation_id": runtime.current_operation_id,
+            "plan_id": plan.plan_id,
+            "generation": runtime.generation,
+            "configuration_sha256": runtime.configuration_sha256,
+            "operation": "PLACE",
+            "ordered_action_ids": ordered_ids,
+        })).hexdigest()
+        members: list[dict[str, object]] = []
+        for action, binding, order in group_rows:
+            intent = cast(dict[str, object], order.intent_payload)
+            binding_bytes = bytes.fromhex(cast(str, intent["provider_binding_bytes_hex"]))
+            binding_sha256 = sha256(binding_bytes).hexdigest()
+            wire_id = cast(str, intent["provider_wire_client_order_id"])
+            source_order = cast(dict[str, object], decode_canonical(action.original_payload))
+            request_order = dict(source_order)
+            request_order["clOrdId"] = wire_id
+            members.append({
+                "action_id": action.action_id,
+                "product_id": action.product_id,
+                "local_order_id": order.id,
+                "binding_sha256": binding_sha256,
+                "wire_clOrdId": wire_id,
+                "ordId": order.exchange_order_id,
+                "request_payload": request_order,
+            })
+        body: dict[str, object] = {
+            "schema_version": "SPIDER_TRANSPORT_BATCH_V1",
+            "scope": {
+                "environment": scope.environment,
+                "execution_scope_id": scope.execution_scope_id,
+                "strategy_id": scope.strategy_id,
+            },
+            "executing_account_ref": scope.execution_scope_id,
+            "transmission_group_id": group_id,
+            "operation": "PLACE",
+            "members": members,
+        }
+        body["payload_sha256"] = sha256(canonical_bytes(body)).hexdigest()
+        return source_group, canonical_bytes(body), members
+
+
+def _transport_enabled_owner(
+    owner: SpiderRuntimeOwner,
+    scope: RuntimeScopeKey,
+    classifier=classify_okx_batch_response,
+) -> SpiderRuntimeOwner:
+    lifecycle = RLock()
+    order_events = RLock()
+    return SpiderRuntimeOwner(
+        owner._sessions,
+        owner._order_manager,
+        owned_scopes=(scope,),
+        model_sources_by_confirmation=owner._model_sources,
+        lifecycle_lock=lambda _strategy_id: lifecycle,
+        order_event_lock=order_events,
+        transport_response_classifier=classifier,
     )
 
 
@@ -837,6 +936,7 @@ def test_broken_and_missing_receipt_proofs_never_restore_as_valid(
         )
         assert tail_payload["transition_ordinal"] == 2
         delivery_id = delivery.delivery_id
+        delivery_sequence = delivery.sequence
         payload = bytes(delivery.source_payload)
     with factory.begin() as session:
         session.execute(
@@ -858,7 +958,22 @@ def test_broken_and_missing_receipt_proofs_never_restore_as_valid(
     assert owner.readback(scope, operation_id) == accepted
     assert owner.restore_owned_runtimes() == frozenset({scope.strategy_id})
 
+    with pytest.raises(IntegrityError):
+        with factory.begin() as session:
+            session.execute(
+                delete(SpiderRuntimeDelivery).where(
+                    SpiderRuntimeDelivery.delivery_id == delivery_id
+                )
+            )
     with factory.begin() as session:
+        session.execute(
+            delete(SpiderRuntimeTapeIndex).where(
+                SpiderRuntimeTapeIndex.environment == scope.environment,
+                SpiderRuntimeTapeIndex.execution_scope_id == scope.execution_scope_id,
+                SpiderRuntimeTapeIndex.strategy_id == scope.strategy_id,
+                SpiderRuntimeTapeIndex.delivery_sequence == delivery_sequence,
+            )
+        )
         session.execute(
             delete(SpiderRuntimeDelivery).where(
                 SpiderRuntimeDelivery.delivery_id == delivery_id
@@ -2183,5 +2298,260 @@ def test_owner_readback_restores_checkpoint_without_model_bootstrap(
         assert session.scalar(
             select(func.count()).select_from(SpiderRuntimeDelivery).where(
                 SpiderRuntimeDelivery.strategy_id == scope.strategy_id
+            )
+        ) == 0
+
+
+def test_initial_place_rejection_then_bound_financial_fact_updates_same_projection(
+    operation_pg: Engine,
+    mock_clock,
+    mock_exchange_adapter,
+) -> None:
+    engine = operation_pg
+    owner, scope, operation_id, order_manager, _prepared, initial, *_ = _install_owner(engine)
+    source_group, request_payload, members = _saved_initial_place_request(engine, scope)
+
+    class OfflineClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def privatePostTradeBatchOrders(
+            self, orders: list[dict[str, object]]
+        ) -> object:
+            self.calls += 1
+            assert orders == [member["request_payload"] for member in members]
+            return {
+                "code": "1",
+                "data": [
+                    {
+                        "clOrdId": member["wire_clOrdId"],
+                        "ordId": "",
+                        "sCode": "51008",
+                    }
+                    for member in members
+                ],
+                "msg": "bounded synthetic rejection",
+            }
+
+        def privatePostTradeCancelBatchOrders(
+            self, _orders: list[dict[str, object]]
+        ) -> object:
+            raise AssertionError("initial PLACE must not call the CANCEL endpoint")
+
+    offline_client = OfflineClient()
+    transport = OkxSpiderBatchTransport(cast(Any, offline_client))
+    transport_owner = _transport_enabled_owner(owner, scope)
+    first = transport_owner.transmit_initial_place_group(
+        scope,
+        source_group,
+        scope.execution_scope_id,
+        request_payload,
+        transport,
+    )
+    assert first.disposition == "RECORDED"
+    assert offline_client.calls == 1
+    assert first.action_outcomes == tuple(
+        (cast(str, member["action_id"]), "REJECTED") for member in members
+    )
+    rejected_readback = transport_owner.readback(scope, operation_id)
+    assert rejected_readback is not None
+    assert rejected_readback["phase"] == "INCOMPLETE"
+    assert rejected_readback["trading_ready"] is False
+    missing = cast(list[dict[str, object]], rejected_readback["initial_plan_missing_members"])
+    sent_ids = {cast(str, member["action_id"]) for member in members}
+    initial_missing = cast(list[dict[str, object]], initial["initial_plan_missing_members"])
+    all_initial_ids = {cast(str, row["initial_member_id"]) for row in initial_missing}
+    untransmitted_ids = all_initial_ids - sent_ids
+    missing_by_id = {
+        cast(str, row["initial_member_id"]): row for row in missing
+    }
+    assert set(missing_by_id) == all_initial_ids
+    assert all(
+        missing_by_id[action_id]["last_outcome"] == "REJECTED"
+        and missing_by_id[action_id]["rejection_reason"] == "51008"
+        for action_id in sent_ids
+    )
+    assert all(
+        missing_by_id[action_id]["last_outcome"] == "UNSENT"
+        and missing_by_id[action_id]["rejection_reason"] is None
+        for action_id in untransmitted_ids
+    )
+
+    # The same saved operation/group is read back; it does not resend the batch.
+    repeated = transport_owner.transmit_initial_place_group(
+        scope,
+        source_group,
+        scope.execution_scope_id,
+        request_payload,
+        transport,
+    )
+    assert repeated == first
+    assert offline_client.calls == 1
+
+    first_action_id = cast(str, members[0]["action_id"])
+    first_local_order_id = cast(str, members[0]["local_order_id"])
+    first_order = order_manager.repo.get_order(first_local_order_id)
+    assert first_order is not None
+    execution = ExecutionEngine(
+        db_session=None,
+        clock=mock_clock,
+        adapter=mock_exchange_adapter,
+        db_session_factory=sessionmaker(engine),
+        repository_transaction_participant=transport_owner.participate_in_order_transaction,
+        is_backtest=True,
+    )
+    # This is already-normalized SOFTWARE evidence through the existing financial
+    # consumer, not OKX wire/WSS or provider-admission evidence.
+    assert execution.process_exchange_order_event(ExchangeOrderEvent(
+        status="open",
+        product_id=first_order.product_id,
+        client_order_id=first_order.client_order_id,
+        exchange_order_id="synthetic-late-provider-order",
+    ))["action"] == "applied"
+
+    updated = transport_owner.readback(scope, operation_id)
+    assert updated is not None
+    assert updated["phase"] == "INCOMPLETE"
+    assert updated["trading_ready"] is False
+    updated_missing = cast(list[dict[str, object]], updated["initial_plan_missing_members"])
+    first_projection = next(
+        row for row in updated_missing if row["initial_member_id"] == first_action_id
+    )
+    assert first_projection["last_outcome"] == "SEND_UNKNOWN"
+    assert first_projection["rejection_reason"] is None
+    assert first_projection["resubmit_eligible"] is False
+    missing_by_id_after = {
+        cast(str, row["initial_member_id"]): row for row in updated_missing
+    }
+    assert set(missing_by_id_after) == all_initial_ids
+    assert all(
+        missing_by_id_after[action_id]["last_outcome"] == "REJECTED"
+        and missing_by_id_after[action_id]["rejection_reason"] == "51008"
+        for action_id in sent_ids - {first_action_id}
+    )
+    assert all(
+        missing_by_id_after[action_id]["last_outcome"] == "UNSENT"
+        and missing_by_id_after[action_id]["rejection_reason"] is None
+        for action_id in untransmitted_ids
+    )
+    assert transport_owner.transmit_initial_place_group(
+        scope,
+        source_group,
+        scope.execution_scope_id,
+        request_payload,
+        transport,
+    ).action_outcomes == tuple(
+        (cast(str, member["action_id"]), "SEND_UNKNOWN" if member["action_id"] == first_action_id else "REJECTED")
+        for member in members
+    )
+    assert offline_client.calls == 1
+    with Session(engine) as session:
+        saved_request = cast(dict[str, object], decode_canonical(request_payload))
+        saved_transmission = session.get(
+            SpiderRuntimeTransmission,
+            cast(str, saved_request["transmission_group_id"]),
+        )
+        assert saved_transmission is not None
+        assert saved_transmission.response_payload is not None
+        assert bytes(saved_transmission.response_payload) == canonical_bytes({
+            "code": "1",
+            "data": [
+                {
+                    "clOrdId": member["wire_clOrdId"],
+                    "ordId": "",
+                    "sCode": "51008",
+                }
+                for member in members
+            ],
+            "msg": "bounded synthetic rejection",
+        })
+
+
+def test_initial_place_acceptance_removes_only_proved_members_and_retry_does_not_resend(
+    operation_pg: Engine,
+) -> None:
+    engine = operation_pg
+    owner, scope, operation_id, _order_manager, _prepared, _initial, *_ = _install_owner(engine)
+    source_group, request_payload, members = _saved_initial_place_request(engine, scope)
+
+    class OfflineClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def privatePostTradeBatchOrders(
+            self, _orders: list[dict[str, object]]
+        ) -> object:
+            self.calls += 1
+            return {
+                "code": "0",
+                "data": [
+                    {
+                        "clOrdId": member["wire_clOrdId"],
+                        "ordId": f"synthetic-order-{index}",
+                        "sCode": "0",
+                    }
+                    for index, member in enumerate(members)
+                ],
+                "msg": "synthetic response",
+            }
+
+        def privatePostTradeCancelBatchOrders(
+            self, _orders: list[dict[str, object]]
+        ) -> object:
+            raise AssertionError("initial PLACE must not call the CANCEL endpoint")
+
+    offline_client = OfflineClient()
+    transport = OkxSpiderBatchTransport(cast(Any, offline_client))
+    transport_owner = _transport_enabled_owner(owner, scope)
+    outcome = transport_owner.transmit_initial_place_group(
+        scope,
+        source_group,
+        scope.execution_scope_id,
+        request_payload,
+        transport,
+    )
+    assert outcome.disposition == "RECORDED"
+    assert outcome.action_outcomes == tuple(
+        (cast(str, member["action_id"]), "ACCEPTED") for member in members
+    )
+    readback = transport_owner.readback(scope, operation_id)
+    assert readback is not None
+    assert readback["phase"] == "INCOMPLETE"
+    assert readback["trading_ready"] is False
+    missing = cast(list[dict[str, object]], readback["initial_plan_missing_members"])
+    assert not {
+        row["initial_member_id"] for row in missing
+    }.intersection(cast(str, member["action_id"]) for member in members)
+    assert readback["initial_plan_status"] == ("COMPLETE" if not missing else "INCOMPLETE")
+    assert transport_owner.transmit_initial_place_group(
+        scope,
+        source_group,
+        scope.execution_scope_id,
+        request_payload,
+        transport,
+    ) == outcome
+    assert offline_client.calls == 1
+    with Session(engine) as session:
+        transmission_id = cast(
+            str,
+            cast(dict[str, object], decode_canonical(request_payload))["transmission_group_id"],
+        )
+        transmission = session.get(SpiderRuntimeTransmission, transmission_id)
+        assert transmission is not None and transmission.response_payload is not None
+        assert bytes(transmission.response_payload) == canonical_bytes({
+            "code": "0",
+            "data": [
+                {
+                    "clOrdId": member["wire_clOrdId"],
+                    "ordId": f"synthetic-order-{index}",
+                    "sCode": "0",
+                }
+                for index, member in enumerate(members)
+            ],
+            "msg": "synthetic response",
+        })
+        assert session.scalar(
+            select(func.count()).select_from(Trade).where(
+                Trade.order_id.in_([member["local_order_id"] for member in members])
             )
         ) == 0

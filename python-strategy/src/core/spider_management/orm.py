@@ -238,6 +238,7 @@ class SpiderRuntimeScope(Base):
     current_operation_id: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
     last_received_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
     last_consumed_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+    last_tape_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
     source_checkpoint: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     source_checkpoint_sha256: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
     control_barrier_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
@@ -272,6 +273,7 @@ class SpiderRuntimeScope(Base):
         CheckConstraint("control_mode IN ('RUN', 'STOP', 'DRAIN')", name="ck_spider_runtime_scope_control"),
         CheckConstraint("current_operation_id COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_runtime_scope_operation_id"),
         CheckConstraint("last_received_sequence >= 0 AND last_consumed_sequence BETWEEN 0 AND last_received_sequence", name="ck_spider_runtime_scope_sequences"),
+        CheckConstraint("last_tape_sequence >= 0", name="ck_spider_runtime_scope_tape_sequence"),
         CheckConstraint("octet_length(source_checkpoint) BETWEEN 1 AND 1048576", name="ck_spider_runtime_scope_checkpoint"),
         CheckConstraint("source_checkpoint_sha256 COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_runtime_scope_checkpoint_hash"),
         CheckConstraint("control_barrier_sequence >= 0", name="ck_spider_runtime_scope_barrier"),
@@ -457,6 +459,157 @@ class SpiderRuntimeDelivery(Base):
         CheckConstraint("elapsed_ms IS NULL OR elapsed_ms >= 0", name="ck_spider_runtime_delivery_elapsed"),
         CheckConstraint("disposition IN ('PENDING', 'CONSUMED', 'SUPPRESSED')", name="ck_spider_runtime_delivery_disposition"),
         CheckConstraint("suppression_reason IS NULL OR disposition = 'SUPPRESSED'", name="ck_spider_runtime_delivery_suppression"),
+    )
+
+
+class SpiderRuntimeTransmission(Base):
+    """Immutable request marker and once-recorded raw response for one group."""
+
+    __tablename__ = "spider_runtime_transmission"
+
+    transmission_group_id: Mapped[str] = mapped_column(
+        String(64, collation="C"), primary_key=True
+    )
+    environment: Mapped[str] = mapped_column(String(128, collation="C"), nullable=False)
+    execution_scope_id: Mapped[str] = mapped_column(
+        String(128, collation="C"), nullable=False
+    )
+    strategy_id: Mapped[str] = mapped_column(String(128, collation="C"), nullable=False)
+    operation_id: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    plan_id: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    configuration_sha256: Mapped[str] = mapped_column(
+        String(64, collation="C"), nullable=False
+    )
+    operation: Mapped[str] = mapped_column(String(8, collation="C"), nullable=False)
+    request_payload: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    request_sha256: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    response_payload: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    response_sha256: Mapped[str | None] = mapped_column(
+        String(64, collation="C"), nullable=True
+    )
+    response_failure: Mapped[str | None] = mapped_column(
+        String(32, collation="C"), nullable=True
+    )
+    recorded_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
+    response_recorded_at: Mapped[DateTime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["operation_id", "environment", "execution_scope_id", "strategy_id"],
+            ["spider_runtime_operation.operation_id", "spider_runtime_operation.environment",
+             "spider_runtime_operation.execution_scope_id", "spider_runtime_operation.strategy_id"],
+            name="fk_spider_runtime_transmission_operation",
+        ),
+        ForeignKeyConstraint(
+            ["plan_id", "operation_id", "environment", "execution_scope_id", "strategy_id"],
+            ["spider_runtime_plan.plan_id", "spider_runtime_plan.operation_id",
+             "spider_runtime_plan.environment", "spider_runtime_plan.execution_scope_id",
+             "spider_runtime_plan.strategy_id"],
+            name="fk_spider_runtime_transmission_plan",
+        ),
+        UniqueConstraint(
+            "transmission_group_id", "environment", "execution_scope_id", "strategy_id",
+            name="uq_spider_runtime_transmission_scope_ref",
+        ),
+        CheckConstraint(
+            "transmission_group_id COLLATE \"C\" ~ '^[0-9a-f]{64}$'",
+            name="ck_spider_runtime_transmission_id",
+        ),
+        CheckConstraint(
+            "generation > 0 AND configuration_sha256 COLLATE \"C\" ~ '^[0-9a-f]{64}$'",
+            name="ck_spider_runtime_transmission_generation_config",
+        ),
+        CheckConstraint(
+            "operation IN ('PLACE', 'CANCEL')",
+            name="ck_spider_runtime_transmission_operation",
+        ),
+        CheckConstraint(
+            "octet_length(request_payload) BETWEEN 1 AND 1048576 AND "
+            "request_sha256 COLLATE \"C\" ~ '^[0-9a-f]{64}$'",
+            name="ck_spider_runtime_transmission_request",
+        ),
+        CheckConstraint(
+            "(response_payload IS NULL) = (response_sha256 IS NULL) AND "
+            "(response_payload IS NULL OR octet_length(response_payload) BETWEEN 1 AND 1048576) AND "
+            "(response_sha256 IS NULL OR response_sha256 COLLATE \"C\" ~ '^[0-9a-f]{64}$') AND "
+            "(response_failure IS NULL OR response_failure IN "
+            "('TRANSPORT_UNKNOWN', 'RESPONSE_INVALID', 'RESPONSE_TOO_LARGE')) AND "
+            "NOT (response_payload IS NOT NULL AND response_failure IS NOT NULL) AND "
+            "((response_payload IS NULL AND response_failure IS NULL AND response_recorded_at IS NULL) OR "
+            "(response_recorded_at IS NOT NULL AND "
+            "(response_payload IS NOT NULL OR response_failure IS NOT NULL)))",
+            name="ck_spider_runtime_transmission_response",
+        ),
+        CheckConstraint(
+            "recorded_at >= TIMESTAMPTZ '0001-01-01 00:00:00+00' AND "
+            "recorded_at < TIMESTAMPTZ '10000-01-01 00:00:00+00' AND "
+            "recorded_at = date_trunc('milliseconds', recorded_at) AND "
+            "(response_recorded_at IS NULL OR "
+            "(response_recorded_at >= TIMESTAMPTZ '0001-01-01 00:00:00+00' AND "
+            "response_recorded_at < TIMESTAMPTZ '10000-01-01 00:00:00+00' AND "
+            "response_recorded_at = date_trunc('milliseconds', response_recorded_at)))",
+            name="ck_spider_runtime_transmission_timestamps",
+        ),
+    )
+
+
+class SpiderRuntimeTapeIndex(Base):
+    """Shared ordering index for financial deliveries and outbound markers."""
+
+    __tablename__ = "spider_runtime_tape_index"
+
+    environment: Mapped[str] = mapped_column(String(128, collation="C"), primary_key=True)
+    execution_scope_id: Mapped[str] = mapped_column(
+        String(128, collation="C"), primary_key=True
+    )
+    strategy_id: Mapped[str] = mapped_column(String(128, collation="C"), primary_key=True)
+    ordinal: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    kind: Mapped[str] = mapped_column(String(16, collation="C"), nullable=False)
+    delivery_sequence: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    transmission_group_id: Mapped[str | None] = mapped_column(
+        String(64, collation="C"), nullable=True
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["environment", "execution_scope_id", "strategy_id"],
+            ["spider_runtime_scope.environment", "spider_runtime_scope.execution_scope_id",
+             "spider_runtime_scope.strategy_id"],
+            name="fk_spider_runtime_tape_scope",
+        ),
+        ForeignKeyConstraint(
+            ["environment", "execution_scope_id", "strategy_id", "delivery_sequence"],
+            ["spider_runtime_delivery.environment", "spider_runtime_delivery.execution_scope_id",
+             "spider_runtime_delivery.strategy_id", "spider_runtime_delivery.sequence"],
+            name="fk_spider_runtime_tape_delivery",
+        ),
+        ForeignKeyConstraint(
+            ["transmission_group_id", "environment", "execution_scope_id", "strategy_id"],
+            ["spider_runtime_transmission.transmission_group_id",
+             "spider_runtime_transmission.environment",
+             "spider_runtime_transmission.execution_scope_id",
+             "spider_runtime_transmission.strategy_id"],
+            name="fk_spider_runtime_tape_transmission",
+        ),
+        UniqueConstraint(
+            "environment", "execution_scope_id", "strategy_id", "delivery_sequence",
+            name="uq_spider_runtime_tape_delivery",
+        ),
+        UniqueConstraint(
+            "environment", "execution_scope_id", "strategy_id", "transmission_group_id",
+            name="uq_spider_runtime_tape_transmission",
+        ),
+        CheckConstraint("ordinal > 0", name="ck_spider_runtime_tape_ordinal"),
+        CheckConstraint(
+            "(kind = 'DELIVERY' AND delivery_sequence IS NOT NULL AND "
+            "transmission_group_id IS NULL) OR "
+            "(kind = 'SEND_MARKER' AND delivery_sequence IS NULL AND "
+            "transmission_group_id IS NOT NULL)",
+            name="ck_spider_runtime_tape_reference",
+        ),
     )
 
 

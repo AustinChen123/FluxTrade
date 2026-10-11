@@ -34,6 +34,7 @@ from src.core.adapter_runtime_composition import (
     runtime_factories_for_config,
     validate_runtime_config as _validate_runtime_config,
 )
+from src.core.adapters.okx_spider_transport import classify_okx_batch_response
 
 
 def _setup_logging() -> None:
@@ -342,6 +343,13 @@ def main(spider_composition: SpiderRuntimeComposition | None = None):
                 **spider_callbacks,
             )
             if spider_composition is not None:
+                selected_venues = {
+                    source.selected_venue
+                    for source in spider_composition.model_sources_by_confirmation.values()
+                }
+                transport_response_classifier = (
+                    classify_okx_batch_response if selected_venues == {"okx"} else None
+                )
                 owner = SpiderRuntimeOwner(
                     _session_scope,
                     engine.execution_engine.order_manager,
@@ -352,6 +360,7 @@ def main(spider_composition: SpiderRuntimeComposition | None = None):
                     strategy_state_manager=engine._strategy_state_manager,
                     lifecycle_lock=engine._strategy_lifecycle_lock,
                     order_event_lock=engine.execution_engine._order_event_apply_lock,
+                    transport_response_classifier=transport_response_classifier,
                 )
                 spider_owner_ref[0] = owner
         except Exception:

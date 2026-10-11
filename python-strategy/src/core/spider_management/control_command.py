@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_canonical
 from src.core.models import StrategyStatus
 from src.core.orm_models import StrategyState
+from src.core.spider_management.financial_delivery import validate_tape_index
 from src.core.spider_management.orm import SpiderControlReceipt
 from src.core.spider_management.orm import (
     SpiderConfigurationRequest,
@@ -289,6 +290,10 @@ def write_stop_in_transaction(
         return SpiderControlWriteResult(
             "REJECTED", "SPIDER_RUNTIME_NOT_FOUND", None
         )
+    if not validate_tape_index(session, runtime):
+        return SpiderControlWriteResult(
+            "UNKNOWN", "SPIDER_TAPE_UNAVAILABLE", runtime.current_operation_id
+        )
     operation_id = runtime.current_operation_id
     locked = state_manager.lock_state_in_transaction(session, request.strategy_id)
     if (
@@ -312,7 +317,7 @@ def write_stop_in_transaction(
         changed_at=datetime.now(UTC),
         expected_version=request.expected_version,
     )
-    barrier = runtime.last_received_sequence
+    barrier = runtime.last_tape_sequence
     runtime.control_mode = "STOP"
     runtime.state_version = transition.version
     runtime.control_barrier_sequence = barrier

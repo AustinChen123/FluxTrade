@@ -21,9 +21,10 @@ from src.core.spider_management.orm import (
     SpiderRuntimeOperation,
     SpiderRuntimePlan,
     SpiderRuntimeScope,
+    SpiderRuntimeTapeIndex,
+    SpiderRuntimeTransmission,
 )
 
-_MAX_SEQUENCE = 2**63 - 1
 _PAYLOAD_KEYS = {
     "schema_version", "scope", "kind", "binding", "trade_id",
     "transition_ordinal", "before", "after", "binding_resolution",
@@ -32,6 +33,7 @@ _PAYLOAD_KEYS = {
 _PROJECTION_KEYS = {
     "status", "filled_quantity", "filled_price", "exchange_order_id"
 }
+_MAX_SEQUENCE = 2**63 - 1
 
 
 def _digest(data: bytes) -> str:
@@ -280,7 +282,7 @@ def stage_financial_receipt(
         if type(sequence) is not int or sequence < 1 or sequence > _MAX_SEQUENCE:
             raise RuntimeError("spider_financial_sequence_exhausted")
         scope_row.last_received_sequence = sequence
-        session.add(SpiderRuntimeDelivery(
+        delivery = SpiderRuntimeDelivery(
             environment=environment,
             execution_scope_id=execution_scope_id,
             strategy_id=strategy_id,
@@ -301,8 +303,114 @@ def stage_financial_receipt(
             elapsed_ms=None,
             disposition="PENDING",
             suppression_reason=None,
-        ))
+        )
+        session.add(delivery)
+        tape_sequence = scope_row.last_tape_sequence + 1
+        if type(tape_sequence) is not int or tape_sequence < 1 or tape_sequence > _MAX_SEQUENCE:
+            raise RuntimeError("spider_financial_tape_sequence_exhausted")
+        scope_row.last_tape_sequence = tape_sequence
+        tape = SpiderRuntimeTapeIndex(
+            environment=environment,
+            execution_scope_id=execution_scope_id,
+            strategy_id=strategy_id,
+            ordinal=tape_sequence,
+            kind="DELIVERY",
+            delivery_sequence=sequence,
+            transmission_group_id=None,
+        )
+        session.add(tape)
+        # Make only the just-staged management proof visible to the same-TX
+        # projection queries; the repository still owns the Order write/flush.
+        session.flush([scope_row, delivery, tape])
         return True
+
+
+def validate_tape_index(session: Session, runtime: SpiderRuntimeScope) -> bool:
+    """Prove the shared tape is contiguous and references every saved item once."""
+    if (
+        type(runtime.last_received_sequence) is not int
+        or type(runtime.last_tape_sequence) is not int
+        or runtime.last_received_sequence < 0
+        or runtime.last_tape_sequence < runtime.last_received_sequence
+        or runtime.last_tape_sequence > _MAX_SEQUENCE
+    ):
+        return False
+    scope_filters = (
+        SpiderRuntimeDelivery.environment == runtime.environment,
+        SpiderRuntimeDelivery.execution_scope_id == runtime.execution_scope_id,
+        SpiderRuntimeDelivery.strategy_id == runtime.strategy_id,
+    )
+    deliveries = session.execute(
+        select(SpiderRuntimeDelivery.sequence).where(*scope_filters).order_by(
+            SpiderRuntimeDelivery.sequence
+        )
+    ).scalars().all()
+    if deliveries != list(range(1, runtime.last_received_sequence + 1)):
+        return False
+    transmission_table = SpiderRuntimeTransmission.__table__
+    transmission_rows = session.execute(
+        select(transmission_table.c.transmission_group_id,
+               transmission_table.c.request_payload,
+               transmission_table.c.request_sha256)
+        .where(
+            transmission_table.c.environment == runtime.environment,
+            transmission_table.c.execution_scope_id == runtime.execution_scope_id,
+            transmission_table.c.strategy_id == runtime.strategy_id,
+        )
+    ).mappings().all()
+    transmission_ids: set[str] = set()
+    for row in transmission_rows:
+        group_id = row["transmission_group_id"]
+        payload = row["request_payload"]
+        if (
+            type(group_id) is not str
+            or type(payload) is not bytes
+            or _digest(payload) != row["request_sha256"]
+            or group_id in transmission_ids
+        ):
+            return False
+        transmission_ids.add(group_id)
+    tape_table = SpiderRuntimeTapeIndex.__table__
+    tape_rows = session.execute(
+        select(tape_table).where(
+            tape_table.c.environment == runtime.environment,
+            tape_table.c.execution_scope_id == runtime.execution_scope_id,
+            tape_table.c.strategy_id == runtime.strategy_id,
+        ).order_by(tape_table.c.ordinal)
+    ).mappings().all()
+    if len(tape_rows) != runtime.last_tape_sequence:
+        return False
+    seen_deliveries: set[int] = set()
+    seen_transmissions: set[str] = set()
+    for ordinal, row in enumerate(tape_rows, 1):
+        if row["ordinal"] != ordinal:
+            return False
+        if row["kind"] == "DELIVERY":
+            sequence = row["delivery_sequence"]
+            if (
+                type(sequence) is not int
+                or row["transmission_group_id"] is not None
+                or not 1 <= sequence <= runtime.last_received_sequence
+                or sequence in seen_deliveries
+            ):
+                return False
+            seen_deliveries.add(sequence)
+        elif row["kind"] == "SEND_MARKER":
+            group_id = row["transmission_group_id"]
+            if (
+                row["delivery_sequence"] is not None
+                or type(group_id) is not str
+                or group_id not in transmission_ids
+                or group_id in seen_transmissions
+            ):
+                return False
+            seen_transmissions.add(group_id)
+        else:
+            return False
+    return (
+        seen_deliveries == set(range(1, runtime.last_received_sequence + 1))
+        and seen_transmissions == transmission_ids
+    )
 
 
 def _projection_matches_install(

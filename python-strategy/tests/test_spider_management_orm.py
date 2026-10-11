@@ -10,6 +10,8 @@ from src.core.spider_management.orm import (
     SpiderRuntimeOperation,
     SpiderRuntimePlan,
     SpiderRuntimeScope,
+    SpiderRuntimeTapeIndex,
+    SpiderRuntimeTransmission,
 )
 
 
@@ -67,6 +69,7 @@ def test_spider_configuration_columns_and_constraints_remain_on_configuration_ta
     assert set(runtime_scope.columns.keys()) >= {
         "environment", "execution_scope_id", "strategy_id", "generation",
         "current_operation_id", "source_checkpoint", "initial_plan_id",
+        "last_tape_sequence",
     }
     assert set(runtime_plan.columns.keys()) >= {
         "plan_id", "operation_id", "manifest_payload", "manifest_sha256",
@@ -111,6 +114,55 @@ def test_operation_phase_check_matches_the_closed_e4_phase_set():
         "phase IN ('PREVIEW', 'DRAIN', 'POSITION', 'RECONCILE', 'COMMIT', "
         "'BUILD', 'RUN', 'INCOMPLETE', 'STOP')"
     )
+
+
+def test_transport_tape_orm_has_exact_shared_ordering_and_scoped_delivery_fk():
+    transmission = SpiderRuntimeTransmission.__table__
+    tape = SpiderRuntimeTapeIndex.__table__
+    assert set(transmission.columns.keys()) == {
+        "transmission_group_id", "environment", "execution_scope_id", "strategy_id",
+        "operation_id", "plan_id", "generation", "configuration_sha256", "operation",
+        "request_payload", "request_sha256", "response_payload", "response_sha256",
+        "response_failure", "recorded_at", "response_recorded_at",
+    }
+    assert set(tape.columns.keys()) == {
+        "environment", "execution_scope_id", "strategy_id", "ordinal", "kind",
+        "delivery_sequence", "transmission_group_id",
+    }
+    assert list(tape.primary_key.columns.keys()) == [
+        "environment", "execution_scope_id", "strategy_id", "ordinal"
+    ]
+    delivery_fk = next(
+        constraint for constraint in tape.constraints
+        if constraint.name == "fk_spider_runtime_tape_delivery"
+    )
+    assert [element.parent.name for element in delivery_fk.elements] == [
+        "environment", "execution_scope_id", "strategy_id", "delivery_sequence"
+    ]
+    assert [element.target_fullname for element in delivery_fk.elements] == [
+        "spider_runtime_delivery.environment",
+        "spider_runtime_delivery.execution_scope_id",
+        "spider_runtime_delivery.strategy_id",
+        "spider_runtime_delivery.sequence",
+    ]
+    tape_checks = {constraint.name for constraint in tape.constraints}
+    assert {
+        "ck_spider_runtime_tape_ordinal",
+        "ck_spider_runtime_tape_reference",
+        "fk_spider_runtime_tape_scope",
+        "fk_spider_runtime_tape_delivery",
+        "fk_spider_runtime_tape_transmission",
+        "uq_spider_runtime_tape_delivery",
+        "uq_spider_runtime_tape_transmission",
+    } <= tape_checks
+    transmission_checks = {constraint.name for constraint in transmission.constraints}
+    assert {
+        "ck_spider_runtime_transmission_id",
+        "ck_spider_runtime_transmission_request",
+        "ck_spider_runtime_transmission_response",
+        "fk_spider_runtime_transmission_operation",
+        "fk_spider_runtime_transmission_plan",
+    } <= transmission_checks
 
 
 def test_runtime_checks_match_closed_e4_bounds_and_outcome_tokens():

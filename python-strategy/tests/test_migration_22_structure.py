@@ -37,7 +37,7 @@ def test_single_head_exact_schema_and_orm_parity():
     config = Config(str(ROOT / "alembic.ini"))
     config.set_main_option("script_location", str(ROOT / "alembic"))
     script = ScriptDirectory.from_config(config)
-    assert script.get_heads() == ["a7d0c5e2f941"]
+    assert script.get_heads() == ["c3f8d1a904b7"]
     revision = script.get_revision("d95a2b73e608")
     assert revision is not None and revision.down_revision == "c84f1a92d607"
     up = sql("upgrade")
