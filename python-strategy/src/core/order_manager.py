@@ -264,7 +264,7 @@ class OrderManager:
         new_trade = Trade(
             id=trade_id,
             order_id=order.id,
-            exchange_trade_id=f"trd_{trade_id[:8]}",
+            exchange_trade_id=None,
             product_id=order.product_id,
             side=order.side,
             price=fill_price,

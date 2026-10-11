@@ -344,6 +344,7 @@ class TestOrderStatusUpdates:
         # The trade is added to DB via mock_db_session.add()
         assert order.status == "closed"
 
+
     def test_fail_order_updates_status(self, mock_order_repo, mock_clock, signal_factory):
         """Failing an order should update its status to failed."""
         order_manager = OrderManager(mock_order_repo, mock_clock)
@@ -390,6 +391,154 @@ class TestOrderStatusUpdates:
 
         assert order.status == OrderStatus.CANCELLED.value
         assert mock_order_repo.orders[order.id].status == OrderStatus.CANCELLED.value
+
+
+@pytest.mark.parametrize("is_backtest", [False, True], ids=["live", "backtest"])
+@pytest.mark.parametrize(
+    "fill_entry_point",
+    ["fill_order", "record_partial_fill", "record_fill_delta"],
+)
+def test_fill_entry_points_keep_local_ids_separate_from_external_ids(
+    is_backtest,
+    fill_entry_point,
+    monkeypatch,
+    mock_clock,
+    mock_order_repo,
+    signal_factory,
+):
+    redis_client = MagicMock()
+    redis_client.hgetall.return_value = {}
+    monkeypatch.setattr(
+        "src.core.order_manager.create_redis_client", lambda: redis_client
+    )
+    order_manager = OrderManager(
+        mock_order_repo, mock_clock, is_backtest=is_backtest
+    )
+
+    recorded_orders = []
+    for price, quantity, fee in (
+        (Decimal("101.25"), Decimal("0.4"), Decimal("0.02")),
+        (Decimal("103.50"), Decimal("0.6"), Decimal("0.03")),
+    ):
+        order = order_manager.create_order(
+            signal_factory(), OrderSide.BUY, "market", quantity
+        )
+        recorded_orders.append(order)
+        record_fill = getattr(order_manager, fill_entry_point)
+        if fill_entry_point == "fill_order":
+            record_fill(order, price, quantity, fee=fee, fee_asset="USDT")
+        elif fill_entry_point == "record_partial_fill":
+            record_fill(
+                order,
+                price,
+                quantity,
+                cumulative_filled_quantity=quantity,
+                cumulative_average_price=price,
+                fee=fee,
+                fee_asset="USDT",
+            )
+        else:
+            record_fill(
+                order,
+                price,
+                quantity,
+                cumulative_filled_quantity=quantity,
+                cumulative_average_price=price,
+                terminal_status=OrderStatus.FILLED,
+                fee=fee,
+                fee_asset="USDT",
+            )
+
+    trades = mock_order_repo.trades
+    assert len(trades) == 2
+    assert all(trade.id for trade in trades)
+    assert len({trade.id for trade in trades}) == 2
+    assert [trade.order_id for trade in trades] == [
+        order.id for order in recorded_orders
+    ]
+    assert all(trade.exchange_trade_id is None for trade in trades)
+    assert [
+        (trade.price, trade.quantity, trade.fee, trade.fee_asset)
+        for trade in trades
+    ] == [
+        (Decimal("101.25"), Decimal("0.4"), Decimal("0.02"), "USDT"),
+        (Decimal("103.50"), Decimal("0.6"), Decimal("0.03"), "USDT"),
+    ]
+
+
+def test_live_fill_persists_null_external_trade_id(
+    mock_clock,
+    signal_factory,
+    sqlite_order_session_factory,
+    monkeypatch,
+):
+    from src.core.orm_models import Trade
+    from src.core.repositories import LiveOrderRepository
+
+    redis_client = MagicMock()
+    redis_client.hgetall.return_value = {}
+    monkeypatch.setattr(
+        "src.core.order_manager.create_redis_client", lambda: redis_client
+    )
+    repository = LiveOrderRepository(
+        db_session_factory=sqlite_order_session_factory
+    )
+    order_manager = OrderManager(repository, mock_clock, is_backtest=False)
+    order = order_manager.create_order(
+        signal_factory(), OrderSide.BUY, "market", Decimal("0.4")
+    )
+
+    order_manager.fill_order(
+        order,
+        Decimal("101.25"),
+        Decimal("0.4"),
+        fee=Decimal("0.02"),
+        fee_asset="USDT",
+    )
+
+    with sqlite_order_session_factory() as session:
+        persisted = session.query(Trade).filter_by(order_id=order.id).one()
+        assert persisted.id
+        assert persisted.order_id == order.id
+        assert persisted.exchange_trade_id is None
+        assert persisted.price == Decimal("101.25")
+        assert persisted.quantity == Decimal("0.4")
+        assert persisted.fee == Decimal("0.02")
+        assert persisted.fee_asset == "USDT"
+
+
+def test_backtest_trade_capture_accepts_null_external_trade_id(
+    mock_clock, mock_db_session, signal_factory
+):
+    from src.core.orm_models import BacktestTradeLog
+    from src.core.repositories import BacktestOrderRepository
+
+    repository = BacktestOrderRepository(mock_db_session, session_id=42)
+    order_manager = OrderManager(repository, mock_clock, is_backtest=True)
+    order = order_manager.create_order(
+        signal_factory(), OrderSide.BUY, "market", Decimal("0.4")
+    )
+
+    order_manager.fill_order(
+        order,
+        Decimal("101.25"),
+        Decimal("0.4"),
+        fee=Decimal("0.02"),
+        fee_asset="USDT",
+    )
+
+    captured = next(
+        call.args[0]
+        for call in mock_db_session.add.call_args_list
+        if isinstance(call.args[0], BacktestTradeLog)
+    )
+    assert captured.id
+    assert captured.order_id == order.id
+    assert captured.exchange_trade_id is None
+    assert captured.price == Decimal("101.25")
+    assert captured.quantity == Decimal("0.4")
+    assert captured.fee == Decimal("0.02")
+    assert captured.fee_asset == "USDT"
 
 
 class TestExchangeOrderId:

@@ -383,24 +383,34 @@ def test_order_event_derives_context_independent_cumulative_average_from_deltas(
                 last_fill_price=Decimal("101"),
             )
         )
-        final = applier.process_exchange_order_event(
-            ExchangeOrderEvent(
-                status="filled",
-                product_id=order.product_id,
-                exchange_order_id="EX-weighted-average",
-                cumulative_filled_quantity=Decimal("0.10"),
-                last_fill_quantity=Decimal("0.06"),
-                last_fill_price=Decimal("103"),
-            )
+        final_event = ExchangeOrderEvent(
+            status="filled",
+            product_id=order.product_id,
+            exchange_order_id="EX-weighted-average",
+            cumulative_filled_quantity=Decimal("0.10"),
+            last_fill_quantity=Decimal("0.06"),
+            last_fill_price=Decimal("103"),
+            fee=Decimal("0.02"),
+            fee_asset="USDT",
         )
+        final = applier.process_exchange_order_event(final_event)
+        replay = applier.process_exchange_order_event(final_event)
 
     assert partial["action"] == "applied"
     assert final["action"] == "applied"
+    assert replay["action"] == "applied"
     assert order.filled_quantity == Decimal("0.10")
     assert order.filled_price == Decimal("102.2")
-    assert [trade.price for trade in mock_order_repo.trades] == [
-        Decimal("101"),
-        Decimal("103"),
+    assert len(mock_order_repo.trades) == 2
+    assert [trade.order_id for trade in mock_order_repo.trades] == [order.id, order.id]
+    assert len({trade.id for trade in mock_order_repo.trades}) == 2
+    assert all(trade.exchange_trade_id is None for trade in mock_order_repo.trades)
+    assert [
+        (trade.price, trade.quantity, trade.fee, trade.fee_asset)
+        for trade in mock_order_repo.trades
+    ] == [
+        (Decimal("101"), Decimal("0.04"), Decimal("0"), "USDT"),
+        (Decimal("103"), Decimal("0.06"), Decimal("0.02"), "USDT"),
     ]
 
 
