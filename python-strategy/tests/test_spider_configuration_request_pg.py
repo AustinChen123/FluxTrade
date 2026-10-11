@@ -25,9 +25,15 @@ from src.core.spider_management.configuration_request_store import (
     SpiderConfigurationRequestStore,
     SpiderConfigurationWriteDisposition,
 )
-from test_migrations import _alembic_config, _target_url, _upgrade
+from test_migrations import (
+    _alembic_config,
+    _target_url,
+    _upgrade,
+    fresh_pg_db as _migration_fresh_pg_db,
+)
 from test_spider_configuration_request import configuration
 
+fresh_pg_db = _migration_fresh_pg_db
 pytest_plugins = ["test_migrations"]
 pytestmark = [
     pytest.mark.integration,
