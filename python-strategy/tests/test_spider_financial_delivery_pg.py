@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from src.control_plane.spider_operation_http import SPIDER_OPERATION_REQUEST_PATH
 from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_canonical
+from src.core.backtest.spider_historical_input import HistoricalRunInput
 from src.core.clock import BacktestClock
 from src.core.command_router import CommandResult
 from src.core.execution import ExecutionEngine
@@ -63,9 +64,14 @@ pytestmark = [
 ]
 
 
-def _install_owner(engine: Engine, *, strategy_id: str = "spider-main"):
+def _install_owner(
+    engine: Engine,
+    *,
+    strategy_id: str = "spider-main",
+    admitted_run: HistoricalRunInput | None = None,
+):
     run, specs, confirmation, prepared, operation_body = _install_evidence(
-        engine, strategy_id=strategy_id
+        engine, strategy_id=strategy_id, admitted_run=admitted_run
     )
     app, _service, headers = _operation_http_app(sessionmaker(engine))
     proposal = SpiderOperationRequest.from_canonical_bytes(canonical_bytes(operation_body))

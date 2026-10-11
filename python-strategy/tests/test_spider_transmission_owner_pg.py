@@ -2,6 +2,7 @@
 
 import logging
 import os
+from dataclasses import replace
 from decimal import Decimal
 from hashlib import sha256
 from threading import RLock
@@ -17,6 +18,7 @@ from src.core.adapters.okx_spider_transport import (
     classify_okx_batch_response,
 )
 from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_canonical
+from src.core.backtest.spider_historical_input import HistoricalRunInput
 from src.core.execution import ExecutionEngine
 from src.core.interfaces.exchange import ExchangeOrderEvent
 from src.core.orm_models import Order, Trade
@@ -39,6 +41,7 @@ from test_spider_financial_delivery_pg import (
 )
 from test_spider_control_command_pg import _command, _dispatch, _owner_with_lifecycle
 from test_spider_operation_request_pg import operation_pg as _operation_pg
+from test_spider_model_bootstrap import _admitted_run
 
 fresh_pg_db = _migration_fresh_pg_db
 pytest_plugins = ["test_migrations"]
@@ -67,6 +70,15 @@ class _OfflinePlaceClient:
         self, _orders: list[dict[str, object]]
     ) -> object:
         raise AssertionError("PLACE transmission must not call the CANCEL endpoint")
+
+
+def _run_with_initial_order_count(per_product: int) -> HistoricalRunInput:
+    run = _admitted_run()
+    cache = cast(dict[str, object], decode_canonical(run.initial_policy_cache))
+    rows = cast(list[dict[str, object]], cache["rows"])
+    for row in rows:
+        row["單數"] = str(per_product)
+    return replace(run, initial_policy_cache=canonical_bytes(cache))
 
 
 def _accepted_envelope(members: list[dict[str, object]]) -> dict[str, object]:
@@ -636,11 +648,39 @@ def test_changed_bytes_for_an_existing_group_are_unavailable_and_never_resent(
         ) == 1
 
 
+@pytest.mark.parametrize(
+    ("orders_per_product", "expected_group_sizes"),
+    ((2, (4, 4)), (11, (20, 2, 20, 2))),
+)
 def test_all_saved_source_groups_complete_and_exact_first_retry_never_resends(
     operation_pg: Engine,
+    mock_clock,
+    mock_exchange_adapter,
+    orders_per_product: int,
+    expected_group_sizes: tuple[int, ...],
 ) -> None:
     engine = operation_pg
-    owner, scope, operation_id, _manager, _prepared, _initial, *_ = _install_owner(engine)
+    run = _run_with_initial_order_count(orders_per_product)
+    owner, scope, operation_id, manager, prepared, initial, *_ = _install_owner(
+        engine, admitted_run=run
+    )
+    source_events = cast(
+        dict[str, object], decode_canonical(prepared.initial_source_events_bytes)
+    )
+    entries = cast(list[dict[str, object]], source_events["entries"])
+    assert [entry["source_product_id"] for entry in entries] == list(run.ordered_products)
+    original_groups: list[list[dict[str, object]]] = []
+    for entry in entries:
+        events = cast(list[dict[str, object]], entry["events"])
+        send_events = [event for event in events if event.get("kind") == "send"]
+        product_groups = [
+            cast(list[dict[str, object]], event["orders"]) for event in send_events
+        ]
+        expected_per_product = (20, 2) if orders_per_product == 11 else (4,)
+        assert tuple(len(group) for group in product_groups) == expected_per_product
+        original_groups.extend(product_groups)
+    assert tuple(len(group) for group in original_groups) == expected_group_sizes
+
     with Session(engine) as session:
         runtime = session.execute(
             select(SpiderRuntimeScope).where(
@@ -658,16 +698,61 @@ def test_all_saved_source_groups_complete_and_exact_first_retry_never_resends(
             .group_by(SpiderRuntimeAction.transmission_group)
             .order_by(SpiderRuntimeAction.transmission_group)
         ).all()
-    assert len(group_sizes) == 2
-    assert all(1 <= count <= 20 for _source_group, count in group_sizes)
+        action_rows = session.execute(
+            select(SpiderRuntimeAction, SpiderRuntimeBinding, Order)
+            .join(
+                SpiderRuntimeBinding,
+                SpiderRuntimeBinding.action_id == SpiderRuntimeAction.action_id,
+            )
+            .join(Order, Order.id == SpiderRuntimeAction.local_order_id)
+            .where(SpiderRuntimeAction.plan_id == runtime.initial_plan_id)
+            .order_by(SpiderRuntimeAction.candidate_ordinal)
+        ).all()
+    assert tuple(count for _source_group, count in group_sizes) == expected_group_sizes
+    assert len(action_rows) == sum(expected_group_sizes)
+    mapped_products = {
+        cast(str, entry["source_product_id"]): cast(
+            str, cast(dict[str, object], entry["instrument_spec"])["product_id"]
+        )
+        for entry in cast(list[dict[str, object]], prepared.product_map["entries"])
+    }
+    candidate_index = 0
+    for group_id, source_group in enumerate(original_groups, start=1):
+        for ordinal, source_order in enumerate(source_group):
+            action, binding, order = action_rows[candidate_index]
+            candidate_index += 1
+            assert action.transmission_group == group_id
+            assert action.transmission_ordinal == ordinal
+            assert bytes(action.original_payload) == canonical_bytes(source_order)
+            assert action.payload_sha256 == sha256(bytes(action.original_payload)).hexdigest()
+            assert binding.action_id == action.action_id
+            assert binding.local_order_id == action.local_order_id == order.id
+            assert binding.source_product_id == action.product_id == source_order["instId"]
+            assert binding.source_client_order_id == source_order["clOrdId"]
+            assert binding.canonical_product_id == order.product_id == mapped_products[
+                cast(str, source_order["instId"])
+            ]
+            intent = cast(dict[str, object], order.intent_payload)
+            assert intent["source_order"] == source_order
+            assert intent["source_client_order_id"] == source_order["clOrdId"]
+            assert intent["local_client_order_id"] == order.client_order_id
+            assert intent["local_client_order_id"] != source_order["clOrdId"]
+            binding_bytes = bytes.fromhex(cast(str, intent["provider_binding_bytes_hex"]))
+            assert sha256(binding_bytes).hexdigest() == intent["provider_binding_sha256"]
+            assert order.side == source_order["side"]
+            assert order.price == Decimal(cast(str, source_order["px"]))
+            assert order.quantity == Decimal(cast(str, source_order["sz"]))
+
     enabled = _transport_enabled_owner(owner, scope)
 
     class AcceptEachGroup:
         def __init__(self) -> None:
             self.calls = 0
+            self.requests: list[list[dict[str, object]]] = []
 
         def privatePostTradeBatchOrders(self, orders: list[dict[str, object]]) -> object:
             self.calls += 1
+            self.requests.append(orders)
             return {
                 "code": "0",
                 "data": [
@@ -687,10 +772,22 @@ def test_all_saved_source_groups_complete_and_exact_first_retry_never_resends(
     client = AcceptEachGroup()
     transport = OkxSpiderBatchTransport(cast(Any, client))
     saved: list[tuple[int, bytes, object]] = []
+    expected_outbound_batches: list[list[dict[str, object]]] = []
     for source_group_value, expected_count in group_sizes:
         source_group = cast(int, source_group_value)
         request_payload, members = _saved_group_request(engine, scope, source_group)
         assert len(members) == expected_count
+        decoded_request = cast(dict[str, object], decode_canonical(bytes(request_payload)))
+        durable_members = cast(list[dict[str, object]], decoded_request["members"])
+        expected_outbound_batches.append([
+            dict(cast(dict[str, object], member["request_payload"]))
+            for member in durable_members
+        ])
+        source_orders = original_groups[source_group - 1]
+        assert len(source_orders) == len(members)
+        for member, source_order in zip(members, source_orders, strict=True):
+            request_order = cast(dict[str, object], member["request_payload"])
+            assert request_order == source_order | {"clOrdId": member["wire_clOrdId"]}
         outcome = enabled.transmit_initial_place_group(
             scope,
             source_group,
@@ -703,6 +800,9 @@ def test_all_saved_source_groups_complete_and_exact_first_retry_never_resends(
             (cast(str, member["action_id"]), "ACCEPTED") for member in members
         )
         saved.append((source_group, request_payload, outcome))
+
+    assert client.calls == len(group_sizes)
+    assert client.requests == expected_outbound_batches
 
     complete = enabled.readback(scope, operation_id)
     assert complete is not None
@@ -719,20 +819,173 @@ def test_all_saved_source_groups_complete_and_exact_first_retry_never_resends(
         transport,
     )
     assert retried == first_outcome
-    assert client.calls == 2
+    assert client.calls == len(group_sizes)
     assert enabled.readback(scope, operation_id) == complete
     with Session(engine) as session:
         assert session.scalar(
             select(func.count()).select_from(SpiderRuntimeTransmission).where(
                 SpiderRuntimeTransmission.strategy_id == scope.strategy_id
             )
-        ) == 2
+        ) == len(group_sizes)
         assert session.scalar(
             select(func.count()).select_from(SpiderRuntimeTapeIndex).where(
                 SpiderRuntimeTapeIndex.strategy_id == scope.strategy_id
             )
-        ) == 2
+        ) == len(group_sizes)
 
+    if orders_per_product == 11:
+        first_group, _first_payload, _first_outcome = saved[0]
+        _request_payload, first_members = _saved_group_request(engine, scope, first_group)
+        target = first_members[0]
+        provider_id = "synthetic-group-1-0"
+        order = manager.repo.get_order(cast(str, target["local_order_id"]))
+        assert order is not None
+        execution = _execution_for_owner(enabled, engine, mock_clock, mock_exchange_adapter)
+        assert execution.process_exchange_order_event(_filled_event(
+            order,
+            provider_id=provider_id,
+            trade_id="two-product-source-late-fill",
+        ))["action"] == "applied"
+
+        after_fill = enabled.readback(scope, operation_id)
+        assert after_fill is not None
+        assert after_fill["initial_plan_status"] == "COMPLETE"
+        assert after_fill["initial_plan_missing_members"] == []
+        assert after_fill["phase"] == "INCOMPLETE"
+        assert after_fill["trading_ready"] is False
+        with Session(engine) as session:
+            saved_order = session.get(Order, order.id)
+            trade = session.execute(
+                select(Trade).where(
+                    Trade.exchange_trade_id == "two-product-source-late-fill"
+                )
+            ).scalar_one()
+            assert saved_order is not None
+            assert saved_order.exchange_order_id == provider_id
+            assert saved_order.status == "FILLED"
+            assert saved_order.filled_quantity == order.quantity
+            assert saved_order.filled_price == order.price
+            assert trade.order_id == order.id
+            assert trade.quantity == order.quantity
+            assert trade.price == order.price
+            assert trade.fee == Decimal("0.01")
+            receipt_before_stop = _financial_receipt_snapshot(session, scope)
+            assert len(receipt_before_stop) == 2
+            fill_receipt = next(row for row in receipt_before_stop if row[4] == trade.id)
+            assert fill_receipt[2] == target["action_id"]
+            assert fill_receipt[3] == order.id
+            assert fill_receipt[7] == "PENDING"
+            assert fill_receipt[8] is None
+            fill_payload_bytes = cast(bytes, fill_receipt[6])
+            assert fill_receipt[5] == sha256(fill_payload_bytes).hexdigest()
+            fill_payload = cast(dict[str, object], decode_canonical(fill_payload_bytes))
+            assert fill_payload["kind"] == "FILL"
+            assert fill_payload["trade_id"] == trade.id
+            assert fill_payload["binding_resolution"] == "BOUND"
+            assert fill_payload["reason_code"] is None
+            fill_binding = cast(dict[str, object], fill_payload["binding"])
+            assert fill_binding["action_id"] == target["action_id"]
+            assert fill_binding["local_order_id"] == order.id
+            received_sequence, consumed_sequence = session.execute(
+                select(
+                    SpiderRuntimeScope.last_received_sequence,
+                    SpiderRuntimeScope.last_consumed_sequence,
+                ).where(SpiderRuntimeScope.strategy_id == scope.strategy_id)
+            ).one()
+            assert received_sequence > consumed_sequence
+            financial_before_stop = (
+                saved_order.id,
+                saved_order.exchange_order_id,
+                saved_order.status,
+                saved_order.filled_quantity,
+                saved_order.filled_price,
+                trade.id,
+                trade.exchange_trade_id,
+                trade.quantity,
+                trade.price,
+                trade.fee,
+                trade.fee_asset,
+            )
+
+        class RedisProbe:
+            def publish(self, _channel: str, _message: str) -> int:
+                return 1
+
+        factory = sessionmaker(engine)
+        lifecycle_lock = RLock()
+        stop_owner = SpiderRuntimeOwner(
+            factory,
+            manager,
+            owned_scopes=(scope,),
+            model_sources_by_confirmation=owner._model_sources,
+            strategy_state_manager=StrategyStateManager(factory, RedisProbe()),
+            lifecycle_lock=lambda _strategy_id: lifecycle_lock,
+            order_event_lock=RLock(),
+            transport_response_classifier=classify_okx_batch_response,
+        )
+        stopped = _dispatch(
+            stop_owner,
+            _command(
+                scope,
+                key="two-product-late-fill-stop",
+                version=cast(int, initial["state_version"]),
+            ),
+        )
+        assert stopped.success is True and stopped.completed is True
+        assert stop_owner.restore_owned_runtimes() == frozenset({scope.strategy_id})
+        after_stop = stop_owner.readback(scope, operation_id)
+        assert after_stop is not None
+        assert after_stop["runtime_control"] == "STOP"
+        assert after_stop["initial_plan_status"] == "COMPLETE"
+        assert after_stop["initial_plan_missing_members"] == []
+        assert after_stop["phase"] == "INCOMPLETE"
+        assert after_stop["trading_ready"] is False
+        assert after_stop["checkpoint_sha256"] == complete["checkpoint_sha256"]
+        assert client.calls == len(group_sizes)
+        with Session(engine) as session:
+            saved_order = session.get(Order, order.id)
+            trade = session.execute(
+                select(Trade).where(
+                    Trade.exchange_trade_id == "two-product-source-late-fill"
+                )
+            ).scalar_one()
+            pending_count = session.scalar(
+                select(func.count()).select_from(SpiderRuntimeDelivery).where(
+                    SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                    SpiderRuntimeDelivery.disposition == "PENDING",
+                )
+            )
+            receipt_after_stop = _financial_receipt_snapshot(session, scope)
+            received_sequence, consumed_sequence = session.execute(
+                select(
+                    SpiderRuntimeScope.last_received_sequence,
+                    SpiderRuntimeScope.last_consumed_sequence,
+                ).where(SpiderRuntimeScope.strategy_id == scope.strategy_id)
+            ).one()
+            assert saved_order is not None
+            assert (
+                saved_order.id,
+                saved_order.exchange_order_id,
+                saved_order.status,
+                saved_order.filled_quantity,
+                saved_order.filled_price,
+                trade.id,
+                trade.exchange_trade_id,
+                trade.quantity,
+                trade.price,
+                trade.fee,
+                trade.fee_asset,
+            ) == financial_before_stop
+            assert pending_count == 0
+            assert len(receipt_after_stop) == len(receipt_before_stop)
+            for before, after in zip(
+                receipt_before_stop, receipt_after_stop, strict=True
+            ):
+                assert before[:7] == after[:7]
+                assert before[7] == "PENDING" and before[8] is None
+                assert after[7] == "SUPPRESSED"
+                assert after[8] == "STOP_CONTROL"
+            assert received_sequence == consumed_sequence
 
 def test_mixed_place_response_projects_only_the_exact_saved_group_and_retries_once(
     operation_pg: Engine,

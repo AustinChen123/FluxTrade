@@ -14,6 +14,7 @@ from src.control_plane.spider_operation_http import (
     SPIDER_OPERATION_REQUEST_PATH,
 )
 from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_canonical
+from src.core.backtest.spider_historical_input import HistoricalRunInput
 from src.core.clock import BacktestClock
 from src.core.command_router import CommandResult
 from src.core.repositories import LiveOrderRepository
@@ -58,8 +59,13 @@ pytestmark = [
 ]
 
 
-def _install_evidence(engine: Engine, *, strategy_id: str = "spider-main"):
-    run = replace(_admitted_run(), account_key="account-main")
+def _install_evidence(
+    engine: Engine,
+    *,
+    strategy_id: str = "spider-main",
+    admitted_run: HistoricalRunInput | None = None,
+):
+    run = replace(admitted_run or _admitted_run(), account_key="account-main")
     template = _confirmation(run).request
     key_suffix = "" if strategy_id == "spider-main" else f"-{strategy_id}"
     configuration_store = SpiderConfigurationRequestStore(sessionmaker(engine))
