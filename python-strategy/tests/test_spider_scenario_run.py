@@ -1064,7 +1064,12 @@ def test_surface_private_o03_and_no_native_access():
         run._run_o03("unused", "r1", PLAN_IDS[0])
     tree = ast.parse(Path(run.__file__).read_text())
     assert not any(isinstance(node, ast.Attribute) and node.attr == "_native" for node in ast.walk(tree))
-    assert not any(isinstance(node, ast.Import) for node in ast.walk(tree))
+    imported_aliases = [
+        (alias.name, alias.asname)
+        for node in ast.walk(tree) if isinstance(node, ast.Import)
+        for alias in node.names
+    ]
+    assert imported_aliases == [("logging", "_logging")]
 
 
 @pytest.mark.parametrize("result,reason,kind", [

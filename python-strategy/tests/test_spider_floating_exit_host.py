@@ -26,10 +26,11 @@ from src.core.backtest.spider_floating_exit_input import (
 from src.core.backtest.spider_historical_input import HistoricalInputError
 from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_canonical
 from src.core.backtest.synthetic_scenario_replay import _ReplayComposition
-from src.core.backtest.synthetic_scenario_codec import ScenarioCodec, _native
+from src.core.backtest.synthetic_scenario_codec import ScenarioCodec
 from test_spider_bayes_replay import _manifest, _valid_source14_run
 from test_spider_execution_input import _input
 from test_spider_historical_input import _initial_account_state, _policy_cache
+from test_synthetic_scenario_native import _native_invariant_fault
 
 
 _MINUTE = 60_000
@@ -431,7 +432,7 @@ def test_cost_projection_failure_at_cache_keeps_native_evidence_and_does_not_ret
     def fail_cost_projection(self):
         nonlocal calls
         calls += 1
-        raise _native.ScenarioReplayInvariantError("NATIVE_INVARIANT")
+        raise _native_invariant_fault()
 
     monkeypatch.setattr(ScenarioCodec, "historical_cost_projection", fail_cost_projection)
     failure = composition._dispatch_due(cutoff * 16 + 6)
