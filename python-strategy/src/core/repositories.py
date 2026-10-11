@@ -33,6 +33,8 @@ class LiveOrderRepository(IOrderRepository):
         db_session_factory: Optional[Callable[[], ContextManager[Session]]] = None,
         account_profile: str | None = None,
         account_id: str | None = None,
+        transaction_participant: Callable[[Session, Order, Trade | None], None]
+        | None = None,
     ):
         if (account_profile is None) != (account_id is None):
             raise ValueError("repository account identity must be complete")
@@ -43,6 +45,7 @@ class LiveOrderRepository(IOrderRepository):
                 raise ValueError("repository account identity must not be blank")
         self._account_profile = account_profile
         self._account_id = account_id
+        self._transaction_participant = transaction_participant
         self._db_session_factory = db_session_factory or (
             lambda: _provided_session(db_session)
         )
@@ -54,6 +57,18 @@ class LiveOrderRepository(IOrderRepository):
             Order.account_profile == self._account_profile,
             Order.account_id == self._account_id,
         )
+
+    def _participate(
+        self,
+        db: Session,
+        order: Order,
+        trade: Trade | None = None,
+    ) -> None:
+        if self._transaction_participant is not None:
+            if not db.in_transaction():
+                db.begin()
+            with db.no_autoflush:
+                self._transaction_participant(db, order, trade)
 
     def _bind_order(self, order: Order) -> None:
         if self._account_profile is None:
@@ -100,6 +115,7 @@ class LiveOrderRepository(IOrderRepository):
     def update_order(self, order: Order) -> None:
         self._bind_order(order)
         with self._db_session_factory() as db:
+            self._participate(db, order)
             db.add(order)
             db.commit()
             db.refresh(order)
@@ -184,10 +200,18 @@ class LiveOrderRepository(IOrderRepository):
 
     def mark_order_cancelled(self, order_id: str) -> None:
         with self._db_session_factory() as db:
-            order = self._scope(db.query(Order)).filter_by(id=order_id).first()
-            if order is None:
-                raise RuntimeError("cancellation_order_not_found")
-            order.status = OrderStatus.CANCELLED.value
+            if self._transaction_participant is None:
+                order = self._scope(db.query(Order)).filter_by(id=order_id).first()
+                if order is None:
+                    raise RuntimeError("cancellation_order_not_found")
+                order.status = OrderStatus.CANCELLED.value
+            else:
+                with db.no_autoflush:
+                    order = self._scope(db.query(Order)).filter_by(id=order_id).first()
+                    if order is None:
+                        raise RuntimeError("cancellation_order_not_found")
+                    order.status = OrderStatus.CANCELLED.value
+                    self._participate(db, order)
             db.commit()
 
     def get_order_by_client_order_id(self, client_order_id: str) -> Optional[Order]:
@@ -288,6 +312,7 @@ class LiveOrderRepository(IOrderRepository):
     def persist_fill(self, order: Order, trade: Trade) -> None:
         self._bind_order(order)
         with self._db_session_factory() as db:
+            self._participate(db, order, trade)
             ensure_product_registered(db, str(trade.product_id))
             db.add(order)
             db.add(trade)
@@ -361,6 +386,7 @@ class LiveOrderRepository(IOrderRepository):
         self._bind_order(order)
         order.exchange_order_id = exchange_order_id
         with self._db_session_factory() as db:
+            self._participate(db, order)
             db.add(order)
             db.commit()
             db.refresh(order)
