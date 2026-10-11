@@ -40,6 +40,7 @@ _P3_NAMES = tuple(name for name, _ in _P3_ARTIFACTS)
 _P3_ALL = (*_P3_NAMES, "completion.json")
 _LIMIT = 16_777_216
 _P3_JOURNAL_LIMIT = 33_554_432
+_GROSS_REPORT_LIMIT = 33_554_432
 _POLICY = "eb6ab34d8685fb59e286f5ffda8af24cbecf3e5ab2c729c585ccdca797cac336"
 _P2_SELECTOR = "SPIDER_P2_CONFIGURED_SCALE_V1"
 _P2_RUN_CONTRACT = "SPIDER_SYNTHETIC_P2_CONFIGURED_RUN_V1"
@@ -201,7 +202,10 @@ def _admit_execution(directory: int, manifest: dict[str, _Any], completion_raw: 
     bad = []
     for name in names:
         try:
-            limit = _P3_JOURNAL_LIMIT if name == "journal.jsonl" else _LIMIT
+            limit = (
+                _GROSS_REPORT_LIMIT if gross_execution and name == "report.jsonl" else
+                _P3_JOURNAL_LIMIT if name == "journal.jsonl" else _LIMIT
+            )
             captured[name] = _capture(
                 directory, name, exclusive=name == "execution_input.json", limit=limit,
             )

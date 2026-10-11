@@ -633,7 +633,14 @@ def _action_bindings_for_mode(attempt: dict[str, Any], journal: list[dict[str, A
             })).hexdigest()
             if action["action_id"] != expected_id:
                 return False
-    if not floating_exit and action_admission_keys != sorted(action_admission_keys):
+    if gross_execution:
+        # Actions retain source-group registration order; future cancel effects
+        # may be registered before requests effective sooner. Legacy paid ordering
+        # remains unchanged; financial journal order is verified independently.
+        action_schedule_sequences = [key[2] for key in action_admission_keys]
+        if action_schedule_sequences != sorted(action_schedule_sequences):
+            return False
+    elif not floating_exit and action_admission_keys != sorted(action_admission_keys):
         return False
     seed = decode_canonical(request.historical_input.initial_account_state)
     seed_orders = cast(dict[str, Any], seed)["orders"]
