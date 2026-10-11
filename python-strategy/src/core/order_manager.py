@@ -228,8 +228,14 @@ class OrderManager:
         terminal_status: OrderStatus | None = None,
         fee: Optional[Decimal] = None,
         fee_asset: Optional[str] = None,
+        *,
+        exchange_trade_id: str | None = None,
     ) -> None:
         """Record a recovered exchange fill delta and set the desired order status."""
+        if exchange_trade_id is not None and (
+            type(exchange_trade_id) is not str or not exchange_trade_id.strip()
+        ):
+            raise ValueError("invalid_exchange_trade_id")
         self._validated_fill(order.side, fill_price, fill_quantity)
         order.status = (
             terminal_status.value
@@ -244,6 +250,7 @@ class OrderManager:
             fill_quantity,
             fee=fee,
             fee_asset=fee_asset,
+            exchange_trade_id=exchange_trade_id,
             log_label="Recovered Position Update",
         )
 
@@ -255,6 +262,7 @@ class OrderManager:
         *,
         fee: Optional[Decimal] = None,
         fee_asset: Optional[str] = None,
+        exchange_trade_id: str | None = None,
         log_label: str,
     ) -> None:
         side = self._validated_fill(order.side, fill_price, fill_quantity)
@@ -264,7 +272,7 @@ class OrderManager:
         new_trade = Trade(
             id=trade_id,
             order_id=order.id,
-            exchange_trade_id=None,
+            exchange_trade_id=exchange_trade_id,
             product_id=order.product_id,
             side=order.side,
             price=fill_price,

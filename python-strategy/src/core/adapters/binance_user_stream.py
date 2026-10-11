@@ -192,11 +192,26 @@ class BinanceOrderEventStream:
             cumulative_average = _optional_decimal(order, "ap")
             last_quantity = _optional_decimal(order, "l")
             last_price = _optional_decimal(order, "L")
+            execution_type = order.get("x")
+            provider_trade_id = order.get("t")
             fee = _optional_decimal(order, "n")
             fee_asset = _optional_string(order, "N")
             reason = _optional_string(order, "er")
         except (InvalidOperation, ValueError):
             raise ExchangeError("binance_order_event_payload_invalid") from None
+        last_fill_exchange_trade_id = None
+        if (
+            execution_type == "TRADE"
+            and type(provider_trade_id) is int
+            and provider_trade_id >= 0
+            and last_quantity is not None
+            and last_quantity.is_finite()
+            and last_quantity > 0
+            and last_price is not None
+            and last_price.is_finite()
+            and last_price > 0
+        ):
+            last_fill_exchange_trade_id = str(provider_trade_id)
         return ExchangeOrderEvent(
             status=status,
             product_id=f"BINANCE:{symbol}-PERP",
@@ -208,6 +223,7 @@ class BinanceOrderEventStream:
             last_fill_price=last_price,
             fee=fee,
             fee_asset=fee_asset,
+            last_fill_exchange_trade_id=last_fill_exchange_trade_id,
             event_timestamp=event_timestamp,
             reason=reason,
         )
