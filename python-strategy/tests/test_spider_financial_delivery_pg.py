@@ -14,7 +14,7 @@ from src.core.clock import BacktestClock
 from src.core.command_router import CommandResult
 from src.core.execution import ExecutionEngine
 from src.core.interfaces.exchange import ExchangeOrderEvent
-from src.core.orm_models import Order, Trade
+from src.core.orm_models import Order, StrategyState, StrategyStateTransition, Trade
 from src.core.order_manager import OrderManager
 from src.core.repositories import LiveOrderRepository
 from src.core.runtime_capabilities import OrderAccountIdentity
@@ -26,6 +26,7 @@ from src.core.spider_management.runtime_owner import (
     SpiderRuntimeOwner,
 )
 from src.core.spider_management.orm import (
+    SpiderControlReceipt,
     SpiderRuntimeDelivery,
     SpiderRuntimeOperation,
     SpiderRuntimeScope,
@@ -986,6 +987,9 @@ def test_main_real_engine_restores_then_receives_fill_through_injected_participa
         def register_script(self, _script: str):
             return lambda *, args: None
 
+        def publish(self, _channel: str, _message: str) -> int:
+            return 1
+
         def close(self) -> None:
             pass
 
@@ -1007,6 +1011,8 @@ def test_main_real_engine_restores_then_receives_fill_through_injected_participa
     owners: list[SpiderRuntimeOwner] = []
     consumer_event_results: list[dict[str, object]] = []
     consumer_order_ids: list[str] = []
+    stop_barriers: list[int] = []
+    delivery_count_before_late_fill: list[int] = []
 
     class ConsumerProbe:
         def __init__(self, **_kwargs):
@@ -1049,6 +1055,100 @@ def test_main_real_engine_restores_then_receives_fill_through_injected_participa
             ))
             consumer_event_results.append(result)
             consumer_order_ids.append(order_id)
+            # Malformed STOP envelopes carrying an owned identity must be
+            # rejected by the owner and never reach generic StrategyState stop.
+            owner = owners[0]
+            malformed_owned_stops = [
+                {"command": "STOP", "id": scope.strategy_id},
+                {"command": "STOP", "id": scope.strategy_id, "params": None},
+                {"command": "STOP", "id": scope.strategy_id, "params": False},
+                {"command": "STOP", "id": scope.strategy_id, "params": []},
+                {"command": "STOP", "id": scope.strategy_id, "params": ""},
+                {"command": "STOP", "id": scope.strategy_id, "params": {}},
+                {
+                    "command": "STOP",
+                    "id": scope.strategy_id,
+                    "params": {"strategy_id": "ordinary-nonowned"},
+                },
+                {
+                    "command": "STOP",
+                    "strategy_id": scope.strategy_id,
+                    "params": {"id": "ordinary-nonowned"},
+                },
+            ]
+            assert owner.handle_owned_command(
+                {"command": "STOP", "id": "ordinary-nonowned"}
+            ) is None
+            with factory() as session:
+                before_malformed = (
+                    session.execute(
+                        select(
+                            SpiderRuntimeScope.control_mode,
+                            SpiderRuntimeScope.state_version,
+                            SpiderRuntimeScope.control_barrier_sequence,
+                            SpiderRuntimeScope.last_received_sequence,
+                        ).where(SpiderRuntimeScope.strategy_id == scope.strategy_id)
+                    ).one(),
+                    session.execute(
+                        select(StrategyState.status, StrategyState.version).where(
+                            StrategyState.strategy_id == scope.strategy_id
+                        )
+                    ).one(),
+                    session.scalar(
+                        select(func.count()).select_from(SpiderControlReceipt).where(
+                            SpiderControlReceipt.strategy_id == scope.strategy_id
+                        )
+                    ),
+                )
+            router_calls: list[dict[str, object]] = []
+            engine_instances[0]._command_router.handle = lambda message: (
+                router_calls.append(message) or CommandResult(False, "unexpected generic fallback")
+            )
+            for malformed in malformed_owned_stops:
+                result = owner.handle_owned_command(malformed)
+                assert result is not None and result.success is False
+                engine_instances[0]._strategy_command_dispatch.dispatch(malformed)
+            assert router_calls == []
+            with factory() as session:
+                after_malformed = (
+                    session.execute(
+                        select(
+                            SpiderRuntimeScope.control_mode,
+                            SpiderRuntimeScope.state_version,
+                            SpiderRuntimeScope.control_barrier_sequence,
+                            SpiderRuntimeScope.last_received_sequence,
+                        ).where(SpiderRuntimeScope.strategy_id == scope.strategy_id)
+                    ).one(),
+                    session.execute(
+                        select(StrategyState.status, StrategyState.version).where(
+                            StrategyState.strategy_id == scope.strategy_id
+                        )
+                    ).one(),
+                    session.scalar(
+                        select(func.count()).select_from(SpiderControlReceipt).where(
+                            SpiderControlReceipt.strategy_id == scope.strategy_id
+                        )
+                    ),
+                )
+            assert after_malformed == before_malformed
+            with factory() as session:
+                stop_barriers.append(cast(int, session.scalar(
+                    select(SpiderRuntimeScope.last_received_sequence).where(
+                        SpiderRuntimeScope.strategy_id == scope.strategy_id
+                    )
+                )))
+            engine_instances[0]._strategy_command_dispatch.dispatch({
+                "command": "STOP",
+                "strategy_id": scope.strategy_id,
+                "params": {
+                    "strategy_id": scope.strategy_id,
+                    "environment": scope.environment,
+                    "execution_scope_id": scope.execution_scope_id,
+                    "actor": "api_key",
+                    "idempotency_key": "main-stop-key",
+                    "expected_version": initial["state_version"],
+                },
+            })
 
         def request_stop(self):
             pass
@@ -1116,20 +1216,163 @@ def test_main_real_engine_restores_then_receives_fill_through_injected_participa
         LiveOrderRepository, actual_engine.execution_engine.order_manager.repo
     )
     assert actual_repository._transaction_participant is not None
+    assert owners[0]._strategy_state_manager is actual_engine._strategy_state_manager
+    assert owners[0]._lifecycle_lock == actual_engine._strategy_lifecycle_lock
+    assert owners[0]._order_event_lock is actual_engine.execution_engine._order_event_apply_lock
     assert len(consumer_event_results) == 1
     assert consumer_event_results[0]["action"] == "applied"
     assert len(consumer_order_ids) == 1
     order_id = consumer_order_ids[0]
     with factory() as session:
+        stopped = session.execute(
+            select(SpiderRuntimeScope.control_mode, SpiderRuntimeScope.control_barrier_sequence,
+                   SpiderRuntimeScope.last_received_sequence, SpiderRuntimeScope.state_version)
+            .where(SpiderRuntimeScope.strategy_id == scope.strategy_id)
+        ).one()
+        assert stopped.control_mode == "STOP"
+        assert stopped.control_barrier_sequence == stop_barriers[0]
+        assert stopped.last_received_sequence == stop_barriers[0]
+        assert stopped.state_version == cast(int, initial["state_version"]) + 1
+        receipt = session.execute(
+            select(SpiderControlReceipt).where(
+                SpiderControlReceipt.strategy_id == scope.strategy_id,
+                SpiderControlReceipt.idempotency_key == "main-stop-key",
+            )
+        ).scalar_one()
+        assert receipt.operation_id == operation_id
+        assert receipt.generation == cast(dict[str, object], initial["effective"])["generation"]
+        assert receipt.before_state_version == initial["state_version"]
+        assert receipt.after_state_version == cast(int, initial["state_version"]) + 1
+        assert receipt.barrier_sequence == 1
+    assert receipt.outcome == "COMPLETED"
+    execution = actual_engine.execution_engine
+    order = execution.order_manager.repo.get_order(order_id)
+    assert order is not None
+    quantity = order.quantity
+    price = cast(Decimal, order.price)
+    with factory() as session:
+        delivery_count_before_late_fill.append(cast(int, session.scalar(
+            select(func.count()).select_from(SpiderRuntimeDelivery).where(
+                SpiderRuntimeDelivery.strategy_id == scope.strategy_id
+            )
+        )))
+    provider_order_id = "main-composition-provider-order"
+    execution.process_exchange_order_event(ExchangeOrderEvent(
+        status="open",
+        product_id=order.product_id,
+        client_order_id=order.client_order_id,
+        exchange_order_id=provider_order_id,
+    ))
+    late_full = ExchangeOrderEvent(
+        status="filled",
+        product_id=order.product_id,
+        client_order_id=order.client_order_id,
+        exchange_order_id=provider_order_id,
+        cumulative_filled_quantity=quantity,
+        cumulative_average_price=price,
+        last_fill_quantity=quantity / Decimal(2),
+        last_fill_price=price,
+        fee=Decimal("0.01"),
+        fee_asset="USDT",
+        last_fill_exchange_trade_id="main-composition-late-trade",
+    )
+    assert execution.process_exchange_order_event(late_full)["action"] == "applied"
+    execution.process_exchange_order_event(late_full)
+    with factory() as session:
         assert session.scalar(
             select(func.count()).select_from(Trade).where(Trade.order_id == order_id)
-        ) == 1
+        ) == 2
+        assert session.scalar(
+            select(func.count()).select_from(SpiderRuntimeDelivery).where(
+                SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                SpiderRuntimeDelivery.local_order_id == order_id,
+            )
+        ) == delivery_count_before_late_fill[0] + 2
+
+    # A second authorized STOP advances the lifecycle version after the real
+    # late fill advanced the receiver barrier. Retrying the original key must
+    # prove A without regressing B's current projection.
+    def dispatch_stop(key: str, expected_version: int) -> CommandResult:
+        results: list[CommandResult | None] = []
+        _owned_dispatch(owners[0], results).dispatch({
+            "command": "STOP",
+            "strategy_id": scope.strategy_id,
+            "params": {
+                "strategy_id": scope.strategy_id,
+                "environment": scope.environment,
+                "execution_scope_id": scope.execution_scope_id,
+                "actor": "api_key",
+                "idempotency_key": key,
+                "expected_version": expected_version,
+            },
+        })
+        assert len(results) == 1 and results[0] is not None
+        return cast(CommandResult, results[0])
+
+    second_stop = dispatch_stop(
+        "main-stop-key-b", cast(int, initial["state_version"]) + 1
+    )
+    assert second_stop.success is True and second_stop.data is not None
+    assert second_stop.data["disposition"] == "COMPLETED"
+    with factory() as session:
+        after_b = session.execute(
+            select(
+                SpiderRuntimeScope.control_mode,
+                SpiderRuntimeScope.state_version,
+                SpiderRuntimeScope.control_barrier_sequence,
+                SpiderRuntimeScope.last_received_sequence,
+                SpiderRuntimeScope.current_operation_id,
+                SpiderRuntimeScope.generation,
+            ).where(SpiderRuntimeScope.strategy_id == scope.strategy_id)
+        ).one()
+        assert session.scalar(
+            select(func.count()).select_from(SpiderControlReceipt).where(
+                SpiderControlReceipt.strategy_id == scope.strategy_id
+            )
+        ) == 2
+    assert after_b.control_mode == "STOP"
+    assert after_b.state_version == cast(int, initial["state_version"]) + 2
+    assert after_b.control_barrier_sequence == after_b.last_received_sequence
+    assert after_b.control_barrier_sequence > stop_barriers[0]
+    assert after_b.current_operation_id == operation_id
+    assert after_b.generation == cast(dict[str, object], initial["effective"])["generation"]
+
+    retry_a = dispatch_stop("main-stop-key", cast(int, initial["state_version"]))
+    assert retry_a.success is True and retry_a.data is not None
+    assert retry_a.data["disposition"] == "COMPLETED"
+    assert retry_a.data["operation_id"] == operation_id
+    assert cast(dict[str, object], retry_a.data["readback"])["runtime_control"] == "STOP"
+    with factory() as session:
+        after_a_retry = session.execute(
+            select(
+                SpiderRuntimeScope.control_mode,
+                SpiderRuntimeScope.state_version,
+                SpiderRuntimeScope.control_barrier_sequence,
+                SpiderRuntimeScope.last_received_sequence,
+                SpiderRuntimeScope.current_operation_id,
+                SpiderRuntimeScope.generation,
+            ).where(SpiderRuntimeScope.strategy_id == scope.strategy_id)
+        ).one()
+        assert session.scalar(
+            select(func.count()).select_from(SpiderControlReceipt).where(
+                SpiderControlReceipt.strategy_id == scope.strategy_id
+            )
+        ) == 2
+        assert session.scalar(
+            select(func.count()).select_from(StrategyStateTransition).where(
+                StrategyStateTransition.strategy_id == scope.strategy_id,
+                StrategyStateTransition.to_status == "STOPPED",
+            )
+        ) == 2
+    assert after_a_retry == after_b
+
     readback = owners[0].readback(scope, operation_id)
     assert readback is not None
     assert readback["checkpoint_sha256"] == initial["checkpoint_sha256"]
     assert readback["initial_plan_missing_members"] == initial[
         "initial_plan_missing_members"
     ]
+    assert readback["runtime_control"] == "STOP"
     assert readback["trading_ready"] is False
     assert owners[0].restore_owned_runtimes() == frozenset({scope.strategy_id})
     assert prepared.build_checkpoint_sha256 == initial["checkpoint_sha256"]

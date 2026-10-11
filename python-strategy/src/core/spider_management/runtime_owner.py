@@ -38,6 +38,13 @@ from src.core.spider_management.financial_delivery import (
     stage_financial_receipt,
     validate_order_receipt_chain,
 )
+from src.core.spider_management.control_command import (
+    SpiderControlCommandError,
+    SpiderManagementCommand,
+    SpiderControlWriteResult,
+    verify_stop_in_transaction,
+    write_stop_in_transaction,
+)
 from src.core.spider_management.orm import (
     SpiderConfigurationRequest,
     SpiderOperationRequestRow,
@@ -47,6 +54,9 @@ from src.core.spider_management.orm import (
     SpiderRuntimeOperation,
     SpiderRuntimePlan,
     SpiderRuntimeScope,
+)
+from src.core.strategy_state_manager import (
+    StrategyStateManager,
 )
 
 
@@ -101,6 +111,9 @@ class SpiderRuntimeOwner:
         *,
         owned_scopes: tuple[RuntimeScopeKey, ...],
         model_sources_by_confirmation: Mapping[str, ModelInstallSource],
+        strategy_state_manager: object | None = None,
+        lifecycle_lock: Callable[[str], ContextManager[object]] | None = None,
+        order_event_lock: ContextManager[object] | None = None,
         lock_timeout_ms: int = 2000,
         statement_timeout_ms: int = 10000,
     ) -> None:
@@ -112,6 +125,9 @@ class SpiderRuntimeOwner:
         self._order_manager = order_manager
         self._owned_scopes = {row.strategy_id: row for row in owned_scopes}
         self._model_sources = dict(model_sources_by_confirmation)
+        self._strategy_state_manager = strategy_state_manager
+        self._lifecycle_lock = lifecycle_lock
+        self._order_event_lock = order_event_lock
         self._lock_timeout_ms = lock_timeout_ms
         self._statement_timeout_ms = statement_timeout_ms
 
@@ -165,6 +181,37 @@ class SpiderRuntimeOwner:
         return owned
 
     def handle_owned_command(self, message: dict) -> CommandResult | None:
+        if type(message) is not dict:
+            return None
+        command = str(message.get("command") or message.get("cmd") or "").upper()
+        if command == "STOP":
+            params = message.get("params")
+            candidates: list[object] = [message.get("id"), message.get("strategy_id")]
+            if type(params) is dict:
+                candidates.extend((params.get("id"), params.get("strategy_id")))
+            owned_candidates = [
+                value for value in candidates
+                if type(value) is str and value in self._owned_scopes
+            ]
+            if not owned_candidates:
+                return None
+            strategy_id = owned_candidates[0]
+            if any(
+                value is not None
+                and (type(value) is not str or value != strategy_id)
+                for value in candidates
+            ):
+                scope = self._owned_scopes[strategy_id]
+                operation_id = self._current_operation_id(scope)
+                return self._control_result(
+                    scope,
+                    "REJECTED",
+                    operation_id,
+                    "SPIDER_CONTROL_SCOPE_MISMATCH",
+                    None if operation_id is None else self.readback(scope, operation_id),
+                )
+            return self.stop(self._owned_scopes[strategy_id], message)
+
         params = message.get("params")
         if type(params) is not dict:
             return None
@@ -172,7 +219,6 @@ class SpiderRuntimeOwner:
         if type(strategy_id) is not str or strategy_id not in self._owned_scopes:
             return None
         scope = self._owned_scopes[strategy_id]
-        command = str(message.get("command") or message.get("cmd") or "").upper()
         if command != "START":
             return CommandResult(False, "Spider operation unavailable", {
                 "reason_code": "SPIDER_OPERATION_UNAVAILABLE"
@@ -192,6 +238,182 @@ class SpiderRuntimeOwner:
             cast(str, params["actor"]),
             cast(str, params["idempotency_key"]),
             cast(int, params["expected_version"]),
+        )
+
+    def stop(self, scope: RuntimeScopeKey, message: object) -> CommandResult:
+        """Commit one scoped STOP receipt and projection in the caller-owned PG TX."""
+        if (
+            self._strategy_state_manager is None
+            or self._lifecycle_lock is None
+            or self._order_event_lock is None
+        ):
+            return self._control_result(
+                scope, "REJECTED", None, "SPIDER_CONTROL_UNAVAILABLE"
+            )
+        command = str(
+            cast(dict[str, object], message).get("command")
+            or cast(dict[str, object], message).get("cmd")
+            or ""
+        ).upper() if type(message) is dict else ""
+        try:
+            request = SpiderManagementCommand.from_message(message, command=command)
+        except SpiderControlCommandError as error:
+            return self._control_result(scope, "REJECTED", None, error.reason_code)
+        if (request.environment, request.execution_scope_id, request.strategy_id) != (
+            scope.environment, scope.execution_scope_id, scope.strategy_id
+        ):
+            return self._control_result(
+                scope, "REJECTED", None, "SPIDER_CONTROL_SCOPE_MISMATCH"
+            )
+
+        write_result: SpiderControlWriteResult | None = None
+        operation_id: str | None = None
+        reason: str | None = None
+        disposition: str | None = None
+        try:
+            with self._lifecycle_lock(scope.strategy_id):
+                with cast(ContextManager[object], self._order_event_lock):
+                    with self._sessions() as session:
+                        if (
+                            not isinstance(session, Session)
+                            or session.in_transaction()
+                            or not session.is_active
+                        ):
+                            disposition, reason = "REJECTED", "SPIDER_SESSION_INVALID"
+                        elif session.get_bind().dialect.name != "postgresql":
+                            disposition, reason = "REJECTED", "SPIDER_POSTGRES_REQUIRED"
+                        else:
+                            with session.begin():
+                                self._configure_writer(session)
+                                write_result = write_stop_in_transaction(
+                                    session,
+                                    request,
+                                    cast(StrategyStateManager, self._strategy_state_manager),
+                                )
+                                disposition = write_result.disposition
+                                reason = write_result.reason_code
+                                operation_id = write_result.operation_id
+        except Exception:
+            pass
+
+        readback = self._control_readback(request)
+        if readback is None:
+            current = self._current_operation_id(scope)
+            if disposition == "REJECTED":
+                current_id = operation_id or current
+                current_readback = (
+                    None if current_id is None else self.readback(scope, current_id)
+                )
+                return self._control_result(
+                    scope,
+                    "REJECTED",
+                    current_id,
+                    cast(str, reason),
+                    current_readback,
+                )
+            return self._control_result(
+                scope,
+                "UNKNOWN",
+                operation_id or current,
+                "SPIDER_CONTROL_READBACK_UNKNOWN",
+                None,
+            )
+        saved_operation_id = cast(
+            str | None,
+            cast(dict[str, object], readback["receipt"])["operation_id"],
+        )
+        if (
+            disposition == "COMPLETED"
+            and write_result is not None
+            and write_result.transition is not None
+        ):
+            try:
+                cast(StrategyStateManager, self._strategy_state_manager).after_committed_transition(
+                    write_result.transition
+                )
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "Committed Spider STOP projection could not be published"
+                )
+        return self._control_result(
+            scope,
+            "COMPLETED",
+            saved_operation_id,
+            "SPIDER_STOPPED",
+            cast(dict[str, object] | None, readback["runtime"]),
+        )
+
+    def _control_readback(
+        self, request: SpiderManagementCommand
+    ) -> dict[str, object] | None:
+        scope = RuntimeScopeKey(
+            request.environment, request.execution_scope_id, request.strategy_id
+        )
+        try:
+            with self._sessions() as session:
+                if (
+                    not isinstance(session, Session)
+                    or session.in_transaction()
+                    or not session.is_active
+                    or session.get_bind().dialect.name != "postgresql"
+                ):
+                    return None
+                with session.begin():
+                    session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY"))
+                    self._configure_writer(session)
+                    proof = verify_stop_in_transaction(session, request)
+                    if proof is None:
+                        return None
+                    operation_id = cast(str | None, proof["operation_id"])
+                runtime_readback = (
+                    None if operation_id is None else self.readback(scope, cast(str, operation_id))
+                )
+                if operation_id is not None and (
+                    runtime_readback is None or runtime_readback["runtime_control"] != "STOP"
+                ):
+                    return None
+                return {"receipt": proof, "runtime": runtime_readback}
+        except Exception:
+            return None
+
+    def _current_operation_id(self, scope: RuntimeScopeKey) -> str | None:
+        try:
+            with self._sessions() as session:
+                if not isinstance(session, Session) or session.in_transaction() or not session.is_active:
+                    return None
+                return session.execute(
+                    select(SpiderRuntimeScope.current_operation_id).where(
+                        SpiderRuntimeScope.environment == scope.environment,
+                        SpiderRuntimeScope.execution_scope_id == scope.execution_scope_id,
+                        SpiderRuntimeScope.strategy_id == scope.strategy_id,
+                    )
+                ).scalar_one_or_none()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _control_result(
+        scope: RuntimeScopeKey,
+        disposition: str,
+        operation_id: str | None,
+        reason: str,
+        readback: dict[str, object] | None = None,
+    ) -> CommandResult:
+        result = {
+            "schema_version": "spider_management_command_result_v1",
+            "scope": _scope(scope),
+            "command": "STOP",
+            "disposition": disposition,
+            "operation_id": operation_id,
+            "phase": None if readback is None else readback["phase"],
+            "reason_code": reason,
+            "readback": readback,
+        }
+        return CommandResult(
+            success=disposition == "COMPLETED",
+            message=reason,
+            data=result,
+            completed=disposition in {"COMPLETED", "REJECTED"},
         )
 
     def install(

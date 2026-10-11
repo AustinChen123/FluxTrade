@@ -2487,6 +2487,7 @@ HEAD_ONLY_TABLES = {
     "daily_nav_snapshots",
     "evolution_epochs",
     "gene_records",
+    "spider_control_receipt",
 }
 
 # Pre-existing tables (created by revs 1–4) that must remain at every stage.
@@ -2510,6 +2511,11 @@ def test_full_upgrade_to_head(fresh_pg_db: str) -> None:
             f"Legacy tables missing after upgrade: {LEGACY_TABLES - tables}"
         )
         assert HEAD_ONLY_TABLES.issubset(tables), "HEAD tables missing after upgrade"
+        assert {
+            "receipt_id", "request_payload", "request_sha256", "operation_id",
+            "generation", "before_state_version", "after_state_version",
+            "barrier_sequence", "outcome",
+        } <= _column_names(engine, "spider_control_receipt")
 
         # ``order`` must carry idempotency, audit, and account identity columns.
         order_cols = _column_names(engine, "order")

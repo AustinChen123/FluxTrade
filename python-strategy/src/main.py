@@ -342,6 +342,9 @@ def main(spider_composition: SpiderRuntimeComposition | None = None):
                     model_sources_by_confirmation=(
                         spider_composition.model_sources_by_confirmation
                     ),
+                    strategy_state_manager=engine._strategy_state_manager,
+                    lifecycle_lock=engine._strategy_lifecycle_lock,
+                    order_event_lock=engine.execution_engine._order_event_apply_lock,
                 )
                 spider_owner_ref[0] = owner
         except Exception:

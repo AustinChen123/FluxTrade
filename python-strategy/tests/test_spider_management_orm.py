@@ -2,6 +2,7 @@
 
 from src.core.spider_management.orm import (
     SpiderConfigurationRequest,
+    SpiderControlReceipt,
     SpiderOperationRequestRow,
     SpiderRuntimeAction,
     SpiderRuntimeBinding,
@@ -21,6 +22,7 @@ def test_spider_configuration_columns_and_constraints_remain_on_configuration_ta
     runtime_action = SpiderRuntimeAction.__table__
     runtime_binding = SpiderRuntimeBinding.__table__
     runtime_delivery = SpiderRuntimeDelivery.__table__
+    control_receipt = SpiderControlReceipt.__table__
 
     assert set(configuration.columns.keys()) == {
         "request_id",
@@ -82,6 +84,21 @@ def test_spider_configuration_columns_and_constraints_remain_on_configuration_ta
         "sequence", "delivery_id", "local_order_id", "trade_id",
         "source_payload", "disposition",
     }
+    assert set(control_receipt.columns.keys()) == {
+        "receipt_id", "environment", "execution_scope_id", "strategy_id",
+        "actor", "idempotency_key", "request_payload", "request_sha256",
+        "operation_id", "generation", "before_state_version",
+        "after_state_version", "barrier_sequence", "outcome", "recorded_at",
+    }
+    control_constraints = {constraint.name for constraint in control_receipt.constraints}
+    assert {
+        "uq_spider_control_receipt_idempotency",
+        "fk_spider_control_receipt_scope",
+        "fk_spider_control_receipt_operation",
+        "ck_spider_control_receipt_payload",
+        "ck_spider_control_receipt_after_version",
+        "ck_spider_control_receipt_outcome",
+    } <= control_constraints
 
 
 def test_operation_phase_check_matches_the_closed_e4_phase_set():

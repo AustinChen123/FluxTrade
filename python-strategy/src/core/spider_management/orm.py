@@ -458,3 +458,61 @@ class SpiderRuntimeDelivery(Base):
         CheckConstraint("disposition IN ('PENDING', 'CONSUMED', 'SUPPRESSED')", name="ck_spider_runtime_delivery_disposition"),
         CheckConstraint("suppression_reason IS NULL OR disposition = 'SUPPRESSED'", name="ck_spider_runtime_delivery_suppression"),
     )
+
+
+class SpiderControlReceipt(Base):
+    """Immutable proof of a scoped, nonfinancial Spider STOP command."""
+
+    __tablename__ = "spider_control_receipt"
+
+    receipt_id: Mapped[str] = mapped_column(String(64, collation="C"), primary_key=True)
+    environment: Mapped[str] = mapped_column(String(128, collation="C"), nullable=False)
+    execution_scope_id: Mapped[str] = mapped_column(String(128, collation="C"), nullable=False)
+    strategy_id: Mapped[str] = mapped_column(String(128, collation="C"), nullable=False)
+    actor: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(128, collation="C"), nullable=False)
+    request_payload: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    request_sha256: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    operation_id: Mapped[str | None] = mapped_column(String(64, collation="C"), nullable=True)
+    generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    before_state_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    after_state_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    barrier_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    outcome: Mapped[str] = mapped_column(String(12, collation="C"), nullable=False)
+    recorded_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=text("date_trunc('milliseconds', clock_timestamp())"),
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "environment", "execution_scope_id", "strategy_id", "actor", "idempotency_key",
+            name="uq_spider_control_receipt_idempotency",
+        ),
+        ForeignKeyConstraint(
+            ["environment", "execution_scope_id", "strategy_id"],
+            ["spider_runtime_scope.environment", "spider_runtime_scope.execution_scope_id", "spider_runtime_scope.strategy_id"],
+            name="fk_spider_control_receipt_scope",
+        ),
+        ForeignKeyConstraint(
+            ["operation_id", "environment", "execution_scope_id", "strategy_id"],
+            ["spider_runtime_operation.operation_id", "spider_runtime_operation.environment", "spider_runtime_operation.execution_scope_id", "spider_runtime_operation.strategy_id"],
+            name="fk_spider_control_receipt_operation",
+        ),
+        CheckConstraint("receipt_id COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_control_receipt_id"),
+        CheckConstraint("environment COLLATE \"C\" ~ '^[A-Za-z0-9_-]{1,128}$'", name="ck_spider_control_receipt_environment"),
+        CheckConstraint("execution_scope_id COLLATE \"C\" ~ '^[A-Za-z0-9_-]{1,128}$'", name="ck_spider_control_receipt_scope"),
+        CheckConstraint("strategy_id COLLATE \"C\" ~ '^[A-Za-z0-9_-]{1,128}$'", name="ck_spider_control_receipt_strategy"),
+        CheckConstraint("actor COLLATE \"C\" ~ '^[A-Za-z0-9][A-Za-z0-9._:@-]{0,63}$'", name="ck_spider_control_receipt_actor"),
+        CheckConstraint("idempotency_key COLLATE \"C\" ~ '^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$'", name="ck_spider_control_receipt_key"),
+        CheckConstraint("octet_length(request_payload) BETWEEN 1 AND 1048576", name="ck_spider_control_receipt_payload"),
+        CheckConstraint("request_sha256 COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_control_receipt_hash"),
+        CheckConstraint("operation_id IS NULL OR operation_id COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_control_receipt_operation_id"),
+        CheckConstraint("generation > 0", name="ck_spider_control_receipt_generation"),
+        CheckConstraint("before_state_version BETWEEN 0 AND 2147483647", name="ck_spider_control_receipt_before_version"),
+        CheckConstraint("after_state_version BETWEEN 1 AND 2147483647 AND after_state_version = before_state_version + 1", name="ck_spider_control_receipt_after_version"),
+        CheckConstraint("barrier_sequence >= 0", name="ck_spider_control_receipt_barrier"),
+        CheckConstraint("outcome = 'COMPLETED'", name="ck_spider_control_receipt_outcome"),
+        CheckConstraint("recorded_at >= TIMESTAMPTZ '0001-01-01 00:00:00+00' AND recorded_at < TIMESTAMPTZ '10000-01-01 00:00:00+00' AND recorded_at = date_trunc('milliseconds', recorded_at)", name="ck_spider_control_receipt_recorded_at"),
+    )
