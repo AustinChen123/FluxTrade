@@ -328,10 +328,19 @@ class LiveOrderRepository(IOrderRepository):
     def persist_fill(self, order: Order, trade: Trade) -> None:
         self._bind_order(order)
         with self._db_session_factory() as db:
-            self._participate(db, order, trade)
-            ensure_product_registered(db, str(trade.product_id))
-            db.add(order)
-            db.add(trade)
+            if self._transaction_participant is None:
+                ensure_product_registered(db, str(trade.product_id))
+                db.add(order)
+                db.add(trade)
+            else:
+                # Product registration uses Session.execute, so keep it and
+                # attachment from autoflushing a caller's dirty Order before
+                # the participant captures the scalar prewrite projection.
+                with db.no_autoflush:
+                    ensure_product_registered(db, str(trade.product_id))
+                    db.add(order)
+                    db.add(trade)
+                    self._participate(db, order, trade)
             db.commit()
             db.refresh(order)
 

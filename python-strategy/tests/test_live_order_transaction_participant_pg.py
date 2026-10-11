@@ -1,14 +1,15 @@
 """Opt-in PostgreSQL execution of the live repository participant contract."""
 
 import os
+from decimal import Decimal
 
 import pytest
-from sqlalchemy import create_engine, text, update
+from sqlalchemy import create_engine, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from src.core.execution import ExecutionEngine
-from src.core.orm_models import Order, Product, Strategy
+from src.core.orm_models import Order, Product, Strategy, Trade
 from src.core.repositories import LiveOrderRepository
 from test_repositories import TestLiveOrderRepositoryTransactionParticipant as _Contract
 from test_migrations import fresh_pg_db as _migration_fresh_pg_db
@@ -42,6 +43,87 @@ def sqlite_order_session_factory(fresh_pg_db):
 
 
 class TestLiveOrderTransactionParticipantPostgres(_Contract):
+    @pytest.mark.parametrize("fail_participant", [False, True])
+    def test_fill_participant_can_target_flush_original_trade_after_prewrite_proof(
+        self,
+        sqlite_order_session_factory,
+        order_factory,
+        fail_participant,
+    ):
+        factory = sqlite_order_session_factory
+        order = order_factory(
+            order_id=f"target-flush-original-trade-{fail_participant}",
+            status="open",
+        )
+        LiveOrderRepository(db_session_factory=factory).add_order(order)
+        order.status = "closed"
+        order.filled_quantity = Decimal("1")
+        order.filled_price = Decimal("42000")
+        trade = Trade(
+            id=f"target-flush-trade-{fail_participant}",
+            order_id=order.id,
+            exchange_trade_id=f"target-flush-trade-{fail_participant}",
+            product_id=order.product_id,
+            side=order.side,
+            price=Decimal("42000"),
+            quantity=Decimal("1"),
+            fee=Decimal("0"),
+            fee_asset="USDT",
+            timestamp=1_800_000_001_000,
+        )
+        trade_id = trade.id
+        callback_sessions: list[Session] = []
+
+        def participant(
+            session: Session,
+            intended_order: Order,
+            original_trade: Trade | None,
+        ) -> None:
+            callback_sessions.append(session)
+            assert session.in_transaction() and session.is_active
+            assert intended_order is order
+            assert original_trade is trade
+            assert original_trade in session.new
+            assert session.is_modified(intended_order)
+            assert session.execute(
+                select(Order.status).where(Order.id == order.id)
+            ).scalar_one() == "open"
+            session.flush([original_trade])
+            assert session.execute(
+                select(Trade.id).where(Trade.id == trade_id)
+            ).scalar_one() == trade_id
+            assert session.execute(
+                select(Order.status).where(Order.id == order.id)
+            ).scalar_one() == "open"
+            with factory() as independent:
+                assert independent.get(Trade, trade_id) is None
+                persisted_order = independent.get(Order, order.id)
+                assert persisted_order is not None
+                assert persisted_order.status == "open"
+            if fail_participant:
+                raise RuntimeError("participant failure after Trade flush")
+
+        repository = LiveOrderRepository(
+            db_session_factory=factory,
+            transaction_participant=participant,
+        )
+        if fail_participant:
+            with pytest.raises(
+                RuntimeError,
+                match="^participant failure after Trade flush$",
+            ):
+                repository.persist_fill(order, trade)
+        else:
+            repository.persist_fill(order, trade)
+
+        assert len(callback_sessions) == 1
+        with factory() as independent:
+            persisted_order = independent.get(Order, order.id)
+            assert persisted_order is not None
+            assert persisted_order.status == ("open" if fail_participant else "closed")
+            persisted_trade = independent.get(Trade, trade_id)
+            assert (persisted_trade is None) is fail_participant
+
     @pytest.mark.parametrize("fail_participant", [False, True])
     def test_execution_engine_financial_update_shares_participant_transaction(
         self,
