@@ -16,6 +16,7 @@ def restore_active_strategies(
     activate_strategy: Callable[..., object],
     transition_to_error: Callable[..., object],
     event_logger: logging.Logger,
+    excluded_strategy_ids: frozenset[str] = frozenset(),
 ) -> None:
     """Restore durably ACTIVE strategies in query order at process startup."""
     with db_session_factory() as db:
@@ -27,6 +28,8 @@ def restore_active_strategies(
 
     for state in active_states:
         strategy_id = cast(str, state.strategy_id)
+        if strategy_id in excluded_strategy_ids:
+            continue
         if not is_strategy_loaded(strategy_id):
             event_logger.error(
                 "Startup restore: strategy class not loaded for %s — marking ERROR",

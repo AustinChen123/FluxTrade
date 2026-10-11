@@ -14,7 +14,7 @@ from src.core.models import (
     OrderStatus,
     PositionSide,
 )
-from src.core.orm_models import Order, Strategy
+from src.core.orm_models import Order, Strategy, Trade as StoredTrade
 from src.core.order_manager import OrderManager
 from src.core.order_manager import PositionCachePersistenceError
 from src.core.runtime_capabilities import (
@@ -80,6 +80,19 @@ from src.core.signal_order_intent import (
 )
 from src.core.strategy_context import RejectionSnapshot
 
+
+OrderTransactionParticipant = Callable[[Session, Order, StoredTrade | None], None]
+
+
+def _validate_order_transaction_participant_target(
+    order_repository: IOrderRepository | None,
+    transaction_participant: OrderTransactionParticipant | None,
+) -> None:
+    if order_repository is not None and transaction_participant is not None:
+        raise ValueError(
+            "repository transaction participant requires internally constructed LiveOrderRepository"
+        )
+
 OPS_KILL_SWITCH_STRATEGY_ID = "__ops_kill_switch__"
 
 
@@ -125,7 +138,12 @@ class ExecutionEngine:
         order_event_processor: OrderEventProcessor | None = None,
         pending_protection_fill_processor: PendingProtectionFillProcessor | None = None,
         entry_candle_freshness_enabled: bool = False,
+        repository_transaction_participant: OrderTransactionParticipant | None = None,
     ):
+        _validate_order_transaction_participant_target(
+            order_repository,
+            repository_transaction_participant,
+        )
         self.logger = logging.getLogger("ExecutionEngine")
         self.clock = clock
         self._db_session_factory = db_session_factory
@@ -175,6 +193,7 @@ class ExecutionEngine:
                         if repository_account_identity is not None
                         else None
                     ),
+                    transaction_participant=repository_transaction_participant,
                 ),
                 clock,
                 is_backtest=is_backtest,

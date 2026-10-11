@@ -3,10 +3,11 @@
 import os
 
 import pytest
-from sqlalchemy import create_engine, update
+from sqlalchemy import create_engine, text, update
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 
+from src.core.execution import ExecutionEngine
 from src.core.orm_models import Order, Product, Strategy
 from src.core.repositories import LiveOrderRepository
 from test_repositories import TestLiveOrderRepositoryTransactionParticipant as _Contract
@@ -41,6 +42,90 @@ def sqlite_order_session_factory(fresh_pg_db):
 
 
 class TestLiveOrderTransactionParticipantPostgres(_Contract):
+    @pytest.mark.parametrize("fail_participant", [False, True])
+    def test_execution_engine_financial_update_shares_participant_transaction(
+        self,
+        sqlite_order_session_factory,
+        order_factory,
+        mock_clock,
+        mock_exchange_adapter,
+        fail_participant,
+    ):
+        factory = sqlite_order_session_factory
+        engine = factory.kw["bind"]
+        with engine.begin() as connection:
+            connection.execute(
+                text("CREATE TABLE participant_marker (order_id TEXT NOT NULL)")
+            )
+        order = order_factory(
+            order_id=f"execution-participant-{fail_participant}",
+            status="open",
+        )
+        LiveOrderRepository(db_session_factory=factory).add_order(order)
+        sessions_seen: list[Session] = []
+        owned_sessions: list[Session] = []
+
+        def tracked_sessions() -> Session:
+            session = factory()
+            owned_sessions.append(session)
+            return session
+
+        def participant(session: Session, intended_order: Order, _trade) -> None:
+            sessions_seen.append(session)
+            assert session.in_transaction()
+            assert session.is_active
+            assert session.get_bind().dialect.name == "postgresql"
+            assert intended_order is order
+            with factory() as independent:
+                assert independent.query(Order.status).filter_by(id=order.id).scalar() == "open"
+                assert independent.execute(
+                    text("SELECT count(*) FROM participant_marker WHERE order_id=:id"),
+                    {"id": order.id},
+                ).scalar_one() == 0
+            session.execute(
+                text("INSERT INTO participant_marker (order_id) VALUES (:id)"),
+                {"id": order.id},
+            )
+            assert session.execute(
+                text("SELECT count(*) FROM participant_marker WHERE order_id=:id"),
+                {"id": order.id},
+            ).scalar_one() == 1
+            with factory() as independent:
+                assert independent.execute(
+                    text("SELECT count(*) FROM participant_marker WHERE order_id=:id"),
+                    {"id": order.id},
+                ).scalar_one() == 0
+            if fail_participant:
+                raise RuntimeError("participant failure")
+
+        execution = ExecutionEngine(
+            db_session=None,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            db_session_factory=tracked_sessions,
+            repository_transaction_participant=participant,
+        )
+        repository = execution.order_manager.repo
+        assert isinstance(repository, LiveOrderRepository)
+        order.status = "closed"
+
+        if fail_participant:
+            with pytest.raises(RuntimeError, match="^participant failure$"):
+                repository.update_order(order)
+        else:
+            repository.update_order(order)
+
+        assert len(sessions_seen) == 1
+        assert owned_sessions[-1] is sessions_seen[0]
+        with factory() as independent:
+            persisted = independent.get(Order, order.id)
+            assert persisted is not None
+            assert persisted.status == ("open" if fail_participant else "closed")
+            assert independent.execute(
+                text("SELECT count(*) FROM participant_marker WHERE order_id=:id"),
+                {"id": order.id},
+            ).scalar_one() == (0 if fail_participant else 1)
+
     def test_prepared_order_stages_only_in_caller_owned_transaction(
         self, sqlite_order_session_factory, order_factory
     ):

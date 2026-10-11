@@ -47,6 +47,33 @@ def test_loaded_active_strategy_activates_with_exact_startup_contract():
     db.query.assert_called_once()
 
 
+def test_owned_active_rows_are_skipped_before_loaded_and_error_checks():
+    db, db_factory = _db_factory(
+        [_state("owned-held"), _state("owned-stopped"), _state("generic-missing")]
+    )
+    is_loaded = MagicMock(return_value=False)
+    activate = MagicMock()
+    transition = MagicMock()
+
+    restore_active_strategies(
+        db_session_factory=db_factory,
+        is_strategy_loaded=is_loaded,
+        activate_strategy=activate,
+        transition_to_error=transition,
+        event_logger=MagicMock(),
+        excluded_strategy_ids=frozenset({"owned-held", "owned-stopped"}),
+    )
+
+    is_loaded.assert_called_once_with("generic-missing")
+    activate.assert_not_called()
+    transition.assert_called_once_with(
+        "generic-missing",
+        "startup_restore_class_missing",
+        actor="system",
+    )
+    db.query.assert_called_once()
+
+
 def test_mixed_batch_preserves_order_and_isolates_missing_and_failed_entries():
     db, db_factory = _db_factory(
         [_state("good-a"), _state("missing"), _state("failed"), _state("good-b")]
