@@ -3578,3 +3578,179 @@ def test_research_dataset_downgrade_removes_guard_objects(
         assert "research_candlestick" not in _table_names(engine)
     finally:
         engine.dispose()
+
+
+def test_binance_last_execution_identity_persists_through_live_fill_pg(
+    fresh_pg_db: str,
+    monkeypatch: pytest.MonkeyPatch,
+    mock_clock,
+) -> None:
+    """Exercise Binance poll through durable Trade rows on current migrations."""
+    import json as json_module
+    from unittest.mock import MagicMock
+
+    from sqlalchemy.orm import sessionmaker
+    from src.core.adapters.binance_user_stream import BinanceOrderEventStream
+    from src.core.interfaces.exchange import ExchangeOrderEvent
+    from src.core.models import OrderStatus
+    from src.core.order_event_sync import OrderEventApplier
+    from src.core.order_manager import OrderManager
+    from src.core.orm_models import Order, Strategy, Trade as ORMTrade
+    from src.core.repositories import LiveOrderRepository
+
+    _upgrade(fresh_pg_db)
+    engine = sa.create_engine(_target_url(fresh_pg_db))
+    try:
+        sessions = sessionmaker(bind=engine)
+        with sessions.begin() as session:
+            session.add(Strategy(id="identity-strategy", name="Identity test"))
+
+        first_repo = LiveOrderRepository(
+            db_session_factory=sessions,
+            account_profile="fixture",
+            account_id="account-a",
+        )
+        second_repo = LiveOrderRepository(
+            db_session_factory=sessions,
+            account_profile="fixture",
+            account_id="account-b",
+        )
+        first_order = Order(
+            id="identity-order-a",
+            exchange_order_id="9001",
+            strategy_id="identity-strategy",
+            product_id="BINANCE:BTCUSDT-PERP",
+            exchange_id="BINANCE",
+            type="market",
+            side="buy",
+            quantity=Decimal("0.5"),
+            status=OrderStatus.SUBMITTED.value,
+            timestamp=1,
+            filled_quantity=Decimal("0"),
+        )
+        second_order = Order(
+            id="identity-order-b",
+            exchange_order_id="9002",
+            strategy_id="identity-strategy",
+            product_id="BINANCE:ETHUSDT-PERP",
+            exchange_id="BINANCE",
+            type="market",
+            side="buy",
+            quantity=Decimal("0.1"),
+            status=OrderStatus.SUBMITTED.value,
+            timestamp=1,
+            filled_quantity=Decimal("0"),
+        )
+        first_repo.add_order(first_order)
+        second_repo.add_order(second_order)
+
+        redis = MagicMock()
+        redis.hgetall.return_value = {}
+        monkeypatch.setattr(
+            "src.core.order_manager.create_redis_client", lambda: redis
+        )
+        first_manager = OrderManager(first_repo, mock_clock, is_backtest=False)
+        second_manager = OrderManager(second_repo, mock_clock, is_backtest=False)
+
+        def make_applier(manager: OrderManager) -> OrderEventApplier:
+            return OrderEventApplier(
+                order_manager=manager,
+                journal_fill=None,
+                fail_pending_conditionals_for_terminal_entry=lambda _order: None,
+                protective_terminal_without_fill_failure=lambda _order: None,
+                write_conditional_warning=lambda **_kwargs: None,
+                place_pending_conditionals_for_entry=lambda _order: [],
+                protective_partial_fill_requires_resize=lambda _order, _state: None,
+                cancel_linked_conditional_for_protection_fill=lambda _order: None,
+            )
+
+        messages = []
+        for symbol, client_id, order_id, status, cumulative, average, last_qty, price, fee, trade_id in (
+            ("BTCUSDT", "client-a", 9001, "PARTIALLY_FILLED", "0.2", "100", "0.2", "100", "0.02", 44123),
+            ("BTCUSDT", "client-a", 9001, "FILLED", "0.5", "100.6", "0.3", "101", "0.03", 44124),
+            ("ETHUSDT", "client-b", 9002, "FILLED", "0.1", "102", "0.1", "102", "0.01", 44123),
+        ):
+            messages.append(
+                json_module.dumps(
+                    {
+                        "e": "ORDER_TRADE_UPDATE",
+                        "E": 1_700_000_000_123,
+                        "o": {
+                            "s": symbol,
+                            "c": client_id,
+                            "i": order_id,
+                            "X": status,
+                            "z": cumulative,
+                            "ap": average,
+                            "l": last_qty,
+                            "L": price,
+                            "x": "TRADE",
+                            "t": trade_id,
+                            "n": fee,
+                            "N": "USDT",
+                        },
+                    }
+                )
+            )
+        messages.append(messages[1])
+        connection = MagicMock()
+        connection.recv.side_effect = messages
+        owner = BinanceOrderEventStream(
+            client=object(),
+            testnet=False,
+            resolve_client_order_id=lambda value: value,
+            monotonic=lambda: 0,
+        )
+        owner._connection = connection
+        owner._listen_key = "test-listen-key"
+        owner._next_keepalive_at = 1
+
+        outcomes = []
+        for index in range(4):
+            event = owner.poll()
+            assert isinstance(event, ExchangeOrderEvent)
+            applier = second_manager if index == 2 else first_manager
+            outcomes.append(make_applier(applier).process_exchange_order_event(event))
+
+        assert [outcome["action"] for outcome in outcomes] == ["applied"] * 4
+        with sessions() as session:
+            trades = (
+                session.query(ORMTrade)
+                .order_by(ORMTrade.order_id, ORMTrade.quantity)
+                .all()
+            )
+            first_trades = [trade for trade in trades if trade.order_id == first_order.id]
+            second_trades = [trade for trade in trades if trade.order_id == second_order.id]
+            assert len(trades) == 3
+            assert [trade.exchange_trade_id for trade in first_trades] == [
+                "44123",
+                "44124",
+            ]
+            assert [trade.exchange_trade_id for trade in second_trades] == ["44123"]
+            assert all(trade.id not in {"44123", "44124"} for trade in trades)
+            assert [trade.order_id for trade in first_trades] == [
+                first_order.id,
+                first_order.id,
+            ]
+            assert [
+                (trade.price, trade.quantity, trade.fee, trade.fee_asset)
+                for trade in first_trades
+            ] == [
+                (Decimal("100"), Decimal("0.2"), Decimal("0.02"), "USDT"),
+                (Decimal("101"), Decimal("0.3"), Decimal("0.03"), "USDT"),
+            ]
+            assert second_trades[0].order_id == second_order.id
+            assert (
+                second_trades[0].price,
+                second_trades[0].quantity,
+                second_trades[0].fee,
+                second_trades[0].fee_asset,
+            ) == (Decimal("102"), Decimal("0.1"), Decimal("0.01"), "USDT")
+            persisted_orders = {
+                row.id: (row.account_profile, row.account_id)
+                for row in session.query(Order).all()
+            }
+            assert persisted_orders[first_order.id] == ("fixture", "account-a")
+            assert persisted_orders[second_order.id] == ("fixture", "account-b")
+    finally:
+        engine.dispose()
