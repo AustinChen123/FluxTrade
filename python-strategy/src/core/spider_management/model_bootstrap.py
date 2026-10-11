@@ -65,6 +65,11 @@ _SELECTION_KEYS = frozenset(
         "time_zone",
     }
 )
+ORIGINAL_MODEL_POLICY_ID = "SPIDER_GRID_ORIGINAL_V1"
+ORIGINAL_MODEL_POLICY_VERSION = "1"
+ORIGINAL_MODEL_POLICY_SOURCE_SHA256 = (
+    "4dbf2bdbee87d4100004fe5b14a93f597e64a9bca6525ed2902afd3476ee40ec"
+)
 @dataclass(frozen=True, slots=True)
 class PreparedModelBootstrap:
     runtime_selection: dict[str, object]
@@ -253,10 +258,9 @@ def _manual_configuration_matches_source(
             "SPIDER_HOST_ORIGINAL_PAID_V1",
             "SPIDER_ORIGINAL_GROSS_PROTECTED_PAID_V1",
         }
-        or run.policy_id != "SPIDER_GRID_ORIGINAL_V1"
-        or run.policy_version != "1"
-        or run.policy_source_sha256
-        != "4dbf2bdbee87d4100004fe5b14a93f597e64a9bca6525ed2902afd3476ee40ec"
+        or run.policy_id != ORIGINAL_MODEL_POLICY_ID
+        or run.policy_version != ORIGINAL_MODEL_POLICY_VERSION
+        or run.policy_source_sha256 != ORIGINAL_MODEL_POLICY_SOURCE_SHA256
     ):
         raise ModelBootstrapUnavailable("model_source_unavailable")
 

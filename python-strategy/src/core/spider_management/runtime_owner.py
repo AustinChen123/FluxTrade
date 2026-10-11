@@ -29,9 +29,13 @@ from src.core.spider_management.configuration_request import (
 from src.core.spider_management.configuration_request_store import _hydrate
 from src.core.spider_management.model_bootstrap import (
     ModelBootstrapUnavailable,
+    ORIGINAL_MODEL_POLICY_ID,
+    ORIGINAL_MODEL_POLICY_SOURCE_SHA256,
+    ORIGINAL_MODEL_POLICY_VERSION,
     PreparedModelBootstrap,
     prepare_model_bootstrap,
 )
+from src.core.spider_management.source_checkpoint_codec import restore_source_checkpoint
 from src.core.spider_management.operation_request import SpiderOperationRequest
 from src.core.spider_management.operation_request_store import _mapping
 from src.core.spider_management.financial_delivery import (
@@ -1141,6 +1145,85 @@ class SpiderRuntimeOwner:
                         or bootstrap_basis["specification_sha256"] != plan.specification_sha256
                     ):
                         return None
+                    ordered_products_value = product_map.get("ordered_products")
+                    if (
+                        type(ordered_products_value) is not list
+                        or not ordered_products_value
+                        or any(type(product) is not str or not product for product in ordered_products_value)
+                        or len(set(ordered_products_value)) != len(ordered_products_value)
+                    ):
+                        return None
+                    ordered_products = tuple(cast(list[str], ordered_products_value))
+                    history_value = initial_manifest.get("historical_provenance")
+                    if type(history_value) is not dict:
+                        return None
+                    historical_provenance = cast(dict[str, object], history_value)
+                    source_sha256 = historical_provenance.get("source_sha256")
+                    initial_checkpoint_sha256 = initial_manifest.get("source_checkpoint_sha256")
+                    if (
+                        type(source_sha256) is not str
+                        or len(source_sha256) != 64
+                        or any(char not in "0123456789abcdef" for char in source_sha256)
+                        or initial_checkpoint_sha256 != plan.source_checkpoint_sha256
+                        or bootstrap_basis.get("source_checkpoint_sha256")
+                        != initial_checkpoint_sha256
+                        or plan.configuration_sha256 != runtime.configuration_sha256
+                        or plan.generation != runtime.generation
+                        or head.configuration_request_id != runtime.confirmation_request_id
+                        or manifest.get("operation_id") != operation_id
+                        or manifest.get("operation_core_sha256") != head.operation_core_sha256
+                        or manifest.get("confirmation_request_id") != runtime.confirmation_request_id
+                        or manifest.get("configuration_sha256") != runtime.configuration_sha256
+                        or manifest.get("generation") != runtime.generation
+                        or runtime_selection.get("environment") != scope.environment
+                        or runtime_selection.get("execution_scope_id") != scope.execution_scope_id
+                        or runtime_selection.get("strategy_id") != scope.strategy_id
+                        or runtime_selection.get("confirmation_request_id")
+                        != runtime.confirmation_request_id
+                        or runtime_selection.get("configuration_sha256")
+                        != runtime.configuration_sha256
+                    ):
+                        return None
+                    configuration_row = session.execute(
+                        select(SpiderConfigurationRequest.__table__).where(
+                            SpiderConfigurationRequest.request_id
+                            == runtime.confirmation_request_id
+                        )
+                    ).mappings().one_or_none()
+                    if configuration_row is None:
+                        return None
+                    configuration_record = _hydrate(configuration_row)
+                    configuration_request = configuration_record.request
+                    configuration = configuration_request.configuration.value
+                    if (
+                        configuration_request.request_kind
+                        is not SpiderConfigurationRequestKind.CONFIRMATION
+                        or configuration_request.request_id != runtime.confirmation_request_id
+                        or configuration_request.configuration.sha256
+                        != runtime.configuration_sha256
+                        or (
+                            configuration_request.environment,
+                            configuration_request.execution_scope_id,
+                            configuration_request.strategy_id,
+                        ) != (scope.environment, scope.execution_scope_id, scope.strategy_id)
+                        or configuration.get("ordered_products") != list(ordered_products)
+                        or configuration.get("policy_id") not in {
+                            "SPIDER_HOST_ORIGINAL_PAID_V1",
+                            "SPIDER_ORIGINAL_GROSS_PROTECTED_PAID_V1",
+                        }
+                    ):
+                        return None
+                    restore_source_checkpoint(
+                        runtime.source_checkpoint,
+                        ordered_products=ordered_products,
+                        policy_id=ORIGINAL_MODEL_POLICY_ID,
+                        policy_version=ORIGINAL_MODEL_POLICY_VERSION,
+                        policy_source_sha256=ORIGINAL_MODEL_POLICY_SOURCE_SHA256,
+                        source_sha256=cast(str, source_sha256),
+                        confirmation_request_id=runtime.confirmation_request_id,
+                        configuration_sha256=runtime.configuration_sha256,
+                        generation=runtime.generation,
+                    )
                     identity_rows = session.execute(
                         select(SpiderRuntimeAction, SpiderRuntimeBinding, Order)
                         .join(

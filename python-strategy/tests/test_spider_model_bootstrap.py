@@ -21,6 +21,9 @@ from src.core.spider_management.model_bootstrap import (
     ModelBootstrapUnavailable,
     prepare_model_bootstrap,
 )
+from src.core.spider_management.source_checkpoint_codec import (
+    restore_source_checkpoint,
+)
 from test_spider_historical_input import HASH, _policy_cache, _valid_run
 
 
@@ -207,6 +210,270 @@ def test_model_bootstrap_captures_initialized_source_and_native_basis():
     assert cast(int, before["order_id"]) < cast(int, after["order_id"])
     assert before["replies"] != after["replies"]
     assert prepared.source_checkpoint_sha256 != prepared.build_checkpoint_sha256
+
+
+def _restore_checkpoint(raw, run, prepared):
+    return restore_source_checkpoint(
+        raw,
+        ordered_products=run.ordered_products,
+        policy_id=run.policy_id,
+        policy_version=run.policy_version,
+        policy_source_sha256=run.policy_source_sha256,
+        source_sha256=prepared.historical_provenance["source_sha256"],
+        confirmation_request_id=prepared.runtime_selection["confirmation_request_id"],
+        configuration_sha256=prepared.runtime_selection["configuration_sha256"],
+        generation=1,
+    )
+
+
+def _scalar_tags(value):
+    if type(value) is dict:
+        if set(value) in ({"tag"}, {"tag", "value"}) and type(value.get("tag")) is str:
+            yield value["tag"]
+        for item in value.values():
+            yield from _scalar_tags(item)
+    elif type(value) is list:
+        for item in value:
+            yield from _scalar_tags(item)
+
+
+def test_source_checkpoint_restore_roundtrips_initial_and_build_states():
+    run = _admitted_run()
+    confirmation = _confirmation(run)
+    prepared = _prepare(run, _selection(run, confirmation), confirmation)
+
+    observed_tags = set()
+    for raw in (prepared.source_checkpoint_bytes, prepared.build_checkpoint_bytes):
+        policy = _restore_checkpoint(raw, run, prepared)
+        assert policy.events == []
+        from src.core.spider_management.source_checkpoint_codec import encode_source_checkpoint
+
+        assert encode_source_checkpoint(
+            policy,
+            ordered_products=run.ordered_products,
+            policy_id=run.policy_id,
+            policy_version=run.policy_version,
+            policy_source_sha256=run.policy_source_sha256,
+            source_sha256=cast(str, prepared.historical_provenance["source_sha256"]),
+            confirmation_request_id=cast(
+                str, prepared.runtime_selection["confirmation_request_id"]
+            ),
+            configuration_sha256=cast(
+                str, prepared.runtime_selection["configuration_sha256"]
+            ),
+        ) == raw
+        decoded = cast(dict[str, object], decode_canonical(raw))
+        observed_tags.update(_scalar_tags(decoded))
+        assert policy.order_id == decoded["order_id"]
+        assert policy.now_ms == decoded["now_ms"]
+        assert policy.shared_ms == decoded["shared_ms"]
+        assert policy.last_market_ms == decoded["last_market_ms"]
+        assert policy.last_earn_ms == decoded["last_earn_ms"]
+        assert list(policy.markets) == list(run.ordered_products)
+
+    assert {"NULL", "STRING", "DECIMAL", "INT64", "BOOL"} <= observed_tags
+
+
+def test_source_checkpoint_restore_roundtrips_nondefault_sparse_policy_state():
+    run = _admitted_run()
+    confirmation = _confirmation(run)
+    prepared = _prepare(run, _selection(run, confirmation), confirmation)
+    original = cast(dict[str, object], decode_canonical(prepared.build_checkpoint_bytes))
+    policy = _restore_checkpoint(prepared.build_checkpoint_bytes, run, prepared)
+    policy.reset_ms = {run.ordered_products[1]: 22, run.ordered_products[0]: 11}
+    policy.last_filled_price = {
+        run.ordered_products[1]: {"buy": "2.50", "sell": "2.75"},
+        run.ordered_products[0]: {"buy": "1.25", "sell": "1.50"},
+    }
+    policy.last_capital = Decimal("123.4500")
+    policy.capital = {"earn": Decimal("0.25"), "usdt": None}
+    policy.replies = {
+        "failed-order": {
+            "instId": run.ordered_products[1],
+            "side": "sell",
+            "sMsg": None,
+        }
+    }
+
+    from src.core.spider_management.source_checkpoint_codec import encode_source_checkpoint
+
+    raw = encode_source_checkpoint(
+        policy,
+        ordered_products=run.ordered_products,
+        policy_id=run.policy_id,
+        policy_version=run.policy_version,
+        policy_source_sha256=run.policy_source_sha256,
+        source_sha256=cast(str, prepared.historical_provenance["source_sha256"]),
+        confirmation_request_id=cast(
+            str, prepared.runtime_selection["confirmation_request_id"]
+        ),
+        configuration_sha256=cast(
+            str, prepared.runtime_selection["configuration_sha256"]
+        ),
+    )
+    restored = _restore_checkpoint(raw, run, prepared)
+
+    assert restored.events == []
+    assert list(restored.reset_ms.items()) == list(policy.reset_ms.items())
+    assert list(restored.last_filled_price.items()) == list(policy.last_filled_price.items())
+    assert restored.last_capital == Decimal("123.45")
+    assert type(restored.last_capital) is Decimal
+    assert list(restored.capital.items()) == [("earn", Decimal("0.25")), ("usdt", None)]
+    assert type(restored.capital["earn"]) is Decimal
+    assert list(restored.replies.items()) == list(policy.replies.items())
+    assert "px" not in restored.replies["failed-order"]
+    assert restored.replies["failed-order"]["sMsg"] is None
+    assert type(restored.running) is bool
+    assert type(restored.order_id) is int
+    for counter in ("now_ms", "shared_ms", "last_market_ms", "last_earn_ms", "order_id"):
+        assert getattr(restored, counter) == original[counter]
+    assert encode_source_checkpoint(
+        restored,
+        ordered_products=run.ordered_products,
+        policy_id=run.policy_id,
+        policy_version=run.policy_version,
+        policy_source_sha256=run.policy_source_sha256,
+        source_sha256=cast(str, prepared.historical_provenance["source_sha256"]),
+        confirmation_request_id=cast(
+            str, prepared.runtime_selection["confirmation_request_id"]
+        ),
+        configuration_sha256=cast(
+            str, prepared.runtime_selection["configuration_sha256"]
+        ),
+    ) == raw
+
+
+@pytest.mark.parametrize(
+    "field,scalar",
+    [
+        (field, scalar)
+        for field in ("buy", "sell")
+        for scalar in (
+            {"tag": "NULL"},
+            {"tag": "BOOL", "value": False},
+            {"tag": "INT64", "value": 1},
+            {"tag": "DECIMAL", "value": "1"},
+        )
+    ],
+)
+def test_source_checkpoint_restore_rejects_nonstring_last_filled_prices(field, scalar):
+    run = _admitted_run()
+    confirmation = _confirmation(run)
+    prepared = _prepare(run, _selection(run, confirmation), confirmation)
+    value = cast(dict[str, object], decode_canonical(prepared.build_checkpoint_bytes))
+    value["last_filled_price"] = [
+        {
+            "product_id": run.ordered_products[0],
+            "buy": {"tag": "STRING", "value": "1"},
+            "sell": {"tag": "STRING", "value": "2"},
+        }
+    ]
+    cast(list[dict[str, object]], value["last_filled_price"])[0][field] = scalar
+
+    with pytest.raises(ValueError, match="^INVALID_SOURCE_CHECKPOINT$"):
+        _restore_checkpoint(canonical_bytes(value), run, prepared)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "unknown_top_level",
+        "unknown_scalar_tag",
+        "noncanonical_decimal",
+        "integer_overflow",
+        "bool_in_integer_field",
+        "bool_generation",
+        "generation_overflow",
+        "order_id_zero",
+        "last_market_overflow",
+        "duplicate_parameter",
+        "row_order",
+        "market_order",
+        "duplicate_sparse_key",
+        "duplicate_reply_alias",
+        "unknown_reset_product",
+    ],
+)
+def test_source_checkpoint_restore_rejects_noncanonical_or_open_shape(mutation):
+    run = _admitted_run()
+    confirmation = _confirmation(run)
+    prepared = _prepare(run, _selection(run, confirmation), confirmation)
+    value = cast(dict[str, object], decode_canonical(prepared.build_checkpoint_bytes))
+    if mutation == "unknown_top_level":
+        value["unexpected"] = None
+    elif mutation == "unknown_scalar_tag":
+        parameters = cast(list[dict[str, object]], value["parameters"])
+        parameters[0]["value"] = {"tag": "UNKNOWN"}
+    elif mutation == "noncanonical_decimal":
+        parameters = cast(list[dict[str, object]], value["parameters"])
+        parameters[0]["value"] = {"tag": "DECIMAL", "value": "1.0"}
+    elif mutation == "integer_overflow":
+        value["now_ms"] = 2**63
+    elif mutation == "bool_in_integer_field":
+        value["now_ms"] = True
+    elif mutation == "bool_generation":
+        cast(dict[str, object], value["effective_identity"])["generation"] = True
+    elif mutation == "generation_overflow":
+        cast(dict[str, object], value["effective_identity"])["generation"] = 2**63
+    elif mutation == "order_id_zero":
+        value["order_id"] = 0
+    elif mutation == "last_market_overflow":
+        value["last_market_ms"] = -(2**63) - 1
+    elif mutation == "duplicate_parameter":
+        parameters = cast(list[object], value["parameters"])
+        parameters.append(parameters[0])
+    elif mutation == "row_order":
+        rows = cast(list[object], value["rows"])
+        rows.reverse()
+    elif mutation == "market_order":
+        markets = cast(list[object], value["markets"])
+        markets.reverse()
+    elif mutation == "duplicate_sparse_key":
+        value["capital"] = [
+            {"key": "earn", "value": {"tag": "NULL"}},
+            {"key": "earn", "value": {"tag": "NULL"}},
+        ]
+    elif mutation == "duplicate_reply_alias":
+        value["replies"] = [
+            {"alias": "same", "value": []},
+            {"alias": "same", "value": []},
+        ]
+    else:
+        value["reset_ms"] = [{"product_id": "NOT_A_PRODUCT", "value": 1}]
+
+    with pytest.raises(ValueError, match="^INVALID_SOURCE_CHECKPOINT$"):
+        _restore_checkpoint(canonical_bytes(value), run, prepared)
+
+
+@pytest.mark.parametrize(
+    "identity,override",
+    [
+        ("policy_source_sha256", "0" * 64),
+        ("policy_id", "OTHER_POLICY"),
+        ("policy_version", "2"),
+        ("source_sha256", "0" * 64),
+        ("confirmation_request_id", "0" * 64),
+        ("configuration_sha256", "0" * 64),
+        ("generation", 2),
+    ],
+)
+def test_source_checkpoint_restore_rejects_wrong_expected_identity(identity, override):
+    run = _admitted_run()
+    confirmation = _confirmation(run)
+    prepared = _prepare(run, _selection(run, confirmation), confirmation)
+    kwargs = {
+        "ordered_products": run.ordered_products,
+        "policy_id": run.policy_id,
+        "policy_version": run.policy_version,
+        "policy_source_sha256": run.policy_source_sha256,
+        "source_sha256": prepared.historical_provenance["source_sha256"],
+        "confirmation_request_id": prepared.runtime_selection["confirmation_request_id"],
+        "configuration_sha256": prepared.runtime_selection["configuration_sha256"],
+        "generation": 1,
+    }
+    kwargs[identity] = override
+    with pytest.raises(ValueError, match="^INVALID_SOURCE_CHECKPOINT$"):
+        restore_source_checkpoint(prepared.build_checkpoint_bytes, **kwargs)
 
 
 def loaded_native_artifact_path_bytes():

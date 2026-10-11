@@ -1,6 +1,7 @@
 """Actual Execution-to-repository TX A receipts on isolated PostgreSQL."""
 
 from decimal import Decimal
+from hashlib import sha256
 import logging
 import os
 from threading import Event, Thread
@@ -32,6 +33,7 @@ from src.core.spider_management.orm import (
     SpiderRuntimeBinding,
     SpiderRuntimeDelivery,
     SpiderRuntimeOperation,
+    SpiderRuntimePlan,
     SpiderRuntimeScope,
 )
 from test_migrations import fresh_pg_db as _migration_fresh_pg_db
@@ -961,6 +963,7 @@ def test_main_real_engine_restores_then_receives_fill_through_injected_participa
     from src import main as main_module
     from src.core.engine import StrategyEngine
     from src.core.interfaces.exchange import ExchangeOrderEvent
+    from src.core.spider_management import runtime_owner as owner_module
 
     owner_logger = logging.getLogger("src.core.spider_management.runtime_owner")
     # Alembic fileConfig disables loggers imported before its migration fixture.
@@ -1195,7 +1198,15 @@ def test_main_real_engine_restores_then_receives_fill_through_injected_participa
         engine_instances.append(self)
 
     def capture_owned_restore(self):
-        original_owned_restore(self)
+        with monkeypatch.context() as bootstrap_guard:
+            bootstrap_guard.setattr(
+                owner_module,
+                "prepare_model_bootstrap",
+                lambda *_args, **_kwargs: pytest.fail(
+                    "owned startup must restore the saved checkpoint"
+                ),
+            )
+            original_owned_restore(self)
         events.append(("owned", self._startup_owned_strategy_ids))
 
     def capture_generic_restore(self):
@@ -2048,3 +2059,129 @@ def test_main_real_engine_restores_then_receives_fill_through_injected_participa
     assert readback["trading_ready"] is False
     assert owners[0].restore_owned_runtimes() == frozenset({scope.strategy_id})
     assert prepared.build_checkpoint_sha256 == initial["checkpoint_sha256"]
+
+
+def test_owner_readback_restores_checkpoint_without_model_bootstrap(
+    operation_pg, monkeypatch, caplog
+):
+    from src.core.spider_management import runtime_owner as owner_module
+
+    owner_logger = logging.getLogger("src.core.spider_management.runtime_owner")
+    monkeypatch.setattr(owner_logger, "disabled", False)
+    if caplog.handler not in owner_logger.handlers:
+        monkeypatch.setattr(owner_logger, "handlers", [*owner_logger.handlers, caplog.handler])
+
+    owner, scope, operation_id, _orders, prepared, initial, _confirmation, _source = (
+        _install_owner(operation_pg)
+    )
+    monkeypatch.setattr(
+        owner_module,
+        "prepare_model_bootstrap",
+        lambda *_args, **_kwargs: pytest.fail("restore must not bootstrap the source"),
+    )
+
+    assert owner.readback(scope, operation_id) is not None
+    assert owner.restore_owned_runtimes() == frozenset({scope.strategy_id})
+    assert owner.readback(scope, operation_id) is not None
+    assert prepared.build_checkpoint_sha256 == initial["checkpoint_sha256"]
+
+    with sessionmaker(operation_pg).begin() as session:
+        runtime = session.scalars(
+            select(SpiderRuntimeScope).where(
+                SpiderRuntimeScope.strategy_id == scope.strategy_id
+            )
+        ).one()
+        checkpoint = cast(dict[str, Any], decode_canonical(bytes(runtime.source_checkpoint)))
+        checkpoint["unexpected_field"] = True
+        corrupted = canonical_bytes(checkpoint)
+        corrupted_sha256 = sha256(corrupted).hexdigest()
+        plan = session.scalars(
+            select(SpiderRuntimePlan).where(
+                SpiderRuntimePlan.plan_id == runtime.initial_plan_id
+            )
+        ).one()
+        manifest = cast(dict[str, Any], decode_canonical(bytes(plan.manifest_payload)))
+        manifest["build_checkpoint_sha256"] = corrupted_sha256
+        cast(dict[str, Any], manifest["initial_manifest"])[
+            "build_checkpoint_sha256"
+        ] = corrupted_sha256
+        manifest_payload = canonical_bytes(manifest)
+        runtime.source_checkpoint = corrupted
+        runtime.source_checkpoint_sha256 = corrupted_sha256
+        plan.manifest_payload = manifest_payload
+        plan.manifest_sha256 = sha256(manifest_payload).hexdigest()
+
+    assert owner.readback(scope, operation_id) is None
+    with sessionmaker(operation_pg)() as session:
+        before_unavailable_restore = (
+            session.scalar(
+                select(func.count()).select_from(Order).where(
+                    Order.strategy_id == scope.strategy_id
+                )
+            ),
+            session.scalar(
+                select(func.count()).select_from(Trade).join(
+                    Order, Trade.order_id == Order.id
+                ).where(
+                    Order.strategy_id == scope.strategy_id
+                )
+            ),
+            session.scalar(
+                select(func.count()).select_from(SpiderControlReceipt).where(
+                    SpiderControlReceipt.strategy_id == scope.strategy_id
+                )
+            ),
+            session.execute(
+                select(
+                    SpiderRuntimeScope.control_mode,
+                    SpiderRuntimeScope.state_version,
+                    SpiderRuntimeScope.control_barrier_sequence,
+                    SpiderRuntimeScope.last_received_sequence,
+                    SpiderRuntimeScope.last_consumed_sequence,
+                ).where(SpiderRuntimeScope.strategy_id == scope.strategy_id)
+            ).one(),
+        )
+    with caplog.at_level("WARNING", logger="src.core.spider_management.runtime_owner"):
+        assert owner.restore_owned_runtimes() == frozenset({scope.strategy_id})
+    assert any("Spider owned runtime readback unavailable" in row.message for row in caplog.records)
+    with sessionmaker(operation_pg)() as session:
+        runtime = session.scalars(
+            select(SpiderRuntimeScope).where(
+                SpiderRuntimeScope.strategy_id == scope.strategy_id
+            )
+        ).one()
+        after_unavailable_restore = (
+            session.scalar(
+                select(func.count()).select_from(Order).where(
+                    Order.strategy_id == scope.strategy_id
+                )
+            ),
+            session.scalar(
+                select(func.count()).select_from(Trade).join(
+                    Order, Trade.order_id == Order.id
+                ).where(
+                    Order.strategy_id == scope.strategy_id
+                )
+            ),
+            session.scalar(
+                select(func.count()).select_from(SpiderControlReceipt).where(
+                    SpiderControlReceipt.strategy_id == scope.strategy_id
+                )
+            ),
+            session.execute(
+                select(
+                    SpiderRuntimeScope.control_mode,
+                    SpiderRuntimeScope.state_version,
+                    SpiderRuntimeScope.control_barrier_sequence,
+                    SpiderRuntimeScope.last_received_sequence,
+                    SpiderRuntimeScope.last_consumed_sequence,
+                ).where(SpiderRuntimeScope.strategy_id == scope.strategy_id)
+            ).one(),
+        )
+        assert runtime.current_operation_id == operation_id
+        assert after_unavailable_restore == before_unavailable_restore
+        assert session.scalar(
+            select(func.count()).select_from(SpiderRuntimeDelivery).where(
+                SpiderRuntimeDelivery.strategy_id == scope.strategy_id
+            )
+        ) == 0

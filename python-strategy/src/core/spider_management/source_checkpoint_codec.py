@@ -1,10 +1,10 @@
 """Private canonical encoder for the existing Spider source checkpoint V1."""
 
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any, cast
 
 from src.core.backtest.spider_run_artifacts import canonical_bytes
-from src.core.backtest.spider_policy import DEFAULTS
+from src.core.backtest.spider_policy import DEFAULTS, Policy
 
 
 class ModelBootstrapUnavailable(ValueError):
@@ -170,3 +170,270 @@ def encode_source_checkpoint(
         "order_id": order_id,
     }
     return canonical_bytes(value)
+
+
+def _require(condition: bool) -> None:
+    if not condition:
+        raise ValueError("INVALID_SOURCE_CHECKPOINT")
+
+
+def _closed_object(value: object, keys: frozenset[str]) -> dict[str, object]:
+    _require(type(value) is dict and set(cast(dict[object, object], value)) == keys)
+    return cast(dict[str, object], value)
+
+
+def _int64(value: object) -> int:
+    _require(type(value) is int and -(2**63) <= cast(int, value) < 2**63)
+    return cast(int, value)
+
+
+def _decode_scalar(value: object) -> object:
+    _require(type(value) is dict)
+    row = cast(dict[str, object], value)
+    tag = row.get("tag")
+    if tag == "NULL":
+        _require(set(row) == {"tag"})
+        return None
+    if tag == "STRING":
+        _require(set(row) == {"tag", "value"} and type(row["value"]) is str)
+        return row["value"]
+    if tag == "DECIMAL":
+        text = row.get("value")
+        _require(set(row) == {"tag", "value"} and type(text) is str)
+        decimal_text = cast(str, text)
+        # The encoder always emits fixed-point text; reject exponent forms before
+        # rendering so a tiny payload cannot request an unbounded expansion.
+        _require("e" not in decimal_text.lower())
+        try:
+            number = Decimal(decimal_text)
+            from src.core.decimal_math import canonical_decimal_text
+
+            canonical = canonical_decimal_text(number)
+        except (InvalidOperation, ValueError):
+            raise ValueError("INVALID_SOURCE_CHECKPOINT") from None
+        _require(number.is_finite() and canonical == decimal_text)
+        return number
+    if tag == "INT64":
+        _require(set(row) == {"tag", "value"})
+        return _int64(row["value"])
+    if tag == "BOOL":
+        _require(set(row) == {"tag", "value"} and type(row["value"]) is bool)
+        return row["value"]
+    raise ValueError("INVALID_SOURCE_CHECKPOINT")
+
+
+def _boolean_scalar(value: object) -> bool:
+    decoded = _decode_scalar(value)
+    _require(type(decoded) is bool)
+    return cast(bool, decoded)
+
+
+def _decode_values(value: object, allowed: frozenset[str]) -> dict[str, object]:
+    _require(type(value) is list)
+    result: dict[str, object] = {}
+    for item in cast(list[object], value):
+        pair = _closed_object(item, frozenset({"key", "value"}))
+        key = pair["key"]
+        _require(type(key) is str and key in allowed and key not in result)
+        result[cast(str, key)] = _decode_scalar(pair["value"])
+    return result
+
+
+def restore_source_checkpoint(
+    raw: bytes,
+    *,
+    ordered_products: tuple[str, ...],
+    policy_id: str,
+    policy_version: str,
+    policy_source_sha256: str,
+    source_sha256: str,
+    confirmation_request_id: str,
+    configuration_sha256: str,
+    generation: int,
+) -> Policy:
+    """Reconstruct and byte-verify one saved V1 Policy without source activity."""
+    from src.core.backtest.spider_run_artifacts import decode_canonical
+
+    _require(
+        type(raw) is bytes
+        and type(ordered_products) is tuple
+        and bool(ordered_products)
+        and all(type(product) is str and bool(product) for product in ordered_products)
+        and len(set(ordered_products)) == len(ordered_products)
+        and type(policy_id) is str
+        and bool(policy_id)
+        and type(policy_version) is str
+        and bool(policy_version)
+        and all(
+            type(value) is str
+            and len(value) == 64
+            and all(char in "0123456789abcdef" for char in value)
+            for value in (
+                policy_source_sha256,
+                source_sha256,
+                confirmation_request_id,
+                configuration_sha256,
+            )
+        )
+        and type(generation) is int
+        and 1 <= generation < 2**63
+    )
+    try:
+        value = decode_canonical(raw)
+        envelope = _closed_object(
+            value,
+            frozenset(
+                {
+                    "schema_version", "policy_identity", "source_sha256",
+                    "effective_identity", "rows", "markets", "parameters",
+                    "capital", "replies", "running", "paused", "online",
+                    "ws_open", "now_ms", "shared_ms", "last_market_ms",
+                    "last_earn_ms", "last_capital", "reset_ms",
+                    "last_filled_price", "order_id",
+                }
+            ),
+        )
+        _require(envelope["schema_version"] == "SPIDER_SOURCE_CHECKPOINT_V1")
+        policy_identity = _closed_object(
+            envelope["policy_identity"],
+            frozenset({"policy_id", "policy_version", "policy_source_sha256"}),
+        )
+        effective_identity = _closed_object(
+            envelope["effective_identity"],
+            frozenset({"generation", "confirmation_request_id", "configuration_sha256"}),
+        )
+        _require(
+            policy_identity
+            == {
+                "policy_id": policy_id,
+                "policy_version": policy_version,
+                "policy_source_sha256": policy_source_sha256,
+            }
+            and envelope["source_sha256"] == source_sha256
+            and type(effective_identity["generation"]) is int
+            and effective_identity
+            == {
+                "generation": generation,
+                "confirmation_request_id": confirmation_request_id,
+                "configuration_sha256": configuration_sha256,
+            }
+        )
+
+        rows_value = envelope["rows"]
+        _require(type(rows_value) is list and len(cast(list[object], rows_value)) == len(ordered_products))
+        rows: list[dict[str, object]] = []
+        for product, row_value in zip(ordered_products, cast(list[object], rows_value), strict=True):
+            row = _closed_object(row_value, frozenset(_ROW_KEYS))
+            decoded_row = {key: _decode_scalar(row[key]) for key in _ROW_KEYS}
+            _require(decoded_row["name"] == product)
+            decoded_row["product_id"] = product
+            rows.append(decoded_row)
+
+        markets_value = envelope["markets"]
+        _require(
+            type(markets_value) is list
+            and len(cast(list[object], markets_value)) == len(ordered_products)
+        )
+        markets: dict[str, dict[str, object]] = {}
+        for product, market_value in zip(
+            ordered_products, cast(list[object], markets_value), strict=True
+        ):
+            market = _closed_object(market_value, frozenset({"product_id", "value"}))
+            _require(market["product_id"] == product)
+            values = _closed_object(market["value"], frozenset(_MARKET_KEYS))
+            markets[product] = {key: _decode_scalar(values[key]) for key in _MARKET_KEYS}
+
+        parameters_value = envelope["parameters"]
+        _require(
+            type(parameters_value) is list
+            and len(cast(list[object], parameters_value)) == len(DEFAULTS)
+        )
+        parameters: dict[str, object] = {}
+        for expected_key, pair_value in zip(DEFAULTS, cast(list[object], parameters_value), strict=True):
+            pair = _closed_object(pair_value, frozenset({"key", "value"}))
+            _require(pair["key"] == expected_key and expected_key not in parameters)
+            parameters[expected_key] = _decode_scalar(pair["value"])
+
+        capital = _decode_values(envelope["capital"], _CAPITAL_KEYS)
+        replies_value = envelope["replies"]
+        _require(type(replies_value) is list)
+        replies: dict[str, dict[str, object]] = {}
+        for reply_value in cast(list[object], replies_value):
+            reply = _closed_object(reply_value, frozenset({"alias", "value"}))
+            alias = reply["alias"]
+            _require(type(alias) is str and alias not in replies)
+            replies[cast(str, alias)] = _decode_values(reply["value"], _REPLY_KEYS)
+
+        flags = {
+            key: _boolean_scalar(envelope[key])
+            for key in ("running", "paused", "online", "ws_open")
+        }
+        now_ms = _int64(envelope["now_ms"])
+        shared_ms = _int64(envelope["shared_ms"])
+        last_market_ms = _int64(envelope["last_market_ms"])
+        last_earn_ms = _int64(envelope["last_earn_ms"])
+        last_capital = _decode_scalar(envelope["last_capital"])
+        _require(last_capital is None or type(last_capital) is Decimal)
+        order_id = envelope["order_id"]
+        _require(type(order_id) is int and 0 < cast(int, order_id) < 2**63)
+
+        reset_value = envelope["reset_ms"]
+        _require(type(reset_value) is list)
+        reset_ms: dict[str, int] = {}
+        for item in cast(list[object], reset_value):
+            reset = _closed_object(item, frozenset({"product_id", "value"}))
+            product = reset["product_id"]
+            _require(type(product) is str and product in ordered_products and product not in reset_ms)
+            reset_ms[cast(str, product)] = _int64(reset["value"])
+
+        last_filled_value = envelope["last_filled_price"]
+        _require(type(last_filled_value) is list)
+        last_filled_price: dict[str, dict[str, object]] = {}
+        for item in cast(list[object], last_filled_value):
+            prices = _closed_object(item, frozenset({"product_id", "buy", "sell"}))
+            product = prices["product_id"]
+            _require(
+                type(product) is str
+                and product in ordered_products
+                and product not in last_filled_price
+            )
+            buy = _decode_scalar(prices["buy"])
+            sell = _decode_scalar(prices["sell"])
+            _require(type(buy) is str and type(sell) is str)
+            last_filled_price[cast(str, product)] = {
+                "buy": buy,
+                "sell": sell,
+            }
+
+        policy = Policy(rows, markets, parameters, now_ms=now_ms)
+        policy.capital = capital
+        policy.replies = replies
+        policy.running = flags["running"]
+        policy.paused = flags["paused"]
+        policy.online = flags["online"]
+        policy.ws_open = flags["ws_open"]
+        policy.now_ms = now_ms
+        policy.shared_ms = shared_ms
+        policy.last_market_ms = last_market_ms
+        policy.last_earn_ms = last_earn_ms
+        policy.last_capital = cast(Decimal | None, last_capital)
+        policy.reset_ms = reset_ms
+        policy.last_filled_price = last_filled_price
+        policy.order_id = cast(int, order_id)
+        policy.events = []
+
+        if encode_source_checkpoint(
+            policy,
+            ordered_products=ordered_products,
+            policy_id=policy_id,
+            policy_version=policy_version,
+            policy_source_sha256=policy_source_sha256,
+            source_sha256=source_sha256,
+            confirmation_request_id=confirmation_request_id,
+            configuration_sha256=configuration_sha256,
+            generation=generation,
+        ) != raw:
+            raise ValueError("INVALID_SOURCE_CHECKPOINT")
+        return policy
+    except (KeyError, TypeError, ValueError, InvalidOperation, OverflowError, IndexError):
+        raise ValueError("INVALID_SOURCE_CHECKPOINT") from None
