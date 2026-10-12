@@ -36,7 +36,13 @@ from src.core.spider_management.model_bootstrap import (
     PreparedModelBootstrap,
     prepare_model_bootstrap,
 )
-from src.core.spider_management.source_checkpoint_codec import restore_source_checkpoint
+from src.core.spider_management.source_checkpoint_codec import (
+    decode_source_market_observation,
+    replace_checkpoint_markets,
+    restore_source_checkpoint,
+    source_market_envelope_identity,
+    encode_source_checkpoint,
+)
 from src.core.spider_management.operation_request import SpiderOperationRequest
 from src.core.spider_management.operation_request_store import _mapping
 from src.core.spider_management.financial_delivery import (
@@ -117,6 +123,7 @@ class SpiderRuntimeComposition:
 
     owned_scopes: tuple[RuntimeScopeKey, ...]
     model_sources_by_confirmation: Mapping[str, ModelInstallSource]
+    register_market_source: Callable[[Callable[[bytes], CommandResult]], Callable[[], None]] | None = None
 
     def __post_init__(self) -> None:
         if type(self.owned_scopes) is not tuple or not self.owned_scopes:
@@ -125,6 +132,8 @@ class SpiderRuntimeComposition:
             raise ValueError("Spider composition strategy scopes must be unique")
         if not isinstance(self.model_sources_by_confirmation, Mapping):
             raise ValueError("Spider model sources must be an explicit mapping")
+        if self.register_market_source is not None and not callable(self.register_market_source):
+            raise ValueError("Spider market source registrar must be callable")
         object.__setattr__(
             self,
             "model_sources_by_confirmation",
@@ -239,6 +248,7 @@ class SpiderRuntimeOwner:
                         )
                     ).scalar_one_or_none()
                 self._drain_stopped_scope(scope)
+                self._drain_source_market_scope(scope)
                 if operation_id is not None and self.readback(scope, operation_id) is None:
                     logging.getLogger(__name__).warning(
                         "Spider owned runtime readback unavailable for %s",
@@ -278,6 +288,283 @@ class SpiderRuntimeOwner:
             logging.getLogger(__name__).exception(
                 "Spider STOP delivery observer could not drain committed facts"
             )
+
+    def receive_source_market(self, raw: bytes) -> CommandResult:
+        """Record one admitted MODEL market snapshot and consume only its next tape slot."""
+        identity = source_market_envelope_identity(raw)
+        if identity is None:
+            return self._source_market_result(None, "REJECTED", "SPIDER_SOURCE_MARKET_INVALID")
+        supplied_scope, snapshot_id = identity
+        scope = self._owned_scopes.get(supplied_scope["strategy_id"])
+        if scope is None or supplied_scope != _scope(scope):
+            return self._source_market_result(scope, "REJECTED", "SPIDER_SOURCE_MARKET_SCOPE_UNKNOWN")
+        if self._lifecycle_lock is None or self._order_event_lock is None:
+            return self._source_market_result(scope, "UNKNOWN", "SPIDER_SOURCE_MARKET_UNAVAILABLE")
+
+        status = "UNKNOWN"
+        reason = "SPIDER_SOURCE_MARKET_WRITE_UNKNOWN"
+        sequence: int | None = None
+        operation_id: str | None = None
+        try:
+            with self._lifecycle_lock(scope.strategy_id):
+                with cast(ContextManager[object], self._order_event_lock):
+                    status, reason, operation_id, sequence = self._record_source_market(
+                        scope, snapshot_id, raw
+                    )
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Spider market receipt write failed; proving the same snapshot identity"
+            )
+            proved = self._source_market_receipt_readback(scope, snapshot_id, raw)
+            if proved is None:
+                return self._source_market_result(
+                    scope, "UNKNOWN", "SPIDER_SOURCE_MARKET_WRITE_UNKNOWN"
+                )
+            operation_id = cast(str, proved["operation_id"])
+            sequence = cast(int, proved["sequence"])
+            readback = self.readback(scope, operation_id)
+            if (
+                readback is None
+                or cast(int, readback["received_sequence"]) < sequence
+            ):
+                return self._source_market_result(
+                    scope,
+                    "UNKNOWN",
+                    "SPIDER_SOURCE_MARKET_READBACK_UNKNOWN",
+                    operation_id=operation_id,
+                    sequence=sequence,
+                )
+            return self._source_market_result(
+                scope,
+                "ACCEPTED",
+                "SPIDER_SOURCE_MARKET_COMMIT_PROVED",
+                operation_id=operation_id,
+                sequence=sequence,
+                receipt_disposition=cast(str, proved["disposition"]),
+                checkpoint_sha256=cast(str, proved["checkpoint_sha256"]),
+            )
+
+        if status in {"RECORDED", "DUPLICATE"}:
+            self._drain_stopped_scope(scope)
+            self._drain_source_market_scope(scope)
+            proved = self._source_market_receipt_readback(scope, snapshot_id, raw)
+            if (
+                proved is None
+                or self.readback(scope, cast(str, proved["operation_id"])) is None
+            ):
+                return self._source_market_result(
+                    scope, "UNKNOWN", "SPIDER_SOURCE_MARKET_READBACK_UNKNOWN",
+                    operation_id=operation_id, sequence=sequence,
+                )
+            return self._source_market_result(
+                scope,
+                "ACCEPTED" if status == "RECORDED" else "DUPLICATE",
+                "SPIDER_SOURCE_MARKET_RECORDED" if status == "RECORDED"
+                else "SPIDER_SOURCE_MARKET_DUPLICATE",
+                operation_id=cast(str, proved["operation_id"]),
+                sequence=cast(int, proved["sequence"]),
+                receipt_disposition=cast(str, proved["disposition"]),
+                checkpoint_sha256=cast(str, proved["checkpoint_sha256"]),
+            )
+        return self._source_market_result(
+            scope, status, reason, operation_id=operation_id, sequence=sequence
+        )
+
+    @staticmethod
+    def _source_market_result(
+        scope: RuntimeScopeKey | None,
+        disposition: str,
+        reason: str,
+        *,
+        operation_id: str | None = None,
+        sequence: int | None = None,
+        receipt_disposition: str | None = None,
+        checkpoint_sha256: str | None = None,
+    ) -> CommandResult:
+        data = {
+            "scope": None if scope is None else _scope(scope),
+            "disposition": disposition,
+            "operation_id": operation_id,
+            "reason_code": reason,
+            "delivery_sequence": sequence,
+            "delivery_disposition": receipt_disposition,
+            "checkpoint_sha256": checkpoint_sha256,
+        }
+        return CommandResult(
+            success=disposition in {"ACCEPTED", "DUPLICATE"},
+            message=reason,
+            data=data,
+            completed=disposition in {"REJECTED", "CONFLICT"},
+        )
+
+    def _record_source_market(
+        self, scope: RuntimeScopeKey, snapshot_id: str, raw: bytes
+    ) -> tuple[str, str, str | None, int | None]:
+        with self._sessions() as session:
+            if (
+                not isinstance(session, Session)
+                or session.in_transaction()
+                or not session.is_active
+                or session.get_bind().dialect.name != "postgresql"
+            ):
+                return "REJECTED", "SPIDER_SOURCE_MARKET_SESSION_UNAVAILABLE", None, None
+            with session.begin():
+                self._configure_writer(session)
+                runtime = session.execute(
+                    select(SpiderRuntimeScope).where(
+                        SpiderRuntimeScope.environment == scope.environment,
+                        SpiderRuntimeScope.execution_scope_id == scope.execution_scope_id,
+                        SpiderRuntimeScope.strategy_id == scope.strategy_id,
+                    ).with_for_update()
+                ).scalar_one_or_none()
+                if runtime is None or runtime.current_operation_id is None:
+                    return "REJECTED", "SPIDER_SOURCE_MARKET_RUNTIME_UNAVAILABLE", None, None
+                operation_id = runtime.current_operation_id
+                plan = session.execute(
+                    select(SpiderRuntimePlan).where(
+                        SpiderRuntimePlan.plan_id == runtime.initial_plan_id,
+                        SpiderRuntimePlan.operation_id == operation_id,
+                    )
+                ).scalar_one_or_none()
+                if (
+                    plan is None
+                    or plan.plan_status not in {"INCOMPLETE", "COMPLETE"}
+                    or plan.generation != runtime.generation
+                    or plan.configuration_sha256 != runtime.configuration_sha256
+                ):
+                    return "REJECTED", "SPIDER_SOURCE_MARKET_INSTALL_UNAVAILABLE", operation_id, None
+                existing = session.execute(
+                    select(SpiderRuntimeDelivery).where(
+                        SpiderRuntimeDelivery.environment == scope.environment,
+                        SpiderRuntimeDelivery.execution_scope_id == scope.execution_scope_id,
+                        SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                        SpiderRuntimeDelivery.delivery_id == snapshot_id,
+                    )
+                ).scalar_one_or_none()
+                if existing is not None:
+                    if (
+                        existing.kind == "SOURCE_MARKET"
+                        and existing.source_payload == raw
+                        and existing.content_sha256 == _digest_bytes(raw)
+                    ):
+                        return "DUPLICATE", "SPIDER_SOURCE_MARKET_DUPLICATE", operation_id, existing.sequence
+                    return "CONFLICT", "SPIDER_SOURCE_MARKET_ID_CONFLICT", operation_id, None
+                if self._refresh_initial_place_projection(
+                    session, scope, runtime, plan, persist=False
+                ) is None:
+                    return "REJECTED", "SPIDER_SOURCE_MARKET_INSTALL_UNAVAILABLE", operation_id, None
+                products, evidence_sha256, _source_sha256 = self._source_market_basis(plan)
+                try:
+                    observation = decode_source_market_observation(
+                        raw,
+                        scope=_scope(scope),
+                        generation=runtime.generation,
+                        confirmation_request_id=runtime.confirmation_request_id,
+                        configuration_sha256=runtime.configuration_sha256,
+                        evidence_sha256=evidence_sha256,
+                        ordered_products=products,
+                        build_checkpoint_bytes=plan.original_build_checkpoint,
+                    )
+                except ValueError:
+                    return "REJECTED", "SPIDER_SOURCE_MARKET_INVALID", operation_id, None
+                if observation.snapshot_id != snapshot_id:
+                    return "REJECTED", "SPIDER_SOURCE_MARKET_ID_INVALID", operation_id, None
+                if runtime.last_tape_sequence < runtime.last_received_sequence:
+                    return "REJECTED", "SPIDER_SOURCE_MARKET_FRONTIER_INVALID", operation_id, None
+                sequence = runtime.last_received_sequence + 1
+                tape_ordinal = runtime.last_tape_sequence + 1
+                if not 1 <= sequence < 2**63 or not 1 <= tape_ordinal < 2**63:
+                    return "REJECTED", "SPIDER_SOURCE_MARKET_FRONTIER_EXHAUSTED", operation_id, None
+                runtime.last_received_sequence = sequence
+                runtime.last_tape_sequence = tape_ordinal
+                session.add(SpiderRuntimeDelivery(
+                    environment=scope.environment,
+                    execution_scope_id=scope.execution_scope_id,
+                    strategy_id=scope.strategy_id,
+                    sequence=sequence,
+                    delivery_id=snapshot_id,
+                    content_sha256=_digest_bytes(raw),
+                    kind="SOURCE_MARKET",
+                    local_order_id=None,
+                    trade_id=None,
+                    action_id=None,
+                    generation=runtime.generation,
+                    configuration_sha256=runtime.configuration_sha256,
+                    role=None,
+                    source_payload=raw,
+                    visible_at=session.execute(
+                        select(func.date_trunc("milliseconds", func.clock_timestamp()))
+                    ).scalar_one(),
+                    elapsed_ms=None,
+                    disposition="PENDING",
+                    suppression_reason=None,
+                ))
+                session.add(SpiderRuntimeTapeIndex(
+                    environment=scope.environment,
+                    execution_scope_id=scope.execution_scope_id,
+                    strategy_id=scope.strategy_id,
+                    ordinal=tape_ordinal,
+                    kind="DELIVERY",
+                    delivery_sequence=sequence,
+                    transmission_group_id=None,
+                ))
+                session.flush()
+                return "RECORDED", "SPIDER_SOURCE_MARKET_RECEIVED", operation_id, sequence
+
+    def _source_market_receipt_readback(
+        self, scope: RuntimeScopeKey, snapshot_id: str, raw: bytes
+    ) -> dict[str, object] | None:
+        try:
+            with self._sessions() as session:
+                if (
+                    not isinstance(session, Session)
+                    or session.in_transaction()
+                    or not session.is_active
+                    or session.get_bind().dialect.name != "postgresql"
+                ):
+                    return None
+                with session.begin():
+                    session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY"))
+                    self._configure_writer(session)
+                    row = session.execute(
+                        select(SpiderRuntimeDelivery).where(
+                            SpiderRuntimeDelivery.environment == scope.environment,
+                            SpiderRuntimeDelivery.execution_scope_id == scope.execution_scope_id,
+                            SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                            SpiderRuntimeDelivery.delivery_id == snapshot_id,
+                        )
+                    ).scalar_one_or_none()
+                    runtime = session.execute(
+                        select(SpiderRuntimeScope).where(
+                            SpiderRuntimeScope.environment == scope.environment,
+                            SpiderRuntimeScope.execution_scope_id == scope.execution_scope_id,
+                            SpiderRuntimeScope.strategy_id == scope.strategy_id,
+                        )
+                    ).scalar_one_or_none()
+                    if (
+                        row is None or runtime is None
+                        or row.kind != "SOURCE_MARKET"
+                        or row.source_payload != raw
+                        or row.content_sha256 != _digest_bytes(raw)
+                        or row.delivery_id != snapshot_id
+                        or row.action_id is not None or row.local_order_id is not None
+                        or row.trade_id is not None or row.role is not None
+                        or row.generation != runtime.generation
+                        or row.configuration_sha256 != runtime.configuration_sha256
+                        or not validate_tape_index(session, runtime)
+                    ):
+                        return None
+                    operation_id = runtime.current_operation_id
+                    if operation_id is None:
+                        return None
+                    return {
+                        "operation_id": operation_id,
+                        "sequence": row.sequence,
+                        "disposition": row.disposition,
+                        "checkpoint_sha256": runtime.source_checkpoint_sha256,
+                    }
+        except Exception:
+            return None
 
     def transmit_initial_place_group(
         self,
@@ -834,6 +1121,217 @@ class SpiderRuntimeOwner:
             logging.getLogger(__name__).exception(
                 "Spider STOP backlog restoration unavailable for %s", scope.strategy_id
             )
+
+    def _drain_source_market_scope(self, scope: RuntimeScopeKey) -> None:
+        """Drain only a finite, contiguous RUN prefix of source-market rows."""
+        try:
+            with self._sessions() as session:
+                if (
+                    not isinstance(session, Session)
+                    or session.in_transaction()
+                    or not session.is_active
+                    or session.get_bind().dialect.name != "postgresql"
+                ):
+                    return
+                snapshot = session.execute(
+                    select(
+                        SpiderRuntimeScope.current_operation_id,
+                        SpiderRuntimeScope.control_mode,
+                        SpiderRuntimeScope.last_consumed_sequence,
+                        SpiderRuntimeScope.last_received_sequence,
+                    ).where(
+                        SpiderRuntimeScope.environment == scope.environment,
+                        SpiderRuntimeScope.execution_scope_id == scope.execution_scope_id,
+                        SpiderRuntimeScope.strategy_id == scope.strategy_id,
+                    )
+                ).one_or_none()
+            if snapshot is None:
+                return
+            operation_id, control_mode, consumed, frontier = snapshot
+            if (
+                type(operation_id) is not str
+                or control_mode != "RUN"
+                or type(consumed) is not int
+                or type(frontier) is not int
+                or consumed >= frontier
+            ):
+                return
+            for sequence in range(consumed + 1, frontier + 1):
+                if self._lifecycle_lock is None or self._order_event_lock is None:
+                    self._warn_source_market_unavailable(scope, sequence, "LOCK_UNAVAILABLE")
+                    return
+                with self._lifecycle_lock(scope.strategy_id):
+                    with cast(ContextManager[object], self._order_event_lock):
+                        outcome = self._consume_source_market(scope, cast(str, operation_id), sequence)
+                if outcome == "BLOCKED":
+                    return
+                if outcome != "CONSUMED":
+                    self._warn_source_market_unavailable(
+                        scope, sequence, "SOURCE_MARKET_CONSUMPTION_UNAVAILABLE"
+                    )
+                    return
+                readback = self.readback(scope, cast(str, operation_id))
+                if (
+                    readback is None
+                    or readback.get("consumed_sequence") != sequence
+                ):
+                    self._warn_source_market_unavailable(
+                        scope, sequence, "SOURCE_MARKET_COMMIT_UNPROVED"
+                    )
+                    return
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Spider source-market backlog could not be consumed for %s",
+                scope.strategy_id,
+            )
+
+    @staticmethod
+    def _warn_source_market_unavailable(
+        scope: RuntimeScopeKey, sequence: int, reason: str
+    ) -> None:
+        logging.getLogger(__name__).warning(
+            "SPIDER_SOURCE_MARKET_UNAVAILABLE strategy=%s sequence=%s reason=%s",
+            scope.strategy_id,
+            sequence,
+            reason,
+        )
+
+    def _consume_source_market(
+        self, scope: RuntimeScopeKey, operation_id: str, sequence: int
+    ) -> str:
+        try:
+            with self._sessions() as session:
+                if (
+                    not isinstance(session, Session)
+                    or session.in_transaction()
+                    or not session.is_active
+                    or session.get_bind().dialect.name != "postgresql"
+                ):
+                    return "UNAVAILABLE"
+                with session.begin():
+                    self._configure_writer(session)
+                    runtime = session.execute(
+                        select(SpiderRuntimeScope).where(
+                            SpiderRuntimeScope.environment == scope.environment,
+                            SpiderRuntimeScope.execution_scope_id == scope.execution_scope_id,
+                            SpiderRuntimeScope.strategy_id == scope.strategy_id,
+                        ).with_for_update()
+                    ).scalar_one_or_none()
+                    if (
+                        runtime is None
+                        or runtime.current_operation_id != operation_id
+                        or runtime.control_mode != "RUN"
+                        or runtime.last_consumed_sequence != sequence - 1
+                        or runtime.last_received_sequence < sequence
+                    ):
+                        return "BLOCKED"
+                    delivery = session.execute(
+                        select(SpiderRuntimeDelivery).where(
+                            SpiderRuntimeDelivery.environment == scope.environment,
+                            SpiderRuntimeDelivery.execution_scope_id == scope.execution_scope_id,
+                            SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                            SpiderRuntimeDelivery.sequence == sequence,
+                        ).with_for_update()
+                    ).scalar_one_or_none()
+                    if delivery is None or delivery.kind != "SOURCE_MARKET":
+                        # A financial fact is never skipped by this source-only consumer.
+                        return "BLOCKED"
+                    if (
+                        delivery.disposition != "PENDING"
+                        or delivery.suppression_reason is not None
+                        or delivery.generation != runtime.generation
+                        or delivery.configuration_sha256 != runtime.configuration_sha256
+                    ):
+                        return "UNAVAILABLE"
+                    plan = session.execute(
+                        select(SpiderRuntimePlan).where(
+                            SpiderRuntimePlan.plan_id == runtime.initial_plan_id,
+                            SpiderRuntimePlan.operation_id == operation_id,
+                        ).with_for_update()
+                    ).scalar_one_or_none()
+                    if plan is None:
+                        return "UNAVAILABLE"
+                    if self._refresh_initial_place_projection(
+                        session, scope, runtime, plan, persist=False
+                    ) is None:
+                        return "UNAVAILABLE"
+                    products, evidence_sha256, source_sha256 = self._source_market_basis(plan)
+                    observation = decode_source_market_observation(
+                        bytes(delivery.source_payload),
+                        scope=_scope(scope),
+                        generation=runtime.generation,
+                        confirmation_request_id=runtime.confirmation_request_id,
+                        configuration_sha256=runtime.configuration_sha256,
+                        evidence_sha256=evidence_sha256,
+                        ordered_products=products,
+                        build_checkpoint_bytes=plan.original_build_checkpoint,
+                    )
+                    if (
+                        delivery.delivery_id != observation.snapshot_id
+                        or delivery.content_sha256 != _digest_bytes(bytes(delivery.source_payload))
+                    ):
+                        return "UNAVAILABLE"
+                    policy = restore_source_checkpoint(
+                        bytes(runtime.source_checkpoint),
+                        ordered_products=products,
+                        policy_id=ORIGINAL_MODEL_POLICY_ID,
+                        policy_version=ORIGINAL_MODEL_POLICY_VERSION,
+                        policy_source_sha256=ORIGINAL_MODEL_POLICY_SOURCE_SHA256,
+                        source_sha256=source_sha256,
+                        confirmation_request_id=runtime.confirmation_request_id,
+                        configuration_sha256=runtime.configuration_sha256,
+                        generation=runtime.generation,
+                    )
+                    policy.apply_market(observation.markets)
+                    updated = encode_source_checkpoint(
+                        policy,
+                        ordered_products=products,
+                        policy_id=ORIGINAL_MODEL_POLICY_ID,
+                        policy_version=ORIGINAL_MODEL_POLICY_VERSION,
+                        policy_source_sha256=ORIGINAL_MODEL_POLICY_SOURCE_SHA256,
+                        source_sha256=source_sha256,
+                        confirmation_request_id=runtime.confirmation_request_id,
+                        configuration_sha256=runtime.configuration_sha256,
+                        generation=runtime.generation,
+                    )
+                    if updated != replace_checkpoint_markets(
+                        bytes(runtime.source_checkpoint),
+                        ordered_products=products,
+                        markets=observation.markets,
+                    ):
+                        return "UNAVAILABLE"
+                    runtime.source_checkpoint = updated
+                    runtime.source_checkpoint_sha256 = _digest_bytes(updated)
+                    delivery.disposition = "CONSUMED"
+                    runtime.last_consumed_sequence = sequence
+                    session.flush()
+            return "CONSUMED"
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Spider source-market transaction failed for %s sequence %s",
+                scope.strategy_id,
+                sequence,
+            )
+            return "UNAVAILABLE"
+
+    @staticmethod
+    def _source_market_basis(plan: SpiderRuntimePlan) -> tuple[tuple[str, ...], str, str]:
+        manifest = cast(dict[str, object], decode_canonical(plan.manifest_payload))
+        initial_manifest = cast(dict[str, object], manifest["initial_manifest"])
+        product_map = cast(dict[str, object], manifest["source_product_map"])
+        provenance = cast(dict[str, object], initial_manifest["historical_provenance"])
+        products_value = product_map["ordered_products"]
+        evidence_sha256 = initial_manifest["historical_input_artifact_sha256"]
+        source_sha256 = provenance["source_sha256"]
+        if (
+            type(products_value) is not list
+            or not products_value
+            or any(type(item) is not str or not item for item in products_value)
+            or type(evidence_sha256) is not str
+            or type(source_sha256) is not str
+        ):
+            raise ValueError("SPIDER_SOURCE_MARKET_BASIS_UNAVAILABLE")
+        return tuple(cast(list[str], products_value)), evidence_sha256, source_sha256
 
     def handle_owned_command(self, message: dict) -> CommandResult | None:
         if type(message) is not dict:
@@ -1464,6 +1962,8 @@ class SpiderRuntimeOwner:
             generation=generation,
             configuration_sha256=configuration_sha256,
             source_checkpoint_sha256=prepared.source_checkpoint_sha256,
+            original_build_checkpoint=prepared.build_checkpoint_bytes,
+            original_build_checkpoint_sha256=prepared.build_checkpoint_sha256,
             specification_sha256=prepared.specification_sha256,
             observed_input_sha256=prepared.historical_input_sha256,
             tape_cursor=prepared.tape_cursor,
@@ -1553,12 +2053,33 @@ class SpiderRuntimeOwner:
                         len(scoped_receipts) != runtime.last_received_sequence
                         or any(
                             row.sequence != index
-                            or row.local_order_id not in plan_order_ids
+                            or row.generation != runtime.generation
+                            or row.configuration_sha256 != runtime.configuration_sha256
+                            or (
+                                row.kind != "SOURCE_MARKET"
+                                and row.local_order_id not in plan_order_ids
+                            )
+                            or (
+                                row.kind == "SOURCE_MARKET"
+                                and (
+                                    row.local_order_id is not None
+                                    or row.action_id is not None
+                                    or row.role is not None
+                                    or row.trade_id is not None
+                                    or type(row.source_payload) is not bytes
+                                    or _digest_bytes(row.source_payload) != row.content_sha256
+                                )
+                            )
                             or (
                                 index <= runtime.last_consumed_sequence
-                                and (
-                                    row.disposition != "SUPPRESSED"
-                                    or row.suppression_reason != "STOP_CONTROL"
+                                and not (
+                                    row.kind == "SOURCE_MARKET"
+                                    and row.disposition == "CONSUMED"
+                                    and row.suppression_reason is None
+                                )
+                                and not (
+                                    row.disposition == "SUPPRESSED"
+                                    and row.suppression_reason == "STOP_CONTROL"
                                 )
                             )
                             or (
@@ -1570,9 +2091,6 @@ class SpiderRuntimeOwner:
                     ):
                         return None
                     if (
-                        runtime.last_consumed_sequence > 0
-                        and runtime.control_mode != "STOP"
-                    ) or (
                         runtime.control_mode == "STOP"
                         and self._current_stop_proof(session, scope, runtime) is None
                     ):
@@ -1767,9 +2285,13 @@ class SpiderRuntimeOwner:
                 or manifest.get("confirmation_request_id") != runtime.confirmation_request_id
                 or manifest.get("configuration_sha256") != runtime.configuration_sha256
                 or manifest.get("generation") != runtime.generation
-                or manifest.get("build_checkpoint_sha256") != runtime.source_checkpoint_sha256
+                or manifest.get("build_checkpoint_sha256")
+                != plan.original_build_checkpoint_sha256
                 or initial_manifest.get("build_checkpoint_sha256")
-                != runtime.source_checkpoint_sha256
+                != plan.original_build_checkpoint_sha256
+                or type(plan.original_build_checkpoint) is not bytes
+                or _digest_bytes(plan.original_build_checkpoint)
+                != plan.original_build_checkpoint_sha256
                 or type(manifest.get("bootstrap_digest")) is not str
                 or manifest.get("bootstrap_digest") != _digest(bootstrap)
                 or initial_manifest.get("bootstrap_basis_sha256")
@@ -2005,7 +2527,7 @@ class SpiderRuntimeOwner:
                 ):
                     return False
             restore_source_checkpoint(
-                runtime.source_checkpoint,
+                plan.original_build_checkpoint,
                 ordered_products=tuple(ordered_products),
                 policy_id=ORIGINAL_MODEL_POLICY_ID,
                 policy_version=ORIGINAL_MODEL_POLICY_VERSION,
@@ -2015,6 +2537,98 @@ class SpiderRuntimeOwner:
                 configuration_sha256=runtime.configuration_sha256,
                 generation=runtime.generation,
             )
+            deliveries = session.execute(
+                select(SpiderRuntimeDelivery).where(
+                    SpiderRuntimeDelivery.environment == scope.environment,
+                    SpiderRuntimeDelivery.execution_scope_id == scope.execution_scope_id,
+                    SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                ).order_by(SpiderRuntimeDelivery.sequence)
+            ).scalars().all()
+            expected_checkpoint = plan.original_build_checkpoint
+            seen_market_ids: set[str] = set()
+            has_stop_suppression = False
+            evidence_sha256 = initial_manifest.get("historical_input_artifact_sha256")
+            if type(evidence_sha256) is not str:
+                return False
+            for sequence, delivery in enumerate(deliveries, 1):
+                if (
+                    delivery.sequence != sequence
+                    or (delivery.environment, delivery.execution_scope_id, delivery.strategy_id)
+                    != (scope.environment, scope.execution_scope_id, scope.strategy_id)
+                    or delivery.generation != runtime.generation
+                    or delivery.configuration_sha256 != runtime.configuration_sha256
+                    or type(delivery.source_payload) is not bytes
+                    or _digest_bytes(delivery.source_payload) != delivery.content_sha256
+                ):
+                    return False
+                stopped = (
+                    delivery.disposition == "SUPPRESSED"
+                    and delivery.suppression_reason == "STOP_CONTROL"
+                )
+                if sequence <= runtime.last_consumed_sequence:
+                    consumed_source = (
+                        delivery.kind == "SOURCE_MARKET"
+                        and delivery.disposition == "CONSUMED"
+                        and delivery.suppression_reason is None
+                    )
+                    if not (consumed_source or stopped):
+                        return False
+                elif delivery.disposition != "PENDING" or delivery.suppression_reason is not None:
+                    return False
+                if stopped:
+                    has_stop_suppression = True
+                if delivery.kind == "SOURCE_MARKET":
+                    if (
+                        delivery.local_order_id is not None
+                        or delivery.trade_id is not None
+                        or delivery.action_id is not None
+                        or delivery.role is not None
+                    ):
+                        return False
+                    observation = decode_source_market_observation(
+                        delivery.source_payload,
+                        scope=_scope(scope),
+                        generation=runtime.generation,
+                        confirmation_request_id=runtime.confirmation_request_id,
+                        configuration_sha256=runtime.configuration_sha256,
+                        evidence_sha256=evidence_sha256,
+                        ordered_products=tuple(ordered_products),
+                        build_checkpoint_bytes=plan.original_build_checkpoint,
+                    )
+                    if (
+                        delivery.delivery_id != observation.snapshot_id
+                        or observation.snapshot_id in seen_market_ids
+                    ):
+                        return False
+                    seen_market_ids.add(observation.snapshot_id)
+                    if delivery.disposition == "CONSUMED":
+                        expected_checkpoint = replace_checkpoint_markets(
+                            expected_checkpoint,
+                            ordered_products=tuple(ordered_products),
+                            markets=observation.markets,
+                        )
+                    elif delivery.disposition == "SUPPRESSED":
+                        if delivery.suppression_reason != "STOP_CONTROL":
+                            return False
+                    elif delivery.disposition != "PENDING":
+                        return False
+                elif delivery.kind in {"FILL", "ORDER_STATE"}:
+                    if (
+                        delivery.local_order_id not in {order.id for _action, _binding, order in identity_rows}
+                        or delivery.action_id is None
+                        or delivery.role != "GRID"
+                        or delivery.disposition == "CONSUMED"
+                    ):
+                        return False
+                else:
+                    return False
+            if has_stop_suppression and self._current_stop_proof(session, scope, runtime) is None:
+                return False
+            if (
+                expected_checkpoint != runtime.source_checkpoint
+                or _digest_bytes(expected_checkpoint) != runtime.source_checkpoint_sha256
+            ):
+                return False
         except (InvalidOperation, KeyError, TypeError, ValueError, UnicodeDecodeError):
             return False
         return True

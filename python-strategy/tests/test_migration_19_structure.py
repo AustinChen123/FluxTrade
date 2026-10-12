@@ -44,7 +44,7 @@ def test_head_marker_guards_and_downgrade():
     config = Config(str(ROOT / "alembic.ini"))
     config.set_main_option("script_location", str(ROOT / "alembic"))
     script = ScriptDirectory.from_config(config)
-    assert script.get_heads() == ["c3f8d1a904b7"]
+    assert script.get_heads() == ["d8a61c3f9b42"]
     revision = script.get_revision(REVISION)
     assert revision is not None and revision.down_revision == "8e4b2c91a6d0"
     up = sql("upgrade")

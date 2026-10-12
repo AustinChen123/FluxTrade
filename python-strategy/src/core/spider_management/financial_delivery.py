@@ -382,6 +382,7 @@ def validate_tape_index(session: Session, runtime: SpiderRuntimeScope) -> bool:
         return False
     seen_deliveries: set[int] = set()
     seen_transmissions: set[str] = set()
+    next_delivery_sequence = 1
     for ordinal, row in enumerate(tape_rows, 1):
         if row["ordinal"] != ordinal:
             return False
@@ -392,9 +393,11 @@ def validate_tape_index(session: Session, runtime: SpiderRuntimeScope) -> bool:
                 or row["transmission_group_id"] is not None
                 or not 1 <= sequence <= runtime.last_received_sequence
                 or sequence in seen_deliveries
+                or sequence != next_delivery_sequence
             ):
                 return False
             seen_deliveries.add(sequence)
+            next_delivery_sequence += 1
         elif row["kind"] == "SEND_MARKER":
             group_id = row["transmission_group_id"]
             if (

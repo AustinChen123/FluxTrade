@@ -40,7 +40,7 @@ def test_head_and_guard_exact_scope():
     config = Config()
     config.set_main_option("script_location", str(ROOT))
     script = ScriptDirectory.from_config(config)
-    assert script.get_heads() == ["c3f8d1a904b7"]
+    assert script.get_heads() == ["d8a61c3f9b42"]
     revision = script.get_revision(REVISION)
     assert revision and revision.down_revision == "7d3a9c02e5f8"
     assert re.fullmatch("[0-9a-f]{12}", REVISION)

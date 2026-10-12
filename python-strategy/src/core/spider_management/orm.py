@@ -294,6 +294,8 @@ class SpiderRuntimePlan(Base):
     generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
     configuration_sha256: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
     source_checkpoint_sha256: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    original_build_checkpoint: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    original_build_checkpoint_sha256: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
     specification_sha256: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
     observed_input_sha256: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
     tape_cursor: Mapped[str] = mapped_column(String(256, collation="C"), nullable=False)
@@ -316,6 +318,8 @@ class SpiderRuntimePlan(Base):
         CheckConstraint("generation > 0", name="ck_spider_runtime_plan_generation"),
         CheckConstraint("configuration_sha256 COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_runtime_plan_configuration_hash"),
         CheckConstraint("source_checkpoint_sha256 COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_runtime_plan_source_hash"),
+        CheckConstraint("octet_length(original_build_checkpoint) BETWEEN 1 AND 1048576", name="ck_spider_runtime_plan_build_checkpoint"),
+        CheckConstraint("original_build_checkpoint_sha256 COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_runtime_plan_build_checkpoint_hash"),
         CheckConstraint("specification_sha256 COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_runtime_plan_specification_hash"),
         CheckConstraint("observed_input_sha256 COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_runtime_plan_observed_hash"),
         CheckConstraint("octet_length(manifest_payload) BETWEEN 1 AND 1048576", name="ck_spider_runtime_plan_manifest"),
@@ -410,7 +414,7 @@ class SpiderRuntimeBinding(Base):
 
 
 class SpiderRuntimeDelivery(Base):
-    """Durable scoped financial receipt staged with its Order/Trade fact."""
+    """Durable scoped source or financial receipt in the shared runtime tape."""
 
     __tablename__ = "spider_runtime_delivery"
 
@@ -421,12 +425,12 @@ class SpiderRuntimeDelivery(Base):
     delivery_id: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
     content_sha256: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
     kind: Mapped[str] = mapped_column(String(32, collation="C"), nullable=False)
-    local_order_id: Mapped[str] = mapped_column(String(36, collation="C"), nullable=False)
+    local_order_id: Mapped[str | None] = mapped_column(String(36, collation="C"), nullable=True)
     trade_id: Mapped[str | None] = mapped_column(String(64, collation="C"), nullable=True)
-    action_id: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    action_id: Mapped[str | None] = mapped_column(String(64, collation="C"), nullable=True)
     generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
     configuration_sha256: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
-    role: Mapped[str] = mapped_column(String(32, collation="C"), nullable=False)
+    role: Mapped[str | None] = mapped_column(String(32, collation="C"), nullable=True)
     source_payload: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     visible_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), nullable=False)
     elapsed_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
@@ -453,7 +457,15 @@ class SpiderRuntimeDelivery(Base):
         CheckConstraint("content_sha256 COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_runtime_delivery_hash"),
         CheckConstraint("generation > 0", name="ck_spider_runtime_delivery_generation"),
         CheckConstraint("configuration_sha256 COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_runtime_delivery_configuration_hash"),
-        CheckConstraint("role COLLATE \"C\" = 'GRID'", name="ck_spider_runtime_delivery_role"),
+        CheckConstraint("kind IN ('FILL', 'ORDER_STATE', 'SOURCE_MARKET')", name="ck_spider_runtime_delivery_kind"),
+        CheckConstraint(
+            "(kind = 'SOURCE_MARKET' AND local_order_id IS NULL AND trade_id IS NULL "
+            "AND action_id IS NULL AND role IS NULL) OR "
+            "(kind IN ('FILL', 'ORDER_STATE') AND local_order_id IS NOT NULL "
+            "AND action_id IS NOT NULL AND role IS NOT NULL "
+            "AND role COLLATE \"C\" = 'GRID')",
+            name="ck_spider_runtime_delivery_kind_references",
+        ),
         CheckConstraint("octet_length(source_payload) BETWEEN 1 AND 1048576", name="ck_spider_runtime_delivery_payload"),
         CheckConstraint("visible_at >= TIMESTAMPTZ '0001-01-01 00:00:00+00' AND visible_at < TIMESTAMPTZ '10000-01-01 00:00:00+00' AND visible_at = date_trunc('milliseconds', visible_at)", name="ck_spider_runtime_delivery_visible_at"),
         CheckConstraint("elapsed_ms IS NULL OR elapsed_ms >= 0", name="ck_spider_runtime_delivery_elapsed"),

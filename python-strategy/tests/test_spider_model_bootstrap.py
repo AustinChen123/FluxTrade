@@ -22,6 +22,8 @@ from src.core.spider_management.model_bootstrap import (
     prepare_model_bootstrap,
 )
 from src.core.spider_management.source_checkpoint_codec import (
+    decode_source_market_observation,
+    replace_checkpoint_markets,
     restore_source_checkpoint,
 )
 from test_spider_historical_input import HASH, _policy_cache, _valid_run
@@ -220,10 +222,215 @@ def _restore_checkpoint(raw, run, prepared):
         policy_version=run.policy_version,
         policy_source_sha256=run.policy_source_sha256,
         source_sha256=prepared.historical_provenance["source_sha256"],
-        confirmation_request_id=prepared.runtime_selection["confirmation_request_id"],
-        configuration_sha256=prepared.runtime_selection["configuration_sha256"],
+        confirmation_request_id=cast(
+            str, prepared.runtime_selection["confirmation_request_id"]
+        ),
+        configuration_sha256=cast(
+            str, prepared.runtime_selection["configuration_sha256"]
+        ),
         generation=1,
     )
+
+
+def _source_market_payload(run, prepared, snapshot_id="a" * 64):
+    checkpoint = cast(
+        dict[str, object], decode_canonical(prepared.build_checkpoint_bytes)
+    )
+    original_markets = cast(list[dict[str, object]], checkpoint["markets"])
+    markets = []
+    for row in original_markets:
+        fields = cast(dict[str, object], row["value"])
+        updated = dict(fields)
+        updated["price"] = {"tag": "DECIMAL", "value": "12.5"}
+        updated["ratioHL"] = {"tag": "DECIMAL", "value": "0.75"}
+        markets.append({"product_id": row["product_id"], "value": updated})
+    return canonical_bytes({
+        "schema_version": "SPIDER_SOURCE_MARKET_V1",
+        "scope": {
+            "environment": "test",
+            "execution_scope_id": "spider-test",
+            "strategy_id": "spider-grid",
+        },
+        "effective_identity": {
+            "generation": 1,
+            "confirmation_request_id": prepared.runtime_selection["confirmation_request_id"],
+            "configuration_sha256": prepared.runtime_selection["configuration_sha256"],
+        },
+        "snapshot_id": snapshot_id,
+        "observed_at_ms": 1_800_000_000_000,
+        "snapshot_as_of_ms": 1_800_000_000_000,
+        "provenance": {
+            "kind": "MODEL",
+            "evidence_sha256": prepared.historical_input_artifact_sha256,
+        },
+        "markets": markets,
+    })
+
+
+def test_source_market_codec_replaces_only_decimal_observation_fields():
+    run = _admitted_run()
+    confirmation = _confirmation(run)
+    prepared = _prepare(run, _selection(run, confirmation), confirmation)
+    raw = _source_market_payload(run, prepared)
+    observation = decode_source_market_observation(
+        raw,
+        scope={
+            "environment": "test",
+            "execution_scope_id": "spider-test",
+            "strategy_id": "spider-grid",
+        },
+        generation=1,
+        confirmation_request_id=cast(
+            str, prepared.runtime_selection["confirmation_request_id"]
+        ),
+        configuration_sha256=cast(
+            str, prepared.runtime_selection["configuration_sha256"]
+        ),
+        evidence_sha256=prepared.historical_input_artifact_sha256,
+        ordered_products=run.ordered_products,
+        build_checkpoint_bytes=prepared.build_checkpoint_bytes,
+    )
+    assert tuple(observation.markets) == run.ordered_products
+    assert all(row["price"] == Decimal("12.5") for row in observation.markets.values())
+    assert all(row["ratioHL"] == Decimal("0.75") for row in observation.markets.values())
+
+    updated = replace_checkpoint_markets(
+        prepared.build_checkpoint_bytes,
+        ordered_products=run.ordered_products,
+        markets=observation.markets,
+    )
+    before = cast(dict[str, object], decode_canonical(prepared.build_checkpoint_bytes))
+    after = cast(dict[str, object], decode_canonical(updated))
+    assert after["markets"] != before["markets"]
+    assert {key: value for key, value in after.items() if key != "markets"} == {
+        key: value for key, value in before.items() if key != "markets"
+    }
+
+
+def test_source_market_codec_accepts_pre_epoch_utc_milliseconds():
+    run = _admitted_run()
+    confirmation = _confirmation(run)
+    prepared = _prepare(run, _selection(run, confirmation), confirmation)
+    value = cast(dict[str, object], decode_canonical(_source_market_payload(run, prepared)))
+    value["observed_at_ms"] = -1
+    value["snapshot_as_of_ms"] = -2
+    decoded = decode_source_market_observation(
+        canonical_bytes(value),
+        scope={
+            "environment": "test",
+            "execution_scope_id": "spider-test",
+            "strategy_id": "spider-grid",
+        },
+        generation=1,
+        confirmation_request_id=cast(
+            str, prepared.runtime_selection["confirmation_request_id"]
+        ),
+        configuration_sha256=cast(
+            str, prepared.runtime_selection["configuration_sha256"]
+        ),
+        evidence_sha256=prepared.historical_input_artifact_sha256,
+        ordered_products=run.ordered_products,
+        build_checkpoint_bytes=prepared.build_checkpoint_bytes,
+    )
+    assert decoded.observed_at_ms == -1
+    assert decoded.snapshot_as_of_ms == -2
+
+
+@pytest.mark.parametrize("mutation", ["bool", "float", "string", "zero", "wrong"])
+def test_source_market_codec_rejects_noncanonical_effective_generation(mutation):
+    run = _admitted_run()
+    confirmation = _confirmation(run)
+    prepared = _prepare(run, _selection(run, confirmation), confirmation)
+    value = cast(dict[str, object], decode_canonical(_source_market_payload(run, prepared)))
+    if mutation == "bool":
+        cast(dict[str, object], value["effective_identity"])["generation"] = True
+        raw = canonical_bytes(value)
+    elif mutation == "float":
+        raw = canonical_bytes(value).replace(b'"generation":1}', b'"generation":1.0}')
+        assert raw != canonical_bytes(value)
+    elif mutation == "string":
+        cast(dict[str, object], value["effective_identity"])["generation"] = "1"
+        raw = canonical_bytes(value)
+    elif mutation == "zero":
+        cast(dict[str, object], value["effective_identity"])["generation"] = 0
+        raw = canonical_bytes(value)
+    else:
+        cast(dict[str, object], value["effective_identity"])["generation"] = 2
+        raw = canonical_bytes(value)
+
+    with pytest.raises(ValueError, match="INVALID_SOURCE_MARKET"):
+        decode_source_market_observation(
+            raw,
+            scope={
+                "environment": "test",
+                "execution_scope_id": "spider-test",
+                "strategy_id": "spider-grid",
+            },
+            generation=1,
+            confirmation_request_id=cast(
+                str, prepared.runtime_selection["confirmation_request_id"]
+            ),
+            configuration_sha256=cast(
+                str, prepared.runtime_selection["configuration_sha256"]
+            ),
+            evidence_sha256=prepared.historical_input_artifact_sha256,
+            ordered_products=run.ordered_products,
+            build_checkpoint_bytes=prepared.build_checkpoint_bytes,
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "price_tag", "specification", "order", "scope", "provider_provenance",
+        "float_time", "before_datetime_year_one",
+    ],
+)
+def test_source_market_codec_rejects_unsupported_observation_cells(mutation):
+    run = _admitted_run()
+    confirmation = _confirmation(run)
+    prepared = _prepare(run, _selection(run, confirmation), confirmation)
+    raw_value = cast(dict[str, object], decode_canonical(_source_market_payload(run, prepared)))
+    if mutation == "price_tag":
+        market = cast(dict[str, object], cast(list[object], raw_value["markets"])[0])
+        cast(dict[str, object], market["value"])["price"] = {
+            "tag": "STRING", "value": "12.5"
+        }
+    elif mutation == "specification":
+        market = cast(dict[str, object], cast(list[object], raw_value["markets"])[0])
+        cast(dict[str, object], market["value"])["lotSz"] = {
+            "tag": "STRING", "value": "999"
+        }
+    elif mutation == "order":
+        cast(list[object], raw_value["markets"]).reverse()
+    elif mutation == "scope":
+        cast(dict[str, object], raw_value["scope"])["strategy_id"] = "other"
+    elif mutation == "provider_provenance":
+        cast(dict[str, object], raw_value["provenance"])["kind"] = "PROVIDER"
+    elif mutation == "before_datetime_year_one":
+        raw_value["observed_at_ms"] = -62_135_596_800_001
+        raw_value["snapshot_as_of_ms"] = -62_135_596_800_001
+    else:
+        raw_value["observed_at_ms"] = True
+    with pytest.raises(ValueError, match="INVALID_SOURCE_MARKET"):
+        decode_source_market_observation(
+            canonical_bytes(raw_value),
+            scope={
+                "environment": "test",
+                "execution_scope_id": "spider-test",
+                "strategy_id": "spider-grid",
+            },
+            generation=1,
+            confirmation_request_id=cast(
+                str, prepared.runtime_selection["confirmation_request_id"]
+            ),
+            configuration_sha256=cast(
+                str, prepared.runtime_selection["configuration_sha256"]
+            ),
+            evidence_sha256=prepared.historical_input_artifact_sha256,
+            ordered_products=run.ordered_products,
+            build_checkpoint_bytes=prepared.build_checkpoint_bytes,
+        )
 
 
 def _scalar_tags(value):

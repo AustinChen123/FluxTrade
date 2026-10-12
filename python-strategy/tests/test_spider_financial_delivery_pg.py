@@ -374,6 +374,7 @@ def test_execution_ack_fills_duplicate_and_cancel_share_actual_receipt_chain(
     state_ordinals: dict[str, list[int]] = {}
     for row in receipt_rows:
         if row.kind == "ORDER_STATE":
+            assert row.local_order_id is not None
             payload = cast(dict[str, Any], decode_canonical(bytes(row.source_payload)))
             state_ordinals.setdefault(row.local_order_id, []).append(
                 cast(int, payload["transition_ordinal"])

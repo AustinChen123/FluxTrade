@@ -32,7 +32,7 @@ def test_transport_tape_is_one_additive_head_with_deterministic_backfill():
     config = Config(str(ROOT / "alembic.ini"))
     config.set_main_option("script_location", str(ROOT / "alembic"))
     script = ScriptDirectory.from_config(config)
-    assert script.get_heads() == [REVISION]
+    assert script.get_heads() == ["d8a61c3f9b42"]
     revision = script.get_revision(REVISION)
     assert revision is not None and revision.down_revision == "a7d0c5e2f941"
 

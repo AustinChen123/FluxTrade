@@ -1,5 +1,6 @@
 """Private canonical encoder for the existing Spider source checkpoint V1."""
 
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any, cast
 
@@ -20,6 +21,248 @@ _CAPITAL_KEYS = frozenset({"earn", "usdt", "avail", "total", "position", "day_ag
 _REPLY_KEYS = frozenset(
     {"instId", "side", "px", "sz", "clOrdId", "state", "accFillSz", "cTime", "sMsg"}
 )
+_MARKET_OBSERVATION_KEYS = frozenset(
+    {
+        "schema_version", "scope", "effective_identity", "snapshot_id",
+        "observed_at_ms", "snapshot_as_of_ms", "provenance", "markets",
+    }
+)
+_MARKET_SPEC_KEYS = ("ctVal", "lotSz", "minSz", "increment")
+
+
+@dataclass(frozen=True, slots=True)
+class SourceMarketObservation:
+    """One strictly decoded, complete replacement of Policy.markets."""
+
+    snapshot_id: str
+    observed_at_ms: int
+    snapshot_as_of_ms: int
+    evidence_sha256: str
+    markets: dict[str, dict[str, object]]
+
+
+def source_market_envelope_identity(raw: bytes) -> tuple[dict[str, str], str] | None:
+    """Extract only the closed routing identity before owner-scope validation."""
+    from src.core.backtest.spider_run_artifacts import decode_canonical
+
+    if type(raw) is not bytes or not 1 <= len(raw) <= 1_048_576:
+        return None
+    try:
+        value = decode_canonical(raw)
+        row = _closed_object(value, _MARKET_OBSERVATION_KEYS)
+        scope = _closed_object(
+            row["scope"], frozenset({"environment", "execution_scope_id", "strategy_id"})
+        )
+        snapshot_id = row["snapshot_id"]
+        if (
+            row["schema_version"] != "SPIDER_SOURCE_MARKET_V1"
+            or canonical_bytes(value) != raw
+            or any(type(item) is not str or not item for item in scope.values())
+            or type(snapshot_id) is not str
+            or len(snapshot_id) != 64
+            or any(char not in "0123456789abcdef" for char in snapshot_id)
+        ):
+            return None
+        return cast(dict[str, str], scope), cast(str, snapshot_id)
+    except (TypeError, ValueError, UnicodeDecodeError):
+        return None
+
+
+def decode_source_market_observation(
+    raw: bytes,
+    *,
+    scope: dict[str, str],
+    generation: int,
+    confirmation_request_id: str,
+    configuration_sha256: str,
+    evidence_sha256: str,
+    ordered_products: tuple[str, ...],
+    build_checkpoint_bytes: bytes,
+) -> SourceMarketObservation:
+    """Validate one MODEL snapshot against the immutable INSTALL market basis."""
+    from datetime import datetime, timezone
+
+    from src.core.backtest.spider_run_artifacts import decode_canonical
+
+    _require(
+        type(raw) is bytes
+        and 1 <= len(raw) <= 1_048_576
+        and type(scope) is dict
+        and set(scope) == {"environment", "execution_scope_id", "strategy_id"}
+        and all(type(value) is str and bool(value) for value in scope.values())
+        and type(generation) is int
+        and 1 <= generation < 2**63
+        and type(confirmation_request_id) is str
+        and len(confirmation_request_id) == 64
+        and all(char in "0123456789abcdef" for char in confirmation_request_id)
+        and type(configuration_sha256) is str
+        and len(configuration_sha256) == 64
+        and all(char in "0123456789abcdef" for char in configuration_sha256)
+        and type(evidence_sha256) is str
+        and len(evidence_sha256) == 64
+        and all(char in "0123456789abcdef" for char in evidence_sha256)
+        and type(ordered_products) is tuple
+        and bool(ordered_products)
+        and all(type(product) is str and bool(product) for product in ordered_products)
+        and len(set(ordered_products)) == len(ordered_products)
+        and type(build_checkpoint_bytes) is bytes
+    )
+    try:
+        value = decode_canonical(raw)
+        observation = _closed_object(value, _MARKET_OBSERVATION_KEYS)
+        _require(observation["schema_version"] == "SPIDER_SOURCE_MARKET_V1")
+        _require(observation["scope"] == scope)
+        effective_identity = _closed_object(
+            observation["effective_identity"],
+            frozenset({"generation", "confirmation_request_id", "configuration_sha256"}),
+        )
+        observed_generation = effective_identity["generation"]
+        _require(
+            type(observed_generation) is int
+            and 1 <= cast(int, observed_generation) < 2**63
+        )
+        _require(
+            effective_identity
+            == {
+                "generation": generation,
+                "confirmation_request_id": confirmation_request_id,
+                "configuration_sha256": configuration_sha256,
+            }
+        )
+        snapshot_id = observation["snapshot_id"]
+        _require(
+            type(snapshot_id) is str
+            and len(snapshot_id) == 64
+            and all(char in "0123456789abcdef" for char in snapshot_id)
+        )
+        observed_at_ms = observation["observed_at_ms"]
+        snapshot_as_of_ms = observation["snapshot_as_of_ms"]
+        _require(
+            type(observed_at_ms) is int
+            and type(snapshot_as_of_ms) is int
+            and snapshot_as_of_ms <= observed_at_ms
+        )
+        epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+        def utc_millis(value: datetime) -> int:
+            delta = value - epoch
+            return delta.days * 86_400_000 + delta.seconds * 1000 + delta.microseconds // 1000
+
+        minimum_ms = utc_millis(datetime(1, 1, 1, tzinfo=timezone.utc))
+        maximum_ms = utc_millis(datetime(9999, 12, 31, 23, 59, 59, 999000, tzinfo=timezone.utc))
+        _require(
+            minimum_ms
+            <= cast(int, snapshot_as_of_ms)
+            <= cast(int, observed_at_ms)
+            <= maximum_ms
+        )
+        provenance = _closed_object(
+            observation["provenance"], frozenset({"kind", "evidence_sha256"})
+        )
+        _require(
+            provenance == {"kind": "MODEL", "evidence_sha256": evidence_sha256}
+        )
+
+        checkpoint = _closed_object(
+            decode_canonical(build_checkpoint_bytes),
+            frozenset(
+                {
+                    "schema_version", "policy_identity", "source_sha256",
+                    "effective_identity", "rows", "markets", "parameters",
+                    "capital", "replies", "running", "paused", "online",
+                    "ws_open", "now_ms", "shared_ms", "last_market_ms",
+                    "last_earn_ms", "last_capital", "reset_ms",
+                    "last_filled_price", "order_id",
+                }
+            ),
+        )
+        baseline_value = checkpoint["markets"]
+        supplied_value = observation["markets"]
+        _require(
+            type(baseline_value) is list
+            and type(supplied_value) is list
+            and len(cast(list[object], baseline_value)) == len(ordered_products)
+            and len(cast(list[object], supplied_value)) == len(ordered_products)
+        )
+        markets: dict[str, dict[str, object]] = {}
+        for product, baseline_item, supplied_item in zip(
+            ordered_products,
+            cast(list[object], baseline_value),
+            cast(list[object], supplied_value),
+            strict=True,
+        ):
+            baseline = _closed_object(baseline_item, frozenset({"product_id", "value"}))
+            supplied = _closed_object(supplied_item, frozenset({"product_id", "value"}))
+            _require(baseline["product_id"] == product == supplied["product_id"])
+            baseline_fields = _closed_object(baseline["value"], frozenset(_MARKET_KEYS))
+            supplied_fields = _closed_object(supplied["value"], frozenset(_MARKET_KEYS))
+            decoded: dict[str, object] = {}
+            for key in _MARKET_KEYS:
+                encoded = supplied_fields[key]
+                decoded[key] = _decode_scalar(encoded)
+            for key in _MARKET_SPEC_KEYS + ("state", "instIdCode"):
+                _require(supplied_fields[key] == baseline_fields[key])
+            for key in _MARKET_SPEC_KEYS:
+                _require(type(decoded[key]) is str)
+                number = Decimal(cast(str, decoded[key]))
+                _require(number.is_finite() and number > 0)
+            _require(type(decoded["price"]) is Decimal and cast(Decimal, decoded["price"]).is_finite())
+            _require(cast(Decimal, decoded["price"]) > 0)
+            _require(type(decoded["ratioHL"]) is Decimal and cast(Decimal, decoded["ratioHL"]).is_finite())
+            _require(cast(Decimal, decoded["ratioHL"]) >= 0)
+            _require(decoded["state"] == "live")
+            _require(type(decoded["instIdCode"]) is int and cast(int, decoded["instIdCode"]) >= 0)
+            markets[product] = decoded
+        _require(canonical_bytes(value) == raw)
+        return SourceMarketObservation(
+            snapshot_id=cast(str, snapshot_id),
+            observed_at_ms=cast(int, observed_at_ms),
+            snapshot_as_of_ms=cast(int, snapshot_as_of_ms),
+            evidence_sha256=evidence_sha256,
+            markets=markets,
+        )
+    except (ArithmeticError, TypeError, ValueError, UnicodeDecodeError):
+        raise ValueError("INVALID_SOURCE_MARKET") from None
+
+
+def replace_checkpoint_markets(
+    checkpoint_bytes: bytes,
+    *,
+    ordered_products: tuple[str, ...],
+    markets: dict[str, dict[str, object]],
+) -> bytes:
+    """Return canonical checkpoint bytes changing only its ordered market map."""
+    from src.core.backtest.spider_run_artifacts import decode_canonical
+
+    try:
+        value = _closed_object(
+            decode_canonical(checkpoint_bytes),
+            frozenset(
+                {
+                    "schema_version", "policy_identity", "source_sha256",
+                    "effective_identity", "rows", "markets", "parameters",
+                    "capital", "replies", "running", "paused", "online",
+                    "ws_open", "now_ms", "shared_ms", "last_market_ms",
+                    "last_earn_ms", "last_capital", "reset_ms",
+                    "last_filled_price", "order_id",
+                }
+            ),
+        )
+        _require(type(markets) is dict and tuple(markets) == ordered_products)
+        replacement: list[dict[str, object]] = []
+        for product in ordered_products:
+            row = markets[product]
+            _require(type(row) is dict and set(row) == set(_MARKET_KEYS))
+            replacement.append(
+                {
+                    "product_id": product,
+                    "value": {key: _scalar(row[key]) for key in _MARKET_KEYS},
+                }
+            )
+        value["markets"] = replacement
+        return canonical_bytes(value)
+    except (ArithmeticError, TypeError, ValueError):
+        raise ValueError("INVALID_SOURCE_CHECKPOINT") from None
 
 
 def _scalar(value: object) -> dict[str, object]:
