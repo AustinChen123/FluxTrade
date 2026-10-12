@@ -341,6 +341,7 @@ class SpiderRuntimeAction(Base):
     strategy_id: Mapped[str] = mapped_column(String(128, collation="C"), nullable=False)
     trigger_delivery_id: Mapped[str | None] = mapped_column(String(64, collation="C"), nullable=True)
     parent_action_id: Mapped[str | None] = mapped_column(String(64, collation="C"), nullable=True)
+    operation: Mapped[str] = mapped_column(String(8, collation="C"), nullable=False, server_default="PLACE")
     generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
     configuration_sha256: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
     role: Mapped[str] = mapped_column(String(32, collation="C"), nullable=False)
@@ -375,6 +376,7 @@ class SpiderRuntimeAction(Base):
         CheckConstraint("generation > 0", name="ck_spider_runtime_action_generation"),
         CheckConstraint("configuration_sha256 COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_runtime_action_configuration_hash"),
         CheckConstraint("role COLLATE \"C\" = 'GRID'", name="ck_spider_runtime_action_role"),
+        CheckConstraint("operation IN ('PLACE', 'CANCEL')", name="ck_spider_runtime_action_operation"),
         CheckConstraint("octet_length(original_payload) BETWEEN 1 AND 1048576", name="ck_spider_runtime_action_payload"),
         CheckConstraint("payload_sha256 COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_runtime_action_payload_hash"),
         CheckConstraint("candidate_ordinal >= 0 AND transmission_group >= 0 AND transmission_ordinal >= 0", name="ck_spider_runtime_action_ordinals"),
@@ -436,6 +438,9 @@ class SpiderRuntimeDelivery(Base):
     elapsed_ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     disposition: Mapped[str] = mapped_column(String(12, collation="C"), nullable=False, server_default="PENDING")
     suppression_reason: Mapped[str | None] = mapped_column(String(64, collation="C"), nullable=True)
+    decision_payload: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    decision_sha256: Mapped[str | None] = mapped_column(String(64, collation="C"), nullable=True)
+    full_callback_key: Mapped[str | None] = mapped_column(String(64, collation="C"), nullable=True)
 
     __table_args__ = (
         ForeignKeyConstraint(
@@ -457,9 +462,12 @@ class SpiderRuntimeDelivery(Base):
         CheckConstraint("content_sha256 COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_runtime_delivery_hash"),
         CheckConstraint("generation > 0", name="ck_spider_runtime_delivery_generation"),
         CheckConstraint("configuration_sha256 COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_runtime_delivery_configuration_hash"),
-        CheckConstraint("kind IN ('FILL', 'ORDER_STATE', 'SOURCE_MARKET')", name="ck_spider_runtime_delivery_kind"),
+        UniqueConstraint("environment", "execution_scope_id", "strategy_id", "full_callback_key", name="uq_spider_runtime_delivery_full_callback"),
+        CheckConstraint("kind IN ('FILL', 'ORDER_STATE', 'SOURCE_MARKET', 'TRANSPORT_RESULT')", name="ck_spider_runtime_delivery_kind"),
         CheckConstraint(
             "(kind = 'SOURCE_MARKET' AND local_order_id IS NULL AND trade_id IS NULL "
+            "AND action_id IS NULL AND role IS NULL) OR "
+            "(kind = 'TRANSPORT_RESULT' AND local_order_id IS NULL AND trade_id IS NULL "
             "AND action_id IS NULL AND role IS NULL) OR "
             "(kind IN ('FILL', 'ORDER_STATE') AND local_order_id IS NOT NULL "
             "AND action_id IS NOT NULL AND role IS NOT NULL "
@@ -471,6 +479,10 @@ class SpiderRuntimeDelivery(Base):
         CheckConstraint("elapsed_ms IS NULL OR elapsed_ms >= 0", name="ck_spider_runtime_delivery_elapsed"),
         CheckConstraint("disposition IN ('PENDING', 'CONSUMED', 'SUPPRESSED')", name="ck_spider_runtime_delivery_disposition"),
         CheckConstraint("suppression_reason IS NULL OR disposition = 'SUPPRESSED'", name="ck_spider_runtime_delivery_suppression"),
+        CheckConstraint("(decision_payload IS NULL) = (decision_sha256 IS NULL)", name="ck_spider_runtime_delivery_decision_pair"),
+        CheckConstraint("decision_payload IS NULL OR octet_length(decision_payload) BETWEEN 1 AND 1048576", name="ck_spider_runtime_delivery_decision_size"),
+        CheckConstraint("decision_sha256 IS NULL OR decision_sha256 COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_runtime_delivery_decision_hash"),
+        CheckConstraint("full_callback_key IS NULL OR full_callback_key COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_runtime_delivery_full_callback_hash"),
     )
 
 

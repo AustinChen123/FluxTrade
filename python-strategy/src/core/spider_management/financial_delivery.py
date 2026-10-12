@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from hashlib import sha256
 from typing import cast
 
@@ -579,10 +579,32 @@ def validate_order_receipt_chain(
     binding: SpiderRuntimeBinding,
     order_id: str,
     current_projection: Mapping[str, object],
+    through_sequence: int | None = None,
 ) -> bool:
     """Verify receipt bytes, identity, Trade links, and the complete Order chain."""
     scope_value = dict(scope)
     binding_value = _binding_value(binding, action)
+    immutable_order = session.execute(
+        select(Order.product_id, Order.side, Order.quantity).where(Order.id == order_id)
+    ).one_or_none()
+    if immutable_order is None or action.operation != "PLACE":
+        return False
+    source_action = decode_canonical(bytes(action.original_payload))
+    if type(source_action) is not dict:
+        return False
+    source_terms = cast(dict[str, object], source_action)
+    try:
+        original_quantity = Decimal(cast(str, source_terms["sz"]))
+        if (
+            not original_quantity.is_finite()
+            or original_quantity <= 0
+            or immutable_order.quantity != original_quantity
+            or immutable_order.product_id != binding.canonical_product_id
+            or immutable_order.side != source_terms["side"]
+        ):
+            return False
+    except (InvalidOperation, KeyError, TypeError, ValueError):
+        return False
     cursor: dict[str, object] = {
         "status": "NEW",
         "filled_quantity": "0",
@@ -591,13 +613,21 @@ def validate_order_receipt_chain(
     }
     ordinal = 0
     previous_sequence = 0
-    rows = session.execute(
-        select(SpiderRuntimeDelivery).where(
+    proved_fill_quantity = Decimal(0)
+    delivery_filters = [
             SpiderRuntimeDelivery.environment == scope["environment"],
             SpiderRuntimeDelivery.execution_scope_id == scope["execution_scope_id"],
             SpiderRuntimeDelivery.strategy_id == scope["strategy_id"],
             SpiderRuntimeDelivery.local_order_id == order_id,
-        ).order_by(SpiderRuntimeDelivery.sequence)
+    ]
+    if through_sequence is not None:
+        if type(through_sequence) is not int or through_sequence <= 0:
+            return False
+        delivery_filters.append(SpiderRuntimeDelivery.sequence <= through_sequence)
+    rows = session.execute(
+        select(SpiderRuntimeDelivery).where(*delivery_filters).order_by(
+            SpiderRuntimeDelivery.sequence
+        )
     ).scalars()
     for row in rows:
         if row.sequence <= previous_sequence:
@@ -642,6 +672,19 @@ def validate_order_receipt_chain(
             }
             ordinal += 1
             domain = b"SPIDER_ORDER_STATE_V1\0"
+            before = cast(dict[str, object], record["before"])
+            after_values = cast(dict[str, object], after)
+            try:
+                before_quantity = Decimal(cast(str, before["filled_quantity"]))
+                after_quantity = Decimal(cast(str, after_values["filled_quantity"]))
+            except (InvalidOperation, TypeError, ValueError):
+                return False
+            if (
+                after_quantity < before_quantity
+                or after_quantity > original_quantity
+                or (after_quantity > before_quantity and proved_fill_quantity != after_quantity)
+            ):
+                return False
         elif row.kind == "FILL":
             if (
                 record["kind"] != "FILL"
@@ -650,6 +693,38 @@ def validate_order_receipt_chain(
                 or record["transition_ordinal"] is not None
                 or not _trade_exists_for_order(session, row.trade_id, order_id)
             ):
+                return False
+            before = cast(dict[str, object], record["before"])
+            after_values = cast(dict[str, object], after)
+            try:
+                before_quantity = Decimal(cast(str, before["filled_quantity"]))
+                after_quantity = Decimal(cast(str, after_values["filled_quantity"]))
+            except (InvalidOperation, TypeError, ValueError):
+                return False
+            trade_values = session.execute(
+                select(Trade.order_id, Trade.product_id, Trade.side, Trade.price, Trade.quantity)
+                .where(Trade.id == row.trade_id)
+            ).one_or_none()
+            if trade_values is None:
+                return False
+            trade_order_id, trade_product, trade_side, trade_price, trade_quantity = trade_values
+            delta = after_quantity - before_quantity
+            if (
+                trade_order_id != order_id
+                or trade_product != immutable_order.product_id
+                or trade_side != immutable_order.side
+                or not isinstance(trade_price, Decimal)
+                or not trade_price.is_finite()
+                or trade_price <= 0
+                or not isinstance(trade_quantity, Decimal)
+                or not trade_quantity.is_finite()
+                or trade_quantity <= 0
+                or delta <= 0
+                or trade_quantity != delta
+            ):
+                return False
+            proved_fill_quantity += trade_quantity
+            if proved_fill_quantity != after_quantity or after_quantity > original_quantity:
                 return False
             identity = {"scope": scope_value, "trade_id": row.trade_id}
             domain = b"SPIDER_FINANCIAL_TRADE_V1\0"

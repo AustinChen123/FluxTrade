@@ -32,9 +32,11 @@ def test_source_market_schema_is_additive_and_preserves_financial_refs():
     config = Config(str(ROOT / "alembic.ini"))
     config.set_main_option("script_location", str(ROOT / "alembic"))
     script = ScriptDirectory.from_config(config)
-    assert script.get_heads() == [REVISION]
+    assert script.get_heads() == ["f47c2a91d683"]
     revision = script.get_revision(REVISION)
     assert revision is not None and revision.down_revision == "c3f8d1a904b7"
+    callback_revision = script.get_revision("f47c2a91d683")
+    assert callback_revision is not None and callback_revision.down_revision == REVISION
 
     upgrade = _migration_sql("upgrade")
     assert "original_build_checkpoint BYTEA" in upgrade

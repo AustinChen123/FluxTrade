@@ -22,6 +22,7 @@ from src.core.backtest.spider_historical_input import HistoricalRunInput
 from src.core.execution import ExecutionEngine
 from src.core.interfaces.exchange import ExchangeOrderEvent
 from src.core.orm_models import Order, Trade
+from src.core.spider_management import runtime_owner as runtime_owner_module
 from src.core.spider_management.orm import (
     SpiderRuntimeAction,
     SpiderRuntimeBinding,
@@ -31,7 +32,7 @@ from src.core.spider_management.orm import (
     SpiderRuntimeTapeIndex,
     SpiderRuntimeTransmission,
 )
-from src.core.spider_management.runtime_owner import SpiderRuntimeOwner
+from src.core.spider_management.runtime_owner import RuntimeScopeKey, SpiderRuntimeOwner
 from src.core.strategy_state_manager import StrategyStateManager
 from test_migrations import fresh_pg_db as _migration_fresh_pg_db
 from test_spider_financial_delivery_pg import (
@@ -458,6 +459,12 @@ def test_stop_can_commit_between_durable_marker_and_provider_response(
         transport_response_classifier=classify_okx_batch_response,
     )
     stopped: list[object] = []
+    with Session(engine) as session:
+        checkpoint_before_send = bytes(session.execute(
+            select(SpiderRuntimeScope.source_checkpoint).where(
+                SpiderRuntimeScope.strategy_id == scope.strategy_id
+            )
+        ).scalar_one())
 
     class StopInsideOfflineCall:
         def __init__(self) -> None:
@@ -520,13 +527,38 @@ def test_stop_can_commit_between_durable_marker_and_provider_response(
             ).where(SpiderRuntimeScope.strategy_id == scope.strategy_id)
         ).one()
         assert runtime.control_mode == "STOP"
-        assert runtime.control_barrier_sequence == runtime.last_tape_sequence == 1
-        marker = session.execute(
-            select(SpiderRuntimeTapeIndex).where(
-                SpiderRuntimeTapeIndex.strategy_id == scope.strategy_id
+        assert runtime.control_barrier_sequence == 1
+        assert runtime.last_tape_sequence == 2
+        tape = session.execute(
+            select(SpiderRuntimeTapeIndex)
+            .where(SpiderRuntimeTapeIndex.strategy_id == scope.strategy_id)
+            .order_by(SpiderRuntimeTapeIndex.ordinal)
+        ).scalars().all()
+        assert [(row.ordinal, row.kind) for row in tape] == [
+            (1, "SEND_MARKER"),
+            (2, "DELIVERY"),
+        ]
+        late_result = session.execute(
+            select(SpiderRuntimeDelivery).where(
+                SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                SpiderRuntimeDelivery.kind == "TRANSPORT_RESULT",
             )
         ).scalar_one()
-        assert marker.kind == "SEND_MARKER"
+        assert late_result.disposition == "SUPPRESSED"
+        assert late_result.suppression_reason == "STOP_CONTROL"
+        assert late_result.decision_payload is None
+        assert late_result.decision_sha256 is None
+        assert session.scalar(
+            select(func.count()).select_from(SpiderRuntimeAction).where(
+                SpiderRuntimeAction.strategy_id == scope.strategy_id,
+                SpiderRuntimeAction.trigger_delivery_id.is_not(None),
+            )
+        ) == 0
+        assert bytes(session.execute(
+            select(SpiderRuntimeScope.source_checkpoint).where(
+                SpiderRuntimeScope.strategy_id == scope.strategy_id
+            )
+        ).scalar_one()) == checkpoint_before_send
 
 
 def test_valid_but_unclassified_raw_response_is_durable_and_projection_is_checked(
@@ -645,7 +677,12 @@ def test_changed_bytes_for_an_existing_group_are_unavailable_and_never_resent(
             select(func.count()).select_from(SpiderRuntimeTapeIndex).where(
                 SpiderRuntimeTapeIndex.strategy_id == scope.strategy_id
             )
-        ) == 1
+        ) == 2
+        assert session.execute(
+            select(SpiderRuntimeTapeIndex.kind)
+            .where(SpiderRuntimeTapeIndex.strategy_id == scope.strategy_id)
+            .order_by(SpiderRuntimeTapeIndex.ordinal)
+        ).scalars().all() == ["SEND_MARKER", "DELIVERY"]
 
 
 @pytest.mark.parametrize(
@@ -831,7 +868,13 @@ def test_all_saved_source_groups_complete_and_exact_first_retry_never_resends(
             select(func.count()).select_from(SpiderRuntimeTapeIndex).where(
                 SpiderRuntimeTapeIndex.strategy_id == scope.strategy_id
             )
-        ) == len(group_sizes)
+        ) == 2 * len(group_sizes)
+        tape = session.execute(
+            select(SpiderRuntimeTapeIndex.kind)
+            .where(SpiderRuntimeTapeIndex.strategy_id == scope.strategy_id)
+            .order_by(SpiderRuntimeTapeIndex.ordinal)
+        ).scalars().all()
+        assert tape == [kind for _ in group_sizes for kind in ("SEND_MARKER", "DELIVERY")]
 
     if orders_per_product == 11:
         first_group, _first_payload, _first_outcome = saved[0]
@@ -870,7 +913,22 @@ def test_all_saved_source_groups_complete_and_exact_first_retry_never_resends(
             assert trade.price == order.price
             assert trade.fee == Decimal("0.01")
             receipt_before_stop = _financial_receipt_snapshot(session, scope)
-            assert len(receipt_before_stop) == 2
+            assert len(receipt_before_stop) == 6
+            kind_rows = session.execute(
+                select(SpiderRuntimeDelivery.sequence, SpiderRuntimeDelivery.kind).where(
+                    SpiderRuntimeDelivery.strategy_id == scope.strategy_id
+                )
+            ).all()
+            receipt_kind_by_sequence: dict[int, str] = {
+                cast(int, sequence): cast(str, kind) for sequence, kind in kind_rows
+            }
+            assert sum(
+                kind == "TRANSPORT_RESULT" for kind in receipt_kind_by_sequence.values()
+            ) == 4
+            assert sum(
+                kind in {"FILL", "ORDER_STATE"}
+                for kind in receipt_kind_by_sequence.values()
+            ) == 2
             fill_receipt = next(row for row in receipt_before_stop if row[4] == trade.id)
             assert fill_receipt[2] == target["action_id"]
             assert fill_receipt[3] == order.id
@@ -982,9 +1040,13 @@ def test_all_saved_source_groups_complete_and_exact_first_retry_never_resends(
                 receipt_before_stop, receipt_after_stop, strict=True
             ):
                 assert before[:7] == after[:7]
-                assert before[7] == "PENDING" and before[8] is None
-                assert after[7] == "SUPPRESSED"
-                assert after[8] == "STOP_CONTROL"
+                receipt_kind = receipt_kind_by_sequence[cast(int, before[0])]
+                if receipt_kind == "TRANSPORT_RESULT":
+                    assert before == after
+                else:
+                    assert before[7] == "PENDING" and before[8] is None
+                    assert after[7] == "SUPPRESSED"
+                    assert after[8] == "STOP_CONTROL"
             assert received_sequence == consumed_sequence
 
 def test_mixed_place_response_projects_only_the_exact_saved_group_and_retries_once(
@@ -1248,6 +1310,22 @@ def _filled_event(order: Order, *, provider_id: str, trade_id: str) -> ExchangeO
     )
 
 
+def _normal_n3_run() -> HistoricalRunInput:
+    """Reuse the admitted native fixture with the contract's exact N3 source cache."""
+    run = _admitted_run()
+    cache = cast(dict[str, object], decode_canonical(run.initial_policy_cache))
+    capital = cast(dict[str, object], cache["capital"])
+    capital.update(total="10000", usdt="10000", avail="10000", earn="0", position="0")
+    rows = cast(list[dict[str, object]], cache["rows"])
+    row = next(value for value in rows if value.get("name") == "A-USDT-SWAP")
+    row.update(leverage="6", 歩差="1", 單數="3", hold上限="0.8", hold下限="-0.8", hold="0")
+    markets = cast(list[dict[str, object]], cache["markets"])
+    market = next(value for value in markets if value.get("product_id") == "A-USDT-SWAP")
+    market.update(price="100", ctVal="1", lotSz="0.001", minSz="0.001",
+                  increment="0.01", ratioHL="0.1", state="live", instIdCode=1)
+    return replace(run, initial_policy_cache=canonical_bytes(cache))
+
+
 def test_late_fill_after_saved_rejection_preserves_financial_facts_and_updates_projection(
     operation_pg: Engine,
     mock_clock,
@@ -1479,6 +1557,1070 @@ def test_late_fill_then_actual_stop_drains_receipts_without_changing_financial_f
     assert trade.fee == Decimal("0.01")
     assert runtime.last_received_sequence == runtime.last_consumed_sequence
     assert offline.calls == 1
+
+
+def test_normal_tx_b_after_execution_fill_before_rest_ack_derives_local_intents_and_cold_proof(
+    operation_pg: Engine,
+    mock_clock,
+    mock_exchange_adapter,
+) -> None:
+    """Exercise TXA receipts, ordered source callbacks, TXB actions and readback."""
+    engine = operation_pg
+    owner, scope, operation_id, order_manager, _prepared, _initial, *_ = _install_owner(
+        engine, admitted_run=_normal_n3_run()
+    )
+    source_group, request_payload, members = _saved_initial_place_request(engine, scope)
+    enabled = _transport_enabled_owner(owner, scope)
+    candidate = next(
+        member for member in members
+        if cast(dict[str, object], member["request_payload"])["side"] == "buy"
+        and Decimal(cast(str, cast(dict[str, object], member["request_payload"])["px"])) == Decimal("50")
+    )
+    order = order_manager.repo.get_order(cast(str, candidate["local_order_id"]))
+    assert order is not None and order.price is not None
+    assert order.price == Decimal("50") and order.quantity == Decimal("100")
+    execution = _execution_for_owner(enabled, engine, mock_clock, mock_exchange_adapter)
+    first_quantity = order.quantity * Decimal("0.6")
+    second_quantity = order.quantity - first_quantity
+
+    class FillBeforeAckClient:
+        calls = 0
+
+        def privatePostTradeBatchOrders(self, _orders: list[dict[str, object]]) -> object:
+            self.calls += 1
+            assert execution.process_exchange_order_event(ExchangeOrderEvent(
+                status="partially_filled",
+                product_id=order.product_id,
+                client_order_id=order.client_order_id,
+                exchange_order_id="normal-fill-provider-order",
+                cumulative_filled_quantity=first_quantity,
+                cumulative_average_price=Decimal("48"),
+                last_fill_quantity=first_quantity,
+                last_fill_price=Decimal("48"),
+                fee=Decimal("0.01"),
+                fee_asset="USDT",
+                last_fill_exchange_trade_id="normal-fill-60-at-48",
+            ))["action"] == "applied"
+            assert execution.process_exchange_order_event(ExchangeOrderEvent(
+                status="filled",
+                product_id=order.product_id,
+                client_order_id=order.client_order_id,
+                exchange_order_id="normal-fill-provider-order",
+                cumulative_filled_quantity=order.quantity,
+                cumulative_average_price=Decimal("48.4"),
+                last_fill_quantity=second_quantity,
+                last_fill_price=Decimal("49"),
+                fee=Decimal("0.02"),
+                fee_asset="USDT",
+                last_fill_exchange_trade_id="normal-fill-40-at-49",
+            ))["action"] == "applied"
+            # Exact duplicate has no new financial receipt and cannot invoke
+            # the source full callback a second time.
+            duplicate = execution.process_exchange_order_event(ExchangeOrderEvent(
+                status="filled",
+                product_id=order.product_id,
+                client_order_id=order.client_order_id,
+                exchange_order_id="normal-fill-provider-order",
+                cumulative_filled_quantity=order.quantity,
+                cumulative_average_price=Decimal("48.4"),
+                last_fill_quantity=second_quantity,
+                last_fill_price=Decimal("49"),
+                fee=Decimal("0.02"),
+                fee_asset="USDT",
+                last_fill_exchange_trade_id="normal-fill-40-at-49",
+            ))
+            assert duplicate["fill_quantity"] == Decimal("0")
+            return {
+                "code": "0",
+                "data": [
+                    {
+                        "clOrdId": member["wire_clOrdId"],
+                        "ordId": (
+                            "normal-fill-provider-order"
+                            if member["action_id"] == candidate["action_id"]
+                            else f"normal-provider-{ordinal}"
+                        ),
+                        "sCode": "0",
+                    }
+                    for ordinal, member in enumerate(members)
+                ],
+                "msg": "synthetic acknowledgement after fills",
+            }
+
+        def privatePostTradeCancelBatchOrders(self, _orders: list[dict[str, object]]) -> object:
+            raise AssertionError("TX B persists cancel intents; it does not transmit them")
+
+    offline = FillBeforeAckClient()
+    result = enabled.transmit_initial_place_group(
+        scope, source_group, scope.execution_scope_id, request_payload,
+        OkxSpiderBatchTransport(cast(Any, offline)),
+    )
+    assert result.disposition == "RECORDED"
+    assert offline.calls == 1
+
+    with Session(engine) as session:
+        trades = session.execute(
+            select(Trade)
+            .join(SpiderRuntimeDelivery, SpiderRuntimeDelivery.trade_id == Trade.id)
+            .where(
+                Trade.order_id == order.id,
+                SpiderRuntimeDelivery.kind == "FILL",
+            )
+            .order_by(SpiderRuntimeDelivery.sequence)
+        ).scalars().all()
+        assert [(trade.quantity, trade.price) for trade in trades] == [
+            (first_quantity, Decimal("48")), (second_quantity, Decimal("49"))
+        ]
+        assert (
+            sum((trade.quantity * trade.price for trade in trades), Decimal("0"))
+            / order.quantity
+        ) == Decimal("48.4")
+        runtime = session.execute(
+            select(SpiderRuntimeScope).where(SpiderRuntimeScope.strategy_id == scope.strategy_id)
+        ).scalar_one()
+        deliveries = session.execute(
+            select(SpiderRuntimeDelivery).where(
+                SpiderRuntimeDelivery.strategy_id == scope.strategy_id
+            ).order_by(SpiderRuntimeDelivery.sequence)
+        ).scalars().all()
+        normal = [row for row in deliveries if row.kind in {"FILL", "ORDER_STATE", "TRANSPORT_RESULT"}]
+        assert normal and all(row.disposition == "CONSUMED" for row in normal)
+        decisions = [
+            cast(dict[str, object], decode_canonical(bytes(row.decision_payload)))
+            for row in normal if row.decision_payload is not None
+        ]
+        full_decisions = [item for item in decisions if item["full_callback_key"] is not None]
+        assert len(full_decisions) == 1
+        full = full_decisions[0]
+        source_input = cast(dict[str, object], full["source_input"])
+        source_order = cast(dict[str, object], source_input["order"])
+        assert Decimal(cast(str, source_order["px"])) == order.price
+        assert source_order["fillPx"] == "49"
+        assert Decimal(cast(str, source_order["accFillSz"])) == order.quantity
+        events = cast(list[dict[str, object]], full["events"])
+        assert [row["kind"] for row in events if row["kind"] in {"cancel", "send"}] == [
+            "cancel", "send"
+        ]
+        cancel_sources = cast(list[dict[str, object]], events[0]["orders"])
+        assert [row["ordId"] for row in cancel_sources] == ["0000065010"]
+        child_sources = cast(list[dict[str, object]], events[1]["orders"])
+        assert [(row["px"], row["sz"], row["side"], row["clOrdId"]) for row in child_sources] == [
+            ("6.25", "355.555", "buy", "0000115003"),
+            ("100", "150", "sell", "0000125007"),
+        ]
+        assert runtime.last_received_sequence == runtime.last_consumed_sequence
+        derived = session.execute(
+            select(SpiderRuntimeAction).where(
+                SpiderRuntimeAction.strategy_id == scope.strategy_id,
+                SpiderRuntimeAction.trigger_delivery_id.is_not(None),
+            ).order_by(SpiderRuntimeAction.candidate_ordinal)
+        ).scalars().all()
+        assert {action.operation for action in derived} >= {"PLACE", "CANCEL"}
+        cancel = next(action for action in derived if action.operation == "CANCEL")
+        assert cancel.local_order_id is not None and cancel.role == "GRID"
+        assert cancel.trigger_delivery_id is not None
+        assert cancel.parent_action_id is not None
+        assert session.execute(
+            select(SpiderRuntimeBinding).where(
+                SpiderRuntimeBinding.action_id == cancel.action_id
+            )
+        ).scalar_one_or_none() is None
+        full_key_count = session.scalar(
+            select(func.count()).select_from(SpiderRuntimeDelivery).where(
+                SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                SpiderRuntimeDelivery.full_callback_key == full["full_callback_key"],
+            )
+        )
+        assert full_key_count == 1
+
+    # The ordinary query exposes only explicitly bound PLACE actions. CANCEL
+    # remains an immutable intent and cannot fabricate a local Order/binding.
+    from test_spider_order_query_pg import _query_service
+
+    query_status, query_body = _query_service(engine, scope).orders(
+        f"strategy_id={scope.strategy_id}"
+    )
+    assert query_status == 200, query_body
+    query_orders = cast(list[dict[str, object]], query_body["orders"])
+    with Session(engine) as session:
+        derived_place_orders = set(session.scalars(
+            select(SpiderRuntimeAction.local_order_id).where(
+                SpiderRuntimeAction.strategy_id == scope.strategy_id,
+                SpiderRuntimeAction.trigger_delivery_id.is_not(None),
+                SpiderRuntimeAction.operation == "PLACE",
+                SpiderRuntimeAction.local_order_id.is_not(None),
+            )
+        ))
+    assert derived_place_orders
+    assert derived_place_orders <= {row["local_order_id"] for row in query_orders}
+
+    cold = _transport_enabled_owner(enabled, scope)
+    proved = cold.readback(scope, operation_id)
+    assert proved is not None
+    assert proved["trading_ready"] is False
+    prior_readback = enabled.readback(scope, operation_id)
+    assert prior_readback is not None
+    assert proved["checkpoint_sha256"] == prior_readback["checkpoint_sha256"]
+
+
+@pytest.mark.parametrize("terminal_status", ["canceled", "rejected"])
+def test_rest_ack_uses_terminal_receipt_before_its_delivery_cutoff(
+    operation_pg: Engine,
+    mock_clock,
+    mock_exchange_adapter,
+    terminal_status: str,
+) -> None:
+    """A proved cancel/failure before REST ACK cannot be moved back to live."""
+    engine = operation_pg
+    owner, scope, _operation_id, order_manager, _prepared, _initial, *_ = _install_owner(engine)
+    source_group, request_payload, members = _saved_initial_place_request(engine, scope)
+    enabled = _transport_enabled_owner(owner, scope)
+    target = members[0]
+    order = order_manager.repo.get_order(cast(str, target["local_order_id"]))
+    assert order is not None
+    execution = _execution_for_owner(enabled, engine, mock_clock, mock_exchange_adapter)
+    assert execution.process_exchange_order_event(ExchangeOrderEvent(
+        status=terminal_status,
+        product_id=order.product_id,
+        client_order_id=order.client_order_id,
+    ))["action"] == "applied"
+    client = _OfflinePlaceClient(_accepted_envelope(members))
+    result = enabled.transmit_initial_place_group(
+        scope, source_group, scope.execution_scope_id, request_payload,
+        OkxSpiderBatchTransport(cast(Any, client)),
+    )
+    assert result.disposition == "RECORDED"
+
+    with Session(engine) as session:
+        target_alias = session.execute(
+            select(SpiderRuntimeBinding.source_client_order_id).where(
+                SpiderRuntimeBinding.action_id == target["action_id"]
+            )
+        ).scalar_one()
+        result_decision = session.execute(
+            select(SpiderRuntimeDelivery.decision_payload).where(
+                SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                SpiderRuntimeDelivery.kind == "TRANSPORT_RESULT",
+            ).order_by(SpiderRuntimeDelivery.sequence.desc())
+        ).scalars().first()
+        assert type(result_decision) is bytes
+        decision = cast(dict[str, object], decode_canonical(result_decision))
+        source_input = cast(dict[str, object], decision["source_input"])
+        assert source_input["type"] == "REST_ACK"
+        entries = cast(list[dict[str, object]], source_input["entries"])
+        assert target_alias not in {entry["clOrdId"] for entry in entries}
+        assert entries
+        assert enabled.readback(scope, _operation_id) is not None
+
+
+def test_rest_ack_decision_remains_before_later_terminal_receipt(
+    operation_pg: Engine,
+    mock_clock,
+    mock_exchange_adapter,
+) -> None:
+    """A later terminal status cannot rewrite the saved earlier ACK input."""
+    engine = operation_pg
+    owner, scope, operation_id, order_manager, _prepared, _initial, *_ = _install_owner(engine)
+    source_group, request_payload, members = _saved_initial_place_request(engine, scope)
+    enabled = _transport_enabled_owner(owner, scope)
+    target = members[0]
+    order = order_manager.repo.get_order(cast(str, target["local_order_id"]))
+    assert order is not None
+    client = _OfflinePlaceClient(_accepted_envelope(members))
+    result = enabled.transmit_initial_place_group(
+        scope, source_group, scope.execution_scope_id, request_payload,
+        OkxSpiderBatchTransport(cast(Any, client)),
+    )
+    assert result.disposition == "RECORDED"
+    execution = _execution_for_owner(enabled, engine, mock_clock, mock_exchange_adapter)
+    assert execution.process_exchange_order_event(ExchangeOrderEvent(
+        status="canceled",
+        product_id=order.product_id,
+        client_order_id=order.client_order_id,
+    ))["action"] == "applied"
+
+    with Session(engine) as session:
+        target_alias = session.execute(
+            select(SpiderRuntimeBinding.source_client_order_id).where(
+                SpiderRuntimeBinding.action_id == target["action_id"]
+            )
+        ).scalar_one()
+        result_decision = session.execute(
+            select(SpiderRuntimeDelivery.decision_payload).where(
+                SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                SpiderRuntimeDelivery.kind == "TRANSPORT_RESULT",
+            ).order_by(SpiderRuntimeDelivery.sequence.desc())
+        ).scalars().first()
+        assert type(result_decision) is bytes
+        decision = cast(dict[str, object], decode_canonical(result_decision))
+        entries = cast(
+            list[dict[str, object]],
+            cast(dict[str, object], decision["source_input"])["entries"],
+        )
+        assert target_alias in {entry["clOrdId"] for entry in entries}
+        assert enabled.readback(scope, operation_id) is not None
+
+
+@pytest.mark.parametrize("commit_fault", ["rollback", "lost_commit"])
+def test_normal_tx_b_rollback_or_lost_commit_replays_once_from_cold_owner(
+    operation_pg: Engine,
+    mock_clock,
+    mock_exchange_adapter,
+    commit_fault: str,
+) -> None:
+    """A failed TX B is retried from durable receipts, never source-local memory."""
+    engine = operation_pg
+    owner, scope, operation_id, order_manager, _prepared, _initial, *_ = _install_owner(engine)
+    source_group, request_payload, members = _saved_initial_place_request(engine, scope)
+    enabled = _transport_enabled_owner(owner, scope)
+    target = members[0]
+    order = order_manager.repo.get_order(cast(str, target["local_order_id"]))
+    assert order is not None and order.price is not None
+    execution = _execution_for_owner(enabled, engine, mock_clock, mock_exchange_adapter)
+    fired = {"count": 0}
+
+    def fail_before_flush(session: Session, _flush_context: object, _instances: object) -> None:
+        staged_decision = any(
+            isinstance(row, SpiderRuntimeDelivery)
+            and row.kind in {"FILL", "ORDER_STATE", "TRANSPORT_RESULT"}
+            and row.decision_payload is not None
+            for row in (*session.new, *session.dirty)
+        )
+        if staged_decision:
+            fired["count"] += 1
+            session.info["spider_normal_tx_b_commit"] = True
+            if commit_fault == "rollback":
+                raise RuntimeError("injected normal TX B rollback")
+
+    def fail_after_commit(session: Session) -> None:
+        if session.info.pop("spider_normal_tx_b_commit", False) and commit_fault == "lost_commit":
+            fired["count"] += 1
+            raise RuntimeError("injected lost TX B commit response")
+
+    event.listen(Session, "before_flush", fail_before_flush)
+    event.listen(Session, "after_commit", fail_after_commit)
+    try:
+        class FillBeforeAckClient:
+            def privatePostTradeBatchOrders(self, _orders: list[dict[str, object]]) -> object:
+                quantity = order.quantity
+                assert execution.process_exchange_order_event(ExchangeOrderEvent(
+                    status="filled",
+                    product_id=order.product_id,
+                    client_order_id=order.client_order_id,
+                    exchange_order_id="normal-replay-provider-order",
+                    cumulative_filled_quantity=quantity,
+                    cumulative_average_price=cast(Decimal, order.price),
+                    last_fill_quantity=quantity,
+                    last_fill_price=cast(Decimal, order.price),
+                    fee=Decimal("0.01"),
+                    fee_asset="USDT",
+                    last_fill_exchange_trade_id="normal-replay-trade",
+                ))["action"] == "applied"
+                return {
+                    "code": "0",
+                    "data": [
+                        {"clOrdId": member["wire_clOrdId"], "ordId": f"replay-{i}", "sCode": "0"}
+                        for i, member in enumerate(members)
+                    ],
+                    "msg": "synthetic ACK after financial fact",
+                }
+
+            def privatePostTradeCancelBatchOrders(self, _orders: list[dict[str, object]]) -> object:
+                raise AssertionError("normal callback records a cancel intent only")
+
+        enabled.transmit_initial_place_group(
+            scope,
+            source_group,
+            scope.execution_scope_id,
+            request_payload,
+            OkxSpiderBatchTransport(cast(Any, FillBeforeAckClient())),
+        )
+    finally:
+        event.remove(Session, "before_flush", fail_before_flush)
+        event.remove(Session, "after_commit", fail_after_commit)
+
+    assert fired["count"] >= 1
+    with Session(engine) as session:
+        runtime_before_replay = session.execute(
+            select(SpiderRuntimeScope).where(SpiderRuntimeScope.strategy_id == scope.strategy_id)
+        ).scalar_one()
+        received_before_replay = runtime_before_replay.last_received_sequence
+        consumed_before_replay = runtime_before_replay.last_consumed_sequence
+        trade_before_replay = session.execute(
+            select(Trade).where(Trade.exchange_trade_id == "normal-replay-trade")
+        ).scalar_one()
+        saved_fact = (trade_before_replay.id, trade_before_replay.quantity, trade_before_replay.price)
+        receipt_count = session.scalar(
+            select(func.count()).select_from(SpiderRuntimeDelivery).where(
+                SpiderRuntimeDelivery.strategy_id == scope.strategy_id
+            )
+        )
+    if commit_fault == "rollback":
+        assert consumed_before_replay < received_before_replay
+    else:
+        assert consumed_before_replay == received_before_replay
+
+    # Reconstructing the owner exercises checkpoint/decision/action proofs with
+    # no process-local callbacks. Any committed decision keeps its full key once.
+    cold = _transport_enabled_owner(owner, scope)
+    cold.restore_owned_runtimes()
+    cold_readback = cold.readback(scope, operation_id)
+    assert cold_readback is not None and cold_readback["trading_ready"] is False
+    with Session(engine) as session:
+        runtime_after_replay = session.execute(
+            select(SpiderRuntimeScope).where(SpiderRuntimeScope.strategy_id == scope.strategy_id)
+        ).scalar_one()
+        trade_after_replay = session.execute(
+            select(Trade).where(Trade.exchange_trade_id == "normal-replay-trade")
+        ).scalar_one()
+        assert runtime_after_replay.last_consumed_sequence == runtime_after_replay.last_received_sequence
+        assert (trade_after_replay.id, trade_after_replay.quantity, trade_after_replay.price) == saved_fact
+        full_claims = session.scalar(
+            select(func.count()).select_from(SpiderRuntimeDelivery).where(
+                SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                SpiderRuntimeDelivery.full_callback_key.is_not(None),
+            )
+        )
+        assert full_claims == 1
+        assert session.scalar(
+            select(func.count()).select_from(SpiderRuntimeDelivery).where(
+                SpiderRuntimeDelivery.strategy_id == scope.strategy_id
+            )
+        ) == receipt_count
+
+
+def _record_n3_policy_failure(
+    engine: Engine,
+    mock_clock,
+    mock_exchange_adapter,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    with_lifecycle: bool = False,
+) -> tuple[SpiderRuntimeOwner, RuntimeScopeKey, str, str, str, bytes, int]:
+    base_owner, scope, operation_id, order_manager, _prepared, _initial, *_ = _install_owner(
+        engine, admitted_run=_normal_n3_run()
+    )
+    source_group, request_payload, members = _saved_initial_place_request(engine, scope)
+    if with_lifecycle:
+        class RedisProbe:
+            def publish(self, _channel: str, _message: str) -> int:
+                return 1
+
+        lifecycle_lock = RLock()
+        order_event_lock = RLock()
+        enabled = SpiderRuntimeOwner(
+            base_owner._sessions,
+            base_owner._order_manager,
+            owned_scopes=(scope,),
+            model_sources_by_confirmation=base_owner._model_sources,
+            strategy_state_manager=StrategyStateManager(
+                sessionmaker(engine), RedisProbe()
+            ),
+            lifecycle_lock=lambda _strategy_id: lifecycle_lock,
+            order_event_lock=order_event_lock,
+            transport_response_classifier=classify_okx_batch_response,
+        )
+    else:
+        enabled = _transport_enabled_owner(base_owner, scope)
+    target = next(
+        member for member in members
+        if cast(dict[str, object], member["request_payload"]).get("side") == "buy"
+        and cast(dict[str, object], member["request_payload"]).get("px") == "50"
+    )
+    order = order_manager.repo.get_order(cast(str, target["local_order_id"]))
+    assert order is not None
+    execution = ExecutionEngine(
+        db_session=None,
+        clock=mock_clock,
+        adapter=mock_exchange_adapter,
+        db_session_factory=sessionmaker(engine),
+        repository_transaction_participant=enabled.participate_in_order_transaction,
+        owned_order_event_observer=(
+            enabled.observe_order_event if with_lifecycle else None
+        ),
+        is_backtest=True,
+    )
+    before_fill: dict[str, object] = {}
+
+    original_callback = runtime_owner_module.invoke_saved_source_callback
+
+    def fail_after_saved_callback(policy: object, source_input: dict[str, object]) -> None:
+        order_input = source_input.get("order")
+        if (
+            source_input.get("type") == "ORDERS"
+            and type(order_input) is dict
+            and order_input.get("state") == "filled"
+        ):
+            with Session(engine) as session:
+                runtime_before_callback = session.execute(
+                    select(
+                        SpiderRuntimeScope.source_checkpoint,
+                        SpiderRuntimeScope.last_consumed_sequence,
+                    ).where(SpiderRuntimeScope.strategy_id == scope.strategy_id)
+                ).one()
+                before_fill["checkpoint"] = bytes(runtime_before_callback.source_checkpoint)
+                before_fill["consumed"] = runtime_before_callback.last_consumed_sequence
+        original_callback(policy, source_input)
+        if (
+            source_input.get("type") == "ORDERS"
+            and type(order_input) is dict
+            and order_input.get("state") == "filled"
+        ):
+            raise RuntimeError("test failure after saved Policy callback")
+
+    monkeypatch.setattr(
+        runtime_owner_module, "invoke_saved_source_callback", fail_after_saved_callback
+    )
+
+    class FillBeforeAckClient:
+        calls = 0
+
+        def privatePostTradeBatchOrders(self, _orders: list[dict[str, object]]) -> object:
+            self.calls += 1
+            assert execution.process_exchange_order_event(_filled_event(
+                order,
+                provider_id="normal-policy-failure-provider",
+                trade_id="normal-policy-failure-trade",
+            ))["action"] == "applied"
+            response = _accepted_envelope(members)
+            rows = cast(list[dict[str, object]], response["data"])
+            selected = next(
+                row for row in rows
+                if row["clOrdId"] == target["wire_clOrdId"]
+            )
+            selected["ordId"] = "normal-policy-failure-provider"
+            return response
+
+        def privatePostTradeCancelBatchOrders(
+            self, _orders: list[dict[str, object]]
+        ) -> object:
+            raise AssertionError("PLACE transport must not call CANCEL")
+
+    client = FillBeforeAckClient()
+    outcome = enabled.transmit_initial_place_group(
+        scope,
+        source_group,
+        scope.execution_scope_id,
+        request_payload,
+        OkxSpiderBatchTransport(cast(Any, client)),
+    )
+    assert outcome.disposition == "RECORDED"
+    assert client.calls == 1
+    with Session(engine) as session:
+        failure = session.execute(
+            select(SpiderRuntimeDelivery).where(
+                SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                SpiderRuntimeDelivery.kind.in_(("FILL", "ORDER_STATE")),
+                SpiderRuntimeDelivery.disposition == "PENDING",
+                SpiderRuntimeDelivery.decision_payload.is_not(None),
+            ).order_by(SpiderRuntimeDelivery.sequence)
+        ).scalars().first()
+        assert failure is not None
+        assert failure.disposition == "PENDING"
+        assert failure.decision_payload is not None
+        assert failure.full_callback_key is None
+        failure_decision = cast(
+            dict[str, object], decode_canonical(bytes(failure.decision_payload))
+        )
+        assert failure_decision["outcome"] == "POLICY_FAILED"
+        initial_plan_id = session.execute(
+            select(SpiderRuntimeScope.initial_plan_id).where(
+                SpiderRuntimeScope.strategy_id == scope.strategy_id
+            )
+        ).scalar_one()
+        assert session.scalar(
+            select(func.count()).select_from(SpiderRuntimeAction).where(
+                SpiderRuntimeAction.plan_id == initial_plan_id,
+                SpiderRuntimeAction.trigger_delivery_id == failure.delivery_id,
+            )
+        ) == 0
+        assert session.scalar(
+            select(func.count()).select_from(Trade).where(
+                Trade.exchange_trade_id == "normal-policy-failure-trade"
+            )
+        ) == 1
+    assert type(before_fill.get("checkpoint")) is bytes
+    assert type(before_fill.get("consumed")) is int
+    return (
+        enabled, scope, operation_id, failure.delivery_id,
+        "normal-policy-failure-trade",
+        cast(bytes, before_fill["checkpoint"]),
+        cast(int, before_fill["consumed"]),
+    )
+
+
+def test_pending_policy_failure_is_reproved_as_cold_financial_prefix(
+    operation_pg: Engine,
+    mock_clock,
+    mock_exchange_adapter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = operation_pg
+    owner, scope, operation_id, failure_id, trade_id, checkpoint_before, cursor_before = (
+        _record_n3_policy_failure(engine, mock_clock, mock_exchange_adapter, monkeypatch)
+    )
+    with Session(engine) as session:
+        failure = session.execute(
+            select(SpiderRuntimeDelivery).where(
+                SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                SpiderRuntimeDelivery.delivery_id == failure_id,
+            )
+        ).scalar_one()
+        assert failure.disposition == "PENDING"
+        assert failure.decision_payload is not None
+        saved_decision = cast(dict[str, object], decode_canonical(bytes(failure.decision_payload)))
+        assert saved_decision["outcome"] == "POLICY_FAILED"
+        assert saved_decision["reason_code"] == "SOURCE_POLICY_FAILED"
+        assert saved_decision["full_callback_key"] is not None
+        assert saved_decision["candidates"] == []
+        assert session.execute(
+            select(SpiderRuntimeScope.source_checkpoint).where(
+                SpiderRuntimeScope.strategy_id == scope.strategy_id
+            )
+        ).scalar_one() == checkpoint_before
+        failure_cursor = session.execute(
+            select(SpiderRuntimeScope.last_consumed_sequence).where(
+                SpiderRuntimeScope.strategy_id == scope.strategy_id
+            )
+        ).scalar_one()
+        assert failure_cursor == cursor_before
+        assert cursor_before < failure.sequence
+        trade_before = session.execute(
+            select(Trade).where(Trade.exchange_trade_id == trade_id)
+        ).scalar_one()
+        trade_fact = (trade_before.id, trade_before.order_id, trade_before.quantity, trade_before.price)
+
+    cold = _transport_enabled_owner(owner, scope)
+    proved = cold.readback(scope, operation_id)
+    assert proved is not None and proved["trading_ready"] is False
+    with Session(engine) as session:
+        runtime = session.execute(
+            select(SpiderRuntimeScope).where(SpiderRuntimeScope.strategy_id == scope.strategy_id)
+        ).scalar_one()
+        trade_after = session.execute(
+            select(Trade).where(Trade.exchange_trade_id == trade_id)
+        ).scalar_one()
+        assert runtime.last_consumed_sequence == cursor_before
+        assert bytes(runtime.source_checkpoint) == checkpoint_before
+        assert (trade_after.id, trade_after.order_id, trade_after.quantity, trade_after.price) == trade_fact
+
+
+def test_existing_stop_suppresses_pending_policy_failure_without_replaying_it(
+    operation_pg: Engine,
+    mock_clock,
+    mock_exchange_adapter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = operation_pg
+    owner, scope, operation_id, failure_id, trade_id, _checkpoint, _cursor = (
+        _record_n3_policy_failure(
+            engine,
+            mock_clock,
+            mock_exchange_adapter,
+            monkeypatch,
+            with_lifecycle=True,
+        )
+    )
+    before = owner.readback(scope, operation_id)
+    assert before is not None and before["runtime_control"] == "RUN"
+    state_version = cast(int, before["state_version"])
+    with Session(engine) as session:
+        failure = session.execute(
+            select(SpiderRuntimeDelivery).where(
+                SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                SpiderRuntimeDelivery.delivery_id == failure_id,
+            )
+        ).scalar_one()
+        assert failure.disposition == "PENDING"
+        assert failure.decision_payload is not None
+        assert failure.decision_sha256 is not None
+        decision_bytes = bytes(failure.decision_payload)
+        decision_hash = failure.decision_sha256
+        runtime = session.execute(
+            select(
+                SpiderRuntimeScope.source_checkpoint,
+                SpiderRuntimeScope.last_consumed_sequence,
+                SpiderRuntimeScope.last_received_sequence,
+            ).where(SpiderRuntimeScope.strategy_id == scope.strategy_id)
+        ).one()
+        assert runtime.source_checkpoint is not None
+        checkpoint_before_stop = bytes(runtime.source_checkpoint)
+        consumed_before_stop = runtime.last_consumed_sequence
+        received_before_stop = runtime.last_received_sequence
+        trade = session.execute(
+            select(Trade).where(Trade.exchange_trade_id == trade_id)
+        ).scalar_one()
+        trade_fact = (trade.id, trade.order_id, trade.quantity, trade.price, trade.fee)
+        original_action_ids = tuple(session.execute(
+            select(SpiderRuntimeAction.action_id).where(
+                SpiderRuntimeAction.strategy_id == scope.strategy_id,
+                SpiderRuntimeAction.trigger_delivery_id.is_(None),
+            ).order_by(SpiderRuntimeAction.candidate_ordinal)
+        ).scalars().all())
+    assert consumed_before_stop < received_before_stop
+
+    stopped = _dispatch(
+        owner,
+        _command(
+            scope,
+            key="pending-policy-failure-stop",
+            version=state_version,
+        ),
+    )
+    assert stopped.success and stopped.completed
+    stopped_readback = owner.readback(scope, operation_id)
+    assert stopped_readback is not None
+    assert stopped_readback["runtime_control"] == "STOP"
+    assert stopped_readback["trading_ready"] is False
+    assert stopped_readback["checkpoint_sha256"] == before["checkpoint_sha256"]
+    assert owner.restore_owned_runtimes() == frozenset({scope.strategy_id})
+    cold_readback = owner.readback(scope, operation_id)
+    assert cold_readback is not None
+    expected_cold_readback = dict(stopped_readback)
+    expected_cold_readback["consumed_sequence"] = received_before_stop
+    assert cold_readback == expected_cold_readback
+
+    with Session(engine) as session:
+        failure = session.execute(
+            select(SpiderRuntimeDelivery).where(
+                SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                SpiderRuntimeDelivery.delivery_id == failure_id,
+            )
+        ).scalar_one()
+        assert failure.disposition == "SUPPRESSED"
+        assert failure.suppression_reason == "STOP_CONTROL"
+        assert failure.decision_payload is not None
+        assert bytes(failure.decision_payload) == decision_bytes
+        assert failure.decision_sha256 == decision_hash
+        runtime = session.execute(
+            select(SpiderRuntimeScope).where(SpiderRuntimeScope.strategy_id == scope.strategy_id)
+        ).scalar_one()
+        assert runtime.last_consumed_sequence == runtime.last_received_sequence
+        assert runtime.last_received_sequence == received_before_stop
+        assert bytes(runtime.source_checkpoint) == checkpoint_before_stop
+        trade = session.execute(
+            select(Trade).where(Trade.exchange_trade_id == trade_id)
+        ).scalar_one()
+        assert (trade.id, trade.order_id, trade.quantity, trade.price, trade.fee) == trade_fact
+        current_action_ids = tuple(session.execute(
+            select(SpiderRuntimeAction.action_id).where(
+                SpiderRuntimeAction.strategy_id == scope.strategy_id,
+                SpiderRuntimeAction.trigger_delivery_id.is_(None),
+            ).order_by(SpiderRuntimeAction.candidate_ordinal)
+        ).scalars().all())
+        assert current_action_ids == original_action_ids
+        assert session.scalar(
+            select(func.count()).select_from(SpiderRuntimeAction).where(
+                SpiderRuntimeAction.strategy_id == scope.strategy_id,
+                SpiderRuntimeAction.trigger_delivery_id.is_not(None),
+            )
+        ) == 0
+        suppressed_after_cursor = session.execute(
+            select(SpiderRuntimeDelivery.kind, SpiderRuntimeDelivery.disposition,
+                   SpiderRuntimeDelivery.suppression_reason)
+            .where(
+                SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                SpiderRuntimeDelivery.sequence > consumed_before_stop,
+            ).order_by(SpiderRuntimeDelivery.sequence)
+        ).all()
+        assert suppressed_after_cursor
+        assert all(
+            disposition == "SUPPRESSED" and reason == "STOP_CONTROL"
+            for _kind, disposition, reason in suppressed_after_cursor
+        )
+
+
+@pytest.mark.parametrize("changed_field", ["event_prefix", "full_callback_key", "reason_code"])
+def test_cold_proof_rejects_inconsistent_pending_policy_failure_evidence(
+    operation_pg: Engine,
+    mock_clock,
+    mock_exchange_adapter,
+    monkeypatch: pytest.MonkeyPatch,
+    changed_field: str,
+) -> None:
+    owner, scope, operation_id, failure_id, _trade_id, _checkpoint, _cursor = _record_n3_policy_failure(
+        operation_pg, mock_clock, mock_exchange_adapter, monkeypatch
+    )
+    with Session(operation_pg) as session:
+        failure = session.execute(
+            select(SpiderRuntimeDelivery).where(
+                SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                SpiderRuntimeDelivery.delivery_id == failure_id,
+            )
+        ).scalar_one()
+        assert failure.decision_payload is not None
+        decision = cast(dict[str, object], decode_canonical(bytes(failure.decision_payload)))
+        if changed_field == "event_prefix":
+            cast(list[object], decision["events"]).append({"kind": "send", "orders": []})
+        elif changed_field == "full_callback_key":
+            decision["full_callback_key"] = "0" * 64
+        else:
+            decision["reason_code"] = "OTHER_FAILURE"
+        corrupted = canonical_bytes(decision)
+        failure.decision_payload = corrupted
+        failure.decision_sha256 = sha256(corrupted).hexdigest()
+        session.commit()
+    assert _transport_enabled_owner(owner, scope).readback(scope, operation_id) is None
+
+
+def _record_n3_full_decision(
+    engine: Engine,
+    mock_clock,
+    mock_exchange_adapter,
+) -> tuple[SpiderRuntimeOwner, RuntimeScopeKey, str, str]:
+    owner, scope, operation_id, order_manager, _prepared, _initial, *_ = _install_owner(
+        engine, admitted_run=_normal_n3_run()
+    )
+    source_group, request_payload, members = _saved_initial_place_request(engine, scope)
+    enabled = _transport_enabled_owner(owner, scope)
+    target = next(
+        member for member in members
+        if cast(dict[str, object], member["request_payload"]).get("side") == "buy"
+        and cast(dict[str, object], member["request_payload"]).get("px") == "50"
+    )
+    order = order_manager.repo.get_order(cast(str, target["local_order_id"]))
+    assert order is not None
+    execution = _execution_for_owner(enabled, engine, mock_clock, mock_exchange_adapter)
+
+    class FillBeforeAckClient:
+        def privatePostTradeBatchOrders(self, _orders: list[dict[str, object]]) -> object:
+            assert execution.process_exchange_order_event(_filled_event(
+                order,
+                provider_id="normal-candidate-proof-provider",
+                trade_id="normal-candidate-proof-trade",
+            ))["action"] == "applied"
+            return _accepted_envelope(members)
+
+        def privatePostTradeCancelBatchOrders(
+            self, _orders: list[dict[str, object]]
+        ) -> object:
+            raise AssertionError("PLACE transport must not call CANCEL")
+
+    assert enabled.transmit_initial_place_group(
+        scope,
+        source_group,
+        scope.execution_scope_id,
+        request_payload,
+        OkxSpiderBatchTransport(cast(Any, FillBeforeAckClient())),
+    ).disposition == "RECORDED"
+    with Session(engine) as session:
+        rows = session.execute(
+            select(SpiderRuntimeDelivery).where(
+                SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                SpiderRuntimeDelivery.decision_payload.is_not(None),
+            ).order_by(SpiderRuntimeDelivery.sequence)
+        ).scalars().all()
+        full = next(
+            row for row in rows
+            if type(row.decision_payload) is bytes
+            and cast(dict[str, object], decode_canonical(row.decision_payload))[
+                "full_callback_key"
+            ] is not None
+        )
+        assert full.decision_payload is not None
+        decision = cast(dict[str, object], decode_canonical(bytes(full.decision_payload)))
+        assert any(
+            candidate.get("operation") == "CANCEL"
+            for candidate in cast(list[dict[str, object]], decision["candidates"])
+        )
+        assert any(
+            candidate.get("operation") == "PLACE"
+            for candidate in cast(list[dict[str, object]], decision["candidates"])
+        )
+    assert enabled.readback(scope, operation_id) is not None
+    return owner, scope, operation_id, full.delivery_id
+
+
+@pytest.mark.parametrize("operation", ["PLACE", "CANCEL"])
+def test_cold_proof_recomputes_filtered_and_unresolved_candidate_disposition(
+    operation_pg: Engine,
+    mock_clock,
+    mock_exchange_adapter,
+    operation: str,
+) -> None:
+    owner, scope, operation_id, delivery_id = _record_n3_full_decision(
+        operation_pg, mock_clock, mock_exchange_adapter
+    )
+    with Session(operation_pg) as session:
+        delivery = session.execute(
+            select(SpiderRuntimeDelivery).where(
+                SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                SpiderRuntimeDelivery.delivery_id == delivery_id,
+            )
+        ).scalar_one()
+        assert delivery.decision_payload is not None
+        decision = cast(dict[str, object], decode_canonical(bytes(delivery.decision_payload)))
+        candidates = cast(list[dict[str, object]], decision["candidates"])
+        candidate = next(value for value in candidates if value["operation"] == operation)
+        persisted_action_id = cast(str, candidate["action_id"])
+        if operation == "PLACE":
+            local_order_id = cast(str, candidate["local_order_id"])
+            binding = session.get(SpiderRuntimeBinding, persisted_action_id)
+            action = session.get(SpiderRuntimeAction, persisted_action_id)
+            local_order = session.get(Order, local_order_id)
+            assert binding is not None and action is not None and local_order is not None
+            session.delete(binding)
+            session.flush()
+            session.delete(action)
+            session.flush()
+            session.delete(local_order)
+            candidate.update(
+                disposition="FILTERED_SOURCE",
+                reason_code="SOURCE_PRODUCT_UNAVAILABLE",
+                action_id=None,
+                local_order_id=None,
+                target_place_action_id=None,
+            )
+        else:
+            assert candidate["target_place_action_id"] is not None
+            cancel_action = session.get(SpiderRuntimeAction, persisted_action_id)
+            assert cancel_action is not None and cancel_action.operation == "CANCEL"
+            session.delete(cancel_action)
+            candidate.update(
+                disposition="UNRESOLVED_TARGET",
+                reason_code="SOURCE_CANCEL_TARGET_UNRESOLVED",
+                action_id=None,
+                local_order_id=None,
+                target_place_action_id=None,
+            )
+        corrupted = canonical_bytes(decision)
+        delivery.decision_payload = corrupted
+        delivery.decision_sha256 = sha256(corrupted).hexdigest()
+        session.commit()
+    assert _transport_enabled_owner(owner, scope).readback(scope, operation_id) is None
+
+
+def test_stop_drains_actual_execution_receipts_without_normal_grid_decisions(
+    operation_pg: Engine,
+    mock_clock,
+    mock_exchange_adapter,
+) -> None:
+    engine = operation_pg
+    owner, scope, operation_id, _factory, initial = _owner_with_lifecycle(engine)
+    order_manager = owner._order_manager
+    source_group, request_payload, members = _saved_initial_place_request(engine, scope)
+    owner._transport_response_classifier = classify_okx_batch_response
+    enabled = owner
+    offline = _OfflinePlaceClient({
+        "code": "0",
+        "data": [
+            {"clOrdId": member["wire_clOrdId"], "ordId": f"stop-provider-{i}", "sCode": "0"}
+            for i, member in enumerate(members)
+        ],
+        "msg": "synthetic acknowledged initial source orders",
+    })
+    assert enabled.transmit_initial_place_group(
+        scope, source_group, scope.execution_scope_id, request_payload,
+        OkxSpiderBatchTransport(cast(Any, offline)),
+    ).disposition == "RECORDED"
+    with Session(engine) as session:
+        before_barrier = session.scalar(
+            select(SpiderRuntimeScope.last_tape_sequence).where(
+                SpiderRuntimeScope.strategy_id == scope.strategy_id
+            )
+        )
+        before_checkpoint = bytes(session.execute(
+            select(SpiderRuntimeScope.source_checkpoint).where(
+                SpiderRuntimeScope.strategy_id == scope.strategy_id
+            )
+        ).scalar_one())
+        before_receipts = session.execute(
+            select(
+                SpiderRuntimeTapeIndex.ordinal,
+                SpiderRuntimeDelivery.sequence,
+                SpiderRuntimeDelivery.delivery_id,
+                SpiderRuntimeDelivery.kind,
+                SpiderRuntimeDelivery.disposition,
+                SpiderRuntimeDelivery.suppression_reason,
+                SpiderRuntimeDelivery.content_sha256,
+                SpiderRuntimeDelivery.source_payload,
+                SpiderRuntimeDelivery.decision_payload,
+                SpiderRuntimeDelivery.decision_sha256,
+            )
+            .join(
+                SpiderRuntimeTapeIndex,
+                SpiderRuntimeTapeIndex.delivery_sequence == SpiderRuntimeDelivery.sequence,
+            ).where(
+                SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                SpiderRuntimeDelivery.kind.in_(("FILL", "ORDER_STATE")),
+                SpiderRuntimeTapeIndex.kind == "DELIVERY",
+            ).order_by(SpiderRuntimeDelivery.sequence)
+        ).all()
+    stopped = _dispatch(owner, _command(
+        scope, key="normal-receipt-stop", version=cast(int, initial["state_version"])
+    ))
+    assert stopped.success and stopped.completed
+
+    order = order_manager.repo.get_order(cast(str, members[0]["local_order_id"]))
+    assert order is not None and order.price is not None
+    execution = ExecutionEngine(
+        db_session=None,
+        clock=mock_clock,
+        adapter=mock_exchange_adapter,
+        db_session_factory=sessionmaker(engine),
+        repository_transaction_participant=owner.participate_in_order_transaction,
+        owned_order_event_observer=owner.observe_order_event,
+        is_backtest=True,
+    )
+    assert execution.process_exchange_order_event(_filled_event(
+        order, provider_id="stop-preserved-provider-order", trade_id="stop-preserved-trade"
+    ))["action"] == "applied"
+    stopped_readback = enabled.readback(scope, operation_id)
+    assert stopped_readback is not None
+    assert stopped_readback["runtime_control"] == "STOP"
+    with Session(engine) as session:
+        trade = session.execute(
+            select(Trade).where(Trade.exchange_trade_id == "stop-preserved-trade")
+        ).scalar_one()
+        assert (trade.order_id, trade.quantity, trade.price) == (
+            order.id, order.quantity, order.price
+        )
+        barrier = cast(int, stopped_readback["barrier_sequence"])
+        assert barrier == before_barrier
+        after_receipts = session.execute(
+            select(
+                SpiderRuntimeTapeIndex.ordinal,
+                SpiderRuntimeDelivery.sequence,
+                SpiderRuntimeDelivery.delivery_id,
+                SpiderRuntimeDelivery.kind,
+                SpiderRuntimeDelivery.disposition,
+                SpiderRuntimeDelivery.suppression_reason,
+                SpiderRuntimeDelivery.content_sha256,
+                SpiderRuntimeDelivery.source_payload,
+                SpiderRuntimeDelivery.decision_payload,
+                SpiderRuntimeDelivery.decision_sha256,
+            )
+            .join(
+                SpiderRuntimeTapeIndex,
+                SpiderRuntimeTapeIndex.delivery_sequence == SpiderRuntimeDelivery.sequence,
+            ).where(
+                SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                SpiderRuntimeDelivery.kind.in_(("FILL", "ORDER_STATE")),
+                SpiderRuntimeTapeIndex.kind == "DELIVERY",
+            ).order_by(SpiderRuntimeDelivery.sequence)
+        ).all()
+        prior_receipts = [row for row in after_receipts if row.ordinal <= barrier]
+        assert prior_receipts == before_receipts
+        post_barrier = [row for row in after_receipts if row.ordinal > barrier]
+        assert post_barrier and all(
+            row.disposition == "SUPPRESSED"
+            and row.suppression_reason == "STOP_CONTROL"
+            and row.decision_payload is None
+            and row.decision_sha256 is None
+            for row in post_barrier
+        )
+        assert session.scalar(
+            select(func.count()).select_from(SpiderRuntimeAction).where(
+                SpiderRuntimeAction.strategy_id == scope.strategy_id,
+                SpiderRuntimeAction.trigger_delivery_id.is_not(None),
+            )
+        ) == 0
+        after_checkpoint = bytes(session.execute(
+            select(SpiderRuntimeScope.source_checkpoint).where(
+                SpiderRuntimeScope.strategy_id == scope.strategy_id
+            )
+        ).scalar_one())
+        assert after_checkpoint == before_checkpoint
 
 
 def test_fill_before_rejection_keeps_same_financial_fact_and_returns_unknown_projection(

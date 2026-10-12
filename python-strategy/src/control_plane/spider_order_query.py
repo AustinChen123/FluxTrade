@@ -393,6 +393,7 @@ class SpiderOrderQueryService:
                     SpiderRuntimeAction.environment == scope_key[0],
                     SpiderRuntimeAction.execution_scope_id == scope_key[1],
                     SpiderRuntimeAction.strategy_id == scope_key[2],
+                    SpiderRuntimeAction.operation == "PLACE",
                 ]
                 if query["order_created_from_ms"] is not None:
                     row_filters.extend(

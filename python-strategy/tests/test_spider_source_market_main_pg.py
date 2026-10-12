@@ -13,10 +13,12 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import sessionmaker
 
 from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_canonical
+from src.core.adapters.okx_spider_transport import OkxSpiderBatchTransport
 from src.core.interfaces.exchange import ExchangeOrderEvent
 from src.core.orm_models import Order, Trade
 from src.core.spider_management.orm import (
     SpiderRuntimeAction,
+    SpiderRuntimeBinding,
     SpiderRuntimeDelivery,
     SpiderRuntimePlan,
     SpiderRuntimeScope,
@@ -24,7 +26,11 @@ from src.core.spider_management.orm import (
 )
 from src.core.spider_management.runtime_owner import SpiderRuntimeComposition
 from test_migrations import fresh_pg_db as _migration_fresh_pg_db
-from test_spider_financial_delivery_pg import _install_owner
+from test_spider_financial_delivery_pg import (
+    _install_owner,
+    _saved_initial_place_request,
+)
+from test_spider_transmission_owner_pg import _normal_n3_run, _saved_group_request
 from test_spider_operation_request_pg import operation_pg as _operation_pg
 
 pytest_plugins = ["test_migrations"]
@@ -131,14 +137,19 @@ def _snapshot(factory: Any, scope: Any) -> dict[str, Any]:
 
 
 def _configure_main(monkeypatch: Any, engine_db: Engine, composition: Any,
-                    events: list[str], captured: dict[str, Any]) -> None:
+                    events: list[str], captured: dict[str, Any],
+                    adapter_config: dict[str, object] | None = None) -> None:
     from src import main as main_module
     from src.core.engine import StrategyEngine
 
     factory = sessionmaker(engine_db)
     monkeypatch.setenv("FLUXTRADE_ENVIRONMENT", "test")
     monkeypatch.setattr(main_module, "SessionLocal", lambda: factory())
-    monkeypatch.setattr(main_module, "_adapter_config_from_env", lambda: {"mode": "simulated"})
+    monkeypatch.setattr(
+        main_module,
+        "_adapter_config_from_env",
+        lambda: adapter_config or {"mode": "simulated"},
+    )
     monkeypatch.setattr(main_module, "_validate_runtime_config", lambda *_a, **_k: None)
     monkeypatch.setattr(main_module, "_strategy_artifact_loader_from_env", lambda: lambda: {})
     monkeypatch.setattr(main_module, "runtime_factories_for_config", lambda _c: (None, None))
@@ -340,7 +351,7 @@ def test_main_real_engine_registers_composed_source_market_and_cleans_up(
         assert delivery.local_order_id is None and delivery.action_id is None
         assert delivery.trade_id is None and delivery.role is None
         assert tape.kind == "DELIVERY" and tape.delivery_sequence == 1
-        assert (runtime.last_received_sequence, runtime.last_consumed_sequence) == (2, 1)
+        assert (runtime.last_received_sequence, runtime.last_consumed_sequence) == (2, 2)
     after = cast(dict[str, Any], captured["market_snapshot"])
     assert (after["received"], after["consumed"]) == (1, 1)
     before_checkpoint = cast(dict[str, Any], decode_canonical(before["checkpoint"]))
@@ -378,10 +389,19 @@ def test_main_real_engine_registers_composed_source_market_and_cleans_up(
         receipt_bytes = bytes(financial_delivery.source_payload)
         receipt = cast(dict[str, Any], decode_canonical(receipt_bytes))
         assert financial_delivery.kind == "FILL"
-        assert financial_delivery.disposition == "PENDING"
-        assert (final_runtime.last_received_sequence, final_runtime.last_consumed_sequence) == (2, 1)
-        assert bytes(final_runtime.source_checkpoint) == after["checkpoint"]
-        assert final_runtime.source_checkpoint_sha256 == after["checkpoint_hash"]
+        assert financial_delivery.disposition == "CONSUMED"
+        assert financial_delivery.decision_payload is not None
+        assert financial_delivery.decision_sha256 == sha256(
+            bytes(financial_delivery.decision_payload)
+        ).hexdigest()
+        normal_decision = cast(
+            dict[str, Any], decode_canonical(bytes(financial_delivery.decision_payload))
+        )
+        assert (final_runtime.last_received_sequence, final_runtime.last_consumed_sequence) == (2, 2)
+        assert final_runtime.source_checkpoint is not None
+        assert final_runtime.source_checkpoint_sha256 == sha256(
+            bytes(final_runtime.source_checkpoint)
+        ).hexdigest()
         assert persisted_trade.exchange_trade_id == "main-source-market-fill"
         assert (
             persisted_trade.order_id,
@@ -405,7 +425,278 @@ def test_main_real_engine_registers_composed_source_market_and_cleans_up(
     final_readback = captured["owner"].readback(scope, _operation_id)
     assert final_readback is not None
     assert final_readback["trading_ready"] is False
-    assert final_readback["checkpoint_sha256"] == after["checkpoint_hash"]
+    assert normal_decision["before_checkpoint_sha256"] == after["checkpoint_hash"]
+    assert normal_decision["after_checkpoint_sha256"] == final_runtime.source_checkpoint_sha256
+    assert final_readback["checkpoint_sha256"] == final_runtime.source_checkpoint_sha256
+
+
+def test_main_execution_tx_a_to_normal_tx_b_uses_n3_source_and_cold_query_proof(
+    operation_pg: Engine, monkeypatch: Any
+) -> None:
+    """Run the approved N3 fill/late-ACK path through the actual Engine entrypoint."""
+    _setup_owner, scope, operation_id, _manager, prepared, _initial, confirmation, source = (
+        _install_owner(operation_pg, admitted_run=_normal_n3_run())
+    )
+    factory = sessionmaker(operation_pg)
+    payload = _payload(scope, prepared)
+    events: list[str] = []
+    captured: dict[str, Any] = {}
+
+    def register(receiver: Any):
+        captured["source_market_result"] = receiver(payload)
+        return lambda: None
+
+    composition = SpiderRuntimeComposition(
+        (scope,), {confirmation.request_id: source}, register
+    )
+
+    def actual_fill_before_rest_ack() -> None:
+        engine = captured["engine"]
+        owner = captured["owner"]
+        source_group, request_payload, members = _saved_initial_place_request(
+            operation_pg, scope
+        )
+        captured["source_group"] = source_group
+        candidate = next(
+            member for member in members
+            if cast(dict[str, Any], member["request_payload"])["side"] == "buy"
+            and cast(dict[str, Any], member["request_payload"])["px"] == "50"
+        )
+        captured["filled_action_id"] = candidate["action_id"]
+        captured["filled_product_id"] = candidate["product_id"]
+        order = engine.execution_engine.order_manager.repo.get_order(
+            cast(str, candidate["local_order_id"])
+        )
+        assert order is not None and order.price == Decimal("50")
+        assert order.quantity == Decimal("100")
+
+        class FillThenAck:
+            def privatePostTradeBatchOrders(self, _orders: list[dict[str, object]]) -> object:
+                first = engine.execution_engine.process_exchange_order_event(
+                    ExchangeOrderEvent(
+                        status="partially_filled", product_id=order.product_id,
+                        client_order_id=order.client_order_id,
+                        exchange_order_id="main-normal-provider-order",
+                        cumulative_filled_quantity=Decimal("60"),
+                        cumulative_average_price=Decimal("48"),
+                        last_fill_quantity=Decimal("60"), last_fill_price=Decimal("48"),
+                        fee=Decimal("0.01"), fee_asset="USDT",
+                        last_fill_exchange_trade_id="main-normal-60-at-48",
+                    )
+                )
+                second = engine.execution_engine.process_exchange_order_event(
+                    ExchangeOrderEvent(
+                        status="filled", product_id=order.product_id,
+                        client_order_id=order.client_order_id,
+                        exchange_order_id="main-normal-provider-order",
+                        cumulative_filled_quantity=Decimal("100"),
+                        cumulative_average_price=Decimal("48.4"),
+                        last_fill_quantity=Decimal("40"), last_fill_price=Decimal("49"),
+                        fee=Decimal("0.02"), fee_asset="USDT",
+                        last_fill_exchange_trade_id="main-normal-40-at-49",
+                    )
+                )
+                assert first["action"] == second["action"] == "applied"
+                return {
+                    "code": "0",
+                    "data": [
+                        {
+                            "clOrdId": member["wire_clOrdId"],
+                            "ordId": (
+                                "main-normal-provider-order"
+                                if member["action_id"] == candidate["action_id"]
+                                else f"main-provider-{i}"
+                            ),
+                            "sCode": "0",
+                        }
+                        for i, member in enumerate(members)
+                    ],
+                    "msg": "ACK arrives after complete financial chain",
+                }
+
+            def privatePostTradeCancelBatchOrders(self, _orders: list[dict[str, object]]) -> object:
+                raise AssertionError("TX B records CANCEL only; provider dispatch remains gated")
+
+        result = owner.transmit_initial_place_group(
+            scope, source_group, scope.execution_scope_id, request_payload,
+            OkxSpiderBatchTransport(cast(Any, FillThenAck())),
+        )
+        assert result.disposition == "RECORDED"
+
+        with factory() as session:
+            plan_id = session.scalar(
+                select(SpiderRuntimeScope.initial_plan_id).where(
+                    SpiderRuntimeScope.strategy_id == scope.strategy_id
+                )
+            )
+            groups = list(dict.fromkeys(session.scalars(
+                select(SpiderRuntimeAction.transmission_group)
+                .where(
+                    SpiderRuntimeAction.plan_id == plan_id,
+                    SpiderRuntimeAction.operation == "PLACE",
+                    SpiderRuntimeAction.trigger_delivery_id.is_(None),
+                    SpiderRuntimeAction.transmission_group.is_not(None),
+                )
+                .order_by(SpiderRuntimeAction.candidate_ordinal)
+            )))
+            other_group = next(group for group in groups if group != source_group)
+            other_aliases = set(session.scalars(
+                select(SpiderRuntimeBinding.source_client_order_id)
+                .join(SpiderRuntimeAction, SpiderRuntimeAction.action_id == SpiderRuntimeBinding.action_id)
+                .where(
+                    SpiderRuntimeAction.plan_id == plan_id,
+                    SpiderRuntimeAction.transmission_group == other_group,
+                )
+            ))
+        other_payload, _other_members = _saved_group_request(
+            operation_pg, scope, cast(int, other_group)
+        )
+
+        class AckOnly:
+            def privatePostTradeBatchOrders(
+                self, orders: list[dict[str, object]]
+            ) -> object:
+                return {
+                    "code": "0",
+                    "data": [
+                        {"clOrdId": row["clOrdId"], "ordId": f"main-b-{i}", "sCode": "0"}
+                        for i, row in enumerate(orders)
+                    ],
+                    "msg": "second original product group acknowledged",
+                }
+
+        other_result = owner.transmit_initial_place_group(
+            scope,
+            cast(int, other_group),
+            scope.execution_scope_id,
+            other_payload,
+            OkxSpiderBatchTransport(cast(Any, AckOnly())),
+        )
+        assert other_result.disposition == "RECORDED"
+        captured["other_aliases"] = other_aliases
+        captured["filled_order_id"] = order.id
+
+    captured["on_consumer_start"] = actual_fill_before_rest_ack
+    _configure_main(
+        monkeypatch,
+        operation_pg,
+        composition,
+        events,
+        captured,
+        adapter_config={
+            "mode": "simulated",
+            "account_profile": "okx",
+            "account_id": "account-main",
+        },
+    )
+    assert captured["source_market_result"].success is True
+    assert captured["source_market_result"].data["delivery_disposition"] == "CONSUMED"
+
+    with factory() as session:
+        runtime = session.execute(
+            select(SpiderRuntimeScope).where(SpiderRuntimeScope.strategy_id == scope.strategy_id)
+        ).scalar_one()
+        rows = session.execute(
+            select(SpiderRuntimeDelivery).where(
+                SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                SpiderRuntimeDelivery.kind.in_(["FILL", "ORDER_STATE", "TRANSPORT_RESULT"]),
+            ).order_by(SpiderRuntimeDelivery.sequence)
+        ).scalars().all()
+        assert rows and all(row.disposition == "CONSUMED" for row in rows)
+        decisions = [
+            cast(dict[str, Any], decode_canonical(bytes(row.decision_payload)))
+            for row in rows if row.decision_payload is not None
+        ]
+        full = [item for item in decisions if item["full_callback_key"] is not None]
+        assert len(full) == 1
+        late_ack = next(item for item in decisions if item["trigger_kind"] == "TRANSPORT_RESULT")
+        late_ack_input = cast(dict[str, Any], late_ack["source_input"])
+        assert late_ack_input["type"] == "REST_ACK"
+        ack_aliases = {
+            row["clOrdId"] for row in cast(list[dict[str, Any]], late_ack_input["entries"])
+        }
+        expected_live_aliases = set(session.scalars(
+            select(SpiderRuntimeBinding.source_client_order_id)
+            .join(SpiderRuntimeAction, SpiderRuntimeAction.action_id == SpiderRuntimeBinding.action_id)
+            .where(
+                SpiderRuntimeAction.strategy_id == scope.strategy_id,
+                SpiderRuntimeAction.transmission_group == captured["source_group"],
+                SpiderRuntimeAction.action_id != captured["filled_action_id"],
+            )
+        ))
+        assert expected_live_aliases <= ack_aliases
+        assert "0000015006" not in ack_aliases
+        all_ack_aliases = {
+            entry["clOrdId"]
+            for item in decisions
+            if item["trigger_kind"] == "TRANSPORT_RESULT"
+            for entry in cast(
+                list[dict[str, Any]],
+                cast(dict[str, Any], item["source_input"])["entries"],
+            )
+        }
+        assert cast(set[str], captured["other_aliases"]) <= all_ack_aliases
+        source_order = cast(dict[str, Any], full[0]["source_input"]["order"])
+        assert (source_order["px"], source_order["fillPx"], source_order["accFillSz"]) == (
+            "50", "49", "100"
+        )
+        source_effects = [
+            row for row in cast(list[dict[str, Any]], full[0]["events"])
+            if row["kind"] in {"cancel", "send"}
+        ]
+        assert [row["kind"] for row in source_effects] == ["cancel", "send"]
+        assert [row["ordId"] for row in source_effects[0]["orders"]] == ["0000065010"]
+        assert [
+            (row["px"], row["sz"], row["side"], row["clOrdId"])
+            for row in source_effects[1]["orders"]
+        ] == [
+            ("6.25", "355.555", "buy", "0000115003"),
+            ("100", "150", "sell", "0000125007"),
+        ]
+        assert runtime.last_received_sequence == runtime.last_consumed_sequence
+        provider_ids = session.execute(
+            select(Order.exchange_order_id).where(Order.id == captured["filled_order_id"])
+        ).scalar_one()
+        provider_trade_ids = set(session.scalars(
+            select(Trade.exchange_trade_id).where(Trade.order_id == captured["filled_order_id"])
+        ))
+        assert provider_ids == "main-normal-provider-order"
+        assert provider_trade_ids == {"main-normal-60-at-48", "main-normal-40-at-49"}
+
+    from src.control_plane.spider_order_query import SpiderOrderQueryService
+
+    service = SpiderOrderQueryService(
+        factory, environment=scope.environment, execution_scope_id=scope.execution_scope_id
+    )
+    query_status, query_body = service.orders(f"strategy_id={scope.strategy_id}")
+    assert query_status == 200, query_body
+    queried_ids = {
+        row["local_order_id"]
+        for row in cast(list[dict[str, Any]], query_body["orders"])
+    }
+    with factory() as session:
+        derived_ids = set(session.scalars(
+            select(SpiderRuntimeAction.local_order_id).where(
+                SpiderRuntimeAction.strategy_id == scope.strategy_id,
+                SpiderRuntimeAction.operation == "PLACE",
+                SpiderRuntimeAction.trigger_delivery_id.is_not(None),
+            )
+        ))
+        cancel = session.execute(
+            select(SpiderRuntimeAction).where(
+                SpiderRuntimeAction.strategy_id == scope.strategy_id,
+                SpiderRuntimeAction.operation == "CANCEL",
+                SpiderRuntimeAction.trigger_delivery_id.is_not(None),
+            )
+        ).scalar_one()
+        parent = session.get(SpiderRuntimeAction, cancel.parent_action_id)
+        assert parent is not None and parent.operation == "PLACE"
+        assert cancel.local_order_id == parent.local_order_id
+        assert session.get(SpiderRuntimeBinding, cancel.action_id) is None
+        cold_owner = captured["owner"]
+    assert derived_ids and derived_ids <= queried_ids
+    cold_readback = cold_owner.readback(scope, operation_id)
+    assert cold_readback is not None and cold_readback["trading_ready"] is False
 
 
 def test_main_market_registration_failure_uses_existing_cleanup(
