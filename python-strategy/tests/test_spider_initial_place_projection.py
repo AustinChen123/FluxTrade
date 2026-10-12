@@ -111,3 +111,24 @@ def test_provider_id_conflict_cannot_cover_an_original_member() -> None:
         financial_acceptance_proved=False,
         current_provider_order_id="different-order",
     ) == ("SEND_UNKNOWN", None, None)
+
+
+@pytest.mark.parametrize(
+    ("operation", "outcome", "expected"),
+    [
+        ("PLACE", ("REJECTED", "51008", None), True),
+        ("PLACE", ("REJECTED", "51400", None), False),
+        ("CANCEL", ("ACCEPTED", None, "venue-order-1"), True),
+        ("CANCEL", ("REJECTED", "51400", None), True),
+        ("CANCEL", ("REJECTED", "51008", None), False),
+    ],
+)
+def test_closed_member_outcome_codes_are_operation_specific(
+    operation: str,
+    outcome: tuple[str, str | None, str | None],
+    expected: bool,
+) -> None:
+    checked = validate_member_outcomes(
+        ["a" * 64], {"a" * 64: outcome}, operation=operation
+    )
+    assert (checked is not None) is expected

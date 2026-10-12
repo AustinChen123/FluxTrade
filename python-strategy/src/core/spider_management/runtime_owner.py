@@ -650,6 +650,334 @@ class SpiderRuntimeOwner:
             scope, transmission_group_id, request_payload
         ) or _TransmissionOutcome("UNKNOWN", transmission_group_id)
 
+    def _transmit_normal_cancel_group(
+        self,
+        scope: RuntimeScopeKey,
+        request_payload: bytes,
+        transport: _BatchTransport,
+    ) -> _TransmissionOutcome:
+        """Transmit one saved normal CANCEL group through the existing owner seam."""
+        request = _decode_transport_request(request_payload)
+        if (
+            request is None or request.get("operation") != "CANCEL"
+            or self._lifecycle_lock is None or self._order_event_lock is None
+        ):
+            return _TransmissionOutcome("UNAVAILABLE", "")
+        try:
+            marker = self._stage_normal_cancel_marker(scope, request_payload)
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "SPIDER_CANCEL_MARKER_UNAVAILABLE strategy=%s", scope.strategy_id,
+            )
+            return _TransmissionOutcome("UNKNOWN", cast(str, request["transmission_group_id"]))
+        if marker is None:
+            return _TransmissionOutcome("REJECTED", cast(str, request["transmission_group_id"]))
+        group_id, should_call = marker
+        if not should_call:
+            return self._transmission_readback(scope, group_id, request_payload) or _TransmissionOutcome(
+                "UNKNOWN", group_id
+            )
+        try:
+            call_result = transport.submit(request_payload)
+            response_payload = getattr(call_result, "response_payload", None)
+            response_failure = getattr(call_result, "response_failure", None)
+            if type(response_payload) is not bytes:
+                response_payload = None
+            if response_failure not in {
+                None, "TRANSPORT_UNKNOWN", "RESPONSE_INVALID", "RESPONSE_TOO_LARGE"
+            }:
+                response_failure = "RESPONSE_INVALID"
+            if response_payload is not None:
+                response_failure = None
+            elif response_failure is None:
+                response_failure = "RESPONSE_INVALID"
+        except Exception:
+            response_payload = None
+            response_failure = "TRANSPORT_UNKNOWN"
+        try:
+            self._record_transmission_result(
+                scope, group_id, request_payload, response_payload, cast(str, response_failure)
+            )
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "SPIDER_CANCEL_RESULT_WRITE_UNPROVED strategy=%s", scope.strategy_id
+            )
+        proved = self._transmission_readback(scope, group_id, request_payload)
+        if proved is not None and proved.disposition == "RECORDED":
+            # A lost close response can prove the committed result without having
+            # reached the normal post-commit drain below the transaction helper.
+            self._drain_stopped_scope(scope)
+            self._drain_source_market_scope(scope)
+            proved = self._transmission_readback(scope, group_id, request_payload)
+        return proved or _TransmissionOutcome("UNKNOWN", group_id)
+
+    def _stage_normal_cancel_marker(
+        self, scope: RuntimeScopeKey, request_payload: bytes
+    ) -> tuple[str, bool] | None:
+        request = _decode_transport_request(request_payload)
+        if request is None or request.get("operation") != "CANCEL":
+            return None
+        if self._lifecycle_lock is None or self._order_event_lock is None:
+            return None
+        with self._lifecycle_lock(scope.strategy_id):
+            with self._order_event_lock:
+                with self._sessions() as session:
+                    if (
+                        not isinstance(session, Session) or session.in_transaction()
+                        or not session.is_active or session.get_bind().dialect.name != "postgresql"
+                    ):
+                        return None
+                    with session.begin():
+                        self._configure_writer(session)
+                        runtime = session.execute(
+                            select(SpiderRuntimeScope).where(
+                                SpiderRuntimeScope.environment == scope.environment,
+                                SpiderRuntimeScope.execution_scope_id == scope.execution_scope_id,
+                                SpiderRuntimeScope.strategy_id == scope.strategy_id,
+                            ).with_for_update()
+                        ).scalar_one_or_none()
+                        if runtime is None or runtime.control_mode != "RUN" or not validate_tape_index(session, runtime):
+                            return None
+                        plan = session.execute(
+                            select(SpiderRuntimePlan).where(
+                                SpiderRuntimePlan.plan_id == runtime.initial_plan_id,
+                                SpiderRuntimePlan.operation_id == runtime.current_operation_id,
+                            ).with_for_update()
+                        ).scalar_one_or_none()
+                        if (
+                            plan is None or plan.generation != runtime.generation
+                            or plan.configuration_sha256 != runtime.configuration_sha256
+                            or self._refresh_initial_place_projection(
+                                session, scope, runtime, plan, persist=False
+                            ) is None
+                            or not self._valid_normal_cancel_request(session, scope, runtime, plan, request)
+                        ):
+                            return None
+                        group_id = cast(str, request["transmission_group_id"])
+                        saved = session.get(SpiderRuntimeTransmission, group_id)
+                        if saved is not None:
+                            if saved.request_payload != request_payload:
+                                return None
+                            return group_id, False
+                        members = cast(list[dict[str, object]], request["members"])
+                        ids = [cast(str, member["cancel_action_id"]) for member in members]
+                        actions = session.execute(
+                            select(SpiderRuntimeAction).where(
+                                SpiderRuntimeAction.plan_id == plan.plan_id,
+                                SpiderRuntimeAction.action_id.in_(ids),
+                            ).order_by(SpiderRuntimeAction.candidate_ordinal).with_for_update()
+                        ).scalars().all()
+                        if (
+                            len(actions) != len(ids)
+                            or [action.action_id for action in actions] != ids
+                            or any(action.outcome_state != "UNSENT" or action.outcome_reference is not None for action in actions)
+                            or runtime.last_tape_sequence >= 2**63 - 1
+                        ):
+                            return None
+                        session.add(SpiderRuntimeTransmission(
+                            transmission_group_id=group_id,
+                            environment=scope.environment,
+                            execution_scope_id=scope.execution_scope_id,
+                            strategy_id=scope.strategy_id,
+                            operation_id=runtime.current_operation_id,
+                            plan_id=plan.plan_id,
+                            generation=runtime.generation,
+                            configuration_sha256=runtime.configuration_sha256,
+                            operation="CANCEL",
+                            request_payload=request_payload,
+                            request_sha256=_digest_bytes(request_payload),
+                            response_payload=None,
+                            response_sha256=None,
+                            response_failure=None,
+                            recorded_at=_database_millisecond_time(session),
+                            response_recorded_at=None,
+                        ))
+                        session.flush()
+                        runtime.last_tape_sequence += 1
+                        session.add(SpiderRuntimeTapeIndex(
+                            environment=scope.environment,
+                            execution_scope_id=scope.execution_scope_id,
+                            strategy_id=scope.strategy_id,
+                            ordinal=runtime.last_tape_sequence,
+                            kind="SEND_MARKER",
+                            delivery_sequence=None,
+                            transmission_group_id=group_id,
+                        ))
+                        for action in actions:
+                            action.outcome_state = "SEND_UNKNOWN"
+                            action.outcome_reference = group_id
+                        session.flush()
+                    return group_id, True
+
+    def _valid_normal_cancel_request(
+        self,
+        session: Session,
+        scope: RuntimeScopeKey,
+        runtime: SpiderRuntimeScope,
+        plan: SpiderRuntimePlan,
+        request: dict[str, object],
+    ) -> bool:
+        members = cast(list[dict[str, object]], request["members"])
+        action_ids = [cast(str, member["cancel_action_id"]) for member in members]
+        group_id = cast(str, request["transmission_group_id"])
+        expected_group = _digest({
+            "domain": "SPIDER_TRANSMISSION_GROUP_V1",
+            "scope": _scope(scope),
+            "operation_id": runtime.current_operation_id,
+            "plan_id": plan.plan_id,
+            "generation": runtime.generation,
+            "configuration_sha256": runtime.configuration_sha256,
+            "operation": "CANCEL",
+            "ordered_action_ids": action_ids,
+        })
+        if group_id != expected_group or request.get("scope") != _scope(scope):
+            return False
+        candidates: list[tuple[dict[str, object], SpiderRuntimeAction, SpiderRuntimeAction, SpiderRuntimeBinding, Order]] = []
+        event_indexes: set[int] = set()
+        target_ids: set[str] = set()
+        for member in members:
+            cancel = session.get(SpiderRuntimeAction, cast(str, member["cancel_action_id"]))
+            if (
+                cancel is None or cancel.operation != "CANCEL" or cancel.plan_id != plan.plan_id
+                or cancel.trigger_delivery_id is None or cancel.generation != runtime.generation
+                or cancel.configuration_sha256 != runtime.configuration_sha256
+            ):
+                return False
+            delivery = session.execute(select(SpiderRuntimeDelivery).where(
+                SpiderRuntimeDelivery.delivery_id == cancel.trigger_delivery_id,
+                SpiderRuntimeDelivery.environment == scope.environment,
+                SpiderRuntimeDelivery.execution_scope_id == scope.execution_scope_id,
+                SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+            )).scalar_one_or_none()
+            if delivery is None or delivery.disposition != "CONSUMED" or delivery.decision_payload is None:
+                return False
+            decision = decode_canonical(bytes(delivery.decision_payload))
+            if type(decision) is not dict:
+                return False
+            saved_candidates = cast(dict[str, object], decision).get("candidates")
+            if type(saved_candidates) is not list:
+                return False
+            candidate = next((cast(dict[str, object], value) for value in cast(list[object], saved_candidates)
+                              if type(value) is dict and cast(dict[str, object], value).get("action_id") == cancel.action_id), None)
+            if (
+                candidate is None or candidate.get("operation") != "CANCEL"
+                or candidate.get("disposition") != "PLANNED"
+                or cast(dict[str, object], decision).get("outcome") != "CONSUMED"
+                or type(candidate.get("source_event_index")) is not int
+                or candidate.get("original_payload") is None
+                or candidate.get("payload_sha256") != _digest_bytes(cancel.original_payload)
+                or candidate.get("original_payload") != decode_canonical(bytes(cancel.original_payload))
+                or candidate.get("target_place_action_id") != cancel.parent_action_id
+                or candidate.get("local_order_id") != cancel.local_order_id
+                or cancel.transmission_ordinal != candidate.get("source_member_index")
+                or cancel.transmission_group != cast(int, candidate.get("candidate_ordinal", -1)) - cast(int, candidate.get("source_member_index", -1))
+            ):
+                return False
+            event_indexes.add(cast(int, candidate["source_event_index"]))
+            target = session.get(SpiderRuntimeAction, cast(str, cancel.parent_action_id))
+            binding = session.get(SpiderRuntimeBinding, cast(str, cancel.parent_action_id))
+            order = session.get(Order, cancel.local_order_id)
+            if (
+                target is None or binding is None or order is None
+                or target.operation != "PLACE" or target.local_order_id != order.id
+                or (target.environment, target.execution_scope_id, target.strategy_id)
+                != (scope.environment, scope.execution_scope_id, scope.strategy_id)
+                or target.trigger_delivery_id is not None and target.plan_id != plan.plan_id
+                or target.product_id != cancel.product_id or binding.local_order_id != order.id
+                or binding.source_product_id != cancel.product_id
+                or order.exchange_order_id is None
+            ):
+                return False
+            intent = order.intent_payload
+            if type(intent) is not dict or type(intent.get("provider_binding_bytes_hex")) is not str:
+                return False
+            try:
+                binding_bytes = bytes.fromhex(cast(str, intent["provider_binding_bytes_hex"]))
+            except ValueError:
+                return False
+            if (
+                sha256(binding_bytes).hexdigest() != member.get("target_binding_sha256")
+                or intent.get("provider_wire_client_order_id") != member.get("target_wire_clOrdId")
+                or order.exchange_order_id != member.get("target_ordId")
+                or target.action_id != member.get("target_place_action_id")
+                or order.id != member.get("target_local_order_id")
+                or target.payload_sha256 != _digest_bytes(target.original_payload)
+                or member.get("product_id") != target.product_id
+                or member.get("request_payload") != {"instId": binding.source_product_id, "ordId": order.exchange_order_id}
+                or prove_spider_order_wire_binding(
+                    scope.environment, scope.execution_scope_id, scope.strategy_id,
+                    target, binding, order,
+                ) is None
+            ):
+                return False
+            if target.action_id in target_ids:
+                return False
+            target_ids.add(target.action_id)
+            projection = {
+                "status": order.status,
+                "filled_quantity": None if order.filled_quantity is None else canonical_decimal_text(order.filled_quantity),
+                "filled_price": None if order.filled_price is None else canonical_decimal_text(order.filled_price),
+                "exchange_order_id": order.exchange_order_id,
+            }
+            if not validate_order_receipt_chain(
+                session, scope=_scope(scope), action=target, binding=binding,
+                order_id=order.id, current_projection=projection,
+            ):
+                return False
+            candidates.append((candidate, cancel, target, binding, order))
+        if len(event_indexes) != 1:
+            return False
+        event_index = next(iter(event_indexes))
+        owner_delivery = session.execute(select(SpiderRuntimeDelivery).where(
+            SpiderRuntimeDelivery.delivery_id == candidates[0][1].trigger_delivery_id,
+            SpiderRuntimeDelivery.environment == scope.environment,
+            SpiderRuntimeDelivery.execution_scope_id == scope.execution_scope_id,
+            SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+        )).scalar_one_or_none()
+        if owner_delivery is None or owner_delivery.decision_payload is None:
+            return False
+        saved_decision = decode_canonical(bytes(owner_delivery.decision_payload))
+        if type(saved_decision) is not dict:
+            return False
+        saved_values = cast(dict[str, object], saved_decision).get("candidates")
+        saved_events = cast(dict[str, object], saved_decision).get("events")
+        if type(saved_values) is not list or type(saved_events) is not list or event_index >= len(saved_events):
+            return False
+        event = cast(list[object], saved_events)[event_index]
+        if type(event) is not dict or cast(dict[str, object], event).get("kind") != "cancel":
+            return False
+        event_orders = cast(dict[str, object], event).get("orders")
+        if type(event_orders) is not list:
+            return False
+        event_candidates = [
+            cast(dict[str, object], value) for value in cast(list[object], saved_values)
+            if type(value) is dict
+            and cast(dict[str, object], value).get("operation") == "CANCEL"
+            and cast(dict[str, object], value).get("source_event_index") == event_index
+        ]
+        if (
+            len(event_candidates) != len(cast(list[object], event_orders))
+            or any(value.get("disposition") != "PLANNED" for value in event_candidates)
+            or [value.get("source_member_index") for value in sorted(
+                event_candidates, key=lambda value: cast(int, value.get("source_member_index", -1))
+            )] != list(range(len(event_candidates)))
+        ):
+            return False
+        expected_ids = [
+            cast(str, cast(dict[str, object], value)["action_id"])
+            for value in cast(list[object], saved_values)
+            if type(value) is dict
+            and cast(dict[str, object], value).get("operation") == "CANCEL"
+            and cast(dict[str, object], value).get("disposition") == "PLANNED"
+            and cast(dict[str, object], value).get("source_event_index") == event_index
+        ]
+        expected_ids.sort(key=lambda action_id: cast(int, next(
+            cast(dict[str, object], value)["candidate_ordinal"]
+            for value in cast(list[object], saved_values)
+            if type(value) is dict and cast(dict[str, object], value).get("action_id") == action_id
+        )))
+        return expected_ids == action_ids and len(expected_ids) == len(set(expected_ids))
+
     def _stage_initial_place_marker(
         self,
         scope: RuntimeScopeKey,
@@ -863,7 +1191,25 @@ class SpiderRuntimeOwner:
                             ).order_by(SpiderRuntimeAction.transmission_ordinal)
                             .with_for_update()
                         ).scalars().all()
-                        if not actions or any(action.outcome_state != "SEND_UNKNOWN" for action in actions):
+                        saved_request = _decode_transport_request(request_payload)
+                        action_key = (
+                            "action_id" if transmission.operation == "PLACE" else "cancel_action_id"
+                        )
+                        expected_action_ids = (
+                            [] if saved_request is None
+                            else [cast(str, member[action_key]) for member in cast(list[dict[str, object]], saved_request["members"])]
+                        )
+                        if (
+                            saved_request is None
+                            or saved_request.get("operation") != transmission.operation
+                            or not actions
+                            or [action.action_id for action in actions] != expected_action_ids
+                            or any(
+                                action.operation != transmission.operation
+                                or action.outcome_state != "SEND_UNKNOWN"
+                                for action in actions
+                            )
+                        ):
                             raise RuntimeError("SPIDER_TRANSMISSION_ACTIONS_UNAVAILABLE")
                         if response_payload is not None:
                             response_failure = None
@@ -967,8 +1313,11 @@ class SpiderRuntimeOwner:
         if request is None:
             return None
         members = cast(list[dict[str, object]], request["members"])
-        action_ids = [cast(str, member["action_id"]) for member in members]
-        return validate_member_outcomes(action_ids, classified)
+        action_key = "action_id" if request["operation"] == "PLACE" else "cancel_action_id"
+        action_ids = [cast(str, member[action_key]) for member in members]
+        return validate_member_outcomes(
+            action_ids, classified, operation=cast(str, request["operation"])
+        )
 
     def _transmission_readback(
         self,
@@ -1536,7 +1885,7 @@ class SpiderRuntimeOwner:
             ).scalar_one_or_none()
             if (
                 transmission is None
-                or transmission.operation != "PLACE"
+                or transmission.operation not in {"PLACE", "CANCEL"}
                 or transmission.request_sha256 != record.get("request_sha256")
                 or transmission.response_sha256 != record.get("response_sha256")
                 or transmission.response_failure != record.get("response_failure")
@@ -1546,6 +1895,106 @@ class SpiderRuntimeOwner:
             request = _decode_transport_request(bytes(transmission.request_payload))
             if request is None or request.get("scope") != _scope(scope):
                 return None, None, delivery.kind
+            if transmission.operation == "CANCEL":
+                cancel_outcomes = self._validate_normal_cancel_transmission(
+                    session, scope, runtime, plan, transmission, request,
+                )
+                if cancel_outcomes is None:
+                    return None, None, delivery.kind
+                cancel_entries: list[dict[str, object]] = []
+                response_obj = (
+                    {} if transmission.response_payload is None
+                    else cast(dict[str, object], decode_canonical(bytes(transmission.response_payload)))
+                )
+                response_rows = response_obj.get("data")
+                for member in cast(list[dict[str, object]], request["members"]):
+                    cancel_id = cast(str, member["cancel_action_id"])
+                    outcome = cancel_outcomes[cancel_id]
+                    if outcome[0] not in {"ACCEPTED", "REJECTED"}:
+                        continue
+                    cancel_action = session.get(SpiderRuntimeAction, cancel_id)
+                    target_action = None if cancel_action is None else session.get(
+                        SpiderRuntimeAction, cast(str, cancel_action.parent_action_id)
+                    )
+                    binding = None if target_action is None else session.get(
+                        SpiderRuntimeBinding, target_action.action_id
+                    )
+                    target_order = None if target_action is None else session.get(
+                        Order, target_action.local_order_id
+                    )
+                    if cancel_action is None or target_action is None or binding is None or target_order is None:
+                        return None, None, delivery.kind
+                    full_key_for_target = full_callback_identity(
+                        _scope(scope), target_order.id, target_action.generation
+                    )
+                    already_full = session.execute(
+                        select(SpiderRuntimeDelivery.sequence).where(
+                            SpiderRuntimeDelivery.environment == scope.environment,
+                            SpiderRuntimeDelivery.execution_scope_id == scope.execution_scope_id,
+                            SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                            SpiderRuntimeDelivery.full_callback_key == full_key_for_target,
+                            SpiderRuntimeDelivery.sequence < delivery.sequence,
+                        ).limit(1)
+                    ).scalar_one_or_none()
+                    if already_full is not None:
+                        continue
+                    prior_financial = session.execute(
+                        select(SpiderRuntimeDelivery).where(
+                            SpiderRuntimeDelivery.environment == scope.environment,
+                            SpiderRuntimeDelivery.execution_scope_id == scope.execution_scope_id,
+                            SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                            SpiderRuntimeDelivery.local_order_id == target_order.id,
+                            SpiderRuntimeDelivery.kind.in_(("FILL", "ORDER_STATE")),
+                            SpiderRuntimeDelivery.sequence < delivery.sequence,
+                        ).order_by(SpiderRuntimeDelivery.sequence)
+                    ).scalars().all()
+                    if prior_financial:
+                        last_financial = prior_financial[-1]
+                        try:
+                            receipt_value = cast(dict[str, object], decode_canonical(bytes(last_financial.source_payload)))
+                            projection = cast(dict[str, object], receipt_value["after"])
+                            quantity = Decimal(cast(str, projection["filled_quantity"]))
+                            original = cast(dict[str, object], decode_canonical(bytes(target_action.original_payload)))
+                        except (InvalidOperation, KeyError, TypeError, ValueError):
+                            return None, None, delivery.kind
+                        if not validate_order_receipt_chain(
+                            session, scope=_scope(scope), action=target_action, binding=binding,
+                            order_id=target_order.id, current_projection=projection,
+                            through_sequence=last_financial.sequence,
+                        ):
+                            return None, None, delivery.kind
+                        prior_state = classify_source_order_transition(
+                            projection.get("status"),
+                            original_quantity=_positive_decimal(original["sz"]),
+                            cumulative_quantity=quantity,
+                            trade_chain_proved=any(row.kind == "FILL" for row in prior_financial),
+                        )
+                        if prior_state.state in {"filled", "canceled", "failed", "economic_terminal"}:
+                            continue
+                    original_value = decode_canonical(bytes(target_action.original_payload))
+                    if type(original_value) is not dict:
+                        return None, None, delivery.kind
+                    original = cast(dict[str, object], original_value)
+                    provider_row: dict[str, object] = {}
+                    if type(response_rows) is list:
+                        for row in cast(list[object], response_rows):
+                            if type(row) is dict and (
+                                cast(dict[str, object], row).get("ordId") == member["target_ordId"]
+                                or cast(dict[str, object], row).get("clOrdId") == member["target_wire_clOrdId"]
+                            ):
+                                provider_row = cast(dict[str, object], row)
+                                break
+                    cancel_entries.append({
+                        "clOrdId": source_alias(binding.source_client_order_id),
+                        "ordId": source_alias(binding.source_client_order_id),
+                        "sCode": "0" if outcome[0] == "ACCEPTED" else cast(str, outcome[1]),
+                        "sMsg": provider_row.get("sMsg") if type(provider_row.get("sMsg")) is str else None,
+                        "instId": binding.source_product_id,
+                        "side": original["side"],
+                        "px": original["px"],
+                        "sz": original["sz"],
+                    })
+                return {"type": "REST_ACK", "operation": "cancel", "entries": cancel_entries}, None, delivery.kind
             classified = (
                 None if transmission.response_payload is None
                 else self._validated_transport_outcomes(
@@ -4078,6 +4527,20 @@ class SpiderRuntimeOwner:
         transmission_reference_by_action: dict[str, str] = {}
         for transmission in transmissions:
             request = _decode_transport_request(transmission.request_payload)
+            if request is not None and transmission.operation == "CANCEL":
+                cancel_outcomes = self._validate_normal_cancel_transmission(
+                    session, scope, runtime, plan, transmission, request,
+                    verify_stored=verify_stored,
+                )
+                if cancel_outcomes is None:
+                    return None
+                if not verify_stored:
+                    for cancel_id, cancel_outcome in cancel_outcomes.items():
+                        cancel_action = session.get(SpiderRuntimeAction, cancel_id)
+                        if cancel_action is None:
+                            return None
+                        cancel_action.outcome_state = cancel_outcome[0]
+                continue
             if (
                 request is None
                 or transmission.request_sha256 != _digest_bytes(transmission.request_payload)
@@ -4180,6 +4643,113 @@ class SpiderRuntimeOwner:
                 return None
             if verify_stored and action.outcome_state != outcomes[action_id][0]:
                 return None
+        return outcomes
+
+    def _validate_normal_cancel_transmission(
+        self,
+        session: Session,
+        scope: RuntimeScopeKey,
+        runtime: SpiderRuntimeScope,
+        plan: SpiderRuntimePlan,
+        transmission: SpiderRuntimeTransmission,
+        request: dict[str, object],
+        *,
+        verify_stored: bool = True,
+    ) -> dict[str, MemberOutcome] | None:
+        if (
+            transmission.operation != "CANCEL"
+            or transmission.request_sha256 != _digest_bytes(transmission.request_payload)
+            or transmission.operation_id != runtime.current_operation_id
+            or transmission.plan_id != plan.plan_id
+            or transmission.generation != runtime.generation
+            or transmission.configuration_sha256 != runtime.configuration_sha256
+            or not self._valid_normal_cancel_request(session, scope, runtime, plan, request)
+        ):
+            return None
+        members = cast(list[dict[str, object]], request["members"])
+        action_ids = [cast(str, member["cancel_action_id"]) for member in members]
+        if transmission.response_recorded_at is None:
+            if (
+                transmission.response_payload is not None
+                or transmission.response_sha256 is not None
+                or transmission.response_failure is not None
+            ):
+                return None
+            outcomes: dict[str, MemberOutcome] = {
+                action_id: ("SEND_UNKNOWN", None, None) for action_id in action_ids
+            }
+        elif transmission.response_payload is not None:
+            if (
+                not 1 <= len(transmission.response_payload) <= 1_048_576
+                or transmission.response_sha256 != _digest_bytes(transmission.response_payload)
+                or transmission.response_failure is not None
+            ):
+                return None
+            classified = self._validated_transport_outcomes(
+                transmission.request_payload, transmission.response_payload
+            )
+            if classified is None:
+                return None
+            outcomes = classified
+        else:
+            if transmission.response_failure not in {
+                "TRANSPORT_UNKNOWN", "RESPONSE_INVALID", "RESPONSE_TOO_LARGE"
+            } or transmission.response_sha256 is not None:
+                return None
+            outcomes = {action_id: ("SEND_UNKNOWN", None, None) for action_id in action_ids}
+        actions = session.execute(
+            select(SpiderRuntimeAction).where(
+                SpiderRuntimeAction.plan_id == plan.plan_id,
+                SpiderRuntimeAction.action_id.in_(action_ids),
+            )
+        ).scalars().all()
+        action_map = {action.action_id: action for action in actions}
+        if len(action_map) != len(action_ids):
+            return None
+        for member in members:
+            action_id = cast(str, member["cancel_action_id"])
+            action = action_map[action_id]
+            outcome = outcomes[action_id]
+            expected_state = outcome[0]
+            if (
+                action.outcome_reference != transmission.transmission_group_id
+                or action.transmission_group != action.candidate_ordinal - cast(int, action.transmission_ordinal)
+                or (
+                    action.outcome_state != expected_state
+                    if verify_stored
+                    else action.outcome_state not in {"SEND_UNKNOWN", expected_state}
+                )
+                or (expected_state == "ACCEPTED" and outcome[2] != member.get("target_ordId"))
+                or (expected_state == "REJECTED" and outcome[1] != "51400")
+            ):
+                return None
+        if transmission.response_recorded_at is None:
+            return outcomes
+        receipt = session.execute(
+            select(SpiderRuntimeDelivery).where(
+                SpiderRuntimeDelivery.environment == scope.environment,
+                SpiderRuntimeDelivery.execution_scope_id == scope.execution_scope_id,
+                SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                SpiderRuntimeDelivery.delivery_id == _digest({
+                    "domain": "SPIDER_TRANSPORT_RESULT_DELIVERY_ID_V1",
+                    "scope": _scope(scope),
+                    "transmission_group_id": transmission.transmission_group_id,
+                }),
+            )
+        ).scalar_one_or_none()
+        if (
+            receipt is None or receipt.kind != "TRANSPORT_RESULT"
+            or receipt.source_payload != canonical_bytes({
+                "schema_version": "SPIDER_TRANSPORT_RESULT_DELIVERY_V1",
+                "scope": _scope(scope),
+                "transmission_group_id": transmission.transmission_group_id,
+                "request_sha256": transmission.request_sha256,
+                "response_sha256": transmission.response_sha256,
+                "response_failure": transmission.response_failure,
+            })
+            or receipt.content_sha256 != _digest_bytes(receipt.source_payload)
+        ):
+            return None
         return outcomes
 
     def _independent_result(
@@ -4286,17 +4856,33 @@ def _decode_transport_request(payload: bytes) -> dict[str, object] | None:
         or not 1 <= len(cast(list[object], request["members"])) <= 20
     ):
         return None
-    if request.get("operation") != "PLACE":
+    operation = request.get("operation")
+    if operation not in {"PLACE", "CANCEL"}:
         return None
-    member_keys = {
+    member_keys = ({
         "action_id", "product_id", "local_order_id", "binding_sha256",
         "wire_clOrdId", "ordId", "request_payload",
-    }
+    } if operation == "PLACE" else {
+        "cancel_action_id", "product_id", "target_place_action_id",
+        "target_local_order_id", "target_binding_sha256", "target_wire_clOrdId",
+        "target_ordId", "request_payload",
+    })
     for member in cast(list[object], request["members"]):
-        if (
-            type(member) is not dict
-            or set(cast(dict[str, object], member)) != member_keys
-            or type(cast(dict[str, object], member).get("request_payload")) is not dict
+        if type(member) is not dict or set(cast(dict[str, object], member)) != member_keys:
+            return None
+        item = cast(dict[str, object], member)
+        if type(item.get("request_payload")) is not dict:
+            return None
+        identity_key = "action_id" if operation == "PLACE" else "cancel_action_id"
+        identity = item.get(identity_key)
+        if type(identity) is not str or len(identity) != 64:
+            return None
+        if operation == "CANCEL" and any(
+            type(item.get(key)) is not str or not item[key]
+            for key in (
+                "product_id", "target_place_action_id", "target_local_order_id",
+                "target_binding_sha256", "target_wire_clOrdId", "target_ordId",
+            )
         ):
             return None
     return request

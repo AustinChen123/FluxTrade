@@ -19,9 +19,13 @@ class OriginalPlaceCandidate:
 
 
 def validate_member_outcomes(
-    action_ids: Sequence[str], outcomes: Mapping[str, object] | None
+    action_ids: Sequence[str], outcomes: Mapping[str, object] | None, *,
+    operation: str = "PLACE",
 ) -> dict[str, MemberOutcome] | None:
     """Validate a provider result's exact action-key and closed tuple shape."""
+    rejection_codes = {"51000", "51008"} if operation == "PLACE" else {"51400"}
+    if operation not in {"PLACE", "CANCEL"}:
+        return None
     expected = set(action_ids)
     if outcomes is None or set(outcomes) != expected:
         return None
@@ -40,7 +44,7 @@ def validate_member_outcomes(
                 return None
         elif state == "REJECTED":
             if (
-                rejection_reason not in {"51000", "51008"}
+                rejection_reason not in rejection_codes
                 or provider_order_id is not None
             ):
                 return None
