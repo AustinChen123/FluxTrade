@@ -106,14 +106,9 @@ class OkxSpiderBatchTransport:
             return OkxBatchCallResult(None, "RESPONSE_INVALID")
         if not 1 <= len(response_payload) <= _MAX_PAYLOAD_BYTES:
             return OkxBatchCallResult(None, "RESPONSE_TOO_LARGE")
-        if operation == "PLACE":
-            member_outcomes = classify_okx_batch_response(request_payload, response_payload)
-            if member_outcomes is None:
-                return OkxBatchCallResult(None, "RESPONSE_INVALID")
-        else:
-            # Keep the bounded raw cancel envelope, but do not claim a cancel
-            # classification before its durable action producer is implemented.
-            member_outcomes = {}
+        member_outcomes = classify_okx_batch_response(request_payload, response_payload)
+        if member_outcomes is None:
+            return OkxBatchCallResult(None, "RESPONSE_INVALID")
         return OkxBatchCallResult(
             response_payload,
             None,
@@ -196,9 +191,21 @@ def _decode_batch_request(payload: bytes) -> dict[str, object] | None:
         if operation == "CANCEL":
             target_id = member["target_local_order_id"]
             target_order_id = member["target_ordId"]
+            target_action_id = member["target_place_action_id"]
+            target_binding = member["target_binding_sha256"]
+            target_wire_id = member["target_wire_clOrdId"]
             if (
-                type(target_id) is not str
+                type(target_action_id) is not str
+                or len(target_action_id) != 64
+                or any(character not in "0123456789abcdef" for character in target_action_id)
+                or type(target_id) is not str
                 or not target_id
+                or type(target_binding) is not str
+                or len(target_binding) != 64
+                or any(character not in "0123456789abcdef" for character in target_binding)
+                or type(target_wire_id) is not str
+                or not 1 <= len(target_wire_id) <= 32
+                or not target_wire_id.isalnum()
                 or target_id in cancel_targets
                 or type(target_order_id) is not str
                 or not target_order_id
@@ -240,46 +247,115 @@ def classify_okx_batch_response(
     response = cast(dict[str, object], response_value)
     members = cast(list[dict[str, object]], request["members"])
     operation = cast(str, request["operation"])
-    if operation != "PLACE":
-        # CANCEL's target-identity classification is implemented with its
-        # durable action producer; never apply PLACE identity rules to it.
+    if operation not in {"PLACE", "CANCEL"}:
         return None
+    action_id_key = "action_id" if operation == "PLACE" else "cancel_action_id"
     outcomes: dict[str, OkxMemberOutcome] = {
-        cast(str, member["action_id"]): ("SEND_UNKNOWN", None, None)
+        cast(str, member[action_id_key]): ("SEND_UNKNOWN", None, None)
         for member in members
     }
     data_value = response.get("data")
     if type(response.get("code")) is not str or type(data_value) is not list:
         return outcomes
-    by_wire_id = {
-        cast(str, member["wire_clOrdId"]): cast(str, member["action_id"])
-        for member in members
+    if operation == "PLACE":
+        by_wire_id = {
+            cast(str, member["wire_clOrdId"]): cast(str, member["action_id"])
+            for member in members
+        }
+        matched: dict[str, list[dict[str, object]]] = {
+            wire_id: [] for wire_id in by_wire_id
+        }
+        for row in cast(list[object], data_value):
+            if type(row) is not dict:
+                continue
+            provider_row = cast(dict[str, object], row)
+            wire_id = provider_row.get("clOrdId")
+            if type(wire_id) is str and wire_id in matched:
+                matched[wire_id].append(provider_row)
+        for wire_id, rows in matched.items():
+            if not rows:
+                continue
+            first = canonical_bytes(rows[0])
+            if any(canonical_bytes(row) != first for row in rows[1:]):
+                continue
+            action_id = by_wire_id[wire_id]
+            row = rows[0]
+            member_code = row.get("sCode")
+            ord_id = row.get("ordId")
+            if type(member_code) is not str:
+                continue
+            if member_code == "0":
+                if type(ord_id) is str and ord_id:
+                    outcomes[action_id] = ("ACCEPTED", None, ord_id)
+            elif member_code in {"51000", "51008"} and (
+                ord_id is None or (type(ord_id) is str and ord_id == "")
+            ):
+                outcomes[action_id] = ("REJECTED", cast(str, member_code), None)
+        return outcomes
+
+    by_target_ord: dict[str, list[str]] = {}
+    by_target_wire: dict[str, list[str]] = {}
+    member_by_action: dict[str, dict[str, object]] = {}
+    for member in members:
+        action_id = cast(str, member["cancel_action_id"])
+        member_by_action[action_id] = member
+        by_target_ord.setdefault(cast(str, member["target_ordId"]), []).append(action_id)
+        by_target_wire.setdefault(cast(str, member["target_wire_clOrdId"]), []).append(action_id)
+
+    matched_cancel: dict[str, list[dict[str, object]]] = {
+        action_id: [] for action_id in member_by_action
     }
-    matched: dict[str, list[dict[str, object]]] = {wire_id: [] for wire_id in by_wire_id}
     for row in cast(list[object], data_value):
         if type(row) is not dict:
             continue
         provider_row = cast(dict[str, object], row)
+        possible_actions: set[str] = set()
+        ord_id = provider_row.get("ordId")
         wire_id = provider_row.get("clOrdId")
-        if type(wire_id) is str and wire_id in matched:
-            matched[wire_id].append(provider_row)
-    for wire_id, rows in matched.items():
+        if type(ord_id) is str and ord_id:
+            possible_actions.update(by_target_ord.get(ord_id, ()))
+        if type(wire_id) is str and wire_id:
+            possible_actions.update(by_target_wire.get(wire_id, ()))
+        for action_id in possible_actions:
+            matched_cancel[action_id].append(provider_row)
+
+    for action_id, rows in matched_cancel.items():
         if not rows:
             continue
         first = canonical_bytes(rows[0])
         if any(canonical_bytes(row) != first for row in rows[1:]):
             continue
-        action_id = by_wire_id[wire_id]
+        member = member_by_action[action_id]
         row = rows[0]
         member_code = row.get("sCode")
         ord_id = row.get("ordId")
-        if type(member_code) is not str:
+        wire_id = row.get("clOrdId")
+        if (
+            type(member_code) is not str
+            or (ord_id is not None and type(ord_id) is not str)
+            or (wire_id is not None and type(wire_id) is not str)
+        ):
+            continue
+        ord_text = cast(str | None, ord_id)
+        wire_text = cast(str | None, wire_id)
+        matched_actions: set[str] = set()
+        if ord_text:
+            matched_actions.update(by_target_ord.get(ord_text, ()))
+        if wire_text:
+            matched_actions.update(by_target_wire.get(wire_text, ()))
+        target_ord_id = cast(str, member["target_ordId"])
+        target_wire_id = cast(str, member["target_wire_clOrdId"])
+        if (
+            matched_actions != {action_id}
+            or (ord_text and ord_text != target_ord_id)
+            or (wire_text and wire_text != target_wire_id)
+            or not (
+                ord_text == target_ord_id or wire_text == target_wire_id
+            )
+        ):
             continue
         if member_code == "0":
-            if type(ord_id) is str and ord_id:
-                outcomes[action_id] = ("ACCEPTED", None, ord_id)
-        elif member_code in {"51000", "51008"} and (
-            ord_id is None or (type(ord_id) is str and ord_id == "")
-        ):
-            outcomes[action_id] = ("REJECTED", cast(str, member_code), None)
+            outcomes[action_id] = ("ACCEPTED", None, target_ord_id)
+        elif member_code == "51400":
+            outcomes[action_id] = ("REJECTED", "51400", None)
     return outcomes

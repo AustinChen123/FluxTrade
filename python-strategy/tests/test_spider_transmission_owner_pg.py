@@ -2431,6 +2431,251 @@ def _record_n3_full_decision(
     return owner, scope, operation_id, full.delivery_id
 
 
+def test_cancel_classifier_uses_saved_normal_target_and_does_not_book_facts(
+    operation_pg: Engine,
+    mock_clock,
+    mock_exchange_adapter,
+) -> None:
+    engine = operation_pg
+    owner, scope, _operation_id, full_delivery_id = _record_n3_full_decision(
+        engine, mock_clock, mock_exchange_adapter
+    )
+
+    # A persisted PLACE result proves only transport acceptance.  Establish the
+    # target provider identity through the ordinary Execution/TXA ACK path.
+    with Session(engine) as session:
+        full_delivery = session.execute(
+            select(SpiderRuntimeDelivery).where(
+                SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                SpiderRuntimeDelivery.delivery_id == full_delivery_id,
+            )
+        ).scalar_one()
+        assert full_delivery.decision_payload is not None
+        saved_decision = cast(
+            dict[str, object], decode_canonical(bytes(full_delivery.decision_payload))
+        )
+        saved_cancel = next(
+            candidate
+            for candidate in cast(list[dict[str, object]], saved_decision["candidates"])
+            if candidate["operation"] == "CANCEL"
+            and candidate["disposition"] == "PLANNED"
+        )
+        saved_cancel_action = session.get(
+            SpiderRuntimeAction, cast(str, saved_cancel["action_id"])
+        )
+        assert saved_cancel_action is not None
+        saved_target_action = session.get(
+            SpiderRuntimeAction, cast(str, saved_cancel_action.parent_action_id)
+        )
+        assert saved_target_action is not None
+        saved_target_order = session.get(Order, saved_target_action.local_order_id)
+        assert saved_target_order is not None
+        saved_transmission = session.get(
+            SpiderRuntimeTransmission, saved_target_action.outcome_reference
+        )
+        assert saved_transmission is not None and saved_transmission.response_payload is not None
+        saved_place_outcomes = classify_okx_batch_response(
+            bytes(saved_transmission.request_payload), bytes(saved_transmission.response_payload)
+        )
+        assert saved_place_outcomes is not None
+        saved_place_outcome = saved_place_outcomes[saved_target_action.action_id]
+        assert saved_place_outcome[0] == "ACCEPTED"
+        proved_target_provider_id = saved_place_outcome[2]
+        assert proved_target_provider_id is not None
+        target_local_order_id = saved_target_order.id
+
+    ack_owner = _transport_enabled_owner(owner, scope)
+    ack_order = ack_owner._order_manager.repo.get_order(target_local_order_id)
+    assert ack_order is not None
+    ack_execution = ExecutionEngine(
+        db_session=None,
+        clock=mock_clock,
+        adapter=mock_exchange_adapter,
+        db_session_factory=sessionmaker(engine),
+        repository_transaction_participant=ack_owner.participate_in_order_transaction,
+        owned_order_event_observer=ack_owner.observe_order_event,
+        is_backtest=True,
+    )
+    assert ack_execution.process_exchange_order_event(ExchangeOrderEvent(
+        status="open",
+        product_id=ack_order.product_id,
+        client_order_id=ack_order.client_order_id,
+        exchange_order_id=proved_target_provider_id,
+        cumulative_filled_quantity=Decimal("0"),
+    ))["action"] == "applied"
+
+    def snapshot(target_order_id: str, cancel_action_id: str) -> tuple[object, ...]:
+        with Session(engine) as session:
+            order = session.get(Order, target_order_id)
+            runtime = session.execute(
+                select(SpiderRuntimeScope).where(
+                    SpiderRuntimeScope.strategy_id == scope.strategy_id
+                )
+            ).scalar_one()
+            cancel = session.get(SpiderRuntimeAction, cancel_action_id)
+            assert order is not None and cancel is not None
+            return (
+                (order.id, order.status, order.exchange_order_id,
+                 order.filled_quantity, order.filled_price),
+                tuple(session.execute(
+                    select(Trade.id, Trade.quantity, Trade.price, Trade.fee).where(
+                        Trade.order_id == target_order_id
+                    ).order_by(Trade.id)
+                ).all()),
+                (bytes(runtime.source_checkpoint), runtime.source_checkpoint_sha256,
+                 runtime.last_received_sequence, runtime.last_consumed_sequence,
+                 runtime.last_tape_sequence),
+                session.scalar(select(func.count()).select_from(SpiderRuntimeDelivery).where(
+                    SpiderRuntimeDelivery.strategy_id == scope.strategy_id
+                )),
+                session.scalar(select(func.count()).select_from(SpiderRuntimeTransmission).where(
+                    SpiderRuntimeTransmission.strategy_id == scope.strategy_id
+                )),
+                (cancel.outcome_state, cancel.outcome_reference),
+            )
+
+    with Session(engine) as session:
+        runtime = session.execute(
+            select(SpiderRuntimeScope).where(
+                SpiderRuntimeScope.strategy_id == scope.strategy_id
+            )
+        ).scalar_one()
+        plan = session.get(SpiderRuntimePlan, runtime.initial_plan_id)
+        assert plan is not None
+        full_delivery = session.execute(
+            select(SpiderRuntimeDelivery).where(
+                SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                SpiderRuntimeDelivery.delivery_id == full_delivery_id,
+            )
+        ).scalar_one()
+        assert full_delivery.decision_payload is not None
+        decision = cast(
+            dict[str, object], decode_canonical(bytes(full_delivery.decision_payload))
+        )
+        cancel_candidate = next(
+            candidate
+            for candidate in cast(list[dict[str, object]], decision["candidates"])
+            if candidate["operation"] == "CANCEL"
+            and candidate["disposition"] == "PLANNED"
+        )
+        cancel_action = session.get(
+            SpiderRuntimeAction, cast(str, cancel_candidate["action_id"])
+        )
+        assert cancel_action is not None and cancel_action.operation == "CANCEL"
+        assert cancel_candidate["target_place_action_id"] == cancel_action.parent_action_id
+        target_action = session.get(
+            SpiderRuntimeAction, cast(str, cancel_action.parent_action_id)
+        )
+        assert target_action is not None and target_action.operation == "PLACE"
+        assert target_action.trigger_delivery_id is None
+        binding = session.get(SpiderRuntimeBinding, target_action.action_id)
+        target_order = session.get(Order, target_action.local_order_id)
+        assert binding is not None and target_order is not None
+        assert target_order.exchange_order_id is not None
+        assert target_action.outcome_state == "ACCEPTED"
+        assert target_action.outcome_reference is not None
+        original_transmission = session.get(
+            SpiderRuntimeTransmission, target_action.outcome_reference
+        )
+        assert original_transmission is not None
+        assert original_transmission.response_payload is not None
+        accepted_target = classify_okx_batch_response(
+            bytes(original_transmission.request_payload),
+            bytes(original_transmission.response_payload),
+        )
+        assert accepted_target is not None
+        assert accepted_target[target_action.action_id] == (
+            "ACCEPTED", None, target_order.exchange_order_id
+        )
+        target_intent = cast(dict[str, object], target_order.intent_payload)
+        binding_bytes = bytes.fromhex(cast(str, target_intent["provider_binding_bytes_hex"]))
+        source_target = cast(dict[str, object], decode_canonical(target_action.original_payload))
+        assert cast(dict[str, object], cancel_candidate["original_payload"])["ordId"] == (
+            binding.source_client_order_id
+        )
+        assert cancel_action.outcome_state == "UNSENT"
+        request_payload = {"instId": source_target["instId"], "ordId": target_order.exchange_order_id}
+        saved_request = cast(
+            dict[str, object], decode_canonical(bytes(original_transmission.request_payload))
+        )
+        executing_account_ref = cast(str, saved_request["executing_account_ref"])
+        cancel_group_id = sha256(canonical_bytes({
+            "domain": "SPIDER_TRANSMISSION_GROUP_V1",
+            "scope": {
+                "environment": scope.environment,
+                "execution_scope_id": scope.execution_scope_id,
+                "strategy_id": scope.strategy_id,
+            },
+            "operation_id": runtime.current_operation_id,
+            "plan_id": plan.plan_id,
+            "generation": runtime.generation,
+            "configuration_sha256": runtime.configuration_sha256,
+            "operation": "CANCEL",
+            "ordered_action_ids": [cancel_action.action_id],
+        })).hexdigest()
+        cancel_member = {
+            "cancel_action_id": cancel_action.action_id,
+            "product_id": target_action.product_id,
+            "target_place_action_id": target_action.action_id,
+            "target_local_order_id": target_order.id,
+            "target_binding_sha256": sha256(binding_bytes).hexdigest(),
+            "target_wire_clOrdId": target_intent["provider_wire_client_order_id"],
+            "target_ordId": target_order.exchange_order_id,
+            "request_payload": request_payload,
+        }
+        cancel_request: dict[str, object] = {
+            "schema_version": "SPIDER_TRANSPORT_BATCH_V1",
+            "scope": {
+                "environment": scope.environment,
+                "execution_scope_id": scope.execution_scope_id,
+                "strategy_id": scope.strategy_id,
+            },
+            "executing_account_ref": executing_account_ref,
+            "transmission_group_id": cancel_group_id,
+            "operation": "CANCEL",
+            "members": [cancel_member],
+        }
+        cancel_request["payload_sha256"] = sha256(canonical_bytes(cancel_request)).hexdigest()
+        cancel_request_bytes = canonical_bytes(cancel_request)
+        target_order_id = target_order.id
+        cancel_action_id = cancel_action.action_id
+        target_provider_id = target_order.exchange_order_id
+    before = snapshot(target_order_id, cancel_action_id)
+
+    class OfflineCancelClient:
+        calls = 0
+        submitted: list[dict[str, object]] = []
+
+        def privatePostTradeCancelBatchOrders(
+            self, orders: list[dict[str, object]]
+        ) -> object:
+            self.calls += 1
+            self.submitted.extend(orders)
+            return {
+                "code": "0",
+                "data": [{
+                    "ordId": target_provider_id,
+                    "clOrdId": "",
+                    "sCode": "0",
+                }],
+                "msg": "synthetic classified cancel acknowledgement",
+            }
+
+        def privatePostTradeBatchOrders(
+            self, _orders: list[dict[str, object]]
+        ) -> object:
+            raise AssertionError("CANCEL classification must use the cancel endpoint")
+
+    offline = OfflineCancelClient()
+    result = OkxSpiderBatchTransport(cast(Any, offline)).submit(cancel_request_bytes)
+    assert offline.calls == 1
+    assert offline.submitted == [request_payload]
+    assert result.response_payload is not None
+    assert result.response_failure is None
+    assert result.member_outcomes == ((cancel_action_id, ("ACCEPTED", None, target_provider_id)),)
+    assert snapshot(target_order_id, cancel_action_id) == before
+
+
 @pytest.mark.parametrize("operation", ["PLACE", "CANCEL"])
 def test_cold_proof_recomputes_filtered_and_unresolved_candidate_disposition(
     operation_pg: Engine,

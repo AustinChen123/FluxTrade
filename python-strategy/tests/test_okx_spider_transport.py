@@ -108,7 +108,14 @@ def test_ccxt_raw_okx_endpoint_receives_exact_ordered_member_payloads_offline(
     assert sent_rows == expected_rows
 
 
-@pytest.mark.parametrize("failure", ["wrong_digest", "extra_root", "duplicate_member", "duplicate_cancel_target"])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "wrong_digest", "extra_root", "duplicate_member", "duplicate_cancel_target",
+        "bad_cancel_target_action", "bad_cancel_binding_hash",
+        "bad_cancel_wire_id", "bad_cancel_provider_id",
+    ],
+)
 def test_invalid_canonical_batch_never_calls_ccxt(
     monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
@@ -120,7 +127,7 @@ def test_invalid_canonical_batch_never_calls_ccxt(
         return {"code": "0", "data": [], "msg": ""}
 
     monkeypatch.setattr(client, "request", offline_request)
-    operation = "CANCEL" if failure == "duplicate_cancel_target" else "PLACE"
+    operation = "CANCEL" if failure.startswith("bad_cancel_") or failure == "duplicate_cancel_target" else "PLACE"
     decoded = cast(dict[str, object], decode_canonical(_batch(operation)))
     if failure == "wrong_digest":
         decoded["payload_sha256"] = "f" * 64
@@ -129,17 +136,36 @@ def test_invalid_canonical_batch_never_calls_ccxt(
         body = dict(decoded)
         body.pop("payload_sha256")
         decoded["payload_sha256"] = sha256(canonical_bytes(body)).hexdigest()
-    else:
+    elif failure == "duplicate_member":
         members = cast(list[dict[str, object]], decoded["members"])
         duplicate = deepcopy(members[0])
-        if failure == "duplicate_member":
-            decoded["members"] = [*members, duplicate]
-        else:
-            duplicate["cancel_action_id"] = "f" * 64
-            members.append(duplicate)
+        decoded["members"] = [*members, duplicate]
         body = dict(decoded)
         body.pop("payload_sha256")
         decoded["payload_sha256"] = sha256(canonical_bytes(body)).hexdigest()
+    elif failure == "duplicate_cancel_target":
+        members = cast(list[dict[str, object]], decoded["members"])
+        duplicate = deepcopy(members[0])
+        duplicate["cancel_action_id"] = "f" * 64
+        members.append(duplicate)
+        body = dict(decoded)
+        body.pop("payload_sha256")
+        decoded["payload_sha256"] = sha256(canonical_bytes(body)).hexdigest()
+    elif failure.startswith("bad_cancel_"):
+        member = cast(dict[str, object], cast(list[object], decoded["members"])[0])
+        if failure == "bad_cancel_target_action":
+            member["target_place_action_id"] = "G" * 64
+        elif failure == "bad_cancel_binding_hash":
+            member["target_binding_sha256"] = []
+        elif failure == "bad_cancel_wire_id":
+            member["target_wire_clOrdId"] = {}
+        else:
+            member["target_ordId"] = []
+        body = dict(decoded)
+        body.pop("payload_sha256")
+        decoded["payload_sha256"] = sha256(canonical_bytes(body)).hexdigest()
+    else:
+        raise AssertionError(f"unhandled invalid request fixture: {failure}")
 
     result = OkxSpiderBatchTransport(cast(Any, client)).submit(canonical_bytes(decoded))
     assert result.response_payload is None
@@ -250,6 +276,71 @@ def test_actual_ccxt_fetch_path_preserves_raw_application_result_once(
     assert cast(dict[str, Any], client.options)["maxRetriesOnFailure"] == 0
 
 
+@pytest.mark.parametrize(
+    ("case", "row", "expected"),
+    [
+        (
+            "success_ord_only",
+            {"ordId": "provider-order-1", "clOrdId": "", "sCode": "0"},
+            ("ACCEPTED", None, "provider-order-1"),
+        ),
+        (
+            "success_wire_only",
+            {"ordId": "", "clOrdId": "sp" + "c" * 30, "sCode": "0"},
+            ("ACCEPTED", None, "provider-order-1"),
+        ),
+        (
+            "ordinary_cancel_rejected",
+            {"ordId": "provider-order-1", "sCode": "51400"},
+            ("REJECTED", "51400", None),
+        ),
+        (
+            "ambiguous_cancel_outcome",
+            {"ordId": "provider-order-1", "sCode": "51412"},
+            ("SEND_UNKNOWN", None, None),
+        ),
+    ],
+)
+def test_actual_ccxt_cancel_fetch_sign_path_keeps_raw_result_once(
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    row: dict[str, object],
+    expected: tuple[str, str | None, str | None],
+) -> None:
+    client = create_okx_spider_batch_client(
+        {
+            "apiKey": "synthetic-key",
+            "secret": "synthetic-secret",
+            "password": "synthetic-passphrase",
+            "options": {"trade/cancel-batch-orders": {"maxRetriesOnFailure": 2}},
+        }
+    )
+    body = canonical_bytes({
+        "code": "0" if case.startswith("success") else "1",
+        "data": [row],
+        "msg": "synthetic bounded cancel result",
+    })
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def offline_http(*args: object, **kwargs: object) -> requests.Response:
+        calls.append((args, cast(dict[str, object], kwargs)))
+        return _http_response(200, body)
+
+    monkeypatch.setattr(client.session, "request", offline_http)
+    result = OkxSpiderBatchTransport(cast(Any, client)).submit(_batch("CANCEL"))
+
+    assert result.response_failure is None
+    assert result.response_payload == body
+    assert result.member_outcomes == (("d" * 64, expected),)
+    assert len(calls) == 1
+    call_args, call_kwargs = calls[0]
+    assert any("/api/v5/trade/cancel-batch-orders" in str(arg) for arg in call_args)
+    headers = cast(dict[str, object], call_kwargs["headers"])
+    assert "OK-ACCESS-SIGN" in headers
+    assert "OK-ACCESS-KEY" in headers
+    assert cast(dict[str, Any], client.options)["maxRetriesOnFailure"] == 0
+
+
 def _two_member_batch() -> bytes:
     request = cast(dict[str, object], decode_canonical(_batch()))
     first = cast(dict[str, object], cast(list[object], request["members"])[0])
@@ -260,6 +351,27 @@ def _two_member_batch() -> bytes:
     second["wire_clOrdId"] = "sp" + "y" * 30
     second_request = cast(dict[str, object], second["request_payload"])
     second_request["clOrdId"] = second["wire_clOrdId"]
+    request["members"] = [first, second]
+    request.pop("payload_sha256")
+    request["payload_sha256"] = sha256(canonical_bytes(request)).hexdigest()
+    return canonical_bytes(request)
+
+
+def _two_member_cancel_batch() -> bytes:
+    request = cast(dict[str, object], decode_canonical(_batch("CANCEL")))
+    first = cast(dict[str, object], cast(list[object], request["members"])[0])
+    second = deepcopy(first)
+    first["cancel_action_id"] = "d" * 64
+    first["target_ordId"] = "provider-a"
+    first["target_wire_clOrdId"] = "sp" + "c" * 30
+    first["request_payload"] = {"instId": "BTC-USDT-SWAP", "ordId": "provider-a"}
+    second["cancel_action_id"] = "f" * 64
+    second["target_place_action_id"] = "b" * 64
+    second["target_local_order_id"] = "00000000-0000-0000-0000-000000000002"
+    second["target_binding_sha256"] = "e" * 64
+    second["target_ordId"] = "provider-b"
+    second["target_wire_clOrdId"] = "sp" + "y" * 30
+    second["request_payload"] = {"instId": "BTC-USDT-SWAP", "ordId": "provider-b"}
     request["members"] = [first, second]
     request.pop("payload_sha256")
     request["payload_sha256"] = sha256(canonical_bytes(request)).hexdigest()
@@ -320,6 +432,84 @@ def test_okx_batch_outcomes_are_exactly_once_per_original_member_and_raw_is_reta
         ("a" * 64, expected_a),
         ("b" * 64, expected_b),
     )
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_a", "expected_b"),
+    [
+        (
+            "shuffled_mixed",
+            ("ACCEPTED", None, "provider-a"),
+            ("REJECTED", "51400", None),
+        ),
+        ("success_by_wire", ("ACCEPTED", None, "provider-a"), ("SEND_UNKNOWN", None, None)),
+        ("success_by_ord", ("ACCEPTED", None, "provider-a"), ("SEND_UNKNOWN", None, None)),
+        ("success_by_both", ("ACCEPTED", None, "provider-a"), ("SEND_UNKNOWN", None, None)),
+        ("other_code", ("SEND_UNKNOWN", None, None), ("SEND_UNKNOWN", None, None)),
+        ("place_only_rejection", ("SEND_UNKNOWN", None, None), ("SEND_UNKNOWN", None, None)),
+        ("conflicting_identity", ("SEND_UNKNOWN", None, None), ("SEND_UNKNOWN", None, None)),
+        ("unrelated_wire_with_target_ord", ("SEND_UNKNOWN", None, None), ("ACCEPTED", None, "provider-b")),
+        ("unrelated_ord_with_target_wire", ("SEND_UNKNOWN", None, None), ("ACCEPTED", None, "provider-b")),
+        ("missing_member", ("SEND_UNKNOWN", None, None), ("ACCEPTED", None, "provider-b")),
+        ("identical_duplicate", ("ACCEPTED", None, "provider-a"), ("SEND_UNKNOWN", None, None)),
+        ("conflicting_duplicate", ("SEND_UNKNOWN", None, None), ("SEND_UNKNOWN", None, None)),
+        ("missing_identity", ("SEND_UNKNOWN", None, None), ("SEND_UNKNOWN", None, None)),
+        ("bad_identity_type", ("SEND_UNKNOWN", None, None), ("SEND_UNKNOWN", None, None)),
+    ],
+)
+def test_cancel_classifier_uses_exact_target_identity_and_bounded_codes(
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    expected_a: tuple[str, str | None, str | None],
+    expected_b: tuple[str, str | None, str | None],
+) -> None:
+    wire_a = "sp" + "c" * 30
+    wire_b = "sp" + "y" * 30
+    exact_a = {"ordId": "provider-a", "clOrdId": wire_a, "sCode": "0"}
+    exact_b_rejected = {"ordId": "provider-b", "clOrdId": wire_b, "sCode": "51400"}
+    if case == "shuffled_mixed":
+        rows: list[object] = [exact_b_rejected, {"ordId": "provider-a", "sCode": "0"}]
+    elif case == "success_by_wire":
+        rows = [{"ordId": "", "clOrdId": wire_a, "sCode": "0"}]
+    elif case == "success_by_ord":
+        rows = [{"ordId": "provider-a", "clOrdId": "", "sCode": "0"}]
+    elif case == "success_by_both":
+        rows = [exact_a]
+    elif case == "other_code":
+        rows = [{"ordId": "provider-a", "sCode": "51412"}]
+    elif case == "place_only_rejection":
+        rows = [{"ordId": "provider-a", "clOrdId": wire_a, "sCode": "51008"}]
+    elif case == "conflicting_identity":
+        rows = [{"ordId": "provider-a", "clOrdId": wire_b, "sCode": "0"}]
+    elif case == "unrelated_wire_with_target_ord":
+        rows = [
+            {"ordId": "provider-a", "clOrdId": "sp" + "z" * 30, "sCode": "0"},
+            {"ordId": "provider-b", "clOrdId": wire_b, "sCode": "0"},
+        ]
+    elif case == "unrelated_ord_with_target_wire":
+        rows = [
+            {"ordId": "provider-z", "clOrdId": wire_a, "sCode": "0"},
+            {"ordId": "provider-b", "clOrdId": wire_b, "sCode": "0"},
+        ]
+    elif case == "missing_member":
+        rows = [{"ordId": "provider-b", "clOrdId": wire_b, "sCode": "0"}]
+    elif case == "identical_duplicate":
+        rows = [exact_a, deepcopy(exact_a)]
+    elif case == "conflicting_duplicate":
+        rows = [exact_a, {**exact_a, "sCode": "51400"}]
+    elif case == "missing_identity":
+        rows = [{"sCode": "0"}]
+    else:
+        rows = [{"ordId": [], "clOrdId": wire_a, "sCode": "0"}]
+    envelope = {"code": "1", "data": rows, "msg": f"synthetic {case}"}
+    client = ccxt.okx({})
+    monkeypatch.setattr(client, "request", lambda *_args, **_kwargs: envelope)
+
+    result = OkxSpiderBatchTransport(cast(Any, client)).submit(_two_member_cancel_batch())
+
+    assert result.response_failure is None
+    assert result.response_payload == canonical_bytes(envelope)
+    assert result.member_outcomes == (("d" * 64, expected_a), ("f" * 64, expected_b))
 
 
 def test_valid_unclassifiable_okx_envelope_is_retained_with_unknown_member(
