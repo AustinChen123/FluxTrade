@@ -49,6 +49,7 @@ from src.core.spider_management.financial_delivery import (
     stage_financial_receipt,
     validate_order_receipt_chain,
     validate_tape_index,
+    prove_spider_order_wire_binding,
 )
 from src.core.spider_management.initial_place_projection import (
     MemberOutcome,
@@ -2469,22 +2470,14 @@ class SpiderRuntimeOwner:
                 intent = order.intent_payload
                 if type(intent) is not dict:
                     return False
-                wire_bytes_hex = intent.get("provider_binding_bytes_hex")
-                if type(wire_bytes_hex) is not str:
-                    return False
-                wire_bytes = bytes.fromhex(wire_bytes_hex)
-                wire_binding = decode_canonical(wire_bytes)
-                expected_wire_id = "sp" + sha256(
-                    b"SPIDER_OKX_CLIENT_BINDING_V1\0" + wire_bytes
-                ).hexdigest()[:30]
-                expected_wire_binding = {
-                    "schema_version": "SPIDER_OKX_CLIENT_BINDING_V1",
-                    "environment": scope.environment,
-                    "execution_scope_id": scope.execution_scope_id,
-                    "strategy_id": scope.strategy_id,
-                    "action_id": action_id,
-                    "product_id": targets[source_product],
-                }
+                wire_proof = prove_spider_order_wire_binding(
+                    scope.environment,
+                    scope.execution_scope_id,
+                    scope.strategy_id,
+                    action,
+                    binding,
+                    order,
+                )
                 if (
                     action.action_id != action_id
                     or action.plan_id != plan.plan_id
@@ -2521,9 +2514,11 @@ class SpiderRuntimeOwner:
                     or order.client_order_id != intent.get("local_client_order_id")
                     or order.client_order_id == binding.source_client_order_id
                     or intent.get("source_client_order_id") != binding.source_client_order_id
-                    or intent.get("provider_wire_client_order_id") != expected_wire_id
-                    or intent.get("provider_binding_sha256") != _digest_bytes(wire_bytes)
-                    or wire_binding != expected_wire_binding
+                    or wire_proof != (
+                        binding.source_client_order_id,
+                        order.client_order_id,
+                        intent.get("provider_wire_client_order_id"),
+                    )
                 ):
                     return False
             restore_source_checkpoint(

@@ -22,10 +22,21 @@
 
 .strategy-intro > button,
 .strategy-action button,
-.strategy-safety button {
+.strategy-safety button,
+.spider-orders button,
+.spider-orders input,
+.spider-orders select {
   min-height: 44px;
   padding: 0 14px;
   cursor: pointer;
+}
+
+.spider-orders button:focus-visible,
+.spider-orders input:focus-visible,
+.spider-orders select:focus-visible,
+.spider-table-scroll:focus-visible {
+  outline: 3px solid var(--teal);
+  outline-offset: 2px;
 }
 
 .strategy-intro > button:disabled,
@@ -248,6 +259,169 @@
   gap: 8px;
 }
 
+.spider-orders {
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+  padding: 18px;
+  border: 1px solid var(--grid);
+  background: var(--panel);
+}
+
+.spider-orders-heading,
+.spider-pagination {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+
+.spider-orders-heading h3,
+.spider-trades h4 {
+  margin: 0;
+}
+
+.spider-orders-heading p:last-child,
+.spider-source-note,
+.spider-utc-note,
+.spider-page-summary,
+.spider-trades > p {
+  margin: 6px 0 0;
+  color: var(--muted);
+  line-height: 1.55;
+}
+
+.spider-order-filters {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr));
+  align-items: end;
+  gap: 12px;
+}
+
+.spider-order-filters label {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.spider-order-filters input,
+.spider-order-filters select {
+  width: 100%;
+  min-width: 0;
+}
+
+.spider-filter-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.spider-utc-note,
+.spider-inline-error {
+  grid-column: 1 / -1;
+}
+
+.spider-inline-error {
+  margin: 0;
+  color: var(--danger);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.spider-live-status,
+.spider-source-note,
+.spider-page-summary {
+  overflow-wrap: anywhere;
+}
+
+.spider-table-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+  overscroll-behavior-inline: contain;
+  border: 1px solid var(--grid);
+}
+
+.spider-table-scroll table {
+  width: 100%;
+  min-width: 920px;
+  border-collapse: collapse;
+  text-align: left;
+}
+
+.spider-table-scroll th,
+.spider-table-scroll td {
+  max-width: 280px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--grid);
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+
+.spider-table-scroll th {
+  background: var(--surface);
+  font-size: 0.82rem;
+  white-space: nowrap;
+}
+
+.spider-table-scroll td code,
+.spider-table-scroll th code {
+  overflow-wrap: anywhere;
+}
+
+.spider-order-details,
+.spider-trades {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+  padding-top: 12px;
+  border-top: 1px solid var(--grid);
+}
+
+.spider-order-details summary {
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+  font-weight: 650;
+}
+
+.spider-order-details > dl {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr));
+  gap: 1px;
+  margin: 0;
+  border: 1px solid var(--grid);
+  background: var(--grid);
+}
+
+.spider-order-details > dl > div {
+  min-width: 0;
+  padding: 10px 12px;
+  background: var(--surface);
+}
+
+.spider-order-details dt {
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.spider-order-details dd {
+  margin: 4px 0 0;
+  overflow-wrap: anywhere;
+  font-family: "SFMono-Regular", "Roboto Mono", monospace;
+  font-size: 0.84rem;
+}
+
+.spider-pagination button {
+  min-width: 96px;
+}
+
+.spider-pagination span {
+  overflow-wrap: anywhere;
+}
+
 @media (max-width: 640px) {
   .strategy-card-header {
     align-items: stretch;
@@ -256,6 +430,12 @@
 
   .strategy-card-header .strategy-action button,
   .strategy-safety button {
+    flex: 1 1 auto;
+  }
+
+  .spider-filter-actions button,
+  .spider-pagination button,
+  .spider-orders-heading > button {
     flex: 1 1 auto;
   }
 

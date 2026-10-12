@@ -38,6 +38,7 @@ from src.control_plane.ops_status_query import OpsStatusQuery
 from src.control_plane.profile_http_query import ProfileQueryService
 from src.control_plane.spider_configuration_http import SpiderConfigurationHttpService
 from src.control_plane.spider_operation_http import SpiderOperationHttpService
+from src.control_plane.spider_order_query import SpiderOrderQueryService
 from src.core.market_data.profiles.read_repository import ProfileReadRepository
 from src.control_plane.server import serve
 from src.core.db import SessionLocal, get_engine
@@ -115,6 +116,7 @@ def build_control_plane_app(
     )
     spider_configuration_http_service = None
     spider_operation_http_service = None
+    spider_order_query_service = None
     if configured_spider_scope is not None:
         configured_environment = RuntimeEnvironment.from_env().identity
         spider_configuration_http_service = SpiderConfigurationHttpService(
@@ -123,6 +125,11 @@ def build_control_plane_app(
             execution_scope_id=configured_spider_scope,
         )
         spider_operation_http_service = SpiderOperationHttpService(
+            db_session_factory,
+            environment=configured_environment,
+            execution_scope_id=configured_spider_scope,
+        )
+        spider_order_query_service = SpiderOrderQueryService(
             db_session_factory,
             environment=configured_environment,
             execution_scope_id=configured_spider_scope,
@@ -248,6 +255,7 @@ def build_control_plane_app(
         ga_command_service=ga_command_service,
         spider_configuration_http_service=spider_configuration_http_service,
         spider_operation_http_service=spider_operation_http_service,
+        spider_order_query_service=spider_order_query_service,
         readiness_probe=(
             readiness_probe
             if readiness_probe is not None

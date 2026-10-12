@@ -13,6 +13,8 @@ import {
   loadBacktestResult,
   loadBacktestResultTrades,
   loadBacktestResultCandles,
+  loadSpiderOrders,
+  loadSpiderOrderTrades,
   loadGaProfile,
   loadGaJobs,
   loadGaJob,
@@ -247,6 +249,49 @@ describe("strategy control API", () => {
         body: '{"command":"STOP","expected_version":1}'
       })
     );
+  });
+});
+
+describe("Spider local order query transport", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("sends one no-store GET with explicit strategy scope and normalized filters", async () => {
+    const fetch = vi.fn().mockResolvedValue(response(200, { closed: true }));
+    vi.stubGlobal("fetch", fetch);
+    const controller = new AbortController();
+    const query = {
+      strategy_id: "opaque strategy/1", category: "ALL" as const, local_order_id: "local-1",
+      order_created_from_ms: 1_797_120_000_001, order_created_to_ms: 1_797_123_600_001,
+      limit: 20, offset: 0
+    };
+    await expect(loadSpiderOrders(query, controller.signal)).resolves.toEqual({ closed: true });
+    expect(fetch).toHaveBeenCalledTimes(1);
+    const [input, init] = fetch.mock.calls[0] as [string, RequestInit];
+    const url = new URL(input, "https://console.invalid");
+    expect(url.pathname).toBe("/api/v1/spider/orders");
+    expect([...url.searchParams.keys()]).toEqual([
+      "strategy_id", "category", "local_order_id", "order_created_from_ms",
+      "order_created_to_ms", "limit", "offset"
+    ]);
+    expect(url.searchParams.get("strategy_id")).toBe(query.strategy_id);
+    expect(init.method).toBeUndefined();
+    expect(init.body).toBeUndefined();
+    expect(init.cache).toBe("no-store");
+    expect(init.signal).toBe(controller.signal);
+  });
+
+  it("encodes the exact local ID once in the route and carries the parent version", async () => {
+    const fetch = vi.fn().mockResolvedValue(response(200, { closed: true }));
+    vi.stubGlobal("fetch", fetch);
+    await loadSpiderOrderTrades("opaque%2Fidentifier", {
+      strategy_id: "strategy-1", category: "ALL", limit: 20, offset: 20,
+      view_version: "a".repeat(64)
+    });
+    const [input] = fetch.mock.calls[0] as [string];
+    const url = new URL(input, "https://console.invalid");
+    expect(url.pathname).toBe("/api/v1/spider/orders/opaque%252Fidentifier/trades");
+    expect(url.searchParams.get("view_version")).toBe("a".repeat(64));
+    expect(url.searchParams.has("local_order_id")).toBe(false);
   });
 });
 

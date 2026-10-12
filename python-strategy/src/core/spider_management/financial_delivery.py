@@ -430,6 +430,7 @@ def _projection_matches_install(
     payload = cast(dict[str, object], original)
     return (
         order.id == binding.local_order_id
+        and action.local_order_id == binding.local_order_id
         and order.strategy_id == binding.strategy_id
         and order.product_id == binding.canonical_product_id
         and order.account_profile == selection.get("account_profile")
@@ -459,6 +460,63 @@ def _projection_matches_install(
         and payload.get("clOrdId") == binding.source_client_order_id
         and before_row["id"] == binding.local_order_id
     )
+
+
+def prove_spider_order_wire_binding(
+    environment: str,
+    execution_scope_id: str,
+    strategy_id: str,
+    action: SpiderRuntimeAction,
+    binding: SpiderRuntimeBinding,
+    order: Order,
+) -> tuple[str, str | None, str] | None:
+    """Verify the saved canonical provider wire binding without lifecycle gates.
+
+    This is intentionally narrower than INSTALL replay and transmission
+    validation: local-fact readers may verify identity but cannot authorize a
+    send, restore runtime policy, or infer provider acceptance.
+    """
+    intent = order.intent_payload
+    if type(intent) is not dict:
+        return None
+    wire_hex = intent.get("provider_binding_bytes_hex")
+    if type(wire_hex) is not str or len(wire_hex) % 2:
+        return None
+    try:
+        raw = bytes.fromhex(wire_hex)
+        saved = decode_canonical(raw)
+    except (TypeError, ValueError, UnicodeDecodeError):
+        return None
+    expected = {
+        "schema_version": "SPIDER_OKX_CLIENT_BINDING_V1",
+        "environment": environment,
+        "execution_scope_id": execution_scope_id,
+        "strategy_id": strategy_id,
+        "action_id": action.action_id,
+        "product_id": binding.canonical_product_id,
+    }
+    wire_id = "sp" + sha256(b"SPIDER_OKX_CLIENT_BINDING_V1\0" + raw).hexdigest()[:30]
+    local_client_id = intent.get("local_client_order_id")
+    source_client_id = intent.get("source_client_order_id")
+    if type(source_client_id) is not str or (
+        local_client_id is not None and type(local_client_id) is not str
+    ):
+        return None
+    if (
+        saved != expected
+        or intent.get("action_id") != action.action_id
+        or intent.get("provider_binding_sha256") != _digest(raw)
+        or intent.get("provider_wire_client_order_id") != wire_id
+        or source_client_id != binding.source_client_order_id
+        or local_client_id != order.client_order_id
+        or binding.action_id != action.action_id
+        or binding.local_order_id != order.id
+        or order.strategy_id != strategy_id
+        or order.product_id != binding.canonical_product_id
+        or binding.source_product_id != action.product_id
+    ):
+        return None
+    return source_client_id, local_client_id, wire_id
 
 
 def _next_transition_ordinal(
