@@ -463,11 +463,13 @@ class SpiderRuntimeDelivery(Base):
         CheckConstraint("generation > 0", name="ck_spider_runtime_delivery_generation"),
         CheckConstraint("configuration_sha256 COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_runtime_delivery_configuration_hash"),
         UniqueConstraint("environment", "execution_scope_id", "strategy_id", "full_callback_key", name="uq_spider_runtime_delivery_full_callback"),
-        CheckConstraint("kind IN ('FILL', 'ORDER_STATE', 'SOURCE_MARKET', 'TRANSPORT_RESULT')", name="ck_spider_runtime_delivery_kind"),
+        CheckConstraint("kind IN ('FILL', 'ORDER_STATE', 'SOURCE_MARKET', 'TRANSPORT_RESULT', 'SOURCE_TIME')", name="ck_spider_runtime_delivery_kind"),
         CheckConstraint(
             "(kind = 'SOURCE_MARKET' AND local_order_id IS NULL AND trade_id IS NULL "
             "AND action_id IS NULL AND role IS NULL) OR "
             "(kind = 'TRANSPORT_RESULT' AND local_order_id IS NULL AND trade_id IS NULL "
+            "AND action_id IS NULL AND role IS NULL) OR "
+            "(kind = 'SOURCE_TIME' AND local_order_id IS NULL AND trade_id IS NULL "
             "AND action_id IS NULL AND role IS NULL) OR "
             "(kind IN ('FILL', 'ORDER_STATE') AND local_order_id IS NOT NULL "
             "AND action_id IS NOT NULL AND role IS NOT NULL "
