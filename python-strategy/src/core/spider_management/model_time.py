@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+from hashlib import sha256
 from typing import cast
 
 from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_canonical
@@ -47,6 +48,118 @@ class ModelTimeTransition:
     snapshots: dict[str, object] | None
     local_hour: int | None
     local_minute: int | None
+
+
+def model_time_envelope_identity(raw: bytes) -> tuple[dict[str, str], str] | None:
+    """Extract only the closed scope and observation ID used for receipt lookup."""
+    if type(raw) is not bytes or not 1 <= len(raw) <= 1_048_576:
+        return None
+    try:
+        envelope = _closed(decode_canonical(raw), {
+            "schema_version", "scope", "effective_identity", "observation_id",
+            "predecessor_observation_id", "checkpoint_before_sha256", "provenance",
+            "event", "clock", "snapshots",
+        })
+        scope = envelope["scope"]
+        observation_id = envelope["observation_id"]
+        _require(
+            canonical_bytes(envelope) == raw
+            and envelope["schema_version"] == SCHEMA_VERSION
+            and _valid_scope(scope)
+            and _valid_effective_identity(envelope["effective_identity"])
+            and _is_sha256(observation_id)
+        )
+        return cast(dict[str, str], scope), cast(str, observation_id)
+    except (TypeError, ValueError, UnicodeDecodeError, RecursionError):
+        return None
+
+
+def model_time_decision_payload(
+    raw: bytes,
+    transition: ModelTimeTransition,
+    *,
+    scope: dict[str, str],
+    generation: int,
+    configuration_sha256: str,
+    trigger_delivery_id: str,
+    before_checkpoint_sha256: str,
+    after_checkpoint_sha256: str,
+    events: list[dict[str, object]],
+    candidates: list[dict[str, object]],
+    outcome: str,
+    reason_code: str | None,
+) -> dict[str, object]:
+    """Build the one closed durable decision shape shared by consume and replay."""
+    identity = model_time_envelope_identity(raw)
+    _require(identity is not None and identity[0] == scope)
+    envelope = cast(dict[str, object], decode_canonical(raw))
+    effective_identity = cast(dict[str, object], envelope["effective_identity"])
+    clock = cast(dict[str, object], envelope["clock"])
+    observation_id = cast(str, envelope["observation_id"])
+    predecessor_id = envelope["predecessor_observation_id"]
+    time_input_sha256 = sha256(raw).hexdigest()
+    _require(
+        type(transition) is ModelTimeTransition
+        and transition.kind == envelope["event"]
+        and transition.record.observation_id == observation_id
+        and transition.record.epoch_id == clock["epoch_id"]
+        and transition.record.observed_utc_ms == clock["observed_utc_ms"]
+        and transition.record.elapsed_ms == clock["elapsed_ms"]
+        and transition.record.time_zone == clock["time_zone"]
+        and transition.record.source_now_ms == transition.source_now_ms
+        and transition.record.checkpoint_sha256 == before_checkpoint_sha256
+        and type(generation) is int
+        and generation == effective_identity["generation"]
+        and configuration_sha256 == effective_identity["configuration_sha256"]
+        and _is_sha256(configuration_sha256)
+        and trigger_delivery_id == observation_id
+        and _is_sha256(trigger_delivery_id)
+        and _is_sha256(before_checkpoint_sha256)
+        and _is_sha256(after_checkpoint_sha256)
+        and _is_sha256(time_input_sha256)
+        and type(events) is list
+        and all(type(item) is dict for item in events)
+        and type(candidates) is list
+        and all(type(item) is dict for item in candidates)
+        and outcome in {"CONSUMED", "POLICY_FAILED"}
+        and (reason_code is None if outcome == "CONSUMED" else reason_code == "SOURCE_POLICY_FAILED")
+    )
+    if transition.kind in {"ANCHOR", "RESTART"}:
+        _require(not events and not candidates and outcome == "CONSUMED")
+    if transition.kind == "ANCHOR":
+        _require(before_checkpoint_sha256 == after_checkpoint_sha256)
+    if outcome == "POLICY_FAILED":
+        _require(
+            transition.kind == "TIMER"
+            and before_checkpoint_sha256 == after_checkpoint_sha256
+            and not candidates
+        )
+    return {
+        "schema_version": "SPIDER_SOURCE_TIME_DECISION_V1",
+        "scope": scope,
+        "generation": generation,
+        "configuration_sha256": configuration_sha256,
+        "trigger_delivery_id": trigger_delivery_id,
+        "trigger_kind": "SOURCE_TIME",
+        "before_checkpoint_sha256": before_checkpoint_sha256,
+        "after_checkpoint_sha256": after_checkpoint_sha256,
+        "time_input_sha256": time_input_sha256,
+        "time_result": {
+            "event": transition.kind,
+            "observation_id": observation_id,
+            "predecessor_observation_id": predecessor_id,
+            "epoch_id": transition.record.epoch_id,
+            "observed_utc_ms": transition.record.observed_utc_ms,
+            "elapsed_ms": transition.record.elapsed_ms,
+            "time_zone": transition.record.time_zone,
+            "time_policy_id": cast(dict[str, object], envelope["clock"])["time_policy_id"],
+            "source_now_ms": transition.source_now_ms,
+        },
+        "events": events,
+        "candidates": candidates,
+        "outcome": outcome,
+        "reason_code": reason_code,
+    }
 
 
 def decode_model_time_transition(

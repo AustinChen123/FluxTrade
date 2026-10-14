@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import json
+from hashlib import sha256
 
 import pytest
 
+from src.core.backtest.spider_run_artifacts import canonical_bytes
 from src.core.spider_management.model_time import (
     ModelTimeRecord,
     ModelTimeUnavailable,
     decode_model_time_transition,
+    model_time_decision_payload,
+    model_time_envelope_identity,
 )
 
 _HASH = "a" * 64
@@ -339,3 +343,98 @@ def test_non_anchor_matching_checkpoint_preserves_exact_delta_and_never_regresse
 
     assert result.source_now_ms == 500 + delta_ms
     assert result.source_now_ms >= 500
+
+
+def test_model_time_identity_extracts_only_canonical_closed_routing_identity() -> None:
+    raw = canonical_bytes(_envelope())
+
+    assert model_time_envelope_identity(raw) == (_SCOPE, "d" * 64)
+    assert model_time_envelope_identity(raw + b" ") is None
+    assert model_time_envelope_identity(b"not-json") is None
+
+    malformed = _envelope()
+    malformed["extra"] = True
+    assert model_time_envelope_identity(canonical_bytes(malformed)) is None
+
+
+def test_time_decision_uses_closed_schema_and_shared_transition_result() -> None:
+    value = _envelope()
+    raw = canonical_bytes(value)
+    transition = _decode(value, previous=None)
+
+    decision = model_time_decision_payload(
+        raw,
+        transition,
+        scope=_SCOPE,
+        generation=1,
+        configuration_sha256="c" * 64,
+        trigger_delivery_id="d" * 64,
+        before_checkpoint_sha256=_HASH,
+        after_checkpoint_sha256=_HASH,
+        events=[],
+        candidates=[],
+        outcome="CONSUMED",
+        reason_code=None,
+    )
+
+    assert set(decision) == {
+        "schema_version", "scope", "generation", "configuration_sha256",
+        "trigger_delivery_id", "trigger_kind", "before_checkpoint_sha256",
+        "after_checkpoint_sha256", "time_input_sha256", "time_result", "events",
+        "candidates", "outcome", "reason_code",
+    }
+    assert decision["schema_version"] == "SPIDER_SOURCE_TIME_DECISION_V1"
+    assert decision["time_input_sha256"] == sha256(raw).hexdigest()
+    assert decision["time_result"] == {
+        "event": "ANCHOR",
+        "observation_id": "d" * 64,
+        "predecessor_observation_id": None,
+        "epoch_id": "epoch-1",
+        "observed_utc_ms": _UTC,
+        "elapsed_ms": 100,
+        "time_zone": "UTC",
+        "time_policy_id": "SPIDER_COUNT_DOWNTIME_NO_CATCHUP_V1",
+        "source_now_ms": 500,
+    }
+
+    with pytest.raises(ValueError):
+        model_time_decision_payload(
+            raw,
+            transition,
+            scope=_SCOPE,
+            generation=1,
+            configuration_sha256="c" * 64,
+            trigger_delivery_id="d" * 64,
+            before_checkpoint_sha256=_HASH,
+            after_checkpoint_sha256="f" * 64,
+            events=[],
+            candidates=[],
+            outcome="CONSUMED",
+            reason_code=None,
+        )
+
+
+def test_policy_failed_time_decision_keeps_checkpoint_and_no_candidates() -> None:
+    value = _envelope("TIMER", previous_id="d" * 64, snapshots=_snapshots())
+    raw = canonical_bytes(value)
+    transition = _decode(value, previous=_record())
+
+    decision = model_time_decision_payload(
+        raw,
+        transition,
+        scope=_SCOPE,
+        generation=1,
+        configuration_sha256="c" * 64,
+        trigger_delivery_id="d" * 64,
+        before_checkpoint_sha256=_HASH,
+        after_checkpoint_sha256=_HASH,
+        events=[{"kind": "alert"}],
+        candidates=[],
+        outcome="POLICY_FAILED",
+        reason_code="SOURCE_POLICY_FAILED",
+    )
+
+    assert decision["outcome"] == "POLICY_FAILED"
+    assert decision["reason_code"] == "SOURCE_POLICY_FAILED"
+    assert decision["events"] == [{"kind": "alert"}]
+    assert decision["candidates"] == []

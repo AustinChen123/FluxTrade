@@ -37,6 +37,14 @@ from src.core.spider_management.model_bootstrap import (
     PreparedModelBootstrap,
     prepare_model_bootstrap,
 )
+from src.core.spider_management.model_time import (
+    ModelTimeRecord,
+    ModelTimeTransition,
+    ModelTimeUnavailable,
+    decode_model_time_transition,
+    model_time_decision_payload,
+    model_time_envelope_identity,
+)
 from src.core.spider_management.source_checkpoint_codec import (
     decode_source_market_observation,
     replace_checkpoint_markets,
@@ -415,6 +423,728 @@ class SpiderRuntimeOwner:
             data=data,
             completed=disposition in {"REJECTED", "CONFLICT"},
         )
+
+    def receive_source_time(self, raw: bytes) -> CommandResult:
+        """Record one admitted MODEL time observation in the shared delivery tape."""
+        identity = model_time_envelope_identity(raw)
+        if identity is None:
+            return self._source_time_result(None, "REJECTED", "SPIDER_SOURCE_TIME_INVALID")
+        supplied_scope, observation_id = identity
+        scope = self._owned_scopes.get(supplied_scope["strategy_id"])
+        if scope is None or supplied_scope != _scope(scope):
+            return self._source_time_result(scope, "REJECTED", "SPIDER_SOURCE_TIME_SCOPE_UNKNOWN")
+        if self._lifecycle_lock is None or self._order_event_lock is None:
+            return self._source_time_result(scope, "UNKNOWN", "SPIDER_SOURCE_TIME_UNAVAILABLE")
+
+        status = "UNKNOWN"
+        reason = "SPIDER_SOURCE_TIME_WRITE_UNKNOWN"
+        sequence: int | None = None
+        operation_id: str | None = None
+        try:
+            with self._lifecycle_lock(scope.strategy_id):
+                with cast(ContextManager[object], self._order_event_lock):
+                    status, reason, operation_id, sequence = self._record_source_time(
+                        scope, observation_id, raw
+                    )
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Spider time receipt write failed; proving the same observation identity"
+            )
+            proved = self._source_time_receipt_readback(scope, observation_id, raw)
+            if proved is None:
+                return self._source_time_result(scope, "UNKNOWN", "SPIDER_SOURCE_TIME_WRITE_UNKNOWN")
+            operation_id = cast(str, proved["operation_id"])
+            sequence = cast(int, proved["sequence"])
+            readback = self.readback(scope, operation_id)
+            if readback is None or cast(int, readback["received_sequence"]) < sequence:
+                return self._source_time_result(
+                    scope, "UNKNOWN", "SPIDER_SOURCE_TIME_READBACK_UNKNOWN",
+                    operation_id=operation_id, sequence=sequence,
+                )
+            return self._source_time_result(
+                scope, "ACCEPTED", "SPIDER_SOURCE_TIME_COMMIT_PROVED",
+                operation_id=operation_id, sequence=sequence,
+                receipt_disposition=cast(str, proved["disposition"]),
+                checkpoint_sha256=cast(str, proved["checkpoint_sha256"]),
+            )
+
+        if status in {"RECORDED", "DUPLICATE"}:
+            self._drain_stopped_scope(scope)
+            self._drain_source_market_scope(scope)
+            proved = self._source_time_receipt_readback(scope, observation_id, raw)
+            if (
+                proved is None
+                or self.readback(scope, cast(str, proved["operation_id"])) is None
+            ):
+                return self._source_time_result(
+                    scope, "UNKNOWN", "SPIDER_SOURCE_TIME_READBACK_UNKNOWN",
+                    operation_id=operation_id, sequence=sequence,
+                )
+            return self._source_time_result(
+                scope,
+                "ACCEPTED" if status == "RECORDED" else "DUPLICATE",
+                "SPIDER_SOURCE_TIME_RECORDED" if status == "RECORDED"
+                else "SPIDER_SOURCE_TIME_DUPLICATE",
+                operation_id=cast(str, proved["operation_id"]),
+                sequence=cast(int, proved["sequence"]),
+                receipt_disposition=cast(str, proved["disposition"]),
+                checkpoint_sha256=cast(str, proved["checkpoint_sha256"]),
+            )
+        return self._source_time_result(
+            scope, status, reason, operation_id=operation_id, sequence=sequence
+        )
+
+    @staticmethod
+    def _source_time_result(
+        scope: RuntimeScopeKey | None,
+        disposition: str,
+        reason: str,
+        *,
+        operation_id: str | None = None,
+        sequence: int | None = None,
+        receipt_disposition: str | None = None,
+        checkpoint_sha256: str | None = None,
+    ) -> CommandResult:
+        return CommandResult(
+            success=disposition in {"ACCEPTED", "DUPLICATE"},
+            message=reason,
+            data={
+                "scope": None if scope is None else _scope(scope),
+                "disposition": disposition,
+                "operation_id": operation_id,
+                "reason_code": reason,
+                "delivery_sequence": sequence,
+                "delivery_disposition": receipt_disposition,
+                "checkpoint_sha256": checkpoint_sha256,
+            },
+            completed=disposition in {"REJECTED", "CONFLICT"},
+        )
+
+    def _record_source_time(
+        self, scope: RuntimeScopeKey, observation_id: str, raw: bytes
+    ) -> tuple[str, str, str | None, int | None]:
+        with self._sessions() as session:
+            if (
+                not isinstance(session, Session)
+                or session.in_transaction()
+                or not session.is_active
+                or session.get_bind().dialect.name != "postgresql"
+            ):
+                return "REJECTED", "SPIDER_SOURCE_TIME_SESSION_UNAVAILABLE", None, None
+            with session.begin():
+                self._configure_writer(session)
+                runtime = session.execute(
+                    select(SpiderRuntimeScope).where(
+                        SpiderRuntimeScope.environment == scope.environment,
+                        SpiderRuntimeScope.execution_scope_id == scope.execution_scope_id,
+                        SpiderRuntimeScope.strategy_id == scope.strategy_id,
+                    ).with_for_update()
+                ).scalar_one_or_none()
+                if runtime is None or runtime.current_operation_id is None:
+                    return "REJECTED", "SPIDER_SOURCE_TIME_RUNTIME_UNAVAILABLE", None, None
+                operation_id = runtime.current_operation_id
+                existing = session.execute(
+                    select(SpiderRuntimeDelivery).where(
+                        SpiderRuntimeDelivery.environment == scope.environment,
+                        SpiderRuntimeDelivery.execution_scope_id == scope.execution_scope_id,
+                        SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                        SpiderRuntimeDelivery.delivery_id == observation_id,
+                    )
+                ).scalar_one_or_none()
+                if existing is not None:
+                    if (
+                        existing.kind == "SOURCE_TIME"
+                        and existing.source_payload == raw
+                        and existing.content_sha256 == _digest_bytes(raw)
+                    ):
+                        return "DUPLICATE", "SPIDER_SOURCE_TIME_DUPLICATE", operation_id, existing.sequence
+                    return "CONFLICT", "SPIDER_SOURCE_TIME_ID_CONFLICT", operation_id, None
+                plan = session.execute(
+                    select(SpiderRuntimePlan).where(
+                        SpiderRuntimePlan.plan_id == runtime.initial_plan_id,
+                        SpiderRuntimePlan.operation_id == operation_id,
+                    ).with_for_update()
+                ).scalar_one_or_none()
+                if (
+                    plan is None
+                    or plan.plan_status not in {"INCOMPLETE", "COMPLETE"}
+                    or plan.generation != runtime.generation
+                    or plan.configuration_sha256 != runtime.configuration_sha256
+                    or runtime.last_received_sequence != runtime.last_consumed_sequence
+                    or not validate_tape_index(session, runtime)
+                    or self._refresh_initial_place_projection(
+                        session, scope, runtime, plan, persist=False
+                    ) is None
+                ):
+                    return "REJECTED", "SPIDER_SOURCE_TIME_FRONTIER_UNAVAILABLE", operation_id, None
+                identity_rows = self._initial_install_identity_rows(session, plan)
+                if identity_rows is None or not self._validate_initial_install_source(
+                    session, scope, runtime, plan, identity_rows
+                ):
+                    return "REJECTED", "SPIDER_SOURCE_TIME_CHECKPOINT_UNAVAILABLE", operation_id, None
+                products, evidence_sha256, _source_sha256 = self._source_market_basis(plan)
+                previous = self._latest_consumed_model_time_record(session, scope)
+                checkpoint = decode_canonical(bytes(runtime.source_checkpoint))
+                if type(checkpoint) is not dict or type(checkpoint.get("now_ms")) is not int:
+                    return "REJECTED", "SPIDER_SOURCE_TIME_CHECKPOINT_UNAVAILABLE", operation_id, None
+                try:
+                    transition = decode_model_time_transition(
+                        raw,
+                        scope=_scope(scope),
+                        effective_identity={
+                            "generation": runtime.generation,
+                            "confirmation_request_id": runtime.confirmation_request_id,
+                            "configuration_sha256": runtime.configuration_sha256,
+                        },
+                        evidence_sha256=evidence_sha256,
+                        ordered_products=products,
+                        checkpoint_now_ms=cast(int, checkpoint["now_ms"]),
+                        checkpoint_sha256=runtime.source_checkpoint_sha256,
+                        previous=previous,
+                    )
+                    self._model_time_snapshot_orders(
+                        session,
+                        scope,
+                        runtime,
+                        plan,
+                        raw,
+                        transition,
+                        sequence=runtime.last_received_sequence + 1,
+                        cutoff_ordinal=runtime.last_tape_sequence + 1,
+                    )
+                except (ModelTimeUnavailable, InvalidOperation, KeyError, TypeError, ValueError):
+                    return "REJECTED", "SPIDER_SOURCE_TIME_INVALID", operation_id, None
+                sequence = runtime.last_received_sequence + 1
+                tape_ordinal = runtime.last_tape_sequence + 1
+                if not 1 <= sequence < 2**63 or not 1 <= tape_ordinal < 2**63:
+                    return "REJECTED", "SPIDER_SOURCE_TIME_FRONTIER_EXHAUSTED", operation_id, None
+                runtime.last_received_sequence = sequence
+                runtime.last_tape_sequence = tape_ordinal
+                session.add(SpiderRuntimeDelivery(
+                    environment=scope.environment,
+                    execution_scope_id=scope.execution_scope_id,
+                    strategy_id=scope.strategy_id,
+                    sequence=sequence,
+                    delivery_id=observation_id,
+                    content_sha256=_digest_bytes(raw),
+                    kind="SOURCE_TIME",
+                    local_order_id=None,
+                    trade_id=None,
+                    action_id=None,
+                    generation=runtime.generation,
+                    configuration_sha256=runtime.configuration_sha256,
+                    role=None,
+                    source_payload=raw,
+                    visible_at=_database_millisecond_time(session),
+                    elapsed_ms=None,
+                    disposition="PENDING",
+                    suppression_reason=None,
+                ))
+                session.add(SpiderRuntimeTapeIndex(
+                    environment=scope.environment,
+                    execution_scope_id=scope.execution_scope_id,
+                    strategy_id=scope.strategy_id,
+                    ordinal=tape_ordinal,
+                    kind="DELIVERY",
+                    delivery_sequence=sequence,
+                    transmission_group_id=None,
+                ))
+                session.flush()
+                return "RECORDED", "SPIDER_SOURCE_TIME_RECEIVED", operation_id, sequence
+
+    def _source_time_receipt_readback(
+        self, scope: RuntimeScopeKey, observation_id: str, raw: bytes
+    ) -> dict[str, object] | None:
+        try:
+            with self._sessions() as session:
+                if (
+                    not isinstance(session, Session)
+                    or session.in_transaction()
+                    or not session.is_active
+                    or session.get_bind().dialect.name != "postgresql"
+                ):
+                    return None
+                with session.begin():
+                    session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY"))
+                    self._configure_writer(session)
+                    row = session.execute(select(SpiderRuntimeDelivery).where(
+                        SpiderRuntimeDelivery.environment == scope.environment,
+                        SpiderRuntimeDelivery.execution_scope_id == scope.execution_scope_id,
+                        SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                        SpiderRuntimeDelivery.delivery_id == observation_id,
+                    )).scalar_one_or_none()
+                    runtime = session.execute(select(SpiderRuntimeScope).where(
+                        SpiderRuntimeScope.environment == scope.environment,
+                        SpiderRuntimeScope.execution_scope_id == scope.execution_scope_id,
+                        SpiderRuntimeScope.strategy_id == scope.strategy_id,
+                    )).scalar_one_or_none()
+                    if (
+                        row is None
+                        or runtime is None
+                        or row.kind != "SOURCE_TIME"
+                        or row.source_payload != raw
+                        or row.content_sha256 != _digest_bytes(raw)
+                        or row.delivery_id != observation_id
+                        or row.action_id is not None
+                        or row.local_order_id is not None
+                        or row.trade_id is not None
+                        or row.role is not None
+                        or row.generation != runtime.generation
+                        or row.configuration_sha256 != runtime.configuration_sha256
+                        or not validate_tape_index(session, runtime)
+                    ):
+                        return None
+                    operation_id = runtime.current_operation_id
+                    if operation_id is None:
+                        return None
+                    return {
+                        "operation_id": operation_id,
+                        "sequence": row.sequence,
+                        "disposition": row.disposition,
+                        "checkpoint_sha256": runtime.source_checkpoint_sha256,
+                    }
+        except Exception:
+            return None
+
+    def _initial_install_identity_rows(
+        self, session: Session, plan: SpiderRuntimePlan
+    ) -> list[tuple[SpiderRuntimeAction, SpiderRuntimeBinding, Order]] | None:
+        rows = session.execute(
+            select(SpiderRuntimeAction, SpiderRuntimeBinding, Order)
+            .join(SpiderRuntimeBinding, SpiderRuntimeBinding.action_id == SpiderRuntimeAction.action_id)
+            .join(Order, Order.id == SpiderRuntimeAction.local_order_id)
+            .where(
+                SpiderRuntimeAction.plan_id == plan.plan_id,
+                SpiderRuntimeAction.operation == "PLACE",
+                SpiderRuntimeAction.trigger_delivery_id.is_(None),
+                ~SpiderRuntimeAction.action_id.in_(select(SpiderMemberResubmission.resubmission_action_id)),
+            ).order_by(SpiderRuntimeAction.candidate_ordinal)
+        ).all()
+        result = cast(list[tuple[SpiderRuntimeAction, SpiderRuntimeBinding, Order]], list(rows))
+        return result or None
+
+    def _latest_consumed_model_time_record(
+        self, session: Session, scope: RuntimeScopeKey
+    ) -> ModelTimeRecord | None:
+        row = session.execute(select(SpiderRuntimeDelivery).where(
+            SpiderRuntimeDelivery.environment == scope.environment,
+            SpiderRuntimeDelivery.execution_scope_id == scope.execution_scope_id,
+            SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+            SpiderRuntimeDelivery.kind == "SOURCE_TIME",
+            SpiderRuntimeDelivery.disposition == "CONSUMED",
+        ).order_by(SpiderRuntimeDelivery.sequence.desc()).limit(1)).scalar_one_or_none()
+        if row is None or type(row.decision_payload) is not bytes:
+            return None
+        decision = decode_canonical(row.decision_payload)
+        if type(decision) is not dict or type(decision.get("time_result")) is not dict:
+            raise ModelTimeUnavailable("SPIDER_MODEL_TIME_HISTORY_UNAVAILABLE")
+        result = cast(dict[str, object], decision["time_result"])
+        return ModelTimeRecord(
+            epoch_id=cast(str, result["epoch_id"]),
+            observed_utc_ms=cast(int, result["observed_utc_ms"]),
+            elapsed_ms=cast(int, result["elapsed_ms"]),
+            source_now_ms=cast(int, result["source_now_ms"]),
+            observation_id=cast(str, result["observation_id"]),
+            time_zone=cast(str, result["time_zone"]),
+            checkpoint_sha256=cast(str, decision["before_checkpoint_sha256"]),
+        )
+
+    def _model_time_snapshot_orders(
+        self, session: Session, scope: RuntimeScopeKey, runtime: SpiderRuntimeScope,
+        plan: SpiderRuntimePlan, raw: bytes, transition: ModelTimeTransition,
+        *, sequence: int, cutoff_ordinal: int,
+    ) -> list[dict[str, object]] | None:
+        snapshots = transition.snapshots
+        if not transition.should_invoke_timer or snapshots is None:
+            return None
+        supplied_value = snapshots.get("open_orders")
+        if supplied_value is None:
+            return None
+        supplied = cast(list[object], supplied_value)
+        supplied_by_id: dict[str, dict[str, object]] = {}
+        for value in supplied:
+            if type(value) is not dict:
+                raise ModelTimeUnavailable("SPIDER_SOURCE_TIME_ORDER_SNAPSHOT_UNAVAILABLE")
+            row = cast(dict[str, object], value)
+            local_id = row.get("local_order_id")
+            if type(local_id) is not str or local_id in supplied_by_id:
+                raise ModelTimeUnavailable("SPIDER_SOURCE_TIME_ORDER_SNAPSHOT_UNAVAILABLE")
+            supplied_by_id[local_id] = row
+
+        roots = session.execute(select(SpiderRuntimeAction, SpiderRuntimeBinding, Order).join(
+            SpiderRuntimeBinding, SpiderRuntimeBinding.action_id == SpiderRuntimeAction.action_id
+        ).join(Order, Order.id == SpiderRuntimeAction.local_order_id).where(
+            SpiderRuntimeAction.plan_id == plan.plan_id,
+            SpiderRuntimeAction.operation == "PLACE",
+            SpiderRuntimeAction.parent_action_id.is_(None),
+        ).order_by(SpiderRuntimeAction.candidate_ordinal)).all()
+        if not roots:
+            raise ModelTimeUnavailable("SPIDER_SOURCE_TIME_ORDER_SNAPSHOT_UNAVAILABLE")
+        selected: list[tuple[SpiderRuntimeAction, SpiderRuntimeBinding, Order]] = []
+        for action, binding, order in roots:
+            if action.trigger_delivery_id is not None:
+                born = session.execute(select(SpiderRuntimeDelivery.sequence).where(
+                    SpiderRuntimeDelivery.environment == scope.environment,
+                    SpiderRuntimeDelivery.execution_scope_id == scope.execution_scope_id,
+                    SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                    SpiderRuntimeDelivery.delivery_id == action.trigger_delivery_id,
+                )).scalar_one_or_none()
+                if type(born) is not int:
+                    raise ModelTimeUnavailable("SPIDER_SOURCE_TIME_ORDER_SNAPSHOT_UNAVAILABLE")
+                if born >= sequence:
+                    continue
+            if (
+                action.role != "GRID" or action.local_order_id != order.id
+                or action.payload_sha256 != _digest_bytes(bytes(action.original_payload))
+                or binding.action_id != action.action_id or binding.local_order_id != order.id
+                or prove_spider_order_wire_binding(
+                    scope.environment, scope.execution_scope_id, scope.strategy_id,
+                    action, binding, order,
+                ) is None
+            ):
+                raise ModelTimeUnavailable("SPIDER_SOURCE_TIME_ORDER_SNAPSHOT_UNAVAILABLE")
+            selected.append((action, binding, order))
+
+        # A resubmission relation replaces its root at its own causal tape ordinal.
+        by_root = {action.action_id: (action, binding, order) for action, binding, order in selected}
+        relations = session.execute(select(SpiderMemberResubmission).where(
+            SpiderMemberResubmission.environment == scope.environment,
+            SpiderMemberResubmission.execution_scope_id == scope.execution_scope_id,
+            SpiderMemberResubmission.strategy_id == scope.strategy_id,
+            SpiderMemberResubmission.tape_ordinal < cutoff_ordinal,
+        ).order_by(SpiderMemberResubmission.tape_ordinal)).scalars().all()
+        for relation in relations:
+            saved = session.get(SpiderMemberResubmissionRequest, relation.request_id)
+            child = session.execute(select(SpiderRuntimeAction, SpiderRuntimeBinding, Order)
+                .join(SpiderRuntimeBinding, SpiderRuntimeBinding.action_id == SpiderRuntimeAction.action_id)
+                .join(Order, Order.id == SpiderRuntimeAction.local_order_id)
+                .where(SpiderRuntimeAction.action_id == relation.resubmission_action_id)).one_or_none()
+            if saved is None or child is None or not self._validate_member_resubmission_relation(session, scope, relation, saved):
+                raise ModelTimeUnavailable("SPIDER_SOURCE_TIME_ORDER_SNAPSHOT_UNAVAILABLE")
+            ancestor = by_root.get(relation.initial_member_id)
+            if ancestor is not None:
+                ancestor_action, ancestor_binding, ancestor_order = ancestor
+                ancestor_receipts = session.execute(select(SpiderRuntimeDelivery).where(
+                    SpiderRuntimeDelivery.environment == scope.environment,
+                    SpiderRuntimeDelivery.execution_scope_id == scope.execution_scope_id,
+                    SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                    SpiderRuntimeDelivery.local_order_id == ancestor_order.id,
+                    SpiderRuntimeDelivery.kind.in_(("FILL", "ORDER_STATE")),
+                    SpiderRuntimeDelivery.sequence < sequence,
+                ).order_by(SpiderRuntimeDelivery.sequence)).scalars().all()
+                if ancestor_receipts:
+                    receipt = decode_canonical(bytes(ancestor_receipts[-1].source_payload))
+                    source = decode_canonical(bytes(ancestor_action.original_payload))
+                    if (
+                        type(receipt) is not dict or type(receipt.get("after")) is not dict
+                        or type(source) is not dict
+                    ):
+                        raise ModelTimeUnavailable("SPIDER_SOURCE_TIME_ORDER_SNAPSHOT_UNAVAILABLE")
+                    projection = cast(dict[str, object], receipt["after"])
+                    original = cast(dict[str, object], source)
+                    ancestor_quantity = _positive_decimal(original.get("sz"))
+                    if not validate_order_receipt_chain(
+                        session, scope=_scope(scope), action=ancestor_action,
+                        binding=ancestor_binding, order_id=ancestor_order.id,
+                        current_projection=projection,
+                        through_sequence=ancestor_receipts[-1].sequence,
+                    ):
+                        raise ModelTimeUnavailable("SPIDER_SOURCE_TIME_ORDER_SNAPSHOT_UNAVAILABLE")
+                    ancestor_fills = session.execute(select(Trade.price).join(
+                        SpiderRuntimeDelivery, SpiderRuntimeDelivery.trade_id == Trade.id
+                    ).where(
+                        SpiderRuntimeDelivery.environment == scope.environment,
+                        SpiderRuntimeDelivery.execution_scope_id == scope.execution_scope_id,
+                        SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                        SpiderRuntimeDelivery.local_order_id == ancestor_order.id,
+                        SpiderRuntimeDelivery.kind == "FILL",
+                        SpiderRuntimeDelivery.sequence < sequence,
+                    )).scalars().all()
+                    ancestor_state = classify_source_order_transition(
+                        projection.get("status"), original_quantity=ancestor_quantity,
+                        cumulative_quantity=Decimal(cast(str, projection["filled_quantity"])),
+                        trade_chain_proved=bool(ancestor_fills) and all(
+                            type(price) is Decimal and price.is_finite() and price > 0
+                            for price in ancestor_fills
+                        ),
+                    ).state
+                    if ancestor_state not in {"filled", "canceled", "failed", "economic_terminal"}:
+                        raise ModelTimeUnavailable("SPIDER_SOURCE_TIME_ORDER_SNAPSHOT_UNAVAILABLE")
+            by_root[relation.initial_member_id] = cast(
+                tuple[SpiderRuntimeAction, SpiderRuntimeBinding, Order], tuple(child)
+            )
+        selected = sorted(by_root.values(), key=lambda item: item[0].candidate_ordinal)
+
+        expected: dict[str, tuple[str, str, str, str, int]] = {}
+        for action, binding, order in selected:
+            source_value = decode_canonical(bytes(action.original_payload))
+            if type(source_value) is not dict:
+                raise ModelTimeUnavailable("SPIDER_SOURCE_TIME_ORDER_SNAPSHOT_UNAVAILABLE")
+            original = cast(dict[str, object], source_value)
+            quantity = _positive_decimal(original.get("sz"))
+            financial = session.execute(select(SpiderRuntimeDelivery).where(
+                SpiderRuntimeDelivery.environment == scope.environment,
+                SpiderRuntimeDelivery.execution_scope_id == scope.execution_scope_id,
+                SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                SpiderRuntimeDelivery.local_order_id == order.id,
+                SpiderRuntimeDelivery.kind.in_(("FILL", "ORDER_STATE")),
+                SpiderRuntimeDelivery.sequence < sequence,
+            ).order_by(SpiderRuntimeDelivery.sequence)).scalars().all()
+            state: str | None = None
+            cumulative = Decimal("0")
+            if financial:
+                last = financial[-1]
+                receipt = decode_canonical(bytes(last.source_payload))
+                if type(receipt) is not dict or type(receipt.get("after")) is not dict:
+                    raise ModelTimeUnavailable("SPIDER_SOURCE_TIME_ORDER_SNAPSHOT_UNAVAILABLE")
+                projection = cast(dict[str, object], receipt["after"])
+                if not validate_order_receipt_chain(
+                    session, scope=_scope(scope), action=action, binding=binding,
+                    order_id=order.id, current_projection=projection,
+                    through_sequence=last.sequence,
+                ):
+                    raise ModelTimeUnavailable("SPIDER_SOURCE_TIME_ORDER_SNAPSHOT_UNAVAILABLE")
+                cumulative = Decimal(cast(str, projection["filled_quantity"]))
+                fills = session.execute(select(Trade.price).join(
+                    SpiderRuntimeDelivery, SpiderRuntimeDelivery.trade_id == Trade.id
+                ).where(
+                    SpiderRuntimeDelivery.environment == scope.environment,
+                    SpiderRuntimeDelivery.execution_scope_id == scope.execution_scope_id,
+                    SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                    SpiderRuntimeDelivery.local_order_id == order.id,
+                    SpiderRuntimeDelivery.kind == "FILL",
+                    SpiderRuntimeDelivery.sequence < sequence,
+                )).scalars().all()
+                classified = classify_source_order_transition(
+                    projection.get("status"), original_quantity=quantity,
+                    cumulative_quantity=cumulative,
+                    trade_chain_proved=bool(fills) and all(
+                        type(price) is Decimal and price.is_finite() and price > 0 for price in fills
+                    ),
+                )
+                state = classified.state
+                if state in {"new", "sent", None}:
+                    raise ModelTimeUnavailable("SPIDER_SOURCE_TIME_ORDER_SNAPSHOT_UNAVAILABLE")
+            else:
+                transmission_rows = session.execute(select(SpiderRuntimeTransmission).where(
+                    SpiderRuntimeTransmission.environment == scope.environment,
+                    SpiderRuntimeTransmission.execution_scope_id == scope.execution_scope_id,
+                    SpiderRuntimeTransmission.strategy_id == scope.strategy_id,
+                    SpiderRuntimeTransmission.operation == "PLACE",
+                )).scalars().all()
+                transmission = None
+                for candidate in transmission_rows:
+                    request = _decode_transport_request(bytes(candidate.request_payload))
+                    members = None if request is None else request.get("members")
+                    if type(members) is list and any(
+                        type(member) is dict and cast(dict[str, object], member).get("action_id") == action.action_id
+                        for member in members
+                    ):
+                        transmission = candidate
+                        break
+                if transmission is None:
+                    continue
+                marker = session.execute(select(SpiderRuntimeTapeIndex.ordinal).where(
+                    SpiderRuntimeTapeIndex.environment == scope.environment,
+                    SpiderRuntimeTapeIndex.execution_scope_id == scope.execution_scope_id,
+                    SpiderRuntimeTapeIndex.strategy_id == scope.strategy_id,
+                    SpiderRuntimeTapeIndex.kind == "SEND_MARKER",
+                    SpiderRuntimeTapeIndex.transmission_group_id == transmission.transmission_group_id,
+                )).scalar_one_or_none()
+                if marker is None or type(marker) is not int or marker >= cutoff_ordinal:
+                    continue
+                results = session.execute(select(SpiderRuntimeDelivery).where(
+                    SpiderRuntimeDelivery.environment == scope.environment,
+                    SpiderRuntimeDelivery.execution_scope_id == scope.execution_scope_id,
+                    SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                    SpiderRuntimeDelivery.kind == "TRANSPORT_RESULT",
+                    SpiderRuntimeDelivery.sequence < sequence,
+                ).order_by(SpiderRuntimeDelivery.sequence)).scalars().all()
+                matched = []
+                for result in results:
+                    value = decode_canonical(bytes(result.source_payload))
+                    if type(value) is dict and value.get("transmission_group_id") == transmission.transmission_group_id:
+                        matched.append((result, cast(dict[str, object], value)))
+                if len(matched) != 1 or transmission.response_recorded_at is None:
+                    raise ModelTimeUnavailable("SPIDER_SOURCE_TIME_ORDER_SNAPSHOT_UNAVAILABLE")
+                result, record = matched[0]
+                if (
+                    result.disposition != "CONSUMED"
+                    or record != {
+                        "schema_version": "SPIDER_TRANSPORT_RESULT_DELIVERY_V1",
+                        "scope": _scope(scope),
+                        "transmission_group_id": transmission.transmission_group_id,
+                        "request_sha256": transmission.request_sha256,
+                        "response_sha256": transmission.response_sha256,
+                        "response_failure": transmission.response_failure,
+                    }
+                    or transmission.request_sha256 != _digest_bytes(bytes(transmission.request_payload))
+                ):
+                    raise ModelTimeUnavailable("SPIDER_SOURCE_TIME_ORDER_SNAPSHOT_UNAVAILABLE")
+                request = _decode_transport_request(bytes(transmission.request_payload))
+                if request is None or not self._valid_normal_place_request(session, scope, runtime, plan, request):
+                    raise ModelTimeUnavailable("SPIDER_SOURCE_TIME_ORDER_SNAPSHOT_UNAVAILABLE")
+                if transmission.response_payload is not None:
+                    outcomes = self._validated_transport_outcomes(
+                        bytes(transmission.request_payload), bytes(transmission.response_payload)
+                    )
+                    if outcomes is None:
+                        raise ModelTimeUnavailable("SPIDER_SOURCE_TIME_ORDER_SNAPSHOT_UNAVAILABLE")
+                    outcome = outcomes.get(action.action_id)
+                    if outcome is None or outcome[0] == "SEND_UNKNOWN":
+                        raise ModelTimeUnavailable("SPIDER_SOURCE_TIME_ORDER_SNAPSHOT_UNAVAILABLE")
+                    if outcome[0] == "REJECTED":
+                        continue
+                else:
+                    # An accepted send without a financial state is not a proved working state.
+                    raise ModelTimeUnavailable("SPIDER_SOURCE_TIME_ORDER_SNAPSHOT_UNAVAILABLE")
+                raise ModelTimeUnavailable("SPIDER_SOURCE_TIME_ORDER_SNAPSHOT_UNAVAILABLE")
+            if state in {"filled", "canceled", "failed", "economic_terminal"}:
+                continue
+            if state not in {"live", "partially_filled"}:
+                raise ModelTimeUnavailable("SPIDER_SOURCE_TIME_ORDER_SNAPSHOT_UNAVAILABLE")
+            expected[order.id] = (
+                state, canonical_decimal_text(_positive_decimal(original.get("px"))),
+                canonical_decimal_text(quantity), canonical_decimal_text(cumulative),
+                order.timestamp,
+            )
+        if set(supplied_by_id) != set(expected):
+            raise ModelTimeUnavailable("SPIDER_SOURCE_TIME_ORDER_SNAPSHOT_UNAVAILABLE")
+        source_orders: list[dict[str, object]] = []
+        selected_by_id = {order.id: (action, binding, order) for action, binding, order in selected}
+        for row in supplied:
+            value = cast(dict[str, object], row)
+            order_id = cast(str, value["local_order_id"])
+            action, binding, order = selected_by_id[order_id]
+            state, price, quantity, cumulative, created = expected[order_id]
+            if value != {
+                "local_order_id": order_id, "state": state, "price": price,
+                "quantity_contracts": quantity, "cumulative_contracts": cumulative,
+                "created_at_ms": created,
+            }:
+                raise ModelTimeUnavailable("SPIDER_SOURCE_TIME_ORDER_SNAPSHOT_UNAVAILABLE")
+            original = cast(dict[str, object], decode_canonical(bytes(action.original_payload)))
+            policy_order = build_orders_source_input(
+                source_alias_id=binding.source_client_order_id,
+                source_product_id=binding.source_product_id,
+                side=cast(str, original["side"]), limit_price=_positive_decimal(original["px"]),
+                original_quantity=_positive_decimal(original["sz"]),
+                cumulative_quantity=Decimal(cumulative), state=state,
+                fill_price=None, created_at_ms=created,
+            )
+            source_orders.append(cast(dict[str, object], policy_order["order"]))
+        return source_orders
+
+    def _validate_model_time_history_step(
+        self, session: Session, scope: RuntimeScopeKey, runtime: SpiderRuntimeScope,
+        plan: SpiderRuntimePlan, delivery: SpiderRuntimeDelivery,
+        expected_checkpoint: bytes, previous: ModelTimeRecord | None,
+        products: tuple[str, ...], evidence_sha256: str, source_sha256: str,
+    ) -> tuple[bytes, ModelTimeRecord | None] | None:
+        raw = bytes(delivery.source_payload)
+        checkpoint = decode_canonical(expected_checkpoint)
+        if type(checkpoint) is not dict or type(checkpoint.get("now_ms")) is not int:
+            return None
+        transition = decode_model_time_transition(
+            raw, scope=_scope(scope), effective_identity={
+                "generation": runtime.generation,
+                "confirmation_request_id": runtime.confirmation_request_id,
+                "configuration_sha256": runtime.configuration_sha256,
+            }, evidence_sha256=evidence_sha256, ordered_products=products,
+            checkpoint_now_ms=cast(int, checkpoint["now_ms"]),
+            checkpoint_sha256=_digest_bytes(expected_checkpoint), previous=previous,
+        )
+        if delivery.delivery_id != transition.record.observation_id:
+            return None
+        cutoff_ordinal = session.execute(select(SpiderRuntimeTapeIndex.ordinal).where(
+            SpiderRuntimeTapeIndex.environment == scope.environment,
+            SpiderRuntimeTapeIndex.execution_scope_id == scope.execution_scope_id,
+            SpiderRuntimeTapeIndex.strategy_id == scope.strategy_id,
+            SpiderRuntimeTapeIndex.delivery_sequence == delivery.sequence,
+            SpiderRuntimeTapeIndex.kind == "DELIVERY",
+        )).scalar_one_or_none()
+        if type(cutoff_ordinal) is not int:
+            return None
+        projected_orders = self._model_time_snapshot_orders(
+            session, scope, runtime, plan, raw, transition,
+            sequence=delivery.sequence, cutoff_ordinal=cutoff_ordinal,
+        )
+        decision_raw = delivery.decision_payload
+        stopped = delivery.disposition == "SUPPRESSED"
+        if stopped and delivery.suppression_reason != "STOP_CONTROL":
+            return None
+        if stopped and decision_raw is None:
+            if delivery.suppression_reason != "STOP_CONTROL":
+                return None
+            return expected_checkpoint, previous
+        if decision_raw is None:
+            return (expected_checkpoint, previous) if delivery.disposition == "PENDING" else None
+        if type(decision_raw) is not bytes or delivery.decision_sha256 != _digest_bytes(decision_raw):
+            return None
+        saved = decode_canonical(decision_raw)
+        if type(saved) is not dict or canonical_bytes(saved) != decision_raw:
+            return None
+        policy = restore_source_checkpoint(
+            expected_checkpoint, ordered_products=products, policy_id=ORIGINAL_MODEL_POLICY_ID,
+            policy_version=ORIGINAL_MODEL_POLICY_VERSION,
+            policy_source_sha256=ORIGINAL_MODEL_POLICY_SOURCE_SHA256,
+            source_sha256=source_sha256,
+            confirmation_request_id=runtime.confirmation_request_id,
+            configuration_sha256=runtime.configuration_sha256, generation=runtime.generation,
+        )
+        failed = False
+        if transition.kind == "RESTART":
+            policy.now_ms = transition.source_now_ms
+        elif transition.should_invoke_timer:
+            if transition.snapshots is None:
+                return None
+            timer_values = {key: transition.snapshots[key] for key in ("earn", "trading", "positions", "open_orders")}
+            timer_values["open_orders"] = projected_orders
+            try:
+                policy.timer_action(transition.source_now_ms, **timer_values,
+                    local_hour=transition.local_hour, local_minute=transition.local_minute)
+            except Exception:
+                failed = True
+        events = list(policy.events)
+        after = expected_checkpoint
+        if not failed and transition.kind != "ANCHOR":
+            after = encode_source_checkpoint(
+                policy, ordered_products=products, policy_id=ORIGINAL_MODEL_POLICY_ID,
+                policy_version=ORIGINAL_MODEL_POLICY_VERSION,
+                policy_source_sha256=ORIGINAL_MODEL_POLICY_SOURCE_SHA256,
+                source_sha256=source_sha256,
+                confirmation_request_id=runtime.confirmation_request_id,
+                configuration_sha256=runtime.configuration_sha256, generation=runtime.generation,
+            )
+        outcome = "POLICY_FAILED" if failed else "CONSUMED"
+        candidates = cast(list[dict[str, object]], saved.get("candidates"))
+        expected = model_time_decision_payload(
+            raw, transition, scope=_scope(scope), generation=runtime.generation,
+            configuration_sha256=runtime.configuration_sha256,
+            trigger_delivery_id=delivery.delivery_id,
+            before_checkpoint_sha256=_digest_bytes(expected_checkpoint),
+            after_checkpoint_sha256=_digest_bytes(after), events=events,
+            candidates=[] if failed else candidates, outcome=outcome,
+            reason_code="SOURCE_POLICY_FAILED" if failed else None,
+        )
+        if canonical_bytes(expected) != decision_raw or (
+            failed and delivery.disposition not in {"PENDING", "SUPPRESSED"}
+        ) or (not failed and delivery.disposition != "CONSUMED"):
+            return None
+        if not failed:
+            if transition.kind == "RESTART":
+                before_value = cast(dict[str, object], decode_canonical(expected_checkpoint))
+                after_value = cast(dict[str, object], decode_canonical(after))
+                before_value["now_ms"] = after_value.get("now_ms")
+                if before_value != after_value:
+                    return None
+            if not self._validate_normal_candidate_proof(
+                session, scope, runtime, plan, delivery, events,
+                cast(list[object], candidates),
+            ):
+                return None
+            return after, transition.record
+        return expected_checkpoint, previous
 
     def _record_source_market(
         self, scope: RuntimeScopeKey, snapshot_id: str, raw: bytes
@@ -1936,6 +2666,10 @@ class SpiderRuntimeOwner:
                             outcome = self._consume_source_market(
                                 scope, cast(str, operation_id), sequence
                             )
+                        elif kind == "SOURCE_TIME":
+                            outcome = self._consume_source_time(
+                                scope, cast(str, operation_id), sequence
+                            )
                         elif kind in {"FILL", "ORDER_STATE", "TRANSPORT_RESULT"}:
                             outcome = self._consume_normal_delivery(
                                 scope, cast(str, operation_id), sequence
@@ -1945,18 +2679,24 @@ class SpiderRuntimeOwner:
                 if outcome == "BLOCKED":
                     return
                 if outcome != "CONSUMED":
-                    self._warn_source_market_unavailable(
-                        scope, sequence, "SOURCE_MARKET_CONSUMPTION_UNAVAILABLE"
-                    )
+                    if kind == "SOURCE_TIME":
+                        self._warn_source_time_unavailable(scope, sequence, "CONSUMPTION_UNAVAILABLE")
+                    else:
+                        self._warn_source_market_unavailable(
+                            scope, sequence, "SOURCE_MARKET_CONSUMPTION_UNAVAILABLE"
+                        )
                     return
                 readback = self.readback(scope, cast(str, operation_id))
                 if (
                     readback is None
                     or readback.get("consumed_sequence") != sequence
                 ):
-                    self._warn_source_market_unavailable(
-                        scope, sequence, "SOURCE_MARKET_COMMIT_UNPROVED"
-                    )
+                    if kind == "SOURCE_TIME":
+                        self._warn_source_time_unavailable(scope, sequence, "COMMIT_UNPROVED")
+                    else:
+                        self._warn_source_market_unavailable(
+                            scope, sequence, "SOURCE_MARKET_COMMIT_UNPROVED"
+                        )
                     return
         except Exception:
             logging.getLogger(__name__).exception(
@@ -1970,6 +2710,17 @@ class SpiderRuntimeOwner:
     ) -> None:
         logging.getLogger(__name__).warning(
             "SPIDER_SOURCE_MARKET_UNAVAILABLE strategy=%s sequence=%s reason=%s",
+            scope.strategy_id,
+            sequence,
+            reason,
+        )
+
+    @staticmethod
+    def _warn_source_time_unavailable(
+        scope: RuntimeScopeKey, sequence: int, reason: str
+    ) -> None:
+        logging.getLogger(__name__).warning(
+            "SPIDER_SOURCE_TIME_UNAVAILABLE strategy=%s sequence=%s reason=%s",
             scope.strategy_id,
             sequence,
             reason,
@@ -3493,6 +4244,152 @@ class SpiderRuntimeOwner:
             ).order_by(SpiderRuntimeAction.candidate_ordinal)
         ).scalars().all()
         return saved_ids == planned_ids
+
+    def _consume_source_time(
+        self, scope: RuntimeScopeKey, operation_id: str, sequence: int
+    ) -> str:
+        try:
+            with self._sessions() as session:
+                if not isinstance(session, Session) or session.in_transaction() or not session.is_active or session.get_bind().dialect.name != "postgresql":
+                    return "UNAVAILABLE"
+                with session.begin():
+                    self._configure_writer(session)
+                    runtime = session.execute(select(SpiderRuntimeScope).where(
+                        SpiderRuntimeScope.environment == scope.environment,
+                        SpiderRuntimeScope.execution_scope_id == scope.execution_scope_id,
+                        SpiderRuntimeScope.strategy_id == scope.strategy_id,
+                    ).with_for_update()).scalar_one_or_none()
+                    if (runtime is None or runtime.current_operation_id != operation_id
+                        or runtime.control_mode != "RUN" or runtime.last_consumed_sequence != sequence - 1
+                        or runtime.last_received_sequence < sequence):
+                        return "BLOCKED"
+                    delivery = session.execute(select(SpiderRuntimeDelivery).where(
+                        SpiderRuntimeDelivery.environment == scope.environment,
+                        SpiderRuntimeDelivery.execution_scope_id == scope.execution_scope_id,
+                        SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                        SpiderRuntimeDelivery.sequence == sequence,
+                    ).with_for_update()).scalar_one_or_none()
+                    if (delivery is None or delivery.kind != "SOURCE_TIME" or delivery.disposition != "PENDING"
+                        or delivery.suppression_reason is not None or type(delivery.source_payload) is not bytes
+                        or delivery.content_sha256 != _digest_bytes(delivery.source_payload)
+                        or delivery.generation != runtime.generation
+                        or delivery.configuration_sha256 != runtime.configuration_sha256):
+                        return "UNAVAILABLE"
+                    plan = session.execute(select(SpiderRuntimePlan).where(
+                        SpiderRuntimePlan.plan_id == runtime.initial_plan_id,
+                        SpiderRuntimePlan.operation_id == operation_id,
+                    ).with_for_update()).scalar_one_or_none()
+                    if plan is None:
+                        return "UNAVAILABLE"
+                    identity_rows = self._initial_install_identity_rows(session, plan)
+                    if identity_rows is None or not self._validate_initial_install_source(session, scope, runtime, plan, identity_rows):
+                        return "UNAVAILABLE"
+                    if delivery.decision_payload is not None:
+                        # A persisted policy failure cannot be retried as a new callback.
+                        return "BLOCKED"
+                    products, evidence_sha256, source_sha256 = self._source_market_basis(plan)
+                    before = bytes(runtime.source_checkpoint)
+                    before_hash = _digest_bytes(before)
+                    previous = self._latest_consumed_model_time_record(session, scope)
+                    checkpoint = decode_canonical(before)
+                    if type(checkpoint) is not dict or type(checkpoint.get("now_ms")) is not int:
+                        return "UNAVAILABLE"
+                    transition = decode_model_time_transition(
+                        bytes(delivery.source_payload), scope=_scope(scope),
+                        effective_identity={"generation": runtime.generation,
+                            "confirmation_request_id": runtime.confirmation_request_id,
+                            "configuration_sha256": runtime.configuration_sha256},
+                        evidence_sha256=evidence_sha256, ordered_products=products,
+                        checkpoint_now_ms=cast(int, checkpoint["now_ms"]),
+                        checkpoint_sha256=before_hash, previous=previous,
+                    )
+                    if delivery.delivery_id != transition.record.observation_id:
+                        return "UNAVAILABLE"
+                    cutoff_ordinal = session.execute(select(SpiderRuntimeTapeIndex.ordinal).where(
+                        SpiderRuntimeTapeIndex.environment == scope.environment,
+                        SpiderRuntimeTapeIndex.execution_scope_id == scope.execution_scope_id,
+                        SpiderRuntimeTapeIndex.strategy_id == scope.strategy_id,
+                        SpiderRuntimeTapeIndex.delivery_sequence == sequence,
+                        SpiderRuntimeTapeIndex.kind == "DELIVERY",
+                    )).scalar_one_or_none()
+                    if type(cutoff_ordinal) is not int:
+                        return "UNAVAILABLE"
+                    projected_orders = self._model_time_snapshot_orders(
+                        session, scope, runtime, plan, bytes(delivery.source_payload),
+                        transition, sequence=sequence, cutoff_ordinal=cutoff_ordinal,
+                    )
+                    policy = restore_source_checkpoint(
+                        before, ordered_products=products, policy_id=ORIGINAL_MODEL_POLICY_ID,
+                        policy_version=ORIGINAL_MODEL_POLICY_VERSION,
+                        policy_source_sha256=ORIGINAL_MODEL_POLICY_SOURCE_SHA256,
+                        source_sha256=source_sha256,
+                        confirmation_request_id=runtime.confirmation_request_id,
+                        configuration_sha256=runtime.configuration_sha256,
+                        generation=runtime.generation,
+                    )
+                    snapshots = transition.snapshots
+                    failed = False
+                    if transition.kind == "RESTART":
+                        policy.now_ms = transition.source_now_ms
+                    elif transition.should_invoke_timer:
+                        if snapshots is None:
+                            return "UNAVAILABLE"
+                        timer_values = {key: snapshots[key] for key in ("earn", "trading", "positions", "open_orders")}
+                        timer_values["open_orders"] = projected_orders
+                        try:
+                            policy.timer_action(transition.source_now_ms, **timer_values,
+                                local_hour=transition.local_hour, local_minute=transition.local_minute)
+                        except Exception:
+                            failed = True
+                    events = list(policy.events)
+                    candidates: list[dict[str, object]] = []
+                    staged: list[object] = []
+                    after = before
+                    outcome = "POLICY_FAILED" if failed else "CONSUMED"
+                    if not failed:
+                        if transition.kind != "ANCHOR":
+                            after = encode_source_checkpoint(
+                                policy, ordered_products=products, policy_id=ORIGINAL_MODEL_POLICY_ID,
+                                policy_version=ORIGINAL_MODEL_POLICY_VERSION,
+                                policy_source_sha256=ORIGINAL_MODEL_POLICY_SOURCE_SHA256,
+                                source_sha256=source_sha256,
+                                confirmation_request_id=runtime.confirmation_request_id,
+                                configuration_sha256=runtime.configuration_sha256,
+                                generation=runtime.generation,
+                            )
+                        if events:
+                            candidates, staged = self._stage_normal_candidates(
+                                session, scope, runtime, plan, delivery, events
+                            )
+                    decision = model_time_decision_payload(
+                        bytes(delivery.source_payload), transition, scope=_scope(scope),
+                        generation=runtime.generation, configuration_sha256=runtime.configuration_sha256,
+                        trigger_delivery_id=delivery.delivery_id,
+                        before_checkpoint_sha256=before_hash,
+                        after_checkpoint_sha256=_digest_bytes(after), events=events,
+                        candidates=candidates, outcome=outcome,
+                        reason_code="SOURCE_POLICY_FAILED" if failed else None,
+                    )
+                    decision_bytes = canonical_bytes(decision)
+                    delivery.decision_payload = decision_bytes
+                    delivery.decision_sha256 = _digest_bytes(decision_bytes)
+                    if failed:
+                        session.flush()
+                        self._warn_source_time_unavailable(
+                            scope, sequence, "SOURCE_POLICY_FAILED"
+                        )
+                        return "BLOCKED"
+                    runtime.source_checkpoint = after
+                    runtime.source_checkpoint_sha256 = _digest_bytes(after)
+                    delivery.disposition = "CONSUMED"
+                    runtime.last_consumed_sequence = sequence
+                    if staged:
+                        session.add_all(staged)
+                    session.flush()
+            return "CONSUMED"
+        except Exception:
+            logging.getLogger(__name__).exception("Spider source-time TX B unavailable")
+            return "UNAVAILABLE"
 
     def _consume_source_market(
         self, scope: RuntimeScopeKey, operation_id: str, sequence: int
@@ -5187,11 +6084,27 @@ class SpiderRuntimeOwner:
                                 )
                             )
                             or (
+                                row.kind == "SOURCE_TIME"
+                                and (
+                                    row.local_order_id is not None or row.trade_id is not None
+                                    or row.action_id is not None or row.role is not None
+                                    or type(row.source_payload) is not bytes
+                                    or _digest_bytes(row.source_payload) != row.content_sha256
+                                )
+                            )
+                            or (
                                 index <= runtime.last_consumed_sequence
                                 and not (
                                     row.kind == "SOURCE_MARKET"
                                     and row.disposition == "CONSUMED"
                                     and row.suppression_reason is None
+                                )
+                                and not (
+                                    row.kind == "SOURCE_TIME"
+                                    and row.disposition == "CONSUMED"
+                                    and row.suppression_reason is None
+                                    and row.decision_payload is not None
+                                    and row.decision_sha256 == _digest_bytes(row.decision_payload)
                                 )
                                 and not (
                                     row.kind in {"FILL", "ORDER_STATE", "TRANSPORT_RESULT"}
@@ -5805,6 +6718,7 @@ class SpiderRuntimeOwner:
                 )
             ).scalars().all())
             expected_checkpoint = plan.original_build_checkpoint
+            previous_model_time: ModelTimeRecord | None = None
             seen_market_ids: set[str] = set()
             has_stop_suppression = False
             resubmission_relations = session.execute(
@@ -5876,7 +6790,7 @@ class SpiderRuntimeOwner:
                 )
                 if sequence <= runtime.last_consumed_sequence:
                     consumed_source = (
-                        delivery.kind == "SOURCE_MARKET"
+                        delivery.kind in {"SOURCE_MARKET", "SOURCE_TIME"}
                         and delivery.disposition == "CONSUMED"
                         and delivery.suppression_reason is None
                     )
@@ -5891,7 +6805,21 @@ class SpiderRuntimeOwner:
                     return False
                 if stopped:
                     has_stop_suppression = True
-                if delivery.kind == "SOURCE_MARKET":
+                if delivery.kind == "SOURCE_TIME":
+                    if (
+                        delivery.local_order_id is not None or delivery.trade_id is not None
+                        or delivery.action_id is not None or delivery.role is not None
+                    ):
+                        return False
+                    time_step = self._validate_model_time_history_step(
+                        session, scope, runtime, plan, delivery, expected_checkpoint,
+                        previous_model_time, tuple(ordered_products),
+                        cast(str, evidence_sha256), source_sha256,
+                    )
+                    if time_step is None:
+                        return False
+                    expected_checkpoint, previous_model_time = time_step
+                elif delivery.kind == "SOURCE_MARKET":
                     if (
                         delivery.local_order_id is not None
                         or delivery.trade_id is not None
