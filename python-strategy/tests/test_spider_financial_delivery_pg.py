@@ -69,11 +69,17 @@ def _install_owner(
     *,
     strategy_id: str = "spider-main",
     admitted_run: HistoricalRunInput | None = None,
+    environment: str = "live",
+    execution_scope_id: str = "account-main",
 ):
     run, specs, confirmation, prepared, operation_body = _install_evidence(
-        engine, strategy_id=strategy_id, admitted_run=admitted_run
+        engine, strategy_id=strategy_id, admitted_run=admitted_run,
+        environment=environment, execution_scope_id=execution_scope_id,
     )
-    app, _service, headers = _operation_http_app(sessionmaker(engine))
+    app, _service, headers = _operation_http_app(
+        sessionmaker(engine), environment=environment,
+        execution_scope_id=execution_scope_id,
+    )
     proposal = SpiderOperationRequest.from_canonical_bytes(canonical_bytes(operation_body))
     proposal_response = app.handle(
         "POST", SPIDER_OPERATION_REQUEST_PATH, proposal.canonical_request_bytes,
@@ -103,17 +109,17 @@ def _install_owner(
     repository = LiveOrderRepository(
         db_session_factory=sessionmaker(engine),
         account_profile="okx",
-        account_id="account-main",
+        account_id=execution_scope_id,
     )
     order_manager = OrderManager(
         repository,
         BacktestClock(1_800_000_000),
         is_backtest=True,
         order_account_identity_resolver=lambda product_id, *, is_backtest: OrderAccountIdentity(
-            "okx", "account-main"
+            "okx", execution_scope_id
         ),
     )
-    scope = RuntimeScopeKey("live", "account-main", strategy_id)
+    scope = RuntimeScopeKey(environment, execution_scope_id, strategy_id)
     owner = SpiderRuntimeOwner(
         sessionmaker(engine),
         order_manager,
@@ -227,6 +233,7 @@ def _transport_enabled_owner(
     owner: SpiderRuntimeOwner,
     scope: RuntimeScopeKey,
     classifier=classify_okx_batch_response,
+    profile_prerequisite=None,
 ) -> SpiderRuntimeOwner:
     lifecycle = RLock()
     order_events = RLock()
@@ -238,6 +245,7 @@ def _transport_enabled_owner(
         lifecycle_lock=lambda _strategy_id: lifecycle,
         order_event_lock=order_events,
         transport_response_classifier=classifier,
+        profile_prerequisite=profile_prerequisite,
     )
 
 

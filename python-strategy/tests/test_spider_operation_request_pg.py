@@ -132,9 +132,11 @@ def _http_operation_request(c2, kind="PROPOSAL", proposal_request_id=None, *, ke
     return SpiderOperationRequest.from_canonical_bytes(canonical_bytes(body))
 
 
-def _operation_http_app(sessions):
+def _operation_http_app(
+    sessions, *, environment: str = "live", execution_scope_id: str = "account-main"
+):
     service = SpiderOperationHttpService(
-        sessions, environment="live", execution_scope_id="account-main"
+        sessions, environment=environment, execution_scope_id=execution_scope_id
     )
     app = ControlPlaneApp(
         BacktestJobExecutor(run_inline=True),

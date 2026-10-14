@@ -136,6 +136,10 @@ class _BatchResponseClassifier(Protocol):
     ) -> Mapping[str, MemberOutcome] | None: ...
 
 
+class _ProfilePrerequisite(Protocol):
+    def __call__(self, request_payload: bytes, now_ms: int) -> bool: ...
+
+
 @dataclass(frozen=True, slots=True)
 class _TransmissionOutcome:
     disposition: str
@@ -188,6 +192,7 @@ class SpiderRuntimeOwner:
         lifecycle_lock: Callable[[str], ContextManager[object]] | None = None,
         order_event_lock: ContextManager[object] | None = None,
         transport_response_classifier: _BatchResponseClassifier | None = None,
+        profile_prerequisite: _ProfilePrerequisite | None = None,
         lock_timeout_ms: int = 2000,
         statement_timeout_ms: int = 10000,
     ) -> None:
@@ -203,6 +208,7 @@ class SpiderRuntimeOwner:
         self._lifecycle_lock = lifecycle_lock
         self._order_event_lock = order_event_lock
         self._transport_response_classifier = transport_response_classifier
+        self._profile_prerequisite = profile_prerequisite
         self._lock_timeout_ms = lock_timeout_ms
         self._statement_timeout_ms = statement_timeout_ms
 
@@ -1555,6 +1561,8 @@ class SpiderRuntimeOwner:
                             or runtime.last_tape_sequence >= 2**63 - 1
                         ):
                             return None
+                        if not self._profile_prerequisite_allows(session, request_payload):
+                            return None
                         session.add(SpiderRuntimeTransmission(
                             transmission_group_id=group_id,
                             environment=scope.environment,
@@ -2157,6 +2165,8 @@ class SpiderRuntimeOwner:
                         if any(action.outcome_state != "UNSENT" or action.outcome_reference is not None
                                for action, _binding, _order in actions):
                             return None
+                        if not self._profile_prerequisite_allows(session, request_payload):
+                            return None
                         runtime.last_tape_sequence += 1
                         session.add(SpiderRuntimeTransmission(
                             transmission_group_id=group_id,
@@ -2395,6 +2405,29 @@ class SpiderRuntimeOwner:
         return validate_member_outcomes(
             action_ids, classified, operation=cast(str, request["operation"])
         )
+
+    def _profile_prerequisite_allows(
+        self, session: Session, request_payload: bytes
+    ) -> bool:
+        checker = self._profile_prerequisite
+        if checker is None:
+            return True
+        try:
+            observed_at = _database_millisecond_time(session)
+            epoch = datetime(1970, 1, 1, tzinfo=observed_at.tzinfo)
+            delta = observed_at - epoch
+            now_ms = (
+                delta.days * 86_400_000
+                + delta.seconds * 1_000
+                + delta.microseconds // 1_000
+            )
+            accepted = checker(request_payload, now_ms)
+            if type(accepted) is bool and accepted:
+                return True
+        except Exception:
+            pass
+        logging.getLogger(__name__).warning("SPIDER_PROFILE_PREREQUISITE_REJECTED")
+        return False
 
     def _transmission_readback(
         self,

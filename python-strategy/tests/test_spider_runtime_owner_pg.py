@@ -64,14 +64,16 @@ def _install_evidence(
     *,
     strategy_id: str = "spider-main",
     admitted_run: HistoricalRunInput | None = None,
+    environment: str = "live",
+    execution_scope_id: str = "account-main",
 ):
-    run = replace(admitted_run or _admitted_run(), account_key="account-main")
+    run = replace(admitted_run or _admitted_run(), account_key=execution_scope_id)
     template = _confirmation(run).request
     key_suffix = "" if strategy_id == "spider-main" else f"-{strategy_id}"
     configuration_store = SpiderConfigurationRequestStore(sessionmaker(engine))
     proposal = SpiderConfigurationRequest.from_fields(
-        environment="live",
-        execution_scope_id="account-main",
+        environment=environment,
+        execution_scope_id=execution_scope_id,
         strategy_id=strategy_id,
         request_kind=SpiderConfigurationRequestKind.PROPOSAL,
         actor="operator",
@@ -82,8 +84,8 @@ def _install_evidence(
     with Session(engine) as session, session.begin():
         configuration_store.record_in_transaction(session, proposal)
     confirmation = SpiderConfigurationRequest.from_fields(
-        environment="live",
-        execution_scope_id="account-main",
+        environment=environment,
+        execution_scope_id=execution_scope_id,
         strategy_id=strategy_id,
         request_kind=SpiderConfigurationRequestKind.CONFIRMATION,
         actor="operator",
@@ -99,15 +101,15 @@ def _install_evidence(
 
     selection = {
         "schema_version": "SPIDER_RUNTIME_SELECTION_V1",
-        "environment": "live",
-        "execution_scope_id": "account-main",
+        "environment": environment,
+        "execution_scope_id": execution_scope_id,
         "strategy_id": strategy_id,
         "confirmation_request_id": confirmation.request_id,
         "configuration_sha256": confirmation.configuration.sha256,
         "host_contract_id": "SPIDER_DURABLE_HOST_V1",
         "host_contract_sha256": "a" * 64,
         "account_profile": "okx",
-        "account_id": "account-main",
+        "account_id": execution_scope_id,
         "provider_profile_sha256": "b" * 64,
         "build_policy_id": "SPIDER_BUILD_EXPLICIT_MEMBER_RESUBMIT_V1",
         "time_policy_id": "SPIDER_COUNT_DOWNTIME_NO_CATCHUP_V1",
@@ -123,8 +125,8 @@ def _install_evidence(
     )
     operation_body = _body()
     operation_body.update({
-        "environment": "live",
-        "execution_scope_id": "account-main",
+        "environment": environment,
+        "execution_scope_id": execution_scope_id,
         "strategy_id": strategy_id,
         "actor": "api_key",
         "idempotency_key": "install-proposal",
@@ -132,7 +134,7 @@ def _install_evidence(
     core = cast(dict[str, Any], operation_body["operation_core"])
     core.update({
         "account_profile": "okx",
-        "account_id": "account-main",
+        "account_id": execution_scope_id,
         "expected_state_version": 7,
         "confirmation_request_id": confirmation.request_id,
         "configuration_sha256": confirmation.configuration.sha256,
