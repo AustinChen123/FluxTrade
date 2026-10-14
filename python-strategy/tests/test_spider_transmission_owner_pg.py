@@ -24,6 +24,8 @@ from src.core.interfaces.exchange import ExchangeOrderEvent
 from src.core.orm_models import Order, Trade
 from src.core.spider_management import runtime_owner as runtime_owner_module
 from src.core.spider_management.orm import (
+    SpiderMemberResubmission,
+    SpiderMemberResubmissionRequest,
     SpiderRuntimeAction,
     SpiderRuntimeBinding,
     SpiderRuntimeDelivery,
@@ -33,6 +35,7 @@ from src.core.spider_management.orm import (
     SpiderRuntimeTransmission,
 )
 from src.core.spider_management.runtime_owner import RuntimeScopeKey, SpiderRuntimeOwner
+from src.core.spider_management.member_resubmission import MemberResubmissionRequest
 from src.core.strategy_state_manager import StrategyStateManager
 from test_migrations import fresh_pg_db as _migration_fresh_pg_db
 from test_spider_financial_delivery_pg import (
@@ -4148,3 +4151,1151 @@ def test_projection_sql_failure_rolls_back_order_state_receipt_and_projection_tx
             .where(SpiderRuntimeAction.action_id == action_id)
         ).one()
         assert projection_after == projection_before
+
+
+@pytest.mark.parametrize(
+    ("result_kind", "expected_disposition"),
+    [
+        ("accepted", "ACCEPTED"),
+        ("accepted-51000", "ACCEPTED"),
+        ("late-old-cancel", "ACCEPTED"),
+        ("late-old-full", "ACCEPTED"),
+        ("rejected", "REJECTED"),
+        ("unknown", "SEND_UNKNOWN"),
+        ("late-old-fill", "PLANNED"),
+        ("stopped", "STOPPED"),
+        ("accepted-canceled", "INELIGIBLE"),
+        ("initial-unknown", "INELIGIBLE"),
+        ("pending-unrelated", "ACCEPTED"),
+    ],
+)
+def test_manual_member_resubmission_uses_saved_request_and_normal_place_consumer(
+    operation_pg: Engine,
+    mock_clock,
+    mock_exchange_adapter,
+    monkeypatch,
+    result_kind: str,
+    expected_disposition: str,
+) -> None:
+    engine = operation_pg
+    owner, scope, operation_id, manager, _prepared, _initial, *_ = _install_owner(
+        engine, admitted_run=_run_with_initial_order_count(11)
+    )
+    enabled = _transport_enabled_owner(owner, scope)
+    source_group, source_payload, source_members = _saved_initial_place_request(engine, scope)
+    assert len(source_members) == 20
+    rejected_ids = (
+        {cast(str, source_members[1]["action_id"]), cast(str, source_members[2]["action_id"])}
+        if result_kind == "accepted-canceled"
+        else {cast(str, source_members[0]["action_id"]), cast(str, source_members[1]["action_id"])}
+    )
+    initial_rejection_code = "51000" if result_kind == "accepted-51000" else "51008"
+    initial_response = {
+        "code": "0",
+        "data": [
+            {
+                "clOrdId": member["wire_clOrdId"],
+                "ordId": "" if member["action_id"] in rejected_ids else f"manual-initial-{index}",
+                "sCode": initial_rejection_code if member["action_id"] in rejected_ids else "0",
+            }
+            for index, member in enumerate(source_members)
+        ],
+        "msg": "synthetic 18 accepted and 2 rejected initial BUILD members",
+    }
+    if result_kind == "initial-unknown":
+        initial_response = {"code": "1", "data": [], "msg": "synthetic ambiguous initial outcome"}
+    initial_result = enabled.transmit_initial_place_group(
+        scope, source_group, scope.execution_scope_id, source_payload,
+        OkxSpiderBatchTransport(cast(Any, _OfflinePlaceClient(initial_response))),
+    )
+    assert initial_result.disposition == "RECORDED"
+    target = cast(str, source_members[0]["action_id"])
+    untouched_rejection = cast(str, source_members[1]["action_id"])
+    if result_kind == "pending-unrelated":
+        unrelated_order = manager.repo.get_order(cast(str, source_members[2]["local_order_id"]))
+        assert unrelated_order is not None
+        execution = _execution_for_owner(
+            enabled, engine, mock_clock, mock_exchange_adapter, observe_order_events=False
+        )
+        assert execution.process_exchange_order_event(ExchangeOrderEvent(
+            status="open",
+            product_id=unrelated_order.product_id,
+            client_order_id=unrelated_order.client_order_id,
+            exchange_order_id="manual-initial-2",
+            cumulative_filled_quantity=Decimal("0"),
+        ))["action"] == "applied"
+    if result_kind == "accepted-canceled":
+        accepted_order = manager.repo.get_order(cast(str, source_members[0]["local_order_id"]))
+        assert accepted_order is not None
+        execution = _execution_for_owner(
+            enabled, engine, mock_clock, mock_exchange_adapter, observe_order_events=True
+        )
+        assert execution.process_exchange_order_event(ExchangeOrderEvent(
+            status="open",
+            product_id=accepted_order.product_id,
+            client_order_id=accepted_order.client_order_id,
+            exchange_order_id="manual-initial-0",
+            cumulative_filled_quantity=Decimal("0"),
+        ))["action"] == "applied"
+        assert execution.process_exchange_order_event(ExchangeOrderEvent(
+            status="canceled",
+            product_id=accepted_order.product_id,
+            client_order_id=accepted_order.client_order_id,
+            exchange_order_id="manual-initial-0",
+            cumulative_filled_quantity=Decimal("0"),
+        ))["action"] == "applied"
+    with Session(engine) as session:
+        runtime = session.execute(select(SpiderRuntimeScope).where(
+            SpiderRuntimeScope.environment == scope.environment,
+            SpiderRuntimeScope.execution_scope_id == scope.execution_scope_id,
+            SpiderRuntimeScope.strategy_id == scope.strategy_id,
+        )).scalar_one()
+        plan = session.get(SpiderRuntimePlan, runtime.initial_plan_id)
+        assert plan is not None
+        initial_order_ids = session.execute(
+            select(SpiderRuntimeAction.local_order_id).where(
+                SpiderRuntimeAction.plan_id == plan.plan_id,
+                SpiderRuntimeAction.trigger_delivery_id.is_(None),
+                SpiderRuntimeAction.parent_action_id.is_(None),
+            )
+        ).scalars().all()
+        initial_order_facts = session.execute(
+            select(
+                Order.id, Order.product_id, Order.side, Order.type,
+                Order.price, Order.quantity, Order.status,
+                Order.exchange_order_id, Order.filled_quantity, Order.filled_price,
+            ).where(Order.id.in_(initial_order_ids)).order_by(Order.id)
+        ).all()
+        initial_trade_facts = session.execute(
+            select(
+                Trade.id, Trade.order_id, Trade.exchange_trade_id, Trade.quantity,
+                Trade.price, Trade.fee, Trade.fee_asset,
+            ).where(Trade.order_id.in_(initial_order_ids)).order_by(Trade.id)
+        ).all()
+        expected_order_facts = initial_order_facts
+        expected_trade_facts = initial_trade_facts
+        changed_pending_order_id: str | None = None
+        expected_pending_order_fact: tuple[object, ...] | None = None
+        state_version = runtime.state_version
+        request_value = {
+            "schema_version": "spider_member_resubmission_request_v1",
+            "environment": scope.environment,
+            "execution_scope_id": scope.execution_scope_id,
+            "strategy_id": scope.strategy_id,
+            "actor": "operator",
+            "idempotency_key": "resubmit-one-member",
+            "expected_version": state_version,
+            "generation": runtime.generation,
+            "configuration_sha256": runtime.configuration_sha256,
+            "initial_plan_id": plan.plan_id,
+            "target_action_id": target,
+        }
+    if result_kind not in {"accepted-canceled", "initial-unknown"}:
+        eligibility_readback = enabled.readback(scope, operation_id)
+        assert eligibility_readback is not None
+        assert eligibility_readback["trading_ready"] is False
+        assert eligibility_readback["scoped_hold_reasons"] == [
+            "PROVIDER_PROFILE_UNAVAILABLE"
+        ]
+        eligible_row = next(
+            row for row in cast(
+                list[dict[str, object]],
+                eligibility_readback["initial_plan_missing_members"],
+            ) if row["initial_member_id"] == target
+        )
+        assert eligible_row["last_outcome"] == "REJECTED"
+        assert eligible_row["rejection_reason"] in {"51000", "51008"}
+        assert eligible_row["resubmit_eligible"] is True
+        assert eligible_row["ineligible_reason"] is None
+    saved_request = MemberResubmissionRequest.from_object(request_value)
+    assert enabled.record_member_resubmission_request(
+        saved_request.canonical_request_bytes
+    ) is not None
+    before_query = _place_attempt_snapshot(engine, scope)
+    with Session(engine) as session:
+        target_action = session.get(SpiderRuntimeAction, target)
+        assert target_action is not None
+        expected_original_payload_sha256 = target_action.payload_sha256
+    recorded = enabled.member_resubmission_readback(saved_request.canonical_request_bytes)
+    assert recorded is not None
+    assert recorded == {
+        "schema_version": "spider_member_resubmission_readback_v1",
+        "request_id": saved_request.request_id,
+        "scope": {
+            "environment": scope.environment,
+            "execution_scope_id": scope.execution_scope_id,
+            "strategy_id": scope.strategy_id,
+        },
+        "actor": saved_request.actor,
+        "idempotency_key": saved_request.idempotency_key,
+        "generation": saved_request.generation,
+        "configuration_sha256": saved_request.configuration_sha256,
+        "initial_plan_id": saved_request.initial_plan_id,
+        "initial_member_id": target,
+        "target_action_id": target,
+        "resubmission_action_id": None,
+        "local_order_id": None,
+        "provider_order_id": None,
+        "original_payload_sha256": expected_original_payload_sha256,
+        "disposition": "RECORDED",
+        "reason_code": None,
+        "runtime": recorded["runtime"],
+    }
+    fresh_owner = _transport_enabled_owner(owner, scope)
+    assert fresh_owner.member_resubmission_readback(
+        saved_request.canonical_request_bytes
+    ) == recorded
+    if result_kind == "accepted":
+        with Session(engine) as session:
+            runtime = session.get(
+                SpiderRuntimeScope,
+                (scope.environment, scope.execution_scope_id, scope.strategy_id),
+            )
+            assert runtime is not None
+            saved_checkpoint_sha256 = runtime.source_checkpoint_sha256
+        with Session(engine) as session, session.begin():
+            runtime = session.get(
+                SpiderRuntimeScope,
+                (scope.environment, scope.execution_scope_id, scope.strategy_id),
+            )
+            assert runtime is not None
+            runtime.source_checkpoint_sha256 = "0" * 64
+        invalid_runtime = fresh_owner.member_resubmission_readback(
+            saved_request.canonical_request_bytes
+        )
+        assert invalid_runtime == {**recorded, "runtime": None}
+        with Session(engine) as session, session.begin():
+            runtime = session.get(
+                SpiderRuntimeScope,
+                (scope.environment, scope.execution_scope_id, scope.strategy_id),
+            )
+            assert runtime is not None
+            runtime.source_checkpoint_sha256 = saved_checkpoint_sha256
+    monkeypatch.setattr(enabled, "readback", lambda *_args: None)
+    without_runtime = enabled.member_resubmission_readback(
+        saved_request.canonical_request_bytes
+    )
+    assert without_runtime == {**recorded, "runtime": None}
+    assert _place_attempt_snapshot(engine, scope) == before_query
+    monkeypatch.undo()
+    command = _command(scope, key="resubmit-one-member", version=state_version)
+    command["command"] = "RESUBMIT"
+    command["params"]["actor"] = "operator"
+    if result_kind == "initial-unknown":
+        result = _dispatch(enabled, command)
+        assert result.success is False
+        result_data = cast(dict[str, object], result.data)
+        assert result_data["reason_code"] == "SPIDER_MEMBER_RESUBMISSION_NOT_ELIGIBLE"
+        with Session(engine) as session:
+            runtime = session.get(
+                SpiderRuntimeScope,
+                (scope.environment, scope.execution_scope_id, scope.strategy_id),
+            )
+            assert runtime is not None
+            assert session.get(SpiderMemberResubmission, saved_request.request_id) is None
+            assert session.scalar(
+                select(func.count()).select_from(SpiderRuntimeAction).where(
+                    SpiderRuntimeAction.plan_id == plan.plan_id
+                )
+            ) == len(initial_order_ids)
+        unknown_readback = enabled.readback(scope, operation_id)
+        assert unknown_readback is not None
+        assert unknown_readback["trading_ready"] is False
+        assert unknown_readback["scoped_hold_reasons"] == ["PROVIDER_PROFILE_UNAVAILABLE"]
+        unknown_row = next(
+            row for row in cast(list[dict[str, object]], unknown_readback["initial_plan_missing_members"])
+            if row["initial_member_id"] == target
+        )
+        assert unknown_row["last_outcome"] == "SEND_UNKNOWN"
+        assert unknown_row["resubmit_eligible"] is False
+        return
+    if result_kind == "accepted-canceled":
+        with Session(engine) as session:
+            runtime = session.execute(select(SpiderRuntimeScope).where(
+                SpiderRuntimeScope.environment == scope.environment,
+                SpiderRuntimeScope.execution_scope_id == scope.execution_scope_id,
+                SpiderRuntimeScope.strategy_id == scope.strategy_id,
+            )).scalar_one()
+            action_count_before = session.scalar(
+                select(func.count()).select_from(SpiderRuntimeAction).where(
+                    SpiderRuntimeAction.plan_id == plan.plan_id
+                )
+            )
+        canceled_request = MemberResubmissionRequest.from_object({
+            **request_value,
+            "expected_version": runtime.state_version,
+        })
+        assert enabled.record_member_resubmission_request(
+            canceled_request.canonical_request_bytes
+        ) is not None
+        canceled_command = _command(
+            scope, key="resubmit-one-member", version=runtime.state_version
+        )
+        canceled_command["command"] = "RESUBMIT"
+        canceled_command["params"]["actor"] = "operator"
+        canceled_result = _dispatch(enabled, canceled_command)
+        assert canceled_result.success is False
+        canceled_data = cast(dict[str, object], canceled_result.data)
+        assert canceled_data["disposition"] == "REJECTED"
+        assert canceled_data["reason_code"] == "SPIDER_MEMBER_RESUBMISSION_NOT_ELIGIBLE"
+        after_canceled = enabled.readback(scope, operation_id)
+        assert after_canceled is not None
+        assert target not in {
+            row["initial_member_id"]
+            for row in cast(list[dict[str, object]], after_canceled["initial_plan_missing_members"])
+        }
+        assert untouched_rejection in {
+            row["initial_member_id"]
+            for row in cast(list[dict[str, object]], after_canceled["initial_plan_missing_members"])
+        }
+        with Session(engine) as session:
+            assert session.scalar(
+                select(func.count()).select_from(SpiderRuntimeAction).where(
+                    SpiderRuntimeAction.plan_id == plan.plan_id
+                )
+            ) == action_count_before
+        return
+    if result_kind == "pending-unrelated":
+        with Session(engine) as session:
+            runtime = session.get(
+                SpiderRuntimeScope,
+                (scope.environment, scope.execution_scope_id, scope.strategy_id),
+            )
+            assert runtime is not None
+            assert runtime.last_received_sequence == runtime.last_consumed_sequence + 2
+            earlier_pending_sequence = runtime.last_consumed_sequence + 1
+            earlier_pending = session.execute(select(SpiderRuntimeDelivery).where(
+                SpiderRuntimeDelivery.environment == scope.environment,
+                SpiderRuntimeDelivery.execution_scope_id == scope.execution_scope_id,
+                SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                SpiderRuntimeDelivery.sequence == earlier_pending_sequence,
+            )).scalar_one()
+            assert earlier_pending.kind == "ORDER_STATE"
+            assert earlier_pending.disposition == "PENDING"
+            pending_sequence = runtime.last_received_sequence
+            pending_row = session.execute(select(SpiderRuntimeDelivery).where(
+                SpiderRuntimeDelivery.environment == scope.environment,
+                SpiderRuntimeDelivery.execution_scope_id == scope.execution_scope_id,
+                SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                SpiderRuntimeDelivery.sequence == pending_sequence,
+            )).scalar_one()
+            assert pending_row.kind == "ORDER_STATE" and pending_row.disposition == "PENDING"
+            assert earlier_pending.local_order_id != source_members[0]["local_order_id"]
+            assert pending_row.local_order_id != source_members[0]["local_order_id"]
+            before_pending_gate = (
+                runtime.source_checkpoint_sha256,
+                runtime.state_version,
+                runtime.last_tape_sequence,
+                runtime.last_received_sequence,
+                runtime.last_consumed_sequence,
+                session.scalar(select(func.count()).select_from(SpiderRuntimeAction).where(
+                    SpiderRuntimeAction.plan_id == plan.plan_id,
+                )),
+                session.scalar(select(func.count()).select_from(SpiderMemberResubmission).where(
+                    SpiderMemberResubmission.environment == scope.environment,
+                    SpiderMemberResubmission.execution_scope_id == scope.execution_scope_id,
+                    SpiderMemberResubmission.strategy_id == scope.strategy_id,
+                )),
+                session.scalar(select(func.count()).select_from(SpiderRuntimeTapeIndex).where(
+                    SpiderRuntimeTapeIndex.environment == scope.environment,
+                    SpiderRuntimeTapeIndex.execution_scope_id == scope.execution_scope_id,
+                    SpiderRuntimeTapeIndex.strategy_id == scope.strategy_id,
+                )),
+            )
+            pending_trade_count = session.scalar(
+                select(func.count()).select_from(Trade).where(
+                    Trade.order_id.in_(initial_order_ids)
+                )
+            )
+        held = _dispatch(enabled, command)
+        assert held.success is False
+        held_data = cast(dict[str, object], held.data)
+        assert held_data["disposition"] == "REJECTED"
+        assert held_data["reason_code"] == "SPIDER_MEMBER_RESUBMISSION_NOT_ELIGIBLE"
+        after_rejection = fresh_owner.member_resubmission_readback(
+            saved_request.canonical_request_bytes
+        )
+        assert after_rejection is not None
+        assert after_rejection["disposition"] == "RECORDED"
+        assert after_rejection["resubmission_action_id"] is None
+        with Session(engine) as session:
+            runtime = session.get(
+                SpiderRuntimeScope,
+                (scope.environment, scope.execution_scope_id, scope.strategy_id),
+            )
+            assert runtime is not None
+            pending_row = session.execute(select(SpiderRuntimeDelivery).where(
+                SpiderRuntimeDelivery.environment == scope.environment,
+                SpiderRuntimeDelivery.execution_scope_id == scope.execution_scope_id,
+                SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                SpiderRuntimeDelivery.sequence == pending_sequence,
+            )).scalar_one()
+            after_pending_gate = (
+                runtime.source_checkpoint_sha256,
+                runtime.state_version,
+                runtime.last_tape_sequence,
+                runtime.last_received_sequence,
+                runtime.last_consumed_sequence,
+                session.scalar(select(func.count()).select_from(SpiderRuntimeAction).where(
+                    SpiderRuntimeAction.plan_id == plan.plan_id,
+                )),
+                session.scalar(select(func.count()).select_from(SpiderMemberResubmission).where(
+                    SpiderMemberResubmission.environment == scope.environment,
+                    SpiderMemberResubmission.execution_scope_id == scope.execution_scope_id,
+                    SpiderMemberResubmission.strategy_id == scope.strategy_id,
+                )),
+                session.scalar(select(func.count()).select_from(SpiderRuntimeTapeIndex).where(
+                    SpiderRuntimeTapeIndex.environment == scope.environment,
+                    SpiderRuntimeTapeIndex.execution_scope_id == scope.execution_scope_id,
+                    SpiderRuntimeTapeIndex.strategy_id == scope.strategy_id,
+                )),
+            )
+            assert after_pending_gate == before_pending_gate
+            assert pending_row.disposition == "PENDING"
+            assert session.get(SpiderMemberResubmissionRequest, saved_request.request_id) is not None
+            assert session.scalar(
+                select(func.count()).select_from(Trade).where(
+                    Trade.order_id.in_(initial_order_ids)
+                )
+            ) == pending_trade_count
+        assert enabled._consume_normal_delivery(
+            scope, operation_id, earlier_pending_sequence
+        ) == "CONSUMED"
+        assert enabled._consume_normal_delivery(
+            scope, operation_id, pending_sequence
+        ) == "CONSUMED"
+        with Session(engine) as session:
+            runtime = session.get(
+                SpiderRuntimeScope,
+                (scope.environment, scope.execution_scope_id, scope.strategy_id),
+            )
+            assert runtime is not None
+            assert runtime.last_received_sequence == runtime.last_consumed_sequence
+        # The saved request and version remain valid after the unrelated row is consumed.
+        result = _dispatch(enabled, command)
+        assert result.success is True
+    if result_kind == "stopped":
+        stoppable = SpiderRuntimeOwner(
+            enabled._sessions,
+            enabled._order_manager,
+            owned_scopes=(scope,),
+            model_sources_by_confirmation=enabled._model_sources,
+            strategy_state_manager=StrategyStateManager(
+                sessionmaker(engine), _RedisProbe()
+            ),
+            lifecycle_lock=enabled._lifecycle_lock,
+            order_event_lock=enabled._order_event_lock,
+            transport_response_classifier=classify_okx_batch_response,
+        )
+        with Session(engine) as session:
+            runtime_before_stop = session.get(
+                SpiderRuntimeScope,
+                (scope.environment, scope.execution_scope_id, scope.strategy_id),
+            )
+            assert runtime_before_stop is not None
+            checkpoint_before_stop = runtime_before_stop.source_checkpoint_sha256
+            action_count_before_stop = session.scalar(
+                select(func.count()).select_from(SpiderRuntimeAction).where(
+                    SpiderRuntimeAction.plan_id == plan.plan_id
+                )
+            )
+        stop_result = _dispatch(
+            stoppable, _command(scope, key="stop-before-resubmit", version=state_version)
+        )
+        assert stop_result.success is True
+        assert stoppable.restore_owned_runtimes() == frozenset({scope.strategy_id})
+        stopped_readback = stoppable.readback(scope, operation_id)
+        assert stopped_readback is not None and stopped_readback["runtime_control"] == "STOP"
+        rejected_resume = _dispatch(enabled, command)
+        assert rejected_resume.success is False
+        with Session(engine) as session:
+            runtime_after_stop = session.get(
+                SpiderRuntimeScope,
+                (scope.environment, scope.execution_scope_id, scope.strategy_id),
+            )
+            assert runtime_after_stop is not None
+            assert runtime_after_stop.source_checkpoint_sha256 == checkpoint_before_stop
+            assert session.scalar(
+                select(func.count()).select_from(SpiderRuntimeAction).where(
+                    SpiderRuntimeAction.plan_id == plan.plan_id
+                )
+            ) == action_count_before_stop
+        return
+    result = _dispatch(enabled, command)
+    assert result.success is True
+    command_data = cast(dict[str, object], result.data)
+    assert command_data["schema_version"] == "spider_management_command_result_v1"
+    assert set(command_data) == {
+        "schema_version", "scope", "command", "disposition", "operation_id",
+        "phase", "reason_code", "readback",
+    }
+    assert command_data["command"] == "RESUBMIT"
+    assert command_data["operation_id"] == operation_id
+    assert command_data["phase"] == "INCOMPLETE"
+    assert command_data["disposition"] == "ACCEPTED"
+    command_readback = cast(dict[str, object], command_data["readback"])
+    assert command_readback["schema_version"] == "spider_runtime_readback_v1"
+    assert "resubmission_action_id" not in command_readback
+    readback = enabled._member_resubmission_readback(scope, saved_request)
+    assert readback is not None
+    assert readback["disposition"] == "PLANNED"
+    assert readback["initial_member_id"] == target
+    assert readback["provider_order_id"] is None
+    assert enabled.member_resubmission_readback(
+        saved_request.canonical_request_bytes
+    ) == readback
+    action_count_before_corruption = _place_attempt_snapshot(engine, scope)
+    with Session(engine) as session:
+        financial_before_corruption = _financial_receipt_snapshot(session, scope)
+    with Session(engine) as session:
+        relation = session.get(SpiderMemberResubmission, saved_request.request_id)
+        assert relation is not None
+        saved_relation_ordinal = relation.tape_ordinal
+    with Session(engine) as session, session.begin():
+        relation = session.get(SpiderMemberResubmission, saved_request.request_id)
+        assert relation is not None
+        relation.tape_ordinal = saved_relation_ordinal + 1
+    assert enabled.member_resubmission_readback(
+        saved_request.canonical_request_bytes
+    ) is None
+    retry_after_corrupt_proof = _dispatch(fresh_owner, command)
+    assert retry_after_corrupt_proof.success is False
+    retry_data = cast(dict[str, object], retry_after_corrupt_proof.data)
+    assert retry_data["disposition"] == "UNKNOWN"
+    assert _place_attempt_snapshot(engine, scope) == action_count_before_corruption
+    with Session(engine) as session:
+        assert _financial_receipt_snapshot(session, scope) == financial_before_corruption
+    with Session(engine) as session, session.begin():
+        relation = session.get(SpiderMemberResubmission, saved_request.request_id)
+        assert relation is not None
+        relation.tape_ordinal = saved_relation_ordinal
+    assert enabled.member_resubmission_readback(
+        saved_request.canonical_request_bytes
+    ) == readback
+    action_id = cast(str, readback["resubmission_action_id"])
+
+    # A different key cannot open a second frontier while this child is pending.
+    with Session(engine) as session:
+        runtime = session.execute(select(SpiderRuntimeScope).where(
+            SpiderRuntimeScope.environment == scope.environment,
+            SpiderRuntimeScope.execution_scope_id == scope.execution_scope_id,
+            SpiderRuntimeScope.strategy_id == scope.strategy_id,
+        )).scalar_one()
+        competing_request = MemberResubmissionRequest.from_object({
+            **request_value,
+            "idempotency_key": "resubmit-second-frontier-attempt",
+            "expected_version": runtime.state_version,
+        "target_action_id": action_id,
+        })
+        actions_before_competing = session.scalar(
+            select(func.count()).select_from(SpiderRuntimeAction).where(
+                SpiderRuntimeAction.plan_id == runtime.initial_plan_id
+            )
+        )
+    assert enabled.record_member_resubmission_request(
+        competing_request.canonical_request_bytes
+    ) is not None
+    competing_command = _command(
+        scope,
+        key="resubmit-second-frontier-attempt",
+        version=competing_request.expected_version,
+    )
+    competing_command["command"] = "RESUBMIT"
+    competing_command["params"]["actor"] = "operator"
+    competing_result = _dispatch(enabled, competing_command)
+    assert competing_result.success is False
+    competing_data = cast(dict[str, object], competing_result.data)
+    assert competing_data["disposition"] == "REJECTED"
+    assert competing_data["reason_code"] == "SPIDER_MEMBER_RESUBMISSION_NOT_ELIGIBLE"
+    with Session(engine) as session:
+        assert session.scalar(
+            select(func.count()).select_from(SpiderRuntimeAction).where(
+                SpiderRuntimeAction.plan_id == runtime.initial_plan_id
+            )
+        ) == actions_before_competing
+
+    with Session(engine) as session:
+        relation = session.get(SpiderMemberResubmission, saved_request.request_id)
+        request_row = session.get(SpiderMemberResubmissionRequest, saved_request.request_id)
+        runtime = session.get(SpiderRuntimeScope, (scope.environment, scope.execution_scope_id, scope.strategy_id))
+        assert relation is not None and request_row is not None and runtime is not None
+        action = session.get(SpiderRuntimeAction, action_id)
+        binding = session.get(SpiderRuntimeBinding, action_id)
+        order = None if action is None else session.get(Order, action.local_order_id)
+        assert action is not None and binding is not None and order is not None
+        initial_frontier = session.scalar(
+            select(func.max(SpiderRuntimeAction.candidate_ordinal)).where(
+                SpiderRuntimeAction.plan_id == plan.plan_id,
+                SpiderRuntimeAction.trigger_delivery_id.is_(None),
+                SpiderRuntimeAction.parent_action_id.is_(None),
+            )
+        )
+        assert type(initial_frontier) is int
+        assert action.candidate_ordinal > initial_frontier
+        intent = cast(dict[str, object], order.intent_payload)
+        binding_bytes = bytes.fromhex(cast(str, intent["provider_binding_bytes_hex"]))
+        wire_id = cast(str, intent["provider_wire_client_order_id"])
+        request_order = cast(dict[str, object], decode_canonical(action.original_payload)).copy()
+        request_order["clOrdId"] = wire_id
+        member = {
+            "action_id": action.action_id,
+            "product_id": action.product_id,
+            "local_order_id": order.id,
+            "binding_sha256": sha256(binding_bytes).hexdigest(),
+            "wire_clOrdId": wire_id,
+            "ordId": order.exchange_order_id,
+            "request_payload": request_order,
+        }
+        group_id = sha256(canonical_bytes({
+            "domain": "SPIDER_TRANSMISSION_GROUP_V1",
+            "scope": {"environment": scope.environment,
+                      "execution_scope_id": scope.execution_scope_id,
+                      "strategy_id": scope.strategy_id},
+            "operation_id": runtime.current_operation_id,
+            "plan_id": runtime.initial_plan_id,
+            "generation": runtime.generation,
+            "configuration_sha256": runtime.configuration_sha256,
+            "operation": "PLACE",
+            "ordered_action_ids": [action.action_id],
+        })).hexdigest()
+        body: dict[str, object] = {
+            "schema_version": "SPIDER_TRANSPORT_BATCH_V1",
+            "scope": {"environment": scope.environment,
+                      "execution_scope_id": scope.execution_scope_id,
+                      "strategy_id": scope.strategy_id},
+            "executing_account_ref": scope.execution_scope_id,
+            "transmission_group_id": group_id,
+            "operation": "PLACE",
+            "members": [member],
+        }
+        body["payload_sha256"] = sha256(canonical_bytes(body)).hexdigest()
+        request_payload = canonical_bytes(body)
+        original_action = session.get(SpiderRuntimeAction, target)
+        assert original_action is not None
+        assert original_action.outcome_state == "REJECTED"
+        original_order = session.get(Order, cast(str, original_action.local_order_id))
+        assert original_order is not None
+        original_facts = (original_order.status, original_order.filled_quantity,
+                          original_order.filled_price, original_order.exchange_order_id)
+
+    if result_kind in {
+        "accepted", "accepted-51000", "late-old-cancel", "late-old-full",
+        "pending-unrelated",
+    }:
+        response = _accepted_envelope([member])
+    elif result_kind == "rejected":
+        response = {"code": "1", "data": [{"clOrdId": wire_id, "ordId": "", "sCode": "51008"}],
+                    "msg": "synthetic resubmission rejection"}
+    elif result_kind == "unknown":
+        response = {"code": "1", "data": [], "msg": "synthetic ambiguous outcome"}
+    else:
+        response = {}
+    offline = _OfflinePlaceClient(response)
+    expected_offline_calls = 0 if result_kind == "late-old-fill" else 1
+    expected_original_facts = original_facts
+    changed_original_order_id: str | None = None
+    if result_kind == "late-old-fill":
+        original_order = manager.repo.get_order(cast(str, source_members[0]["local_order_id"]))
+        assert original_order is not None
+        execution = _execution_for_owner(
+            enabled, engine, mock_clock, mock_exchange_adapter, observe_order_events=True
+        )
+        assert execution.process_exchange_order_event(_filled_event(
+            original_order,
+            provider_id="late-old-resubmission-target",
+            trade_id="late-old-resubmission-trade",
+        ))["action"] == "applied"
+        original_order = manager.repo.get_order(original_order.id)
+        assert original_order is not None
+        expected_original_facts = (
+            original_order.status, original_order.filled_quantity,
+            original_order.filled_price, original_order.exchange_order_id,
+        )
+        with Session(engine) as session:
+            expected_order_facts = session.execute(
+                select(
+                    Order.id, Order.product_id, Order.side, Order.type,
+                    Order.price, Order.quantity, Order.status,
+                    Order.exchange_order_id, Order.filled_quantity, Order.filled_price,
+                ).where(Order.id.in_(initial_order_ids)).order_by(Order.id)
+            ).all()
+            expected_trade_facts = session.execute(
+                select(
+                    Trade.id, Trade.order_id, Trade.exchange_trade_id, Trade.quantity,
+                    Trade.price, Trade.fee, Trade.fee_asset,
+                ).where(Trade.order_id.in_(initial_order_ids)).order_by(Trade.id)
+            ).all()
+        outcome = enabled._transmit_normal_place_group(
+            scope, request_payload, OkxSpiderBatchTransport(cast(Any, offline))
+        )
+        assert outcome.disposition == "REJECTED"
+        assert offline.calls == 0
+    else:
+        outcome = enabled._transmit_normal_place_group(
+            scope, request_payload, OkxSpiderBatchTransport(cast(Any, offline))
+        )
+        assert offline.calls == 1
+        assert outcome.disposition == "RECORDED"
+    assert enabled.readback(scope, operation_id) is not None
+    cold = _transport_enabled_owner(owner, scope)._member_resubmission_readback(scope, saved_request)
+    assert cold is not None and cold["disposition"] == expected_disposition
+    expected_action_state = expected_disposition
+    if expected_disposition == "ACCEPTED" and result_kind == "accepted":
+        child_order_id = cast(str, readback["local_order_id"])
+        child_order = manager.repo.get_order(child_order_id)
+        assert child_order is not None
+        execution = _execution_for_owner(
+            enabled, engine, mock_clock, mock_exchange_adapter, observe_order_events=True
+        )
+        assert execution.process_exchange_order_event(_filled_event(
+            child_order,
+            provider_id="synthetic-provider-order-0",
+            trade_id="manual-resubmission-full-fill",
+        ))["action"] == "applied"
+        with Session(engine) as session:
+            filled_order = session.get(Order, child_order_id)
+            trade = session.execute(
+                select(Trade).where(
+                    Trade.exchange_trade_id == "manual-resubmission-full-fill"
+                )
+            ).scalar_one()
+            assert filled_order is not None
+            assert filled_order.status == "FILLED"
+            assert filled_order.exchange_order_id == "synthetic-provider-order-0"
+            assert trade.order_id == child_order_id
+            assert trade.quantity == child_order.quantity
+            assert trade.price == child_order.price
+            assert trade.fee == Decimal("0.01")
+            assert trade.fee_asset == "USDT"
+            assert session.scalar(
+                select(func.count()).select_from(SpiderRuntimeDelivery).where(
+                    SpiderRuntimeDelivery.action_id == action_id,
+                    SpiderRuntimeDelivery.full_callback_key.is_not(None),
+                )
+            ) == 1
+        cold_after_fill = _transport_enabled_owner(owner, scope)._member_resubmission_readback(
+            scope, saved_request
+        )
+        assert cold_after_fill is not None
+        expected_action_state = cast(str, cold_after_fill["disposition"])
+        with Session(engine) as session:
+            full_delivery = session.execute(select(SpiderRuntimeDelivery).where(
+                SpiderRuntimeDelivery.local_order_id == child_order_id,
+                SpiderRuntimeDelivery.full_callback_key.is_not(None),
+            ).order_by(SpiderRuntimeDelivery.sequence.desc())).scalars().first()
+            assert full_delivery is not None and full_delivery.decision_payload is not None
+            historical_delivery_id = full_delivery.delivery_id
+            full_decision = cast(dict[str, object], decode_canonical(bytes(full_delivery.decision_payload)))
+            callback_candidates = cast(list[dict[str, object]], full_decision["candidates"])
+            cancel_targets = {
+                cast(str, item["target_place_action_id"])
+                for item in callback_candidates
+                if item.get("operation") == "CANCEL" and item.get("disposition") == "PLANNED"
+            }
+            # The resubmitted fill keeps its original GRID coordinate. The
+            # source Policy.order_filled cancellation neighborhood for a buy
+            # fill is [index + n + 1, index - n, index + 1]; it cancels the
+            # existing order at the matching coordinate, not the filled child.
+            filled_action = session.get(SpiderRuntimeAction, action_id)
+            assert filled_action is not None
+            filled_binding = session.get(SpiderRuntimeBinding, action_id)
+            assert filled_binding is not None
+            filled_source = cast(
+                dict[str, object], decode_canonical(bytes(filled_action.original_payload))
+            )
+            filled_index = int(cast(str, filled_source["clOrdId"])[-4:])
+            cancel_indices = {filled_index + 12, filled_index - 11, filled_index + 1}
+            assert len(cancel_targets) == 1
+            for cancel_action_id in cancel_targets:
+                cancel_action = session.get(SpiderRuntimeAction, cancel_action_id)
+                assert cancel_action is not None
+                cancel_binding = session.get(SpiderRuntimeBinding, cancel_action_id)
+                assert cancel_binding is not None
+                cancel_source = cast(
+                    dict[str, object], decode_canonical(bytes(cancel_action.original_payload))
+                )
+                cancel_index = int(cast(str, cancel_source["clOrdId"])[-4:])
+                assert cancel_index == filled_index + 12
+                assert cancel_index in cancel_indices
+                assert cancel_binding.source_product_id == filled_binding.source_product_id
+            historical_decision_bytes = bytes(full_delivery.decision_payload)
+            historical_candidate_frontier = max(
+                cast(int, item["candidate_ordinal"]) for item in callback_candidates
+            )
+            runtime = session.get(
+                SpiderRuntimeScope,
+                (scope.environment, scope.execution_scope_id, scope.strategy_id),
+            )
+            assert runtime is not None
+            later_request_value = {
+                **request_value,
+                "idempotency_key": "resubmit-after-child-callback",
+                "expected_version": runtime.state_version,
+                "target_action_id": untouched_rejection,
+            }
+        later_request = MemberResubmissionRequest.from_object(later_request_value)
+        assert enabled.record_member_resubmission_request(
+            later_request.canonical_request_bytes
+        ) is not None
+        later_command = _command(
+            scope,
+            key="resubmit-after-child-callback",
+            version=later_request.expected_version,
+        )
+        later_command["command"] = "RESUBMIT"
+        later_command["params"]["actor"] = "operator"
+        later_result = _dispatch(enabled, later_command)
+        assert later_result.success is True
+        later_data = cast(dict[str, object], later_result.data)
+        assert later_data["disposition"] == "ACCEPTED"
+        later_runtime = cast(dict[str, object], later_data["readback"])
+        assert later_runtime["schema_version"] == "spider_runtime_readback_v1"
+        later_readback = enabled._member_resubmission_readback(scope, later_request)
+        assert later_readback is not None
+        assert later_readback["disposition"] == "PLANNED"
+        later_action_id = cast(str, later_readback["resubmission_action_id"])
+        with Session(engine) as session:
+            later_action = session.get(SpiderRuntimeAction, later_action_id)
+            latest_history = session.execute(select(SpiderRuntimeDelivery).where(
+                SpiderRuntimeDelivery.delivery_id == historical_delivery_id,
+                SpiderRuntimeDelivery.environment == scope.environment,
+                SpiderRuntimeDelivery.execution_scope_id == scope.execution_scope_id,
+                SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+            )).scalar_one_or_none()
+            assert later_action is not None and latest_history is not None
+            assert latest_history.decision_payload is not None
+            assert later_action.candidate_ordinal > historical_candidate_frontier
+            assert bytes(latest_history.decision_payload) == historical_decision_bytes
+        cold_after_later_resubmit = _transport_enabled_owner(owner, scope).readback(
+            scope, operation_id
+        )
+        assert cold_after_later_resubmit is not None
+        cold_old_attempt = _transport_enabled_owner(owner, scope)._member_resubmission_readback(
+            scope, saved_request
+        )
+        assert cold_old_attempt is not None and cold_old_attempt["disposition"] == "ACCEPTED"
+    elif result_kind in {"late-old-cancel", "late-old-full"}:
+        original_order = manager.repo.get_order(
+            cast(str, source_members[0]["local_order_id"])
+        )
+        assert original_order is not None
+        before_old_fact = (
+            original_order.status, original_order.exchange_order_id,
+            original_order.filled_quantity, original_order.filled_price,
+        )
+        with Session(engine) as session:
+            before_checkpoint = session.get(
+                SpiderRuntimeScope,
+                (scope.environment, scope.execution_scope_id, scope.strategy_id),
+            )
+            assert before_checkpoint is not None
+            source_checkpoint_before = before_checkpoint.source_checkpoint_sha256
+            consumed_before = before_checkpoint.last_consumed_sequence
+        old_execution = _execution_for_owner(
+            enabled, engine, mock_clock, mock_exchange_adapter, observe_order_events=True
+        )
+        if result_kind == "late-old-cancel":
+            old_result = old_execution.process_exchange_order_event(ExchangeOrderEvent(
+                status="canceled",
+                product_id=original_order.product_id,
+                client_order_id=original_order.client_order_id,
+                exchange_order_id="late-old-provider-cancel",
+                cumulative_filled_quantity=Decimal("0"),
+            ))
+            assert old_result["action"] == "applied"
+            changed_original_order_id = original_order.id
+            original_order = manager.repo.get_order(original_order.id)
+            assert original_order is not None
+            expected_original_facts = (
+                original_order.status, original_order.filled_quantity,
+                original_order.filled_price, original_order.exchange_order_id,
+            )
+            assert original_order.status != before_old_fact[0]
+            assert original_order.exchange_order_id == "late-old-provider-cancel"
+            assert (original_order.filled_quantity or Decimal("0")) == Decimal("0")
+            with Session(engine) as session:
+                state = session.get(
+                    SpiderRuntimeScope,
+                    (scope.environment, scope.execution_scope_id, scope.strategy_id),
+                )
+                delivery = session.execute(select(SpiderRuntimeDelivery).where(
+                    SpiderRuntimeDelivery.local_order_id == original_order.id,
+                    SpiderRuntimeDelivery.kind == "ORDER_STATE",
+                ).order_by(SpiderRuntimeDelivery.sequence.desc())).scalars().first()
+                assert state is not None and delivery is not None
+                assert state.source_checkpoint_sha256 == source_checkpoint_before
+                consumed_deliveries = session.execute(select(SpiderRuntimeDelivery).where(
+                    SpiderRuntimeDelivery.environment == scope.environment,
+                    SpiderRuntimeDelivery.execution_scope_id == scope.execution_scope_id,
+                    SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                    SpiderRuntimeDelivery.sequence > consumed_before,
+                    SpiderRuntimeDelivery.sequence <= state.last_consumed_sequence,
+                ).order_by(SpiderRuntimeDelivery.sequence)).scalars().all()
+                assert [item.sequence for item in consumed_deliveries] == list(
+                    range(consumed_before + 1, state.last_consumed_sequence + 1)
+                )
+                assert all(item.disposition == "CONSUMED" for item in consumed_deliveries)
+                assert delivery.sequence <= state.last_consumed_sequence
+                assert delivery.disposition == "CONSUMED"
+                assert delivery.decision_payload is not None
+                decision = cast(dict[str, object], decode_canonical(bytes(delivery.decision_payload)))
+                assert decision["source_input"] == {
+                    "type": "NO_SOURCE", "reason_code": "SUPERSEDED_ATTEMPT"
+                }
+        else:
+            old_result = old_execution.process_exchange_order_event(_filled_event(
+                original_order, provider_id="late-old-provider-order",
+                trade_id="late-old-after-resubmit-full",
+            ))
+            assert old_result["action"] == "applied"
+            changed_original_order_id = original_order.id
+            original_order = manager.repo.get_order(original_order.id)
+            assert original_order is not None
+            expected_original_facts = (
+                original_order.status, original_order.filled_quantity,
+                original_order.filled_price, original_order.exchange_order_id,
+            )
+            assert original_order.status == "FILLED"
+            assert original_order.exchange_order_id == "late-old-provider-order"
+            assert original_order.filled_quantity == original_order.quantity
+            assert original_order.filled_price == original_order.price
+            with Session(engine) as session:
+                state = session.get(
+                    SpiderRuntimeScope,
+                    (scope.environment, scope.execution_scope_id, scope.strategy_id),
+                )
+                delivery = session.execute(select(SpiderRuntimeDelivery).where(
+                    SpiderRuntimeDelivery.trade_id.is_not(None),
+                    SpiderRuntimeDelivery.local_order_id == original_order.id,
+                    SpiderRuntimeDelivery.kind == "FILL",
+                ).order_by(SpiderRuntimeDelivery.sequence.desc())).scalars().first()
+                trade = session.execute(select(Trade).where(
+                    Trade.exchange_trade_id == "late-old-after-resubmit-full"
+                )).scalar_one()
+                preceding_state = session.get(
+                    SpiderRuntimeDelivery,
+                    (scope.environment, scope.execution_scope_id, scope.strategy_id,
+                     consumed_before + 1),
+                )
+                assert state is not None and delivery is not None
+                assert preceding_state is not None
+                assert state.source_checkpoint_sha256 == source_checkpoint_before
+                assert state.last_consumed_sequence == consumed_before + 1
+                assert state.last_received_sequence == delivery.sequence
+                assert delivery.sequence == state.last_consumed_sequence + 1
+                assert state.control_mode == "RUN"
+                assert preceding_state.kind == "ORDER_STATE"
+                assert preceding_state.disposition == "CONSUMED"
+                assert delivery.disposition == "PENDING"
+                assert delivery.decision_payload is None
+                assert delivery.full_callback_key is None
+                assert trade.order_id == original_order.id
+                assert trade.quantity == original_order.quantity
+                assert trade.price == original_order.price
+                assert trade.fee == Decimal("0.01") and trade.fee_asset == "USDT"
+                assert trade.quantity == original_order.quantity
+                assert trade.price == original_order.price
+                assert (
+                    original_order.status, original_order.exchange_order_id,
+                    original_order.filled_quantity, original_order.filled_price,
+                ) != before_old_fact
+            assert _transport_enabled_owner(owner, scope).readback(scope, operation_id) is not None
+            fresh_owner = _transport_enabled_owner(owner, scope)
+            assert fresh_owner.restore_owned_runtimes() == frozenset({scope.strategy_id})
+            duplicate_execution = _execution_for_owner(
+                fresh_owner, engine, mock_clock, mock_exchange_adapter,
+                observe_order_events=True,
+            )
+            duplicate_old = duplicate_execution.process_exchange_order_event(_filled_event(
+                original_order, provider_id="late-old-provider-order",
+                trade_id="late-old-after-resubmit-full",
+            ))
+            assert duplicate_old["action"] == "applied"
+            assert duplicate_old["fill_quantity"] == Decimal("0")
+            with Session(engine) as session:
+                state = session.get(
+                    SpiderRuntimeScope,
+                    (scope.environment, scope.execution_scope_id, scope.strategy_id),
+                )
+                still_pending = session.execute(select(SpiderRuntimeDelivery).where(
+                    SpiderRuntimeDelivery.local_order_id == original_order.id,
+                    SpiderRuntimeDelivery.kind == "FILL",
+                    SpiderRuntimeDelivery.trade_id.is_not(None),
+                ).order_by(SpiderRuntimeDelivery.sequence.desc())).scalars().first()
+                assert state is not None and still_pending is not None
+                assert state.source_checkpoint_sha256 == source_checkpoint_before
+                assert state.last_consumed_sequence == consumed_before + 1
+                assert still_pending.sequence == state.last_consumed_sequence + 1
+                assert still_pending.disposition == "PENDING"
+                assert still_pending.decision_payload is None
+                assert still_pending.full_callback_key is None
+    if result_kind == "pending-unrelated":
+        unrelated_order = manager.repo.get_order(cast(str, source_members[3]["local_order_id"]))
+        assert unrelated_order is not None
+        execution = _execution_for_owner(
+            enabled, engine, mock_clock, mock_exchange_adapter, observe_order_events=False
+        )
+        assert execution.process_exchange_order_event(ExchangeOrderEvent(
+            status="open",
+            product_id=unrelated_order.product_id,
+            client_order_id=unrelated_order.client_order_id,
+            exchange_order_id="manual-initial-3",
+            cumulative_filled_quantity=Decimal("0"),
+        ))["action"] == "applied"
+        changed_pending_order_id = unrelated_order.id
+        with Session(engine) as session:
+            expected_pending_order_fact = tuple(session.execute(select(
+                Order.id, Order.product_id, Order.side, Order.type,
+                Order.price, Order.quantity, Order.status,
+                Order.exchange_order_id, Order.filled_quantity, Order.filled_price,
+            ).where(Order.id == unrelated_order.id)).one())
+        with Session(engine) as session:
+            runtime = session.get(
+                SpiderRuntimeScope,
+                (scope.environment, scope.execution_scope_id, scope.strategy_id),
+            )
+            assert runtime is not None
+            assert runtime.last_received_sequence > runtime.last_consumed_sequence
+        committed_duplicate = enabled._consume_member_resubmission(
+            scope, "operator", "resubmit-one-member", state_version
+        )
+        assert committed_duplicate.success is True
+        assert cast(dict[str, object], committed_duplicate.data)["disposition"] == "ACCEPTED"
+    duplicate_result = _dispatch(enabled, command)
+    assert duplicate_result.success is True
+    duplicate_data = cast(dict[str, object], duplicate_result.data)
+    duplicate_runtime = cast(dict[str, object], duplicate_data["readback"])
+    assert duplicate_runtime["schema_version"] == "spider_runtime_readback_v1"
+    duplicate_readback = enabled._member_resubmission_readback(scope, saved_request)
+    assert duplicate_readback is not None
+    assert duplicate_readback["resubmission_action_id"] == action_id
+    assert offline.calls == expected_offline_calls
+    if expected_disposition == "REJECTED":
+        with Session(engine) as session:
+            runtime = session.get(
+                SpiderRuntimeScope,
+                (scope.environment, scope.execution_scope_id, scope.strategy_id),
+            )
+            first_action = session.get(SpiderRuntimeAction, action_id)
+            first_order = None if first_action is None else session.get(
+                Order, first_action.local_order_id
+            )
+            assert runtime is not None and first_action is not None and first_order is not None
+            next_request_value = {
+                **request_value,
+                "idempotency_key": "resubmit-after-rejection",
+                "expected_version": runtime.state_version,
+                "target_action_id": action_id,
+            }
+            first_ordinal = first_action.candidate_ordinal
+            first_client_id = first_order.client_order_id
+        next_request = MemberResubmissionRequest.from_object(next_request_value)
+        assert enabled.record_member_resubmission_request(
+            next_request.canonical_request_bytes
+        ) is not None
+        next_command = _command(
+            scope, key="resubmit-after-rejection", version=next_request.expected_version
+        )
+        next_command["command"] = "RESUBMIT"
+        next_command["params"]["actor"] = "operator"
+        next_result = _dispatch(enabled, next_command)
+        assert next_result.success is True
+        next_data = cast(dict[str, object], next_result.data)
+        assert next_data["disposition"] == "ACCEPTED"
+        next_runtime = cast(dict[str, object], next_data["readback"])
+        assert next_runtime["schema_version"] == "spider_runtime_readback_v1"
+        next_readback = enabled._member_resubmission_readback(scope, next_request)
+        assert next_readback is not None
+        assert next_readback["disposition"] == "PLANNED"
+        next_action_id = cast(str, next_readback["resubmission_action_id"])
+        with Session(engine) as session:
+            next_action = session.get(SpiderRuntimeAction, next_action_id)
+            next_order = None if next_action is None else session.get(Order, next_action.local_order_id)
+            assert next_action is not None and next_order is not None
+            assert next_action.candidate_ordinal > first_ordinal
+            assert next_order.client_order_id != first_client_id
+    final_projection = enabled.readback(scope, operation_id)
+    assert final_projection is not None
+    initial_ids = {
+        cast(str, row["initial_member_id"])
+        for row in cast(list[dict[str, object]], _initial["initial_plan_missing_members"])
+    }
+    projected_missing = cast(list[dict[str, object]], final_projection["initial_plan_missing_members"])
+    if expected_disposition == "ACCEPTED":
+        assert target not in {row["initial_member_id"] for row in projected_missing}
+        assert untouched_rejection in {row["initial_member_id"] for row in projected_missing}
+    else:
+        assert target in {row["initial_member_id"] for row in projected_missing}
+    assert {row["initial_member_id"] for row in projected_missing} <= initial_ids
+    with Session(engine) as session:
+        original_action = session.get(SpiderRuntimeAction, target)
+        new_action = session.get(SpiderRuntimeAction, action_id)
+        original_order = None if original_action is None else session.get(Order, original_action.local_order_id)
+        assert original_action is not None and new_action is not None and original_order is not None
+        expected_original_outcome = (
+            "SEND_UNKNOWN"
+            if result_kind in {"late-old-cancel", "late-old-full", "late-old-fill"}
+            else "REJECTED"
+        )
+        assert original_action.outcome_state == expected_original_outcome
+        if result_kind in {"late-old-cancel", "late-old-full"}:
+            original_transmission = session.get(
+                SpiderRuntimeTransmission, original_action.outcome_reference
+            )
+            assert original_transmission is not None
+            assert original_transmission.response_payload is not None
+            original_rest_outcome = classify_okx_batch_response(
+                bytes(original_transmission.request_payload),
+                bytes(original_transmission.response_payload),
+            )
+            assert original_rest_outcome is not None
+            assert original_rest_outcome[target] == ("REJECTED", "51008", None)
+        assert (original_order.status, original_order.filled_quantity,
+                original_order.filled_price, original_order.exchange_order_id) == expected_original_facts
+        assert new_action.outcome_state == (
+            "UNSENT" if expected_disposition == "PLANNED" else expected_action_state
+        )
+        current_order_facts = session.execute(
+            select(
+                Order.id, Order.product_id, Order.side, Order.type,
+                Order.price, Order.quantity, Order.status,
+                Order.exchange_order_id, Order.filled_quantity, Order.filled_price,
+            ).where(Order.id.in_(initial_order_ids)).order_by(Order.id)
+        ).all()
+        current_trade_facts = session.execute(
+            select(
+                Trade.id, Trade.order_id, Trade.exchange_trade_id, Trade.quantity,
+                Trade.price, Trade.fee, Trade.fee_asset,
+            ).where(Trade.order_id.in_(initial_order_ids)).order_by(Trade.id)
+        ).all()
+        if result_kind in {"late-old-cancel", "late-old-full"}:
+            changed_id = cast(str, changed_original_order_id)
+            assert [row for row in current_order_facts if row[0] != changed_id] == [
+                row for row in expected_order_facts if row[0] != changed_id
+            ]
+            assert [row for row in current_trade_facts if row[1] != changed_id] == [
+                row for row in expected_trade_facts if row[1] != changed_id
+            ]
+            target_trades = [row for row in current_trade_facts if row[1] == changed_id]
+            original_target_trades = [row for row in expected_trade_facts if row[1] == changed_id]
+            if result_kind == "late-old-cancel":
+                assert target_trades == original_target_trades
+            else:
+                assert len(target_trades) == len(original_target_trades) + 1
+                late_trade = next(row for row in target_trades if row[2] == "late-old-after-resubmit-full")
+                assert late_trade[3:7] == (
+                    original_order.quantity, original_order.price, Decimal("0.01"), "USDT"
+                )
+        elif result_kind == "pending-unrelated":
+            assert changed_pending_order_id is not None
+            assert expected_pending_order_fact is not None
+            assert [row for row in current_order_facts if row[0] != changed_pending_order_id] == [
+                row for row in expected_order_facts if row[0] != changed_pending_order_id
+            ]
+            assert next(
+                row for row in current_order_facts if row[0] == changed_pending_order_id
+            ) == expected_pending_order_fact
+            assert current_trade_facts == expected_trade_facts
+        else:
+            assert current_order_facts == expected_order_facts
+            assert current_trade_facts == expected_trade_facts

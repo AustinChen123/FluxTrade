@@ -317,7 +317,9 @@ def test_market_source_boolean_generation_rejects_without_owner_writes(operation
         ) == before_frontiers
 
 
-def test_market_source_does_not_skip_earlier_financial_delivery(operation_pg: Engine):
+def test_market_source_does_not_skip_earlier_financial_delivery(
+    operation_pg: Engine, monkeypatch: pytest.MonkeyPatch
+):
     owner, scope, operation_id, factory, prepared, _initial, _order_manager, _confirmation, _source = _owner(operation_pg)
     from src.core.clock import BacktestClock
     from src.core.execution import ExecutionEngine
@@ -382,10 +384,21 @@ def test_market_source_does_not_skip_earlier_financial_delivery(operation_pg: En
         assert runtime_before_market.last_received_sequence == 2
         assert runtime_before_market.last_tape_sequence == 2
         assert bytes(runtime_before_market.source_checkpoint) == prepared.build_checkpoint_bytes
+    attempted: list[int] = []
+    consume_normal = owner._consume_normal_delivery
+
+    def block_earliest_delivery(delivery_scope, intended_operation_id, sequence):
+        attempted.append(sequence)
+        if sequence == 1:
+            return "UNAVAILABLE"
+        return consume_normal(delivery_scope, intended_operation_id, sequence)
+
+    monkeypatch.setattr(owner, "_consume_normal_delivery", block_earliest_delivery)
     market = _market_payload(scope, prepared, "d" * 64, price="17.5")
     received = owner.receive_source_market(market)
     assert received.success is True and received.data is not None
     assert received.data["delivery_sequence"] == 3
+    assert attempted == [1]
     with factory() as session:
         runtime = session.execute(
             select(SpiderRuntimeScope).where(

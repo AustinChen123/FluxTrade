@@ -1198,13 +1198,13 @@ def test_main_real_engine_restores_then_receives_fill_through_injected_participa
                     select(SpiderRuntimeScope.last_consumed_sequence).where(
                         SpiderRuntimeScope.strategy_id == scope.strategy_id
                     )
-                ) == 0
+                ) == 1
                 assert session.scalar(
                     select(SpiderRuntimeDelivery.disposition).where(
                         SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
                         SpiderRuntimeDelivery.sequence == 1,
                     )
-                ) == "PENDING"
+                ) == "CONSUMED"
             # Malformed STOP envelopes carrying an owned identity must be
             # rejected by the owner and never reach generic StrategyState stop.
             owner = owners[0]
@@ -1797,7 +1797,7 @@ def test_main_real_engine_restores_then_receives_fill_through_injected_participa
                 SpiderRuntimeDelivery.disposition == "SUPPRESSED",
                 SpiderRuntimeDelivery.suppression_reason == "STOP_CONTROL",
             )
-        ) == 5
+        ) == 4
     with factory() as session:
         assert session.scalar(
             select(func.count()).select_from(Trade).where(Trade.order_id == order_id)
@@ -1818,9 +1818,12 @@ def test_main_real_engine_restores_then_receives_fill_through_injected_participa
             .order_by(SpiderRuntimeDelivery.sequence)
         ).all()
         assert [row.sequence for row in suppressed] == [1, 2, 3, 4, 5]
+        assert (suppressed[0].disposition, suppressed[0].suppression_reason) == (
+            "CONSUMED", None
+        )
         assert all(
             row.disposition == "SUPPRESSED" and row.suppression_reason == "STOP_CONTROL"
-            for row in suppressed
+            for row in suppressed[1:]
         )
         assert session.scalar(
             select(SpiderRuntimeScope.last_consumed_sequence).where(
@@ -2173,7 +2176,7 @@ def test_main_real_engine_restores_then_receives_fill_through_injected_participa
 
     readback = owners[0].readback(scope, operation_id)
     assert readback is not None
-    assert readback["checkpoint_sha256"] == initial["checkpoint_sha256"]
+    assert readback["checkpoint_sha256"] != initial["checkpoint_sha256"]
     assert readback["initial_plan_missing_members"] == initial[
         "initial_plan_missing_members"
     ]

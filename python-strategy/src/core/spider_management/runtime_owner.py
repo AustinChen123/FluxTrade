@@ -69,6 +69,11 @@ from src.core.spider_management.initial_place_projection import (
     expected_plan_status,
     validate_member_outcomes,
 )
+from src.core.spider_management.member_resubmission import (
+    MemberResubmissionError,
+    MemberResubmissionRequest,
+    control_receipt_id as member_control_receipt_id,
+)
 from src.core.spider_management.control_command import (
     SpiderControlCommandError,
     SpiderManagementCommand,
@@ -81,6 +86,8 @@ from src.core.spider_management.orm import (
     SpiderConfigurationRequest,
     SpiderControlReceipt,
     SpiderOperationRequestRow,
+    SpiderMemberResubmission,
+    SpiderMemberResubmissionRequest,
     SpiderRuntimeAction,
     SpiderRuntimeBinding,
     SpiderRuntimeDelivery,
@@ -770,7 +777,10 @@ class SpiderRuntimeOwner:
                             or not (
                                 self._valid_normal_cancel_request(session, scope, runtime, plan, request)
                                 if operation == "CANCEL"
-                                else self._valid_normal_place_request(session, scope, runtime, plan, request)
+                                else self._valid_normal_place_request(
+                                    session, scope, runtime, plan, request,
+                                    latest_eligibility=False,
+                                )
                             )
                         ):
                             return None
@@ -785,6 +795,20 @@ class SpiderRuntimeOwner:
                         members = cast(list[dict[str, object]], request["members"])
                         action_key = "cancel_action_id" if operation == "CANCEL" else "action_id"
                         ids = [cast(str, member[action_key]) for member in members]
+                        if operation == "PLACE" and session.execute(
+                            select(SpiderMemberResubmission.request_id).where(
+                                SpiderMemberResubmission.environment == scope.environment,
+                                SpiderMemberResubmission.execution_scope_id == scope.execution_scope_id,
+                                SpiderMemberResubmission.strategy_id == scope.strategy_id,
+                                SpiderMemberResubmission.target_action_id.in_(ids),
+                            ).limit(1)
+                        ).scalar_one_or_none() is not None:
+                            return None
+                        if operation == "PLACE" and not self._valid_normal_place_request(
+                            session, scope, runtime, plan, request,
+                            latest_eligibility=True,
+                        ):
+                            return None
                         actions = session.execute(
                             select(SpiderRuntimeAction).where(
                                 SpiderRuntimeAction.plan_id == plan.plan_id,
@@ -840,6 +864,8 @@ class SpiderRuntimeOwner:
         runtime: SpiderRuntimeScope,
         plan: SpiderRuntimePlan,
         request: dict[str, object],
+        *,
+        latest_eligibility: bool = False,
     ) -> bool:
         members = cast(list[dict[str, object]], request["members"])
         action_ids = [cast(str, member["action_id"]) for member in members]
@@ -873,6 +899,16 @@ class SpiderRuntimeOwner:
             return False
         rows = cast(list[tuple[SpiderRuntimeAction, SpiderRuntimeBinding, Order]], list(rows))
         trigger_ids = {action.trigger_delivery_id for action, _binding, _order in rows}
+        if trigger_ids == {None}:
+            if any(action.parent_action_id is not None for action, _binding, _order in rows):
+                return self._valid_member_resubmission_place_request(
+                    session, scope, runtime, plan, request, rows,
+                    latest_eligibility=latest_eligibility,
+                )
+            return _valid_initial_place_request(
+                request, scope, scope.execution_scope_id, group_id, rows,
+                require_unsent=False,
+            )
         if len(trigger_ids) != 1 or None in trigger_ids:
             return False
         trigger_id = cast(str, next(iter(trigger_ids)))
@@ -965,6 +1001,148 @@ class SpiderRuntimeOwner:
         ):
             return False
         return True
+
+    def _valid_member_resubmission_place_request(
+        self,
+        session: Session,
+        scope: RuntimeScopeKey,
+        runtime: SpiderRuntimeScope,
+        plan: SpiderRuntimePlan,
+        request: dict[str, object],
+        rows: list[tuple[SpiderRuntimeAction, SpiderRuntimeBinding, Order]],
+        *,
+        latest_eligibility: bool = False,
+    ) -> bool:
+        """Validate a single PLACE only through its saved manual relation."""
+        members = cast(list[dict[str, object]], request["members"])
+        if len(members) != 1 or len(rows) != 1:
+            return False
+        action, binding, order = rows[0]
+        relations = session.execute(
+            select(SpiderMemberResubmission).where(
+                SpiderMemberResubmission.resubmission_action_id == action.action_id,
+                SpiderMemberResubmission.environment == scope.environment,
+                SpiderMemberResubmission.execution_scope_id == scope.execution_scope_id,
+                SpiderMemberResubmission.strategy_id == scope.strategy_id,
+            ).limit(2)
+        ).scalars().all()
+        if len(relations) != 1:
+            return False
+        relation = relations[0]
+        saved = session.get(SpiderMemberResubmissionRequest, relation.request_id)
+        target = session.get(SpiderRuntimeAction, relation.target_action_id)
+        target_binding = None if target is None else session.get(SpiderRuntimeBinding, target.action_id)
+        target_order = None if target is None else session.get(Order, target.local_order_id)
+        if saved is None or not self._validate_member_resubmission_relation(
+            session, scope, relation, saved
+        ) or target is None or target_binding is None or target_order is None:
+            return False
+        if latest_eligibility:
+            if target.outcome_state not in {"REJECTED", "UNSENT"}:
+                return False
+            target_acceptance = self._financial_acceptance_proved(
+                session, scope, target, target_binding, target_order
+            )
+            if target_acceptance is not False:
+                return False
+            projected = self._refresh_initial_place_projection(
+                session, scope, runtime, plan, persist=False
+            )
+            frontier = None if projected is None else next(
+                (item for item in projected if item.get("initial_member_id") == relation.initial_member_id),
+                None,
+            )
+            if frontier is None or frontier.get("current_frontier_action_id") != action.action_id:
+                return False
+        group_id = cast(str, request["transmission_group_id"])
+        expected_group = _digest({
+            "domain": "SPIDER_TRANSMISSION_GROUP_V1",
+            "scope": _scope(scope),
+            "operation_id": runtime.current_operation_id,
+            "plan_id": plan.plan_id,
+            "generation": runtime.generation,
+            "configuration_sha256": runtime.configuration_sha256,
+            "operation": "PLACE",
+            "ordered_action_ids": [action.action_id],
+        })
+        member = members[0]
+        intent = order.intent_payload
+        if type(intent) is not dict:
+            return False
+        try:
+            binding_bytes = bytes.fromhex(cast(str, intent["provider_binding_bytes_hex"]))
+            source_order = decode_canonical(bytes(action.original_payload))
+        except (KeyError, TypeError, ValueError, UnicodeDecodeError):
+            return False
+        if type(source_order) is not dict:
+            return False
+        wire_id = intent.get("provider_wire_client_order_id")
+        expected_order = dict(cast(dict[str, object], source_order))
+        expected_order["clOrdId"] = wire_id
+        return bool(
+            request.get("scope") == _scope(scope)
+            and request.get("executing_account_ref") == scope.execution_scope_id
+            and group_id == expected_group
+            and action.operation == "PLACE"
+            and action.plan_id == plan.plan_id
+            and action.parent_action_id == relation.target_action_id
+            and action.trigger_delivery_id is None
+            and action.generation == runtime.generation
+            and action.configuration_sha256 == runtime.configuration_sha256
+            and action.outcome_reference in {None, group_id}
+            and action.transmission_group == action.candidate_ordinal
+            and member.get("action_id") == action.action_id
+            and member.get("product_id") == action.product_id
+            and member.get("local_order_id") == order.id
+            and member.get("binding_sha256") == _digest_bytes(binding_bytes)
+            and member.get("wire_clOrdId") == wire_id
+            and member.get("ordId") is None
+            and member.get("request_payload") == expected_order
+            and prove_spider_order_wire_binding(
+                scope.environment, scope.execution_scope_id, scope.strategy_id,
+                action, binding, order,
+            ) is not None
+        )
+
+    @staticmethod
+    def _financial_acceptance_proved(
+        session: Session,
+        scope: RuntimeScopeKey,
+        action: SpiderRuntimeAction,
+        binding: SpiderRuntimeBinding,
+        order: Order,
+    ) -> bool | None:
+        projection = {
+            "status": order.status,
+            "filled_quantity": (
+                None if order.filled_quantity is None
+                else canonical_decimal_text(order.filled_quantity)
+            ),
+            "filled_price": (
+                None if order.filled_price is None
+                else canonical_decimal_text(order.filled_price)
+            ),
+            "exchange_order_id": order.exchange_order_id,
+        }
+        if not validate_order_receipt_chain(
+            session,
+            scope=_scope(scope),
+            action=action,
+            binding=binding,
+            order_id=order.id,
+            current_projection=projection,
+        ):
+            return None
+        kinds = session.execute(
+            select(SpiderRuntimeDelivery.kind).where(
+                SpiderRuntimeDelivery.environment == scope.environment,
+                SpiderRuntimeDelivery.execution_scope_id == scope.execution_scope_id,
+                SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                SpiderRuntimeDelivery.action_id == action.action_id,
+                SpiderRuntimeDelivery.local_order_id == order.id,
+            )
+        ).scalars()
+        return any(kind in {"FILL", "ORDER_STATE"} for kind in kinds)
 
     def _valid_normal_cancel_request(
         self,
@@ -1224,6 +1402,15 @@ class SpiderRuntimeOwner:
                         saved = session.get(SpiderRuntimeTransmission, group_id)
                         if saved is not None:
                             return group_id, False
+                        if session.execute(
+                            select(SpiderMemberResubmission.request_id).where(
+                                SpiderMemberResubmission.environment == scope.environment,
+                                SpiderMemberResubmission.execution_scope_id == scope.execution_scope_id,
+                                SpiderMemberResubmission.strategy_id == scope.strategy_id,
+                                SpiderMemberResubmission.target_action_id.in_(action_ids),
+                            ).limit(1)
+                        ).scalar_one_or_none() is not None:
+                            return None
                         if runtime.control_mode != "RUN" or plan.plan_status != "INCOMPLETE":
                             return None
                         if not _valid_initial_place_request(
@@ -2081,6 +2268,37 @@ class SpiderRuntimeOwner:
                     )
                     if cancel_action is None or target_action is None or binding is None or target_order is None:
                         return None, None, delivery.kind
+                    result_ordinal = session.execute(
+                        select(SpiderRuntimeTapeIndex.ordinal).where(
+                            SpiderRuntimeTapeIndex.environment == scope.environment,
+                            SpiderRuntimeTapeIndex.execution_scope_id == scope.execution_scope_id,
+                            SpiderRuntimeTapeIndex.strategy_id == scope.strategy_id,
+                            SpiderRuntimeTapeIndex.delivery_sequence == delivery.sequence,
+                            SpiderRuntimeTapeIndex.kind == "DELIVERY",
+                        )
+                    ).scalar_one_or_none()
+                    marker_ordinal = session.execute(
+                        select(SpiderRuntimeTapeIndex.ordinal).where(
+                            SpiderRuntimeTapeIndex.environment == scope.environment,
+                            SpiderRuntimeTapeIndex.execution_scope_id == scope.execution_scope_id,
+                            SpiderRuntimeTapeIndex.strategy_id == scope.strategy_id,
+                            SpiderRuntimeTapeIndex.transmission_group_id == transmission.transmission_group_id,
+                            SpiderRuntimeTapeIndex.kind == "SEND_MARKER",
+                        )
+                    ).scalar_one_or_none()
+                    if type(result_ordinal) is not int or type(marker_ordinal) is not int:
+                        return None, None, delivery.kind
+                    if session.execute(
+                        select(SpiderMemberResubmission.request_id).where(
+                            SpiderMemberResubmission.environment == scope.environment,
+                            SpiderMemberResubmission.execution_scope_id == scope.execution_scope_id,
+                            SpiderMemberResubmission.strategy_id == scope.strategy_id,
+                            SpiderMemberResubmission.target_action_id == target_action.action_id,
+                            SpiderMemberResubmission.tape_ordinal > marker_ordinal,
+                            SpiderMemberResubmission.tape_ordinal < result_ordinal,
+                        ).limit(1)
+                    ).scalar_one_or_none() is not None:
+                        continue
                     full_key_for_target = full_callback_identity(
                         _scope(scope), target_order.id, target_action.generation
                     )
@@ -2183,18 +2401,25 @@ class SpiderRuntimeOwner:
                 ordered_action_rows = [
                     action_map.get(action_id) for action_id in request_action_ids
                 ]
+                ordered_rows = cast(
+                    list[tuple[SpiderRuntimeAction, SpiderRuntimeBinding, Order]],
+                    [row for row in ordered_action_rows if row is not None],
+                )
                 if (
                     any(row is None for row in ordered_action_rows)
                     or not (
-                        _valid_initial_place_request(
-                            request, scope, scope.execution_scope_id,
-                            transmission.transmission_group_id,
-                            cast(list[tuple[SpiderRuntimeAction, SpiderRuntimeBinding, Order]], ordered_action_rows),
-                            require_unsent=False,
+                        self._valid_normal_place_request(
+                            session, scope, runtime, plan, request
                         )
-                        if all(row[0].trigger_delivery_id is None for row in ordered_action_rows if row is not None)
-                        else self._valid_normal_place_request(
-                            session, scope, runtime, plan, request,
+                        if any(
+                            row[0].parent_action_id is not None
+                            or row[0].trigger_delivery_id is not None
+                            for row in ordered_rows
+                        )
+                        else _valid_initial_place_request(
+                            request, scope, scope.execution_scope_id,
+                            transmission.transmission_group_id, ordered_rows,
+                            require_unsent=False,
                         )
                     )
                 ):
@@ -2206,7 +2431,10 @@ class SpiderRuntimeOwner:
                         ordered_action_rows,
                     )
                 }
-                if any(action.trigger_delivery_id is not None for action, _binding in verified_action_map.values()):
+                if any(
+                    action.trigger_delivery_id is not None or action.parent_action_id is not None
+                    for action, _binding in verified_action_map.values()
+                ):
                     classified = self._place_outcomes_at_cutoff(
                         session, scope,
                         cast(list[tuple[SpiderRuntimeAction, SpiderRuntimeBinding, Order]], ordered_action_rows),
@@ -2235,6 +2463,38 @@ class SpiderRuntimeOwner:
                     if type(source_order_value) is not dict:
                         return None, None, delivery.kind
                     source_order = cast(dict[str, object], source_order_value)
+                    result_ordinal = session.execute(
+                        select(SpiderRuntimeTapeIndex.ordinal).where(
+                            SpiderRuntimeTapeIndex.environment == scope.environment,
+                            SpiderRuntimeTapeIndex.execution_scope_id == scope.execution_scope_id,
+                            SpiderRuntimeTapeIndex.strategy_id == scope.strategy_id,
+                            SpiderRuntimeTapeIndex.delivery_sequence == delivery.sequence,
+                            SpiderRuntimeTapeIndex.kind == "DELIVERY",
+                        )
+                    ).scalar_one_or_none()
+                    marker_ordinal = session.execute(
+                        select(SpiderRuntimeTapeIndex.ordinal).where(
+                            SpiderRuntimeTapeIndex.environment == scope.environment,
+                            SpiderRuntimeTapeIndex.execution_scope_id == scope.execution_scope_id,
+                            SpiderRuntimeTapeIndex.strategy_id == scope.strategy_id,
+                            SpiderRuntimeTapeIndex.transmission_group_id == transmission.transmission_group_id,
+                            SpiderRuntimeTapeIndex.kind == "SEND_MARKER",
+                        )
+                    ).scalar_one_or_none()
+                    if type(result_ordinal) is not int or type(marker_ordinal) is not int:
+                        return None, None, delivery.kind
+                    superseded_before_ack = session.execute(
+                        select(SpiderMemberResubmission.request_id).where(
+                            SpiderMemberResubmission.environment == scope.environment,
+                            SpiderMemberResubmission.execution_scope_id == scope.execution_scope_id,
+                            SpiderMemberResubmission.strategy_id == scope.strategy_id,
+                            SpiderMemberResubmission.target_action_id == action.action_id,
+                            SpiderMemberResubmission.tape_ordinal > marker_ordinal,
+                            SpiderMemberResubmission.tape_ordinal < result_ordinal,
+                        ).limit(1)
+                    ).scalar_one_or_none()
+                    if superseded_before_ack is not None:
+                        continue
                     # REST is an acknowledgement, never a status authority. Once the
                     # local order has reached an economic terminal state, or its
                     # source full callback has been claimed, a delayed response must
@@ -2422,11 +2682,39 @@ class SpiderRuntimeOwner:
                     SpiderRuntimeDelivery.sequence < delivery.sequence,
                 ).limit(1)
             ).scalar_one_or_none() is not None
+        delivery_ordinal = session.execute(
+            select(SpiderRuntimeTapeIndex.ordinal).where(
+                SpiderRuntimeTapeIndex.environment == scope.environment,
+                SpiderRuntimeTapeIndex.execution_scope_id == scope.execution_scope_id,
+                SpiderRuntimeTapeIndex.strategy_id == scope.strategy_id,
+                SpiderRuntimeTapeIndex.delivery_sequence == delivery.sequence,
+                SpiderRuntimeTapeIndex.kind == "DELIVERY",
+            )
+        ).scalar_one_or_none()
+        if type(delivery_ordinal) is not int:
+            return None, key, delivery.kind
+        superseded = session.execute(
+            select(SpiderMemberResubmission.request_id).where(
+                SpiderMemberResubmission.environment == scope.environment,
+                SpiderMemberResubmission.execution_scope_id == scope.execution_scope_id,
+                SpiderMemberResubmission.strategy_id == scope.strategy_id,
+                SpiderMemberResubmission.target_action_id == action.action_id,
+                SpiderMemberResubmission.tape_ordinal < delivery_ordinal,
+            ).limit(1)
+        ).scalar_one_or_none() is not None
+        if superseded and transition.full_callback and not already_claimed:
+            logging.getLogger(__name__).warning(
+                "SPIDER_SOURCE_ACTIVE_ATTEMPT_UNRESOLVED strategy=%s sequence=%s",
+                scope.strategy_id, delivery.sequence,
+            )
+            return None, key, delivery.kind
         if transition.state == "economic_terminal":
             source_input = {"type": "NO_SOURCE", "reason_code": "ECONOMIC_TERMINAL"}
         elif already_claimed:
             source_input = {"type": "NO_SOURCE", "reason_code": "FULL_ALREADY_CONSUMED"}
             key = None
+        elif superseded:
+            source_input = {"type": "NO_SOURCE", "reason_code": "SUPERSEDED_ATTEMPT"}
         else:
             state = {
                 "new": "new", "sent": "sent", "live": "live",
@@ -2500,25 +2788,10 @@ class SpiderRuntimeOwner:
                 str, cast(dict[str, object], row["instrument_spec"])["product_id"]
             ) for row in map_rows
         }
-        previous_decisions = session.execute(
-            select(SpiderRuntimeDelivery.decision_payload).where(
-                SpiderRuntimeDelivery.environment == scope.environment,
-                SpiderRuntimeDelivery.execution_scope_id == scope.execution_scope_id,
-                SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
-                SpiderRuntimeDelivery.sequence < delivery.sequence,
-                SpiderRuntimeDelivery.decision_payload.is_not(None),
-            ).order_by(SpiderRuntimeDelivery.sequence)
-        ).scalars().all()
-        last_ordinal = _initial_candidate_frontier(plan)
-        for raw in previous_decisions:
-            if type(raw) is not bytes:
-                continue
-            value = decode_canonical(bytes(raw))
-            if type(value) is dict and type(cast(dict[str, object], value).get("candidates")) is list:
-                for candidate in cast(list[dict[str, object]], cast(dict[str, object], value)["candidates"]):
-                    ordinal = candidate.get("candidate_ordinal")
-                    if type(ordinal) is int:
-                        last_ordinal = max(last_ordinal, ordinal)
+        frontier = self._normal_candidate_frontier(session, scope, plan, delivery)
+        if frontier is None:
+            raise ValueError("SPIDER_SOURCE_CANDIDATE_FRONTIER_UNAVAILABLE")
+        last_ordinal = frontier
         candidates: list[dict[str, object]] = []
         staged: list[object] = []
         for event_index, event in enumerate(events):
@@ -2554,23 +2827,17 @@ class SpiderRuntimeOwner:
                 )
                 target_rows: list[SpiderRuntimeAction] = []
                 if classification.needs_cancel_target_lookup:
-                    product = cast(str, source_payload.get("instId"))
+                    product = source_payload.get("instId")
                     alias_value = classification.cancel_alias
-                    target_rows = list(session.execute(
-                        select(SpiderRuntimeAction).join(
-                            SpiderRuntimeBinding,
-                            SpiderRuntimeBinding.action_id == SpiderRuntimeAction.action_id,
-                        ).where(
-                            SpiderRuntimeAction.environment == scope.environment,
-                            SpiderRuntimeAction.execution_scope_id == scope.execution_scope_id,
-                            SpiderRuntimeAction.strategy_id == scope.strategy_id,
-                            SpiderRuntimeAction.plan_id == plan.plan_id,
-                            SpiderRuntimeAction.operation == "PLACE",
-                            SpiderRuntimeAction.generation == runtime.generation,
-                            SpiderRuntimeAction.product_id == product,
-                            SpiderRuntimeBinding.source_client_order_id == alias_value,
-                        )
-                    ).scalars().all())
+                    if type(product) is not str or type(alias_value) is not str:
+                        raise ValueError("SPIDER_SOURCE_CANCEL_TARGET_UNAVAILABLE")
+                    resolved_targets = self._normal_cancel_targets_at_cutoff(
+                        session, scope, runtime, plan, delivery,
+                        product=product, source_alias_id=alias_value,
+                    )
+                    if resolved_targets is None:
+                        raise ValueError("SPIDER_SOURCE_CANCEL_TARGET_UNAVAILABLE")
+                    target_rows = resolved_targets
                     classification = classify_source_candidate(
                         operation,
                         source_payload,
@@ -2716,6 +2983,151 @@ class SpiderRuntimeOwner:
                     "source_member_index": member_index,
                 })
         return candidates, staged
+
+    def _normal_candidate_frontier(
+        self,
+        session: Session,
+        scope: RuntimeScopeKey,
+        plan: SpiderRuntimePlan,
+        delivery: SpiderRuntimeDelivery,
+    ) -> int | None:
+        """Return ordinals proved before this delivery's tape position."""
+        cutoff = session.execute(select(SpiderRuntimeTapeIndex.ordinal).where(
+            SpiderRuntimeTapeIndex.environment == scope.environment,
+            SpiderRuntimeTapeIndex.execution_scope_id == scope.execution_scope_id,
+            SpiderRuntimeTapeIndex.strategy_id == scope.strategy_id,
+            SpiderRuntimeTapeIndex.delivery_sequence == delivery.sequence,
+            SpiderRuntimeTapeIndex.kind == "DELIVERY",
+        )).scalar_one_or_none()
+        if type(cutoff) is not int:
+            return None
+        frontier = _initial_candidate_frontier(plan)
+        previous = session.execute(select(SpiderRuntimeDelivery).where(
+            SpiderRuntimeDelivery.environment == scope.environment,
+            SpiderRuntimeDelivery.execution_scope_id == scope.execution_scope_id,
+            SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+            SpiderRuntimeDelivery.sequence < delivery.sequence,
+        ).order_by(SpiderRuntimeDelivery.sequence)).scalars().all()
+        for prior in previous:
+            if prior.disposition != "CONSUMED" or prior.decision_payload is None:
+                continue
+            value = decode_canonical(bytes(prior.decision_payload))
+            if type(value) is not dict or type(cast(dict[str, object], value).get("candidates")) is not list:
+                return None
+            for candidate in cast(list[object], cast(dict[str, object], value)["candidates"]):
+                if type(candidate) is not dict:
+                    return None
+                ordinal = cast(dict[str, object], candidate).get("candidate_ordinal")
+                if type(ordinal) is not int or ordinal <= 0:
+                    return None
+                frontier = max(frontier, ordinal)
+        relations = session.execute(select(SpiderMemberResubmission).where(
+            SpiderMemberResubmission.environment == scope.environment,
+            SpiderMemberResubmission.execution_scope_id == scope.execution_scope_id,
+            SpiderMemberResubmission.strategy_id == scope.strategy_id,
+            SpiderMemberResubmission.tape_ordinal < cutoff,
+        ).order_by(SpiderMemberResubmission.tape_ordinal)).scalars().all()
+        for relation in relations:
+            saved = session.get(SpiderMemberResubmissionRequest, relation.request_id)
+            action = session.get(SpiderRuntimeAction, relation.resubmission_action_id)
+            if (
+                saved is None or action is None
+                or not self._validate_member_resubmission_relation(session, scope, relation, saved)
+            ):
+                return None
+            frontier = max(frontier, action.candidate_ordinal)
+        return frontier
+
+    def _normal_cancel_targets_at_cutoff(
+        self,
+        session: Session,
+        scope: RuntimeScopeKey,
+        runtime: SpiderRuntimeScope,
+        plan: SpiderRuntimePlan,
+        delivery: SpiderRuntimeDelivery,
+        *,
+        product: str,
+        source_alias_id: str,
+    ) -> list[SpiderRuntimeAction] | None:
+        cutoff = session.execute(select(SpiderRuntimeTapeIndex.ordinal).where(
+            SpiderRuntimeTapeIndex.environment == scope.environment,
+            SpiderRuntimeTapeIndex.execution_scope_id == scope.execution_scope_id,
+            SpiderRuntimeTapeIndex.strategy_id == scope.strategy_id,
+            SpiderRuntimeTapeIndex.delivery_sequence == delivery.sequence,
+            SpiderRuntimeTapeIndex.kind == "DELIVERY",
+        )).scalar_one_or_none()
+        if type(cutoff) is not int:
+            return None
+        rows = session.execute(
+            select(SpiderRuntimeAction, SpiderRuntimeBinding)
+            .join(SpiderRuntimeBinding, SpiderRuntimeBinding.action_id == SpiderRuntimeAction.action_id)
+            .where(
+                SpiderRuntimeAction.environment == scope.environment,
+                SpiderRuntimeAction.execution_scope_id == scope.execution_scope_id,
+                SpiderRuntimeAction.strategy_id == scope.strategy_id,
+                SpiderRuntimeAction.plan_id == plan.plan_id,
+                SpiderRuntimeAction.operation == "PLACE",
+                SpiderRuntimeAction.generation == runtime.generation,
+                SpiderRuntimeAction.product_id == product,
+                SpiderRuntimeBinding.source_client_order_id == source_alias_id,
+            )
+        ).all()
+        roots: dict[str, SpiderRuntimeAction] = {}
+        children: dict[str, dict[str, SpiderRuntimeAction]] = {}
+        for action, _binding in rows:
+            if action.parent_action_id is None:
+                if action.trigger_delivery_id is None:
+                    roots[action.action_id] = action
+                else:
+                    source_delivery = session.execute(select(SpiderRuntimeDelivery).where(
+                        SpiderRuntimeDelivery.delivery_id == action.trigger_delivery_id,
+                        SpiderRuntimeDelivery.environment == scope.environment,
+                        SpiderRuntimeDelivery.execution_scope_id == scope.execution_scope_id,
+                        SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                        SpiderRuntimeDelivery.sequence < delivery.sequence,
+                        SpiderRuntimeDelivery.disposition == "CONSUMED",
+                        SpiderRuntimeDelivery.decision_payload.is_not(None),
+                    )).scalar_one_or_none()
+                    if source_delivery is not None:
+                        roots[action.action_id] = action
+                continue
+            relation = session.execute(select(SpiderMemberResubmission).where(
+                SpiderMemberResubmission.environment == scope.environment,
+                SpiderMemberResubmission.execution_scope_id == scope.execution_scope_id,
+                SpiderMemberResubmission.strategy_id == scope.strategy_id,
+                SpiderMemberResubmission.resubmission_action_id == action.action_id,
+                SpiderMemberResubmission.tape_ordinal < cutoff,
+            )).scalar_one_or_none()
+            if relation is None:
+                continue
+            saved = session.get(SpiderMemberResubmissionRequest, relation.request_id)
+            if saved is None or not self._validate_member_resubmission_relation(
+                session, scope, relation, saved
+            ):
+                return None
+            children.setdefault(relation.initial_member_id, {})[action.action_id] = action
+        selected: list[SpiderRuntimeAction] = []
+        for root_id, root in roots.items():
+            related = session.execute(select(SpiderMemberResubmission).where(
+                SpiderMemberResubmission.environment == scope.environment,
+                SpiderMemberResubmission.execution_scope_id == scope.execution_scope_id,
+                SpiderMemberResubmission.strategy_id == scope.strategy_id,
+                SpiderMemberResubmission.initial_member_id == root_id,
+                SpiderMemberResubmission.tape_ordinal < cutoff,
+            ).order_by(SpiderMemberResubmission.tape_ordinal)).scalars().all()
+            latest = root
+            for relation in related:
+                saved = session.get(SpiderMemberResubmissionRequest, relation.request_id)
+                child = session.get(SpiderRuntimeAction, relation.resubmission_action_id)
+                if (
+                    saved is None or child is None
+                    or not self._validate_member_resubmission_relation(session, scope, relation, saved)
+                    or relation.resubmission_action_id not in children.get(root_id, {})
+                ):
+                    return None
+                latest = child
+            selected.append(latest)
+        return sorted(selected, key=lambda action: action.candidate_ordinal)
 
     def _validate_normal_decision_history_step(
         self,
@@ -2913,25 +3325,10 @@ class SpiderRuntimeOwner:
             )
             for row in cast(list[dict[str, object]], source_map["entries"])
         }
-        previous = session.execute(
-            select(SpiderRuntimeDelivery.decision_payload).where(
-                SpiderRuntimeDelivery.environment == scope.environment,
-                SpiderRuntimeDelivery.execution_scope_id == scope.execution_scope_id,
-                SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
-                SpiderRuntimeDelivery.sequence < delivery.sequence,
-                SpiderRuntimeDelivery.decision_payload.is_not(None),
-            ).order_by(SpiderRuntimeDelivery.sequence)
-        ).scalars().all()
-        next_ordinal = _initial_candidate_frontier(plan) + 1
-        for saved in previous:
-            if type(saved) is not bytes:
-                continue
-            prior = decode_canonical(saved)
-            if type(prior) is dict and type(cast(dict[str, object], prior).get("candidates")) is list:
-                for candidate in cast(list[dict[str, object]], cast(dict[str, object], prior)["candidates"]):
-                    value = candidate.get("candidate_ordinal")
-                    if type(value) is int:
-                        next_ordinal = max(next_ordinal, value + 1)
+        frontier = self._normal_candidate_frontier(session, scope, plan, delivery)
+        if frontier is None:
+            return False
+        next_ordinal = frontier + 1
         planned_ids: list[str] = []
         for candidate_value, (event_index, member_index, operation, member) in zip(
             candidates_value, expected_members, strict=True
@@ -2966,22 +3363,16 @@ class SpiderRuntimeOwner:
             )
             target_matches: list[SpiderRuntimeAction] = []
             if classification.needs_cancel_target_lookup:
-                target_matches = list(session.execute(
-                    select(SpiderRuntimeAction).join(
-                        SpiderRuntimeBinding,
-                        SpiderRuntimeBinding.action_id == SpiderRuntimeAction.action_id,
-                    ).where(
-                        SpiderRuntimeAction.environment == scope.environment,
-                        SpiderRuntimeAction.execution_scope_id == scope.execution_scope_id,
-                        SpiderRuntimeAction.strategy_id == scope.strategy_id,
-                        SpiderRuntimeAction.plan_id == plan.plan_id,
-                        SpiderRuntimeAction.operation == "PLACE",
-                        SpiderRuntimeAction.generation == runtime.generation,
-                        SpiderRuntimeAction.product_id == product,
-                        SpiderRuntimeBinding.source_client_order_id
-                        == classification.cancel_alias,
-                    )
-                ).scalars().all())
+                if type(product) is not str or type(classification.cancel_alias) is not str:
+                    return False
+                resolved_targets = self._normal_cancel_targets_at_cutoff(
+                    session, scope, runtime, plan, delivery,
+                    product=product,
+                    source_alias_id=classification.cancel_alias,
+                )
+                if resolved_targets is None:
+                    return False
+                target_matches = resolved_targets
                 classification = classify_source_candidate(
                     operation,
                     member,
@@ -3279,6 +3670,23 @@ class SpiderRuntimeOwner:
         if type(strategy_id) is not str or strategy_id not in self._owned_scopes:
             return None
         scope = self._owned_scopes[strategy_id]
+        if command == "RESUBMIT":
+            if (
+                params.get("environment") != scope.environment
+                or params.get("execution_scope_id") != scope.execution_scope_id
+                or type(params.get("expected_version")) is not int
+                or type(params.get("actor")) is not str
+                or type(params.get("idempotency_key")) is not str
+            ):
+                return self._member_resubmission_result(
+                    scope, "REJECTED", "SPIDER_MEMBER_RESUBMISSION_INVALID"
+                )
+            return self._consume_member_resubmission(
+                scope,
+                cast(str, params["actor"]),
+                cast(str, params["idempotency_key"]),
+                cast(int, params["expected_version"]),
+            )
         if command != "START":
             return CommandResult(False, "Spider operation unavailable", {
                 "reason_code": "SPIDER_OPERATION_UNAVAILABLE"
@@ -3299,6 +3707,781 @@ class SpiderRuntimeOwner:
             cast(str, params["idempotency_key"]),
             cast(int, params["expected_version"]),
         )
+
+    def record_member_resubmission_request(
+        self, canonical_request_bytes: bytes
+    ) -> dict[str, object] | None:
+        """Save one immutable request; this operation has no source or send effects."""
+        try:
+            request = MemberResubmissionRequest.from_canonical_bytes(canonical_request_bytes)
+            scope = self._owned_scopes.get(request.strategy_id)
+            if scope is None or (request.environment, request.execution_scope_id) != (
+                scope.environment, scope.execution_scope_id
+            ):
+                return None
+            with self._sessions() as session:
+                if (
+                    not isinstance(session, Session) or session.in_transaction()
+                    or not session.is_active or session.get_bind().dialect.name != "postgresql"
+                ):
+                    return None
+                with session.begin():
+                    self._configure_writer(session)
+                    runtime = session.execute(
+                        select(SpiderRuntimeScope).where(
+                            SpiderRuntimeScope.environment == scope.environment,
+                            SpiderRuntimeScope.execution_scope_id == scope.execution_scope_id,
+                            SpiderRuntimeScope.strategy_id == scope.strategy_id,
+                        ).with_for_update()
+                    ).scalar_one_or_none()
+                    if runtime is None:
+                        return None
+                    existing = session.execute(
+                        select(SpiderMemberResubmissionRequest).where(
+                            SpiderMemberResubmissionRequest.environment == scope.environment,
+                            SpiderMemberResubmissionRequest.execution_scope_id == scope.execution_scope_id,
+                            SpiderMemberResubmissionRequest.strategy_id == scope.strategy_id,
+                            SpiderMemberResubmissionRequest.actor == request.actor,
+                            SpiderMemberResubmissionRequest.idempotency_key == request.idempotency_key,
+                        ).with_for_update().limit(2)
+                    ).scalars().all()
+                    if existing:
+                        if len(existing) != 1 or existing[0].request_payload != canonical_request_bytes:
+                            return None
+                        return {"request_id": request.request_id, "request_sha256": request.request_sha256}
+                    plan = session.get(SpiderRuntimePlan, request.initial_plan_id)
+                    target = session.get(SpiderRuntimeAction, request.target_action_id)
+                    if (
+                        runtime.initial_plan_id != request.initial_plan_id
+                        or runtime.generation != request.generation
+                        or runtime.configuration_sha256 != request.configuration_sha256
+                        or plan is None or plan.operation_id != runtime.current_operation_id
+                        or target is None or target.plan_id != plan.plan_id
+                        or target.operation != "PLACE"
+                        or (target.environment, target.execution_scope_id, target.strategy_id)
+                        != (scope.environment, scope.execution_scope_id, scope.strategy_id)
+                    ):
+                        return None
+                    session.add(SpiderMemberResubmissionRequest(
+                        request_id=request.request_id,
+                        environment=request.environment,
+                        execution_scope_id=request.execution_scope_id,
+                        strategy_id=request.strategy_id,
+                        actor=request.actor,
+                        idempotency_key=request.idempotency_key,
+                        expected_version=request.expected_version,
+                        generation=request.generation,
+                        configuration_sha256=request.configuration_sha256,
+                        initial_plan_id=request.initial_plan_id,
+                        target_action_id=request.target_action_id,
+                        request_payload=canonical_request_bytes,
+                        request_sha256=request.request_sha256,
+                    ))
+                    session.flush()
+            return {"request_id": request.request_id, "request_sha256": request.request_sha256}
+        except Exception:
+            return None
+
+    def _consume_member_resubmission(
+        self, scope: RuntimeScopeKey, actor: str, idempotency_key: str,
+        expected_version: int,
+    ) -> CommandResult:
+        """Atomically create one explicit child action and restore only its source reply."""
+        request: MemberResubmissionRequest | None = None
+        existing = self._saved_member_resubmission(scope, actor, idempotency_key)
+        if existing is None:
+            return self._member_resubmission_result(scope, "REJECTED", "SPIDER_MEMBER_RESUBMISSION_NOT_FOUND")
+        request = existing
+        proved = self._member_resubmission_readback(scope, request)
+        if proved is not None:
+            return self._member_resubmission_result(
+                scope, cast(str, proved["disposition"]), cast(str, proved["reason_code"]), proved
+            )
+        if (
+            request.expected_version != expected_version
+            or request.actor != actor
+            or request.idempotency_key != idempotency_key
+        ):
+            return self._member_resubmission_result(scope, "REJECTED", "SPIDER_MEMBER_RESUBMISSION_CONFLICT")
+        if self._lifecycle_lock is None or self._order_event_lock is None:
+            return self._member_resubmission_result(scope, "REJECTED", "SPIDER_MEMBER_RESUBMISSION_UNAVAILABLE")
+        try:
+            with self._lifecycle_lock(scope.strategy_id):
+                with self._order_event_lock:
+                    with self._sessions() as session:
+                        if (
+                            not isinstance(session, Session) or session.in_transaction()
+                            or not session.is_active or session.get_bind().dialect.name != "postgresql"
+                        ):
+                            return self._member_resubmission_result(scope, "REJECTED", "SPIDER_SESSION_INVALID")
+                        with session.begin():
+                            self._configure_writer(session)
+                            runtime = session.execute(
+                                select(SpiderRuntimeScope).where(
+                                    SpiderRuntimeScope.environment == scope.environment,
+                                    SpiderRuntimeScope.execution_scope_id == scope.execution_scope_id,
+                                    SpiderRuntimeScope.strategy_id == scope.strategy_id,
+                                ).with_for_update()
+                            ).scalar_one_or_none()
+                            saved = session.execute(
+                                select(SpiderMemberResubmissionRequest).where(
+                                    SpiderMemberResubmissionRequest.request_id == request.request_id,
+                                    SpiderMemberResubmissionRequest.environment == scope.environment,
+                                    SpiderMemberResubmissionRequest.execution_scope_id == scope.execution_scope_id,
+                                    SpiderMemberResubmissionRequest.strategy_id == scope.strategy_id,
+                                ).with_for_update()
+                            ).scalar_one_or_none()
+                            if runtime is None or saved is None or saved.request_payload != request.canonical_request_bytes:
+                                return self._member_resubmission_result(scope, "REJECTED", "SPIDER_MEMBER_RESUBMISSION_NOT_FOUND")
+                            prior = session.get(SpiderMemberResubmission, request.request_id)
+                            if prior is not None:
+                                raise RuntimeError("SPIDER_MEMBER_RESUBMISSION_ALREADY_RECORDED")
+                            else:
+                                if (
+                                    runtime.control_mode != "RUN"
+                                    or runtime.state_version != request.expected_version
+                                    or runtime.generation != request.generation
+                                    or runtime.configuration_sha256 != request.configuration_sha256
+                                    or runtime.initial_plan_id != request.initial_plan_id
+                                    or runtime.last_tape_sequence >= 2**63 - 1
+                                ):
+                                    return self._member_resubmission_result(scope, "REJECTED", "SPIDER_MEMBER_RESUBMISSION_STALE")
+                                if runtime.last_received_sequence != runtime.last_consumed_sequence:
+                                    return self._member_resubmission_result(
+                                        scope,
+                                        "REJECTED",
+                                        "SPIDER_MEMBER_RESUBMISSION_NOT_ELIGIBLE",
+                                    )
+                                head = session.execute(
+                                    select(SpiderRuntimeOperation).where(
+                                        SpiderRuntimeOperation.operation_id == runtime.current_operation_id,
+                                        SpiderRuntimeOperation.environment == scope.environment,
+                                        SpiderRuntimeOperation.execution_scope_id == scope.execution_scope_id,
+                                        SpiderRuntimeOperation.strategy_id == scope.strategy_id,
+                                    ).with_for_update()
+                                ).scalar_one_or_none()
+                                plan = session.execute(
+                                    select(SpiderRuntimePlan).where(
+                                        SpiderRuntimePlan.plan_id == runtime.initial_plan_id,
+                                        SpiderRuntimePlan.operation_id == runtime.current_operation_id,
+                                    ).with_for_update()
+                                ).scalar_one_or_none()
+                                target = session.get(SpiderRuntimeAction, request.target_action_id)
+                                if (
+                                    head is None or head.phase != "INCOMPLETE" or plan is None
+                                    or plan.plan_status != "INCOMPLETE" or target is None
+                                    or plan.generation != runtime.generation
+                                    or plan.configuration_sha256 != runtime.configuration_sha256
+                                    or request.target_action_id != saved.target_action_id
+                                    or not validate_tape_index(session, runtime)
+                                ):
+                                    return self._member_resubmission_result(scope, "REJECTED", "SPIDER_MEMBER_RESUBMISSION_UNAVAILABLE")
+                                missing = self._refresh_initial_place_projection(
+                                    session, scope, runtime, plan, persist=False
+                                )
+                                if missing is None:
+                                    return self._member_resubmission_result(scope, "REJECTED", "SPIDER_MEMBER_RESUBMISSION_UNAVAILABLE")
+                                row = next((item for item in missing
+                                            if item.get("current_frontier_action_id") == target.action_id), None)
+                                if (
+                                    row is None
+                                    or row.get("last_outcome") not in {"REJECTED", "UNSENT"}
+                                    or row.get("resubmit_eligible") is not True
+                                    or (
+                                        row.get("last_outcome") == "UNSENT"
+                                        and row.get("latest_resubmission_request_id") is not None
+                                    )
+                                ):
+                                    return self._member_resubmission_result(scope, "REJECTED", "SPIDER_MEMBER_RESUBMISSION_NOT_ELIGIBLE")
+                                if row.get("last_outcome") == "REJECTED" and row.get("rejection_reason") not in {"51000", "51008"}:
+                                    return self._member_resubmission_result(scope, "REJECTED", "SPIDER_MEMBER_RESUBMISSION_NOT_ELIGIBLE")
+                                if target.outcome_state != row.get("last_outcome") or target.outcome_state == "SEND_UNKNOWN":
+                                    return self._member_resubmission_result(scope, "REJECTED", "SPIDER_MEMBER_RESUBMISSION_NOT_ELIGIBLE")
+                                root_id = cast(str, row["initial_member_id"])
+                                root = session.get(SpiderRuntimeAction, root_id)
+                                root_binding = session.get(SpiderRuntimeBinding, root_id)
+                                root_order = None if root is None else session.get(Order, root.local_order_id)
+                                if (
+                                    root is None or root_binding is None or root_order is None
+                                    or root.trigger_delivery_id is not None or root.parent_action_id is not None
+                                    or root.operation != "PLACE" or root.plan_id != plan.plan_id
+                                ):
+                                    return self._member_resubmission_result(scope, "REJECTED", "SPIDER_MEMBER_RESUBMISSION_UNAVAILABLE")
+                                original = decode_canonical(bytes(root.original_payload))
+                                if type(original) is not dict:
+                                    return self._member_resubmission_result(scope, "REJECTED", "SPIDER_MEMBER_RESUBMISSION_UNAVAILABLE")
+                                source_order = cast(dict[str, object], original)
+                                frontier = _initial_candidate_frontier(plan)
+                                action_frontier = session.execute(
+                                    select(func.max(SpiderRuntimeAction.candidate_ordinal)).where(
+                                        SpiderRuntimeAction.plan_id == plan.plan_id
+                                    )
+                                ).scalar_one_or_none()
+                                if type(action_frontier) is int:
+                                    frontier = max(frontier, action_frontier)
+                                previous_decisions = session.execute(
+                                    select(SpiderRuntimeDelivery.decision_payload).where(
+                                        SpiderRuntimeDelivery.environment == scope.environment,
+                                        SpiderRuntimeDelivery.execution_scope_id == scope.execution_scope_id,
+                                        SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
+                                        SpiderRuntimeDelivery.decision_payload.is_not(None),
+                                    ).order_by(SpiderRuntimeDelivery.sequence)
+                                ).scalars().all()
+                                for saved_decision in previous_decisions:
+                                    if type(saved_decision) is not bytes:
+                                        continue
+                                    decoded = decode_canonical(saved_decision)
+                                    if type(decoded) is dict and type(cast(dict[str, object], decoded).get("candidates")) is list:
+                                        for candidate in cast(list[dict[str, object]], cast(dict[str, object], decoded)["candidates"]):
+                                            if type(candidate.get("candidate_ordinal")) is int:
+                                                frontier = max(frontier, cast(int, candidate["candidate_ordinal"]))
+                                action_id = _digest({
+                                    "domain": "SPIDER_MEMBER_RESUBMISSION_ACTION_V1",
+                                    "scope": _scope(scope),
+                                    "control_receipt_id": member_control_receipt_id(request),
+                                    "candidate_ordinal": 0,
+                                })
+                                if session.get(SpiderRuntimeAction, action_id) is not None:
+                                    return self._member_resubmission_result(scope, "UNKNOWN", "SPIDER_MEMBER_RESUBMISSION_READBACK_UNKNOWN")
+                                candidate_ordinal = frontier + 1
+                                source_product = root_binding.source_product_id
+                                local_product = root_binding.canonical_product_id
+                                side = cast(str, source_order["side"])
+                                price = _positive_decimal(source_order["px"])
+                                quantity = _positive_decimal(source_order["sz"])
+                                order_side = OrderSide.BUY if side == "buy" else OrderSide.SELL
+                                position_side = SignalType.LONG if side == "buy" else SignalType.SHORT
+                                timestamp = root_order.timestamp
+                                local_client_id = market_signal_client_order_id(
+                                    scope.strategy_id, local_product, runtime.current_operation_id,
+                                    timestamp, "spiderresubmit", candidate_ordinal,
+                                )
+                                order = self._order_manager.prepare_order(
+                                    Signal(
+                                        strategy_id=scope.strategy_id, product_id=local_product,
+                                        timeframe="SPIDER_MEMBER_RESUBMISSION", timestamp=timestamp,
+                                        type=position_side, quantity=quantity, price=price,
+                                    ),
+                                    order_side, "limit", quantity, price=price,
+                                    client_order_id=local_client_id,
+                                )
+                                order.account_profile = root_order.account_profile
+                                order.account_id = root_order.account_id
+                                order.id = str(uuid5(
+                                    NAMESPACE_URL, "SPIDER_MEMBER_RESUBMISSION_ORDER_V1\0" + action_id
+                                ))
+                                binding_value = {
+                                    "schema_version": "SPIDER_OKX_CLIENT_BINDING_V1",
+                                    "environment": scope.environment,
+                                    "execution_scope_id": scope.execution_scope_id,
+                                    "strategy_id": scope.strategy_id,
+                                    "action_id": action_id,
+                                    "product_id": local_product,
+                                }
+                                binding_bytes = canonical_bytes(binding_value)
+                                wire_client_id = "sp" + sha256(
+                                    b"SPIDER_OKX_CLIENT_BINDING_V1\0" + binding_bytes
+                                ).hexdigest()[:30]
+                                order.intent_payload = {
+                                    "action_id": action_id,
+                                    "source_order": source_order,
+                                    "source_client_order_id": root_binding.source_client_order_id,
+                                    "local_client_order_id": local_client_id,
+                                    "provider_wire_client_order_id": wire_client_id,
+                                    "provider_binding_bytes_hex": binding_bytes.hex(),
+                                    "provider_binding_sha256": _digest_bytes(binding_bytes),
+                                }
+                                repository = self._order_manager.repo
+                                if not isinstance(repository, LiveOrderRepository):
+                                    return self._member_resubmission_result(scope, "REJECTED", "SPIDER_CALLBACK_REPOSITORY_UNAVAILABLE")
+                                repository.stage_order_in_transaction(session, order)
+                                action = SpiderRuntimeAction(
+                                    action_id=action_id, plan_id=plan.plan_id,
+                                    environment=scope.environment, execution_scope_id=scope.execution_scope_id,
+                                    strategy_id=scope.strategy_id, trigger_delivery_id=None,
+                                    parent_action_id=target.action_id, operation="PLACE",
+                                    generation=runtime.generation,
+                                    configuration_sha256=runtime.configuration_sha256,
+                                    role="GRID", product_id=source_product, local_order_id=order.id,
+                                    original_payload=root.original_payload,
+                                    payload_sha256=root.payload_sha256,
+                                    candidate_ordinal=candidate_ordinal,
+                                    transmission_group=candidate_ordinal, transmission_ordinal=0,
+                                    outcome_state="UNSENT", outcome_reference=None,
+                                )
+                                binding = SpiderRuntimeBinding(
+                                    action_id=action_id, environment=scope.environment,
+                                    execution_scope_id=scope.execution_scope_id,
+                                    strategy_id=scope.strategy_id, local_order_id=order.id,
+                                    source_product_id=source_product,
+                                    canonical_product_id=local_product,
+                                    source_client_order_id=root_binding.source_client_order_id,
+                                    product_map_sha256=root_binding.product_map_sha256,
+                                )
+                                after_checkpoint = self._resubmission_checkpoint(
+                                    bytes(runtime.source_checkpoint), scope, runtime, plan,
+                                    root, root_binding,
+                                )
+                                tape_ordinal = runtime.last_tape_sequence + 1
+                                relation = SpiderMemberResubmission(
+                                    request_id=request.request_id,
+                                    control_receipt_id=member_control_receipt_id(request),
+                                    environment=scope.environment,
+                                    execution_scope_id=scope.execution_scope_id,
+                                    strategy_id=scope.strategy_id,
+                                    generation=runtime.generation,
+                                    configuration_sha256=runtime.configuration_sha256,
+                                    initial_plan_id=plan.plan_id,
+                                    initial_member_id=root.action_id,
+                                    target_action_id=target.action_id,
+                                    resubmission_action_id=action_id,
+                                    tape_ordinal=tape_ordinal,
+                                    before_checkpoint_sha256=runtime.source_checkpoint_sha256,
+                                    after_checkpoint_sha256=_digest_bytes(after_checkpoint),
+                                )
+                                session.add_all((action, binding))
+                                session.flush()
+                                session.add(relation)
+                                session.add(SpiderRuntimeTapeIndex(
+                                    environment=scope.environment,
+                                    execution_scope_id=scope.execution_scope_id,
+                                    strategy_id=scope.strategy_id, ordinal=tape_ordinal,
+                                    kind="RESUBMIT", delivery_sequence=None,
+                                    transmission_group_id=None,
+                                    member_resubmission_request_id=request.request_id,
+                                ))
+                                runtime.last_tape_sequence = tape_ordinal
+                                runtime.source_checkpoint = after_checkpoint
+                                runtime.source_checkpoint_sha256 = _digest_bytes(after_checkpoint)
+                                session.flush()
+                                if self._refresh_initial_place_projection(
+                                    session, scope, runtime, plan, persist=True
+                                ) is None:
+                                    raise RuntimeError("SPIDER_MEMBER_RESUBMISSION_PROJECTION_UNAVAILABLE")
+                            # The commit boundary has passed; independent cold proof below.
+            proof = self._member_resubmission_readback(scope, request)
+            if proof is None:
+                return self._member_resubmission_result(
+                    scope, "UNKNOWN", "SPIDER_MEMBER_RESUBMISSION_READBACK_UNKNOWN"
+                )
+            return self._member_resubmission_result(
+                scope, cast(str, proof["disposition"]),
+                "SPIDER_MEMBER_RESUBMISSION_PLANNED", proof,
+            )
+        except Exception:
+            proof = self._member_resubmission_readback(scope, request)
+            if proof is not None:
+                return self._member_resubmission_result(
+                    scope, cast(str, proof["disposition"]), cast(str, proof["reason_code"]), proof
+                )
+            return self._member_resubmission_result(scope, "UNKNOWN", "SPIDER_MEMBER_RESUBMISSION_UNAVAILABLE")
+
+    @staticmethod
+    def _member_resubmission_result(
+        scope: RuntimeScopeKey, disposition: str, reason: str,
+        readback: dict[str, object] | None = None,
+    ) -> CommandResult:
+        command_disposition = (
+            "ACCEPTED" if readback is not None
+            else "REJECTED" if disposition == "REJECTED"
+            else "UNKNOWN"
+        )
+        runtime = (
+            None if readback is None or type(readback.get("runtime")) is not dict
+            else cast(dict[str, object], readback["runtime"])
+        )
+        return CommandResult(
+            success=command_disposition == "ACCEPTED",
+            message=reason,
+            data={
+                "schema_version": "spider_management_command_result_v1",
+                "scope": _scope(scope), "command": "RESUBMIT",
+                "disposition": command_disposition,
+                "operation_id": None if runtime is None else runtime.get("operation_id"),
+                "phase": None if runtime is None else runtime.get("phase"),
+                "reason_code": reason,
+                "readback": runtime,
+            },
+            completed=command_disposition == "REJECTED",
+        )
+
+    def _saved_member_resubmission(
+        self, scope: RuntimeScopeKey, actor: str, idempotency_key: str
+    ) -> MemberResubmissionRequest | None:
+        try:
+            with self._sessions() as session:
+                if not isinstance(session, Session) or session.in_transaction() or not session.is_active:
+                    return None
+                row = session.execute(select(SpiderMemberResubmissionRequest).where(
+                    SpiderMemberResubmissionRequest.environment == scope.environment,
+                    SpiderMemberResubmissionRequest.execution_scope_id == scope.execution_scope_id,
+                    SpiderMemberResubmissionRequest.strategy_id == scope.strategy_id,
+                    SpiderMemberResubmissionRequest.actor == actor,
+                    SpiderMemberResubmissionRequest.idempotency_key == idempotency_key,
+                )).scalar_one_or_none()
+                if row is None or type(row.request_payload) is not bytes or row.request_sha256 != _digest_bytes(row.request_payload):
+                    return None
+                request = MemberResubmissionRequest.from_canonical_bytes(row.request_payload)
+                if request.request_id != row.request_id:
+                    return None
+                return request
+        except Exception:
+            return None
+
+    def _member_resubmission_readback(
+        self, scope: RuntimeScopeKey, request: MemberResubmissionRequest
+    ) -> dict[str, object] | None:
+        runtime = self.readback(scope, self._current_operation_id(scope) or "")
+        if runtime is None:
+            return None
+        try:
+            with self._sessions() as session:
+                if not isinstance(session, Session) or session.in_transaction() or not session.is_active:
+                    return None
+                with session.begin():
+                    session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY"))
+                    relation = session.get(SpiderMemberResubmission, request.request_id)
+                    saved = session.get(SpiderMemberResubmissionRequest, request.request_id)
+                    if relation is None or saved is None or saved.request_payload != request.canonical_request_bytes:
+                        return None
+                    if not self._validate_member_resubmission_relation(session, scope, relation, saved):
+                        return None
+                    action = session.get(SpiderRuntimeAction, relation.resubmission_action_id)
+                    order = None if action is None else session.get(Order, action.local_order_id)
+                    if action is None or order is None:
+                        return None
+                    disposition = "PLANNED" if action.outcome_state == "UNSENT" else action.outcome_state
+                    reason_code: str | None = None
+                    if action.outcome_reference is not None:
+                        transmission = session.get(
+                            SpiderRuntimeTransmission, action.outcome_reference
+                        )
+                        if transmission is not None:
+                            reason_code = transmission.response_failure
+                            if transmission.response_payload is not None:
+                                classified = self._validated_transport_outcomes(
+                                    bytes(transmission.request_payload),
+                                    bytes(transmission.response_payload),
+                                )
+                                outcome = None if classified is None else classified.get(action.action_id)
+                                reason_code = None if outcome is None else outcome[1]
+                    return {
+                        "schema_version": "spider_member_resubmission_readback_v1",
+                        "request_id": request.request_id,
+                        "scope": _scope(scope), "actor": request.actor,
+                        "idempotency_key": request.idempotency_key,
+                        "generation": relation.generation,
+                        "configuration_sha256": relation.configuration_sha256,
+                        "initial_plan_id": relation.initial_plan_id,
+                        "initial_member_id": relation.initial_member_id,
+                        "target_action_id": relation.target_action_id,
+                        "resubmission_action_id": relation.resubmission_action_id,
+                        "local_order_id": order.id,
+                        "provider_order_id": order.exchange_order_id,
+                        "original_payload_sha256": action.payload_sha256,
+                        "disposition": disposition,
+                        "reason_code": reason_code,
+                        "runtime": runtime,
+                    }
+        except Exception:
+            return None
+
+    def member_resubmission_readback(
+        self, canonical_request_bytes: bytes
+    ) -> dict[str, object] | None:
+        """Observe a saved intent without requiring an attempt or ready runtime."""
+        try:
+            request = MemberResubmissionRequest.from_canonical_bytes(canonical_request_bytes)
+            scope = self._owned_scopes.get(request.strategy_id)
+            if scope is None or (request.environment, request.execution_scope_id) != (
+                scope.environment, scope.execution_scope_id
+            ):
+                return None
+            with self._sessions() as session:
+                if (
+                    not isinstance(session, Session) or session.in_transaction()
+                    or not session.is_active or session.get_bind().dialect.name != "postgresql"
+                ):
+                    return None
+                with session.begin():
+                    session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY"))
+                    saved = session.get(SpiderMemberResubmissionRequest, request.request_id)
+                    if (
+                        saved is None or saved.request_payload != canonical_request_bytes
+                        or saved.request_sha256 != _digest_bytes(canonical_request_bytes)
+                        or (saved.environment, saved.execution_scope_id, saved.strategy_id)
+                        != (scope.environment, scope.execution_scope_id, scope.strategy_id)
+                        or saved.actor != request.actor
+                        or saved.idempotency_key != request.idempotency_key
+                        or saved.expected_version != request.expected_version
+                        or saved.generation != request.generation
+                        or saved.configuration_sha256 != request.configuration_sha256
+                        or saved.initial_plan_id != request.initial_plan_id
+                        or saved.target_action_id != request.target_action_id
+                    ):
+                        return None
+                    plan = session.get(SpiderRuntimePlan, request.initial_plan_id)
+                    target = session.get(SpiderRuntimeAction, request.target_action_id)
+                    if (
+                        plan is None or target is None
+                        or plan.generation != request.generation
+                        or plan.configuration_sha256 != request.configuration_sha256
+                        or target.plan_id != plan.plan_id or target.operation != "PLACE"
+                        or (target.environment, target.execution_scope_id, target.strategy_id)
+                        != (scope.environment, scope.execution_scope_id, scope.strategy_id)
+                    ):
+                        return None
+                    target_relation = session.execute(
+                        select(SpiderMemberResubmission).where(
+                            SpiderMemberResubmission.resubmission_action_id == target.action_id,
+                            SpiderMemberResubmission.environment == scope.environment,
+                            SpiderMemberResubmission.execution_scope_id == scope.execution_scope_id,
+                            SpiderMemberResubmission.strategy_id == scope.strategy_id,
+                        ).limit(2)
+                    ).scalars().all()
+                    if len(target_relation) > 1:
+                        return None
+                    if target_relation:
+                        lineage = target_relation[0]
+                        lineage_request = session.get(
+                            SpiderMemberResubmissionRequest, lineage.request_id
+                        )
+                        if (
+                            lineage_request is None
+                            or not self._validate_member_resubmission_relation(
+                                session, scope, lineage, lineage_request
+                            )
+                        ):
+                            return None
+                        root_id = lineage.initial_member_id
+                    elif target.parent_action_id is None and target.trigger_delivery_id is None:
+                        root_id = target.action_id
+                    else:
+                        return None
+                    root = session.get(SpiderRuntimeAction, root_id)
+                    if root is None or root.plan_id != plan.plan_id:
+                        return None
+                    roots = session.execute(
+                        select(SpiderRuntimeAction, SpiderRuntimeBinding, Order)
+                        .join(SpiderRuntimeBinding, SpiderRuntimeBinding.action_id == SpiderRuntimeAction.action_id)
+                        .join(Order, Order.id == SpiderRuntimeAction.local_order_id)
+                        .where(
+                            SpiderRuntimeAction.plan_id == plan.plan_id,
+                            SpiderRuntimeAction.operation == "PLACE",
+                            SpiderRuntimeAction.trigger_delivery_id.is_(None),
+                            SpiderRuntimeAction.parent_action_id.is_(None),
+                            ~SpiderRuntimeAction.action_id.in_(
+                                select(SpiderMemberResubmission.resubmission_action_id).where(
+                                    SpiderMemberResubmission.environment == scope.environment,
+                                    SpiderMemberResubmission.execution_scope_id == scope.execution_scope_id,
+                                    SpiderMemberResubmission.strategy_id == scope.strategy_id,
+                                )
+                            ),
+                        ).order_by(SpiderRuntimeAction.candidate_ordinal)
+                    ).all()
+                    root_rows = cast(
+                        list[tuple[SpiderRuntimeAction, SpiderRuntimeBinding, Order]], list(roots)
+                    )
+                    if (
+                        root.action_id != root_id or root.operation != "PLACE"
+                        or root.parent_action_id is not None or root.trigger_delivery_id is not None
+                        or not any(row[0].action_id == root_id for row in root_rows)
+                        or not self._validate_initial_install_roots(
+                            session, scope, plan, root_rows
+                        )
+                    ):
+                        return None
+                    relation = session.get(SpiderMemberResubmission, request.request_id)
+                    if relation is not None and not self._validate_member_resubmission_relation(
+                        session, scope, relation, saved
+                    ):
+                        return None
+                    original_payload_sha256 = root.payload_sha256
+                    initial_member_id = root.action_id
+                    runtime_operation_id = plan.operation_id
+            if relation is not None:
+                # Committed action evidence stays on the shared cold-proof path.
+                return self._member_resubmission_readback(scope, request)
+            runtime = (
+                None if runtime_operation_id is None
+                else self.readback(scope, runtime_operation_id)
+            )
+            return {
+                "schema_version": "spider_member_resubmission_readback_v1",
+                "request_id": request.request_id,
+                "scope": _scope(scope),
+                "actor": request.actor,
+                "idempotency_key": request.idempotency_key,
+                "generation": request.generation,
+                "configuration_sha256": request.configuration_sha256,
+                "initial_plan_id": request.initial_plan_id,
+                "initial_member_id": initial_member_id,
+                "target_action_id": request.target_action_id,
+                "resubmission_action_id": None,
+                "local_order_id": None,
+                "provider_order_id": None,
+                "original_payload_sha256": original_payload_sha256,
+                "disposition": "RECORDED",
+                "reason_code": None,
+                "runtime": runtime,
+            }
+        except Exception:
+            return None
+
+    def _resubmission_checkpoint(
+        self, checkpoint: bytes, scope: RuntimeScopeKey,
+        runtime: SpiderRuntimeScope, plan: SpiderRuntimePlan,
+        root: SpiderRuntimeAction, binding: SpiderRuntimeBinding,
+    ) -> bytes:
+        manifest = cast(dict[str, object], decode_canonical(bytes(plan.manifest_payload)))
+        products = cast(dict[str, object], manifest["source_product_map"])
+        initial_manifest = cast(dict[str, object], manifest["initial_manifest"])
+        provenance = cast(
+            dict[str, object], initial_manifest["historical_provenance"]
+        )
+        ordered_products = tuple(cast(list[str], products["ordered_products"]))
+        source_order = cast(dict[str, object], decode_canonical(bytes(root.original_payload)))
+        policy = restore_source_checkpoint(
+            checkpoint,
+            ordered_products=ordered_products,
+            policy_id=ORIGINAL_MODEL_POLICY_ID,
+            policy_version=ORIGINAL_MODEL_POLICY_VERSION,
+            policy_source_sha256=ORIGINAL_MODEL_POLICY_SOURCE_SHA256,
+            source_sha256=cast(str, provenance["source_sha256"]),
+            confirmation_request_id=runtime.confirmation_request_id,
+            configuration_sha256=runtime.configuration_sha256,
+            generation=runtime.generation,
+        )
+        policy.replies[binding.source_client_order_id] = {
+            "instId": binding.source_product_id,
+            "side": source_order["side"],
+            "px": source_order["px"],
+            "sz": source_order["sz"],
+            "clOrdId": binding.source_client_order_id,
+            "state": "new",
+        }
+        return encode_source_checkpoint(
+            policy,
+            ordered_products=ordered_products,
+            policy_id=ORIGINAL_MODEL_POLICY_ID,
+            policy_version=ORIGINAL_MODEL_POLICY_VERSION,
+            policy_source_sha256=ORIGINAL_MODEL_POLICY_SOURCE_SHA256,
+            source_sha256=cast(str, provenance["source_sha256"]),
+            confirmation_request_id=runtime.confirmation_request_id,
+            configuration_sha256=runtime.configuration_sha256,
+            generation=runtime.generation,
+        )
+
+    def _validate_member_resubmission_relation(
+        self, session: Session, scope: RuntimeScopeKey,
+        relation: SpiderMemberResubmission,
+        saved: SpiderMemberResubmissionRequest,
+    ) -> bool:
+        try:
+            request = MemberResubmissionRequest.from_canonical_bytes(saved.request_payload)
+            if (
+                saved.request_sha256 != request.request_sha256
+                or relation.request_id != request.request_id
+                or relation.control_receipt_id != member_control_receipt_id(request)
+                or (relation.environment, relation.execution_scope_id, relation.strategy_id)
+                != (scope.environment, scope.execution_scope_id, scope.strategy_id)
+                or relation.generation != request.generation
+                or relation.configuration_sha256 != request.configuration_sha256
+                or relation.initial_plan_id != request.initial_plan_id
+                or relation.target_action_id != request.target_action_id
+                or saved.environment != request.environment
+                or saved.execution_scope_id != request.execution_scope_id
+                or saved.strategy_id != request.strategy_id
+                or saved.actor != request.actor
+                or saved.idempotency_key != request.idempotency_key
+                or saved.expected_version != request.expected_version
+                or saved.generation != request.generation
+                or saved.configuration_sha256 != request.configuration_sha256
+                or saved.initial_plan_id != request.initial_plan_id
+                or saved.target_action_id != request.target_action_id
+            ):
+                return False
+            runtime = session.execute(select(SpiderRuntimeScope).where(
+                SpiderRuntimeScope.environment == scope.environment,
+                SpiderRuntimeScope.execution_scope_id == scope.execution_scope_id,
+                SpiderRuntimeScope.strategy_id == scope.strategy_id,
+            )).scalar_one_or_none()
+            plan = session.get(SpiderRuntimePlan, relation.initial_plan_id)
+            root = session.get(SpiderRuntimeAction, relation.initial_member_id)
+            target = session.get(SpiderRuntimeAction, relation.target_action_id)
+            action = session.get(SpiderRuntimeAction, relation.resubmission_action_id)
+            root_binding = None if root is None else session.get(SpiderRuntimeBinding, root.action_id)
+            binding = None if action is None else session.get(SpiderRuntimeBinding, action.action_id)
+            order = None if action is None else session.get(Order, action.local_order_id)
+            root_order = None if root is None else session.get(Order, root.local_order_id)
+            tape = session.execute(select(SpiderRuntimeTapeIndex).where(
+                SpiderRuntimeTapeIndex.environment == scope.environment,
+                SpiderRuntimeTapeIndex.execution_scope_id == scope.execution_scope_id,
+                SpiderRuntimeTapeIndex.strategy_id == scope.strategy_id,
+                SpiderRuntimeTapeIndex.ordinal == relation.tape_ordinal,
+            )).scalar_one_or_none()
+            receipt_target = session.execute(select(SpiderMemberResubmission).where(
+                SpiderMemberResubmission.resubmission_action_id == relation.target_action_id,
+                SpiderMemberResubmission.request_id != relation.request_id,
+            )).scalar_one_or_none()
+            if root is None or target is None or action is None or root_binding is None or binding is None or order is None or root_order is None or runtime is None or plan is None:
+                return False
+            expected_root = target.action_id if receipt_target is None else receipt_target.initial_member_id
+            original = decode_canonical(bytes(root.original_payload))
+            intent = order.intent_payload
+            if type(original) is not dict or type(intent) is not dict:
+                return False
+            expected_action = _digest({
+                "domain": "SPIDER_MEMBER_RESUBMISSION_ACTION_V1",
+                "scope": _scope(scope),
+                "control_receipt_id": relation.control_receipt_id,
+                "candidate_ordinal": 0,
+            })
+            return bool(
+                expected_root == root.action_id
+                and root.operation == "PLACE" and root.parent_action_id is None
+                and root.trigger_delivery_id is None and root.plan_id == plan.plan_id
+                and target.operation == "PLACE" and target.plan_id == plan.plan_id
+                and target.generation == runtime.generation
+                and relation.generation == runtime.generation
+                and relation.configuration_sha256 == runtime.configuration_sha256
+                and plan.generation == runtime.generation
+                and plan.configuration_sha256 == runtime.configuration_sha256
+                and action.action_id == expected_action
+                and action.operation == "PLACE" and action.trigger_delivery_id is None
+                and action.parent_action_id == target.action_id
+                and action.plan_id == plan.plan_id and action.generation == runtime.generation
+                and action.configuration_sha256 == runtime.configuration_sha256
+                and action.original_payload == root.original_payload
+                and action.payload_sha256 == root.payload_sha256 == _digest_bytes(root.original_payload)
+                and action.candidate_ordinal > _initial_candidate_frontier(plan)
+                and action.transmission_group == action.candidate_ordinal
+                and action.transmission_ordinal == 0
+                and binding.action_id == action.action_id and binding.local_order_id == order.id
+                and binding.source_product_id == root_binding.source_product_id
+                and binding.canonical_product_id == root_binding.canonical_product_id
+                and binding.source_client_order_id == root_binding.source_client_order_id
+                and binding.product_map_sha256 == root_binding.product_map_sha256
+                and order.id == action.local_order_id
+                and order.product_id == root_binding.canonical_product_id
+                and order.side == original.get("side")
+                and order.type == "limit" and order.price == _positive_decimal(original.get("px"))
+                and order.quantity == _positive_decimal(original.get("sz"))
+                and intent.get("action_id") == action.action_id
+                and intent.get("source_order") == original
+                and intent.get("source_client_order_id") == root_binding.source_client_order_id
+                and order.client_order_id == intent.get("local_client_order_id")
+                and order.client_order_id != root_order.client_order_id
+                and prove_spider_order_wire_binding(
+                    scope.environment, scope.execution_scope_id, scope.strategy_id,
+                    action, binding, order,
+                ) is not None
+                and tape is not None and tape.kind == "RESUBMIT"
+                and tape.member_resubmission_request_id == request.request_id
+                and tape.delivery_sequence is None and tape.transmission_group_id is None
+            )
+        except (MemberResubmissionError, InvalidOperation, KeyError, TypeError, ValueError, UnicodeDecodeError):
+            return False
 
     def stop(self, scope: RuntimeScopeKey, message: object) -> CommandResult:
         """Commit one scoped STOP receipt and projection in the caller-owned PG TX."""
@@ -3853,8 +5036,8 @@ class SpiderRuntimeOwner:
                         },
                         "last_outcome": "UNSENT",
                         "rejection_reason": None,
-                        "resubmit_eligible": False,
-                        "ineligible_reason": "PROVIDER_PROFILE_UNAVAILABLE",
+                        "resubmit_eligible": True,
+                        "ineligible_reason": None,
                         "latest_resubmission_request_id": None,
                     })
         if not action_rows or len(action_rows) != len(binding_rows):
@@ -3951,6 +5134,13 @@ class SpiderRuntimeOwner:
                             SpiderRuntimeAction.plan_id == plan.plan_id,
                             SpiderRuntimeAction.operation == "PLACE",
                             SpiderRuntimeAction.trigger_delivery_id.is_(None),
+                            ~SpiderRuntimeAction.action_id.in_(
+                                select(SpiderMemberResubmission.resubmission_action_id).where(
+                                    SpiderMemberResubmission.environment == scope.environment,
+                                    SpiderMemberResubmission.execution_scope_id == scope.execution_scope_id,
+                                    SpiderMemberResubmission.strategy_id == scope.strategy_id,
+                                )
+                            ),
                         )
                     ).scalars().all())
                     all_place_order_ids = set(session.execute(
@@ -4039,6 +5229,13 @@ class SpiderRuntimeOwner:
                             SpiderRuntimeAction.plan_id == plan.plan_id,
                             SpiderRuntimeAction.operation == "PLACE",
                             SpiderRuntimeAction.trigger_delivery_id.is_(None),
+                            ~SpiderRuntimeAction.action_id.in_(
+                                select(SpiderMemberResubmission.resubmission_action_id).where(
+                                    SpiderMemberResubmission.environment == scope.environment,
+                                    SpiderMemberResubmission.execution_scope_id == scope.execution_scope_id,
+                                    SpiderMemberResubmission.strategy_id == scope.strategy_id,
+                                )
+                            ),
                         )
                         .order_by(SpiderRuntimeAction.candidate_ordinal)
                     ).all()
@@ -4104,6 +5301,13 @@ class SpiderRuntimeOwner:
                 SpiderRuntimeAction.plan_id == plan.plan_id,
                 SpiderRuntimeAction.operation == "PLACE",
                 SpiderRuntimeAction.trigger_delivery_id.is_(None),
+                ~SpiderRuntimeAction.action_id.in_(
+                    select(SpiderMemberResubmission.resubmission_action_id).where(
+                        SpiderMemberResubmission.environment == scope.environment,
+                        SpiderMemberResubmission.execution_scope_id == scope.execution_scope_id,
+                        SpiderMemberResubmission.strategy_id == scope.strategy_id,
+                    )
+                ),
             )
             .order_by(SpiderRuntimeAction.candidate_ordinal)
         ).all()
@@ -4124,16 +5328,43 @@ class SpiderRuntimeOwner:
                     for action, binding, order in identity_rows
                 ]
             else:
-                derived = session.execute(
-                    select(SpiderRuntimeAction.action_id).where(
-                        SpiderRuntimeAction.plan_id == plan.plan_id,
-                        SpiderRuntimeAction.operation == "PLACE",
-                        SpiderRuntimeAction.trigger_delivery_id.is_not(None),
-                        SpiderRuntimeAction.local_order_id == current_order.id,
-                    )
-                ).scalar_one_or_none()
-                if derived is None:
-                    return None
+                callback_action = session.execute(select(SpiderRuntimeAction.action_id).where(
+                    SpiderRuntimeAction.environment == scope.environment,
+                    SpiderRuntimeAction.execution_scope_id == scope.execution_scope_id,
+                    SpiderRuntimeAction.strategy_id == scope.strategy_id,
+                    SpiderRuntimeAction.plan_id == plan.plan_id,
+                    SpiderRuntimeAction.operation == "PLACE",
+                    SpiderRuntimeAction.trigger_delivery_id.is_not(None),
+                    SpiderRuntimeAction.parent_action_id.is_(None),
+                    SpiderRuntimeAction.local_order_id == current_order.id,
+                )).scalar_one_or_none()
+                if callback_action is None:
+                    relation, saved, action = session.execute(
+                        select(SpiderMemberResubmission, SpiderMemberResubmissionRequest, SpiderRuntimeAction)
+                        .join(
+                            SpiderMemberResubmissionRequest,
+                            SpiderMemberResubmissionRequest.request_id == SpiderMemberResubmission.request_id,
+                        )
+                        .join(
+                            SpiderRuntimeAction,
+                            SpiderRuntimeAction.action_id == SpiderMemberResubmission.resubmission_action_id,
+                        )
+                        .where(
+                            SpiderMemberResubmission.environment == scope.environment,
+                            SpiderMemberResubmission.execution_scope_id == scope.execution_scope_id,
+                            SpiderMemberResubmission.strategy_id == scope.strategy_id,
+                            SpiderRuntimeAction.plan_id == plan.plan_id,
+                            SpiderRuntimeAction.operation == "PLACE",
+                            SpiderRuntimeAction.trigger_delivery_id.is_(None),
+                            SpiderRuntimeAction.parent_action_id.is_not(None),
+                            SpiderRuntimeAction.local_order_id == current_order.id,
+                        )
+                    ).one_or_none() or (None, None, None)
+                    if (
+                        relation is None or saved is None or action is None
+                        or not self._validate_member_resubmission_relation(session, scope, relation, saved)
+                    ):
+                        return None
         if not self._validate_initial_install_source(
             session, scope, runtime, plan, identity_rows
         ):
@@ -4161,6 +5392,72 @@ class SpiderRuntimeOwner:
             ))
         try:
             missing = build_missing_projection(candidates, outcomes)
+            missing_by_root = {
+                cast(str, item["initial_member_id"]): item for item in missing
+            }
+            for item in missing_by_root.values():
+                if item.get("last_outcome") == "UNSENT":
+                    item["resubmit_eligible"] = True
+                    item["ineligible_reason"] = None
+                elif (
+                    item.get("last_outcome") == "REJECTED"
+                    and item.get("rejection_reason") in {"51000", "51008"}
+                ):
+                    item["resubmit_eligible"] = True
+                    item["ineligible_reason"] = None
+            relations = session.execute(
+                select(SpiderMemberResubmission).where(
+                    SpiderMemberResubmission.environment == scope.environment,
+                    SpiderMemberResubmission.execution_scope_id == scope.execution_scope_id,
+                    SpiderMemberResubmission.strategy_id == scope.strategy_id,
+                ).order_by(SpiderMemberResubmission.tape_ordinal)
+            ).scalars().all()
+            for relation in relations:
+                saved = session.get(SpiderMemberResubmissionRequest, relation.request_id)
+                if saved is None or not self._validate_member_resubmission_relation(
+                    session, scope, relation, saved
+                ):
+                    return None
+                row = missing_by_root.get(relation.initial_member_id)
+                action = session.get(SpiderRuntimeAction, relation.resubmission_action_id)
+                if action is None:
+                    return None
+                if row is None:
+                    if outcomes.get(relation.initial_member_id, (None, None, None))[0] not in {
+                        "ACCEPTED", "TERMINAL"
+                    }:
+                        return None
+                    continue
+                if action.outcome_state in {"ACCEPTED", "TERMINAL"}:
+                    missing_by_root.pop(relation.initial_member_id)
+                    continue
+                row["current_frontier_action_id"] = relation.resubmission_action_id
+                row["last_outcome"] = action.outcome_state
+                row["latest_resubmission_request_id"] = relation.request_id
+                row["resubmit_eligible"] = action.outcome_state == "REJECTED"
+                row["ineligible_reason"] = (
+                    "RESUBMISSION_PENDING" if action.outcome_state == "UNSENT" else None
+                )
+                row["rejection_reason"] = None
+                if action.outcome_state == "REJECTED":
+                    transmission = session.get(
+                        SpiderRuntimeTransmission, action.outcome_reference
+                    ) if action.outcome_reference is not None else None
+                    classified = (
+                        None if transmission is None or transmission.response_payload is None
+                        else self._validated_transport_outcomes(
+                            bytes(transmission.request_payload),
+                            bytes(transmission.response_payload),
+                        )
+                    )
+                    outcome = None if classified is None else classified.get(action.action_id)
+                    if outcome is None or outcome[0] != "REJECTED":
+                        return None
+                    row["rejection_reason"] = outcome[1]
+                    row["resubmit_eligible"] = outcome[1] in {"51000", "51008"}
+                    if not row["resubmit_eligible"]:
+                        row["ineligible_reason"] = "RESUBMISSION_OUTCOME_NOT_ELIGIBLE"
+            missing = list(missing_by_root.values())
             missing_payload = canonical_bytes(missing)
         except (TypeError, ValueError):
             return None
@@ -4177,6 +5474,277 @@ class SpiderRuntimeOwner:
             return None
         return missing
 
+    def _validate_initial_install_root_bindings(
+        self,
+        session: Session,
+        scope: RuntimeScopeKey,
+        plan: SpiderRuntimePlan,
+        identity_rows: list[tuple[SpiderRuntimeAction, SpiderRuntimeBinding, Order]],
+    ) -> bool:
+        """Prove initial member bindings from immutable plan/operation evidence."""
+        if (
+            (plan.environment, plan.execution_scope_id, plan.strategy_id)
+            != (scope.environment, scope.execution_scope_id, scope.strategy_id)
+            or type(plan.manifest_payload) is not bytes
+            or _digest_bytes(plan.manifest_payload) != plan.manifest_sha256
+            or type(plan.original_build_checkpoint) is not bytes
+            or _digest_bytes(plan.original_build_checkpoint)
+            != plan.original_build_checkpoint_sha256
+        ):
+            return False
+        try:
+            manifest_value = decode_canonical(plan.manifest_payload)
+            if type(manifest_value) is not dict:
+                return False
+            manifest = cast(dict[str, object], manifest_value)
+            bootstrap_value = manifest.get("bootstrap_basis")
+            product_map_value = manifest.get("source_product_map")
+            events_value = manifest.get("initial_source_events")
+            initial_value = manifest.get("initial_manifest")
+            if any(type(value) is not dict for value in (
+                bootstrap_value, product_map_value, events_value, initial_value
+            )):
+                return False
+            bootstrap = cast(dict[str, object], bootstrap_value)
+            product_map = cast(dict[str, object], product_map_value)
+            events = cast(dict[str, object], events_value)
+            initial = cast(dict[str, object], initial_value)
+            operation = session.get(SpiderRuntimeOperation, plan.operation_id)
+            if (
+                operation is None
+                or (operation.environment, operation.execution_scope_id, operation.strategy_id)
+                != (scope.environment, scope.execution_scope_id, scope.strategy_id)
+                or operation.operation_core_sha256 != manifest.get("operation_core_sha256")
+                or operation.configuration_request_id != manifest.get("confirmation_request_id")
+                or manifest.get("domain") != "SPIDER_INITIAL_MANIFEST_V1"
+                or manifest.get("operation_id") != plan.operation_id
+                or manifest.get("generation") != plan.generation
+                or manifest.get("configuration_sha256") != plan.configuration_sha256
+                or manifest.get("build_checkpoint_sha256") != plan.original_build_checkpoint_sha256
+                or initial.get("build_checkpoint_sha256") != plan.original_build_checkpoint_sha256
+                or manifest.get("bootstrap_digest") != _digest(bootstrap)
+                or initial.get("bootstrap_basis_sha256") != manifest.get("bootstrap_digest")
+                or initial.get("product_map") != product_map
+                or initial.get("product_map_sha256") != _digest(product_map)
+                or bootstrap.get("product_map_sha256") != _digest(product_map)
+                or initial.get("specification_sha256") != plan.specification_sha256
+                or bootstrap.get("specification_sha256") != plan.specification_sha256
+                or initial.get("source_checkpoint_sha256") != plan.source_checkpoint_sha256
+                or bootstrap.get("source_checkpoint_sha256") != plan.source_checkpoint_sha256
+                or initial.get("initial_source_events_sha256") != _digest(events)
+            ):
+                return False
+            provenance_value = initial.get("historical_provenance")
+            if type(provenance_value) is not dict:
+                return False
+            provenance = cast(dict[str, object], provenance_value)
+            source_sha256 = provenance.get("source_sha256")
+            if type(source_sha256) is not str or len(source_sha256) != 64:
+                return False
+            if any(char not in "0123456789abcdef" for char in source_sha256):
+                return False
+            confirmation_row = session.execute(
+                select(SpiderConfigurationRequest.__table__).where(
+                    SpiderConfigurationRequest.request_id == operation.configuration_request_id
+                )
+            ).mappings().one_or_none()
+            if confirmation_row is None:
+                return False
+            confirmation = _hydrate(confirmation_row).request
+            configuration = confirmation.configuration.value
+            if (
+                confirmation.request_kind is not SpiderConfigurationRequestKind.CONFIRMATION
+                or confirmation.configuration.sha256 != plan.configuration_sha256
+                or (confirmation.environment, confirmation.execution_scope_id, confirmation.strategy_id)
+                != (scope.environment, scope.execution_scope_id, scope.strategy_id)
+                or configuration.get("ordered_products") != product_map.get("ordered_products")
+                or configuration.get("policy_id") not in {
+                    "SPIDER_HOST_ORIGINAL_PAID_V1",
+                    "SPIDER_ORIGINAL_GROSS_PROTECTED_PAID_V1",
+                }
+            ):
+                return False
+            ordered_value = product_map.get("ordered_products")
+            map_entries = product_map.get("entries")
+            source_entries = events.get("entries")
+            if (
+                type(ordered_value) is not list or not ordered_value
+                or any(type(item) is not str or not item for item in ordered_value)
+                or len(set(ordered_value)) != len(ordered_value)
+                or events.get("domain") != "SPIDER_INITIAL_SOURCE_EVENTS_V1"
+                or events.get("ordered_products") != ordered_value
+                or type(map_entries) is not list or type(source_entries) is not list
+                or len(map_entries) != len(ordered_value)
+                or len(source_entries) != len(ordered_value)
+            ):
+                return False
+            ordered = cast(list[str], ordered_value)
+            selection_value = bootstrap.get("runtime_selection")
+            if type(selection_value) is not dict:
+                return False
+            selection = cast(dict[str, object], selection_value)
+            if (
+                selection.get("environment") != scope.environment
+                or selection.get("execution_scope_id") != scope.execution_scope_id
+                or selection.get("strategy_id") != scope.strategy_id
+                or selection.get("confirmation_request_id") != operation.configuration_request_id
+                or selection.get("configuration_sha256") != plan.configuration_sha256
+            ):
+                return False
+            targets: dict[str, str] = {}
+            for product, map_row, source_row in zip(
+                ordered, cast(list[object], map_entries), cast(list[object], source_entries), strict=True
+            ):
+                if type(map_row) is not dict or type(source_row) is not dict:
+                    return False
+                map_value = cast(dict[str, object], map_row)
+                source_value = cast(dict[str, object], source_row)
+                instrument = map_value.get("instrument_spec")
+                if (
+                    map_value.get("source_product_id") != product
+                    or source_value.get("source_product_id") != product
+                    or type(instrument) is not dict
+                    or type(cast(dict[str, object], instrument).get("product_id")) is not str
+                    or not cast(str, cast(dict[str, object], instrument)["product_id"])
+                ):
+                    return False
+                targets[product] = cast(str, cast(dict[str, object], instrument)["product_id"])
+            candidates: list[tuple[str, dict[str, object], int, int]] = []
+            group = 0
+            for product, source_row in zip(ordered, cast(list[object], source_entries), strict=True):
+                source_value = cast(dict[str, object], source_row)
+                source_events = source_value.get("events")
+                if type(source_events) is not list or not source_events:
+                    return False
+                for event_value in cast(list[object], source_events):
+                    if type(event_value) is not dict:
+                        return False
+                    event_payload = cast(dict[str, object], event_value)
+                    kind = event_payload.get("kind")
+                    if kind == "request_market":
+                        continue
+                    orders_value = event_payload.get("orders")
+                    if kind != "send" or type(orders_value) is not list or not orders_value:
+                        return False
+                    group += 1
+                    for ordinal, order_value in enumerate(cast(list[object], orders_value)):
+                        if type(order_value) is not dict:
+                            return False
+                        source_order = cast(dict[str, object], order_value)
+                        if (
+                            source_order.get("instId") != product
+                            or source_order.get("side") not in {"buy", "sell"}
+                            or source_order.get("ordType") != "limit"
+                            or type(source_order.get("clOrdId")) is not str
+                            or not cast(str, source_order["clOrdId"])
+                            or type(source_order.get("px")) is not str
+                            or type(source_order.get("sz")) is not str
+                        ):
+                            return False
+                        candidates.append((product, source_order, group, ordinal))
+            if len(candidates) != len(identity_rows) or not candidates:
+                return False
+            for candidate_ordinal, (candidate, row) in enumerate(
+                zip(candidates, identity_rows, strict=True), 1
+            ):
+                product, source_order, transmission_group, transmission_ordinal = candidate
+                action, binding, order = row
+                source_bytes = canonical_bytes(source_order)
+                intent = order.intent_payload
+                if type(intent) is not dict:
+                    return False
+                expected_action = _digest({
+                    "domain": "SPIDER_INITIAL_ACTION_V1",
+                    "scope": _scope(scope),
+                    "operation_id": plan.operation_id,
+                    "plan_id": plan.plan_id,
+                    "candidate_ordinal": candidate_ordinal,
+                })
+                if (
+                    action.action_id != expected_action or action.plan_id != plan.plan_id
+                    or (action.environment, action.execution_scope_id, action.strategy_id)
+                    != (scope.environment, scope.execution_scope_id, scope.strategy_id)
+                    or action.generation != plan.generation
+                    or action.configuration_sha256 != plan.configuration_sha256
+                    or action.role != "GRID" or action.product_id != product
+                    or action.local_order_id != order.id or action.trigger_delivery_id is not None
+                    or action.parent_action_id is not None
+                    or action.candidate_ordinal != candidate_ordinal
+                    or action.transmission_group != transmission_group
+                    or action.transmission_ordinal != transmission_ordinal
+                    or action.original_payload != source_bytes
+                    or action.payload_sha256 != _digest_bytes(source_bytes)
+                    or (binding.action_id, binding.local_order_id) != (action.action_id, order.id)
+                    or (binding.environment, binding.execution_scope_id, binding.strategy_id)
+                    != (scope.environment, scope.execution_scope_id, scope.strategy_id)
+                    or binding.source_product_id != product
+                    or binding.canonical_product_id != targets[product]
+                    or binding.product_map_sha256 != _digest(product_map)
+                    or order.product_id != targets[product] or order.type != "limit"
+                    or order.side != source_order["side"]
+                    or order.price != _positive_decimal(source_order["px"])
+                    or order.quantity != _positive_decimal(source_order["sz"])
+                    or order.account_profile != selection.get("account_profile")
+                    or order.account_id != selection.get("account_id")
+                    or binding.source_client_order_id != source_order["clOrdId"]
+                    or order.client_order_id != intent.get("local_client_order_id")
+                    or order.client_order_id == binding.source_client_order_id
+                    or intent.get("source_client_order_id") != binding.source_client_order_id
+                    or prove_spider_order_wire_binding(
+                        scope.environment, scope.execution_scope_id, scope.strategy_id,
+                        action, binding, order,
+                    ) != (
+                        binding.source_client_order_id, order.client_order_id,
+                        intent.get("provider_wire_client_order_id"),
+                    )
+                ):
+                    return False
+            restore_source_checkpoint(
+                plan.original_build_checkpoint,
+                ordered_products=tuple(ordered),
+                policy_id=ORIGINAL_MODEL_POLICY_ID,
+                policy_version=ORIGINAL_MODEL_POLICY_VERSION,
+                policy_source_sha256=ORIGINAL_MODEL_POLICY_SOURCE_SHA256,
+                source_sha256=source_sha256,
+                confirmation_request_id=confirmation.request_id,
+                configuration_sha256=plan.configuration_sha256,
+                generation=plan.generation,
+            )
+            return True
+        except (InvalidOperation, KeyError, TypeError, ValueError, UnicodeDecodeError):
+            return False
+
+    def _validate_initial_install_roots(
+        self,
+        session: Session,
+        scope: RuntimeScopeKey,
+        plan: SpiderRuntimePlan,
+        identity_rows: list[tuple[SpiderRuntimeAction, SpiderRuntimeBinding, Order]],
+    ) -> tuple[tuple[str, ...], str, str] | None:
+        """Return replay context only after proving immutable initial roots."""
+        if not self._validate_initial_install_root_bindings(
+            session, scope, plan, identity_rows
+        ):
+            return None
+        try:
+            manifest = cast(dict[str, object], decode_canonical(plan.manifest_payload))
+            initial = cast(dict[str, object], manifest["initial_manifest"])
+            product_map = cast(dict[str, object], manifest["source_product_map"])
+            provenance = cast(dict[str, object], initial["historical_provenance"])
+            ordered_value = product_map["ordered_products"]
+            source_sha256 = provenance["source_sha256"]
+            evidence_sha256 = initial["historical_input_artifact_sha256"]
+            if (
+                type(ordered_value) is not list
+                or any(type(value) is not str for value in ordered_value)
+                or type(source_sha256) is not str
+                or type(evidence_sha256) is not str
+            ):
+                return None
+            return tuple(cast(list[str], ordered_value)), source_sha256, evidence_sha256
+        except (KeyError, TypeError, ValueError, UnicodeDecodeError):
+            return None
+
     def _validate_initial_install_source(
         self,
         session: Session,
@@ -4186,6 +5754,12 @@ class SpiderRuntimeOwner:
         identity_rows: list[tuple[SpiderRuntimeAction, SpiderRuntimeBinding, Order]],
     ) -> bool:
         """Prove immutable INSTALL source events still produce every saved row."""
+        proof_context = self._validate_initial_install_roots(
+            session, scope, plan, identity_rows
+        )
+        if proof_context is None:
+            return False
+        ordered_products, source_sha256, evidence_sha256 = proof_context
         if (
             runtime.current_operation_id is None
             or runtime.initial_plan_id != plan.plan_id
@@ -4203,286 +5777,20 @@ class SpiderRuntimeOwner:
             or _digest_bytes(plan.manifest_payload) != plan.manifest_sha256
         ):
             return False
-        try:
-            manifest_value = decode_canonical(plan.manifest_payload)
-            if type(manifest_value) is not dict:
-                return False
-            manifest = cast(dict[str, object], manifest_value)
-            initial_manifest_value = manifest.get("initial_manifest")
-            bootstrap_value = manifest.get("bootstrap_basis")
-            product_map_value = manifest.get("source_product_map")
-            events_value = manifest.get("initial_source_events")
-            if any(
-                type(value) is not dict
-                for value in (
-                    initial_manifest_value,
-                    bootstrap_value,
-                    product_map_value,
-                    events_value,
-                )
-            ):
-                return False
-            initial_manifest = cast(dict[str, object], initial_manifest_value)
-            bootstrap = cast(dict[str, object], bootstrap_value)
-            product_map = cast(dict[str, object], product_map_value)
-            source_events = cast(dict[str, object], events_value)
-            historical_provenance_value = initial_manifest.get("historical_provenance")
-            if type(historical_provenance_value) is not dict:
-                return False
-            historical_provenance = cast(dict[str, object], historical_provenance_value)
-            source_sha256 = historical_provenance.get("source_sha256")
-            if (
-                manifest.get("domain") != "SPIDER_INITIAL_MANIFEST_V1"
-                or manifest.get("operation_id") != runtime.current_operation_id
-                or manifest.get("confirmation_request_id") != runtime.confirmation_request_id
-                or manifest.get("configuration_sha256") != runtime.configuration_sha256
-                or manifest.get("generation") != runtime.generation
-                or manifest.get("build_checkpoint_sha256")
-                != plan.original_build_checkpoint_sha256
-                or initial_manifest.get("build_checkpoint_sha256")
-                != plan.original_build_checkpoint_sha256
-                or type(plan.original_build_checkpoint) is not bytes
-                or _digest_bytes(plan.original_build_checkpoint)
-                != plan.original_build_checkpoint_sha256
-                or type(manifest.get("bootstrap_digest")) is not str
-                or manifest.get("bootstrap_digest") != _digest(bootstrap)
-                or initial_manifest.get("bootstrap_basis_sha256")
-                != manifest.get("bootstrap_digest")
-                or initial_manifest.get("product_map") != product_map
-                or type(initial_manifest.get("product_map_sha256")) is not str
-                or initial_manifest.get("product_map_sha256") != _digest(product_map)
-                or bootstrap.get("product_map_sha256") != _digest(product_map)
-                or type(initial_manifest.get("specification_sha256")) is not str
-                or initial_manifest.get("specification_sha256") != plan.specification_sha256
-                or bootstrap.get("specification_sha256") != plan.specification_sha256
-                or initial_manifest.get("source_checkpoint_sha256")
-                != plan.source_checkpoint_sha256
-                or bootstrap.get("source_checkpoint_sha256")
-                != plan.source_checkpoint_sha256
-                or type(source_sha256) is not str
-                or len(source_sha256) != 64
-                or any(char not in "0123456789abcdef" for char in source_sha256)
-                or manifest.get("initial_source_events") is None
-                or type(initial_manifest.get("initial_source_events_sha256")) is not str
-                or initial_manifest.get("initial_source_events_sha256")
-                != _digest(source_events)
-            ):
-                return False
-            operation_core_sha256 = manifest.get("operation_core_sha256")
-            if type(operation_core_sha256) is not str:
-                return False
-            operation = session.execute(
-                select(SpiderRuntimeOperation).where(
-                    SpiderRuntimeOperation.operation_id == runtime.current_operation_id,
-                    SpiderRuntimeOperation.environment == scope.environment,
-                    SpiderRuntimeOperation.execution_scope_id == scope.execution_scope_id,
-                    SpiderRuntimeOperation.strategy_id == scope.strategy_id,
-                )
-            ).scalar_one_or_none()
-            if (
-                operation is None
-                or operation.phase != "INCOMPLETE"
-                or operation.operation_core_sha256 != operation_core_sha256
-                or manifest.get("operation_core_sha256")
-                != operation.operation_core_sha256
-                or operation.configuration_request_id != runtime.confirmation_request_id
-            ):
-                return False
-
-            basis_selection_value = bootstrap.get("runtime_selection")
-            if type(basis_selection_value) is not dict:
-                return False
-            selection = cast(dict[str, object], basis_selection_value)
-            if (
-                selection.get("environment") != scope.environment
-                or selection.get("execution_scope_id") != scope.execution_scope_id
-                or selection.get("strategy_id") != scope.strategy_id
-                or selection.get("confirmation_request_id")
-                != runtime.confirmation_request_id
-                or selection.get("configuration_sha256") != runtime.configuration_sha256
-            ):
-                return False
-            configuration_row = session.execute(
-                select(SpiderConfigurationRequest.__table__).where(
-                    SpiderConfigurationRequest.request_id == runtime.confirmation_request_id
-                )
-            ).mappings().one_or_none()
-            if configuration_row is None:
-                return False
-            configuration_record = _hydrate(configuration_row)
-            confirmation = configuration_record.request
-            configuration = confirmation.configuration.value
-            if (
-                confirmation.request_kind is not SpiderConfigurationRequestKind.CONFIRMATION
-                or confirmation.request_id != runtime.confirmation_request_id
-                or confirmation.configuration.sha256 != runtime.configuration_sha256
-                or (confirmation.environment, confirmation.execution_scope_id, confirmation.strategy_id)
-                != (scope.environment, scope.execution_scope_id, scope.strategy_id)
-                or configuration.get("ordered_products") != product_map.get("ordered_products")
-                or configuration.get("policy_id") not in {
-                    "SPIDER_HOST_ORIGINAL_PAID_V1",
-                    "SPIDER_ORIGINAL_GROSS_PROTECTED_PAID_V1",
-                }
-            ):
-                return False
-
-            ordered_products_value = product_map.get("ordered_products")
-            entries_value = product_map.get("entries")
-            source_entries_value = source_events.get("entries")
-            if (
-                type(ordered_products_value) is not list
-                or not ordered_products_value
-                or any(type(product) is not str or not product for product in ordered_products_value)
-                or len(set(ordered_products_value)) != len(ordered_products_value)
-                or source_events.get("domain") != "SPIDER_INITIAL_SOURCE_EVENTS_V1"
-                or source_events.get("ordered_products") != ordered_products_value
-                or type(entries_value) is not list
-                or type(source_entries_value) is not list
-                or len(entries_value) != len(ordered_products_value)
-                or len(source_entries_value) != len(ordered_products_value)
-            ):
-                return False
-            ordered_products = cast(list[str], ordered_products_value)
-            product_entries = cast(list[object], entries_value)
-            source_entries = cast(list[object], source_entries_value)
-            targets: dict[str, str] = {}
-            for product, map_entry, source_entry in zip(
-                ordered_products, product_entries, source_entries, strict=True
-            ):
-                if (
-                    type(map_entry) is not dict
-                    or type(source_entry) is not dict
-                    or cast(dict[str, object], map_entry).get("source_product_id") != product
-                    or cast(dict[str, object], source_entry).get("source_product_id") != product
-                ):
-                    return False
-                instrument = cast(dict[str, object], map_entry).get("instrument_spec")
-                if type(instrument) is not dict:
-                    return False
-                target_product = cast(dict[str, object], instrument).get("product_id")
-                if type(target_product) is not str or not target_product:
-                    return False
-                targets[product] = target_product
-
-            source_candidates: list[tuple[str, dict[str, object], int, int]] = []
-            transmission_group = 0
-            for product, source_entry_value in zip(
-                ordered_products, source_entries, strict=True
-            ):
-                source_entry = cast(dict[str, object], source_entry_value)
-                events_value = source_entry.get("events")
-                if type(events_value) is not list or not events_value:
-                    return False
-                for event_value in cast(list[object], events_value):
-                    if type(event_value) is not dict:
-                        return False
-                    event_payload = cast(dict[str, object], event_value)
-                    event_kind = event_payload.get("kind")
-                    if event_kind == "request_market":
-                        continue
-                    if event_kind != "send":
-                        return False
-                    orders_value = event_payload.get("orders")
-                    if type(orders_value) is not list or not orders_value:
-                        return False
-                    transmission_group += 1
-                    for ordinal, order_value in enumerate(cast(list[object], orders_value)):
-                        if type(order_value) is not dict:
-                            return False
-                        source_order = cast(dict[str, object], order_value)
-                        if (
-                            source_order.get("instId") != product
-                            or source_order.get("side") not in {"buy", "sell"}
-                            or type(source_order.get("clOrdId")) is not str
-                            or not cast(str, source_order["clOrdId"])
-                            or source_order.get("ordType") != "limit"
-                            or type(source_order.get("px")) is not str
-                            or type(source_order.get("sz")) is not str
-                        ):
-                            return False
-                        source_candidates.append(
-                            (product, source_order, transmission_group, ordinal)
-                        )
-            if len(source_candidates) != len(identity_rows) or not source_candidates:
-                return False
-            for candidate_ordinal, (candidate, row) in enumerate(
-                zip(source_candidates, identity_rows, strict=True), 1
-            ):
-                source_product, source_order, group, group_ordinal = candidate
-                action, binding, order = row
-                source_bytes = canonical_bytes(source_order)
-                action_id = _digest({
-                    "domain": "SPIDER_INITIAL_ACTION_V1",
-                    "scope": _scope(scope),
-                    "operation_id": runtime.current_operation_id,
-                    "plan_id": plan.plan_id,
-                    "candidate_ordinal": candidate_ordinal,
-                })
-                intent = order.intent_payload
-                if type(intent) is not dict:
-                    return False
-                wire_proof = prove_spider_order_wire_binding(
-                    scope.environment,
-                    scope.execution_scope_id,
-                    scope.strategy_id,
-                    action,
-                    binding,
-                    order,
-                )
-                if (
-                    action.action_id != action_id
-                    or action.plan_id != plan.plan_id
-                    or action.environment != scope.environment
-                    or action.execution_scope_id != scope.execution_scope_id
-                    or action.strategy_id != scope.strategy_id
-                    or action.generation != runtime.generation
-                    or action.configuration_sha256 != runtime.configuration_sha256
-                    or action.role != "GRID"
-                    or action.product_id != source_product
-                    or action.local_order_id != order.id
-                    or action.trigger_delivery_id is not None
-                    or action.candidate_ordinal != candidate_ordinal
-                    or action.transmission_group != group
-                    or action.transmission_ordinal != group_ordinal
-                    or action.original_payload != source_bytes
-                    or action.payload_sha256 != _digest_bytes(source_bytes)
-                    or binding.action_id != action_id
-                    or binding.environment != scope.environment
-                    or binding.execution_scope_id != scope.execution_scope_id
-                    or binding.strategy_id != scope.strategy_id
-                    or binding.local_order_id != order.id
-                    or binding.source_product_id != source_product
-                    or binding.canonical_product_id != targets[source_product]
-                    or binding.product_map_sha256 != _digest(product_map)
-                    or order.product_id != targets[source_product]
-                    or order.type != "limit"
-                    or order.side != source_order["side"]
-                    or order.price != _positive_decimal(source_order["px"])
-                    or order.quantity != _positive_decimal(source_order["sz"])
-                    or order.account_profile != selection.get("account_profile")
-                    or order.account_id != selection.get("account_id")
-                    or binding.source_client_order_id != source_order["clOrdId"]
-                    or order.client_order_id != intent.get("local_client_order_id")
-                    or order.client_order_id == binding.source_client_order_id
-                    or intent.get("source_client_order_id") != binding.source_client_order_id
-                    or wire_proof != (
-                        binding.source_client_order_id,
-                        order.client_order_id,
-                        intent.get("provider_wire_client_order_id"),
-                    )
-                ):
-                    return False
-            restore_source_checkpoint(
-                plan.original_build_checkpoint,
-                ordered_products=tuple(ordered_products),
-                policy_id=ORIGINAL_MODEL_POLICY_ID,
-                policy_version=ORIGINAL_MODEL_POLICY_VERSION,
-                policy_source_sha256=ORIGINAL_MODEL_POLICY_SOURCE_SHA256,
-                source_sha256=source_sha256,
-                confirmation_request_id=runtime.confirmation_request_id,
-                configuration_sha256=runtime.configuration_sha256,
-                generation=runtime.generation,
+        operation = session.execute(
+            select(SpiderRuntimeOperation).where(
+                SpiderRuntimeOperation.operation_id == runtime.current_operation_id,
+                SpiderRuntimeOperation.environment == scope.environment,
+                SpiderRuntimeOperation.execution_scope_id == scope.execution_scope_id,
+                SpiderRuntimeOperation.strategy_id == scope.strategy_id,
             )
+        ).scalar_one_or_none()
+        if (
+            operation is None or operation.phase != "INCOMPLETE"
+            or operation.configuration_request_id != runtime.confirmation_request_id
+        ):
+            return False
+        try:
             deliveries = session.execute(
                 select(SpiderRuntimeDelivery).where(
                     SpiderRuntimeDelivery.environment == scope.environment,
@@ -4499,10 +5807,59 @@ class SpiderRuntimeOwner:
             expected_checkpoint = plan.original_build_checkpoint
             seen_market_ids: set[str] = set()
             has_stop_suppression = False
-            evidence_sha256 = initial_manifest.get("historical_input_artifact_sha256")
-            if type(evidence_sha256) is not str:
-                return False
+            resubmission_relations = session.execute(
+                select(SpiderMemberResubmission).where(
+                    SpiderMemberResubmission.environment == scope.environment,
+                    SpiderMemberResubmission.execution_scope_id == scope.execution_scope_id,
+                    SpiderMemberResubmission.strategy_id == scope.strategy_id,
+                ).order_by(SpiderMemberResubmission.tape_ordinal)
+            ).scalars().all()
+            tape_rows = session.execute(
+                select(SpiderRuntimeTapeIndex).where(
+                    SpiderRuntimeTapeIndex.environment == scope.environment,
+                    SpiderRuntimeTapeIndex.execution_scope_id == scope.execution_scope_id,
+                    SpiderRuntimeTapeIndex.strategy_id == scope.strategy_id,
+                ).order_by(SpiderRuntimeTapeIndex.ordinal)
+            ).scalars().all()
+            delivery_tape_ordinals = {
+                row.delivery_sequence: row.ordinal
+                for row in tape_rows if row.kind == "DELIVERY"
+            }
+            relation_index = 0
+
+            def apply_resubmissions_before(tape_ordinal: int) -> bool:
+                nonlocal expected_checkpoint, relation_index
+                while (
+                    relation_index < len(resubmission_relations)
+                    and resubmission_relations[relation_index].tape_ordinal < tape_ordinal
+                ):
+                    relation = resubmission_relations[relation_index]
+                    saved = session.get(SpiderMemberResubmissionRequest, relation.request_id)
+                    root = session.get(SpiderRuntimeAction, relation.initial_member_id)
+                    binding = None if root is None else session.get(SpiderRuntimeBinding, root.action_id)
+                    if (
+                        saved is None or root is None or binding is None
+                        or not self._validate_member_resubmission_relation(
+                            session, scope, relation, saved
+                        )
+                        or relation.before_checkpoint_sha256 != _digest_bytes(expected_checkpoint)
+                    ):
+                        return False
+                    expected_checkpoint = self._resubmission_checkpoint(
+                        expected_checkpoint, scope, runtime, plan, root, binding
+                    )
+                    if relation.after_checkpoint_sha256 != _digest_bytes(expected_checkpoint):
+                        return False
+                    relation_index += 1
+                return True
+
             for sequence, delivery in enumerate(deliveries, 1):
+                delivery_tape_ordinal = delivery_tape_ordinals.get(sequence)
+                if (
+                    delivery_tape_ordinal is None
+                    or not apply_resubmissions_before(delivery_tape_ordinal)
+                ):
+                    return False
                 if (
                     delivery.sequence != sequence
                     or (delivery.environment, delivery.execution_scope_id, delivery.strategy_id)
@@ -4607,6 +5964,8 @@ class SpiderRuntimeOwner:
                     if expected_next is None:
                         return False
                     expected_checkpoint = expected_next
+            if not apply_resubmissions_before(runtime.last_tape_sequence + 1):
+                return False
             if has_stop_suppression and self._current_stop_proof(session, scope, runtime) is None:
                 return False
             if (
@@ -4635,62 +5994,12 @@ class SpiderRuntimeOwner:
             return None
         financial_acceptance: dict[str, bool] = {}
         for action, binding, order in identity_rows:
-            current_projection = {
-                "status": order.status,
-                "filled_quantity": (
-                    None if order.filled_quantity is None
-                    else canonical_decimal_text(order.filled_quantity)
-                ),
-                "filled_price": (
-                    None if order.filled_price is None
-                    else canonical_decimal_text(order.filled_price)
-                ),
-                "exchange_order_id": order.exchange_order_id,
-            }
-            if not validate_order_receipt_chain(
-                session,
-                scope=_scope(scope),
-                action=action,
-                binding=binding,
-                order_id=order.id,
-                current_projection=current_projection,
-            ):
+            acceptance_proved = self._financial_acceptance_proved(
+                session, scope, action, binding, order
+            )
+            if acceptance_proved is None:
                 return None
-            receipts = session.execute(
-                select(SpiderRuntimeDelivery).where(
-                    SpiderRuntimeDelivery.environment == scope.environment,
-                    SpiderRuntimeDelivery.execution_scope_id == scope.execution_scope_id,
-                    SpiderRuntimeDelivery.strategy_id == scope.strategy_id,
-                    SpiderRuntimeDelivery.action_id == action.action_id,
-                    SpiderRuntimeDelivery.local_order_id == order.id,
-                ).order_by(SpiderRuntimeDelivery.sequence)
-            ).scalars().all()
-            proves_acceptance = False
-            for receipt in receipts:
-                try:
-                    payload = decode_canonical(receipt.source_payload)
-                except (TypeError, ValueError, UnicodeDecodeError):
-                    return None
-                if type(payload) is not dict:
-                    return None
-                binding_value = payload.get("binding")
-                if type(binding_value) is not dict:
-                    return None
-                if (
-                    payload.get("schema_version") != "SPIDER_FINANCIAL_RECEIPT_V1"
-                    or payload.get("scope") != _scope(scope)
-                    or payload.get("kind") != receipt.kind
-                    or payload.get("binding_resolution") not in {"BOUND", "UNRESOLVED"}
-                    or cast(dict[str, object], binding_value).get("action_id") != action.action_id
-                    or cast(dict[str, object], binding_value).get("local_order_id") != order.id
-                ):
-                    return None
-                if (
-                    receipt.kind in {"FILL", "ORDER_STATE"}
-                    and payload.get("binding_resolution") == "BOUND"
-                ):
-                    proves_acceptance = True
-            financial_acceptance[action.action_id] = proves_acceptance
+            financial_acceptance[action.action_id] = acceptance_proved
 
         transmissions = session.execute(
             select(SpiderRuntimeTransmission).where(
@@ -4732,7 +6041,14 @@ class SpiderRuntimeOwner:
                     .where(SpiderRuntimeAction.action_id.in_(derived_ids))
                     .order_by(SpiderRuntimeAction.transmission_ordinal)
                 ).all()
-                if derived_rows and all(row[0].trigger_delivery_id is not None for row in derived_rows):
+                if derived_rows and (
+                    all(row[0].trigger_delivery_id is not None for row in derived_rows)
+                    or all(
+                        row[0].trigger_delivery_id is None
+                        and row[0].parent_action_id is not None
+                        for row in derived_rows
+                    )
+                ):
                     derived_outcomes = self._validate_normal_place_transmission(
                         session, scope, runtime, plan, transmission, request,
                         cast(list[tuple[SpiderRuntimeAction, SpiderRuntimeBinding, Order]], list(derived_rows)),

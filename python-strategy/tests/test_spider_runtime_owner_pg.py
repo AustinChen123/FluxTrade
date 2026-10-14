@@ -368,8 +368,8 @@ def test_http_confirmed_operation_reaches_atomic_held_install_and_exact_retry(
     missing = cast(list[dict[str, object]], first["initial_plan_missing_members"])
     assert len(missing) > 0
     assert all(row["last_outcome"] == "UNSENT" for row in missing)
-    assert all(row["ineligible_reason"] == "PROVIDER_PROFILE_UNAVAILABLE" for row in missing)
-    assert all(row["resubmit_eligible"] is False for row in missing)
+    assert all(row["ineligible_reason"] is None for row in missing)
+    assert all(row["resubmit_eligible"] is True for row in missing)
 
     dispatch.dispatch(command)
     second = owner.readback(scope, confirmed.operation_id)

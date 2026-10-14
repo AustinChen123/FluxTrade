@@ -408,10 +408,11 @@ def test_populated_c3_predecessor_upgrade_preserves_corrupt_checkpoint_and_facts
                 (scope.strategy_id,),
             ).one()
         assert (bytes(stored[0]), stored[1]) == runtime_values
-        _upgrade(fresh_pg_db, "head")
+        _upgrade(fresh_pg_db, "d8a61c3f9b42")
         upgraded = _scoped_snapshot(engine, scope)
         _assert_expected_schema_transition(predecessor, upgraded)
         _assert_legacy_rows_preserved(predecessor, upgraded)
+        _upgrade(fresh_pg_db, "head")
         with factory() as session:
             runtime = session.execute(
                 select(SpiderRuntimeScope).where(

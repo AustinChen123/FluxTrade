@@ -15,6 +15,8 @@ from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_canon
 from src.core.decimal_math import canonical_decimal_text
 from src.core.orm_models import Order, Trade
 from src.core.spider_management.orm import (
+    SpiderMemberResubmission,
+    SpiderMemberResubmissionRequest,
     SpiderRuntimeAction,
     SpiderRuntimeBinding,
     SpiderRuntimeDelivery,
@@ -370,6 +372,13 @@ def validate_tape_index(session: Session, runtime: SpiderRuntimeScope) -> bool:
         ):
             return False
         transmission_ids.add(group_id)
+    request_ids = set(session.execute(
+        select(SpiderMemberResubmissionRequest.request_id).where(
+            SpiderMemberResubmissionRequest.environment == runtime.environment,
+            SpiderMemberResubmissionRequest.execution_scope_id == runtime.execution_scope_id,
+            SpiderMemberResubmissionRequest.strategy_id == runtime.strategy_id,
+        )
+    ).scalars().all())
     tape_table = SpiderRuntimeTapeIndex.__table__
     tape_rows = session.execute(
         select(tape_table).where(
@@ -382,6 +391,7 @@ def validate_tape_index(session: Session, runtime: SpiderRuntimeScope) -> bool:
         return False
     seen_deliveries: set[int] = set()
     seen_transmissions: set[str] = set()
+    seen_resubmissions: set[str] = set()
     next_delivery_sequence = 1
     for ordinal, row in enumerate(tape_rows, 1):
         if row["ordinal"] != ordinal:
@@ -391,6 +401,7 @@ def validate_tape_index(session: Session, runtime: SpiderRuntimeScope) -> bool:
             if (
                 type(sequence) is not int
                 or row["transmission_group_id"] is not None
+                or row["member_resubmission_request_id"] is not None
                 or not 1 <= sequence <= runtime.last_received_sequence
                 or sequence in seen_deliveries
                 or sequence != next_delivery_sequence
@@ -402,17 +413,37 @@ def validate_tape_index(session: Session, runtime: SpiderRuntimeScope) -> bool:
             group_id = row["transmission_group_id"]
             if (
                 row["delivery_sequence"] is not None
+                or row["member_resubmission_request_id"] is not None
                 or type(group_id) is not str
                 or group_id not in transmission_ids
                 or group_id in seen_transmissions
             ):
                 return False
             seen_transmissions.add(group_id)
+        elif row["kind"] == "RESUBMIT":
+            request_id = row["member_resubmission_request_id"]
+            if (
+                row["delivery_sequence"] is not None
+                or row["transmission_group_id"] is not None
+                or type(request_id) is not str
+                or request_id not in request_ids
+                or request_id in seen_resubmissions
+            ):
+                return False
+            seen_resubmissions.add(request_id)
         else:
             return False
     return (
         seen_deliveries == set(range(1, runtime.last_received_sequence + 1))
         and seen_transmissions == transmission_ids
+        and len(seen_resubmissions) == session.scalar(
+            select(func.count()).select_from(SpiderMemberResubmission)
+            .where(
+                SpiderMemberResubmission.environment == runtime.environment,
+                SpiderMemberResubmission.execution_scope_id == runtime.execution_scope_id,
+                SpiderMemberResubmission.strategy_id == runtime.strategy_id,
+            )
+        )
     )
 
 

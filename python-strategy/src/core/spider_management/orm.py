@@ -596,6 +596,9 @@ class SpiderRuntimeTapeIndex(Base):
     transmission_group_id: Mapped[str | None] = mapped_column(
         String(64, collation="C"), nullable=True
     )
+    member_resubmission_request_id: Mapped[str | None] = mapped_column(
+        String(64, collation="C"), nullable=True
+    )
 
     __table_args__ = (
         ForeignKeyConstraint(
@@ -618,6 +621,12 @@ class SpiderRuntimeTapeIndex(Base):
              "spider_runtime_transmission.strategy_id"],
             name="fk_spider_runtime_tape_transmission",
         ),
+        ForeignKeyConstraint(
+            ["member_resubmission_request_id", "environment", "execution_scope_id", "strategy_id"],
+            ["spider_member_resubmission_request.request_id", "spider_member_resubmission_request.environment",
+             "spider_member_resubmission_request.execution_scope_id", "spider_member_resubmission_request.strategy_id"],
+            name="fk_spider_runtime_tape_member_resubmission",
+        ),
         UniqueConstraint(
             "environment", "execution_scope_id", "strategy_id", "delivery_sequence",
             name="uq_spider_runtime_tape_delivery",
@@ -626,12 +635,18 @@ class SpiderRuntimeTapeIndex(Base):
             "environment", "execution_scope_id", "strategy_id", "transmission_group_id",
             name="uq_spider_runtime_tape_transmission",
         ),
+        UniqueConstraint(
+            "environment", "execution_scope_id", "strategy_id", "member_resubmission_request_id",
+            name="uq_spider_runtime_tape_member_resubmission",
+        ),
         CheckConstraint("ordinal > 0", name="ck_spider_runtime_tape_ordinal"),
         CheckConstraint(
             "(kind = 'DELIVERY' AND delivery_sequence IS NOT NULL AND "
-            "transmission_group_id IS NULL) OR "
+            "transmission_group_id IS NULL AND member_resubmission_request_id IS NULL) OR "
             "(kind = 'SEND_MARKER' AND delivery_sequence IS NULL AND "
-            "transmission_group_id IS NOT NULL)",
+            "transmission_group_id IS NOT NULL AND member_resubmission_request_id IS NULL) OR "
+            "(kind = 'RESUBMIT' AND delivery_sequence IS NULL AND "
+            "transmission_group_id IS NULL AND member_resubmission_request_id IS NOT NULL)",
             name="ck_spider_runtime_tape_reference",
         ),
     )
@@ -692,4 +707,119 @@ class SpiderControlReceipt(Base):
         CheckConstraint("barrier_sequence >= 0", name="ck_spider_control_receipt_barrier"),
         CheckConstraint("outcome = 'COMPLETED'", name="ck_spider_control_receipt_outcome"),
         CheckConstraint("recorded_at >= TIMESTAMPTZ '0001-01-01 00:00:00+00' AND recorded_at < TIMESTAMPTZ '10000-01-01 00:00:00+00' AND recorded_at = date_trunc('milliseconds', recorded_at)", name="ck_spider_control_receipt_recorded_at"),
+    )
+
+
+class SpiderMemberResubmissionRequest(Base):
+    """Saved immutable operator intent; it cannot itself authorize a send."""
+
+    __tablename__ = "spider_member_resubmission_request"
+
+    request_id: Mapped[str] = mapped_column(String(64, collation="C"), primary_key=True)
+    environment: Mapped[str] = mapped_column(String(128, collation="C"), nullable=False)
+    execution_scope_id: Mapped[str] = mapped_column(String(128, collation="C"), nullable=False)
+    strategy_id: Mapped[str] = mapped_column(String(128, collation="C"), nullable=False)
+    actor: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(128, collation="C"), nullable=False)
+    expected_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    configuration_sha256: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    initial_plan_id: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    target_action_id: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    request_payload: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    request_sha256: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    recorded_at: Mapped[DateTime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        server_default=text("date_trunc('milliseconds', clock_timestamp())"),
+    )
+
+    __table_args__ = (
+        UniqueConstraint("environment", "execution_scope_id", "strategy_id", "actor", "idempotency_key",
+                         name="uq_spider_member_resubmit_request_key"),
+        UniqueConstraint("request_id", "environment", "execution_scope_id", "strategy_id",
+                         name="uq_spider_member_resubmit_request_scope"),
+        ForeignKeyConstraint(["environment", "execution_scope_id", "strategy_id"],
+                             ["spider_runtime_scope.environment", "spider_runtime_scope.execution_scope_id",
+                              "spider_runtime_scope.strategy_id"],
+                             name="fk_spider_member_resubmit_request_scope"),
+        ForeignKeyConstraint(["target_action_id", "environment", "execution_scope_id", "strategy_id"],
+                             ["spider_runtime_action.action_id", "spider_runtime_action.environment",
+                              "spider_runtime_action.execution_scope_id", "spider_runtime_action.strategy_id"],
+                             name="fk_spider_member_resubmit_request_target"),
+        CheckConstraint("request_id COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_member_resubmit_request_id"),
+        CheckConstraint("environment COLLATE \"C\" ~ '^[A-Za-z0-9_-]{1,128}$'", name="ck_spider_member_resubmit_environment"),
+        CheckConstraint("execution_scope_id COLLATE \"C\" ~ '^[A-Za-z0-9_-]{1,128}$'", name="ck_spider_member_resubmit_scope"),
+        CheckConstraint("strategy_id COLLATE \"C\" ~ '^[A-Za-z0-9_-]{1,128}$'", name="ck_spider_member_resubmit_strategy"),
+        CheckConstraint("actor COLLATE \"C\" ~ '^[A-Za-z0-9][A-Za-z0-9._:@-]{0,63}$'", name="ck_spider_member_resubmit_actor"),
+        CheckConstraint("idempotency_key COLLATE \"C\" ~ '^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$'", name="ck_spider_member_resubmit_key"),
+        CheckConstraint("expected_version BETWEEN 0 AND 2147483647", name="ck_spider_member_resubmit_version"),
+        CheckConstraint("generation > 0", name="ck_spider_member_resubmit_generation"),
+        CheckConstraint("configuration_sha256 COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_member_resubmit_config_hash"),
+        CheckConstraint("initial_plan_id COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_member_resubmit_plan_id"),
+        CheckConstraint("target_action_id COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_member_resubmit_target_id"),
+        CheckConstraint("octet_length(request_payload) BETWEEN 1 AND 1048576", name="ck_spider_member_resubmit_payload"),
+        CheckConstraint("request_sha256 COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_member_resubmit_payload_hash"),
+        CheckConstraint("recorded_at = date_trunc('milliseconds', recorded_at)", name="ck_spider_member_resubmit_recorded_at"),
+    )
+
+
+class SpiderMemberResubmission(Base):
+    """Immutable relation from an original candidate through one explicit attempt."""
+
+    __tablename__ = "spider_member_resubmission"
+
+    request_id: Mapped[str] = mapped_column(String(64, collation="C"), primary_key=True)
+    control_receipt_id: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False, unique=True)
+    environment: Mapped[str] = mapped_column(String(128, collation="C"), nullable=False)
+    execution_scope_id: Mapped[str] = mapped_column(String(128, collation="C"), nullable=False)
+    strategy_id: Mapped[str] = mapped_column(String(128, collation="C"), nullable=False)
+    generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    configuration_sha256: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    initial_plan_id: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    initial_member_id: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    target_action_id: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    resubmission_action_id: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False, unique=True)
+    tape_ordinal: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    before_checkpoint_sha256: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+    after_checkpoint_sha256: Mapped[str] = mapped_column(String(64, collation="C"), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "environment", "execution_scope_id", "strategy_id", "tape_ordinal",
+            name="uq_spider_member_resubmission_tape_ordinal",
+        ),
+        ForeignKeyConstraint(["request_id", "environment", "execution_scope_id", "strategy_id"],
+                             ["spider_member_resubmission_request.request_id", "spider_member_resubmission_request.environment",
+                              "spider_member_resubmission_request.execution_scope_id", "spider_member_resubmission_request.strategy_id"],
+                             name="fk_spider_member_resubmission_request"),
+        ForeignKeyConstraint(["initial_plan_id", "environment", "execution_scope_id", "strategy_id"],
+                             ["spider_runtime_plan.plan_id", "spider_runtime_plan.environment",
+                              "spider_runtime_plan.execution_scope_id", "spider_runtime_plan.strategy_id"],
+                             name="fk_spider_member_resubmission_plan"),
+        ForeignKeyConstraint(["initial_member_id", "environment", "execution_scope_id", "strategy_id"],
+                             ["spider_runtime_action.action_id", "spider_runtime_action.environment",
+                              "spider_runtime_action.execution_scope_id", "spider_runtime_action.strategy_id"],
+                             name="fk_spider_member_resubmission_initial_member"),
+        ForeignKeyConstraint(["target_action_id", "environment", "execution_scope_id", "strategy_id"],
+                             ["spider_runtime_action.action_id", "spider_runtime_action.environment",
+                              "spider_runtime_action.execution_scope_id", "spider_runtime_action.strategy_id"],
+                             name="fk_spider_member_resubmission_target"),
+        ForeignKeyConstraint(["resubmission_action_id", "environment", "execution_scope_id", "strategy_id"],
+                             ["spider_runtime_action.action_id", "spider_runtime_action.environment",
+                              "spider_runtime_action.execution_scope_id", "spider_runtime_action.strategy_id"],
+                             name="fk_spider_member_resubmission_action"),
+        CheckConstraint("request_id COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_member_resubmission_request_id"),
+        CheckConstraint("control_receipt_id COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_member_resubmission_receipt_id"),
+        CheckConstraint("environment COLLATE \"C\" ~ '^[A-Za-z0-9_-]{1,128}$'", name="ck_spider_member_resubmission_environment"),
+        CheckConstraint("execution_scope_id COLLATE \"C\" ~ '^[A-Za-z0-9_-]{1,128}$'", name="ck_spider_member_resubmission_scope"),
+        CheckConstraint("strategy_id COLLATE \"C\" ~ '^[A-Za-z0-9_-]{1,128}$'", name="ck_spider_member_resubmission_strategy"),
+        CheckConstraint("generation > 0", name="ck_spider_member_resubmission_generation"),
+        CheckConstraint("configuration_sha256 COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_member_resubmission_config_hash"),
+        CheckConstraint("initial_plan_id COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_member_resubmission_plan_id"),
+        CheckConstraint("initial_member_id COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_member_resubmission_initial_id"),
+        CheckConstraint("target_action_id COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_member_resubmission_target_id"),
+        CheckConstraint("resubmission_action_id COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_member_resubmission_action_id"),
+        CheckConstraint("tape_ordinal > 0", name="ck_spider_member_resubmission_tape_ordinal"),
+        CheckConstraint("before_checkpoint_sha256 COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_member_resubmission_before_hash"),
+        CheckConstraint("after_checkpoint_sha256 COLLATE \"C\" ~ '^[0-9a-f]{64}$'", name="ck_spider_member_resubmission_after_hash"),
     )

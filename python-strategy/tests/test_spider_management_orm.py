@@ -127,7 +127,7 @@ def test_transport_tape_orm_has_exact_shared_ordering_and_scoped_delivery_fk():
     }
     assert set(tape.columns.keys()) == {
         "environment", "execution_scope_id", "strategy_id", "ordinal", "kind",
-        "delivery_sequence", "transmission_group_id",
+        "delivery_sequence", "transmission_group_id", "member_resubmission_request_id",
     }
     assert list(tape.primary_key.columns.keys()) == [
         "environment", "execution_scope_id", "strategy_id", "ordinal"
@@ -145,12 +145,27 @@ def test_transport_tape_orm_has_exact_shared_ordering_and_scoped_delivery_fk():
         "spider_runtime_delivery.strategy_id",
         "spider_runtime_delivery.sequence",
     ]
+    resubmission_fk = next(
+        constraint for constraint in tape.constraints
+        if constraint.name == "fk_spider_runtime_tape_member_resubmission"
+    )
+    assert [element.parent.name for element in resubmission_fk.elements] == [
+        "member_resubmission_request_id", "environment", "execution_scope_id", "strategy_id"
+    ]
+    assert [element.target_fullname for element in resubmission_fk.elements] == [
+        "spider_member_resubmission_request.request_id",
+        "spider_member_resubmission_request.environment",
+        "spider_member_resubmission_request.execution_scope_id",
+        "spider_member_resubmission_request.strategy_id",
+    ]
     tape_checks = {constraint.name for constraint in tape.constraints}
     assert {
         "ck_spider_runtime_tape_ordinal",
         "ck_spider_runtime_tape_reference",
         "fk_spider_runtime_tape_scope",
         "fk_spider_runtime_tape_delivery",
+        "fk_spider_runtime_tape_member_resubmission",
+        "uq_spider_runtime_tape_member_resubmission",
         "fk_spider_runtime_tape_transmission",
         "uq_spider_runtime_tape_delivery",
         "uq_spider_runtime_tape_transmission",

@@ -250,6 +250,11 @@ def test_populated_predecessor_transport_migration_backfill_and_downgrade(
         assert predecessor["spider_control_receipt"]
         assert predecessor["trade"]
 
+        _upgrade(fresh_pg_db, "c3f8d1a904b7")
+        assert _legacy_snapshot(engine) == predecessor
+
+        # The ORM and owner checks below use the current head's schema; keep
+        # those operability checks separate from the c3 migration proof above.
         _upgrade(fresh_pg_db, "head")
         factory = sessionmaker(engine)
         with factory() as session:
@@ -297,14 +302,13 @@ def test_populated_predecessor_transport_migration_backfill_and_downgrade(
                     and row.transmission_group_id is None
                     for row in indexed
                 )
-        assert _legacy_snapshot(engine) == predecessor
-
         _downgrade(fresh_pg_db, "a7d0c5e2f941")
+        assert _legacy_snapshot(engine) == predecessor
+        _upgrade(fresh_pg_db, "c3f8d1a904b7")
         assert _legacy_snapshot(engine) == predecessor
         _upgrade(fresh_pg_db, "head")
         for owner, scope, operation_id, _install, stopped in seeded:
             assert owner.readback(scope, operation_id) == stopped
-        assert _legacy_snapshot(engine) == predecessor
         with engine.connect() as conn:
             assert (
                 conn.execute(
