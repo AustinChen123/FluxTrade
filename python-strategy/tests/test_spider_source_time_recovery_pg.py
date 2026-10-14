@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import logging
 from decimal import Decimal
 from hashlib import sha256
 from typing import Any, cast
@@ -313,8 +314,19 @@ def test_earlier_unresolved_market_or_financial_prefix_blocks_time_and_cold_star
 
 
 def test_policy_failure_is_a_nonretryable_pending_prefix_then_stop_proves_it_cold(
-    operation_pg: Engine, caplog
+    operation_pg: Engine, caplog, monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
 ) -> None:
+    runtime_owner_logger = logging.getLogger(
+        "src.core.spider_management.runtime_owner"
+    )
+    monkeypatch.setattr(runtime_owner_logger, "disabled", False)
+    monkeypatch.setattr(runtime_owner_logger, "propagate", False)
+    if caplog.handler not in runtime_owner_logger.handlers:
+        runtime_owner_logger.addHandler(caplog.handler)
+        request.addfinalizer(
+            lambda: runtime_owner_logger.removeHandler(caplog.handler)
+        )
     owner, scope, operation_id, factory, prepared, _initial, order_manager, confirmation, source = _owner(operation_pg)
     anchor = _time(scope, prepared, _runtime(factory, scope), "failed-timer-anchor", "ANCHOR")
     assert owner.receive_source_time(anchor).data is not None

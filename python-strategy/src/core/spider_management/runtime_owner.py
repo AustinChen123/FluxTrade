@@ -150,6 +150,7 @@ class SpiderRuntimeComposition:
     owned_scopes: tuple[RuntimeScopeKey, ...]
     model_sources_by_confirmation: Mapping[str, ModelInstallSource]
     register_market_source: Callable[[Callable[[bytes], CommandResult]], Callable[[], None]] | None = None
+    register_time_source: Callable[[Callable[[bytes], CommandResult]], Callable[[], None]] | None = None
 
     def __post_init__(self) -> None:
         if type(self.owned_scopes) is not tuple or not self.owned_scopes:
@@ -160,6 +161,8 @@ class SpiderRuntimeComposition:
             raise ValueError("Spider model sources must be an explicit mapping")
         if self.register_market_source is not None and not callable(self.register_market_source):
             raise ValueError("Spider market source registrar must be callable")
+        if self.register_time_source is not None and not callable(self.register_time_source):
+            raise ValueError("Spider time source registrar must be callable")
         object.__setattr__(
             self,
             "model_sources_by_confirmation",

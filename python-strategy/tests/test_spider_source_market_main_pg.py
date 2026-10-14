@@ -745,5 +745,5 @@ def test_main_market_cleanup_failure_does_not_skip_engine_or_consumer_cleanup(
     assert events.index("source-cleanup") < events.index("engine-shutdown")
     assert events.index("engine-shutdown") < events.index("consumer-stop")
     assert warning_calls == [
-        ("Spider market source cleanup failed: %s", ("RuntimeError",))
+        ("Spider %s source cleanup failed: %s", ("market", "RuntimeError"))
     ]

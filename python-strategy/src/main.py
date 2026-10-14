@@ -253,7 +253,7 @@ def main(spider_composition: SpiderRuntimeComposition | None = None):
     engine = None
     adapter = None
     spider_owner_ref: list[SpiderRuntimeOwner | None] = [None]
-    market_source_cleanup = None
+    source_cleanups: list[tuple[str, Any]] = []
     clean_exit = False
     try:
         consumer.acquire_service_ownership()
@@ -384,7 +384,15 @@ def main(spider_composition: SpiderRuntimeComposition | None = None):
             cleanup = spider_composition.register_market_source(owner.receive_source_market)
             if not callable(cleanup):
                 raise TypeError("Spider market source registrar must return cleanup")
-            market_source_cleanup = cleanup
+            source_cleanups.append(("market", cleanup))
+        if spider_composition is not None and spider_composition.register_time_source is not None:
+            owner = spider_owner_ref[0]
+            if owner is None:
+                raise RuntimeError("SPIDER_OWNER_UNAVAILABLE")
+            cleanup = spider_composition.register_time_source(owner.receive_source_time)
+            if not callable(cleanup):
+                raise TypeError("Spider time source registrar must return cleanup")
+            source_cleanups.append(("time", cleanup))
         consumer.configure_callbacks(
             on_message_callback=engine.on_market_data,
             channel_provider=engine.build_stream_channels,
@@ -394,12 +402,13 @@ def main(spider_composition: SpiderRuntimeComposition | None = None):
         clean_exit = True
     finally:
         try:
-            if market_source_cleanup is not None:
+            for source_kind, cleanup in reversed(source_cleanups):
                 try:
-                    market_source_cleanup()
+                    cleanup()
                 except Exception as cleanup_error:
                     logger.warning(
-                        "Spider market source cleanup failed: %s",
+                        "Spider %s source cleanup failed: %s",
+                        source_kind,
                         type(cleanup_error).__name__,
                     )
             if engine is not None:
