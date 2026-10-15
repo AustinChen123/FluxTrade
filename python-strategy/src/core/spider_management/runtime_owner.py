@@ -137,7 +137,7 @@ class _BatchResponseClassifier(Protocol):
 
 
 class _ProfilePrerequisite(Protocol):
-    def __call__(self, request_payload: bytes, now_ms: int) -> bool: ...
+    def __call__(self, request_payload: bytes, now_ms: int, /) -> bool: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,6 +155,7 @@ class SpiderRuntimeComposition:
     model_sources_by_confirmation: Mapping[str, ModelInstallSource]
     register_market_source: Callable[[Callable[[bytes], CommandResult]], Callable[[], None]] | None = None
     register_time_source: Callable[[Callable[[bytes], CommandResult]], Callable[[], None]] | None = None
+    profile_prerequisite: Callable[[bytes, int], bool] | None = None
 
     def __post_init__(self) -> None:
         if type(self.owned_scopes) is not tuple or not self.owned_scopes:
@@ -167,6 +168,8 @@ class SpiderRuntimeComposition:
             raise ValueError("Spider market source registrar must be callable")
         if self.register_time_source is not None and not callable(self.register_time_source):
             raise ValueError("Spider time source registrar must be callable")
+        if self.profile_prerequisite is not None and not callable(self.profile_prerequisite):
+            raise ValueError("Spider profile prerequisite must be callable")
         object.__setattr__(
             self,
             "model_sources_by_confirmation",

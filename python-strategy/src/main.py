@@ -362,6 +362,7 @@ def main(spider_composition: SpiderRuntimeComposition | None = None):
                     lifecycle_lock=engine._strategy_lifecycle_lock,
                     order_event_lock=engine.execution_engine._order_event_apply_lock,
                     transport_response_classifier=transport_response_classifier,
+                    profile_prerequisite=spider_composition.profile_prerequisite,
                 )
                 spider_owner_ref[0] = owner
         except Exception:
