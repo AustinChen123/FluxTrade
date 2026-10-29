@@ -555,10 +555,13 @@ def _execute_historical(store, attempt, run: _HistoricalRunInput):
     configuration = attempt["configuration_context"]
     historical = attempt["historical_context"]
 
-    def capture(cutoff, prefix):
-        return _normalized(composition.capture_owner_evidence(
-            cutoff, *_owner_requests(composition._account, cutoff, prefix),
-        ))
+    def capture(cutoff, prefix, *, include_scheduler=False):
+        requests = _owner_requests(composition._account, cutoff, prefix)
+        if include_scheduler:
+            captured = composition.capture_owner_evidence(cutoff, *requests)
+        else:
+            captured = dict(owner_evidence=composition._capture_owner_evidence_core(cutoff, *requests))
+        return _normalized(captured)
 
     def persist(kind, key, observed):
         nonlocal previous_owner, closed
@@ -621,7 +624,7 @@ def _execute_historical(store, attempt, run: _HistoricalRunInput):
         if not closed:
             store.publish_failure(reason, primary)
         return reason
-    final_capture = capture(cutoff, "FINAL")
+    final_capture = capture(cutoff, "FINAL", include_scheduler=True)
     status = store._status("RUNNING")
     artifacts = _build(
         run.run_id, attempt, status, journal, initial, final_capture["owner_evidence"],

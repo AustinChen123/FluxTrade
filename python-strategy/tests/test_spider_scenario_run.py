@@ -563,7 +563,7 @@ def test_historical_post_mutation_capture_failure_preserves_unpersisted_frontier
 ):
     value, raw = historical_input(f"capture-failure-{capture_site.lower()}",
                                   partial_fill=capture_site == "HISTORICAL_MARKET_RESULT")
-    original_capture = run._ReplayComposition.capture_owner_evidence
+    original_capture = run._ReplayComposition._capture_owner_evidence_core
     original_group = wire.ScenarioCodec.apply_group
     original_market = wire.ScenarioCodec.historical_market_step
     mutation = []
@@ -597,7 +597,7 @@ def test_historical_post_mutation_capture_failure_preserves_unpersisted_frontier
             fail_market_capture[0] = True
         return result
 
-    monkeypatch.setattr(run._ReplayComposition, "capture_owner_evidence", capture)
+    monkeypatch.setattr(run._ReplayComposition, "_capture_owner_evidence_core", capture)
     monkeypatch.setattr(wire.ScenarioCodec, "apply_group", apply_group)
     monkeypatch.setattr(wire.ScenarioCodec, "historical_market_step", market_step)
     result = run.run_spider_scenario(str(tmp_path), value.run_id, run._P3_SELECTOR, raw)

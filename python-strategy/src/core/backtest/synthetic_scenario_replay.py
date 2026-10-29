@@ -574,8 +574,8 @@ class _ReplayComposition:
                            polls=sorted(polls, key=lambda row: (row["poll_id"], row["continuation_id"])), callback_actions=actions)
         return deepcopy(observation)
 
-    def capture_owner_evidence(self, cutoff, trading_request, positions_request, open_orders_request):
-        """Observe the owner and scheduler without dispatching or emitting a barrier."""
+    def _capture_owner_evidence_core(self, cutoff, trading_request, positions_request, open_orders_request):
+        """Observe owner state without dispatching or rendering scheduler history."""
         _poll_check(type(cutoff) is int and 0 <= cutoff < 2**63)
         requests = deepcopy((trading_request, positions_request, open_orders_request))
         for kind, request in zip(("TRADING", "POSITIONS", "OPEN_ORDERS"), requests, strict=True):
@@ -586,6 +586,13 @@ class _ReplayComposition:
         for kind, request in zip(("trading", "positions", "open_orders"), requests, strict=True):
             owner[kind + "_request"] = request
             owner[kind + "_fact"] = self._codec.capture_snapshot(deepcopy(request))
+        return owner
+
+    def capture_owner_evidence(self, cutoff, trading_request, positions_request, open_orders_request):
+        """Observe the owner and scheduler without dispatching or emitting a barrier."""
+        owner = self._capture_owner_evidence_core(
+            cutoff, trading_request, positions_request, open_orders_request,
+        )
         observation = self._public_scheduler_observation()
         return deepcopy(dict(owner_evidence=owner, scheduler_observation=observation))
 
