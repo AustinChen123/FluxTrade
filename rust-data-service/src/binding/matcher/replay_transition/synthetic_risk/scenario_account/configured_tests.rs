@@ -530,7 +530,12 @@ fn configured_multi_version_identity_covers_inactive_timelines_causally() {
         |p| {
             p.marks.remove(0);
         },
-        |p| p.marks.push(p.marks[0].clone()),
+        |p| {
+            let mut inactive = p.marks[0].clone();
+            inactive.valid_from = 210;
+            inactive.valid_to = 220;
+            p.marks.push(inactive);
+        },
         |p| p.specs.reverse(),
         |p| p.tiers.reverse(),
         |p| p.marks.reverse(),
@@ -550,6 +555,20 @@ fn configured_multi_version_identity_covers_inactive_timelines_causally() {
         |p| p.marks[0].price = d("100.0"),
     ];
     assert_timeline_scale_equivalent(&seed, &product, scales);
+}
+
+#[test]
+fn configured_multi_version_identity_rejects_duplicate_mark_history() {
+    let (seed, mut product) = multi_version_input();
+    product.marks.push(product.marks[0].clone());
+    assert_eq!(
+        context_id_vec(
+            &configured_scenario(d("10"), &[product.clone()]),
+            &product.marks,
+            seed.effective_at,
+        ),
+        Err("OVERLAPPING_MARKS")
+    );
 }
 #[test]
 fn configured_multi_version_rejects_invalid_timeline_shapes_before_owner() {
