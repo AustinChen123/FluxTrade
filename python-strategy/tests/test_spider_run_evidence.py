@@ -917,6 +917,212 @@ def test_callback_matching_complete_result_unique_whole_row(matches):
     reconciliation(actual)
 
 
+def test_actions_index_matches_ordered_scan_and_uses_fast_path(monkeypatch):
+    first = dict(record_kind="SOURCE_GROUP_RESULT", journal_seq=4,
+                 payload=dict(result=dict(group_id="g", value=1)))
+    second = dict(record_kind="SOURCE_GROUP_RESULT", journal_seq=7,
+                  payload=dict(result=dict(group_id="g", value=2)))
+    actions = [dict(delivery_id="d1", event_index=0, action_index=0, group_id="g", status="SUBMITTED",
+                    group_result=dict(group_id="g", value=2)),
+               dict(delivery_id="d2", event_index=1, action_index=1, group_id="g", status="SUBMITTED",
+                    group_result=dict(group_id="g", value=1))]
+    fallbacks = 0
+    original = evidence._actions_original
+
+    def count_fallback(journal, observed):
+        nonlocal fallbacks
+        fallbacks += 1
+        return original(journal, observed)
+
+    monkeypatch.setattr(evidence, "_actions_original", count_fallback)
+    assert evidence._actions([first, second], actions) == original([first, second], actions)
+    assert [row["group_result_ref"] for row in evidence._actions([first, second], actions)] == ["journal:7", "journal:4"]
+    assert fallbacks == 0
+
+
+@pytest.mark.parametrize("journal,actions", [
+    ([dict(record_kind="SOURCE_GROUP_RESULT", journal_seq=1, payload=dict(result=dict(group_id="g", value=1)))],
+     [dict(delivery_id="d", event_index=0, action_index=0, group_id=[], status="SUBMITTED", group_result={})]),
+    ([], [dict(delivery_id="d", event_index=0, action_index=0, status="SUBMITTED")]),
+    ([{}], []),
+])
+def test_actions_index_malformed_inputs_match_verbatim_oracle(journal, actions):
+    def outcome(call):
+        try:
+            return ("return", call())
+        except Exception as error:
+            return ("raise", type(error), error.args)
+
+    assert outcome(lambda: evidence._actions(journal, actions)) == outcome(
+        lambda: evidence._actions_original(journal, actions))
+
+
+def test_actions_exception_fallback_discards_partial_index(monkeypatch):
+    journal = [dict(record_kind="SOURCE_GROUP_RESULT", journal_seq=1,
+                    payload=dict(result=dict(group_id="g", value="x")))]
+    actions = [dict(delivery_id="d", event_index=0, action_index=0, group_id="g", status="SUBMITTED",
+                    group_result=dict(group_id="g", value="x"))]
+    expected = evidence._actions_original(journal, actions)
+    original_equal = evidence._equal
+    calls = 0
+
+    def fail_once(left, right):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("fast-path-only")
+        return original_equal(left, right)
+
+    monkeypatch.setattr(evidence, "_equal", fail_once)
+    assert evidence._actions(journal, actions) == expected
+    assert calls == 2
+
+
+def test_actions_missing_group_result_precedes_later_malformed_source_result(monkeypatch):
+    journal = [dict(record_kind="SOURCE_GROUP_RESULT", journal_seq=1,
+                    payload=dict(result=dict(group_id="g", value="x"))),
+               dict(record_kind="SOURCE_GROUP_RESULT", journal_seq=2)]
+    actions = [dict(delivery_id="d", event_index=0, action_index=0, group_id="g", status="SUBMITTED")]
+    original = evidence._actions_original
+    fallback_calls = 0
+
+    def fallback(journal_rows, observed):
+        nonlocal fallback_calls
+        fallback_calls += 1
+        return original(journal_rows, observed)
+
+    monkeypatch.setattr(evidence, "_actions_original", fallback)
+    with pytest.raises(KeyError) as error:
+        evidence._actions(journal, actions)
+    assert error.value.args == ("group_result",)
+    assert fallback_calls == 1
+
+
+def test_deferred_action_index_differential_duplicates_and_fallback(monkeypatch):
+    key = dict(queue_class="DELIVERY", stable_id="d", schedule_sequence=1, visible_at=6)
+    callback = dict(record_kind="CALLBACK_RESULT", scheduler_key=key, payload=dict(
+        outcome="SUCCESS", delivery_id="d",
+        actions=[dict(event_index=0, action_index=0, status="UNSUBMITTED",
+        group_id=None, group_result=None, native_failure=None)]))
+    observation = dict(records=[dict(kind="DELIVERY", stable_id="d", classification="SUCCESS", key=key)],
+                       callback_actions=[dict(delivery_id="d", event_index=0, action_index=0, group_id=None,
+                       status="UNSUBMITTED", group_result=None, effective_at=19)], pending_keys=[])
+    original = evidence._historical_deferred_actions_compatible_original
+    fallbacks = 0
+
+    def count_fallback(journal, observed, cutoff):
+        nonlocal fallbacks
+        fallbacks += 1
+        return original(journal, observed, cutoff)
+
+    def outcome(call):
+        try:
+            return ("return", call())
+        except Exception as error:
+            return ("raise", type(error), error.args)
+
+    monkeypatch.setattr(evidence, "_historical_deferred_actions_compatible_original", count_fallback)
+    assert evidence._historical_deferred_actions_compatible([callback], observation, 6) is True
+    assert fallbacks == 0
+    duplicated = dict(observation, records=[*observation["records"], observation["records"][0]])
+    assert evidence._historical_deferred_actions_compatible([callback], duplicated, 6) == original([callback], duplicated, 6)
+    assert fallbacks == 0
+    malformed = dict(observation, records=[{}])
+    assert outcome(lambda: evidence._historical_deferred_actions_compatible([callback], malformed, 6)) == outcome(
+        lambda: original([callback], malformed, 6))
+    assert fallbacks == 1
+
+
+def test_action_fast_paths_leave_inputs_unchanged_on_success_and_fallback():
+    journal = [dict(record_kind="SOURCE_GROUP_RESULT", journal_seq=1,
+                    payload=dict(result=dict(group_id="g", value="x")))]
+    actions = [dict(delivery_id="d", event_index=0, action_index=0, group_id="g", status="SUBMITTED",
+                    group_result=dict(group_id="g", value="x"))]
+    before = deepcopy((journal, actions))
+    evidence._actions(journal, actions)
+    assert (journal, actions) == before
+
+    key = dict(queue_class="DELIVERY", stable_id="d", schedule_sequence=1, visible_at=6)
+    callback = dict(record_kind="CALLBACK_RESULT", scheduler_key=key, payload=dict(
+        outcome="SUCCESS", delivery_id="d", actions=[dict(event_index=0, action_index=0,
+        status="UNSUBMITTED", group_id=None, group_result=None, native_failure=None)]))
+    observation = dict(records=[dict(kind="DELIVERY", stable_id="d", classification="SUCCESS", key=key)],
+                       callback_actions=[dict(delivery_id="d", event_index=0, action_index=0, group_id=None,
+                       status="UNSUBMITTED", group_result=None, effective_at=19)], pending_keys=[])
+    before = deepcopy(([callback], observation))
+    evidence._historical_deferred_actions_compatible([callback], observation, 6)
+    assert ([callback], observation) == before
+    malformed_observation = dict(observation, records=[{}])
+    before = deepcopy(([callback], malformed_observation))
+    with pytest.raises(KeyError, match="kind"):
+        evidence._historical_deferred_actions_compatible([callback], malformed_observation, 6)
+    assert ([callback], malformed_observation) == before
+
+
+def test_actions_payload_dict_subclass_falls_back_without_fast_path_access(monkeypatch):
+    class Payload(dict):
+        touched = False
+
+        def __getitem__(self, key):
+            type(self).touched = True
+            raise AssertionError("fast path touched custom payload")
+
+    payload = Payload(result={"group_id": "g"})
+    journal = [{"record_kind": "SOURCE_GROUP_RESULT", "payload": payload}]
+    actions = []
+    original = evidence._actions_original
+    calls = []
+
+    def fallback(*args):
+        calls.append(args)
+        return original(*args)
+
+    monkeypatch.setattr(evidence, "_actions_original", fallback)
+    before = dict(payload)
+    def outcome(call):
+        try:
+            return ("value", call())
+        except Exception as exc:
+            return ("exception", type(exc), exc.args)
+    assert outcome(lambda: evidence._actions(journal, actions)) == outcome(lambda: original(journal, actions))
+    assert calls == [(journal, actions)]
+    assert Payload.touched is False
+    assert dict(payload) == before
+
+
+def test_deferred_payload_dict_subclass_falls_back_without_fast_path_access(monkeypatch):
+    class Payload(dict):
+        touched = False
+
+        def __getitem__(self, key):
+            type(self).touched = True
+            raise AssertionError("fast path touched custom payload")
+
+    payload = Payload(result={"group_id": "g"})
+    journal = [{"record_kind": "SOURCE_GROUP_RESULT", "payload": payload}]
+    observation = {"records": [], "callback_actions": [], "pending_keys": []}
+    original = evidence._historical_deferred_actions_compatible_original
+    calls = []
+
+    def fallback(*args):
+        calls.append(args)
+        return original(*args)
+
+    monkeypatch.setattr(evidence, "_historical_deferred_actions_compatible_original", fallback)
+    before = dict(payload)
+    def outcome(call):
+        try:
+            return ("value", call())
+        except Exception as exc:
+            return ("exception", type(exc), exc.args)
+    assert outcome(lambda: evidence._historical_deferred_actions_compatible(journal, observation, 0)) == outcome(
+        lambda: original(journal, observation, 0)
+    )
+    assert calls == [(journal, observation, 0)]
+    assert Payload.touched is False
+    assert dict(payload) == before
+
+
 @pytest.mark.parametrize("status", ["SUBMITTED", "UNSUBMITTED"])
 def test_unresolved_nullable_callback_is_failed_not_projection_error(status):
     values = fixture()

@@ -35,6 +35,10 @@ _P2_SELECTOR = "SPIDER_P2_CONFIGURED_SCALE_V1"
 _P2_PLAN_SHA256 = "8235c952a5d199825a2a77842b03f49e213ef707c0f30b24d8bf623fde53c2b3"
 
 
+class _IndexFallback(Exception):
+    """Internal signal to discard a guarded index and use the original scan."""
+
+
 class ReconciliationProjectionError(ValueError):
     """Required evidence cannot be represented by the frozen eleven shapes."""
 
@@ -654,15 +658,9 @@ def _historical_polls_endpoint_mode_compatible_indexed(
     return True
 
 
-def _historical_poll_fast_path_inputs_safe(
-    observation: _Any, cutoff: _Any, paid_prefix: _Any, allow_terminal_delivery: _Any,
-) -> bool:
-    """Validate the complete JSON-like input graph before any indexed-path reads."""
-    if type(cutoff) is not int or (paid_prefix is not None and type(paid_prefix) is not str):
-        return False
-    if type(allow_terminal_delivery) is not bool:
-        return False
-    stack = [observation]
+def _exact_json_builtin_graph(*values: _Any) -> bool:
+    """Accept only recursively exact JSON builtin values without invoking hooks."""
+    stack = list(values)
     visited: set[int] = set()
     while stack:
         value = stack.pop()
@@ -687,6 +685,19 @@ def _historical_poll_fast_path_inputs_safe(
                     return False
                 stack.append(item)
             continue
+        return False
+    return True
+
+
+def _historical_poll_fast_path_inputs_safe(
+    observation: _Any, cutoff: _Any, paid_prefix: _Any, allow_terminal_delivery: _Any,
+) -> bool:
+    """Validate the complete JSON-like input graph before any indexed-path reads."""
+    if not _exact_json_builtin_graph(observation, cutoff, paid_prefix, allow_terminal_delivery):
+        return False
+    if type(cutoff) is not int or (paid_prefix is not None and type(paid_prefix) is not str):
+        return False
+    if type(allow_terminal_delivery) is not bool:
         return False
     if type(observation) is not dict:
         return False
@@ -810,7 +821,7 @@ def _digests(sites: list[tuple]) -> list[dict[str, _Any]]:
             for stage, _, owner, first in sites]
 
 
-def _actions(journal: list[dict[str, _Any]], actions: list[dict[str, _Any]]) -> list[dict[str, _Any]]:
+def _actions_original(journal: list[dict[str, _Any]], actions: list[dict[str, _Any]]) -> list[dict[str, _Any]]:
     projected = []
     for action in actions:
         matches = [row for row in journal if row["record_kind"] == "SOURCE_GROUP_RESULT"
@@ -823,7 +834,54 @@ def _actions(journal: list[dict[str, _Any]], actions: list[dict[str, _Any]]) -> 
     return projected
 
 
-def _historical_deferred_actions_compatible(
+def _actions(journal: list[dict[str, _Any]], actions: list[dict[str, _Any]]) -> list[dict[str, _Any]]:
+    """Project actions with a guarded, per-call source-result index."""
+    try:
+        if not _exact_json_builtin_graph(journal, actions):
+            raise _IndexFallback()
+        sources: dict[str, list[dict[str, _Any]]] = {}
+        source_count = 0
+        for row in journal:
+            if type(row) is not dict or "record_kind" not in row:
+                raise _IndexFallback()
+            kind = row["record_kind"]
+            if type(kind) is not str:
+                raise _IndexFallback()
+            if kind != "SOURCE_GROUP_RESULT":
+                continue
+            if "payload" not in row or type(row["payload"]) is not dict:
+                raise _IndexFallback()
+            payload = row["payload"]
+            if "result" not in payload or type(payload["result"]) is not dict:
+                raise _IndexFallback()
+            result = payload["result"]
+            if "group_id" not in result or type(result["group_id"]) is not str:
+                raise _IndexFallback()
+            sources.setdefault(result["group_id"], []).append(row)
+            source_count += 1
+
+        projected = []
+        for action in actions:
+            matches = []
+            if action["status"] == "SUBMITTED" and source_count:
+                group_id = action["group_id"]
+                if type(group_id) is not str:
+                    raise _IndexFallback()
+                for row in sources.get(group_id, []):
+                    if _equal(row["payload"]["result"], action["group_result"]):
+                        matches.append(row)
+            projected.append(dict(delivery_id=action["delivery_id"], event_index=action["event_index"], action_index=action["action_index"],
+                                  group_id=action["group_id"], status=action["status"], cancel_effect_ref=None,
+                                  group_result_ref=f"journal:{matches[0]['journal_seq']}" if len(matches) == 1 else None,
+                                  **({"effective_at": action["effective_at"]} if "effective_at" in action else {})))
+        return projected
+    except _IndexFallback:
+        return _actions_original(journal, actions)
+    except Exception:
+        return _actions_original(journal, actions)
+
+
+def _historical_deferred_actions_compatible_original(
     journal: list[dict[str, _Any]], observation: dict[str, _Any], cutoff: int,
 ) -> bool:
     records = observation["records"]
@@ -906,6 +964,135 @@ def _historical_deferred_actions_compatible(
         if action["effective_at"] != expected_effective_at or expected_effective_at <= cutoff:
             return False
     return True
+
+
+def _historical_deferred_actions_compatible(
+    journal: list[dict[str, _Any]], observation: dict[str, _Any], cutoff: int,
+) -> bool:
+    """Validate deferred actions with guarded per-call lookup indexes."""
+    try:
+        if not _exact_json_builtin_graph(journal, observation, cutoff):
+            raise _IndexFallback()
+        records = observation["records"]
+        callback_actions_observed = observation["callback_actions"]
+        pending_keys = observation["pending_keys"]
+        if (type(records) is not list or type(callback_actions_observed) is not list
+                or type(pending_keys) is not list):
+            raise _IndexFallback()
+
+        parents_by_id: dict[str, list[dict[str, _Any]]] = {}
+        groups_by_id: dict[str, list[dict[str, _Any]]] = {}
+        for record in records:
+            if type(record) is not dict or "kind" not in record or type(record["kind"]) is not str:
+                raise _IndexFallback()
+            if record["kind"] == "DELIVERY":
+                if "stable_id" not in record or type(record["stable_id"]) is not str:
+                    raise _IndexFallback()
+                parents_by_id.setdefault(record["stable_id"], []).append(record)
+            elif record["kind"] == "SOURCE_GROUP":
+                if "stable_id" not in record or type(record["stable_id"]) is not str:
+                    raise _IndexFallback()
+                groups_by_id.setdefault(record["stable_id"], []).append(record)
+        pending_by_group: dict[str, list[dict[str, _Any]]] = {}
+        for key in pending_keys:
+            if type(key) is not dict or "queue_class" not in key or type(key["queue_class"]) is not str:
+                raise _IndexFallback()
+            if key["queue_class"] == "SOURCE_GROUP":
+                if "stable_id" not in key or type(key["stable_id"]) is not str:
+                    raise _IndexFallback()
+                pending_by_group.setdefault(key["stable_id"], []).append(key)
+
+        observed_actions = {}
+        for action in callback_actions_observed:
+            identity = (action["delivery_id"], action["event_index"], action["action_index"])
+            if identity in observed_actions:
+                return False
+            observed_actions[identity] = action
+
+        callback_actions = {}
+        callback_rows = {}
+        source_results_by_group: dict[str, list[dict[str, _Any]]] = {}
+        for row in journal:
+            if type(row) is not dict or "record_kind" not in row or type(row["record_kind"]) is not str:
+                raise _IndexFallback()
+            if row["record_kind"] == "SOURCE_GROUP_RESULT":
+                payload = row["payload"]
+                result = payload["result"]
+                if type(result["group_id"]) is not str:
+                    raise _IndexFallback()
+                source_results_by_group.setdefault(result["group_id"], []).append(row)
+            if row["record_kind"] != "CALLBACK_RESULT":
+                continue
+            callback = row["payload"]
+            for item in callback["actions"]:
+                identity = (callback["delivery_id"], item["event_index"], item["action_index"])
+                if identity in callback_actions:
+                    return False
+                callback_actions[identity] = item
+                callback_rows[identity] = row
+        if observed_actions.keys() != callback_actions.keys():
+            return False
+
+        for identity, action in observed_actions.items():
+            callback_action, callback = callback_actions[identity], callback_rows[identity]
+            if (callback["payload"]["outcome"] != "SUCCESS"
+                    or callback["payload"]["delivery_id"] != identity[0]
+                    or callback_action["status"] != "UNSUBMITTED"
+                    or callback_action["group_id"] != action["group_id"]
+                    or callback_action.get("group_result") is not None
+                    or callback_action.get("native_failure") is not None
+                    or action.get("native_failure") is not None):
+                return False
+            delivery_id = action["delivery_id"]
+            parents = parents_by_id.get(delivery_id, []) if type(delivery_id) is str else []
+            if type(delivery_id) is not str and any(record["kind"] == "DELIVERY" for record in records):
+                raise _IndexFallback()
+            if len(parents) != 1 or parents[0]["classification"] != "SUCCESS":
+                return False
+            parent_key = parents[0]["key"]
+            if callback["scheduler_key"] != parent_key:
+                return False
+            visible_at = parent_key["visible_at"]
+            if visible_at > cutoff or visible_at < 6 or visible_at % 16 != 6:
+                return False
+
+            group_id = action["group_id"]
+            if action["status"] == "SUBMITTED":
+                if "effective_at" in action or group_id is None or action.get("group_result") is None:
+                    return False
+                if type(group_id) is not str and source_results_by_group:
+                    raise _IndexFallback()
+                matches = source_results_by_group.get(group_id, []) if type(group_id) is str else []
+                if (len(matches) != 1
+                        or not _equal(matches[0]["payload"]["result"], action["group_result"])):
+                    return False
+                continue
+
+            if action["status"] != "UNSUBMITTED" or action.get("group_result") is not None:
+                return False
+            if group_id is not None:
+                if "effective_at" in action:
+                    return False
+                if type(group_id) is not str and (groups_by_id or pending_by_group):
+                    raise _IndexFallback()
+                group_records = groups_by_id.get(group_id, []) if type(group_id) is str else []
+                group_keys = pending_by_group.get(group_id, []) if type(group_id) is str else []
+                if (len(group_records) != 1 or group_records[0]["classification"] != "PENDING"
+                        or len(group_keys) != 1 or group_records[0]["key"] != group_keys[0]
+                        or group_keys[0]["visible_at"] <= cutoff):
+                    return False
+                continue
+
+            if "effective_at" not in action:
+                return False
+            expected_effective_at = (((visible_at - 6) // 16) + 1) * 16 + 3
+            if action["effective_at"] != expected_effective_at or expected_effective_at <= cutoff:
+                return False
+        return True
+    except _IndexFallback:
+        return _historical_deferred_actions_compatible_original(journal, observation, cutoff)
+    except Exception:
+        return _historical_deferred_actions_compatible_original(journal, observation, cutoff)
 
 
 def _terminal(policy: str, endpoint: dict[str, _Any]) -> dict[str, _Any]:
