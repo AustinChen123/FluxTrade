@@ -1,9 +1,12 @@
 """The single pure reconciliation projection/predicate owner; never admission."""
 
 from copy import deepcopy as _copy
+from enum import Enum as _Enum
 from hashlib import sha256 as _sha256
 from struct import pack as _pack
 from typing import Any as _Any
+from typing import Final as _Final
+from typing import Literal as _Literal
 from typing import cast as _cast
 
 from src.core.backtest.spider_policy_protocol import (
@@ -442,7 +445,13 @@ def _historical_polls_endpoint_mode_compatible_original(
     return True
 
 
-_HISTORICAL_FAST_PATH_FALLBACK = object()
+class _HistoricalFastPathFallback(_Enum):
+    FALLBACK = "fallback"
+
+
+_HISTORICAL_FAST_PATH_FALLBACK: _Final[_HistoricalFastPathFallback] = (
+    _HistoricalFastPathFallback.FALLBACK
+)
 
 
 def _historical_polls_endpoint_mode_compatible(
@@ -468,7 +477,7 @@ def _historical_polls_endpoint_mode_compatible(
 def _historical_polls_endpoint_mode_compatible_fast(
     observation: dict[str, _Any], cutoff: int, mode: _HistoricalSequenceMode,
     paid_prefix: str | None = None, allow_terminal_delivery: bool = False,
-) -> bool:
+) -> bool | _Literal[_HistoricalFastPathFallback.FALLBACK]:
     """Indexed fast path with a whole-call fallback to the historical checker."""
     if (mode is not _HistoricalSequenceMode.LEGACY_SHARED_SEQUENCE_V1
             and mode is not _HistoricalSequenceMode.HISTORICAL_DISJOINT_SEQUENCE_V1):
