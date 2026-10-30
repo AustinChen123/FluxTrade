@@ -65,7 +65,7 @@ fn min_cash_execution_metadata_is_frozen_across_context_and_duplicates() {
     );
     use super::super::super::context::tests::{activation, mark_rows};
     let (_, marks) = owner.btc_context().unwrap();
-    let change = activation(&owner, 503, mark_rows(marks.as_slice(), 503));
+    let change = activation(&owner, 503, mark_rows(marks, 503));
     owner.activate_context(&change).unwrap();
     let before = owner.clone();
     assert_eq!(
@@ -609,7 +609,7 @@ fn long_and_short_golden_fifo_runs_use_actual_commits() {
                 let (scenario, marks) = owner.btc_context().unwrap();
                 assert_eq!(
                     scenario
-                        .evaluate(&owner.projection().unwrap(), marks.as_slice())
+                        .evaluate(&owner.projection().unwrap(), marks)
                         .unwrap()
                         .equity
                         - owner.cash,

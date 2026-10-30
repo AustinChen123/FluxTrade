@@ -31,7 +31,7 @@ pub(in super::super) fn activation(owner: &ScenarioAccount, at: i64, rows: Rows)
         expected_before: owner.valuation_context_id,
         expected_after: owner_context_id_with_policy(
             scenario,
-            marks.as_slice(),
+            marks,
             at,
             owner.seed_effective_at,
             &owner.config_id,
@@ -44,19 +44,20 @@ pub(in super::super) fn activation(owner: &ScenarioAccount, at: i64, rows: Rows)
     }
 }
 
-pub(in super::super) fn mark_rows(marks: &[Mark], at: i64) -> Rows {
+pub(in super::super) fn mark_rows(marks: &mark_history::MarkHistory, at: i64) -> Rows {
     Rows::Marks(
         [Product::Btc, Product::Eth]
             .into_iter()
             .map(|p| {
-                let m = marks
-                    .iter()
-                    .find(|m| m.product == p && m.valid_from <= at && at < m.valid_to)
-                    .unwrap();
+                let m = marks.mark_at(&p, at).unwrap();
                 (p, m.valid_from, m.valid_to, m.price)
             })
             .collect(),
     )
+}
+
+pub(in super::super) fn mark_rows_vec(marks: &[Mark], at: i64) -> Rows {
+    mark_rows(&mark_history::MarkHistory::from_vec(marks.to_vec()), at)
 }
 
 fn configured_mark_rows(owner: &ScenarioAccount, at: i64) -> Rows {
@@ -66,11 +67,7 @@ fn configured_mark_rows(owner: &ScenarioAccount, at: i64) -> Rows {
             .products()
             .into_iter()
             .map(|product| {
-                let row = marks
-                    .as_slice()
-                    .iter()
-                    .find(|m| m.product == product && m.valid_from <= at && at < m.valid_to)
-                    .unwrap();
+                let row = marks.mark_at(&product, at).unwrap();
                 (product, row.valid_from, row.valid_to, row.price)
             })
             .collect(),
@@ -412,9 +409,9 @@ fn configured_mark_shortfall_commits_source_then_waits_for_cancel_effect_before_
         })
         .collect::<Vec<_>>();
     let old_counterfactual =
-        reservation::calculate(&projection, &orders, scenario, &old_marks).unwrap();
+        reservation::calculate_vec(&projection, &orders, scenario, &old_marks).unwrap();
     let new_counterfactual =
-        reservation::calculate(&projection, &orders, scenario, marks.as_slice()).unwrap();
+        reservation::calculate_vec(&projection, &orders, scenario, marks.as_slice()).unwrap();
     assert_eq!(
         (
             old_counterfactual.equity,
@@ -500,8 +497,24 @@ fn exact_mmr_boundary_requests_reducing_order_and_stops_only_after_effect() {
             valid_to: 3000,
         });
         let mut owner = ScenarioAccount::from_seed(&seed, &config, &marks).unwrap();
-        let input = activation(&owner, 600, mark_rows(&marks, 600));
+        let input = activation(&owner, 600, mark_rows_vec(&marks, 600));
         let receipt = owner.activate_context(&input).unwrap();
+        for (index, product) in [Product::Btc, Product::Eth].into_iter().enumerate() {
+            let old = marks
+                .iter()
+                .find(|mark| {
+                    mark.product == product && mark.valid_from <= 599 && 599 < mark.valid_to
+                })
+                .unwrap();
+            let new = marks
+                .iter()
+                .find(|mark| {
+                    mark.product == product && mark.valid_from <= 600 && 600 < mark.valid_to
+                })
+                .unwrap();
+            assert_eq!(&receipt.rows_before[index].2, old);
+            assert_eq!(&receipt.rows_after[index].2, new);
+        }
         assert_eq!(receipt.after.equity, d(equity));
         assert_eq!(receipt.after.maintenance_margin, d("2"));
         assert_eq!(receipt.after.used_margin, d("50.5"));
@@ -705,7 +718,7 @@ fn cross_product_pending_set_is_stable_after_first_effect_restores_margin() {
     );
     let mut owner = ScenarioAccount::from_seed(&seed, &config, &marks).unwrap();
     assert_eq!(owner.reservation().unwrap().used_margin, d("909"));
-    let input = activation(&owner, 600, mark_rows(&marks, 600));
+    let input = activation(&owner, 600, mark_rows_vec(&marks, 600));
     for stage in [
         Stage::RiskActionDrafted(0),
         Stage::RiskActionDrafted(1),
@@ -877,7 +890,7 @@ fn context_and_group_invalid_shape_and_fault_retention_are_atomic() {
     });
     let mut expired = ScenarioAccount::from_seed(&seed, &config, &boundary_marks).unwrap();
     let boundary = activation(&expired, 1000, input.rows.clone());
-    let later_mark = activation(&expired, 1000, mark_rows(&boundary_marks, 1000));
+    let later_mark = activation(&expired, 1000, mark_rows_vec(&boundary_marks, 1000));
     let mut invalid = group.clone();
     invalid.members = vec![
         Member {

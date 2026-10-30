@@ -363,7 +363,7 @@ fn reducing_stress_uses_actual_fee_and_preserves_input() {
         projection.cash = add(projection.cash, draft.cash_delta).unwrap();
         projection.positions[0].contracts = position.contracts;
         projection.positions[0].lots[0].contracts = position.contracts;
-        let value = config.evaluate(&projection, &marks).unwrap();
+        let value = config.evaluate_vec(&projection, &marks).unwrap();
         assert_eq!(
             (
                 value.equity,
@@ -494,7 +494,7 @@ fn strict_stress_threshold_equalities_remain_visible_to_future_admission() {
         projection.cash = add(projection.cash, draft.cash_delta).unwrap();
         projection.positions[0].contracts = d("0.5");
         projection.positions[0].lots[0].contracts = d("0.5");
-        let after = config.evaluate(&projection, &marks).unwrap();
+        let after = config.evaluate_vec(&projection, &marks).unwrap();
         assert_eq!(
             (after.equity, after.maintenance_margin),
             (d(equity), d(mmr))

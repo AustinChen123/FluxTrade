@@ -23,7 +23,7 @@ mod group;
 mod historical;
 mod hypothetical_settlement;
 mod inspection;
-mod mark_history;
+pub(super) mod mark_history;
 mod min_cash;
 mod reservation;
 mod risk_transition;
@@ -284,13 +284,26 @@ fn product_id(product: &Product) -> &str {
     product.0.as_ref()
 }
 
-fn context_id(scenario: &FrozenScenario, marks: &[Mark], at: i64) -> Result<Hash, Fault> {
+#[cfg(test)]
+fn context_id_vec(scenario: &FrozenScenario, marks: &[Mark], at: i64) -> Result<Hash, Fault> {
+    context_id(
+        scenario,
+        &mark_history::MarkHistory::from_vec(marks.to_vec()),
+        at,
+    )
+}
+
+fn context_id(
+    scenario: &FrozenScenario,
+    marks: &mark_history::MarkHistory,
+    at: i64,
+) -> Result<Hash, Fault> {
     context_id_at(scenario, marks, at, at)
 }
 
 fn owner_context_id(
     scenario: &FrozenScenario,
-    marks: &[Mark],
+    marks: &mark_history::MarkHistory,
     active_at: i64,
     seed_effective_at: i64,
     config_id: &str,
@@ -307,7 +320,7 @@ fn owner_context_id(
 
 fn owner_context_id_with_policy(
     scenario: &FrozenScenario,
-    marks: &[Mark],
+    marks: &mark_history::MarkHistory,
     active_at: i64,
     seed_effective_at: i64,
     config_id: &str,
@@ -332,17 +345,14 @@ fn owner_context_id_with_policy(
 
 fn context_id_at(
     scenario: &FrozenScenario,
-    marks: &[Mark],
+    marks: &mark_history::MarkHistory,
     active_at: i64,
     encoded_at: i64,
 ) -> Result<Hash, Fault> {
     let mut fields = Vec::new();
     for product in scenario.products() {
         let (spec, tier) = scenario.resolve(&product, active_at)?;
-        let mark = marks
-            .iter()
-            .find(|m| m.product == product && m.valid_from <= active_at && active_at < m.valid_to)
-            .ok_or("MARK_COVERAGE_MISSING")?;
+        let mark = marks.mark_at(&product, active_at)?;
         fields.extend([
             Some(product_id(&product).into()),
             Some(spec.version.clone()),
@@ -539,7 +549,7 @@ impl ScenarioAccount {
             &self.projection()?,
             &self.orders.values().map(|o| &o.facts).collect::<Vec<_>>(),
             scenario,
-            marks.as_slice(),
+            marks,
             self.is_gross_admission_profile(),
         )
     }
@@ -586,9 +596,10 @@ impl ScenarioAccount {
         marks: &[Mark],
         gross_admission_profile: bool,
     ) -> Result<Self, Fault> {
+        let marks = mark_history::MarkHistory::from_vec(marks.to_vec());
         let valuation_context_id = owner_context_id_with_policy(
             &scenario,
-            marks,
+            &marks,
             seed.effective_at,
             seed.effective_at,
             &seed.config_id,
@@ -716,7 +727,7 @@ impl ScenarioAccount {
                 p1_liquidation_profile: false,
                 gross_admission_profile,
                 scenario,
-                marks: mark_history::MarkHistory::from_vec(marks.to_vec()),
+                marks,
             },
             valuation_context_id,
             seed_effective_at: seed.effective_at,
@@ -738,11 +749,7 @@ impl ScenarioAccount {
             transition: Default::default(),
         };
         let (scenario, marks) = owner.btc_context()?;
-        if scenario
-            .evaluate(&owner.projection()?, marks.as_slice())?
-            .risk
-            != MaintenanceState::Safe
-        {
+        if scenario.evaluate(&owner.projection()?, marks)?.risk != MaintenanceState::Safe {
             return Err("SEED_MMR_BREACH");
         }
         owner.reservation()?;
@@ -787,7 +794,7 @@ impl ScenarioAccount {
                 ..
             } => owner_context_id_with_policy(
                 scenario,
-                marks.as_slice(),
+                marks,
                 effective_at,
                 self.seed_effective_at,
                 &self.config_id,

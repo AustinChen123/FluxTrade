@@ -37,7 +37,7 @@ fn group_mixed_account_children_fail_before_valid_prior_member() {
             account_key: original.key.clone(),
             stamp: source::stamp("prior", 500, 20),
             expected_before: original.valuation_context_id,
-            expected_after: context_id(&config, &marks, 500).unwrap(),
+            expected_after: context_id_vec(&config, &marks, 500).unwrap(),
             rows: context::Rows::Marks(
                 next.iter()
                     .map(|m| (m.product.clone(), m.valid_from, m.valid_to, m.price))

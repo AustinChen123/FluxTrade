@@ -24,7 +24,7 @@ pub(in super::super::super) fn run_with_panic(
         valid_to: 3000,
     });
     let mut owner = ScenarioAccount::from_seed(&seed, &config, &marks).unwrap();
-    let input = context::tests::activation(&owner, 501, context::tests::mark_rows(&marks, 501));
+    let input = context::tests::activation(&owner, 501, context::tests::mark_rows_vec(&marks, 501));
     let group = Group {
         group_id: "actual".into(),
         account_key: owner.key.clone(),

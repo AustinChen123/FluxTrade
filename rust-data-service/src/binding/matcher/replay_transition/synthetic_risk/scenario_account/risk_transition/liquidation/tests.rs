@@ -1,12 +1,12 @@
 use super::super::super::tests::{d, fixture};
 use super::*;
-use context::tests::{activation, mark_rows};
+use context::tests::{activation, mark_rows, mark_rows_vec};
 
 // Consume the existing complete source draft at its pre-continuation boundary.
 // Production still publishes that same draft and takes the 4C-2 sentinel.
 pub(super) fn source_draft(owner: &ScenarioAccount, at: i64) -> ScenarioAccount {
     let (_, marks) = owner.btc_context().unwrap();
-    let mut input = activation(owner, at, mark_rows(marks.as_slice(), at));
+    let mut input = activation(owner, at, mark_rows(marks, at));
     input.stamp.event_id = format!("mark-{at}");
     let (receipt, draft) = owner.prepare_context(&input).unwrap();
     let draft = draft.unwrap();
@@ -143,7 +143,7 @@ fn long_short_exact_preparation_is_pure_and_integrated_result_reconciles() {
         }
         let mut production = initial;
         let (_, marks) = production.btc_context().unwrap();
-        let input = activation(&production, at + 1, mark_rows(marks.as_slice(), at + 1));
+        let input = activation(&production, at + 1, mark_rows(marks, at + 1));
         production.activate_context(&input).unwrap();
         assert_eq!(production.gate, Gate::Running);
         assert_eq!(
@@ -428,7 +428,7 @@ fn pending_cancel_and_invalid_preparation_inputs_fail_without_a_step() {
         valid_to: 3000,
     });
     let mut pending = ScenarioAccount::from_seed(&seed, &config, &marks).unwrap();
-    let input = activation(&pending, 600, mark_rows(&marks, 600));
+    let input = activation(&pending, 600, mark_rows_vec(&marks, 600));
     pending.activate_context(&input).unwrap();
     assert_eq!(
         pending.transition.lifecycle,
@@ -491,8 +491,7 @@ fn pending_cancel_and_invalid_preparation_inputs_fail_without_a_step() {
                         _ => unreachable!(),
                     });
                     if field == 5 {
-                        bad.valuation_context_id =
-                            context_id(scenario, updated.as_slice(), 501).unwrap();
+                        bad.valuation_context_id = context_id(scenario, &updated, 501).unwrap();
                     }
                     *marks = updated;
                 }

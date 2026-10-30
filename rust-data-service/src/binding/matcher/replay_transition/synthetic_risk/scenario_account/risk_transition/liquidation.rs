@@ -263,7 +263,7 @@ fn prepare_step(owner: &ScenarioAccount, history: &[Receipt]) -> Result<commit::
     if !risk.liquidation_required {
         return Err("INVALID_RISK_EPISODE");
     }
-    let valuation_before = scenario.evaluate(&before, marks.as_slice())?;
+    let valuation_before = scenario.evaluate(&before, marks)?;
     for (product, position) in owner.positions.btc()? {
         let (spec, _) = scenario.resolve(product, before.effective_at)?;
         let policy = if scenario.configured.is_some() {
@@ -397,7 +397,7 @@ fn prepare_step(owner: &ScenarioAccount, history: &[Receipt]) -> Result<commit::
             draft.positions.btc_mut()?.remove(&product);
         }
     }
-    let valuation_after = scenario.evaluate(&draft.projection()?, marks.as_slice())?;
+    let valuation_after = scenario.evaluate(&draft.projection()?, marks)?;
     let reservation_after = draft.reservation()?;
     let post_step_decision = StepDecision::from_valuation(&valuation_after);
     let mut receipt = Receipt {

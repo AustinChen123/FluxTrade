@@ -161,7 +161,7 @@ pub(super) fn current(owner: &ScenarioAccount, kind: Kind) -> Result<Payload, Fa
                 PositionState::BtcEth(positions) => {
                     let (scenario, marks) = owner.btc_context()?;
                     let input = owner.projection()?;
-                    let value = scenario.evaluate(&input, marks.as_slice())?;
+                    let value = scenario.evaluate(&input, marks)?;
                     for v in value.products {
                         let p = &positions[&v.product];
                         let mark = marks

@@ -162,7 +162,7 @@ fn context_hash(
         .iter()
         .flat_map(|row| row.marks.iter().cloned())
         .collect::<Vec<_>>();
-    context_id(scenario, &marks, seed.effective_at).unwrap()
+    context_id_vec(scenario, &marks, seed.effective_at).unwrap()
 }
 
 fn configured_scenario(leverage: Decimal, products: &[ConfiguredProduct]) -> FrozenScenario {
@@ -720,7 +720,7 @@ fn configured_spec_tier_and_mark_boundaries_mismatch_independently() {
         before_spec,
         owner_context_id(
             &spec_owner.btc_context().unwrap().0,
-            spec_owner.btc_context().unwrap().1.as_slice(),
+            spec_owner.btc_context().unwrap().1,
             100,
             spec_owner.seed_effective_at,
             &spec_owner.config_id,
@@ -807,7 +807,7 @@ fn configured_two_product_mark_activation_updates_and_stabilizes_owner_identity(
         .flat_map(|row| row.marks.iter().cloned())
         .collect::<Vec<_>>();
     let activation =
-        context::tests::activation(&owner, 600, context::tests::mark_rows(&marks, 600));
+        context::tests::activation(&owner, 600, context::tests::mark_rows_vec(&marks, 600));
     let receipt = owner.activate_context(&activation).unwrap();
     assert_eq!(owner.valuation_context_id, activation.expected_after);
     assert_ne!(receipt.input.expected_before, receipt.input.expected_after);

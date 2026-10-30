@@ -6,6 +6,7 @@ use num_traits::{Pow, ToPrimitive, Zero};
 use rust_decimal::Decimal;
 
 use super::Fault;
+use scenario_account::mark_history::MarkHistory;
 
 mod configuration;
 use configuration::{frozen_spec, frozen_tiers, interval, ConfiguredProduct};
@@ -89,12 +90,12 @@ impl FrozenScenario {
     fn evaluate(
         &self,
         input: &ValuationInput,
-        marks: &[Mark],
+        marks: &MarkHistory,
     ) -> Result<IncompleteValuation, Fault> {
         if input.effective_at < 0 {
             return Err("INVALID_EFFECTIVE_TIME");
         }
-        validate_marks(marks)?;
+        validate_marks(marks.as_slice())?;
         let mut products = Vec::new();
         let mut equity_terms = vec![input.cash];
         let mut mmr = Decimal::ZERO;
@@ -113,14 +114,7 @@ impl FrozenScenario {
             {
                 return Err("INVALID_POSITION");
             }
-            let mark = marks
-                .iter()
-                .find(|m| {
-                    m.product == position.product
-                        && m.valid_from <= input.effective_at
-                        && input.effective_at < m.valid_to
-                })
-                .ok_or("MARK_COVERAGE_MISSING")?;
+            let mark = marks.mark_at(&position.product, input.effective_at)?;
             let (tier_index, tier) = if self.configured.is_some() {
                 configured_tier(
                     self,
@@ -195,6 +189,15 @@ impl FrozenScenario {
             exposure_margin: exposure,
             available_margin: add(equity, -exposure)?,
         })
+    }
+
+    #[cfg(test)]
+    fn evaluate_vec(
+        &self,
+        input: &ValuationInput,
+        marks: &[Mark],
+    ) -> Result<IncompleteValuation, Fault> {
+        self.evaluate(input, &MarkHistory::from_vec(marks.to_vec()))
     }
 }
 
@@ -558,12 +561,12 @@ mod tests {
         let first = mark(Product::Btc, "50000", 100, 200);
         for (at, valid) in [(99, false), (100, true), (199, true), (200, false)] {
             state.effective_at = at;
-            assert_eq!(config.evaluate(&state, &[first.clone()]).is_ok(), valid);
+            assert_eq!(config.evaluate_vec(&state, &[first.clone()]).is_ok(), valid);
         }
         state.effective_at = 200;
         let next = mark(Product::Btc, "51000", 200, 300);
         let value = config
-            .evaluate(&state, &[next.clone(), first.clone()])
+            .evaluate_vec(&state, &[next.clone(), first.clone()])
             .unwrap();
         assert_eq!(value.equity, d("1010"));
         assert_eq!(value.maintenance_margin, d("2.04"));
@@ -579,13 +582,39 @@ mod tests {
             vec![mark(Product::Btc, "-1", 100, 300)],
         ] {
             let before = (state.clone(), invalid.clone());
-            assert!(config.evaluate(&state, &invalid).is_err());
+            assert!(config.evaluate_vec(&state, &invalid).is_err());
             assert_eq!((state.clone(), invalid), before);
         }
         state.effective_at = 199;
         assert_eq!(
-            config.evaluate(&state, &[first, next]).unwrap().equity,
+            config.evaluate_vec(&state, &[first, next]).unwrap().equity,
             d("1000")
+        );
+    }
+
+    #[test]
+    fn evaluate_fault_precedence_checks_time_before_invalid_marks() {
+        let scenario = config();
+        let mut state = input("1000", vec![]);
+        state.effective_at = -1;
+        let invalid_marks = [mark(Product::Btc, "0", 0, 3000)];
+        assert_eq!(
+            scenario.evaluate(&state, &MarkHistory::from_vec(invalid_marks.to_vec())),
+            Err("INVALID_EFFECTIVE_TIME")
+        );
+        assert_eq!(
+            scenario.evaluate_vec(&state, &invalid_marks),
+            Err("INVALID_EFFECTIVE_TIME")
+        );
+
+        state.effective_at = 1000;
+        assert_eq!(
+            scenario.evaluate(&state, &MarkHistory::from_vec(invalid_marks.to_vec())),
+            Err("INVALID_MARK")
+        );
+        assert_eq!(
+            scenario.evaluate_vec(&state, &invalid_marks),
+            Err("INVALID_MARK")
         );
     }
 
@@ -600,7 +629,7 @@ mod tests {
             mark(Product::Eth, "1900", 0, 3000),
         ];
         let before = (config.clone(), state.clone(), marks.clone());
-        let result = config.evaluate(&state, &marks).unwrap();
+        let result = config.evaluate_vec(&state, &marks).unwrap();
         assert_eq!(
             (
                 result.equity,
@@ -630,13 +659,13 @@ mod tests {
             );
         }
         assert_eq!((config.clone(), state.clone(), marks.clone()), before);
-        assert_eq!(config.evaluate(&state, &marks).unwrap(), result);
+        assert_eq!(config.evaluate_vec(&state, &marks).unwrap(), result);
         let mut changed = state.clone();
         changed.cash = d("9999");
         assert_eq!(result.equity, d("1050"));
-        assert_ne!(config.evaluate(&changed, &marks).unwrap(), result);
+        assert_ne!(config.evaluate_vec(&changed, &marks).unwrap(), result);
         assert_eq!(
-            config.evaluate(&state, &marks[..1]),
+            config.evaluate_vec(&state, &marks[..1]),
             Err("MARK_COVERAGE_MISSING")
         );
     }
@@ -652,7 +681,7 @@ mod tests {
             (1001, "2250", MaintenanceState::Breach),
         ] {
             state.effective_at = at;
-            let value = config.evaluate(&state, &marks).unwrap();
+            let value = config.evaluate_vec(&state, &marks).unwrap();
             assert_eq!((value.maintenance_margin, value.risk), (d(expected), risk));
             assert_eq!(
                 (value.equity, value.exposure_margin),
@@ -665,7 +694,7 @@ mod tests {
             ("2.01", MaintenanceState::Safe),
         ] {
             let value = config
-                .evaluate(
+                .evaluate_vec(
                     &input(cash, vec![position(Product::Btc, "1", "50000")]),
                     &marks,
                 )
@@ -675,7 +704,7 @@ mod tests {
                 (d(cash), d("2"), risk)
             );
         }
-        let flat = config.evaluate(&input("-1", vec![]), &[]).unwrap();
+        let flat = config.evaluate_vec(&input("-1", vec![]), &[]).unwrap();
         assert_eq!(
             (
                 flat.equity,
@@ -705,7 +734,7 @@ mod tests {
         ] {
             let state = input("1000", vec![position(product.clone(), quantity, "50000")]);
             let value = config
-                .evaluate(&state, &[mark(product, "50000", 0, 3000)])
+                .evaluate_vec(&state, &[mark(product, "50000", 0, 3000)])
                 .unwrap();
             assert_eq!(
                 (value.products[0].tier, value.maintenance_margin),
@@ -722,7 +751,7 @@ mod tests {
             );
             let before = state.clone();
             assert!(config
-                .evaluate(
+                .evaluate_vec(
                     &state,
                     &[
                         mark(Product::Btc, "50000", 0, 3000),
@@ -734,12 +763,12 @@ mod tests {
         }
         let duplicate = input("1000", vec![position(Product::Btc, "1", "50000"); 2]);
         assert_eq!(
-            config.evaluate(&duplicate, &[mark(Product::Btc, "50000", 0, 3000)]),
+            config.evaluate_vec(&duplicate, &[mark(Product::Btc, "50000", 0, 3000)]),
             Err("DUPLICATE_NET_POSITION")
         );
         let extreme = input("1000", vec![position(Product::Eth, "25000", "1")]);
         assert_eq!(
-            config.evaluate(
+            config.evaluate_vec(
                 &extreme,
                 &[Mark {
                     price: Decimal::MAX,
@@ -755,7 +784,7 @@ mod tests {
         let config = config();
         let mut state = input("3000", vec![position(Product::Btc, "1001", "50000")]);
         let loss = config
-            .evaluate(&state, &[mark(Product::Btc, "49900", 0, 3000)])
+            .evaluate_vec(&state, &[mark(Product::Btc, "49900", 0, 3000)])
             .unwrap();
         assert_eq!(
             (
@@ -775,7 +804,7 @@ mod tests {
         for at in [1999, 2000, 2001] {
             state.effective_at = at;
             let before = state.clone();
-            let value = config.evaluate(&state, &marks).unwrap();
+            let value = config.evaluate_vec(&state, &marks).unwrap();
             assert_eq!(
                 (
                     value.products[0].base_quantity,
@@ -810,7 +839,7 @@ mod tests {
                 ..mark(Product::Btc, "1", 0, 3000)
             }];
             let before = (config.clone(), state.clone(), marks.clone());
-            assert_eq!(config.evaluate(&state, &marks), Err(fault));
+            assert_eq!(config.evaluate_vec(&state, &marks), Err(fault));
             assert_eq!((config.clone(), state, marks), before);
         }
     }
@@ -848,7 +877,7 @@ mod tests {
             let mut state = input("0", positions);
             state.cash = Decimal::MAX;
             let before = (state.clone(), marks.clone());
-            let value = config.evaluate(&state, &marks).unwrap();
+            let value = config.evaluate_vec(&state, &marks).unwrap();
             assert_eq!(
                 (
                     value.equity,

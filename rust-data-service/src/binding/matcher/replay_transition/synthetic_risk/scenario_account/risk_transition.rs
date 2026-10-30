@@ -99,7 +99,7 @@ impl ScenarioAccount {
         }
         let after_reservation = self.reservation()?;
         let (scenario, marks) = self.btc_context()?;
-        let valuation = scenario.evaluate(&self.projection()?, marks.as_slice())?;
+        let valuation = scenario.evaluate(&self.projection()?, marks)?;
         self.prepare_risk(stamp, &after_reservation)?;
         Ok((
             FinancialSnapshot::BtcEth(after_reservation),

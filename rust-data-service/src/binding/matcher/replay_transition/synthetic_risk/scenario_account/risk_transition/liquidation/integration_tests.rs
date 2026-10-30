@@ -332,7 +332,7 @@ fn terminal_unknown_effect_matches_direct_rejection_but_history_conflict_wins() 
 
 fn mark(owner: &ScenarioAccount, at: i64, id: &str) -> context::Input {
     let (_, marks) = owner.btc_context().unwrap();
-    let mut input = activation(owner, at, mark_rows(marks.as_slice(), at));
+    let mut input = activation(owner, at, mark_rows(marks, at));
     input.stamp.event_id = id.into();
     input
 }

@@ -297,7 +297,7 @@ fn frozen_loop_bound_includes_both_products_and_rejects_non_decreasing_tier() {
     unchanged_tier.state_version = bad.receipt.account_version_after;
     let (scenario, marks) = unchanged_tier.btc_context().unwrap();
     bad.receipt.valuation_after = scenario
-        .evaluate(&unchanged_tier.projection().unwrap(), marks.as_slice())
+        .evaluate(&unchanged_tier.projection().unwrap(), marks)
         .unwrap();
     bad.receipt.reservation_after = unchanged_tier.reservation().unwrap();
     let mut expected = owner.clone();

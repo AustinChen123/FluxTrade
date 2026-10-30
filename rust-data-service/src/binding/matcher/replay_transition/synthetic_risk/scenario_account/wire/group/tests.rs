@@ -658,7 +658,7 @@ fn owner_not_wire_classifies_market_profile_and_group_business_rules() {
     value["members"][0]["stamp"]["effective_at"] = json!(501);
     value["members"][0]["payload"]["expected_before"] = json!(hex(current.valuation_context_id));
     value["members"][0]["payload"]["expected_after"] =
-        json!(hex(context_id(config, marks.as_slice(), 501).unwrap()));
+        json!(hex(context_id(config, marks, 501).unwrap()));
     let group = parse(&value, &current).unwrap();
     assert_eq!(
         current.apply_group(&group),

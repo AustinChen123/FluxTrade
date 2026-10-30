@@ -263,10 +263,10 @@ fn invalid_reservation_inputs_fail_without_modifying_authoritative_facts() {
         let mut order = seed.orders[0].clone();
         mutate(&mut order);
         let before = order.clone();
-        assert!(calculate(&projection, &[&order], &config, &marks).is_err());
+        assert!(calculate_vec(&projection, &[&order], &config, &marks).is_err());
         assert_eq!(order, before);
     }
-    assert!(calculate(
+    assert!(calculate_vec(
         &projection,
         &[&seed.orders[0], &seed.orders[0]],
         &config,
@@ -284,10 +284,45 @@ fn invalid_reservation_inputs_fail_without_modifying_authoritative_facts() {
             marks[1].clone(),
         ],
     ] {
-        assert!(calculate(&projection, &[], &config, &bad_marks).is_err());
+        assert!(calculate_vec(&projection, &[], &config, &bad_marks).is_err());
     }
+
+    let invalid_marks = [Mark {
+        price: d("0"),
+        ..marks[0].clone()
+    }];
+    let invalid_order = order("", Side::Long, "1");
+    assert_eq!(
+        calculate(
+            &projection,
+            &[&invalid_order],
+            &config,
+            &MarkHistory::from_vec(invalid_marks.to_vec())
+        ),
+        Err("INVALID_RESERVATION_ORDER")
+    );
+    assert_eq!(
+        calculate_vec(&projection, &[&invalid_order], &config, &invalid_marks),
+        Err("INVALID_RESERVATION_ORDER")
+    );
+
+    let mut invalid_scenario = config.clone();
+    invalid_scenario.leverage = d("5");
+    assert_eq!(
+        calculate(
+            &projection,
+            &[],
+            &invalid_scenario,
+            &MarkHistory::from_vec(invalid_marks.to_vec())
+        ),
+        Err("UNSUPPORTED_SCENARIO_CONFIG")
+    );
+    assert_eq!(
+        calculate_vec(&projection, &[], &invalid_scenario, &invalid_marks),
+        Err("UNSUPPORTED_SCENARIO_CONFIG")
+    );
     let mut unsupported = config.clone();
     unsupported.leverage = d("5");
-    assert!(calculate(&projection, &[], &unsupported, &marks).is_err());
+    assert!(calculate_vec(&projection, &[], &unsupported, &marks).is_err());
     assert_eq!(owner.projection().unwrap(), projection);
 }

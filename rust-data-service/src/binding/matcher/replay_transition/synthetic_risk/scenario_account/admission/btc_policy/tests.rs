@@ -5,7 +5,7 @@ mod configured_fee_causality;
 
 #[test]
 fn a04_causal_mark_admission_shortfall_request_effect_versions() {
-    use super::super::super::context::tests::{activation, mark_rows, stamp};
+    use super::super::super::context::tests::{activation, mark_rows_vec as mark_rows, stamp};
     use super::super::super::risk_transition::{cancel, Lifecycle};
     let (mut seed, config, mut marks) = seed("1000", "1", Side::Long);
     seed.positions[0].product = Product::Eth;

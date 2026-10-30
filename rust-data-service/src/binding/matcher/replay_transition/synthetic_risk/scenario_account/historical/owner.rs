@@ -145,7 +145,7 @@ impl ScenarioAccount {
         }
         let after = owner_context_id_with_policy(
             scenario,
-            marks.as_slice(),
+            marks,
             effective_at,
             self.seed_effective_at,
             &self.config_id,
@@ -321,11 +321,11 @@ impl ScenarioAccount {
             } else {
                 return Err("PROFILE_MISMATCH");
             }
-            let (scenario, _) = draft.btc_context()?;
+            let (scenario, marks) = draft.btc_context()?;
             let before = draft.valuation_context_id;
             let after = owner_context_id_with_policy(
                 scenario,
-                &next_marks,
+                marks,
                 at,
                 draft.seed_effective_at,
                 &draft.config_id,
