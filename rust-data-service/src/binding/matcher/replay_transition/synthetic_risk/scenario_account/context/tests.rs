@@ -235,11 +235,7 @@ fn configured_mark_vector_invalid_shapes_fail_without_publishing_context() {
             "stale" => {
                 let (scenario, marks) = owner.btc_context().unwrap();
                 let product = &scenario.products()[0];
-                let old = marks
-                    .as_slice()
-                    .iter()
-                    .find(|m| m.product == *product && m.valid_from < 600)
-                    .unwrap();
+                let old = marks.mark_at(product, 599).unwrap();
                 rows[0] = (product.clone(), old.valid_from, old.valid_to, old.price);
             }
             _ => rows[1].3 += Decimal::ONE,
@@ -396,11 +392,7 @@ fn configured_mark_shortfall_commits_source_then_waits_for_cancel_effect_before_
         .products()
         .into_iter()
         .map(|p| {
-            let mark = marks
-                .as_slice()
-                .iter()
-                .find(|m| m.product == p && m.valid_from < 600)
-                .unwrap();
+            let mark = marks.mark_at(&p, 599).unwrap();
             Mark {
                 valid_from: 600,
                 valid_to: 3000,
@@ -410,8 +402,7 @@ fn configured_mark_shortfall_commits_source_then_waits_for_cancel_effect_before_
         .collect::<Vec<_>>();
     let old_counterfactual =
         reservation::calculate_vec(&projection, &orders, scenario, &old_marks).unwrap();
-    let new_counterfactual =
-        reservation::calculate_vec(&projection, &orders, scenario, marks.as_slice()).unwrap();
+    let new_counterfactual = reservation::calculate(&projection, &orders, scenario, marks).unwrap();
     assert_eq!(
         (
             old_counterfactual.equity,

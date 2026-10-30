@@ -366,15 +366,7 @@ pub(super) fn admission_reference_price(
     effective_at: i64,
 ) -> Result<Decimal, Fault> {
     let (scenario, marks) = owner.btc_context()?;
-    let mark = marks
-        .as_slice()
-        .iter()
-        .find(|mark| {
-            mark.product == *product
-                && mark.valid_from <= effective_at
-                && effective_at < mark.valid_to
-        })
-        .ok_or("MARK_COVERAGE_MISSING")?;
+    let mark = marks.mark_at(product, effective_at)?;
     let (spec, _) = scenario.resolve(product, effective_at)?;
     let reference = round_to_tick(mark.price, spec.tick, side == Side::Long)?;
     if reference <= Decimal::ZERO {

@@ -289,12 +289,8 @@ impl ScenarioAccount {
         if at == old_at
             && steps.iter().any(|step| {
                 current_marks
-                    .as_slice()
-                    .iter()
-                    .find(|mark| {
-                        mark.product == step.product && mark.valid_from <= at && at < mark.valid_to
-                    })
-                    .is_none_or(|mark| mark.price != step.mark_price)
+                    .mark_at(&step.product, at)
+                    .map_or(true, |mark| mark.price != step.mark_price)
             })
         {
             return Err("UNSUPPORTED_CONTEXT_TRANSITION");
@@ -335,12 +331,7 @@ impl ScenarioAccount {
             )?;
             let mut row_markers = Vec::with_capacity(products.len());
             for product in &products {
-                let mark = next_marks
-                    .iter()
-                    .find(|mark| {
-                        mark.product == *product && mark.valid_from <= at && at < mark.valid_to
-                    })
-                    .ok_or("MARK_COVERAGE_MISSING")?;
+                let mark = marks.mark_at(product, at)?;
                 row_markers.push((product.clone(), mark.valid_from, mark.valid_to, mark.price));
             }
             let context_event = {

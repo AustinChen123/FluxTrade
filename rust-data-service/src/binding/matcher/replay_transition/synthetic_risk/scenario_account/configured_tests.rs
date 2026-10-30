@@ -483,7 +483,7 @@ fn configured_multi_version_timelines_resolve_boundaries_and_mark_gaps() {
         let (spec, tier) = scenario.resolve(&products[0], at).unwrap();
         assert_eq!((spec.version.as_str(), tier.version.as_str()), expected);
     }
-    assert_eq!(marks.as_slice()[1].price, d("101"));
+    assert_eq!(marks.mark_at(&products[0], 50).unwrap().price, d("101"));
 }
 
 #[test]
