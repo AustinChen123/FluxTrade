@@ -295,25 +295,13 @@ impl ScenarioAccount {
         {
             return Err("UNSUPPORTED_CONTEXT_TRANSITION");
         }
-        let mut next_marks = current_marks.as_slice().to_vec();
-        for step in &steps {
-            for mark in next_marks.iter_mut().filter(|mark| {
-                mark.product == step.product && mark.valid_from < at && at < mark.valid_to
-            }) {
-                mark.valid_to = at;
-            }
-            next_marks.retain(|mark| !(mark.product == step.product && mark.valid_from == at));
-            next_marks.push(Mark {
-                product: step.product.clone(),
-                price: step.mark_price,
-                valid_from: at,
-                valid_to: i64::MAX,
-            });
-        }
-        validate_marks(&next_marks)?;
+        let candidate_marks = current_marks.stage_historical_update(
+            at,
+            steps.iter().map(|step| (&step.product, step.mark_price)),
+        )?;
         if at > old_at {
             if let ProfileContext::BtcEthScenario { marks, .. } = &mut draft.profile {
-                *marks = super::mark_history::MarkHistory::from_vec(next_marks.clone());
+                *marks = candidate_marks;
             } else {
                 return Err("PROFILE_MISMATCH");
             }

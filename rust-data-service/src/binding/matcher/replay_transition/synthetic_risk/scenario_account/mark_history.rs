@@ -29,6 +29,32 @@ impl MarkHistory {
             .ok_or("MARK_COVERAGE_MISSING")
     }
 
+    pub(in crate::binding::matcher::replay_transition::synthetic_risk::scenario_account) fn stage_historical_update<
+        'a,
+    >(
+        &self,
+        at: i64,
+        steps: impl IntoIterator<Item = (&'a super::super::Product, super::super::Decimal)>,
+    ) -> Result<Self, super::super::Fault> {
+        let mut candidate = self.marks.clone();
+        for (product, price) in steps {
+            for mark in candidate.iter_mut().filter(|mark| {
+                mark.product == *product && mark.valid_from < at && at < mark.valid_to
+            }) {
+                mark.valid_to = at;
+            }
+            candidate.retain(|mark| !(mark.product == *product && mark.valid_from == at));
+            candidate.push(Mark {
+                product: product.clone(),
+                price,
+                valid_from: at,
+                valid_to: i64::MAX,
+            });
+        }
+        super::super::validate_marks(&candidate)?;
+        Ok(Self::from_vec(candidate))
+    }
+
     #[cfg(test)]
     pub(super) fn into_vec_for_test(self) -> Vec<Mark> {
         self.marks
@@ -60,6 +86,136 @@ mod tests {
             valid_from: from,
             valid_to: to,
         }
+    }
+
+    fn legacy_stage(
+        rows: &[Mark],
+        at: i64,
+        steps: &[(Product, i64)],
+    ) -> Result<Vec<Mark>, super::super::Fault> {
+        let mut candidate = rows.to_vec();
+        for (product, price) in steps {
+            for mark in candidate.iter_mut().filter(|mark| {
+                mark.product == *product && mark.valid_from < at && at < mark.valid_to
+            }) {
+                mark.valid_to = at;
+            }
+            candidate.retain(|mark| !(mark.product == *product && mark.valid_from == at));
+            candidate.push(row(product.clone(), *price, at, i64::MAX));
+        }
+        super::super::validate_marks(&candidate)?;
+        Ok(candidate)
+    }
+
+    fn facade_stage(
+        rows: &[Mark],
+        at: i64,
+        steps: &[(Product, i64)],
+    ) -> Result<Vec<Mark>, super::super::Fault> {
+        let history = MarkHistory::from_vec(rows.to_vec());
+        history
+            .stage_historical_update(
+                at,
+                steps
+                    .iter()
+                    .map(|(product, price)| (product, Decimal::from(*price))),
+            )
+            .map(MarkHistory::into_vec_for_test)
+    }
+
+    #[test]
+    fn staging_candidates_match_legacy_vec_procedure() {
+        let finite = vec![row(Product::Btc, 10, 0, 20)];
+        let cases = [
+            (
+                finite.clone(),
+                5,
+                vec![(Product::Btc, 11)],
+                Ok(vec![
+                    row(Product::Btc, 10, 0, 5),
+                    row(Product::Btc, 11, 5, i64::MAX),
+                ]),
+            ),
+            (
+                finite.clone(),
+                10,
+                vec![(Product::Btc, 10)],
+                Ok(vec![
+                    row(Product::Btc, 10, 0, 10),
+                    row(Product::Btc, 10, 10, i64::MAX),
+                ]),
+            ),
+            (
+                finite.clone(),
+                10,
+                vec![(Product::Btc, 11)],
+                Ok(vec![
+                    row(Product::Btc, 10, 0, 10),
+                    row(Product::Btc, 11, 10, i64::MAX),
+                ]),
+            ),
+            (
+                finite.clone(),
+                15,
+                vec![(Product::Btc, 11)],
+                Ok(vec![
+                    row(Product::Btc, 10, 0, 15),
+                    row(Product::Btc, 11, 15, i64::MAX),
+                ]),
+            ),
+            (
+                vec![
+                    row(Product::Btc, 10, 0, 5),
+                    row(Product::Btc, 11, 5, i64::MAX),
+                ],
+                5,
+                vec![(Product::Btc, 11)],
+                Ok(vec![
+                    row(Product::Btc, 10, 0, 5),
+                    row(Product::Btc, 11, 5, i64::MAX),
+                ]),
+            ),
+            (
+                vec![row(Product::Btc, 10, 0, 25), row(Product::Btc, 11, 25, 30)],
+                10,
+                vec![(Product::Btc, 10)],
+                Err("OVERLAPPING_MARKS"),
+            ),
+        ];
+        for (rows, at, steps, expected) in cases {
+            let oracle = legacy_stage(&rows, at, &steps);
+            assert_eq!(oracle, expected);
+            assert_eq!(facade_stage(&rows, at, &steps), oracle);
+        }
+    }
+
+    #[test]
+    fn historical_staging_candidates_are_isolated_across_nested_clones() {
+        let root = MarkHistory::from_vec(vec![row(Product::Btc, 10, 0, 20)]);
+        let left = root
+            .clone()
+            .stage_historical_update(5, [(&Product::Btc, Decimal::from(11))])
+            .unwrap();
+        let left_clone = left.clone();
+        let right = left_clone
+            .stage_historical_update(8, [(&Product::Btc, Decimal::from(12))])
+            .unwrap();
+        assert_eq!(root.as_slice(), &[row(Product::Btc, 10, 0, 20)]);
+        assert_eq!(
+            left.as_slice(),
+            &[
+                row(Product::Btc, 10, 0, 5),
+                row(Product::Btc, 11, 5, i64::MAX)
+            ]
+        );
+        assert_eq!(
+            right.as_slice(),
+            &[
+                row(Product::Btc, 10, 0, 5),
+                row(Product::Btc, 11, 5, 8),
+                row(Product::Btc, 12, 8, i64::MAX)
+            ]
+        );
     }
 
     #[test]
