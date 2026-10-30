@@ -57,7 +57,10 @@ pub(in super::super) fn mark_rows(marks: &mark_history::MarkHistory, at: i64) ->
 }
 
 pub(in super::super) fn mark_rows_vec(marks: &[Mark], at: i64) -> Rows {
-    mark_rows(&mark_history::MarkHistory::from_vec(marks.to_vec()), at)
+    mark_rows(
+        &mark_history::MarkHistory::try_from_vec(marks.to_vec()).unwrap(),
+        at,
+    )
 }
 
 fn configured_mark_rows(owner: &ScenarioAccount, at: i64) -> Rows {

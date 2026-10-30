@@ -422,7 +422,7 @@ fn historical_same_time_same_price_validates_then_discards_candidate() {
         Err("UNSUPPORTED_CONTEXT_TRANSITION")
     );
     assert_eq!(owner, before);
-    let marks_before = owner.btc_context().unwrap().1.as_slice().to_vec();
+    let marks_before = owner.btc_context().unwrap().1.to_vec_for_test();
     let same_time_steps = [
         (Product("A-USDT-SWAP".into()), d("105")),
         (Product("B-USDT-SWAP".into()), d("100")),
@@ -463,7 +463,7 @@ fn historical_same_time_same_price_validates_then_discards_candidate() {
     owner.historical_market_step(&input).unwrap();
     assert_eq!(owner, before);
     assert_eq!(
-        owner.btc_context().unwrap().1.as_slice(),
+        owner.btc_context().unwrap().1.to_vec_for_test(),
         expected_same_time.unwrap()
     );
 
@@ -507,7 +507,7 @@ fn historical_same_time_future_seed_collision_rejects_without_owner_changes() {
         &[],
     );
     let before = owner.clone();
-    let marks = owner.btc_context().unwrap().1.as_slice().to_vec();
+    let marks = owner.btc_context().unwrap().1.to_vec_for_test();
     let same_time_steps = [
         (Product("A-USDT-SWAP".into()), d("105")),
         (Product("B-USDT-SWAP".into()), d("100")),

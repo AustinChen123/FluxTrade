@@ -95,7 +95,6 @@ impl FrozenScenario {
         if input.effective_at < 0 {
             return Err("INVALID_EFFECTIVE_TIME");
         }
-        validate_marks(marks.as_slice())?;
         let mut products = Vec::new();
         let mut equity_terms = vec![input.cash];
         let mut mmr = Decimal::ZERO;
@@ -197,7 +196,7 @@ impl FrozenScenario {
         input: &ValuationInput,
         marks: &[Mark],
     ) -> Result<IncompleteValuation, Fault> {
-        self.evaluate(input, &MarkHistory::from_vec(marks.to_vec()))
+        self.evaluate(input, &MarkHistory::try_from_vec(marks.to_vec())?)
     }
 }
 
@@ -344,6 +343,7 @@ struct Mark {
     valid_to: i64,
 }
 
+#[cfg(test)]
 fn validate_marks(marks: &[Mark]) -> Result<(), Fault> {
     for (i, mark) in marks.iter().enumerate() {
         if mark.price <= Decimal::ZERO || mark.valid_from < 0 || mark.valid_to <= mark.valid_from {
@@ -593,27 +593,22 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_fault_precedence_checks_time_before_invalid_marks() {
+    fn invalid_mark_fault_is_rejected_at_validating_builder() {
         let scenario = config();
         let mut state = input("1000", vec![]);
         state.effective_at = -1;
         let invalid_marks = [mark(Product::Btc, "0", 0, 3000)];
         assert_eq!(
-            scenario.evaluate(&state, &MarkHistory::from_vec(invalid_marks.to_vec())),
+            scenario.evaluate_vec(&state, &[mark(Product::Btc, "1", 0, 3000)]),
             Err("INVALID_EFFECTIVE_TIME")
         );
         assert_eq!(
-            scenario.evaluate_vec(&state, &invalid_marks),
-            Err("INVALID_EFFECTIVE_TIME")
-        );
-
-        state.effective_at = 1000;
-        assert_eq!(
-            scenario.evaluate(&state, &MarkHistory::from_vec(invalid_marks.to_vec())),
+            MarkHistory::try_from_vec(invalid_marks.to_vec()).map(|_| ()),
             Err("INVALID_MARK")
         );
+        state.effective_at = 1000;
         assert_eq!(
-            scenario.evaluate_vec(&state, &invalid_marks),
+            MarkHistory::try_from_vec(invalid_marks.to_vec()).map(|_| ()),
             Err("INVALID_MARK")
         );
     }

@@ -173,8 +173,7 @@ fn a07a_delayed_version_one_fill_survives_rejection_and_version_two_context() {
     let at_503 = marks.mark_at(&Product::Eth, 503).unwrap();
     assert_eq!((at_503.valid_from, at_503.price), (503, d("101")));
     let eth: Vec<_> = marks
-        .clone()
-        .into_vec_for_test()
+        .to_vec_for_test()
         .into_iter()
         .filter(|mark| mark.product == Product::Eth)
         .map(|mark| (mark.valid_from, mark.price))

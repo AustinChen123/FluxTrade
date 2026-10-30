@@ -288,7 +288,7 @@ fn product_id(product: &Product) -> &str {
 fn context_id_vec(scenario: &FrozenScenario, marks: &[Mark], at: i64) -> Result<Hash, Fault> {
     context_id(
         scenario,
-        &mark_history::MarkHistory::from_vec(marks.to_vec()),
+        &mark_history::MarkHistory::try_from_vec(marks.to_vec())?,
         at,
     )
 }
@@ -578,7 +578,6 @@ impl ScenarioAccount {
             scenario.specs.clone(),
             scenario.tiers.clone(),
         )?;
-        validate_marks(marks)?;
         Self::from_validated_configuration(seed, scenario, marks)
     }
 
@@ -596,7 +595,7 @@ impl ScenarioAccount {
         marks: &[Mark],
         gross_admission_profile: bool,
     ) -> Result<Self, Fault> {
-        let marks = mark_history::MarkHistory::from_vec(marks.to_vec());
+        let marks = mark_history::MarkHistory::try_from_vec(marks.to_vec())?;
         let valuation_context_id = owner_context_id_with_policy(
             &scenario,
             &marks,

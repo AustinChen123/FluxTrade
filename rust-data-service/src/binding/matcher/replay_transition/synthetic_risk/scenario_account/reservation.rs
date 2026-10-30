@@ -65,7 +65,6 @@ pub(super) fn calculate_with_gross(
         }
     }
     scenario.validate()?;
-    validate_marks(marks.as_slice())?;
     context_id(scenario, marks, input.effective_at)?;
     let valuation = scenario.evaluate(input, marks)?;
     let mut snapshot = Snapshot {
@@ -212,7 +211,7 @@ pub(super) fn calculate_vec(
         input,
         orders,
         scenario,
-        &mark_history::MarkHistory::from_vec(marks.to_vec()),
+        &mark_history::MarkHistory::try_from_vec(marks.to_vec()).expect("valid test marks"),
     )
 }
 

@@ -446,7 +446,13 @@ fn pending_cancel_and_invalid_preparation_inputs_fail_without_a_step() {
         &anchor(Side::Long, "1001", "50000", "3000", 500, "49900"),
         501,
     );
-    for field in 0..7 {
+    let (_, marks) = owner.btc_context().unwrap();
+    let duplicate = marks.to_vec_for_test();
+    assert_eq!(
+        crate::binding::matcher::replay_transition::synthetic_risk::scenario_account::mark_history::MarkHistory::try_from_vec([duplicate.clone(), duplicate[2..].to_vec()].concat()).map(|_| ()),
+        Err("OVERLAPPING_MARKS")
+    );
+    for field in [0, 1, 2, 3, 5, 6] {
         let mut bad = owner.clone();
         let expected = match field {
             0 => {
@@ -478,18 +484,27 @@ fn pending_cancel_and_invalid_preparation_inputs_fail_without_a_step() {
                         .tiers
                         .retain(|t| !(t.product == Product::Btc && t.version == "tier-v1"));
                 } else {
-                    let updated = marks.clone().round_trip_for_test(|rows| match field {
-                        3 => {
-                            rows.remove(2);
-                        }
-                        4 => {
-                            rows.push(rows[2].clone());
-                        }
+                    let mut rows = marks.to_vec_for_test();
+                    match field {
+                        3 => rows.retain(|row| {
+                            !(row.product == Product::Btc
+                                && row.valid_from <= 501
+                                && 501 < row.valid_to)
+                        }),
                         5 => {
-                            rows[2].price = d("49900.01");
+                            let row = rows
+                                .iter_mut()
+                                .find(|row| {
+                                    row.product == Product::Btc
+                                        && row.valid_from <= 501
+                                        && 501 < row.valid_to
+                                })
+                                .unwrap();
+                            row.price = d("49900.01");
                         }
                         _ => unreachable!(),
-                    });
+                    }
+                    let updated = crate::binding::matcher::replay_transition::synthetic_risk::scenario_account::mark_history::MarkHistory::try_from_vec(rows).unwrap();
                     if field == 5 {
                         bad.valuation_context_id = context_id(scenario, &updated, 501).unwrap();
                     }
@@ -497,7 +512,6 @@ fn pending_cancel_and_invalid_preparation_inputs_fail_without_a_step() {
                 }
                 match field {
                     3 | 6 => "UNSUPPORTED_CONTEXT_TRANSITION",
-                    4 => "OVERLAPPING_MARKS",
                     _ => "INVALID_HYPOTHETICAL_EXECUTION",
                 }
             }
