@@ -79,7 +79,11 @@ fn receipt_projection_survives_real_fills_and_cancel_with_closed_matching() {
         2
     );
     let (_, marks) = owner.btc_context().unwrap();
-    let context = context::tests::activation(&owner, 504, context::tests::mark_rows(marks, 504));
+    let context = context::tests::activation(
+        &owner,
+        504,
+        context::tests::mark_rows(marks.as_slice(), 504),
+    );
     owner.activate_context(&context).unwrap();
     for event in ["A", "event-X", "C", "E", "activate", "missing"] {
         for (kind, transport) in [

@@ -115,7 +115,7 @@ impl ScenarioAccount {
             draft.state_version = r.account_version_after;
             draft.commit_sequence = r.commit_sequence;
             let (scenario, marks) = draft.btc_context()?;
-            let after = scenario.evaluate(&draft.projection()?, marks)?;
+            let after = scenario.evaluate(&draft.projection()?, marks.as_slice())?;
             let old_tier = r
                 .valuation_before
                 .products
@@ -169,7 +169,7 @@ impl ScenarioAccount {
             running(self)?;
             let (scenario, marks) = self.btc_context()?;
             let bound = scenario
-                .evaluate(&self.projection()?, marks)?
+                .evaluate(&self.projection()?, marks.as_slice())?
                 .products
                 .iter()
                 .try_fold(0usize, |n, p| {

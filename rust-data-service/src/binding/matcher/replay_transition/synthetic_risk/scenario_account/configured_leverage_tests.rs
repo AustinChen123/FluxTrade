@@ -238,7 +238,7 @@ fn active_tier_classifies_actual_and_worst_contracts_but_not_future_rows() {
     ); // Actual tier minimum 1.5; reserved tier maximum 2.
     let (scenario, marks) = at_boundary.btc_context().unwrap();
     let valuation = scenario
-        .evaluate(&at_boundary.projection().unwrap(), marks)
+        .evaluate(&at_boundary.projection().unwrap(), marks.as_slice())
         .unwrap();
     assert_eq!(valuation.products[0].tier, 2);
     let untouched_limit = [
@@ -259,7 +259,7 @@ fn active_tier_classifies_actual_and_worst_contracts_but_not_future_rows() {
     let (scenario, marks) = first_tier.btc_context().unwrap();
     assert_eq!(
         scenario
-            .evaluate(&first_tier.projection().unwrap(), marks)
+            .evaluate(&first_tier.projection().unwrap(), marks.as_slice())
             .unwrap()
             .products[0]
             .tier,

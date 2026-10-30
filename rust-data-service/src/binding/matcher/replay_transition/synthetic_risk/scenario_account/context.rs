@@ -184,7 +184,7 @@ impl ScenarioAccount {
             .then_some(gross_admission::POLICY_ID);
         let after_id = owner_context_id_with_policy(
             scenario,
-            marks,
+            marks.as_slice(),
             at,
             self.seed_effective_at,
             &self.config_id,
@@ -231,10 +231,12 @@ impl ScenarioAccount {
                 )?;
             }
             let old_mark = marks
+                .as_slice()
                 .iter()
                 .find(|m| m.product == product && m.valid_from <= old_at && old_at < m.valid_to)
                 .ok_or("MARK_COVERAGE_MISSING")?;
             let mark = marks
+                .as_slice()
                 .iter()
                 .find(|m| m.product == product && m.valid_from <= at && at < m.valid_to)
                 .ok_or("MARK_COVERAGE_MISSING")?;

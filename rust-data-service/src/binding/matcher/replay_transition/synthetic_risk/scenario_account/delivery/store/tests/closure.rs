@@ -169,12 +169,17 @@ fn a07a_delayed_version_one_fill_survives_rejection_and_version_two_context() {
     assert_inspection(&owner);
     let (_, marks) = owner.btc_context().unwrap();
     let eth: Vec<_> = marks
+        .as_slice()
         .iter()
         .filter(|m| m.product == Product::Eth)
         .map(|m| (m.valid_from, m.price))
         .collect();
     assert_eq!(eth, vec![(0, d("100")), (503, d("101"))]);
-    let context = context::tests::activation(&owner, 503, context::tests::mark_rows(marks, 503));
+    let context = context::tests::activation(
+        &owner,
+        503,
+        context::tests::mark_rows(marks.as_slice(), 503),
+    );
     owner.activate_context(&context).unwrap();
     assert_eq!(
         (owner.state_version, owner.cash, owner.fees),

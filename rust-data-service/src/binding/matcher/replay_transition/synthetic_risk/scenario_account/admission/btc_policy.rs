@@ -52,7 +52,7 @@ pub(super) fn evaluate(
     let product = intent.product.btc()?;
     let (scenario, marks) = current.btc_context()?;
     let input = current.projection()?;
-    let value = scenario.evaluate(&input, marks)?;
+    let value = scenario.evaluate(&input, marks.as_slice())?;
     let position = current.positions.btc()?.get(product);
     let role = classify(
         position.map(|p| (p.side, p.contracts)),
@@ -131,7 +131,7 @@ pub(super) fn evaluate(
                     .collect(),
             });
         }
-        let after = scenario.evaluate(&stress_input, marks)?;
+        let after = scenario.evaluate(&stress_input, marks.as_slice())?;
         let stress = Stress {
             equity: after.equity,
             maintenance_margin: after.maintenance_margin,

@@ -28,6 +28,7 @@ pub(super) fn project(owner: &ScenarioAccount) -> Result<wire::Json, Fault> {
     for product in configured_products {
         let (spec, tier) = scenario.resolve(&product, effective_at)?;
         let mark = marks
+            .as_slice()
             .iter()
             .find(|row| {
                 row.product == product

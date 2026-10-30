@@ -31,7 +31,8 @@ pub(in super::super) fn mixed_owner() -> ScenarioAccount {
         .unwrap();
     assert!(!effect.receipts.is_empty());
     let (_, marks) = a.btc_context().unwrap();
-    let context = context::tests::activation(&a, 600, context::tests::mark_rows(marks, 600));
+    let context =
+        context::tests::activation(&a, 600, context::tests::mark_rows(marks.as_slice(), 600));
     a.activate_context(&context).unwrap();
     a.effect_cancel(&EffectInput {
         stamp: source::stamp("release", 601, 50),

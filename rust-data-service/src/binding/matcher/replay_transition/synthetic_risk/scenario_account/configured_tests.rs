@@ -483,7 +483,7 @@ fn configured_multi_version_timelines_resolve_boundaries_and_mark_gaps() {
         let (spec, tier) = scenario.resolve(&products[0], at).unwrap();
         assert_eq!((spec.version.as_str(), tier.version.as_str()), expected);
     }
-    assert_eq!(marks[1].price, d("101"));
+    assert_eq!(marks.as_slice()[1].price, d("101"));
 }
 
 #[test]
@@ -720,7 +720,7 @@ fn configured_spec_tier_and_mark_boundaries_mismatch_independently() {
         before_spec,
         owner_context_id(
             &spec_owner.btc_context().unwrap().0,
-            spec_owner.btc_context().unwrap().1,
+            spec_owner.btc_context().unwrap().1.as_slice(),
             100,
             spec_owner.seed_effective_at,
             &spec_owner.config_id,

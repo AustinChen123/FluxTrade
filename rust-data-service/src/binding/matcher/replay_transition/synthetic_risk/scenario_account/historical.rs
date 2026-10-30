@@ -367,6 +367,7 @@ pub(super) fn admission_reference_price(
 ) -> Result<Decimal, Fault> {
     let (scenario, marks) = owner.btc_context()?;
     let mark = marks
+        .as_slice()
         .iter()
         .find(|mark| {
             mark.product == *product

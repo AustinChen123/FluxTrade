@@ -859,7 +859,11 @@ fn gross_projection_readiness_tracks_native_admission_boundaries() {
         ScenarioAccount::from_configured_profile(&failed_seed, d("10"), failed_products, true)
             .unwrap();
     let (scenario, marks) = failed.btc_context().unwrap();
-    let context = context::tests::activation(&failed, 501, context::tests::mark_rows(marks, 501));
+    let context = context::tests::activation(
+        &failed,
+        501,
+        context::tests::mark_rows(marks.as_slice(), 501),
+    );
     assert!(scenario.configured.is_some());
     assert_eq!(
         failed.activate_context_checked(&context, |stage| {
@@ -906,7 +910,7 @@ fn gross_projection_readiness_tracks_native_admission_boundaries() {
     let terminal_context = context::tests::activation(
         &terminal,
         501,
-        context::tests::mark_rows(terminal_marks, 501),
+        context::tests::mark_rows(terminal_marks.as_slice(), 501),
     );
     terminal.activate_context(&terminal_context).unwrap();
     assert!(matches!(

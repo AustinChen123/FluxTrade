@@ -23,6 +23,7 @@ mod group;
 mod historical;
 mod hypothetical_settlement;
 mod inspection;
+mod mark_history;
 mod min_cash;
 mod reservation;
 mod risk_transition;
@@ -37,7 +38,7 @@ mod wire;
 enum ProfileContext {
     BtcEthScenario {
         scenario: FrozenScenario,
-        marks: Vec<Mark>,
+        marks: mark_history::MarkHistory,
         min_cash_profile: bool,
         p1_liquidation_profile: bool,
         gross_admission_profile: bool,
@@ -520,7 +521,7 @@ impl ScenarioAccount {
         Self::from_validated_configuration_profile(seed, scenario, &marks, gross_admission_profile)
     }
 
-    fn btc_context(&self) -> Result<(&FrozenScenario, &[Mark]), Fault> {
+    fn btc_context(&self) -> Result<(&FrozenScenario, &mark_history::MarkHistory), Fault> {
         match &self.profile {
             ProfileContext::BtcEthScenario {
                 scenario, marks, ..
@@ -538,7 +539,7 @@ impl ScenarioAccount {
             &self.projection()?,
             &self.orders.values().map(|o| &o.facts).collect::<Vec<_>>(),
             scenario,
-            marks,
+            marks.as_slice(),
             self.is_gross_admission_profile(),
         )
     }
@@ -715,7 +716,7 @@ impl ScenarioAccount {
                 p1_liquidation_profile: false,
                 gross_admission_profile,
                 scenario,
-                marks: marks.to_vec(),
+                marks: mark_history::MarkHistory::from_vec(marks.to_vec()),
             },
             valuation_context_id,
             seed_effective_at: seed.effective_at,
@@ -737,7 +738,11 @@ impl ScenarioAccount {
             transition: Default::default(),
         };
         let (scenario, marks) = owner.btc_context()?;
-        if scenario.evaluate(&owner.projection()?, marks)?.risk != MaintenanceState::Safe {
+        if scenario
+            .evaluate(&owner.projection()?, marks.as_slice())?
+            .risk
+            != MaintenanceState::Safe
+        {
             return Err("SEED_MMR_BREACH");
         }
         owner.reservation()?;
@@ -782,7 +787,7 @@ impl ScenarioAccount {
                 ..
             } => owner_context_id_with_policy(
                 scenario,
-                marks,
+                marks.as_slice(),
                 effective_at,
                 self.seed_effective_at,
                 &self.config_id,

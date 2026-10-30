@@ -6,7 +6,7 @@ use context::tests::{activation, mark_rows};
 // Production still publishes that same draft and takes the 4C-2 sentinel.
 pub(super) fn source_draft(owner: &ScenarioAccount, at: i64) -> ScenarioAccount {
     let (_, marks) = owner.btc_context().unwrap();
-    let mut input = activation(owner, at, mark_rows(marks, at));
+    let mut input = activation(owner, at, mark_rows(marks.as_slice(), at));
     input.stamp.event_id = format!("mark-{at}");
     let (receipt, draft) = owner.prepare_context(&input).unwrap();
     let draft = draft.unwrap();
@@ -143,7 +143,7 @@ fn long_short_exact_preparation_is_pure_and_integrated_result_reconciles() {
         }
         let mut production = initial;
         let (_, marks) = production.btc_context().unwrap();
-        let input = activation(&production, at + 1, mark_rows(marks, at + 1));
+        let input = activation(&production, at + 1, mark_rows(marks.as_slice(), at + 1));
         production.activate_context(&input).unwrap();
         assert_eq!(production.gate, Gate::Running);
         assert_eq!(
@@ -473,24 +473,28 @@ fn pending_cancel_and_invalid_preparation_inputs_fail_without_a_step() {
                 else {
                     unreachable!()
                 };
-                match field {
-                    3 => {
-                        marks.remove(2);
+                if field == 6 {
+                    scenario
+                        .tiers
+                        .retain(|t| !(t.product == Product::Btc && t.version == "tier-v1"));
+                } else {
+                    let updated = marks.clone().round_trip_for_test(|rows| match field {
+                        3 => {
+                            rows.remove(2);
+                        }
+                        4 => {
+                            rows.push(rows[2].clone());
+                        }
+                        5 => {
+                            rows[2].price = d("49900.01");
+                        }
+                        _ => unreachable!(),
+                    });
+                    if field == 5 {
+                        bad.valuation_context_id =
+                            context_id(scenario, updated.as_slice(), 501).unwrap();
                     }
-                    4 => {
-                        marks.push(marks[2].clone());
-                    }
-                    5 => {
-                        marks[2].price = d("49900.01");
-                    }
-                    _ => {
-                        scenario
-                            .tiers
-                            .retain(|t| !(t.product == Product::Btc && t.version == "tier-v1"));
-                    }
-                }
-                if field == 5 {
-                    bad.valuation_context_id = context_id(scenario, marks, 501).unwrap();
+                    *marks = updated;
                 }
                 match field {
                     3 | 6 => "UNSUPPORTED_CONTEXT_TRANSITION",

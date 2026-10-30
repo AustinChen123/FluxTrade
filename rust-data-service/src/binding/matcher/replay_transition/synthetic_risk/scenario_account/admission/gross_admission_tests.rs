@@ -262,6 +262,7 @@ fn configured_gross_projection_uses_absolute_product_gross_and_admission_is_nonm
         .into_iter()
         .map(|product| {
             let mark = marks
+                .as_slice()
                 .iter()
                 .find(|mark| {
                     mark.product == product && mark.valid_from <= 600 && 600 < mark.valid_to

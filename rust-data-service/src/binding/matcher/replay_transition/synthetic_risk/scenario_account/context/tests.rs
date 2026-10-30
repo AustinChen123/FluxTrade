@@ -31,7 +31,7 @@ pub(in super::super) fn activation(owner: &ScenarioAccount, at: i64, rows: Rows)
         expected_before: owner.valuation_context_id,
         expected_after: owner_context_id_with_policy(
             scenario,
-            marks,
+            marks.as_slice(),
             at,
             owner.seed_effective_at,
             &owner.config_id,
@@ -67,6 +67,7 @@ fn configured_mark_rows(owner: &ScenarioAccount, at: i64) -> Rows {
             .into_iter()
             .map(|product| {
                 let row = marks
+                    .as_slice()
                     .iter()
                     .find(|m| m.product == product && m.valid_from <= at && at < m.valid_to)
                     .unwrap();
@@ -238,6 +239,7 @@ fn configured_mark_vector_invalid_shapes_fail_without_publishing_context() {
                 let (scenario, marks) = owner.btc_context().unwrap();
                 let product = &scenario.products()[0];
                 let old = marks
+                    .as_slice()
                     .iter()
                     .find(|m| m.product == *product && m.valid_from < 600)
                     .unwrap();
@@ -398,6 +400,7 @@ fn configured_mark_shortfall_commits_source_then_waits_for_cancel_effect_before_
         .into_iter()
         .map(|p| {
             let mark = marks
+                .as_slice()
                 .iter()
                 .find(|m| m.product == p && m.valid_from < 600)
                 .unwrap();
@@ -410,7 +413,8 @@ fn configured_mark_shortfall_commits_source_then_waits_for_cancel_effect_before_
         .collect::<Vec<_>>();
     let old_counterfactual =
         reservation::calculate(&projection, &orders, scenario, &old_marks).unwrap();
-    let new_counterfactual = reservation::calculate(&projection, &orders, scenario, marks).unwrap();
+    let new_counterfactual =
+        reservation::calculate(&projection, &orders, scenario, marks.as_slice()).unwrap();
     assert_eq!(
         (
             old_counterfactual.equity,

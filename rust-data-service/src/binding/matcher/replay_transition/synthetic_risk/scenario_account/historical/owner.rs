@@ -145,7 +145,7 @@ impl ScenarioAccount {
         }
         let after = owner_context_id_with_policy(
             scenario,
-            marks,
+            marks.as_slice(),
             effective_at,
             self.seed_effective_at,
             &self.config_id,
@@ -289,6 +289,7 @@ impl ScenarioAccount {
         if at == old_at
             && steps.iter().any(|step| {
                 current_marks
+                    .as_slice()
                     .iter()
                     .find(|mark| {
                         mark.product == step.product && mark.valid_from <= at && at < mark.valid_to
@@ -298,7 +299,7 @@ impl ScenarioAccount {
         {
             return Err("UNSUPPORTED_CONTEXT_TRANSITION");
         }
-        let mut next_marks = current_marks.to_vec();
+        let mut next_marks = current_marks.as_slice().to_vec();
         for step in &steps {
             for mark in next_marks.iter_mut().filter(|mark| {
                 mark.product == step.product && mark.valid_from < at && at < mark.valid_to
@@ -316,7 +317,7 @@ impl ScenarioAccount {
         validate_marks(&next_marks)?;
         if at > old_at {
             if let ProfileContext::BtcEthScenario { marks, .. } = &mut draft.profile {
-                *marks = next_marks.clone();
+                *marks = super::mark_history::MarkHistory::from_vec(next_marks.clone());
             } else {
                 return Err("PROFILE_MISMATCH");
             }
