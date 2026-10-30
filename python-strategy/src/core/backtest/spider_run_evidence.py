@@ -307,7 +307,7 @@ def _historical_native_notice_mode_compatible(
         return False
 
 
-def _historical_polls_endpoint_mode_compatible(
+def _historical_polls_endpoint_mode_compatible_original(
     observation: dict[str, _Any], cutoff: int, mode: _HistoricalSequenceMode,
     paid_prefix: str | None = None, allow_terminal_delivery: bool = False,
 ) -> bool:
@@ -435,6 +435,291 @@ def _historical_polls_endpoint_mode_compatible(
                 allowed_awaiting.append(("CAPTURED", "TERMINAL"))
             if awaiting_state not in allowed_awaiting:
                 return False
+    return True
+
+
+_HISTORICAL_FAST_PATH_FALLBACK = object()
+
+
+def _historical_polls_endpoint_mode_compatible(
+    observation: dict[str, _Any], cutoff: int, mode: _HistoricalSequenceMode,
+    paid_prefix: str | None = None, allow_terminal_delivery: bool = False,
+) -> bool:
+    """Run the indexed path, delegating every exception to the verbatim original."""
+    try:
+        result = _historical_polls_endpoint_mode_compatible_fast(
+            observation, cutoff, mode, paid_prefix, allow_terminal_delivery,
+        )
+    except Exception:
+        return _historical_polls_endpoint_mode_compatible_original(
+            observation, cutoff, mode, paid_prefix, allow_terminal_delivery,
+        )
+    if result is _HISTORICAL_FAST_PATH_FALLBACK:
+        return _historical_polls_endpoint_mode_compatible_original(
+            observation, cutoff, mode, paid_prefix, allow_terminal_delivery,
+        )
+    return result
+
+
+def _historical_polls_endpoint_mode_compatible_fast(
+    observation: dict[str, _Any], cutoff: int, mode: _HistoricalSequenceMode,
+    paid_prefix: str | None = None, allow_terminal_delivery: bool = False,
+) -> bool:
+    """Indexed fast path with a whole-call fallback to the historical checker."""
+    if (mode is not _HistoricalSequenceMode.LEGACY_SHARED_SEQUENCE_V1
+            and mode is not _HistoricalSequenceMode.HISTORICAL_DISJOINT_SEQUENCE_V1):
+        return _HISTORICAL_FAST_PATH_FALLBACK
+    if not _historical_poll_fast_path_inputs_safe(
+        observation, cutoff, paid_prefix, allow_terminal_delivery,
+    ):
+        return _HISTORICAL_FAST_PATH_FALLBACK
+    records = observation["records"]
+    timers: dict[str, list[dict[str, _Any]]] = {}
+    captures: dict[str, list[dict[str, _Any]]] = {}
+    deliveries: dict[tuple[int, int], list[dict[str, _Any]]] = {}
+    for record in records:
+        if type(record) is not dict or "kind" not in record or type(record["kind"]) is not str:
+            return _HISTORICAL_FAST_PATH_FALLBACK
+        kind = record["kind"]
+        if kind == "HISTORICAL_TIMER":
+            if ("stable_id" not in record or type(record["stable_id"]) is not str
+                    or "key" not in record or type(record["key"]) is not dict
+                    or "schedule_sequence" not in record["key"]
+                    or type(record["key"]["schedule_sequence"]) is not int):
+                return _HISTORICAL_FAST_PATH_FALLBACK
+            timers.setdefault(record["stable_id"], []).append(record)
+        elif kind == "SNAPSHOT_CAPTURE":
+            if ("stable_id" not in record or type(record["stable_id"]) is not str
+                    or "key" not in record or type(record["key"]) is not dict
+                    or any(key not in record["key"] for key in
+                           ("queue_class", "stable_id", "schedule_sequence", "visible_at"))
+                    or type(record["key"]["queue_class"]) is not str
+                    or type(record["key"]["stable_id"]) is not str
+                    or type(record["key"]["schedule_sequence"]) is not int
+                    or type(record["key"]["visible_at"]) is not int
+                    or "classification" not in record or type(record["classification"]) is not str):
+                return _HISTORICAL_FAST_PATH_FALLBACK
+            captures.setdefault(record["stable_id"], []).append(record)
+        elif kind == "DELIVERY":
+            if ("key" not in record or type(record["key"]) is not dict
+                    or any(key not in record["key"] for key in
+                           ("schedule_sequence", "visible_at", "queue_class"))
+                    or type(record["key"]["schedule_sequence"]) is not int
+                    or type(record["key"]["visible_at"]) is not int
+                    or type(record["key"]["queue_class"]) is not str
+                    or "classification" not in record or type(record["classification"]) is not str):
+                return _HISTORICAL_FAST_PATH_FALLBACK
+            delivery_key = (record["key"]["schedule_sequence"], record["key"]["visible_at"])
+            deliveries.setdefault(delivery_key, []).append(record)
+
+    if not _historical_pending_matches(observation, cutoff, allow_same_time=allow_terminal_delivery):
+        return False
+
+    # Keep the original poll, stage, and capture-before-delivery loops and their
+    # query-read points. Only the three records scans are replaced by buckets.
+    return _historical_polls_endpoint_mode_compatible_indexed(
+        observation, cutoff, mode, paid_prefix, allow_terminal_delivery,
+        timers, captures, deliveries,
+    )
+
+
+def _historical_polls_endpoint_mode_compatible_indexed(
+    observation: dict[str, _Any], cutoff: int, mode: _HistoricalSequenceMode,
+    paid_prefix: str | None, allow_terminal_delivery: bool,
+    timers_by_id: dict[str, list[dict[str, _Any]]],
+    captures_by_id: dict[str, list[dict[str, _Any]]],
+    deliveries_by_schedule: dict[tuple[int, int], list[dict[str, _Any]]],
+) -> bool:
+    """Run the original classifier loops with only record scans indexed."""
+    pending_keys = observation["pending_keys"]
+    stage_layouts = {
+        True: (("EARN", 0, 1, 5), ("TRADING", 1, 6, 10),
+               ("POSITIONS", 2, 11, 15), ("OPEN_ORDERS", 3, 16, 20)),
+        False: (("TRADING", 0, 1, 5), ("POSITIONS", 1, 6, 10),
+                ("OPEN_ORDERS", 2, 11, 15)),
+    }
+    for poll in observation["polls"]:
+        paused = poll["status"] == "PAUSED" and poll["awaiting"] is None
+        if paused and paid_prefix is not None:
+            continue
+        completed = poll["status"] == "COMPLETED" and poll["awaiting"] is None
+        failed_prefix = paid_prefix is not None and poll["status"] == "CALLBACK_FAILED" and poll["awaiting"] is None
+        if not completed and not failed_prefix and poll["status"] != "IN_PROGRESS":
+            return False
+        marker = "_POLL_"
+        prefix, separator, raw_text = poll["poll_id"].partition(marker)
+        expected_prefixes = {"P3"} if paid_prefix is None else {paid_prefix}
+        if (prefix not in expected_prefixes or not separator or not raw_text.isascii()
+                or not raw_text.isdigit()):
+            return False
+        raw_at = int(raw_text)
+        if poll["continuation_id"] != f"{prefix}_CONT_{raw_at}":
+            return False
+        timer_id = f"{prefix}_TIMER_{raw_at}"
+        timer_rows = timers_by_id.get(timer_id, [])
+        if len(timer_rows) != 1:
+            return False
+        has_earn = bool(captures_by_id.get(f"{poll['poll_id']}_EARN", []))
+        layout = stage_layouts[has_earn]
+        if has_earn and not any(item[0] == "EARN" for item in layout):
+            return False
+        awaiting = "EARN" if poll["awaiting"] == "EARN_IF_DUE" else poll["awaiting"]
+        if not completed and not failed_prefix and awaiting not in ("EARN", "TRADING", "POSITIONS", "OPEN_ORDERS"):
+            return False
+        observed_stages = []
+        stage_classifications: dict[str, tuple[str, str | None]] = {}
+        for stage in layout:
+            name, stage_index, capture_offset, delivery_offset = stage
+            snapshot_id = f"{poll['poll_id']}_{name}"
+            capture_rows = captures_by_id.get(snapshot_id, [])
+            if not capture_rows:
+                continue
+            if len(capture_rows) != 1:
+                return False
+            capture = capture_rows[0]
+            capture_key = capture["key"]
+            capture_sequence = timer_rows[0]["key"]["schedule_sequence"] * 4 + stage_index
+            expected_capture_at = (raw_at + capture_offset) * 16 + 5
+            if (capture_key["queue_class"] != "SNAPSHOT_CAPTURE"
+                    or capture_key["stable_id"] != snapshot_id
+                    or capture_key["schedule_sequence"] != capture_sequence
+                    or capture_key["visible_at"] != expected_capture_at):
+                return False
+            if capture["classification"] == "PENDING":
+                if completed or name != awaiting or expected_capture_at <= cutoff or capture_key not in pending_keys:
+                    return False
+                delivery_at = (raw_at + delivery_offset) * 16 + 6
+                delivery_sequence = _historical_delivery_sequence(
+                    mode, _HistoricalDeliveryKind.POLL, capture_sequence,
+                )
+                if not deliveries_by_schedule:
+                    delivery_present = False
+                else:
+                    delivery_present = bool(deliveries_by_schedule.get((delivery_sequence, delivery_at), []))
+                if delivery_present:
+                    return False
+                observed_stages.append(name)
+                stage_classifications[name] = ("PENDING_CAPTURE", None)
+                continue
+            if capture["classification"] != "SUCCESS" or expected_capture_at > cutoff:
+                return False
+            delivery_at = (raw_at + delivery_offset) * 16 + 6
+            delivery_sequence = _historical_delivery_sequence(
+                mode, _HistoricalDeliveryKind.POLL, capture_sequence,
+            )
+            if not deliveries_by_schedule:
+                delivery_rows = []
+            else:
+                delivery_rows = deliveries_by_schedule.get((delivery_sequence, delivery_at), [])
+            if len(delivery_rows) != 1:
+                return False
+            delivery = delivery_rows[0]
+            if delivery["key"]["queue_class"] != "DELIVERY":
+                return False
+            if delivery["classification"] == "PENDING":
+                if delivery_at <= cutoff or delivery["key"] not in pending_keys:
+                    return False
+            elif delivery["classification"] not in ("SUCCESS", "TERMINAL"):
+                return False
+            if completed and delivery["classification"] != "SUCCESS":
+                return False
+            observed_stages.append(name)
+            stage_classifications[name] = ("CAPTURED", delivery["classification"])
+        if completed:
+            if observed_stages != [item[0] for item in layout]:
+                return False
+        elif failed_prefix:
+            if observed_stages != [item[0] for item in layout[:len(observed_stages)]]:
+                return False
+            if observed_stages and any(
+                stage_classifications.get(name) != ("CAPTURED", "SUCCESS")
+                for name in observed_stages[:-1]
+            ):
+                return False
+        else:
+            if awaiting not in observed_stages:
+                return False
+            awaiting_index = next(index for index, item in enumerate(layout) if item[0] == awaiting)
+            if observed_stages != [item[0] for item in layout[:awaiting_index + 1]]:
+                return False
+            for name, _, _, _ in layout[:awaiting_index]:
+                if stage_classifications.get(name) != ("CAPTURED", "SUCCESS"):
+                    return False
+            awaiting_state = stage_classifications.get(awaiting)
+            allowed_awaiting = [("PENDING_CAPTURE", None), ("CAPTURED", "PENDING")]
+            if allow_terminal_delivery:
+                allowed_awaiting.append(("CAPTURED", "TERMINAL"))
+            if awaiting_state not in allowed_awaiting:
+                return False
+    return True
+
+
+def _historical_poll_fast_path_inputs_safe(
+    observation: _Any, cutoff: _Any, paid_prefix: _Any, allow_terminal_delivery: _Any,
+) -> bool:
+    """Validate the complete JSON-like input graph before any indexed-path reads."""
+    if type(cutoff) is not int or (paid_prefix is not None and type(paid_prefix) is not str):
+        return False
+    if type(allow_terminal_delivery) is not bool:
+        return False
+    stack = [observation]
+    visited: set[int] = set()
+    while stack:
+        value = stack.pop()
+        value_type = type(value)
+        if (value_type is str or value_type is int or value_type is float
+                or value_type is bool or value_type is type(None)):
+            continue
+        if value_type is list or value_type is tuple:
+            identity = id(value)
+            if identity in visited:
+                continue
+            visited.add(identity)
+            stack.extend(value)
+            continue
+        if value_type is dict:
+            identity = id(value)
+            if identity in visited:
+                continue
+            visited.add(identity)
+            for key, item in value.items():
+                if type(key) is not str:
+                    return False
+                stack.append(item)
+            continue
+        return False
+    if type(observation) is not dict:
+        return False
+    for name in ("records", "polls", "pending_keys"):
+        if name not in observation or type(observation[name]) is not list:
+            return False
+    # Required indexed fields still fail closed when absent.
+    for row in observation["records"]:
+        if type(row) is not dict or "kind" not in row:
+            return False
+        if row["kind"] == "HISTORICAL_TIMER" and (
+            "stable_id" not in row or "key" not in row
+            or type(row["key"]) is not dict or "schedule_sequence" not in row["key"]
+        ):
+            return False
+        if row["kind"] == "SNAPSHOT_CAPTURE" and (
+            "stable_id" not in row or "classification" not in row or "key" not in row
+            or type(row["key"]) is not dict
+            or any(name not in row["key"] for name in ("queue_class", "stable_id", "schedule_sequence", "visible_at"))
+        ):
+            return False
+        if row["kind"] == "DELIVERY" and (
+            "classification" not in row or "key" not in row or type(row["key"]) is not dict
+            or any(name not in row["key"] for name in ("queue_class", "schedule_sequence", "visible_at"))
+        ):
+            return False
+    if any(type(key) is not dict for key in observation["pending_keys"]):
+        return False
+    for poll in observation["polls"]:
+        if type(poll) is not dict or any(
+            name not in poll for name in ("status", "awaiting", "poll_id", "continuation_id")
+        ):
+            return False
     return True
 
 

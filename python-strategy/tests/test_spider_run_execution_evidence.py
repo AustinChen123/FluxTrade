@@ -11,6 +11,7 @@ from typing import Any, cast
 import pytest
 
 from src.core.backtest import spider_run_execution_evidence as evidence
+from src.core.backtest import spider_run_evidence as poll_evidence
 from src.core.backtest.spider_run_artifacts import (
     canonical_bytes, configuration_context, decode_canonical, decode_jsonl, encode_jsonl, historical_context,
 )
@@ -31,6 +32,20 @@ from test_spider_historical_input import (
 from test_spider_paid_endpoint_native import _seeded_two_product_run
 
 H = "a" * 64
+
+
+def _assert_poll_mode_differential(scheduler, paid_prefix, *, allow_terminal_delivery=False):
+    for mode in poll_evidence._HistoricalSequenceMode:
+        args = (scheduler, scheduler["current_time"], mode, paid_prefix, allow_terminal_delivery)
+        try:
+            expected = poll_evidence._historical_polls_endpoint_mode_compatible_original(*args)
+        except Exception as error:
+            expected = (type(error), error.args)
+        try:
+            actual = poll_evidence._historical_polls_endpoint_mode_compatible(*args)
+        except Exception as error:
+            actual = (type(error), error.args)
+        assert actual == expected
 
 
 def _capture(composition: _ReplayComposition, tag: str, cutoff: int | None = None) -> dict[str, Any]:
@@ -234,6 +249,17 @@ def test_paid_legacy_shared_delivery_sequences_remain_readable(monkeypatch):
             lambda _mode, _kind, counter: counter,
         )
         artifacts, facts = _bundle()
+    scheduler = facts["report"]["scheduler_observation"]
+    paid_prefix = f"PAID_{validate_spider_execution_input(facts['request'])[:16]}"
+    _assert_poll_mode_differential(scheduler, paid_prefix)
+    paused = deepcopy(scheduler)
+    paused["polls"].append(dict(status="PAUSED", awaiting=None))
+    _assert_poll_mode_differential(paused, paid_prefix)
+    same_time_pending = deepcopy(scheduler)
+    same_time_key = dict(queue_class="UNRELATED", stable_id="same-time", visible_at=same_time_pending["current_time"])
+    same_time_pending["records"].append(dict(kind="UNRELATED", classification="PENDING", key=same_time_key))
+    same_time_pending["pending_keys"].append(deepcopy(same_time_key))
+    _assert_poll_mode_differential(same_time_pending, paid_prefix, allow_terminal_delivery=True)
     result = evidence.build_execution_reconciliation(facts["run_id"], artifacts)
     assert facts["paid"]["status"] == "PAID_FLAT"
     assert result["result"] == "OK", [(row["name"], row["result"]) for row in result["checks"]]
@@ -570,6 +596,11 @@ def test_actual_native_failed_prefixes_keep_terminal_facts_and_reconcile(failure
     request = _seeded_two_product_run(with_working_order=failure_mode == "callback_ack")
     artifacts, facts = _bundle(request, failure_mode=failure_mode, monkeypatch=monkeypatch)
     assert facts["paid"]["status"] == "FAILED"
+    _assert_poll_mode_differential(
+        facts["report"]["scheduler_observation"],
+        f"PAID_{validate_spider_execution_input(request)[:16]}",
+        allow_terminal_delivery=True,
+    )
     if failure_mode == "capture_failure":
         assert facts["paid"]["failure"]["primary"]["kind"] == "OWNER_EVIDENCE"
         assert facts["paid"]["failure"]["evidence_error"]["reason"] == "injected evidence capture failure"
@@ -662,6 +693,11 @@ def test_actual_native_earn_snapshot_terminal_without_callback_result_reconciles
     artifacts, facts = _bundle(request, failure_mode="earn_snapshot_poll", monkeypatch=monkeypatch)
     assert facts["paid"]["status"] == "FAILED"
     report = cast(dict[str, Any], decode_jsonl(artifacts["report.jsonl"])[0])
+    _assert_poll_mode_differential(
+        report["scheduler_observation"],
+        f"PAID_{validate_spider_execution_input(request)[:16]}",
+        allow_terminal_delivery=True,
+    )
     terminal = report["paid_observation"]["terminal_fact"]
     assert terminal is not None
     assert terminal["kind"] == "DELIVERY"

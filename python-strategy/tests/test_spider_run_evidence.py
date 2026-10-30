@@ -253,6 +253,471 @@ def test_h03_mixed_poll_delivery_sequence_modes_are_rejected():
     assert not evidence._historical_polls_endpoint_compatible(observation, cutoff)
 
 
+def _assert_poll_checker_differential(observation, cutoff, mode, paid_prefix=None,
+                                      allow_terminal_delivery=False):
+    args = (observation, cutoff, mode, paid_prefix, allow_terminal_delivery)
+    try:
+        expected = evidence._historical_polls_endpoint_mode_compatible_original(*args)
+    except Exception as error:
+        expected = (type(error), error.args)
+    try:
+        actual = evidence._historical_polls_endpoint_mode_compatible(*args)
+    except Exception as error:
+        actual = (type(error), error.args)
+    assert actual == expected
+
+
+def test_indexed_poll_checker_matches_original_for_delivery_multimap_collisions():
+    _, observation, cutoff = h03_endpoint_observation(100_001)
+    mode = evidence._HistoricalSequenceMode.HISTORICAL_DISJOINT_SEQUENCE_V1
+    _assert_poll_checker_differential(observation, cutoff, mode)
+    poll = next(row for row in observation["polls"] if row["status"] == "COMPLETED")
+    raw_at = int(poll["poll_id"].partition("_POLL_")[2])
+    timer = next(row for row in observation["records"]
+                 if row["kind"] == "HISTORICAL_TIMER"
+                 and row["stable_id"] == f"P3_TIMER_{raw_at}")
+    has_earn = any(row["kind"] == "SNAPSHOT_CAPTURE"
+                   and row["stable_id"] == f"{poll['poll_id']}_EARN"
+                   for row in observation["records"])
+    layout = (("EARN", 0, 1, 5), ("TRADING", 1, 6, 10),
+              ("POSITIONS", 2, 11, 15), ("OPEN_ORDERS", 3, 16, 20)) if has_earn else (
+                  ("TRADING", 0, 1, 5), ("POSITIONS", 1, 6, 10), ("OPEN_ORDERS", 2, 11, 15))
+    target = None
+    for name, stage_index, _, delivery_offset in layout:
+        capture = next(row for row in observation["records"]
+                       if row["kind"] == "SNAPSHOT_CAPTURE"
+                       and row["stable_id"] == f"{poll['poll_id']}_{name}")
+        sequence = timer["key"]["schedule_sequence"] * 4 + stage_index
+        delivery_sequence = sequence_protocol.historical_delivery_sequence(
+            mode, sequence_protocol.HistoricalDeliveryKind.POLL, sequence,
+        )
+        delivery_at = (raw_at + delivery_offset) * 16 + 6
+        target = next((row for row in observation["records"]
+                       if row["kind"] == "DELIVERY"
+                       and row["key"]["schedule_sequence"] == delivery_sequence
+                       and row["key"]["visible_at"] == delivery_at), None)
+        if capture["classification"] == "SUCCESS" and target is not None:
+            break
+        target = None
+    assert target is not None
+    # Same schedule/time, distinct stable identity must retain cardinality=2.
+    duplicate_identity = deepcopy(target)
+    duplicate_identity["key"]["stable_id"] += "-other"
+    observation["records"].append(duplicate_identity)
+    _assert_poll_checker_differential(observation, cutoff, mode)
+    observation["records"].pop()
+    # Same stable identity at another schedule/time must not enter the bucket.
+    duplicate_time = deepcopy(target)
+    duplicate_time["key"]["schedule_sequence"] += 100_000
+    duplicate_time["key"]["visible_at"] += 1
+    observation["records"].append(duplicate_time)
+    _assert_poll_checker_differential(observation, cutoff, mode)
+
+
+@pytest.mark.parametrize("mode", list(evidence._HistoricalSequenceMode))
+def test_indexed_poll_checker_differential_invalid_status_missing_timer_and_legal_timer(mode):
+    _, observation, cutoff = h03_endpoint_observation(100_001)
+    _assert_poll_checker_differential(observation, cutoff, mode)
+    invalid = deepcopy(observation)
+    invalid["polls"][0]["status"] = "INVALID"
+    invalid["records"] = [{}]
+    _assert_poll_checker_differential(invalid, cutoff, mode)
+    assert evidence._historical_polls_endpoint_compatible(invalid, cutoff) is False
+    missing = deepcopy(observation)
+    poll = missing["polls"][-1]
+    poll["status"] = "IN_PROGRESS"
+    timer_id = f"P3_TIMER_{int(poll['poll_id'].partition('_POLL_')[2])}"
+    missing["records"] = [row for row in missing["records"] if row.get("stable_id") != timer_id]
+    _assert_poll_checker_differential(missing, cutoff, mode)
+
+
+def test_indexed_poll_checker_unsafe_relevant_row_uses_whole_call_fallback(monkeypatch):
+    _, observation, cutoff = h03_endpoint_observation(100_001)
+    observation["records"].append({"kind": "HISTORICAL_TIMER", "stable_id": [],
+                                    "classification": "SUCCESS", "key": {}})
+    expected = evidence._historical_polls_endpoint_mode_compatible_original(
+        observation, cutoff, evidence._HistoricalSequenceMode.HISTORICAL_DISJOINT_SEQUENCE_V1,
+    )
+    called = 0
+    original = evidence._historical_polls_endpoint_mode_compatible_original
+
+    def spy(*args):
+        nonlocal called
+        called += 1
+        return original(*args)
+
+    monkeypatch.setattr(evidence, "_historical_polls_endpoint_mode_compatible_original", spy)
+    actual = evidence._historical_polls_endpoint_mode_compatible(
+        observation, cutoff, evidence._HistoricalSequenceMode.HISTORICAL_DISJOINT_SEQUENCE_V1,
+    )
+    assert actual == expected
+    assert called == 1
+
+
+def test_indexed_poll_checker_subclass_sources_fall_back_before_hash_or_mapping_reads(monkeypatch):
+    class UnhashableStr(str):
+        __hash__ = None
+
+    class DictSubclass(dict):
+        def __contains__(self, key):
+            raise AssertionError("subclass containment must not be called by fast path")
+
+    _, observation, cutoff = h03_endpoint_observation(100_001)
+    observation["polls"] = []
+    observation["records"] = [{
+        "kind": "HISTORICAL_TIMER", "stable_id": UnhashableStr("timer"),
+        "classification": "SUCCESS", "key": {"schedule_sequence": 0},
+    }]
+    original = evidence._historical_polls_endpoint_mode_compatible_original
+    cases = [observation]
+    mapping_case = deepcopy(observation)
+    mapping_case["records"] = [DictSubclass({"kind": "OTHER"})]
+    cases.append(mapping_case)
+    for case in cases:
+        try:
+            expected = original(case, cutoff, evidence._HistoricalSequenceMode.HISTORICAL_DISJOINT_SEQUENCE_V1)
+        except Exception as error:
+            expected = (type(error), error.args)
+        calls = 0
+
+        def spy(*args):
+            nonlocal calls
+            calls += 1
+            return original(*args)
+
+        monkeypatch.setattr(evidence, "_historical_polls_endpoint_mode_compatible_original", original)
+        monkeypatch.setattr(evidence, "_historical_polls_endpoint_mode_compatible_original", spy)
+        try:
+            actual = evidence._historical_polls_endpoint_mode_compatible(
+                case, cutoff, evidence._HistoricalSequenceMode.HISTORICAL_DISJOINT_SEQUENCE_V1,
+            )
+        except Exception as error:
+            actual = (type(error), error.args)
+        assert actual == expected
+        assert calls == 1
+        monkeypatch.setattr(evidence, "_historical_polls_endpoint_mode_compatible_original", original)
+
+
+def test_indexed_poll_checker_stateful_classification_subclass_falls_back(monkeypatch):
+    class Classification(str):
+        def __eq__(self, other):
+            self.calls = getattr(self, "calls", 0) + 1
+            if self.calls > 1:
+                raise RuntimeError("classification compared twice")
+            return super().__eq__(other)
+
+    def make_observation():
+        _, observation, cutoff = h03_endpoint_observation(100_001)
+        observation["polls"] = []
+        observation["pending_keys"] = []
+        observation["records"] = [{
+            "kind": "HISTORICAL_TIMER", "stable_id": "x",
+            "classification": Classification("SUCCESS"),
+            "key": {"schedule_sequence": 0},
+        }]
+        return observation, cutoff
+
+    original = evidence._historical_polls_endpoint_mode_compatible_original
+    observation, cutoff = make_observation()
+    args = (observation, cutoff, evidence._HistoricalSequenceMode.HISTORICAL_DISJOINT_SEQUENCE_V1)
+    try:
+        expected = original(*args)
+    except Exception as error:
+        expected = (type(error), error.args)
+    calls = 0
+
+    def spy(*spy_args):
+        nonlocal calls
+        calls += 1
+        return original(*spy_args)
+
+    monkeypatch.setattr(evidence, "_historical_polls_endpoint_mode_compatible_original", spy)
+    observation, cutoff = make_observation()
+    args = (observation, cutoff, evidence._HistoricalSequenceMode.HISTORICAL_DISJOINT_SEQUENCE_V1)
+    try:
+        actual = evidence._historical_polls_endpoint_mode_compatible(*args)
+    except Exception as error:
+        actual = (type(error), error.args)
+    assert actual == expected is True
+    assert calls == 1
+
+
+def test_indexed_poll_checker_nested_non_json_payload_falls_back(monkeypatch):
+    _, observation, cutoff = h03_endpoint_observation(100_001)
+    observation["records"][0]["payload"] = {"nested": ([object()],)}
+    original = evidence._historical_polls_endpoint_mode_compatible_original
+    calls = 0
+
+    def spy(*args):
+        nonlocal calls
+        calls += 1
+        return original(*args)
+
+    monkeypatch.setattr(evidence, "_historical_polls_endpoint_mode_compatible_original", spy)
+    args = (observation, cutoff, evidence._HistoricalSequenceMode.HISTORICAL_DISJOINT_SEQUENCE_V1)
+    actual = evidence._historical_polls_endpoint_mode_compatible(*args)
+    expected = original(*args)
+    assert actual == expected
+    assert calls == 1
+
+
+def test_indexed_poll_checker_tuple_float_payload_stays_on_fast_path(monkeypatch):
+    _, observation, cutoff = h03_endpoint_observation(100_001)
+    observation["records"][0]["payload"] = ("allowed", [1.25, None, True])
+    original = evidence._historical_polls_endpoint_mode_compatible_original
+    calls = 0
+
+    def spy(*args):
+        nonlocal calls
+        calls += 1
+        return original(*args)
+
+    monkeypatch.setattr(evidence, "_historical_polls_endpoint_mode_compatible_original", spy)
+    args = (observation, cutoff, evidence._HistoricalSequenceMode.HISTORICAL_DISJOINT_SEQUENCE_V1)
+    expected = original(*args)
+    actual = evidence._historical_polls_endpoint_mode_compatible(*args)
+    assert actual == expected
+    assert calls == 0
+
+
+
+
+def test_indexed_poll_checker_contract_a_fallback_parity_and_input_purity(monkeypatch):
+    _, base, cutoff = h03_endpoint_observation(100_001)
+    mode = evidence._HistoricalSequenceMode.HISTORICAL_DISJOINT_SEQUENCE_V1
+    invalid_poll_id = {
+        "records": [], "pending_keys": [],
+        "polls": [{"status": "COMPLETED", "awaiting": None, "poll_id": 7, "continuation_id": "x"}],
+    }
+    paused = deepcopy(invalid_poll_id)
+    paused["polls"][0].update(status="PAUSED")
+    completed_keyerror = deepcopy(invalid_poll_id)
+    completed_keyerror["polls"][0].update(status="COMPLETED")
+    completed_keyerror["records"] = [{"kind": "OTHER"}]
+    huge_id = deepcopy(invalid_poll_id)
+    huge_id["polls"][0].update(poll_id="P3_POLL_" + "1" * 5000)
+    invalid_integer_id = {
+        "records": [], "pending_keys": [],
+        "polls": [{"status": "INVALID", "awaiting": None, "poll_id": 0, "continuation_id": "x"}],
+    }
+    invalid_huge_id = deepcopy(invalid_integer_id)
+    invalid_huge_id["polls"][0].update(poll_id="P3_POLL_" + "1" * 5000)
+    negative_sequence = deepcopy(base)
+    poll = next(row for row in negative_sequence["polls"] if row["status"] == "COMPLETED")
+    poll_id = poll["poll_id"]
+    raw_at = int(poll_id.partition("_POLL_")[2])
+    timer = next(row for row in negative_sequence["records"]
+                 if row["kind"] == "HISTORICAL_TIMER" and row["stable_id"] == f"P3_TIMER_{raw_at}")
+    timer["key"]["schedule_sequence"] = -1
+    capture = next(row for row in negative_sequence["records"]
+                   if row["kind"] == "SNAPSHOT_CAPTURE" and row["stable_id"] == f"{poll_id}_TRADING")
+    capture["key"]["schedule_sequence"] = 0
+    helper_exception = deepcopy(base)
+    helper_poll = next(row for row in helper_exception["polls"] if row["status"] == "COMPLETED")
+    helper_poll_id = helper_poll["poll_id"]
+    helper_raw_at = int(helper_poll_id.partition("_POLL_")[2])
+    helper_timer = next(row for row in helper_exception["records"]
+                        if row["kind"] == "HISTORICAL_TIMER"
+                        and row["stable_id"] == f"P3_TIMER_{helper_raw_at}")
+    helper_timer["key"]["schedule_sequence"] = -1
+    helper_capture = next(row for row in helper_exception["records"]
+                          if row["kind"] == "SNAPSHOT_CAPTURE"
+                          and row["stable_id"] == f"{helper_poll_id}_TRADING")
+    helper_capture["key"]["schedule_sequence"] = -4
+    cases = [
+        (invalid_poll_id, None), (paused, "PAID_x"),
+        (completed_keyerror, None), (huge_id, None),
+        (invalid_integer_id, None), (invalid_huge_id, None),
+        (negative_sequence, None), (helper_exception, None),
+    ]
+
+    actual_original = evidence._historical_polls_endpoint_mode_compatible_original
+    calls = 0
+
+    def fallback_spy(*args):
+        nonlocal calls
+        calls += 1
+        return actual_original(*args)
+
+    monkeypatch.setattr(evidence, "_historical_polls_endpoint_mode_compatible_original", fallback_spy)
+    for observation, paid_prefix in cases:
+        pristine = deepcopy(observation)
+        args = (observation, cutoff, mode, paid_prefix)
+        try:
+            expected = actual_original(*args)
+        except Exception as error:
+            expected = (type(error), error.args)
+        before = calls
+        try:
+            actual = evidence._historical_polls_endpoint_mode_compatible(*args)
+        except Exception as error:
+            actual = (type(error), error.args)
+        assert actual == expected
+        if observation in (invalid_integer_id, invalid_huge_id):
+            assert actual is False
+        if isinstance(expected, tuple) and len(expected) == 2 and isinstance(expected[0], type):
+            assert calls == before + 1
+        else:
+            assert calls in (before, before + 1)
+        assert observation == pristine
+
+    _, normal, normal_cutoff = h03_endpoint_observation(100_001)
+    pristine = deepcopy(normal)
+    before = calls
+    expected = actual_original(normal, normal_cutoff, mode)
+    actual = evidence._historical_polls_endpoint_mode_compatible(normal, normal_cutoff, mode)
+    assert actual == expected
+    assert calls == before
+    assert normal == pristine
+
+
+def test_indexed_poll_checker_real_sequence_negative_schedule_falls_back(monkeypatch):
+    _, observation, cutoff = h03_endpoint_observation(100_001)
+    poll = next(row for row in observation["polls"] if row["status"] == "COMPLETED")
+    raw_at = int(poll["poll_id"].partition("_POLL_")[2])
+    timer = next(row for row in observation["records"]
+                 if row["kind"] == "HISTORICAL_TIMER" and row["stable_id"] == f"P3_TIMER_{raw_at}")
+    timer["key"]["schedule_sequence"] = -1
+    capture = next(row for row in observation["records"]
+                   if row["kind"] == "SNAPSHOT_CAPTURE" and row["stable_id"] == f"{poll['poll_id']}_TRADING")
+    capture["key"]["schedule_sequence"] = 0
+    mode = evidence._HistoricalSequenceMode.HISTORICAL_DISJOINT_SEQUENCE_V1
+    original = evidence._historical_polls_endpoint_mode_compatible_original
+    calls = 0
+
+    def spy(*args):
+        nonlocal calls
+        calls += 1
+        return original(*args)
+
+    monkeypatch.setattr(evidence, "_historical_polls_endpoint_mode_compatible_original", spy)
+    expected = original(observation, cutoff, mode)
+    actual = evidence._historical_polls_endpoint_mode_compatible(observation, cutoff, mode)
+    assert actual == expected is False
+    assert calls == 0
+
+
+def test_indexed_poll_checker_metaclass_equality_is_never_called_by_guard(monkeypatch):
+    class Meta(type):
+        def __eq__(cls, other):
+            raise RuntimeError("metaclass equality called")
+
+    class Unknown(metaclass=Meta):
+        pass
+
+    _, observation, cutoff = h03_endpoint_observation(100_001)
+    observation["records"][0]["payload"] = {"deep": (Unknown(),)}
+    mode = evidence._HistoricalSequenceMode.HISTORICAL_DISJOINT_SEQUENCE_V1
+    original = evidence._historical_polls_endpoint_mode_compatible_original
+    try:
+        expected = original(observation, cutoff, mode)
+    except Exception as error:
+        expected = (type(error), error.args)
+    calls = 0
+
+    def fallback_spy(*args):
+        nonlocal calls
+        calls += 1
+        return original(*args)
+
+    monkeypatch.setattr(evidence, "_historical_polls_endpoint_mode_compatible_original", fallback_spy)
+    try:
+        actual = evidence._historical_polls_endpoint_mode_compatible(observation, cutoff, mode)
+    except Exception as error:
+        actual = (type(error), error.args)
+    assert actual == expected
+    assert calls == 1
+
+
+def test_indexed_poll_checker_unhashable_delivery_query_key_falls_back(monkeypatch):
+    _, observation, cutoff = h03_endpoint_observation(100_001)
+    monkeypatch.setattr(evidence, "_historical_delivery_sequence", lambda *_args: [])
+    expected = evidence._historical_polls_endpoint_mode_compatible_original(
+        observation, cutoff, evidence._HistoricalSequenceMode.HISTORICAL_DISJOINT_SEQUENCE_V1,
+    )
+    called = 0
+    original = evidence._historical_polls_endpoint_mode_compatible_original
+
+    def spy(*args):
+        nonlocal called
+        called += 1
+        return original(*args)
+
+    monkeypatch.setattr(evidence, "_historical_polls_endpoint_mode_compatible_original", spy)
+    actual = evidence._historical_polls_endpoint_mode_compatible(
+        observation, cutoff, evidence._HistoricalSequenceMode.HISTORICAL_DISJOINT_SEQUENCE_V1,
+    )
+    assert actual == expected
+    assert called == 1
+
+
+@pytest.mark.parametrize("pending_capture", [False, True])
+def test_indexed_poll_checker_empty_delivery_source_uses_empty_result(pending_capture, monkeypatch):
+    _, observation, cutoff = h03_endpoint_observation(100_001)
+    if pending_capture:
+        poll = next(row for row in observation["polls"] if row["status"] == "IN_PROGRESS")
+    else:
+        poll = next(row for row in observation["polls"] if row["status"] == "COMPLETED")
+    timer_id = f"P3_TIMER_{int(poll['poll_id'].partition('_POLL_')[2])}"
+    observation["polls"] = [poll]
+    observation["records"] = [
+        row for row in observation["records"]
+        if row.get("stable_id") == timer_id
+        or (row.get("kind") == "SNAPSHOT_CAPTURE" and
+            type(row.get("stable_id")) is str and row["stable_id"].startswith(poll["poll_id"] + "_"))
+    ]
+    observation["pending_keys"] = [
+        deepcopy(row["key"]) for row in observation["records"]
+        if row.get("classification") == "PENDING"
+    ]
+    monkeypatch.setattr(evidence, "_historical_delivery_sequence", lambda *_args: [])
+    for mode in evidence._HistoricalSequenceMode:
+        _assert_poll_checker_differential(observation, cutoff, mode)
+
+
+def test_missing_capture_stable_id_without_timer_returns_false_and_falls_back(monkeypatch):
+    _, observation, cutoff = h03_endpoint_observation(100_001)
+    poll = observation["polls"][-1]
+    poll["status"] = "IN_PROGRESS"
+    observation["polls"] = [poll]
+    raw_at = int(poll["poll_id"].partition("_POLL_")[2])
+    timer_id = f"P3_TIMER_{raw_at}"
+    missing_capture_id = f"{poll['poll_id']}_{poll['awaiting']}"
+    observation["records"] = [
+        row for row in observation["records"]
+        if row.get("stable_id") != timer_id
+    ]
+    capture = next(row for row in observation["records"]
+                   if row["kind"] == "SNAPSHOT_CAPTURE" and row["stable_id"] == missing_capture_id)
+    del capture["stable_id"]
+    original = evidence._historical_polls_endpoint_mode_compatible_original
+    calls = 0
+
+    def spy(*args):
+        nonlocal calls
+        calls += 1
+        return original(*args)
+
+    monkeypatch.setattr(evidence, "_historical_polls_endpoint_mode_compatible_original", spy)
+    for mode in evidence._HistoricalSequenceMode:
+        _assert_poll_checker_differential(observation, cutoff, mode)
+        assert evidence._historical_polls_endpoint_mode_compatible(observation, cutoff, mode) is False
+    assert calls == len(evidence._HistoricalSequenceMode) * 3
+
+
+def test_invalid_poll_status_short_circuits_malformed_records_differential(monkeypatch):
+    _, observation, cutoff = h03_endpoint_observation(100_001)
+    observation["polls"][0]["status"] = "INVALID"
+    observation["records"] = [{}]
+    actual = evidence._historical_polls_endpoint_compatible(observation, cutoff)
+    monkeypatch.setattr(
+        evidence, "_historical_polls_endpoint_mode_compatible",
+        evidence._historical_polls_endpoint_mode_compatible_original,
+    )
+    expected = evidence._historical_polls_endpoint_compatible(observation, cutoff)
+    assert actual is expected is False
+
+
 def expected_checks(values):
     attempt, status, journal, endpoint, report = values
     coverage = attempt["planned_coverage"]
