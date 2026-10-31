@@ -1,5 +1,7 @@
 use super::{
-    codec, protocol,
+    codec,
+    order_field_policy::optional_nonnegative_decimal,
+    protocol,
     session::{classify_response_codes, ensure_success, ResponseDisposition},
 };
 use anyhow::{ensure, Context, Result};
@@ -864,16 +866,6 @@ fn optional_u64_quantity(value: Option<u64>, _field: &str) -> Result<Option<Deci
 
 fn required_nonnegative_decimal(value: Option<f64>, field: &str) -> Result<Decimal> {
     optional_nonnegative_decimal(value, field)?.with_context(|| format!("missing Rithmic {field}"))
-}
-
-fn optional_nonnegative_decimal(value: Option<f64>, field: &str) -> Result<Option<Decimal>> {
-    value
-        .map(|value| {
-            ensure!(value.is_finite() && value >= 0.0, "invalid Rithmic {field}");
-            Decimal::from_str(&value.to_string())
-                .with_context(|| format!("invalid Rithmic {field}"))
-        })
-        .transpose()
 }
 
 fn optional_decimal(value: Option<f64>, field: &str) -> Result<Option<Decimal>> {

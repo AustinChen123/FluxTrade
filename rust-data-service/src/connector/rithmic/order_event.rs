@@ -1,11 +1,11 @@
 use super::{
     codec,
     ledger::{AccountIdentity, TransactionType},
+    order_field_policy::optional_nonnegative_decimal,
     protocol,
 };
 use anyhow::{ensure, Context, Result};
 use rust_decimal::Decimal;
-use std::str::FromStr;
 
 const EXCHANGE_ORDER_NOTIFICATION: i32 = 352;
 
@@ -393,16 +393,6 @@ fn optional_nonnegative_quantity(value: Option<i32>, field: &str) -> Result<Opti
         .map(|value| {
             ensure!(value >= 0, "invalid Rithmic {field}");
             Ok(Decimal::from(value))
-        })
-        .transpose()
-}
-
-fn optional_nonnegative_decimal(value: Option<f64>, field: &str) -> Result<Option<Decimal>> {
-    value
-        .map(|value| {
-            ensure!(value.is_finite() && value >= 0.0, "invalid Rithmic {field}");
-            Decimal::from_str(&value.to_string())
-                .with_context(|| format!("invalid Rithmic {field}"))
         })
         .transpose()
 }
