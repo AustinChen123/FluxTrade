@@ -76,7 +76,7 @@ def test_python_ci_treats_warnings_as_errors():
     ) in workflow
     assert 'run: uv run pytest -W error -m "integration or rust" -v' in workflow
     assert "  push:\n    branches: ['**']\n  pull_request:\n" in workflow
-    assert 'timeout-minutes: 45' in workflow
+    assert 'timeout-minutes: 60' in workflow
     assert 'timeout-minutes: 90' in workflow
     assert "--timeout=1800" in workflow
     assert "github.event_name == 'push'" in workflow

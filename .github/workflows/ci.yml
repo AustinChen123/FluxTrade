@@ -127,10 +127,11 @@ jobs:
       #   2. Run: cargo llvm-cov --no-default-features --codecov --output-path codecov.json
       #   3. Upload artifact or send to Codecov
 
+  # Observed fast-lane test steps took 17–39 minutes; keep a 60-minute job cap.
   python-check:
     name: Python Check
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     defaults:
       run:
         working-directory: ./python-strategy
