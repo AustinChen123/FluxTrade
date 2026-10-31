@@ -621,7 +621,7 @@ def test_live_order_warning_logs_the_binding_diagnostic_attribute(adapter, clien
         "failure=negative identity=basket#masked:length=1 order#absent"
     )
     error = RuntimeError("untrusted account, basket, user and credential sentinels")
-    error.diagnostic = diagnostic
+    setattr(error, "diagnostic", diagnostic)
     client.poll_event.side_effect = error
     adapter.start_order_event_stream()
     with caplog.at_level(logging.WARNING):

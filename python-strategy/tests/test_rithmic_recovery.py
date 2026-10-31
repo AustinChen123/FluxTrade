@@ -1054,7 +1054,7 @@ def test_snapshot_loader_logs_typed_numeric_diagnostic_at_warning(caplog, with_b
         "failure=negative identity=basket#0123456789abcdef order#absent"
     )
     diagnostic_error = RuntimeError(diagnostic)
-    diagnostic_error.diagnostic = diagnostic
+    setattr(diagnostic_error, "diagnostic", diagnostic)
     loader = Mock(side_effect=diagnostic_error)
     orders = [local_order(exchange_order_id="synthetic-basket")] if with_basket else []
 
