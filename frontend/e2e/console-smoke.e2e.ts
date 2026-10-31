@@ -1791,9 +1791,9 @@ for (const roster of ["empty", "single", "multiple"] as const) {
     if (states.length === 0) await expect(page.getByText("No strategy state yet")).toBeVisible();
     for (const row of await page.locator(".strategy-list > li").all()) {
       const header = row.locator(".strategy-card-header");
-      await expect(header.getByRole("button")).toBeVisible();
+      await expect(header.locator(".strategy-action").getByRole("button")).toBeVisible();
       expect(await header.evaluate((node) => Boolean(node.compareDocumentPosition(node.parentElement!.querySelector("dl")!) & Node.DOCUMENT_POSITION_FOLLOWING))).toBe(true);
-      const button = header.getByRole("button");
+      const button = header.locator(".strategy-action").getByRole("button");
       await button.focus();
       await expect(button).toBeFocused();
       expect(await button.evaluate((node) => getComputedStyle(node).outlineStyle)).not.toBe("none");
@@ -1806,8 +1806,8 @@ for (const roster of ["empty", "single", "multiple"] as const) {
       const row = page.locator(".strategy-list > li").filter({ hasText: target });
       const dialogMessages: string[] = [];
       page.once("dialog", async (dialog) => { dialogMessages.push(dialog.message()); await dialog.accept(); });
-      await row.getByRole("button").press("Enter");
-      await expect(row.getByRole("button")).toBeDisabled();
+      await row.locator(".strategy-action").getByRole("button").press("Enter");
+      await expect(row.locator(".strategy-action").getByRole("button")).toBeDisabled();
       await expect(page.locator(".strategy-notice")).toContainText("Awaiting state confirmation");
       expect(dialogMessages).toEqual([`Run “${roster === "multiple" ? "Resume strategy" : "Stop strategy"}” for ${target}?`]);
       expect(commands).toEqual([{ path: `/strategies/${target}/commands`, body: {
@@ -1815,7 +1815,7 @@ for (const roster of ["empty", "single", "multiple"] as const) {
       } }]);
       if (roster === "multiple") await expect(page.getByRole("button", { name: "Stop strategy", exact: true })).toBeEnabled();
       await page.reload();
-      await expect(page.locator(".strategy-list > li").filter({ hasText: target }).getByRole("button")).toBeDisabled();
+      await expect(page.locator(".strategy-list > li").filter({ hasText: target }).locator(".strategy-action").getByRole("button")).toBeDisabled();
       expect(commands).toHaveLength(1);
     }
     await page.screenshot({ path: testInfo.outputPath(`strategy-${roster}.png`), fullPage: true });
@@ -1949,7 +1949,7 @@ for (const failure of [401, 403, 409, 408, 503, "listener", "network", "malforme
     await page.locator("#language").selectOption("en");
     const active = page.locator(".strategy-list > li").filter({ hasText: "active-strategy" });
     page.once("dialog", (dialog) => void dialog.accept());
-    await active.getByRole("button").click();
+    await active.locator(".strategy-action").getByRole("button").click();
     await expect(page.getByRole("alert")).toBeVisible();
     await expect(page.getByRole("alert")).not.toContainText("SENSITIVE_SENTINEL");
     const definite = [401, 403, 409, "listener"].includes(failure);
@@ -1958,9 +1958,9 @@ for (const failure of [401, 403, 409, 408, 503, "listener", "network", "malforme
       await expect(page.locator(".strategy-notice")).toContainText("Awaiting state confirmation");
       await expect(page.getByText("Last-known strategy state. Refresh is required before using controls.")).toBeVisible();
     } else {
-      if (definite) await expect(active.getByRole("button")).toBeEnabled();
-      else await expect(active.getByRole("button")).toBeDisabled();
-      await expect(page.locator(".strategy-list > li").filter({ hasText: "other-strategy" }).getByRole("button")).toBeEnabled();
+      if (definite) await expect(active.locator(".strategy-action").getByRole("button")).toBeEnabled();
+      else await expect(active.locator(".strategy-action").getByRole("button")).toBeDisabled();
+      await expect(page.locator(".strategy-list > li").filter({ hasText: "other-strategy" }).locator(".strategy-action").getByRole("button")).toBeEnabled();
     }
     await expect(page.getByRole("button", { name: "Unlock LOCKDOWN" })).toBeDisabled();
     expect(sent).toBe(1);
@@ -2043,14 +2043,14 @@ for (const snapshot of ["unchanged", "status-only", "version-only", "missing"] a
     await page.locator("#language").selectOption("en");
     const target = page.locator(".strategy-list > li").filter({ hasText: "active-strategy" });
     page.once("dialog", (dialog) => void dialog.accept());
-    await target.getByRole("button").click();
+    await target.locator(".strategy-action").getByRole("button").click();
     await expect.poll(() => refreshes).toBe(2);
     const locked = snapshot === "unchanged" || snapshot === "missing";
     await expect.poll(() => page.evaluate(() => JSON.parse(sessionStorage.getItem("fluxtrade.strategy.awaiting") ?? "[]").length)).toBe(locked ? 1 : 0);
     if (snapshot === "missing") await expect(target).toHaveCount(0);
-    else if (locked) await expect(target.getByRole("button")).toBeDisabled();
-    else await expect(target.getByRole("button")).toBeEnabled();
-    await expect(page.locator(".strategy-list > li").filter({ hasText: "other-strategy" }).getByRole("button")).toBeEnabled();
+    else if (locked) await expect(target.locator(".strategy-action").getByRole("button")).toBeDisabled();
+    else await expect(target.locator(".strategy-action").getByRole("button")).toBeEnabled();
+    await expect(page.locator(".strategy-list > li").filter({ hasText: "other-strategy" }).locator(".strategy-action").getByRole("button")).toBeEnabled();
     await expect(page.locator(".strategy-notice")).toContainText("Awaiting state confirmation");
     await expect(page.getByRole("button", { name: "Unlock LOCKDOWN" })).toBeDisabled();
     expect(sent).toBe(1);
