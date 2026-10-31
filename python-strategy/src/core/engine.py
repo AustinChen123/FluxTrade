@@ -617,6 +617,7 @@ class StrategyEngine:
                 stop_event=self._order_event_stop,
                 callbacks=runtime_callbacks,
                 logger=logger,
+                notification_sink=self.notification_dispatcher,
             )
             if runtime_capabilities_factory is not None
             else NoopRuntimeCapabilities(

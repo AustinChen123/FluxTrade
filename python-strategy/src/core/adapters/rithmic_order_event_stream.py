@@ -8,6 +8,7 @@ from logging import Logger
 from typing import Any, Protocol
 
 from src.core.interfaces.exchange import ExchangeOrderEvent
+from src.core.notifications import NotificationSink
 
 from .rithmic_adapter import RithmicUnmappedOrderEvent
 
@@ -45,6 +46,7 @@ class RithmicOrderEventStreamService:
         halt_submissions: Callable[[], None],
         on_runtime_started: Callable[[], bool],
         logger: Logger,
+        notification_sink: NotificationSink | None = None,
     ) -> None:
         self._adapter = adapter
         self._stop_event = stop_event
@@ -57,6 +59,7 @@ class RithmicOrderEventStreamService:
         self._halt_submissions = halt_submissions
         self._on_runtime_started = on_runtime_started
         self._logger = logger
+        self.notification_sink = notification_sink
 
     def start(self, *, halt_on_failure: bool = True) -> bool:
         try:
