@@ -98,6 +98,8 @@ def _expected_projection(artifacts: dict[str, Any]) -> dict[str, object]:
     }
 
 
+# ~613s locally; GitHub runners are 2-3x slower. Speedup is a tracked follow-up.
+@pytest.mark.timeout(3600)
 @pytest.mark.slow
 def test_fixed_candidate_projection_matches_full_research_and_cli(tmp_path):
     names = ("floating-cli", "floating-full-long-id", "floating-research-id")
