@@ -16,7 +16,7 @@ def composition(profile="SYNTHETIC_BTC_ETH_V1"):
 
 
 def deliver(replay, kind, payload):
-    delivery = cast(w.Delivery, {"payload_kind": kind, "immutable_payload": payload})
+    delivery = cast(w.Delivery, {"payload_kind": kind, "visible_at": 500, "immutable_payload": payload})
     before, original = replay._codec.inspect_state(), deepcopy(delivery)
     result = replay._capture_callback(delivery)
     assert replay._codec.inspect_state() == before

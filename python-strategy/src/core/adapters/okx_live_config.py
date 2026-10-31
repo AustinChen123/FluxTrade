@@ -40,5 +40,10 @@ def build_okx_live_adapter_config(
         "instrument_product_ids": product_ids,
         "account_initialization": account_initialization,
     }
+    passphrase = environ.get("EXCHANGE_PASSPHRASE")
+    if passphrase is None or not passphrase.strip():
+        raise ValueError("EXCHANGE_PASSPHRASE must be set explicitly")
+
     config.update(build_ccxt_live_credentials(environ))
+    config["extra_config"] = {"password": passphrase}
     return config

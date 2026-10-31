@@ -70,6 +70,9 @@ _LEGACY_PROVIDER_IMPORTS = frozenset(
         ),
     }
 )
+_APPROVED_SPIDER_PROVIDER_IMPORTS = frozenset(
+    {("src.main", "src.core.adapters.okx_spider_transport")}
+)
 _FORBIDDEN_SPIDER_OWNER_IMPORT_ROOTS = (
     "src.core.backtest_runner",
     "src.core.research_backtest_runner",
@@ -348,8 +351,16 @@ def test_tracked_production_provider_imports_match_exact_baseline() -> None:
             sources,
             package_modules=packages,
         )
-        == _LEGACY_PROVIDER_IMPORTS
+        == _LEGACY_PROVIDER_IMPORTS | _APPROVED_SPIDER_PROVIDER_IMPORTS
     )
+    _assert_main_spider_provider_import_is_classifier_only(sources["src.main"])
+    assert not {
+        (owner, "src.core.adapters.okx_spider_transport")
+        for owner in (
+            "src.core.spider_management.runtime_owner",
+            "src.core.spider_management.initial_place_projection",
+        )
+    } & _provider_pairs(sources, package_modules=packages)
 
 
 def test_tracked_production_orm_free_port_imports_match_exact_baseline() -> None:
@@ -461,7 +472,8 @@ def test_replay_contract_is_provider_and_orm_free_before_staging() -> None:
     sources, packages = _tracked_production_sources()
     sources[importer] = source
     assert (
-        _provider_pairs(sources, package_modules=packages) == _LEGACY_PROVIDER_IMPORTS
+        _provider_pairs(sources, package_modules=packages)
+        == _LEGACY_PROVIDER_IMPORTS | _APPROVED_SPIDER_PROVIDER_IMPORTS
     )
     assert (
         _orm_free_pairs(sources, package_modules=packages) == _LEGACY_PORT_ORM_IMPORTS
@@ -479,6 +491,100 @@ def test_replay_contract_is_provider_and_orm_free_before_staging() -> None:
         sources | {importer: "from src.core.orm_models import Order"},
         package_modules=packages,
     )
+
+
+def _assert_main_spider_provider_import_is_classifier_only(source: str) -> None:
+    tree = ast.parse(source)
+    spider_imports: list[tuple[str, ...]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "src.core.adapters.okx_spider_transport":
+            spider_imports.append(tuple(alias.name for alias in node.names))
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name in {
+                    "src.core.adapters.okx_spider_transport",
+                    "ccxt",
+                    "websockets",
+                }:
+                    spider_imports.append((alias.name,))
+    assert spider_imports == [("classify_okx_batch_response",)]
+    forbidden_dynamic = {
+        "src.core.adapters.okx_spider_transport",
+        "ccxt",
+        "websockets",
+    }
+    assert not forbidden_dynamic.intersection(_dynamic_imports(tree))
+
+
+def test_spider_classifier_import_stays_main_local_and_pure() -> None:
+    sources, packages = _tracked_production_sources()
+    _assert_main_spider_provider_import_is_classifier_only(sources["src.main"])
+    for owner in (
+        "src.core.spider_management.runtime_owner",
+        "src.core.spider_management.initial_place_projection",
+    ):
+        assert (
+            owner,
+            "src.core.adapters.okx_spider_transport",
+        ) not in _provider_pairs(sources, package_modules=packages)
+
+
+@pytest.mark.parametrize(
+    "owner",
+    [
+        "src.core.spider_management.runtime_owner",
+        "src.core.spider_management.initial_place_projection",
+    ],
+)
+def test_spider_provider_classifier_cannot_move_into_management_or_projection(
+    owner: str,
+) -> None:
+    sources, packages = _tracked_production_sources()
+    if owner not in sources:
+        sources[owner] = (
+            _PYTHON_ROOT / "src/core/spider_management/initial_place_projection.py"
+        ).read_text()
+    sources[owner] += "\nfrom src.core.adapters.okx_spider_transport import classify_okx_batch_response\n"
+    assert (
+        _provider_pairs(sources, package_modules=packages)
+        != _LEGACY_PROVIDER_IMPORTS | _APPROVED_SPIDER_PROVIDER_IMPORTS
+    )
+
+
+@pytest.mark.parametrize(
+    "forbidden_import",
+    [
+        "from src.core.adapters.okx_spider_transport import OkxSpiderBatchTransport",
+        "from src.core.adapters.okx_spider_transport import create_okx_spider_batch_client",
+        "import ccxt",
+        "import websockets",
+    ],
+)
+def test_main_cannot_import_spider_sender_or_sdk(
+    forbidden_import: str,
+) -> None:
+    sources, _packages = _tracked_production_sources()
+    with pytest.raises(AssertionError):
+        _assert_main_spider_provider_import_is_classifier_only(
+            sources["src.main"] + "\n" + forbidden_import + "\n"
+        )
+
+
+@pytest.mark.parametrize(
+    "forbidden_import",
+    [
+        'from importlib import import_module\nimport_module("src.core.adapters.okx_spider_transport")',
+        '__import__("src.core.adapters.okx_spider_transport")',
+    ],
+)
+def test_main_cannot_dynamically_import_spider_transport_module(
+    forbidden_import: str,
+) -> None:
+    sources, _packages = _tracked_production_sources()
+    with pytest.raises(AssertionError):
+        _assert_main_spider_provider_import_is_classifier_only(
+            sources["src.main"] + "\n" + forbidden_import + "\n"
+        )
 
 
 @pytest.mark.parametrize(

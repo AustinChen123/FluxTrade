@@ -35,6 +35,7 @@ def _valid_environ() -> dict[str, str]:
     return {
         "EXCHANGE_API_KEY": " key ",
         "EXCHANGE_SECRET": " secret ",
+        "EXCHANGE_PASSPHRASE": " passphrase ",
         "EXCHANGE_TESTNET": " false ",
         "EXCHANGE_ENABLE_WS": " false ",
     }
@@ -104,6 +105,7 @@ def test_okx_owner_returns_exact_current_config_and_key_order() -> None:
         "api_key": "key",
         "secret": "secret",
         "testnet": False,
+        "extra_config": {"password": " passphrase "},
     }
     assert list(config) == [
         "mode",
@@ -114,6 +116,7 @@ def test_okx_owner_returns_exact_current_config_and_key_order() -> None:
         "api_key",
         "secret",
         "testnet",
+        "extra_config",
     ]
     assert config["instrument_product_ids"] is products
     assert config["account_initialization"]["product_ids"] is products
@@ -165,6 +168,56 @@ def test_okx_owner_parses_websocket_before_credentials(monkeypatch) -> None:
     credentials.assert_not_called()
 
 
+@pytest.mark.parametrize("raw", [None, "", "   ", "\t \n"])
+def test_okx_owner_rejects_missing_or_blank_passphrase_without_exposing_value(raw) -> None:
+    environ = _valid_environ()
+    if raw is None:
+        environ.pop("EXCHANGE_PASSPHRASE")
+    else:
+        environ["EXCHANGE_PASSPHRASE"] = raw
+
+    with pytest.raises(ValueError) as raised:
+        _owner().build_okx_live_adapter_config(
+            product_ids=["OKX:BTCUSDT-PERP"],
+            environ=environ,
+        )
+
+    assert raised.value.args == ("EXCHANGE_PASSPHRASE must be set explicitly",)
+    assert raw is None or not raw or raw not in str(raised.value)
+
+
+def test_okx_passphrase_reaches_constructed_client_password(monkeypatch) -> None:
+    from src.core.adapters import ccxt_adapter
+
+    class FakeOkx:
+        def __init__(self, config):
+            self.config = config
+            self.password = config.get("password")
+
+        def set_sandbox_mode(self, _enabled):
+            pass
+
+    monkeypatch.setattr(ccxt_adapter.ccxt, "okx", FakeOkx, raising=False)
+    environ = _valid_environ()
+    passphrase = "  exact passphrase  "
+    environ["EXCHANGE_PASSPHRASE"] = passphrase
+    config = _owner().build_okx_live_adapter_config(
+        product_ids=["OKX:BTCUSDT-PERP"],
+        environ=environ,
+    )
+
+    adapter = importlib.import_module(
+        "src.core.adapters.live_okx"
+    ).create_okx_live_adapter(
+        api_key=config["api_key"],
+        secret=config["secret"],
+        testnet=config["testnet"],
+        extra_config=config["extra_config"],
+    )
+
+    assert adapter.client.password == passphrase
+
+
 @pytest.mark.parametrize(
     ("updates", "expected"),
     [
@@ -173,6 +226,7 @@ def test_okx_owner_parses_websocket_before_credentials(monkeypatch) -> None:
                 "EXCHANGE_ENABLE_WS": "enabled",
                 "EXCHANGE_API_KEY": "",
                 "EXCHANGE_SECRET": "",
+                "EXCHANGE_PASSPHRASE": "",
                 "EXCHANGE_TESTNET": "enabled",
             },
             "EXCHANGE_ENABLE_WS must be a boolean",

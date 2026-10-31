@@ -1,10 +1,12 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ApiError, type StrategyState, type StrategyStatus } from "../../api";
 import i18n from "../../shared/i18n";
+import { spiderTestOrder, spiderTestOrdersPage, spiderTestTrade, spiderTestTradesPage } from "./spiderOrders.test-fixtures";
+import type { SpiderTradesPage } from "./spiderOrdersModel";
 import { StrategyManager } from "./StrategyManager";
 
 const api = vi.hoisted(() => ({
@@ -12,7 +14,9 @@ const api = vi.hoisted(() => ({
   loadKillSwitchStatus: vi.fn(),
   clearKillSwitch: vi.fn(),
   loadStrategyStates: vi.fn(),
-  sendStrategyCommand: vi.fn()
+  sendStrategyCommand: vi.fn(),
+  loadSpiderOrders: vi.fn(),
+  loadSpiderOrderTrades: vi.fn()
 }));
 
 vi.mock("../../api", async (importOriginal) => ({
@@ -78,6 +82,8 @@ describe("strategy management", () => {
       strategy("error-strategy", "ERROR", "feed disconnected"),
       strategy("ready-strategy", "READY")
     ]);
+    api.loadSpiderOrders.mockResolvedValue(spiderTestOrdersPage);
+    api.loadSpiderOrderTrades.mockResolvedValue(spiderTestTradesPage);
     api.sendStrategyCommand.mockResolvedValue(undefined);
     vi.spyOn(window, "confirm").mockReturnValue(true);
   });
@@ -423,5 +429,233 @@ describe("strategy management", () => {
     ).toBeTruthy();
     expect(api.ensureBrowserSession).toHaveBeenCalledTimes(2);
     expect(api.loadStrategyStates).toHaveBeenCalledTimes(2);
+  });
+
+  it("opens a read-only exact-strategy query and preserves the closed DTO strings and null IDs", async () => {
+    api.loadStrategyStates.mockResolvedValue([strategy("exact-strategy", "ACTIVE")]);
+    render(<StrategyManager />);
+    await screen.findByText("exact-strategy");
+    const card = screen.getByText("exact-strategy").closest("li")!;
+    fireEvent.click(within(card).getByRole("button", { name: "檢視本地執行紀錄" }));
+
+    expect(await screen.findByText(/SQL_LOCAL_FACTS.*NOT_ASSERTED.*LOCKDOWN/)).toBeTruthy();
+    expect(await screen.findByText(spiderTestOrder.local_order_id)).toBeTruthy();
+    expect(screen.getByText(/FUTURE_STATUS/)).toBeTruthy();
+    expect(screen.getAllByText("12345.67", { exact: true }).length).toBeGreaterThan(0);
+    expect(screen.getAllByText("未記錄").length).toBeGreaterThan(0);
+    expect(api.loadSpiderOrders).toHaveBeenCalledTimes(1);
+    expect(api.loadSpiderOrders).toHaveBeenCalledWith({
+      strategy_id: "exact-strategy", category: "ALL", limit: 20, offset: 0
+    }, expect.any(AbortSignal));
+    expect(api.sendStrategyCommand).not.toHaveBeenCalled();
+  });
+
+  it("carries the unchanged parent view version into execution drill-down", async () => {
+    api.loadStrategyStates.mockResolvedValue([strategy("exact-strategy", "ACTIVE")]);
+    render(<StrategyManager />);
+    await screen.findByText("exact-strategy");
+    const card = screen.getByText("exact-strategy").closest("li")!;
+    fireEvent.click(within(card).getByRole("button", { name: "檢視本地執行紀錄" }));
+    const inspect = await screen.findByRole("button", {
+      name: `檢視本地訂單 ${spiderTestOrder.local_order_id} 的執行明細`
+    });
+    fireEvent.click(inspect);
+
+    expect(await screen.findByText(/-0\.00000012/)).toBeTruthy();
+    expect(api.loadSpiderOrderTrades).toHaveBeenCalledWith(
+      spiderTestOrder.local_order_id,
+      {
+        strategy_id: "exact-strategy", category: "ALL", limit: 20, offset: 0,
+        view_version: spiderTestOrdersPage.view_version
+      },
+      expect.any(AbortSignal)
+    );
+    expect(api.loadSpiderOrderTrades.mock.calls[0][1]).not.toHaveProperty("local_order_id");
+    expect(spiderTestTradesPage.view_version).toBe(spiderTestOrdersPage.view_version);
+  });
+
+  it.each(["   ", " order id "])("preserves the exact opaque local order filter %j", async (localOrderId) => {
+    api.loadStrategyStates.mockResolvedValue([strategy("exact-strategy", "ACTIVE")]);
+    render(<StrategyManager />);
+    await screen.findByText("exact-strategy");
+    const card = screen.getByText("exact-strategy").closest("li")!;
+    fireEvent.click(within(card).getByRole("button", { name: "檢視本地執行紀錄" }));
+    await screen.findByText(spiderTestOrder.local_order_id);
+    api.loadSpiderOrders.mockResolvedValue({
+      ...spiderTestOrdersPage,
+      filters: { ...spiderTestOrdersPage.filters, local_order_id: localOrderId }
+    });
+    fireEvent.change(screen.getByLabelText("精確本地訂單 ID 篩選"), {
+      target: { value: localOrderId }
+    });
+    fireEvent.click(screen.getByRole("button", { name: "套用篩選" }));
+
+    await waitFor(() => expect(api.loadSpiderOrders).toHaveBeenCalledTimes(2));
+    expect(api.loadSpiderOrders.mock.calls[1][0]).toMatchObject({
+      strategy_id: "exact-strategy", local_order_id: localOrderId, offset: 0
+    });
+  });
+
+  it("retains only explicitly stale orders when a paged order response changes version", async () => {
+    const secondOrder = { ...spiderTestOrder, local_order_id: "local-order-002" };
+    api.loadStrategyStates.mockResolvedValue([strategy("exact-strategy", "ACTIVE")]);
+    api.loadSpiderOrders
+      .mockResolvedValueOnce({ ...spiderTestOrdersPage, total_count: 2, next_offset: 1 })
+      .mockResolvedValueOnce({
+        ...spiderTestOrdersPage, offset: 1, total_count: 2, next_offset: null,
+        view_version: "c".repeat(64), orders: [secondOrder]
+      });
+    render(<StrategyManager />);
+    await screen.findByText("exact-strategy");
+    const card = screen.getByText("exact-strategy").closest("li")!;
+    fireEvent.click(within(card).getByRole("button", { name: "檢視本地執行紀錄" }));
+    await screen.findByText(spiderTestOrder.local_order_id);
+    fireEvent.click(within(screen.getByRole("navigation", { name: "訂單分頁" }))
+      .getByRole("button", { name: "下一頁" }));
+
+    expect(await screen.findByText(/保留畫面會標示為過期/)).toBeTruthy();
+    expect(screen.getByText(spiderTestOrder.local_order_id)).toBeTruthy();
+    expect(screen.queryByText(secondOrder.local_order_id)).toBeNull();
+    expect(api.loadSpiderOrders.mock.calls[1][0].view_version).toBe(spiderTestOrdersPage.view_version);
+    expect((within(screen.getByRole("navigation", { name: "訂單分頁" }))
+      .getByRole("button", { name: "下一頁" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("ignores a late trade response after selecting another local order", async () => {
+    const secondOrder = { ...spiderTestOrder, local_order_id: "local-order-002" };
+    const secondTrade = {
+      ...spiderTestTradesPage.trades[0],
+      local_order_id: secondOrder.local_order_id,
+      local_trade_id: "local-trade-002"
+    };
+    api.loadStrategyStates.mockResolvedValue([strategy("exact-strategy", "ACTIVE")]);
+    api.loadSpiderOrders.mockResolvedValue({
+      ...spiderTestOrdersPage,
+      total_count: 2,
+      orders: [spiderTestOrder, secondOrder]
+    });
+    let resolveFirst!: (page: typeof spiderTestTradesPage) => void;
+    const firstResponse = new Promise<typeof spiderTestTradesPage>((resolve) => {
+      resolveFirst = resolve;
+    });
+    api.loadSpiderOrderTrades.mockImplementation((orderId: string) =>
+      orderId === spiderTestOrder.local_order_id
+        ? firstResponse
+        : Promise.resolve({
+            ...spiderTestTradesPage,
+            local_order_id: secondOrder.local_order_id,
+            trades: [secondTrade]
+          })
+    );
+    render(<StrategyManager />);
+    await screen.findByText("exact-strategy");
+    const card = screen.getByText("exact-strategy").closest("li")!;
+    fireEvent.click(within(card).getByRole("button", { name: "檢視本地執行紀錄" }));
+    fireEvent.click(await screen.findByRole("button", {
+      name: `檢視本地訂單 ${spiderTestOrder.local_order_id} 的執行明細`
+    }));
+    await waitFor(() => expect(api.loadSpiderOrderTrades).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole("button", {
+      name: `檢視本地訂單 ${secondOrder.local_order_id} 的執行明細`
+    }));
+    expect(await screen.findByText("local-trade-002")).toBeTruthy();
+    resolveFirst(spiderTestTradesPage);
+    await new Promise((resolve) => window.setTimeout(resolve, 0));
+    expect(screen.getByText("local-trade-002")).toBeTruthy();
+    expect(screen.queryByText(spiderTestTrade.local_trade_id)).toBeNull();
+  });
+
+  it.each([
+    [503, "spider_order_query_unavailable"],
+    [401, "unauthorized"],
+    [403, "forbidden"],
+    [409, "spider_order_view_changed"]
+  ])("gates old trade continuation and ignores late trade data after order-read %s", async (status, code) => {
+    let rejectOrders!: (reason: unknown) => void;
+    let resolveLateTrades!: (page: SpiderTradesPage) => void;
+    api.loadStrategyStates.mockResolvedValue([strategy("exact-strategy", "ACTIVE")]);
+    api.loadSpiderOrders
+      .mockResolvedValueOnce({ ...spiderTestOrdersPage, total_count: 2, next_offset: 1 })
+      .mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectOrders = reject; }));
+    api.loadSpiderOrderTrades
+      .mockResolvedValueOnce({ ...spiderTestTradesPage, total_count: 2, next_offset: 1 })
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveLateTrades = resolve; }));
+    render(<StrategyManager />);
+    await screen.findByText("exact-strategy");
+    const card = screen.getByText("exact-strategy").closest("li")!;
+    fireEvent.click(within(card).getByRole("button", { name: "檢視本地執行紀錄" }));
+    fireEvent.click(await screen.findByRole("button", {
+      name: `檢視本地訂單 ${spiderTestOrder.local_order_id} 的執行明細`
+    }));
+    await screen.findByText(spiderTestTrade.local_trade_id);
+    const tradeNavigation = screen.getByRole("navigation", { name: "執行分頁" });
+    fireEvent.click(within(tradeNavigation).getByRole("button", { name: "下一頁" }));
+    await waitFor(() => expect(api.loadSpiderOrderTrades).toHaveBeenCalledTimes(2));
+    const orderNavigation = screen.getByRole("navigation", { name: "訂單分頁" });
+    fireEvent.click(within(orderNavigation).getByRole("button", { name: "下一頁" }));
+    await waitFor(() => expect(api.loadSpiderOrders).toHaveBeenCalledTimes(2));
+    expect((within(tradeNavigation).getByRole("button", { name: "下一頁" }) as HTMLButtonElement).disabled).toBe(true);
+
+    rejectOrders(new ApiError(code, status));
+    expect(await screen.findByRole("alert")).toBeTruthy();
+    if (status === 503) {
+      expect(screen.getAllByText(spiderTestOrder.local_order_id).length).toBeGreaterThan(0);
+      expect(screen.getByText(spiderTestTrade.local_trade_id)).toBeTruthy();
+      expect((within(screen.getByRole("navigation", { name: "執行分頁" }))
+        .getByRole("button", { name: "下一頁" }) as HTMLButtonElement).disabled).toBe(true);
+    } else {
+      expect(screen.queryByText(spiderTestOrder.local_order_id)).toBeNull();
+      expect(screen.queryByText(spiderTestTrade.local_trade_id)).toBeNull();
+    }
+
+    resolveLateTrades({
+      ...spiderTestTradesPage,
+      offset: 1,
+      total_count: 2,
+      trades: [{ ...spiderTestTrade, local_trade_id: "late-trade-should-not-render" }]
+    });
+    await new Promise((resolve) => window.setTimeout(resolve, 0));
+    expect(screen.queryByText("late-trade-should-not-render")).toBeNull();
+    if (status === 409) {
+      expect(screen.getByRole("button", { name: "從第一頁重新載入變更後的檢視" })).toBeTruthy();
+    }
+  });
+
+  it.each([401, 403])("clears financial data after a query permission failure (%s)", async (status) => {
+    api.loadStrategyStates.mockResolvedValue([strategy("exact-strategy", "ACTIVE")]);
+    api.loadSpiderOrderTrades.mockRejectedValue(new ApiError("forbidden", status));
+    render(<StrategyManager />);
+    await screen.findByText("exact-strategy");
+    const card = screen.getByText("exact-strategy").closest("li")!;
+    fireEvent.click(within(card).getByRole("button", { name: "檢視本地執行紀錄" }));
+    fireEvent.click(await screen.findByRole("button", {
+      name: `檢視本地訂單 ${spiderTestOrder.local_order_id} 的執行明細`
+    }));
+
+    expect(await screen.findByRole("alert")).toBeTruthy();
+    expect(screen.queryByText(spiderTestOrder.local_order_id, { exact: true })).toBeNull();
+    expect(screen.queryByText("12345.67", { exact: true })).toBeNull();
+    expect(api.loadSpiderOrderTrades).toHaveBeenCalledTimes(1);
+  });
+
+  it("clears the old view on 409 and waits for an explicit page-one reload", async () => {
+    api.loadStrategyStates.mockResolvedValue([strategy("exact-strategy", "ACTIVE")]);
+    api.loadSpiderOrderTrades.mockRejectedValue(new ApiError("spider_order_view_changed", 409));
+    render(<StrategyManager />);
+    await screen.findByText("exact-strategy");
+    const card = screen.getByText("exact-strategy").closest("li")!;
+    fireEvent.click(within(card).getByRole("button", { name: "檢視本地執行紀錄" }));
+    fireEvent.click(await screen.findByRole("button", {
+      name: `檢視本地訂單 ${spiderTestOrder.local_order_id} 的執行明細`
+    }));
+
+    expect(await screen.findByText(/已儲存檢視內容已變更/)).toBeTruthy();
+    expect(screen.queryByText(spiderTestOrder.local_order_id, { exact: true })).toBeNull();
+    expect(api.loadSpiderOrders).toHaveBeenCalledTimes(1);
+    await new Promise((resolve) => window.setTimeout(resolve, 500));
+    expect(api.loadSpiderOrders).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByRole("button", { name: "從第一頁重新載入變更後的檢視" }));
+    expect(await screen.findByText(spiderTestOrder.local_order_id, { exact: true })).toBeTruthy();
+    expect(api.loadSpiderOrders).toHaveBeenCalledTimes(2);
   });
 });

@@ -2,14 +2,17 @@ name: CI
 
 on:
   push:
-    branches: [ "main", "develop", "refactor/**", "test/**", "fix/**", "feat/**", "chore/**", "cleanup/**" ]
+    branches: ['**']
   pull_request:
-    branches: [ "main", "develop", "refactor/**" ]
+  workflow_dispatch:
 
 # Cancel in-progress runs on the same branch to save CI minutes
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  UV_LOCKED: "true"
 
 permissions:
   contents: read
@@ -124,9 +127,11 @@ jobs:
       #   2. Run: cargo llvm-cov --no-default-features --codecov --output-path codecov.json
       #   3. Upload artifact or send to Codecov
 
+  # Observed fast-lane test steps took 17–39 minutes; keep a 60-minute job cap.
   python-check:
     name: Python Check
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     defaults:
       run:
         working-directory: ./python-strategy
@@ -148,17 +153,26 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('rust-data-service/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
-      - name: Build and install fluxtrade_core.so
-        working-directory: ./rust-data-service
-        run: |
-          cargo build --lib --release
-          cp target/release/libfluxtrade_core.so ../python-strategy/src/fluxtrade_core.so
-
       - name: Install uv
         uses: astral-sh/setup-uv@v6
 
       - name: Set up Python
         run: uv python install
+
+      - name: Select PyO3 interpreter
+        run: echo "PYO3_PYTHON=$(uv run --no-sync python -c 'import os,sys; print(os.path.abspath(sys.executable))')" >> "$GITHUB_ENV"
+
+      - name: Build and install fluxtrade_core.so
+        working-directory: ./rust-data-service
+        run: |
+          test -x "$PYO3_PYTHON"
+          cargo build --lib --release
+          cp target/release/libfluxtrade_core.so ../python-strategy/src/fluxtrade_core.so
+
+      - name: Verify native module ABI
+        env:
+          PYTHONPATH: src
+        run: uv run --no-sync python -c 'import sys, fluxtrade_core; print(sys.version); print(fluxtrade_core.__file__)'
 
       - name: Verify profile assembly and cleanup cross-language contract
         shell: bash
@@ -202,7 +216,9 @@ jobs:
         run: uv run pytest tests/test_invariant_*.py -v
 
       - name: Run unit tests with coverage
-        run: uv run pytest -W error -m "not integration" --cov=src --cov-report=term-missing --cov-report=xml:coverage.xml --cov-fail-under=77
+        env:
+          COVERAGE_CORE: sysmon
+        run: uv run pytest -W error -m "not integration and not slow" -n 4 --cov=src --cov-report=term-missing --cov-report=xml:coverage.xml --cov-fail-under=77
 
       - name: Upload coverage report
         if: always()
@@ -242,6 +258,61 @@ jobs:
         # 2. Use shields.io endpoint badge: ![Coverage](https://img.shields.io/endpoint?url=<URL_TO_JSON>)
         # Or integrate with Codecov/Coveralls for automatic badge generation.
 
+
+  # The largest fast-lane call took 77.48s locally; ubuntu-latest is 1.5-2.5x slower, so allow 300s per fast test and 1800s per slow test.
+  python-slow:
+    name: Python Slow Tests
+    if: >-
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')) ||
+      github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: ./python-strategy
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain (for fluxtrade_core.so)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.82.0"
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust-data-service/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust-data-service/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Set up Python
+        run: uv python install
+
+      - name: Select PyO3 interpreter
+        run: echo "PYO3_PYTHON=$(uv run --no-sync python -c 'import os,sys; print(os.path.abspath(sys.executable))')" >> "$GITHUB_ENV"
+
+      - name: Build and install fluxtrade_core.so
+        working-directory: ./rust-data-service
+        run: |
+          test -x "$PYO3_PYTHON"
+          cargo build --lib --release
+          cp target/release/libfluxtrade_core.so ../python-strategy/src/fluxtrade_core.so
+
+      - name: Verify native module ABI
+        env:
+          PYTHONPATH: src
+        run: uv run --no-sync python -c 'import sys, fluxtrade_core; print(sys.version); print(fluxtrade_core.__file__)'
+
+      - name: Run slow tests
+        run: uv run pytest -W error -m "slow and not integration" -n 4 --timeout=1800 --durations=50
+
   integration-check:
     name: Integration Tests (Rust + Python)
     runs-on: ubuntu-latest
@@ -262,6 +333,17 @@ jobs:
           --health-retries 10
     steps:
       - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Set up Python
+        working-directory: ./python-strategy
+        run: uv python install
+
+      - name: Select PyO3 interpreter
+        working-directory: ./python-strategy
+        run: echo "PYO3_PYTHON=$(uv run --no-sync python -c 'import os,sys; print(os.path.abspath(sys.executable))')" >> "$GITHUB_ENV"
 
       - name: Install Rust toolchain (from rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@master
@@ -285,7 +367,7 @@ jobs:
 
       - name: Build Rust library (Linux)
         working-directory: ./rust-data-service
-        run: cargo build --lib --release
+        run: test -x "$PYO3_PYTHON" && cargo build --lib --release
         if: runner.os == 'Linux'
 
       - name: Copy .so to Python
@@ -299,12 +381,11 @@ jobs:
             exit 1
           fi
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v6
-
-      - name: Set up Python
+      - name: Verify native module ABI
         working-directory: ./python-strategy
-        run: uv python install
+        env:
+          PYTHONPATH: src
+        run: uv run --no-sync python -c 'import sys, fluxtrade_core; print(sys.version); print(fluxtrade_core.__file__)'
 
       - name: Set up Node for real Control Plane browser integration
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
@@ -387,7 +468,7 @@ jobs:
   refactor-gate:
     name: Refactor Gate
     if: always()
-    needs: [frontend-check, integration-check, python-check, rust-check, secret-scan]
+    needs: [frontend-check, integration-check, python-check, python-slow, rust-check, secret-scan]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -401,6 +482,8 @@ jobs:
       - name: Validate workflow and required jobs
         env:
           NEEDS_JSON: ${{ toJson(needs) }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REF: ${{ github.ref }}
         run: |
           ruby <<'RUBY'
           require "digest"
@@ -427,8 +510,7 @@ jobs:
           unless manifest.is_a?(Hash) && manifest.keys.sort == expected_keys &&
                  manifest["schema"] == "fluxtrade_refactor_expected_jobs_v1" &&
                  manifest["workflow_path"] == workflow_path &&
-                 manifest["aggregate_job_id"] == "refactor-gate" &&
-                 manifest["excluded_job_ids"] == []
+                 manifest["aggregate_job_id"] == "refactor-gate"
             fail_closed.call("MANIFEST_SCHEMA_MISMATCH", "manifest_contract", "repair_manifest")
           end
 
@@ -462,8 +544,12 @@ jobs:
           aggregate = manifest["aggregate_job_id"]
           required = manifest["required_job_ids"]
           non_aggregate = jobs.keys.reject { |id| id == aggregate }.sort
-          unless required.is_a?(Array) && required == required.sort && required.uniq == required && required == non_aggregate
-            fail_closed.call("JOB_GRAPH_MISMATCH", "required_job_ids", "reconcile_manifest_and_workflow")
+          excluded = manifest["excluded_job_ids"]
+          unless excluded.is_a?(Array) && excluded == excluded.sort && excluded.uniq == excluded &&
+                 excluded.all? { |id| non_aggregate.include?(id) } &&
+                 required.is_a?(Array) && required == required.sort && required.uniq == required &&
+                 (required & excluded).empty? && (required + excluded).sort == non_aggregate
+            fail_closed.call("JOB_GRAPH_MISMATCH", "required_job_ids_or_exclusions", "reconcile_manifest_and_workflow")
           end
           unless graph[aggregate] == required
             fail_closed.call("JOB_GRAPH_MISMATCH", "aggregate_needs", "reconcile_manifest_and_workflow")
@@ -477,12 +563,34 @@ jobs:
           unless runtime_needs.is_a?(Hash) && runtime_needs.keys.sort == required
             fail_closed.call("REQUIRED_JOB_MISSING", "runtime_job_set", "rerun_required_jobs")
           end
+          slow_result_accepted = lambda do |event_name, ref, result|
+            next false unless %w[pull_request push workflow_dispatch].include?(event_name)
+            expected_to_run = event_name == "pull_request" ||
+              (event_name == "push" && %w[refs/heads/main refs/heads/develop].include?(ref)) ||
+              event_name == "workflow_dispatch"
+            expected_to_run ? result == "success" : result == "skipped"
+          end
+          unless slow_result_accepted.call("pull_request", "refs/pull/7/merge", "success") &&
+                 !slow_result_accepted.call("pull_request", "refs/pull/7/merge", "skipped") &&
+                 !slow_result_accepted.call("pull_request", "refs/pull/7/merge", "failure") &&
+                 !slow_result_accepted.call("pull_request", "refs/pull/7/merge", "cancelled") &&
+                 slow_result_accepted.call("push", "refs/heads/feature", "skipped") &&
+                 !slow_result_accepted.call("push", "refs/heads/feature", "success") &&
+                 slow_result_accepted.call("push", "refs/heads/main", "success") &&
+                 !slow_result_accepted.call("push", "refs/heads/main", "failure") &&
+                 slow_result_accepted.call("workflow_dispatch", "refs/heads/feature", "success") &&
+                 slow_result_accepted.call("push", "refs/heads/develop", "success") &&
+                 !slow_result_accepted.call("schedule", "refs/heads/main", "skipped") &&
+                 !slow_result_accepted.call("unknown", "refs/heads/main", "skipped")
+            fail_closed.call("SLOW_JOB_POLICY_SELF_TEST_FAILED", "event_result_matrix", "repair_slow_job_policy")
+          end
           required.each do |id|
             entry = runtime_needs[id]
             unless entry.is_a?(Hash) && entry["result"].is_a?(String)
               fail_closed.call("MALFORMED_RUNTIME_NEEDS", "job_id=#{id}", "rerun_required_jobs")
             end
-            unless entry["result"] == "success"
+            accepted = id == "python-slow" ? slow_result_accepted.call(ENV.fetch("GITHUB_EVENT_NAME"), ENV.fetch("GITHUB_REF"), entry["result"]) : entry["result"] == "success"
+            unless accepted
               fail_closed.call("REQUIRED_JOB_NOT_SUCCESS", "job_id=#{id} result=#{entry["result"]}", "inspect_named_job")
             end
           end

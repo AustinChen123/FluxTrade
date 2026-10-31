@@ -23,7 +23,9 @@ fn boundary(reason: Fault) -> BoundaryError {
         | "INVALID_HISTORICAL_BAR"
         | "INVALID_HISTORICAL_TIME"
         | "INVALID_HISTORICAL_ORDER_SNAPSHOT"
-        | "HISTORICAL_MARKET_OWNER_UNSUPPORTED" => BoundaryError::Input(reason),
+        | "HISTORICAL_MARKET_OWNER_UNSUPPORTED"
+        | "UNSUPPORTED_GROSS_PROFILE" => BoundaryError::Input(reason),
+        "UNSUPPORTED_COST_PROFILE" => BoundaryError::Input(reason),
         "UNKNOWN_RECEIPT_REFERENCE" => BoundaryError::Lookup(reason),
         "SNAPSHOT_ID_CONFLICT" | "DELIVERY_ID_CONFLICT" => BoundaryError::Conflict(reason),
         _ => BoundaryError::Invariant,
@@ -67,6 +69,64 @@ impl Session {
     fn inspect_state(&mut self) -> Reply {
         self.guarded(false, |s| s.inspect_state_inner())
     }
+    fn historical_cost_projection(&mut self) -> Reply {
+        if !matches!(
+            &self.owner.profile,
+            ProfileContext::BtcEthScenario {
+                scenario: FrozenScenario {
+                    configured: Some(_),
+                    ..
+                },
+                ..
+            }
+        ) {
+            return Err(BoundaryError::Input("UNSUPPORTED_COST_PROFILE"));
+        }
+        self.guarded(false, |s| {
+            s.owner
+                .historical_source_cost_projection()
+                .and_then(|value| value.canonical().map_err(|_| "NATIVE_INVARIANT"))
+                .map_err(boundary)
+        })
+    }
+    fn gross_admission_projection(&mut self) -> Reply {
+        if !self.owner.is_gross_admission_profile() {
+            return Err(BoundaryError::Input("UNSUPPORTED_GROSS_PROFILE"));
+        }
+        self.guarded(false, |s| {
+            gross_admission::project(&s.owner)
+                .and_then(|value| value.canonical().map_err(|_| "NATIVE_INVARIANT"))
+                .map_err(boundary)
+        })
+    }
+    fn gross_response_projection(&mut self) -> Reply {
+        if !self.owner.is_gross_admission_profile() {
+            return Err(BoundaryError::Input("UNSUPPORTED_GROSS_PROFILE"));
+        }
+        self.guarded(false, |s| {
+            gross_response::project(&s.owner)
+                .and_then(|value| value.canonical().map_err(|_| "NATIVE_INVARIANT"))
+                .map_err(boundary)
+        })
+    }
+    fn apply_gross_response_group(&mut self, request: &str, control: &str) -> Reply {
+        if !self.owner.is_gross_admission_profile() {
+            return Err(BoundaryError::Input("UNSUPPORTED_GROSS_PROFILE"));
+        }
+        let decoded = wire::decode(control).map_err(boundary)?;
+        let fields = decoded
+            .object(&["schema_version", "restricted"], &[])
+            .map_err(boundary)?;
+        if fields["schema_version"].text().map_err(boundary)?
+            != "spider_gross_response_group_control_v1"
+        {
+            return Err(BoundaryError::Input("INVALID_SCHEMA"));
+        }
+        let restricted = fields["restricted"].boolean().map_err(boundary)?;
+        self.guarded(true, |s| {
+            s.apply_group_inner_with_restriction(request, restricted)
+        })
+    }
     fn guarded(&mut self, mutation: bool, operation: impl FnOnce(&mut Self) -> Reply) -> Reply {
         if mutation && self.poisoned {
             return Err(BoundaryError::Invariant);
@@ -80,9 +140,14 @@ impl Session {
         result
     }
     fn apply_group_inner(&mut self, request: &str) -> Reply {
+        self.apply_group_inner_with_restriction(request, false)
+    }
+    fn apply_group_inner_with_restriction(&mut self, request: &str, restrict_risk: bool) -> Reply {
         let group = wire::group::decode_group(request, &self.owner).map_err(boundary)?;
         let before = self.owner.state_version;
-        let outcome = self.owner.apply_group_observed(&group, |_| Ok(()));
+        let outcome =
+            self.owner
+                .apply_group_observed_with_restriction(&group, restrict_risk, |_| Ok(()));
         self.group_result(&group, before, outcome)
     }
     fn group_result(

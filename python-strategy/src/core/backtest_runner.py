@@ -57,7 +57,13 @@ from src.core.backtest.run_evidence import (
     strategy_configuration_contract,
 )
 from src.core.backtest.spider_formal_runner import (
+    SpiderExecutionFormalResult,
+    SpiderFloatingExitFormalResult,
+    SpiderGrossExecutionFormalResult,
     SpiderFormalRunResult,
+    _invoke_spider_execution,
+    _invoke_spider_floating_exit,
+    _invoke_spider_gross_execution,
     _invoke_spider_historical,
 )
 from src.core.analytics import (
@@ -329,6 +335,42 @@ def _write_markdown_report(
 
 
 class BacktestRunner:
+    @staticmethod
+    def run_spider_gross_execution(
+        *, output_root: str, run_id: str, gross_execution_input: bytes,
+    ) -> SpiderGrossExecutionFormalResult:
+        """Run one shared protected gross-response research scenario."""
+        return _invoke_spider_gross_execution(
+            output_root=output_root,
+            run_id=run_id,
+            gross_execution_input=gross_execution_input,
+            runner_kind="full",
+        )
+
+    @staticmethod
+    def run_spider_floating_exit(
+        *, output_root: str, run_id: str, floating_exit_input: bytes,
+    ) -> SpiderFloatingExitFormalResult:
+        """Run one shared source-derived floating-exit research scenario."""
+        return _invoke_spider_floating_exit(
+            output_root=output_root,
+            run_id=run_id,
+            floating_exit_input=floating_exit_input,
+            runner_kind="full",
+        )
+
+    @staticmethod
+    def run_spider_execution(
+        *, output_root: str, run_id: str, execution_input: bytes,
+    ) -> SpiderExecutionFormalResult:
+        """Run the shared paid Spider lifecycle without the candle runner."""
+        return _invoke_spider_execution(
+            output_root=output_root,
+            run_id=run_id,
+            execution_input=execution_input,
+            runner_kind="full",
+        )
+
     @staticmethod
     def run_spider_historical(
         *, output_root: str, run_id: str, historical_input: bytes,

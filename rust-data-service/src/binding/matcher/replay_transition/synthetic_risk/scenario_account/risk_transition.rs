@@ -42,6 +42,15 @@ pub(super) struct Facts {
     liquidations: Vec<liquidation::Receipt>,
 }
 
+impl Facts {
+    pub(super) fn source_cost_receipts(&self) -> Result<Vec<super::SourceCostReceipt>, Fault> {
+        self.liquidations
+            .iter()
+            .map(liquidation::Receipt::source_cost_receipt)
+            .collect()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct AutomaticReceipt {
     pub id: Hash,

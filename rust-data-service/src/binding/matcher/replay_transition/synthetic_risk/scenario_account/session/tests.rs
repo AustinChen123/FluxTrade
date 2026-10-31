@@ -5,6 +5,27 @@ const KEY: &str = r#"{"venue":"okx-scenario","environment":"test","account":"A"}
 fn session() -> Session {
     Session::new("SYNTHETIC_BTC_ETH_V1", KEY, None).unwrap()
 }
+
+#[test]
+fn unsupported_source_cost_profile_is_input_and_does_not_clear_poison() {
+    let mut s = session();
+    let before = s.owner.clone();
+    assert_eq!(
+        s.historical_cost_projection(),
+        Err(BoundaryError::Input("UNSUPPORTED_COST_PROFILE"))
+    );
+    assert!(!s.poisoned);
+    assert_eq!(s.owner, before);
+
+    s.poisoned = true;
+    assert_eq!(
+        s.historical_cost_projection(),
+        Err(BoundaryError::Input("UNSUPPORTED_COST_PROFILE"))
+    );
+    assert!(s.poisoned);
+    assert_eq!(s.owner, before);
+}
+
 fn value(reply: Reply) -> Value {
     serde_json::from_str(&reply.unwrap()).unwrap()
 }

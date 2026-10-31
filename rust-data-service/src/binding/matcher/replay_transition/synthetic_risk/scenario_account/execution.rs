@@ -234,6 +234,20 @@ enum Preparation<'a> {
 }
 
 impl CommittedExecution {
+    pub(super) fn source_cost_receipt(&self) -> Result<SourceCostReceipt, Fault> {
+        if self.fee_asset != "USDT" {
+            return Err("NATIVE_INVARIANT");
+        }
+        Ok(SourceCostReceipt {
+            sequence: self.commit_sequence,
+            product: self.product.btc()?.clone(),
+            before: self.position_before.clone(),
+            after: self.position_after.clone(),
+            price: self.price,
+            fee: self.fee_amount,
+        })
+    }
+
     pub(super) fn historical_order_id(&self) -> &str {
         &self.order_id
     }

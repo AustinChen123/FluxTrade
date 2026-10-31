@@ -26,7 +26,10 @@ def test_exact_migration_scope_and_orm_parity():
     config = Config(str(ROOT / "alembic.ini"))
     config.set_main_option("script_location", str(ROOT / "alembic"))
     script = ScriptDirectory.from_config(config)
-    assert script.get_heads() == ["f27c8d14a9b1"]
+    heads = script.get_heads()
+    assert len(heads) == 1
+    reachable_revisions = {revision.revision for revision in script.iterate_revisions(heads[0], "base")}
+    assert REVISION in reachable_revisions
     revision = script.get_revision(REVISION)
     assert revision is not None and revision.down_revision == "b73e9a21c604"
     spec = importlib.util.spec_from_file_location("version_migration", revision.path)

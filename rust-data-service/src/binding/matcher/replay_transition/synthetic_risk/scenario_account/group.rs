@@ -207,6 +207,15 @@ impl ScenarioAccount {
     pub(super) fn apply_group_observed(
         &mut self,
         group: &Group,
+        hook: impl FnMut(risk_transition::Stage) -> Result<(), Fault>,
+    ) -> Result<Applied, Fault> {
+        self.apply_group_observed_with_restriction(group, false, hook)
+    }
+
+    pub(super) fn apply_group_observed_with_restriction(
+        &mut self,
+        group: &Group,
+        restrict_risk: bool,
         mut hook: impl FnMut(risk_transition::Stage) -> Result<(), Fault>,
     ) -> Result<Applied, Fault> {
         let result = self.prepare_group(group);
@@ -260,13 +269,12 @@ impl ScenarioAccount {
                         execution::commit::Reply::Rejected(reason) => Some(reason),
                         _ => None,
                     }),
-                Input::Intent(input) => {
-                    self.group_admit(&member.stamp, input)
-                        .map(|(reason, event)| {
-                            source_reference = event;
-                            reason
-                        })
-                }
+                Input::Intent(input) => self
+                    .group_admit_with_restriction(&member.stamp, input, restrict_risk)
+                    .map(|(reason, event)| {
+                        source_reference = event;
+                        reason
+                    }),
                 Input::Request(input) => self.request_cancel(input).map(|r| r.rejected),
                 Input::Effect(input) => self
                     .effect_cancel_checked(input, &mut hook)

@@ -106,6 +106,7 @@ from src.core.engine import (
 )
 import src.core.engine as engine_module
 from src.core.execution import ExecutionEngine, ExitDecision
+from src.core.repositories import LiveOrderRepository
 from src.core.interfaces.exchange import (
     ExchangeError,
     ExchangeOrderEvent,
@@ -489,6 +490,38 @@ class _RecordingRiskManager:
 
 
 class TestEngineInit:
+    def test_repository_transaction_participant_is_forwarded_to_execution(
+        self, engine_factory
+    ):
+        participant = MagicMock()
+        engine = engine_factory(
+            order_repository=None,
+            repository_transaction_participant=participant,
+        )
+
+        repository = engine.execution_engine.order_manager.repo
+        assert isinstance(repository, LiveOrderRepository)
+        assert repository._transaction_participant is participant
+
+    def test_engine_rejects_participant_with_explicit_repository_before_setup(
+        self, mock_db_session, mock_clock, mock_order_repo
+    ):
+        with (
+            patch("src.core.engine.create_redis_client") as redis_factory,
+            pytest.raises(
+                ValueError,
+                match="^repository transaction participant requires internally constructed LiveOrderRepository$",
+            ),
+        ):
+            StrategyEngine(
+                db_session=mock_db_session,
+                clock=mock_clock,
+                order_repository=mock_order_repo,
+                repository_transaction_participant=MagicMock(),
+            )
+
+        redis_factory.assert_not_called()
+
     def test_engine_has_no_concrete_rithmic_bootstrap_policy(self):
         source = (Path(__file__).parents[1] / "src" / "core" / "engine.py").read_text()
 
@@ -1374,6 +1407,64 @@ class TestEngineInit:
 
         engine.execution_engine.reconcile_recoverable_client_orders.assert_called_once_with()
         assert isinstance(engine._venue_runtime, NoopRuntimeCapabilities)
+
+    def test_owned_runtime_restore_precedes_reconcile_stream_and_generic_restore(
+        self, engine_factory
+    ):
+        events: list[str] = []
+        owned_ids = frozenset({"spider-held", "spider-stopped"})
+        engine = engine_factory(
+            owned_runtime_restorer=lambda: events.append("owned") or owned_ids,
+        )
+        engine._live_balance_asset = None
+        engine._runtime_reconciliation_enabled = False
+        engine._check_system_state = MagicMock(return_value=False)
+        engine._reconcile_recoverable_orders_on_startup = MagicMock(
+            side_effect=lambda: events.append("reconcile")
+        )
+        engine._start_exchange_order_event_stream = MagicMock(
+            side_effect=lambda: events.append("stream")
+        )
+        engine.scan_strategies = MagicMock(side_effect=lambda: events.append("scan"))
+        for phase in (
+            "_halt_for_kill_switch",
+            "_start_command_listener",
+            "_reconcile_startup_balance",
+            "_initialize_strategy_state_cache_on_startup",
+            "_start_strategy_state_subscriber_on_startup",
+            "_start_heartbeat",
+        ):
+            setattr(engine, phase, MagicMock())
+
+        with patch("src.core.engine.restore_active_strategies") as generic_restore:
+            generic_restore.side_effect = lambda **_kwargs: events.append("generic")
+            engine.startup()
+
+        assert events == ["owned", "reconcile", "stream", "scan", "generic"]
+        assert generic_restore.call_args.kwargs["excluded_strategy_ids"] == owned_ids
+
+    @pytest.mark.parametrize(
+        "invalid_ids",
+        [
+            {"spider-main"},
+            ("spider-main",),
+            "spider-main",
+            frozenset({""}),
+            frozenset({"  "}),
+            frozenset({1}),
+        ],
+    )
+    def test_owned_runtime_restorer_rejects_invalid_identifier_result(
+        self, engine_factory, invalid_ids
+    ):
+        engine = engine_factory(
+            owned_runtime_restorer=cast(Any, lambda: invalid_ids),
+        )
+
+        with pytest.raises(TypeError, match="^owned runtime restorer must return frozenset\\[str\\]$"):
+            engine._restore_owned_runtimes_on_startup()
+
+        assert engine._startup_owned_strategy_ids == frozenset()
 
     @pytest.mark.parametrize(
         ("live_balance_asset", "is_rithmic_runtime", "expected_order"),

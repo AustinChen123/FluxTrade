@@ -334,7 +334,7 @@ fn invalid_input_context_and_seed_identity_precedence_are_atomic() {
 fn preparation_faults_panics_and_dropped_drafts_never_publish() {
     let (owner, intent) = setup(capacity::Program::CapacityV1);
     let prepared = owner
-        .prepare_admission(&event(&intent), false, |_| Ok(()))
+        .prepare_admission(&event(&intent), false, false, |_| Ok(()))
         .unwrap();
     assert_eq!(prepared.draft.orders.len(), 1);
     drop(prepared);

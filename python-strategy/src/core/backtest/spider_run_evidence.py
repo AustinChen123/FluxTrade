@@ -6,6 +6,11 @@ from struct import pack as _pack
 from typing import Any as _Any
 from typing import cast as _cast
 
+from src.core.backtest.spider_policy_protocol import (
+    HistoricalDeliveryKind as _HistoricalDeliveryKind,
+    HistoricalSequenceMode as _HistoricalSequenceMode,
+    historical_delivery_sequence as _historical_delivery_sequence,
+)
 from src.core.backtest.spider_run_artifacts import (
     ConfigurationContext as _ConfigurationContext,
     _P3_RUN_CONTRACT,
@@ -138,10 +143,15 @@ def _historical_snapshot_matches(owner: dict[str, _Any], cutoff: int,
         return False
 
 
-def _historical_pending_matches(observation: dict[str, _Any], cutoff: int) -> bool:
+def _historical_pending_matches(
+    observation: dict[str, _Any], cutoff: int, *, allow_same_time: bool = False,
+) -> bool:
     pending = observation["pending_keys"]
     records = [row["key"] for row in observation["records"] if row["classification"] == "PENDING"]
-    if len(pending) != len(records) or any(key["visible_at"] <= cutoff for key in pending):
+    if len(pending) != len(records) or any(
+        key["visible_at"] < cutoff or (key["visible_at"] == cutoff and not allow_same_time)
+        for key in pending
+    ):
         return False
     by_identity: dict[tuple[str, str], dict[str, _Any]] = {}
     for key in pending:
@@ -158,9 +168,151 @@ def _historical_pending_matches(observation: dict[str, _Any], cutoff: int) -> bo
     return seen == set(by_identity)
 
 
-def _historical_polls_endpoint_compatible(observation: dict[str, _Any], cutoff: int) -> bool:
-    """Accept completed polls or an exact, still-future frozen continuation."""
-    if not _historical_pending_matches(observation, cutoff):
+def _historical_polls_endpoint_compatible(
+    observation: dict[str, _Any], cutoff: int,
+    journal: list[dict[str, _Any]] | None = None,
+) -> bool:
+    """Accept one coherent sequence mode for poll and, when supplied, native notices."""
+    if any(row["status"] not in ("COMPLETED", "IN_PROGRESS") for row in observation["polls"]):
+        return False
+    return any(
+        _historical_polls_endpoint_mode_compatible(observation, cutoff, mode)
+        and (journal is None or _historical_native_notice_mode_compatible(
+            observation, cutoff, journal, mode,
+        ))
+        for mode in _HistoricalSequenceMode
+    )
+
+
+def _historical_native_notice_mode_compatible(
+    observation: dict[str, _Any], cutoff: int, journal: list[dict[str, _Any]],
+    mode: _HistoricalSequenceMode,
+) -> bool:
+    """Bind native fill/cancel notices to scheduler keys under the poll mode."""
+    expected: list[dict[str, _Any]] = []
+    counter = 0
+    try:
+        for row in journal:
+            payload = row["payload"]
+            if row["record_kind"] == "HISTORICAL_MARKET_RESULT":
+                result = payload["result"]
+                raw_time = result["raw_time_ms"]
+                if type(raw_time) is not int:
+                    return False
+                for product in result["products"]:
+                    for fill in product["fills"]:
+                        expected.append(dict(
+                            payload_kind="EXECUTION_FACT",
+                            source_fact_id=fill["source_event_id"],
+                            occurrence_index=fill["occurrence_index"],
+                            visible_at=(raw_time + 2) * 16 + 6,
+                            schedule_sequence=_historical_delivery_sequence(
+                                mode, _HistoricalDeliveryKind.NATIVE, counter,
+                            ),
+                        ))
+                        counter += 1
+            elif row["record_kind"] == "SOURCE_GROUP_RESULT":
+                result = payload["result"]
+                request = payload["request"]
+                members = request["members"]
+                if (result["classification"] != "COMMITTED" or type(members) is not list
+                        or len(members) != 1 or members[0]["kind"] != "CANCEL_EFFECT"):
+                    continue
+                stamp = members[0]["stamp"]
+                effective_at = stamp["effective_at"]
+                if type(effective_at) is not int:
+                    return False
+                expected.append(dict(
+                    payload_kind="TRANSPORT_ACK",
+                    source_fact_id=stamp["event_id"],
+                    occurrence_index=0,
+                    visible_at=(effective_at // 16 + 2) * 16 + 6,
+                    schedule_sequence=_historical_delivery_sequence(
+                        mode, _HistoricalDeliveryKind.NATIVE, counter,
+                    ),
+                ))
+                counter += 1
+
+        expected_by_identity: dict[tuple[str, str, int], dict[str, _Any]] = {}
+        for item in expected:
+            identity = (item["payload_kind"], item["source_fact_id"], item["occurrence_index"])
+            if identity in expected_by_identity:
+                return False
+            expected_by_identity[identity] = item
+
+        attempts_by_identity: dict[tuple[str, str, int], list[dict[str, _Any]]] = {}
+        for row in journal:
+            if row["record_kind"] != "DELIVERY_ATTEMPT":
+                continue
+            delivery = row["payload"]["delivery"]
+            if delivery["payload_kind"] not in ("EXECUTION_FACT", "TRANSPORT_ACK"):
+                continue
+            identity = (delivery["payload_kind"], delivery["source_fact_id"],
+                        delivery["occurrence_index"])
+            attempts_by_identity.setdefault(identity, []).append(row)
+
+        callbacks_by_key: dict[tuple[int, int, str], list[dict[str, _Any]]] = {}
+        for row in journal:
+            if row["record_kind"] != "CALLBACK_RESULT":
+                continue
+            key = row["scheduler_key"]
+            identity = (key["visible_at"], key["schedule_sequence"], key["stable_id"])
+            callbacks_by_key.setdefault(identity, []).append(row)
+
+        observed_records: dict[tuple[int, int], list[dict[str, _Any]]] = {}
+        for record in observation["records"]:
+            if record["kind"] != "DELIVERY":
+                continue
+            key = record["key"]
+            observed_records.setdefault((key["visible_at"], key["schedule_sequence"]), []).append(record)
+        pending_keys = observation["pending_keys"]
+
+        for identity, item in expected_by_identity.items():
+            visible_at = item["visible_at"]
+            sequence = item["schedule_sequence"]
+            records = [record for record in observed_records.get((visible_at, sequence), [])
+                       if record["key"]["queue_class"] == "DELIVERY"]
+            if len(records) != 1:
+                return False
+            record = records[0]
+            attempts = attempts_by_identity.get(identity, [])
+            if visible_at > cutoff:
+                if (attempts or record["classification"] != "PENDING"
+                        or record["key"] not in pending_keys):
+                    return False
+                continue
+            callback_key = (visible_at, sequence, record["key"]["stable_id"])
+            callbacks = callbacks_by_key.get(callback_key, [])
+            if (record["classification"] != "SUCCESS" or len(callbacks) != 1
+                    or callbacks[0]["payload"]["delivery_id"] != record["key"]["stable_id"]
+                    or callbacks[0]["payload"]["outcome"] != "SUCCESS"):
+                return False
+            if attempts:
+                if len(attempts) != 1:
+                    return False
+                attempt = attempts[0]
+                delivery = attempt["payload"]["delivery"]
+                scheduler_key = attempt["scheduler_key"]
+                if (delivery["visible_at"] != visible_at
+                        or delivery["schedule_sequence"] != sequence
+                        or scheduler_key != record["key"]
+                        or scheduler_key["queue_class"] != "DELIVERY"):
+                    return False
+
+        return (set(attempts_by_identity) <= {
+                    identity for identity, item in expected_by_identity.items()
+                    if item["visible_at"] <= cutoff
+                } and all(len(rows) == 1 for rows in attempts_by_identity.values()))
+    except (KeyError, IndexError, TypeError, ValueError, OverflowError):
+        return False
+
+
+def _historical_polls_endpoint_mode_compatible(
+    observation: dict[str, _Any], cutoff: int, mode: _HistoricalSequenceMode,
+    paid_prefix: str | None = None, allow_terminal_delivery: bool = False,
+) -> bool:
+    """Check the poll prefix under exactly one historical DELIVERY sequence mode."""
+    if not _historical_pending_matches(observation, cutoff, allow_same_time=allow_terminal_delivery):
         return False
     records = observation["records"]
     pending_keys = observation["pending_keys"]
@@ -171,20 +323,23 @@ def _historical_polls_endpoint_compatible(observation: dict[str, _Any], cutoff: 
                 ("OPEN_ORDERS", 2, 11, 15)),
     }
     for poll in observation["polls"]:
-        if poll["status"] == "COMPLETED" and poll["awaiting"] is None:
+        paused = poll["status"] == "PAUSED" and poll["awaiting"] is None
+        if paused and paid_prefix is not None:
             continue
-        if poll["status"] != "IN_PROGRESS":
+        completed = poll["status"] == "COMPLETED" and poll["awaiting"] is None
+        failed_prefix = paid_prefix is not None and poll["status"] == "CALLBACK_FAILED" and poll["awaiting"] is None
+        if not completed and not failed_prefix and poll["status"] != "IN_PROGRESS":
             return False
-        awaiting = "EARN" if poll["awaiting"] == "EARN_IF_DUE" else poll["awaiting"]
-        if awaiting not in ("EARN", "TRADING", "POSITIONS", "OPEN_ORDERS"):
-            return False
-        prefix, separator, raw_text = poll["poll_id"].partition("P3_POLL_")
-        if prefix or not separator or not raw_text.isascii() or not raw_text.isdigit():
+        marker = "_POLL_"
+        prefix, separator, raw_text = poll["poll_id"].partition(marker)
+        expected_prefixes = {"P3"} if paid_prefix is None else {paid_prefix}
+        if (prefix not in expected_prefixes or not separator or not raw_text.isascii()
+                or not raw_text.isdigit()):
             return False
         raw_at = int(raw_text)
-        if poll["continuation_id"] != f"P3_CONT_{raw_at}":
+        if poll["continuation_id"] != f"{prefix}_CONT_{raw_at}":
             return False
-        timer_id = f"P3_TIMER_{raw_at}"
+        timer_id = f"{prefix}_TIMER_{raw_at}"
         timers = [record for record in records
                   if record["kind"] == "HISTORICAL_TIMER" and record["stable_id"] == timer_id]
         if len(timers) != 1:
@@ -192,45 +347,94 @@ def _historical_polls_endpoint_compatible(observation: dict[str, _Any], cutoff: 
         has_earn = any(record["kind"] == "SNAPSHOT_CAPTURE"
                        and record["stable_id"] == f"{poll['poll_id']}_EARN" for record in records)
         layout = stage_layouts[has_earn]
-        if awaiting == "EARN" and not has_earn:
+        if has_earn and not any(item[0] == "EARN" for item in layout):
             return False
-        stage = next((item for item in layout if item[0] == awaiting), None)
-        if stage is None:
+        awaiting = "EARN" if poll["awaiting"] == "EARN_IF_DUE" else poll["awaiting"]
+        if not completed and not failed_prefix and awaiting not in ("EARN", "TRADING", "POSITIONS", "OPEN_ORDERS"):
             return False
-        _, stage_index, capture_offset, delivery_offset = stage
-        expected_sequence = timers[0]["key"]["schedule_sequence"] * 4 + stage_index
-        snapshot_id = f"{poll['poll_id']}_{awaiting}"
-        captures = [record for record in records
-                    if record["kind"] == "SNAPSHOT_CAPTURE" and record["stable_id"] == snapshot_id]
-        if len(captures) != 1:
-            return False
-        capture = captures[0]
-        capture_key = capture["key"]
-        expected_capture_at = (raw_at + capture_offset) * 16 + 5
-        if (capture_key["queue_class"] != "SNAPSHOT_CAPTURE"
-                or capture_key["stable_id"] != snapshot_id
-                or capture_key["schedule_sequence"] != expected_sequence
-                or capture_key["visible_at"] != expected_capture_at):
-            return False
-        if capture["classification"] == "PENDING":
-            if expected_capture_at <= cutoff or capture_key not in pending_keys:
+        observed_stages = []
+        stage_classifications: dict[str, tuple[str, str | None]] = {}
+        for stage in layout:
+            name, stage_index, capture_offset, delivery_offset = stage
+            snapshot_id = f"{poll['poll_id']}_{name}"
+            captures = [record for record in records
+                        if record["kind"] == "SNAPSHOT_CAPTURE" and record["stable_id"] == snapshot_id]
+            if not captures:
+                continue
+            if len(captures) != 1:
+                return False
+            capture = captures[0]
+            capture_key = capture["key"]
+            capture_sequence = timers[0]["key"]["schedule_sequence"] * 4 + stage_index
+            expected_capture_at = (raw_at + capture_offset) * 16 + 5
+            if (capture_key["queue_class"] != "SNAPSHOT_CAPTURE"
+                    or capture_key["stable_id"] != snapshot_id
+                    or capture_key["schedule_sequence"] != capture_sequence
+                    or capture_key["visible_at"] != expected_capture_at):
+                return False
+            if capture["classification"] == "PENDING":
+                if completed or name != awaiting or expected_capture_at <= cutoff or capture_key not in pending_keys:
+                    return False
+                delivery_at = (raw_at + delivery_offset) * 16 + 6
+                delivery_sequence = _historical_delivery_sequence(
+                    mode, _HistoricalDeliveryKind.POLL, capture_sequence,
+                )
+                if any(record["kind"] == "DELIVERY"
+                       and record["key"]["schedule_sequence"] == delivery_sequence
+                       and record["key"]["visible_at"] == delivery_at for record in records):
+                    return False
+                observed_stages.append(name)
+                stage_classifications[name] = ("PENDING_CAPTURE", None)
+                continue
+            if capture["classification"] != "SUCCESS" or expected_capture_at > cutoff:
                 return False
             delivery_at = (raw_at + delivery_offset) * 16 + 6
-            if any(record["kind"] == "DELIVERY" and record["key"]["schedule_sequence"] == expected_sequence
-                   and record["key"]["visible_at"] == delivery_at for record in records):
+            delivery_sequence = _historical_delivery_sequence(
+                mode, _HistoricalDeliveryKind.POLL, capture_sequence,
+            )
+            deliveries = [record for record in records if record["kind"] == "DELIVERY"
+                          and record["key"]["schedule_sequence"] == delivery_sequence
+                          and record["key"]["visible_at"] == delivery_at]
+            if len(deliveries) != 1:
                 return False
-            continue
-        if capture["classification"] != "SUCCESS" or expected_capture_at > cutoff:
-            return False
-        delivery_at = (raw_at + delivery_offset) * 16 + 6
-        continuations = [record for record in records
-                         if record["kind"] == "DELIVERY" and record["classification"] == "PENDING"
-                         and record["key"]["queue_class"] == "DELIVERY"
-                         and record["key"]["schedule_sequence"] == expected_sequence
-                         and record["key"]["visible_at"] == delivery_at
-                         and record["key"] in pending_keys]
-        if len(continuations) != 1 or delivery_at <= cutoff:
-            return False
+            delivery = deliveries[0]
+            if delivery["key"]["queue_class"] != "DELIVERY":
+                return False
+            if delivery["classification"] == "PENDING":
+                if delivery_at <= cutoff or delivery["key"] not in pending_keys:
+                    return False
+            elif delivery["classification"] not in ("SUCCESS", "TERMINAL"):
+                return False
+            if completed and delivery["classification"] != "SUCCESS":
+                return False
+            observed_stages.append(name)
+            stage_classifications[name] = ("CAPTURED", delivery["classification"])
+        if completed:
+            if observed_stages != [item[0] for item in layout]:
+                return False
+        elif failed_prefix:
+            if observed_stages != [item[0] for item in layout[:len(observed_stages)]]:
+                return False
+            if observed_stages and any(
+                stage_classifications.get(name) != ("CAPTURED", "SUCCESS")
+                for name in observed_stages[:-1]
+            ):
+                return False
+        else:
+            if awaiting not in observed_stages:
+                return False
+            awaiting_index = next(index for index, item in enumerate(layout) if item[0] == awaiting)
+            if observed_stages != [item[0] for item in layout[:awaiting_index + 1]]:
+                return False
+            for name, _, _, _ in layout[:awaiting_index]:
+                if stage_classifications.get(name) != ("CAPTURED", "SUCCESS"):
+                    return False
+            awaiting_state = stage_classifications.get(awaiting)
+            allowed_awaiting = [("PENDING_CAPTURE", None), ("CAPTURED", "PENDING")]
+            if allow_terminal_delivery:
+                allowed_awaiting.append(("CAPTURED", "TERMINAL"))
+            if awaiting_state not in allowed_awaiting:
+                return False
     return True
 
 
@@ -495,7 +699,7 @@ def _historical_endpoint(run_id: str, attempt: dict[str, _Any], status: dict[str
         raise ReconciliationProjectionError()
     if observation.get("gate") != "RUNNING" or observation.get("terminal") is not None:
         raise ReconciliationProjectionError()
-    if not _historical_polls_endpoint_compatible(observation, cutoff):
+    if not _historical_polls_endpoint_compatible(observation, cutoff, journal):
         raise ReconciliationProjectionError()
     if not _historical_deferred_actions_compatible(journal, observation, cutoff):
         raise ReconciliationProjectionError()
@@ -660,7 +864,7 @@ def _historical_reconciliation(run_id: str, attempt: dict[str, _Any], status: di
     queue_ok = (_historical_pending_matches(observation, cutoff)
                 and endpoint["remaining_planned_barriers"] == [])
     polls = observation["polls"]
-    polls_ok = _historical_polls_endpoint_compatible(observation, cutoff)
+    polls_ok = _historical_polls_endpoint_compatible(observation, cutoff, journal)
     actions = _actions(journal, observation["callback_actions"])
     actions_ok = _historical_deferred_actions_compatible(journal, observation, cutoff)
     expected_queue = dict(pending_keys=pending, remaining_planned_barriers=[])

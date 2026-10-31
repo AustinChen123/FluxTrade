@@ -52,7 +52,39 @@ pub(super) fn fixture_intent(
     }
 }
 
+#[cfg(test)]
+pub(super) fn fixture_intent_for_product(
+    owner: &ScenarioAccount,
+    id: &str,
+    product: ProfileProduct,
+    side: Side,
+    quantity: Decimal,
+    price: Decimal,
+) -> OrderIntent {
+    let mut intent = fixture_intent(owner, id, side, quantity, price);
+    intent.product = product;
+    intent
+}
+
+#[cfg(test)]
+pub(super) fn fixture_intent_for_product_role(
+    owner: &ScenarioAccount,
+    id: &str,
+    product: ProfileProduct,
+    side: Side,
+    quantity: Decimal,
+    price: Decimal,
+    reduce_only: bool,
+) -> OrderIntent {
+    let mut intent = fixture_intent_for_product(owner, id, product, side, quantity, price);
+    intent.reduce_only = reduce_only;
+    intent
+}
+
 mod btc_policy;
+#[cfg(test)]
+#[path = "admission/gross_admission_tests.rs"]
+mod gross_admission_tests;
 #[cfg(test)]
 pub(super) mod inspection_tests;
 pub(super) mod wire;
@@ -106,6 +138,16 @@ pub(super) struct OrderIntent {
 }
 
 impl OrderIntent {
+    pub(super) fn gross_inputs(&self) -> (&ProfileProduct, Side, Decimal, bool, OrderType) {
+        (
+            &self.product,
+            self.side,
+            self.quantity,
+            self.reduce_only,
+            self.order_type,
+        )
+    }
+
     #[cfg(test)]
     pub(super) fn historical_market_fixture(
         owner: &ScenarioAccount,
@@ -194,6 +236,28 @@ impl OrderIntent {
     }
 }
 
+#[cfg(test)]
+pub(super) fn historical_reducing_market_fixture(
+    owner: &ScenarioAccount,
+    intent_id: String,
+    client_order_id: String,
+    product_id: &'static str,
+    side: Side,
+    quantity: Decimal,
+) -> OrderIntent {
+    let mut intent = OrderIntent::historical_market_fixture(
+        owner,
+        intent_id,
+        client_order_id,
+        product_id,
+        side,
+        quantity,
+        None,
+    );
+    intent.reduce_only = true;
+    intent
+}
+
 struct Envelope<'a> {
     event_id: &'a str,
     effective_at: i64,
@@ -232,6 +296,7 @@ pub(super) struct AdmissionResult {
     evaluation: Evaluation,
     created_at_event_id: String,
     order_type: OrderType,
+    gross_decision: Option<gross_admission::Decision>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -423,6 +488,12 @@ impl ScenarioAccount {
             if let Some(order) = &r.accepted_order {
                 order_facts(e, order)?;
             }
+            if self.is_gross_admission_profile() {
+                e.presence(r.gross_decision.is_some());
+                if let Some(decision) = &r.gross_decision {
+                    decision.encode(e);
+                }
+            }
         }
         Ok(())
     }
@@ -446,14 +517,24 @@ impl ScenarioAccount {
         stamp: &risk_transition::cancel::Stamp,
         intent: &OrderIntent,
     ) -> Result<(Option<Fault>, String), Fault> {
+        self.group_admit_with_restriction(stamp, intent, false)
+    }
+
+    pub(super) fn group_admit_with_restriction(
+        &mut self,
+        stamp: &risk_transition::cancel::Stamp,
+        intent: &OrderIntent,
+        restrict_risk: bool,
+    ) -> Result<(Option<Fault>, String), Fault> {
         let result = self
-            .admit_stamped_checked(
+            .admit_stamped_with_restriction(
                 &Envelope {
                     event_id: &stamp.event_id,
                     effective_at: stamp.effective_at,
                     intent,
                 },
                 stamp,
+                restrict_risk,
                 |_| Ok(()),
             )?
             .result;
@@ -479,6 +560,16 @@ impl ScenarioAccount {
         stamp: &risk_transition::cancel::Stamp,
         hook: impl FnMut(PrepareStage) -> Result<(), Fault>,
     ) -> Result<Reply, Fault> {
+        self.admit_stamped_with_restriction(envelope, stamp, false, hook)
+    }
+
+    fn admit_stamped_with_restriction(
+        &mut self,
+        envelope: &Envelope<'_>,
+        stamp: &risk_transition::cancel::Stamp,
+        restrict_risk: bool,
+        hook: impl FnMut(PrepareStage) -> Result<(), Fault>,
+    ) -> Result<Reply, Fault> {
         if self.seed_intents.contains(&envelope.intent.intent_id) {
             return Err(self.source_failure("SEED_IDENTITY_CONFLICT"));
         }
@@ -496,7 +587,7 @@ impl ScenarioAccount {
         let historical = stamp.ordering_contract_id == "HISTORICAL_ORDER_V1"
             && matches!(self.profile, ProfileContext::BtcEthScenario { ref scenario, .. } if scenario.configured.is_some());
         let prepared = catch_unwind(AssertUnwindSafe(|| {
-            self.prepare_admission(envelope, historical, hook)
+            self.prepare_admission(envelope, historical, restrict_risk, hook)
         }))
         .map_err(|_| "ADMISSION_PANIC")
         .and_then(|result| result);
@@ -534,6 +625,7 @@ impl ScenarioAccount {
         &self,
         envelope: &Envelope<'_>,
         historical: bool,
+        restrict_risk: bool,
         mut hook: impl FnMut(PrepareStage) -> Result<(), Fault>,
     ) -> Result<Prepared, Fault> {
         let intent = envelope.intent;
@@ -583,6 +675,7 @@ impl ScenarioAccount {
             }
             OrderType::Unsupported => return Err("UNSUPPORTED_ORDER_TYPE"),
         };
+        let mut deferred_minimum_candidate = false;
         let (spec_version, rule_data_version) = match &self.profile {
             ProfileContext::P1O03 => {
                 if intent.product != ProfileProduct::Pa
@@ -625,7 +718,12 @@ impl ScenarioAccount {
             ProfileContext::BtcEthScenario { scenario, .. } => {
                 let (spec, tier) =
                     scenario.resolve(intent.product.btc()?, envelope.effective_at)?;
-                if intent.quantity < spec.minimum
+                deferred_minimum_candidate = historical
+                    && intent.order_type == OrderType::Market
+                    && intent.reduce_only
+                    && intent.quantity < spec.minimum;
+                if (intent.quantity < spec.minimum && !deferred_minimum_candidate)
+                    || intent.quantity <= Decimal::ZERO
                     || !aligned(intent.quantity, spec.lot)
                     || price <= Decimal::ZERO
                     || !aligned(price, spec.tick)
@@ -643,7 +741,7 @@ impl ScenarioAccount {
                 ..
             }
         ) && self.cash < Decimal::from(995);
-        if !below_floor {
+        if !below_floor && !deferred_minimum_candidate {
             draft.orders.insert(
                 order_id.clone(),
                 RestingOrder {
@@ -668,7 +766,10 @@ impl ScenarioAccount {
                 },
             );
         }
-        hook(PrepareStage::OrderDrafted)?;
+        if !deferred_minimum_candidate {
+            hook(PrepareStage::OrderDrafted)?;
+        }
+        let mut gross_decision = None;
         let (evaluation, reason_code) = if below_floor {
             (Evaluation::MinCash(self.cash), Some("MIN_CASH"))
         } else {
@@ -689,10 +790,20 @@ impl ScenarioAccount {
                     (Evaluation::GoldenCapacity(projection), reason)
                 }
                 ProfileContext::BtcEthScenario { .. } => {
-                    let (evidence, reason) = btc_policy::evaluate(self, &draft, intent, price)?;
+                    let (evidence, mut reason) = btc_policy::evaluate(self, &draft, intent, price)?;
+                    if self.is_gross_admission_profile() && reason.is_none() {
+                        let decision = gross_admission::evaluate(self, &draft, intent)?;
+                        reason = decision.reason;
+                        gross_decision = Some(decision);
+                    }
                     (Evaluation::BtcEth(evidence), reason)
                 }
             }
+        };
+        let reason_code = if restrict_risk && !intent.reduce_only && reason_code.is_none() {
+            Some("GROSS_RESPONSE_PENDING")
+        } else {
+            reason_code
         };
         let accepted = reason_code.is_none();
         if accepted {
@@ -722,6 +833,7 @@ impl ScenarioAccount {
             evaluation,
             created_at_event_id: envelope.event_id.into(),
             order_type: intent.order_type,
+            gross_decision,
         };
         draft
             .intent_results

@@ -64,6 +64,17 @@ from src.control_plane.strategy_control import (
     StrategyControlUnavailable,
 )
 from src.control_plane.strategy_state_query import StrategyStateQueryService
+from src.control_plane.spider_configuration_http import (
+    SPIDER_CONFIGURATION_READBACK_PATH,
+    SPIDER_CONFIGURATION_REQUEST_PATH,
+    SpiderConfigurationHttpService,
+)
+from src.control_plane.spider_operation_http import (
+    SPIDER_OPERATION_READBACK_PATH,
+    SPIDER_OPERATION_REQUEST_PATH,
+    SpiderOperationHttpService,
+)
+from src.control_plane.spider_order_query import SPIDER_ORDERS_PATH, SpiderOrderQueryService
 from src.control_plane.profile_http_query import ProfileQueryService
 from src.control_plane.ops_status_query import OpsStatusQuery
 from src.control_plane.profile_http_contract import ProfileHttpError
@@ -130,6 +141,9 @@ class ControlPlaneApp:
         backtest_results_query_service: BacktestResultsQueryService | None = None,
         invalidation_hub: ControlPlaneInvalidationHub | None = None,
         ga_command_service: GaCommandService | None = None,
+        spider_configuration_http_service: SpiderConfigurationHttpService | None = None,
+        spider_operation_http_service: SpiderOperationHttpService | None = None,
+        spider_order_query_service: SpiderOrderQueryService | None = None,
     ) -> None:
         if api_key == "":
             raise ValueError("api_key must be non-empty when provided")
@@ -146,6 +160,9 @@ class ControlPlaneApp:
         self.ops_status_query = ops_status_query
         self.backtest_results_query_service = backtest_results_query_service
         self.ga_command_service = ga_command_service
+        self.spider_configuration_http_service = spider_configuration_http_service
+        self.spider_operation_http_service = spider_operation_http_service
+        self.spider_order_query_service = spider_order_query_service
         self.invalidation_hub = (
             invalidation_hub
             if invalidation_hub is not None
@@ -188,6 +205,23 @@ class ControlPlaneApp:
         results_family = _is_backtest_results_path(raw_path)
         ga_family = is_ga_read_path(raw_path)
         events_path = clean_path == "/api/v1/events"
+        spider_configuration_route_family = (
+            raw_target.startswith(SPIDER_CONFIGURATION_REQUEST_PATH)
+            or raw_path in {
+                SPIDER_CONFIGURATION_REQUEST_PATH,
+                SPIDER_CONFIGURATION_READBACK_PATH,
+            }
+            or raw_path.startswith(f"{SPIDER_CONFIGURATION_REQUEST_PATH}/")
+        )
+        spider_operation_route_family = (
+            raw_target.startswith(SPIDER_OPERATION_REQUEST_PATH)
+            or raw_path in {SPIDER_OPERATION_REQUEST_PATH, SPIDER_OPERATION_READBACK_PATH}
+            or raw_path.startswith(f"{SPIDER_OPERATION_REQUEST_PATH}/")
+        )
+        spider_order_route_family = (
+            raw_path == SPIDER_ORDERS_PATH
+            or raw_path.startswith(f"{SPIDER_ORDERS_PATH}/")
+        )
         results_path = raw_path if results_family else clean_path
         query = {} if results_family or ga_family else parse_qs(parsed_url.query)
 
@@ -215,6 +249,9 @@ class ControlPlaneApp:
                 results_family
                 or ga_family
                 or events_path
+                or spider_configuration_route_family
+                or spider_operation_route_family
+                or spider_order_route_family
                 or clean_path
                 in {
                     "/api/v1/auth/session",
@@ -239,6 +276,9 @@ class ControlPlaneApp:
                 results_family
                 or ga_family
                 or events_path
+                or spider_configuration_route_family
+                or spider_operation_route_family
+                or spider_order_route_family
                 or clean_path == "/ops/kill-switch"
             ):
                 return HttpResponse(
@@ -274,6 +314,126 @@ class ControlPlaneApp:
 
         if events_path:
             return self._handle_events(method, identity)
+
+        if spider_configuration_route_family:
+            supported_path = raw_path in {
+                SPIDER_CONFIGURATION_REQUEST_PATH,
+                SPIDER_CONFIGURATION_READBACK_PATH,
+            }
+            supported_target = raw_target == raw_path or (
+                bool(parsed_url.query)
+                and raw_target == f"{raw_path}?{parsed_url.query}"
+            )
+            if not supported_path or not supported_target or method != "POST":
+                return HttpResponse(
+                    404,
+                    {"error": "not_found"},
+                    headers=(("Cache-Control", "no-store"),),
+                )
+            if self.api_key is None and self.browser_auth is None:
+                return HttpResponse(
+                    403,
+                    {"error": "forbidden"},
+                    headers=(("Cache-Control", "no-store"),),
+                )
+            service = self.spider_configuration_http_service
+            if service is None:
+                return HttpResponse(
+                    503,
+                    {"error": "spider_configuration_unavailable"},
+                    headers=(("Cache-Control", "no-store"),),
+                )
+            if raw_path == SPIDER_CONFIGURATION_REQUEST_PATH:
+                status_code, payload = service.record(
+                    raw_query=parsed_url.query,
+                    body=body,
+                    actor=identity.actor,
+                )
+            else:
+                status_code, payload = service.readback(
+                    raw_query=parsed_url.query,
+                    body=body,
+                )
+            return HttpResponse(
+                status_code,
+                payload,
+                headers=(("Cache-Control", "no-store"),),
+            )
+
+        if spider_operation_route_family:
+            supported_path = raw_path in {
+                SPIDER_OPERATION_REQUEST_PATH,
+                SPIDER_OPERATION_READBACK_PATH,
+            }
+            supported_target = raw_target == raw_path or (
+                bool(parsed_url.query)
+                and raw_target == f"{raw_path}?{parsed_url.query}"
+            )
+            if not supported_path or not supported_target or method != "POST":
+                return HttpResponse(
+                    404,
+                    {"error": "not_found"},
+                    headers=(("Cache-Control", "no-store"),),
+                )
+            if self.api_key is None and self.browser_auth is None:
+                return HttpResponse(
+                    403,
+                    {"error": "forbidden"},
+                    headers=(("Cache-Control", "no-store"),),
+                )
+            service = self.spider_operation_http_service
+            if service is None:
+                return HttpResponse(
+                    503,
+                    {"error": "spider_operation_unavailable"},
+                    headers=(("Cache-Control", "no-store"),),
+                )
+            if raw_path == SPIDER_OPERATION_REQUEST_PATH:
+                status_code, payload = service.record(
+                    raw_query=parsed_url.query,
+                    body=body,
+                    actor=identity.actor,
+                    step_up_confirmed=(
+                        identity.browser_principal is None
+                        or (
+                            self.browser_auth is not None
+                            and self.browser_auth.has_step_up(identity.browser_principal)
+                        )
+                    ),
+                )
+            else:
+                status_code, payload = service.readback(
+                    raw_query=parsed_url.query,
+                    body=body,
+                )
+            return HttpResponse(
+                status_code,
+                payload,
+                headers=(("Cache-Control", "no-store"),),
+            )
+
+        if spider_order_route_family:
+            service = self.spider_order_query_service
+            if parsed_url.fragment:
+                status_code, payload = 404, {"error": "not_found"}
+            elif self.api_key is None and self.browser_auth is None:
+                status_code, payload = 503, {"error": "spider_order_query_unavailable"}
+            elif service is None:
+                status_code, payload = 503, {"error": "spider_order_query_unavailable"}
+            elif method != "GET":
+                status_code, payload = 404, {"error": "not_found"}
+            elif raw_path == SPIDER_ORDERS_PATH:
+                status_code, payload = service.orders(parsed_url.query, body)
+            else:
+                selector = raw_path[len(SPIDER_ORDERS_PATH) + 1:]
+                suffix = "/trades"
+                if not selector.endswith(suffix) or selector.count("/") != 1:
+                    status_code, payload = 404, {"error": "not_found"}
+                else:
+                    status_code, payload = service.trades(
+                        selector[:-len(suffix)], parsed_url.query, body
+                    )
+            return HttpResponse(status_code, payload, headers=(("Cache-Control", "no-store"),))
 
         if (
             identity.browser_principal is not None
@@ -450,7 +610,15 @@ class ControlPlaneApp:
                 require_confirmation=identity.browser_principal is not None,
             )
 
-        return HttpResponse(404, {"error": "not_found"})
+        return HttpResponse(
+            404,
+            {"error": "not_found"},
+            headers=(
+                (("Cache-Control", "no-store"),)
+                if spider_configuration_route_family or spider_operation_route_family or spider_order_route_family
+                else ()
+            ),
+        )
 
     def _handle_events(
         self,

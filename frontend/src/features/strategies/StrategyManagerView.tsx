@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import type { useTranslation } from "react-i18next";
 
 import type { Locale } from "../../shared/i18n";
@@ -13,6 +13,7 @@ import type {
   StrategyManagerError,
   StrategyRecord
 } from "./strategyCommandState";
+import { SpiderOrdersPanel } from "./SpiderOrdersPanel";
 type KillSwitchStatus = {
   state: "LOCKDOWN" | "OK" | "UNKNOWN";
   listener_available: boolean;
@@ -79,6 +80,7 @@ export function StrategyManagerView({
   ,killSwitchStatus = null, killSwitchReadError = false, killSwitchPending = false, killSwitchReadPending = false,
   refreshKillSwitch = async () => undefined, unlockKillSwitch = async () => undefined
 }: StrategyManagerViewProps) {
+  const [inspectionStrategyId, setInspectionStrategyId] = useState<string | null>(null);
   const counts = useMemo(() => {
     const totals: Partial<Record<StrategyRecord["status"], number>> = {};
     for (const strategy of strategies) {
@@ -226,6 +228,9 @@ export function StrategyManagerView({
                           </button>
                         ))}
                       </div>
+                      <button type="button" onClick={() => setInspectionStrategyId(strategy.strategy_id)}>
+                        {t("strategies.orders.open")}
+                      </button>
                     </div>
                     <p className="strategy-control-note">{t("strategies.stopExplanation")}</p>
                     {(pendingStrategyId !== null || awaitingState) && (
@@ -271,6 +276,15 @@ export function StrategyManagerView({
           <span />
           {t("strategies.loading")}
         </div>
+      )}
+      {inspectionStrategyId !== null && (
+        <SpiderOrdersPanel
+          key={inspectionStrategyId}
+          strategyId={inspectionStrategyId}
+          locale={locale}
+          t={t}
+          onClose={() => setInspectionStrategyId(null)}
+        />
       )}
     </section>
   );

@@ -25,6 +25,9 @@ class _OpsCommandService(Protocol):
 
 
 _STATE_COMMANDS = frozenset({"START", "STOP", "RESUME", "FORCE_RECOVER"})
+_OWNED_COMMANDS = frozenset(
+    {"START", "STOP", "RESUME", "RELOAD", "RESUBMIT", "FORCE_RECOVER"}
+)
 
 
 class StrategyCommandDispatchService:
@@ -42,6 +45,7 @@ class StrategyCommandDispatchService:
         mark_strategy_command_operation_completed: Callable[..., None],
         command_router: Callable[[], _CommandRouter],
         event_logger: Callable[[], logging.Logger],
+        handle_owned_command: Callable[[dict], _CommandResult | None] | None = None,
     ) -> None:
         self._assert_leadership = assert_leadership
         self._scan_strategies = scan_strategies
@@ -54,6 +58,7 @@ class StrategyCommandDispatchService:
         )
         self._command_router = command_router
         self._event_logger = event_logger
+        self._handle_owned_command = handle_owned_command
 
     def dispatch(self, data: object) -> None:
         self._assert_leadership()
@@ -69,6 +74,11 @@ class StrategyCommandDispatchService:
         event_logger.info("Received Command: %s with params %s", cmd, params)
 
         try:
+            if cmd in _OWNED_COMMANDS and self._handle_owned_command is not None:
+                owned_result = self._handle_owned_command(data)
+                if owned_result is not None:
+                    self._log_result(event_logger, cmd, owned_result)
+                    return
             if cmd == "SCAN":
                 self._scan_strategies()
                 return
@@ -136,17 +146,7 @@ class StrategyCommandDispatchService:
                     actor=actor,
                     idempotency_key=idempotency_key,
                 )
-            if result.success:
-                if result.completed is True:
-                    event_logger.info("Command %s succeeded: %s", cmd, result.message)
-                else:
-                    event_logger.info(
-                        "Command %s accepted, pending completion: %s",
-                        cmd,
-                        result.message,
-                    )
-            else:
-                event_logger.warning("Command %s failed: %s", cmd, result.message)
+            self._log_result(event_logger, cmd, result)
         except Exception as error:
             event_logger.error(
                 "Error executing command %s: %s\n%s",
@@ -154,3 +154,19 @@ class StrategyCommandDispatchService:
                 error,
                 traceback.format_exc(),
             )
+
+    @staticmethod
+    def _log_result(
+        event_logger: logging.Logger, command: str, result: _CommandResult
+    ) -> None:
+        if result.success:
+            if result.completed is True:
+                event_logger.info("Command %s succeeded: %s", command, result.message)
+            else:
+                event_logger.info(
+                    "Command %s accepted, pending completion: %s",
+                    command,
+                    result.message,
+                )
+        else:
+            event_logger.warning("Command %s failed: %s", command, result.message)

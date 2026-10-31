@@ -4,9 +4,9 @@ from typing import cast
 
 from src.core.backtest import spider_run_native_schema as native
 from src.core.backtest.spider_run_artifacts import (
-    ConfigurationContext, _artifact_contexts, _boolean, _boundary, _decimal_text,
+    ConfigurationContext, FloatingExitContext, GrossExecutionContext, _artifact_contexts, _boolean, _boundary, _decimal_text,
     _enum, _historical_context, _integer, _list, _object, _P3_COVERAGE_KINDS,
-    _require, _terminal_policy, _text,
+    _require, _terminal_policy, _text, artifact_execution_context,
 )
 
 _CLASSES = ["SOURCE_GROUP", "SNAPSHOT_CAPTURE", "DELIVERY"]
@@ -100,10 +100,14 @@ def _policy_event(value: object) -> None:
                 _string(row[key])
 
 
-def owner_evidence(value: object, *, context: ConfigurationContext | None = None) -> None:
+def owner_evidence(value: object, *, context: ConfigurationContext | None = None,
+                   gross_profile: bool = False) -> None:
     row = _object(value, "cutoff inspection trading_request trading_fact positions_request positions_fact open_orders_request open_orders_fact")
     _integer(row["cutoff"])
-    native.inspection(row["inspection"], context=context)
+    if gross_profile:
+        native.inspection(row["inspection"], context=context, gross_profile=True)
+    else:
+        native.inspection(row["inspection"], context=context)
     for name in ("trading", "positions", "open_orders"):
         native.snapshot_request(row[name + "_request"])
         native.snapshot_fact(row[name + "_fact"], context=context)
@@ -114,10 +118,16 @@ def owner_evidence(value: object, *, context: ConfigurationContext | None = None
 
 
 def scheduler_key(value: object, *, historical: bool = False,
-                  historical_market_step: bool = False) -> tuple[int, int, int, str]:
+                  historical_market_step: bool = False,
+                  paid_execution: bool = False) -> tuple[int, int, int, str]:
     row = _object(value, "visible_at queue_class schedule_sequence stable_id")
-    classes = ([*_CLASSES, *_P3_CLASSES] if historical else
-               [*_CLASSES, "HISTORICAL_MARKET_STEP"] if historical_market_step else _CLASSES)
+    classes = [*_CLASSES]
+    if historical:
+        classes.extend(_P3_CLASSES)
+    elif historical_market_step:
+        classes.append("HISTORICAL_MARKET_STEP")
+    if paid_execution:
+        classes.append("PAID_ENDPOINT_DRAIN")
     return (_integer(row["visible_at"]), classes.index(_enum(row["queue_class"], classes)),
             _integer(row["schedule_sequence"]), _text(row["stable_id"]))
 
@@ -163,17 +173,34 @@ def callback_result(value: object) -> None:
         _code(failure["reason"])
 
 
-def journal_record(value: object) -> None:
-    row = _object(value, "schema_version run_id journal_seq barrier_id record_kind scheduler_key causal_parent_ids effective_at visible_at account_version_before account_version_after payload", "configuration_context historical_context")
+def journal_record(value: object, *, execution: object | None = None) -> None:
+    validated_execution = artifact_execution_context(execution) if execution is not None else None
+    gross_execution = type(validated_execution) is GrossExecutionContext
+    floating_exit = type(validated_execution) is FloatingExitContext
+    required = "schema_version run_id journal_seq barrier_id record_kind scheduler_key causal_parent_ids effective_at visible_at account_version_before account_version_after payload"
+    optional = "configuration_context historical_context"
+    if validated_execution is not None:
+        required += " execution_context"
+        optional = "configuration_context historical_context"
+    row = _object(value, required, optional)
     context = _context(row)
-    _enum(row["schema_version"], ["spider_journal_record_v1"])
+    expected_schema = ("spider_gross_execution_journal_record_v1" if gross_execution else
+                       "spider_floating_exit_journal_record_v1" if floating_exit else
+                       "spider_execution_journal_record_v1" if validated_execution is not None else
+                       "spider_journal_record_v1")
+    _enum(row["schema_version"], [expected_schema])
+    if validated_execution is not None:
+        row_execution = artifact_execution_context(row["execution_context"])
+        _require(row_execution == validated_execution)
+        _require("configuration_context" in row and "historical_context" in row)
     _text(row["run_id"], "[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
     _require(_integer(row["journal_seq"]) > 0)
     _text(row["barrier_id"])
     kind = _enum(row["record_kind"], [*_KINDS, _P3_KIND])
     _, historical = _artifact_contexts(row)
     _require(kind != _P3_KIND or historical is not None)
-    key = scheduler_key(row["scheduler_key"], historical_market_step=kind == _P3_KIND)
+    key = scheduler_key(row["scheduler_key"], historical_market_step=kind == _P3_KIND,
+                        paid_execution=gross_execution)
     expected_queue = (0 if kind == "SOURCE_GROUP_RESULT" else 1 if kind == "SNAPSHOT_FACT"
                       else 3 if kind == _P3_KIND else 2)
     _require(key[1] == expected_queue)
@@ -187,11 +214,21 @@ def journal_record(value: object) -> None:
         else:
             _require(row[version_field] is None)
     if kind == "SOURCE_GROUP_RESULT":
-        payload = _object(row["payload"], "request result owner_evidence_before owner_evidence_after")
+        payload = _object(
+            row["payload"],
+            "request result owner_evidence_before owner_evidence_after"
+            + (" gross_group_control" if gross_execution else ""),
+        )
         native.group(payload["request"], context=context, historical=historical is not None)
         native.group_result(payload["result"])
-        owner_evidence(payload["owner_evidence_before"], context=context)
-        owner_evidence(payload["owner_evidence_after"], context=context)
+        if gross_execution:
+            control = _object(payload["gross_group_control"], "schema_version restricted")
+            _enum(control["schema_version"], ["spider_gross_response_group_control_v1"])
+            _boolean(control["restricted"])
+        else:
+            _require("gross_group_control" not in payload)
+        owner_evidence(payload["owner_evidence_before"], context=context, gross_profile=gross_execution)
+        owner_evidence(payload["owner_evidence_after"], context=context, gross_profile=gross_execution)
     elif kind == "SNAPSHOT_FACT":
         payload = _object(row["payload"], "purpose request fact")
         _enum(payload["purpose"], ["INITIAL", "POST_GROUP", "POLL", "FINAL"])
@@ -207,6 +244,8 @@ def journal_record(value: object) -> None:
         payload = cast(dict[str, object], row["payload"])
         native.historical_market_result(
             payload, context=context, historical_context=_historical_context(historical),
+            expected_run_contract_hash=(validated_execution.execution_input_sha256 if validated_execution is not None else None),
+            gross_profile=gross_execution,
         )
         result = cast(dict[str, object], payload["result"])
         inspection_before = cast(dict[str, object], payload["owner_inspection_before"])
@@ -224,21 +263,22 @@ def journal_record(value: object) -> None:
         callback_result(row["payload"])
 
 
-def journal(value: object) -> None:
+def journal(value: object, *, execution: object | None = None) -> None:
+    validated_execution = artifact_execution_context(execution) if execution is not None else None
     barriers: list[str] = []
     for sequence, item in enumerate(_list(value), 1):
-        journal_record(item)
+        journal_record(item, execution=validated_execution)
         row = cast(dict[str, object], item)
         _require(row["journal_seq"] == sequence)
         barriers.append(_text(row["barrier_id"]))
     _require(len(barriers) == len(set(barriers)))
 
 
-def scheduler_terminal(value: object, *, historical: bool = False) -> None:
+def scheduler_terminal(value: object, *, historical: bool = False, paid_execution: bool = False) -> None:
     if value is None:
         return
     row = _object(value, "kind stable_id classification reason")
-    kind = _enum(row["kind"], [*_CLASSES, *(_P3_CLASSES if historical else []), "POLL", "DISPATCH", "QUEUE"])
+    kind = _enum(row["kind"], [*_CLASSES, *( _P3_CLASSES if historical else []), *( ["PAID_ENDPOINT_DRAIN"] if paid_execution else []), "POLL", "DISPATCH", "QUEUE"])
     if row["stable_id"] is not None or kind not in ("DISPATCH", "QUEUE"):
         _text(row["stable_id"])
     _enum(row["classification"], ["TERMINAL"])
@@ -253,19 +293,19 @@ def poll(value: object) -> tuple[str, str]:
     return _text(row["poll_id"]), _text(row["continuation_id"])
 
 
-def scheduler_observation(value: object, *, historical: bool = False) -> None:
+def scheduler_observation(value: object, *, historical: bool = False, paid_execution: bool = False) -> None:
     row = _object(value, "current_time last_popped gate terminal pending_keys records polls callback_actions")
     _integer(row["current_time"])
     if row["last_popped"] is not None:
-        scheduler_key(row["last_popped"], historical=historical)
+        scheduler_key(row["last_popped"], historical=historical, paid_execution=paid_execution)
     _enum(row["gate"], ["RUNNING", "FAILED"])
-    scheduler_terminal(row["terminal"], historical=historical)
-    classes = [*_CLASSES, *(_P3_CLASSES if historical else [])]
-    _ordered([scheduler_key(item, historical=historical) for item in _list(row["pending_keys"])])
+    scheduler_terminal(row["terminal"], historical=historical, paid_execution=paid_execution)
+    classes = [*_CLASSES, *(_P3_CLASSES if historical else []), *( ["PAID_ENDPOINT_DRAIN"] if paid_execution else [])]
+    _ordered([scheduler_key(item, historical=historical, paid_execution=paid_execution) for item in _list(row["pending_keys"])])
     records: list[tuple] = []
     for item in _list(row["records"]):
         record = _object(item, "key kind stable_id classification")
-        key = scheduler_key(record["key"], historical=historical)
+        key = scheduler_key(record["key"], historical=historical, paid_execution=paid_execution)
         identity = (classes.index(_enum(record["kind"], classes)), _text(record["stable_id"]))
         _require(identity == (key[1], key[3]))
         _enum(record["classification"], ["PENDING", "SUCCESS", "TERMINAL"])

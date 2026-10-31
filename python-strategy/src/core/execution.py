@@ -14,7 +14,7 @@ from src.core.models import (
     OrderStatus,
     PositionSide,
 )
-from src.core.orm_models import Order, Strategy
+from src.core.orm_models import Order, Strategy, Trade as StoredTrade
 from src.core.order_manager import OrderManager
 from src.core.order_manager import PositionCachePersistenceError
 from src.core.runtime_capabilities import (
@@ -80,6 +80,19 @@ from src.core.signal_order_intent import (
 )
 from src.core.strategy_context import RejectionSnapshot
 
+
+OrderTransactionParticipant = Callable[[Session, Order, StoredTrade | None], None]
+
+
+def _validate_order_transaction_participant_target(
+    order_repository: IOrderRepository | None,
+    transaction_participant: OrderTransactionParticipant | None,
+) -> None:
+    if order_repository is not None and transaction_participant is not None:
+        raise ValueError(
+            "repository transaction participant requires internally constructed LiveOrderRepository"
+        )
+
 OPS_KILL_SWITCH_STRATEGY_ID = "__ops_kill_switch__"
 
 
@@ -125,7 +138,13 @@ class ExecutionEngine:
         order_event_processor: OrderEventProcessor | None = None,
         pending_protection_fill_processor: PendingProtectionFillProcessor | None = None,
         entry_candle_freshness_enabled: bool = False,
+        repository_transaction_participant: OrderTransactionParticipant | None = None,
+        owned_order_event_observer: Callable[[str], None] | None = None,
     ):
+        _validate_order_transaction_participant_target(
+            order_repository,
+            repository_transaction_participant,
+        )
         self.logger = logging.getLogger("ExecutionEngine")
         self.clock = clock
         self._db_session_factory = db_session_factory
@@ -138,6 +157,7 @@ class ExecutionEngine:
         self._order_event_processor = (
             order_event_processor or process_order_event_without_venue_policy
         )
+        self._owned_order_event_observer = owned_order_event_observer
         self._pending_protection_fill_processor = (
             pending_protection_fill_processor
             or audit_pending_protection_without_venue_policy
@@ -175,6 +195,7 @@ class ExecutionEngine:
                         if repository_account_identity is not None
                         else None
                     ),
+                    transaction_participant=repository_transaction_participant,
                 ),
                 clock,
                 is_backtest=is_backtest,
@@ -857,7 +878,18 @@ class ExecutionEngine:
             )
             if result.get("action") == "applied_position_cache_failed":
                 self._latch_fill_position_cache_failure()
-            return result
+        if (
+            self._owned_order_event_observer is not None
+            and result.get("action") in {"applied", "applied_position_cache_failed"}
+            and type(result.get("order_id")) is str
+        ):
+            try:
+                self._owned_order_event_observer(cast(str, result["order_id"]))
+            except Exception:
+                self.logger.exception(
+                    "Owned order-event observer failed after committed financial application"
+                )
+        return result
 
     @property
     def fill_position_cache_failed(self) -> bool:

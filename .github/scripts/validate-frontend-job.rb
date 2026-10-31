@@ -18,7 +18,7 @@ COMMANDS = [
   "npm run build",
   "npm run test:browser"
 ].freeze
-REQUIRED_JOBS = %w[frontend-check integration-check python-check rust-check secret-scan].freeze
+REQUIRED_JOBS = %w[frontend-check integration-check python-check python-slow rust-check secret-scan].freeze
 
 def invalid?(condition)
   raise INVALID unless condition
@@ -29,7 +29,8 @@ def validate_frontend_job(workflow)
   triggers = workflow["on"] || workflow[true]
   invalid?(triggers.is_a?(Hash))
   push_branches = triggers.dig("push", "branches")
-  invalid?(push_branches.is_a?(Array) && push_branches.include?("chore/**"))
+  invalid?(push_branches.is_a?(Array) && (push_branches.include?("**") || push_branches.include?("chore/**")))
+  invalid?(push_branches.none? { |branch| !branch.is_a?(String) || branch.start_with?("!") })
   jobs = workflow["jobs"]
   invalid?(jobs.is_a?(Hash))
   job = jobs["frontend-check"]
@@ -96,9 +97,13 @@ end
 
 def self_test
   raise "valid snapshot rejected" unless validate_frontend_job(valid_snapshot).nil?
+  all_branches = Marshal.load(Marshal.dump(valid_snapshot))
+  all_branches["on"]["push"]["branches"] = ["**"]
+  raise "all-branch push snapshot rejected" unless validate_frontend_job(all_branches).nil?
 
   mutations = [
     ->(value) { value["on"]["push"]["branches"].delete("chore/**") },
+    ->(value) { value["on"]["push"]["branches"] << "!chore/**" },
     ->(value) { value["jobs"].delete("frontend-check") },
     ->(value) { value["jobs"]["frontend-check"]["runs-on"] = "ubuntu-latest" },
     ->(value) { value["jobs"]["frontend-check"]["defaults"]["run"]["working-directory"] = "." },

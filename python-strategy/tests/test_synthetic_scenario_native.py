@@ -8,6 +8,12 @@ import pytest
 pytestmark = pytest.mark.rust
 
 
+def _native_invariant_fault() -> Exception:
+    import fluxtrade_core as native
+
+    return native.ScenarioReplayInvariantError("NATIVE_INVARIANT")
+
+
 def test_scheduler_classifier_uses_only_exact_closed_native_types():
     import fluxtrade_core as native
     from src.core.backtest.synthetic_scenario_codec import _native_failure
@@ -19,6 +25,9 @@ def test_scheduler_classifier_uses_only_exact_closed_native_types():
         assert _native_failure(cls(reason)) == dict(kind=kind, reason=reason)
         assert _native_failure(type("Derived", (cls,), {})(reason)) is None
     assert all(_native_failure(error) is None for error in (ValueError("INVALID_SCHEMA"), LookupError("UNKNOWN_RECEIPT_REFERENCE"), RuntimeError("NATIVE_INVARIANT")))
+    fault = _native_invariant_fault()
+    assert type(fault) is native.ScenarioReplayInvariantError
+    assert _native_failure(fault) == dict(kind="INVARIANT", reason="NATIVE_INVARIANT")
 
 
 def test_native_session_registered_and_closed_profiles_are_canonical():

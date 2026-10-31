@@ -14,6 +14,11 @@ mod delivery;
 mod event_limit;
 mod execution;
 mod golden_cancel;
+mod gross_admission;
+mod gross_response;
+#[cfg(test)]
+#[path = "scenario_account/gross_response_tests.rs"]
+mod gross_response_tests;
 mod group;
 mod historical;
 mod hypothetical_settlement;
@@ -22,6 +27,7 @@ mod min_cash;
 mod reservation;
 mod risk_transition;
 mod session;
+mod source_cost_projection;
 pub(crate) use session::register_python;
 mod snapshot;
 mod source;
@@ -34,6 +40,7 @@ enum ProfileContext {
         marks: Vec<Mark>,
         min_cash_profile: bool,
         p1_liquidation_profile: bool,
+        gross_admission_profile: bool,
     },
     GoldenCapacity(capacity::Config),
     EventLimit(event_limit::Config),
@@ -161,6 +168,16 @@ struct ProductPosition {
     entry_basis: Decimal,
 }
 
+#[derive(Clone)]
+struct SourceCostReceipt {
+    sequence: u64,
+    product: Product,
+    before: Option<ProductPosition>,
+    after: Option<ProductPosition>,
+    price: Decimal,
+    fee: Decimal,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum PositionState {
     BtcEth(BTreeMap<Product, ProductPosition>),
@@ -277,6 +294,24 @@ fn owner_context_id(
     seed_effective_at: i64,
     config_id: &str,
 ) -> Result<Hash, Fault> {
+    owner_context_id_with_policy(
+        scenario,
+        marks,
+        active_at,
+        seed_effective_at,
+        config_id,
+        None,
+    )
+}
+
+fn owner_context_id_with_policy(
+    scenario: &FrozenScenario,
+    marks: &[Mark],
+    active_at: i64,
+    seed_effective_at: i64,
+    config_id: &str,
+    policy_id: Option<&str>,
+) -> Result<Hash, Fault> {
     let encoded_at = if scenario.configured.is_some() {
         seed_effective_at
     } else {
@@ -284,10 +319,11 @@ fn owner_context_id(
     };
     let context = context_id_at(scenario, marks, active_at, encoded_at)?;
     if scenario.configured.is_some() {
-        Ok(hash_fields(&[
-            Some(format!("{:02x?}", context)),
-            Some(config_id.into()),
-        ]))
+        let mut fields = vec![Some(format!("{:02x?}", context)), Some(config_id.into())];
+        if let Some(policy_id) = policy_id {
+            fields.push(Some(policy_id.into()));
+        }
+        Ok(hash_fields(&fields))
     } else {
         Ok(context)
     }
@@ -438,6 +474,15 @@ impl ScenarioAccount {
         leverage: Decimal,
         products: Vec<ConfiguredProduct>,
     ) -> Result<Self, Fault> {
+        Self::from_configured_profile(seed, leverage, products, false)
+    }
+
+    fn from_configured_profile(
+        seed: &CleanSeed,
+        leverage: Decimal,
+        products: Vec<ConfiguredProduct>,
+        gross_admission_profile: bool,
+    ) -> Result<Self, Fault> {
         seed.key.validate().map_err(|_| "INVALID_SCHEMA")?;
         if !identity(&seed.config_id) || seed.effective_at < 0 {
             return Err("INVALID_SCHEMA");
@@ -472,7 +517,7 @@ impl ScenarioAccount {
         }) {
             return Err("INVALID_SCHEMA");
         }
-        Self::from_validated_configuration(seed, scenario, &marks)
+        Self::from_validated_configuration_profile(seed, scenario, &marks, gross_admission_profile)
     }
 
     fn btc_context(&self) -> Result<(&FrozenScenario, &[Mark]), Fault> {
@@ -489,11 +534,22 @@ impl ScenarioAccount {
 
     fn reservation(&self) -> Result<reservation::Snapshot, Fault> {
         let (scenario, marks) = self.btc_context()?;
-        reservation::calculate(
+        reservation::calculate_with_gross(
             &self.projection()?,
             &self.orders.values().map(|o| &o.facts).collect::<Vec<_>>(),
             scenario,
             marks,
+            self.is_gross_admission_profile(),
+        )
+    }
+
+    fn is_gross_admission_profile(&self) -> bool {
+        matches!(
+            self.profile,
+            ProfileContext::BtcEthScenario {
+                gross_admission_profile: true,
+                ..
+            }
         )
     }
 
@@ -520,12 +576,22 @@ impl ScenarioAccount {
         scenario: FrozenScenario,
         marks: &[Mark],
     ) -> Result<Self, Fault> {
-        let valuation_context_id = owner_context_id(
+        Self::from_validated_configuration_profile(seed, scenario, marks, false)
+    }
+
+    fn from_validated_configuration_profile(
+        seed: &CleanSeed,
+        scenario: FrozenScenario,
+        marks: &[Mark],
+        gross_admission_profile: bool,
+    ) -> Result<Self, Fault> {
+        let valuation_context_id = owner_context_id_with_policy(
             &scenario,
             marks,
             seed.effective_at,
             seed.effective_at,
             &seed.config_id,
+            gross_admission_profile.then_some(gross_admission::POLICY_ID),
         )?;
         let mut positions = BTreeMap::new();
         let mut sequences = BTreeSet::new();
@@ -647,6 +713,7 @@ impl ScenarioAccount {
             profile: ProfileContext::BtcEthScenario {
                 min_cash_profile: false,
                 p1_liquidation_profile: false,
+                gross_admission_profile,
                 scenario,
                 marks: marks.to_vec(),
             },
@@ -709,13 +776,17 @@ impl ScenarioAccount {
     fn validate_context(&self, effective_at: i64) -> Result<(), Fault> {
         let current = match &self.profile {
             ProfileContext::BtcEthScenario {
-                scenario, marks, ..
-            } => owner_context_id(
+                scenario,
+                marks,
+                gross_admission_profile,
+                ..
+            } => owner_context_id_with_policy(
                 scenario,
                 marks,
                 effective_at,
                 self.seed_effective_at,
                 &self.config_id,
+                gross_admission_profile.then_some(gross_admission::POLICY_ID),
             ),
             ProfileContext::GoldenCapacity(config) => config.context_id(effective_at),
             ProfileContext::EventLimit(config) => config.context_id(effective_at),

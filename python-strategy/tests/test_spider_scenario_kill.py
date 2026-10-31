@@ -22,8 +22,15 @@ def child(root, window, pipe):
         raise AssertionError("barrier must end only by SIGKILL")
     register, apply = run._Store.register, wire.ScenarioCodec.apply_group
     append, publish = run._Store.append_journal, run._Store._publish
-    def registered(self, attempt: dict[str, Any], *, historical_input: bytes | None = None) -> str:
-        result = register(self, attempt, historical_input=historical_input)
+    def registered(
+        self, attempt: dict[str, Any], *, historical_input: bytes | None = None,
+        execution_input: bytes | None = None, floating_exit_input: bytes | None = None,
+        gross_execution_input: bytes | None = None,
+    ) -> str:
+        result = register(
+            self, attempt, historical_input=historical_input, execution_input=execution_input,
+            floating_exit_input=floating_exit_input, gross_execution_input=gross_execution_input,
+        )
         if window == "running":
             reached(token=result)
         return result

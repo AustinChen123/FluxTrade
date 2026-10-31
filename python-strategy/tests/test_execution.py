@@ -86,6 +86,61 @@ def test_production_repository_is_bound_to_runtime_account_identity(
     assert isinstance(repository, LiveOrderRepository)
     assert repository._account_profile == "binance"
     assert repository._account_id == "futures-main"
+    assert repository._transaction_participant is None
+
+
+def test_constructed_live_repository_receives_exact_transaction_participant(
+    mock_db_session,
+    mock_clock,
+    mock_exchange_adapter,
+):
+    participant = MagicMock()
+
+    engine = ExecutionEngine(
+        db_session=mock_db_session,
+        clock=mock_clock,
+        adapter=mock_exchange_adapter,
+        repository_transaction_participant=participant,
+    )
+
+    repository = engine.order_manager.repo
+    assert isinstance(repository, LiveOrderRepository)
+    assert repository._transaction_participant is participant
+
+
+def test_explicit_repository_rejects_transaction_participant_before_use(
+    mock_db_session,
+    mock_clock,
+    mock_exchange_adapter,
+    mock_order_repo,
+):
+    with pytest.raises(
+        ValueError,
+        match="^repository transaction participant requires internally constructed LiveOrderRepository$",
+    ):
+        ExecutionEngine(
+            db_session=mock_db_session,
+            clock=mock_clock,
+            adapter=mock_exchange_adapter,
+            order_repository=mock_order_repo,
+            repository_transaction_participant=MagicMock(),
+        )
+
+
+def test_explicit_repository_without_participant_remains_unchanged(
+    mock_db_session,
+    mock_clock,
+    mock_exchange_adapter,
+    mock_order_repo,
+):
+    engine = ExecutionEngine(
+        db_session=mock_db_session,
+        clock=mock_clock,
+        adapter=mock_exchange_adapter,
+        order_repository=mock_order_repo,
+    )
+
+    assert engine.order_manager.repo is mock_order_repo
 
 
 @pytest.mark.parametrize(
