@@ -7,6 +7,7 @@ from src.core.fill_delta import FillDelta, fill_delta_from_cumulative
 from src.core.interfaces.exchange import ExchangeOrderEvent
 from src.core.models import OrderStatus
 from src.core.order_manager import PositionCachePersistenceError
+from src.core.notifications import NotificationSink
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,7 @@ class OrderEventApplier:
         cancel_linked_conditional_for_protection_fill: Callable[[object], dict | None],
         remote_follow_up_required: Callable[[object, str], bool] | None = None,
         on_position_cache_failure: Callable[[], None] | None = None,
+        notification_sink: NotificationSink | None = None,
     ) -> None:
         self.order_manager = order_manager
         self.journal_fill = journal_fill
@@ -65,6 +67,7 @@ class OrderEventApplier:
             lambda _order, _event_state: True
         )
         self.on_position_cache_failure = on_position_cache_failure or (lambda: None)
+        self.notification_sink = notification_sink
 
     def process_exchange_order_event(
         self,

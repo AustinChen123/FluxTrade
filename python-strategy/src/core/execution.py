@@ -71,6 +71,7 @@ from src.core import execution_journal
 from src.core import execution_portfolio_exposure
 from src.core import execution_verified_net_reduction
 from src.core.order_event_sync import OrderEventApplier
+from src.core.notifications import NotificationSink
 from src.core.order_reconciliation import OrderReconciler
 from src.core.portfolio_runtime import PortfolioExposureSnapshot
 from src.core.signal_order_intent import (
@@ -141,6 +142,7 @@ class ExecutionEngine:
         entry_candle_freshness_enabled: bool = False,
         repository_transaction_participant: OrderTransactionParticipant | None = None,
         owned_order_event_observer: Callable[[str], None] | None = None,
+        notification_sink: NotificationSink | None = None,
     ):
         _validate_order_transaction_participant_target(
             order_repository,
@@ -159,6 +161,7 @@ class ExecutionEngine:
             order_event_processor or process_order_event_without_venue_policy
         )
         self._owned_order_event_observer = owned_order_event_observer
+        self.notification_sink = notification_sink
         self._pending_protection_fill_processor = (
             pending_protection_fill_processor
             or audit_pending_protection_without_venue_policy
@@ -269,6 +272,7 @@ class ExecutionEngine:
             ),
             remote_follow_up_required=self._remote_follow_up_required,
             on_position_cache_failure=self._latch_fill_position_cache_failure,
+            notification_sink=notification_sink,
         )
         self._order_reconciler = OrderReconciler(
             adapter=self.adapter,

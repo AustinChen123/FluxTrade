@@ -2,6 +2,7 @@ import logging
 import threading
 from collections.abc import Mapping
 from typing import Callable, Protocol, cast
+from src.core.notifications import NotificationSink
 
 
 _SAFE_ACTIONS = frozenset({"applied", "applied_position_cache_failed"})
@@ -53,6 +54,7 @@ class GenericOrderEventStream:
         event_logger: logging.Logger,
         thread_factory: _ThreadFactory = threading.Thread,
         recoverable_orders_loader: Callable[[], list[object]] = list,
+        notification_sink: NotificationSink | None = None,
     ) -> None:
         self._adapter_loader = adapter_loader
         self._is_running = is_running
@@ -66,6 +68,7 @@ class GenericOrderEventStream:
         self._event_logger = event_logger
         self._thread_factory = thread_factory
         self._recoverable_orders_loader = recoverable_orders_loader
+        self.notification_sink = notification_sink
 
     def start(self) -> None:
         adapter = self._adapter_loader()
