@@ -1046,6 +1046,46 @@ def test_default_snapshot_loader_resolves_the_native_extension_export(monkeypatc
     loader.assert_called_once_with("test", "ACCOUNT")
 
 
+@pytest.mark.parametrize("with_basket", [False, True])
+def test_snapshot_loader_logs_typed_numeric_diagnostic_at_warning(caplog, with_basket):
+    diagnostic = (
+        "rithmic_numeric_validation template=351 context=history notify_type=2(STATUS) "
+        "field=price present=true raw_bits=0xbff0000000000000 value=-1 "
+        "failure=negative identity=basket#0123456789abcdef order#absent"
+    )
+    diagnostic_error = RuntimeError(diagnostic)
+    diagnostic_error.diagnostic = diagnostic
+    loader = Mock(side_effect=diagnostic_error)
+    orders = [local_order(exchange_order_id="synthetic-basket")] if with_basket else []
+
+    with caplog.at_level(logging.WARNING, logger="RithmicAdapter"):
+        with pytest.raises(RuntimeError, match="rithmic_numeric_validation"):
+            load_rithmic_recovery_snapshot("test", "ACCOUNT", orders, 1_700_000_200, loader)
+
+    assert any(
+        record.levelno >= logging.WARNING and diagnostic in record.getMessage()
+        for record in caplog.records
+    )
+    assert "BASKET_ID_SECRET" not in caplog.text
+    assert "ORDER_ID_SECRET" not in caplog.text
+    assert "ACCOUNT_ID_SECRET" not in caplog.text
+
+
+@pytest.mark.parametrize("with_basket", [False, True])
+def test_snapshot_warning_never_logs_untrusted_exception_text(caplog, with_basket):
+    sentinels = "ACCOUNT_ID_SECRET_123 BASKET_ID_SECRET_123 USER_SECRET_123 CREDENTIAL_SECRET_123"
+    error = RuntimeError(sentinels)
+    orders = [local_order(exchange_order_id="synthetic-basket")] if with_basket else []
+    loader = Mock(side_effect=error)
+    with caplog.at_level(logging.WARNING, logger="RithmicAdapter"):
+        with pytest.raises(RuntimeError) as caught:
+            load_rithmic_recovery_snapshot("test", "ACCOUNT", orders, 1_700_000_200, loader)
+    assert caught.value is error
+    warnings = [record for record in caplog.records if record.levelno >= logging.WARNING]
+    assert warnings
+    assert all(sentinel not in record.getMessage() for record in warnings for sentinel in sentinels.split())
+
+
 def test_snapshot_loader_includes_persisted_native_parent_basket():
     loader = Mock(return_value=snapshot())
     child = local_order(

@@ -355,10 +355,27 @@ fn runtime_error(py: Python<'_>, error: anyhow::Error) -> PyErr {
     let (connect_phase, connect_failure_kind) = connect_diagnostics(failure, &error);
     let (session_failure_reason, provider_response_code) =
         session_failure_diagnostics(failure, &error);
-    let target = PyRuntimeError::new_err("Rithmic ledger snapshot failed")
+    let diagnostic = error
+        .downcast_ref::<crate::rithmic_ledger::order_field_policy::NumericFieldDiagnostic>()
+        .map(ToString::to_string);
+    let diagnostic = diagnostic.or_else(|| {
+        error
+            .downcast_ref::<crate::rithmic_ledger::order_field_policy::QuantityFieldDiagnostic>()
+            .map(ToString::to_string)
+    });
+    let message = diagnostic
+        .as_ref()
+        .map(|diagnostic| format!("Rithmic ledger snapshot failed: {diagnostic}"))
+        .unwrap_or_else(|| "Rithmic ledger snapshot failed".to_string());
+    let target = PyRuntimeError::new_err(message)
         .into_value(py)
         .into_bound(py)
         .into_any();
+    if let Some(diagnostic) = diagnostic {
+        if target.setattr("diagnostic", diagnostic).is_err() {
+            return PyRuntimeError::new_err("Rithmic ledger snapshot failed");
+        }
+    }
     project_runtime_error_target(
         failure,
         retryable,
@@ -423,6 +440,116 @@ mod tests {
     use pyo3::types::PyModule;
     use rust_decimal_macros::dec;
     use std::ffi::CString;
+
+    #[test]
+    fn decoded_snapshot_diagnostic_reaches_recovery_warning() {
+        let _project_import_guard = crate::binding::embedded_python_project_import_lock();
+        Python::with_gil(|py| {
+            let sys = PyModule::import(py, "sys").unwrap();
+            let paths = sys.getattr("path").unwrap();
+            let version_info = sys.getattr("version_info").unwrap();
+            let major: u8 = version_info.get_item(0).unwrap().extract().unwrap();
+            let minor: u8 = version_info.get_item(1).unwrap().extract().unwrap();
+            let repository_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .expect("rust-data-service should be inside the repository");
+            for path in [
+                repository_root.join(format!(
+                    "python-strategy/.venv/lib/python{major}.{minor}/site-packages"
+                )),
+                repository_root.join("python-strategy"),
+            ] {
+                paths
+                    .call_method1("insert", (0, path.to_string_lossy().as_ref()))
+                    .unwrap();
+            }
+            let source_error = crate::rithmic_ledger::ledger::invalid_snapshot_quantity_diagnostic_for_binding_test();
+            let projected = runtime_error(py, source_error);
+            let value = projected.value(py);
+            let diagnostic = value
+                .getattr("diagnostic")
+                .unwrap()
+                .extract::<String>()
+                .unwrap();
+            assert!(diagnostic.contains("template=351 context=snapshot"));
+            assert!(diagnostic.contains("field=quantity present=false raw_i32=N/A"));
+            assert!(!diagnostic.contains("BASKET_ID_SECRET_123"));
+            assert!(!diagnostic.contains("ORDER_ID_SECRET_456"));
+
+            let source = CString::new(
+                r#"
+import logging
+from src.core.adapters.rithmic_recovery import load_rithmic_recovery_snapshot
+
+class CapturingHandler(logging.Handler):
+    def __init__(self):
+        super().__init__(logging.WARNING)
+        self.messages = []
+    def emit(self, record):
+        self.messages.append(record.getMessage())
+
+class Order:
+    exchange_order_id = "BASKET_ID_SECRET_123"
+    timestamp = 1_700_000_000_000
+
+def run(expected_field):
+    logger = logging.getLogger("RithmicAdapter")
+    logger.setLevel(logging.WARNING)
+    handler = CapturingHandler()
+    logger.addHandler(handler)
+    try:
+        try:
+            load_rithmic_recovery_snapshot(
+                "test-profile", "ACCOUNT_ID_SECRET", [Order()], 1_700_000_200,
+                loader=lambda *args, **kwargs: (_ for _ in ()).throw(native_error),
+            )
+        except RuntimeError:
+            pass
+    finally:
+        logger.removeHandler(handler)
+    assert any("template=351 context=snapshot" in message and f"field={expected_field}" in message for message in handler.messages), repr(handler.messages)
+    assert all("BASKET_ID_SECRET_123" not in message for message in handler.messages), repr(handler.messages)
+    assert all("ORDER_ID_SECRET_456" not in message for message in handler.messages), repr(handler.messages)
+"#
+                .trim()
+                .to_string(),
+            )
+            .unwrap();
+            let filename = CString::new("rithmic_recovery_warning_test.py").unwrap();
+            let module_name = CString::new("rithmic_recovery_warning_test").unwrap();
+            let module = PyModule::from_code(
+                py,
+                source.as_c_str(),
+                filename.as_c_str(),
+                module_name.as_c_str(),
+            )
+            .unwrap();
+            module.setattr("native_error", value).unwrap();
+            module
+                .getattr("run")
+                .unwrap()
+                .call1(("quantity",))
+                .unwrap_or_else(|error| {
+                    panic!("recovery warning integration failed: {}", error.value(py))
+                });
+            let price_error =
+                crate::rithmic_ledger::ledger::invalid_snapshot_price_diagnostic_for_binding_test();
+            let projected_price = runtime_error(py, price_error);
+            module
+                .setattr("native_error", projected_price.value(py))
+                .unwrap();
+            module
+                .getattr("run")
+                .unwrap()
+                .call1(("price",))
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "recovery price warning integration failed: {}",
+                        error.value(py)
+                    )
+                });
+        });
+    }
 
     #[test]
     fn runtime_error_projects_only_the_independent_safe_ledger() {

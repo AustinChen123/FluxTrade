@@ -142,7 +142,7 @@ impl PyOrderClient {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let runtime = py
             .allow_threads(|| OrderRuntimeHandle::start(profile, account_id))
-            .map_err(runtime_error)?;
+            .map_err(|error| runtime_error(py, error))?;
         Ok(Self {
             runtime: Mutex::new(runtime),
         })
@@ -190,7 +190,7 @@ impl PyOrderClient {
                 .submit(order)
         })
         .map(PyOrderAck::from)
-        .map_err(runtime_error)
+        .map_err(|error| runtime_error(py, error))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -239,7 +239,7 @@ impl PyOrderClient {
                 .submit_bracket(order)
         })
         .map(PyOrderAck::from)
-        .map_err(runtime_error)
+        .map_err(|error| runtime_error(py, error))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -275,7 +275,7 @@ impl PyOrderClient {
                 .modify(modification)
         })
         .map(|()| true)
-        .map_err(runtime_error)
+        .map_err(|error| runtime_error(py, error))
     }
 
     fn cancel(&self, py: Python<'_>, basket_id: String) -> PyResult<bool> {
@@ -287,7 +287,7 @@ impl PyOrderClient {
                 .cancel(basket_id)
         })
         .map(|()| true)
-        .map_err(runtime_error)
+        .map_err(|error| runtime_error(py, error))
     }
 
     #[pyo3(signature = (exchange, symbol, window_name=None))]
@@ -311,7 +311,7 @@ impl PyOrderClient {
                 .exit_position(position)
         })
         .map(|()| true)
-        .map_err(runtime_error)
+        .map_err(|error| runtime_error(py, error))
     }
 
     fn lookup(
@@ -329,14 +329,14 @@ impl PyOrderClient {
                 .lookup(client_order_id, exchange, symbol)
         })
         .map(|snapshot| snapshot.map(PyLedgerOrder::from))
-        .map_err(runtime_error)
+        .map_err(|error| runtime_error(py, error))
     }
 
-    fn poll_event(&self) -> PyResult<Option<PyOrderEvent>> {
+    fn poll_event(&self, py: Python<'_>) -> PyResult<Option<PyOrderEvent>> {
         self.lock_runtime()?
             .try_next_event()
             .map(|event| event.map(PyOrderEvent::from))
-            .map_err(runtime_error)
+            .map_err(|error| runtime_error(py, error))
     }
 }
 
@@ -385,13 +385,136 @@ fn decimal_text(value: Option<Decimal>) -> Option<String> {
     value.map(|value| value.to_string())
 }
 
-fn runtime_error(error: anyhow::Error) -> PyErr {
-    PyRuntimeError::new_err(format!("{error:#}"))
+fn runtime_error(py: Python<'_>, error: anyhow::Error) -> PyErr {
+    let diagnostic = error
+        .downcast_ref::<crate::rithmic_ledger::order_field_policy::NumericFieldDiagnostic>()
+        .map(ToString::to_string)
+        .or_else(|| {
+            error
+                .downcast_ref::<crate::rithmic_ledger::order_field_policy::QuantityFieldDiagnostic>(
+                )
+                .map(ToString::to_string)
+        });
+    let message = diagnostic
+        .as_ref()
+        .map(|value| format!("Rithmic order event failed: {value}"))
+        .unwrap_or_else(|| format!("{error:#}"));
+    let target = PyRuntimeError::new_err(message)
+        .into_value(py)
+        .into_bound(py)
+        .into_any();
+    if let Some(diagnostic) = diagnostic {
+        if target.setattr("diagnostic", diagnostic).is_err() {
+            return PyRuntimeError::new_err("Rithmic order event failed");
+        }
+    }
+    PyErr::from_value(target)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_error_attaches_only_typed_safe_order_diagnostic() {
+        let _project_import_guard = crate::binding::embedded_python_project_import_lock();
+        Python::with_gil(|py| {
+            let error =
+                crate::rithmic_ledger::order_event::invalid_price_diagnostic_for_binding_test();
+            let projected = runtime_error(py, error);
+            let value = projected.value(py);
+            let diagnostic = value
+                .getattr("diagnostic")
+                .unwrap()
+                .extract::<String>()
+                .unwrap();
+            assert!(
+                diagnostic.contains("template=352 context=live notify_type=1(STATUS) field=price")
+            );
+            assert!(!diagnostic.contains("BASKET_ID_SECRET_123"));
+            assert!(!diagnostic.contains("ORDER_ID_SECRET_456"));
+            assert!(!value.to_string().contains("BASKET_ID_SECRET_123"));
+
+            let source = std::ffi::CString::new(
+                r#"
+import logging
+import threading
+from src.core.adapters.rithmic_adapter import RithmicExchangeAdapter
+
+class CapturingHandler(logging.Handler):
+    def __init__(self):
+        super().__init__(logging.WARNING)
+        self.messages = []
+    def emit(self, record):
+        self.messages.append(record.getMessage())
+
+class Client:
+    def poll_event(self):
+        raise native_error
+
+class AdapterProxy:
+    _client_lock = threading.Lock()
+    logger = logging.getLogger("RithmicAdapter")
+    def _require_client(self):
+        return Client()
+
+def run(expected_field):
+    logger = logging.getLogger("RithmicAdapter")
+    logger.setLevel(logging.WARNING)
+    handler = CapturingHandler()
+    logger.addHandler(handler)
+    try:
+        caught = []
+        try:
+            RithmicExchangeAdapter.poll_order_event(AdapterProxy())
+        except Exception as error:
+            caught.append(error)
+    finally:
+        logger.removeHandler(handler)
+    assert caught, "native exception was not raised"
+    assert any("template=352 context=live" in message and f"field={expected_field}" in message for message in handler.messages), repr(handler.messages)
+    assert all("BASKET_ID_SECRET_123" not in message for message in handler.messages), repr(handler.messages)
+    assert all("ORDER_ID_SECRET_456" not in message for message in handler.messages), repr(handler.messages)
+"#
+                .trim()
+                .to_string(),
+            )
+            .unwrap();
+            let filename = std::ffi::CString::new("rithmic_live_warning_test.py").unwrap();
+            let module_name = std::ffi::CString::new("rithmic_live_warning_test").unwrap();
+            let module = pyo3::types::PyModule::from_code(
+                py,
+                source.as_c_str(),
+                filename.as_c_str(),
+                module_name.as_c_str(),
+            )
+            .unwrap();
+            module.setattr("native_error", value).unwrap();
+            module
+                .getattr("run")
+                .unwrap()
+                .call1(("price",))
+                .unwrap_or_else(|error| {
+                    panic!("live warning integration failed: {}", error.value(py))
+                });
+            let quantity =
+                crate::rithmic_ledger::order_event::invalid_quantity_diagnostic_for_binding_test();
+            let projected_quantity = runtime_error(py, quantity);
+            module
+                .setattr("native_error", projected_quantity.value(py))
+                .unwrap();
+            module
+                .getattr("run")
+                .unwrap()
+                .call1(("quantity",))
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "live quantity warning integration failed: {}",
+                        error.value(py)
+                    )
+                });
+        });
+    }
 
     #[test]
     fn python_boundary_parses_only_supported_side_and_order_type() {
@@ -496,6 +619,7 @@ mod tests {
 
     #[test]
     fn sparse_official_payload_reaches_durable_python_fill_pipeline() {
+        let _project_import_guard = crate::binding::embedded_python_project_import_lock();
         use crate::rithmic_ledger::{
             ledger::AccountIdentity,
             order_event::decode_order_event,

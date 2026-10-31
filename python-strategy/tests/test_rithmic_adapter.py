@@ -1,3 +1,4 @@
+import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal, InvalidOperation
@@ -599,6 +600,36 @@ def test_native_bracket_child_event_maps_to_local_leg_identity(adapter, client):
 
     assert mapped.client_order_id == stop.client_order_id
     assert mapped.raw["native_parent_client_order_id"] == entry.client_order_id
+
+
+def test_live_order_warning_uses_only_typed_diagnostic_or_fixed_text(adapter, client, caplog):
+    sentinels = "ACCOUNT_ID_SECRET_123 BASKET_ID_SECRET_123 USER_SECRET_123 CREDENTIAL_SECRET_123"
+    client.poll_event.side_effect = RuntimeError(sentinels)
+    adapter.start_order_event_stream()
+    with caplog.at_level(logging.WARNING, logger="RithmicAdapter"):
+        with pytest.raises(ExchangeError):
+            adapter.poll_order_event()
+    warnings = [record for record in caplog.records if record.levelno >= logging.WARNING]
+    assert warnings
+    assert all(value not in record.getMessage() for record in warnings for value in sentinels.split())
+
+
+def test_live_order_warning_logs_the_binding_diagnostic_attribute(adapter, client, caplog):
+    diagnostic = (
+        "rithmic_numeric_validation template=352 context=live notify_type=1(STATUS) "
+        "field=price present=true raw_bits=0xbff0000000000000 value=-1 "
+        "failure=negative identity=basket#masked:length=1 order#absent"
+    )
+    error = RuntimeError("untrusted account, basket, user and credential sentinels")
+    error.diagnostic = diagnostic
+    client.poll_event.side_effect = error
+    adapter.start_order_event_stream()
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(ExchangeError):
+            adapter.poll_order_event()
+    records = [record for record in caplog.records if record.levelno >= logging.WARNING]
+    assert any(diagnostic in record.getMessage() for record in records)
+    assert all("untrusted" not in record.getMessage() for record in records)
 
 
 def test_event_resolution_and_restore_merge_share_the_existing_client_lock(
