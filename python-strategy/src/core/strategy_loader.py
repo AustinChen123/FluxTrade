@@ -291,6 +291,11 @@ class StrategyLoader:
                     "__fluxtrade_catalog_sha256__",
                     catalog_digest,
                 )
+                setattr(
+                    artifact_class,
+                    "__fluxtrade_system_placed_protection__",
+                    entry["system_placed_protection"],
+                )
                 strategies[strategy_id] = artifact_class
                 logger.info(
                     "Loaded catalog %s: %s",
@@ -408,11 +413,24 @@ class StrategyLoader:
                 raise ValueError("strategy module must be a Python source file")
             if readiness not in StrategyLoader.READINESS_VALUES:
                 raise ValueError(f"unknown strategy readiness: {readiness}")
+            protection = entry.get("system_placed_protection", "")
+            if (
+                "system_placed_protection" in entry
+                and (
+                    not isinstance(protection, str)
+                    or protection not in {"NONE", "SL", "TP", "SL+TP"}
+                )
+            ):
+                raise ValueError(
+                    "unknown system_placed_protection declaration: "
+                    f"{protection!r}"
+                )
             seen_ids.add(strategy_id)
             normalized.append(
                 {
                     **cast(dict[str, str], values),
                     "kind": kind,
+                    "system_placed_protection": protection,
                 }
             )
         return normalized, verified_files

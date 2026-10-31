@@ -1,4 +1,5 @@
 from contextlib import nullcontext
+import json
 from typing import cast
 from unittest.mock import MagicMock, call
 
@@ -19,6 +20,11 @@ from src.strategies.base import BaseStrategy
 def _dependencies(found: dict[str, object], states: list[object | None]):
     loader = MagicMock(return_value=found)
     db = MagicMock()
+    db.get.return_value = Strategy(
+        id="existing",
+        name="Existing",
+        configuration_json="{}",
+    )
     db.query.return_value.filter.return_value.first.side_effect = states
     transition_to_error = MagicMock()
     event_logger = MagicMock()
@@ -128,6 +134,158 @@ def test_each_discovered_artifact_commits_independently():
     db.add.assert_called_once()
 
 
+@pytest.mark.parametrize("declaration", ["NONE", "SL", "TP", "SL+TP"])
+def test_catalog_declaration_updates_existing_strategy_configuration(declaration):
+    class Artifact:
+        __fluxtrade_system_placed_protection__ = declaration
+        __fluxtrade_catalog_sha256__ = "catalog-revision"
+
+    existing = Strategy(
+        id="existing",
+        name="Existing",
+        configuration_json='{"risk_limit":"kept"}',
+    )
+    loader, db, transition, event_logger = _dependencies({"existing": Artifact}, [None])
+    db.get.return_value = existing
+
+    synchronize_strategy_artifacts(
+        artifact_loader=loader,
+        publish_loaded_classes=MagicMock(),
+        db_session_factory=lambda: nullcontext(db),
+        transition_to_error=transition,
+        event_logger=event_logger,
+    )
+
+    assert json.loads(cast(str, existing.configuration_json)) == {
+        "risk_limit": "kept",
+        "system_placed_protection": declaration,
+        "system_placed_protection_revision": "catalog-revision",
+    }
+    db.commit.assert_called_once()
+
+
+def test_undeclared_artifact_preserves_unparseable_existing_configuration():
+    class Artifact:
+        pass
+
+    existing = Strategy(
+        id="existing",
+        name="Existing",
+        configuration_json="not-json",
+    )
+    loader, db, transition, event_logger = _dependencies(
+        {"existing": Artifact}, [None]
+    )
+    db.get.return_value = existing
+
+    synchronize_strategy_artifacts(
+        artifact_loader=loader,
+        publish_loaded_classes=MagicMock(),
+        db_session_factory=lambda: nullcontext(db),
+        transition_to_error=transition,
+        event_logger=event_logger,
+    )
+
+    assert cast(str, existing.configuration_json) == "not-json"
+    db.commit.assert_called_once()
+    db.rollback.assert_not_called()
+
+
+def test_invalid_existing_configuration_skips_only_declared_artifact():
+    class Artifact:
+        __fluxtrade_system_placed_protection__ = "SL"
+        __fluxtrade_catalog_sha256__ = "catalog-revision"
+
+    class OtherArtifact:
+        __fluxtrade_system_placed_protection__ = "TP"
+        __fluxtrade_catalog_sha256__ = "other-revision"
+
+    existing = Strategy(
+        id="existing",
+        name="Existing",
+        configuration_json="not-json",
+    )
+    other = Strategy(
+        id="other",
+        name="Other",
+        configuration_json="{}",
+    )
+    loader, db, transition, event_logger = _dependencies(
+        {"existing": Artifact, "other": OtherArtifact}, [None, None]
+    )
+    db.get.return_value = existing
+    db.get.side_effect = [existing, other]
+
+    synchronize_strategy_artifacts(
+        artifact_loader=loader,
+        publish_loaded_classes=MagicMock(),
+        db_session_factory=lambda: nullcontext(db),
+        transition_to_error=transition,
+        event_logger=event_logger,
+    )
+
+    assert cast(str, existing.configuration_json) == "not-json"
+    assert json.loads(cast(str, other.configuration_json)) == {
+        "system_placed_protection": "TP",
+        "system_placed_protection_revision": "other-revision",
+    }
+    event_logger.warning.assert_called_once()
+    assert "Skipping strategy artifact %s during catalog sync: %s" in str(
+        event_logger.warning.call_args.args[0]
+    )
+    assert db.rollback.call_count == 1
+    assert db.commit.call_count == 1
+
+
+def test_catalog_commit_failure_rolls_back_declaration_and_preserves_existing_keys(
+    tmp_path,
+):
+    class Artifact:
+        __fluxtrade_system_placed_protection__ = "SL+TP"
+        __fluxtrade_catalog_sha256__ = "new-revision"
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'catalog-commit-failure.db'}")
+    Base.metadata.create_all(engine, tables=[Strategy.__table__, StrategyState.__table__])
+    session_factory = sessionmaker(bind=engine)
+    with session_factory() as db:
+        db.add(
+            Strategy(
+                id="existing",
+                name="Existing",
+                configuration_json='{"risk_limit":7,"preserve":"yes"}',
+            )
+        )
+        db.commit()
+
+    def fail_catalog_commit(_session):
+        raise RuntimeError("catalog transaction commit failed")
+
+    event.listen(session_factory, "before_commit", fail_catalog_commit)
+    try:
+        def load_artifact() -> dict[str, ArtifactLoadResult]:
+            return {"existing": cast(type[BaseStrategy], Artifact)}
+
+        with pytest.raises(RuntimeError, match="catalog transaction commit failed"):
+            synchronize_strategy_artifacts(
+                artifact_loader=load_artifact,
+                publish_loaded_classes=MagicMock(),
+                db_session_factory=session_factory,
+                transition_to_error=MagicMock(),
+                event_logger=MagicMock(),
+            )
+    finally:
+        event.remove(session_factory, "before_commit", fail_catalog_commit)
+
+    with session_factory() as db:
+        persisted = db.get(Strategy, "existing")
+        assert persisted is not None
+        assert json.loads(cast(str, persisted.configuration_json)) == {
+            "risk_limit": 7,
+            "preserve": "yes",
+        }
+    engine.dispose()
+
+
 def test_loaded_classes_publish_before_database_failure():
     class Artifact:
         pass
@@ -157,7 +315,8 @@ def test_new_artifact_creates_strategy_parent_before_lifecycle_transition(
     request: pytest.FixtureRequest,
 ):
     class Artifact:
-        pass
+        __fluxtrade_system_placed_protection__ = "TP"
+        __fluxtrade_catalog_sha256__ = "catalog-revision"
 
     found: dict[str, ArtifactLoadResult] = {
         "fresh-artifact": cast(type[BaseStrategy], Artifact)
@@ -189,7 +348,12 @@ def test_new_artifact_creates_strategy_parent_before_lifecycle_transition(
     manager.transition_to_error("fresh-artifact", "warmup unavailable")
 
     with session_factory() as db:
-        assert db.get(Strategy, "fresh-artifact") is not None
+        strategy = db.get(Strategy, "fresh-artifact")
+        assert strategy is not None
+        assert json.loads(cast(str, strategy.configuration_json)) == {
+            "system_placed_protection": "TP",
+            "system_placed_protection_revision": "catalog-revision",
+        }
         state = db.get(StrategyState, "fresh-artifact")
         assert state is not None
         assert state.status == StrategyStatus.ERROR
