@@ -1,3 +1,4 @@
+import json
 import logging
 import threading
 import time as _time
@@ -1321,13 +1322,15 @@ class ExecutionEngine:
         limit_price = resolved_intent.limit_price
 
         # 1. Create Entry Order in DB
+        intent_payload = self._signal_order_intent(signal, resolved_intent) or {}
+        intent_payload.update(self._entry_protection_snapshot(signal))
         order = self.order_manager.create_order(
             signal=signal,
             side=side,
             order_type=order_type,
             quantity=qty,
             price=limit_price,
-            intent_payload=self._signal_order_intent(signal, resolved_intent) or None,
+            intent_payload=intent_payload or None,
         )
         self._attach_min_notional_reference_price(order, candle)
         conditional_orders = self._create_conditional_orders(signal, order, qty, candle)
@@ -1457,6 +1460,7 @@ class ExecutionEngine:
             },
             **self._signal_order_intent(signal, resolved_intent),
         }
+        intent_payload.update(self._entry_protection_snapshot(signal))
         order = self.order_manager.create_order(
             signal=signal,
             side=side,
@@ -2067,6 +2071,56 @@ class ExecutionEngine:
         if resolved_intent.uses_legacy_value_fallback:
             payload["legacy_price_source"] = "signal.value"
         return payload
+
+    def _entry_protection_snapshot(self, signal: Signal) -> dict[str, object]:
+        """Read catalog declaration once for this new entry's durable intent."""
+        if signal.type not in {SignalType.LONG, SignalType.SHORT}:
+            return {}
+        if self._db_session_factory is None and self._db_session is None:
+            return {
+                "system_placed_protection": "UNDECLARED",
+                "system_placed_protection_revision": None,
+            }
+        if self._db_session_factory is not None:
+            with self._db_session_factory() as db:
+                strategy = db.get(Strategy, signal.strategy_id)
+                raw_configuration = (
+                    cast(str | None, strategy.configuration_json)
+                    if isinstance(strategy, Strategy)
+                    else None
+                )
+        else:
+            assert self._db_session is not None
+            strategy = self._db_session.get(Strategy, signal.strategy_id)
+            raw_configuration = (
+                cast(str | None, strategy.configuration_json)
+                if isinstance(strategy, Strategy)
+                else None
+            )
+        try:
+            configuration = json.loads(raw_configuration or "{}")
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("strategy configuration_json is invalid") from exc
+        if not isinstance(configuration, dict):
+            raise ValueError("strategy configuration_json must contain an object")
+        declaration = configuration.get("system_placed_protection", "UNDECLARED")
+        if not isinstance(declaration, str) or declaration not in {
+            "UNDECLARED",
+            "NONE",
+            "SL",
+            "TP",
+            "SL+TP",
+        }:
+            raise ValueError("invalid system_placed_protection declaration")
+        revision = configuration.get("system_placed_protection_revision")
+        if declaration == "UNDECLARED":
+            revision = None
+        elif not isinstance(revision, str) or not revision:
+            raise ValueError("system_placed_protection revision is required")
+        return {
+            "system_placed_protection": declaration,
+            "system_placed_protection_revision": revision,
+        }
 
     def _resolve_order_intent_or_reject(
         self,

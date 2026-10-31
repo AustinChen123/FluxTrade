@@ -1266,7 +1266,9 @@ class TestOrderTypeDetection:
         assert len(mock_exchange_adapter.open_orders) == 1
         assert mock_exchange_adapter.open_orders[0].type == "limit"
         assert mock_exchange_adapter.open_orders[0].intent_payload == {
-            "legacy_price_source": "signal.value"
+            "legacy_price_source": "signal.value",
+            "system_placed_protection": "UNDECLARED",
+            "system_placed_protection_revision": None,
         }
 
     def test_signal_without_price_creates_market(
