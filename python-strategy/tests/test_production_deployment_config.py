@@ -567,3 +567,15 @@ def test_runtime_images_can_be_overridden_for_private_builds(tmp_path: Path):
     assert services["migrate"]["image"] == env["PYTHON_STRATEGY_IMAGE"]
     assert services["python-strategy"]["image"] == env["PYTHON_STRATEGY_IMAGE"]
     assert services["control-plane"]["image"] == env["PYTHON_STRATEGY_IMAGE"]
+
+
+@pytest.mark.parametrize("mode", [("--self-test",), ()])
+def test_frontend_workflow_validator_accepts_current_workflow(mode: tuple[str, ...]):
+    result = subprocess.run(
+        ["ruby", ".github/scripts/validate-frontend-job.rb", *mode],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
