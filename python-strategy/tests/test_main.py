@@ -1269,3 +1269,43 @@ def test_main_releases_ownership_when_engine_shutdown_fails(monkeypatch) -> None
 
     db_session.close.assert_called_once()
     consumer.stop.assert_called_once()
+
+
+def test_main_real_engine_startup_failure_stops_notification_dispatcher(
+    monkeypatch, tmp_path, engine_factory
+) -> None:
+    from src.core.notifications import NotificationDispatcher
+
+    monkeypatch.setenv("AUDIT_EXTERNAL_ORDERS", "true")
+    monkeypatch.delenv("ADAPTER_MODE", raising=False)
+    monkeypatch.delenv("EXCHANGE_MODE", raising=False)
+    monkeypatch.setenv("FLUXTRADE_ENVIRONMENT", "test")
+    dispatcher = NotificationDispatcher(path=tmp_path / "main-alerts.jsonl")
+    with patch("src.core.engine.NotificationDispatcher", return_value=dispatcher):
+        engine = engine_factory()
+    engine._halt_for_kill_switch = lambda: None
+    engine._start_command_listener = lambda: None
+    engine._check_system_state = lambda: False
+
+    def fail_later_startup_phase():
+        raise RuntimeError("later startup phase failed")
+
+    engine._reconcile_startup_balance = fail_later_startup_phase
+    db_session = MagicMock()
+    consumer = MagicMock(spec=strategy_main.DataConsumer)
+    adapter = MagicMock()
+    monkeypatch.setattr(strategy_main, "create_adapter", lambda *_a, **_kw: adapter)
+
+    with (
+        patch("src.main.configure_metrics"),
+        patch("src.main.SessionLocal", return_value=db_session),
+        patch("src.main.StrategyEngine", return_value=engine),
+        patch("src.main.DataConsumer", return_value=consumer),
+    ):
+        with pytest.raises(RuntimeError, match="later startup phase failed"):
+            strategy_main.main()
+
+    assert dispatcher._state in {"stopping", "stopped"}
+    assert (tmp_path / "main-alerts.jsonl").exists()
+    consumer.stop.assert_called_once()
+    db_session.close.assert_called_once()

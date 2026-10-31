@@ -186,3 +186,15 @@ def test_redis_close_is_the_only_swallowed_cleanup_error() -> None:
     logger.warning.assert_called_once_with("Error closing Redis: %s", failure)
     assert events[-1] == "entry_gate"
     logger.info.assert_any_call("StrategyEngine shutdown complete.")
+
+
+def test_notification_stop_runs_in_outer_finally_after_shutdown_failure() -> None:
+    events: list[str] = []
+    service = _service(events)
+    service._mark_stopping = MagicMock(side_effect=RuntimeError("early shutdown error"))
+    service._stop_notifications = MagicMock()
+
+    with pytest.raises(RuntimeError, match="early shutdown error"):
+        service.shutdown(timeout=0.4, clean_exit=False)
+
+    service._stop_notifications.assert_called_once_with(0.4)

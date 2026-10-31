@@ -762,6 +762,9 @@ class StrategyEngine:
                 else None
             ),
             event_logger=logger,
+            stop_notifications=lambda timeout: self.notification_dispatcher.stop(
+                timeout=timeout
+            ),
         )
         self._ops_command_service = OpsCommandService(
             operation_lock=lambda: self._ops_command_lock,
@@ -870,6 +873,7 @@ class StrategyEngine:
                 raise
             return result
 
+        self.notification_dispatcher.start()
         # Start fail-closed so the command listener can accept a manual clear
         # while startup waits on a persisted LOCKDOWN state.
         run_phase(self._halt_for_kill_switch)
