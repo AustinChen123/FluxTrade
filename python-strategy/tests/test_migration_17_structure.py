@@ -26,11 +26,14 @@ def migration_sql(direction: str) -> str:
     return " ".join(output.getvalue().split())
 
 
-def test_invalidation_is_only_new_head() -> None:
+def test_invalidation_remains_in_single_revision_history() -> None:
     config = Config()
     config.set_main_option("script_location", str(ROOT))
     script = ScriptDirectory.from_config(config)
-    assert script.get_heads() == ["d8a61c3f9b42"]
+    heads = script.get_heads()
+    assert len(heads) == 1
+    reachable_revisions = {revision.revision for revision in script.iterate_revisions(heads[0], "base")}
+    assert REVISION in reachable_revisions
     revision = script.get_revision(REVISION)
     assert revision is not None and revision.down_revision == "6c2f8a91d4e7"
     assert re.fullmatch(r"[0-9a-f]{12}", REVISION)

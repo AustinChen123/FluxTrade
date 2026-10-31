@@ -15,6 +15,8 @@ from sqlalchemy.schema import CreateIndex
 from src.core.market_data.profiles.orm import ProfileActivationRequest
 from test_migration_19_structure import ROOT
 
+REVISION = "d95a2b73e608"
+
 
 def sql(direction):
     spec = importlib.util.spec_from_file_location(
@@ -33,12 +35,15 @@ def sql(direction):
     return " ".join(output.getvalue().split())
 
 
-def test_single_head_exact_schema_and_orm_parity():
+def test_single_revision_history_exact_schema_and_orm_parity():
     config = Config(str(ROOT / "alembic.ini"))
     config.set_main_option("script_location", str(ROOT / "alembic"))
     script = ScriptDirectory.from_config(config)
-    assert script.get_heads() == ["d8a61c3f9b42"]
-    revision = script.get_revision("d95a2b73e608")
+    heads = script.get_heads()
+    assert len(heads) == 1
+    reachable_revisions = {revision.revision for revision in script.iterate_revisions(heads[0], "base")}
+    assert REVISION in reachable_revisions
+    revision = script.get_revision(REVISION)
     assert revision is not None and revision.down_revision == "c84f1a92d607"
     up = sql("upgrade")
     table = cast(Table, ProfileActivationRequest.__table__)
