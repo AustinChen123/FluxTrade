@@ -30,7 +30,7 @@ case "$event_name" in
   pull_request)
     [[ -z $event_created ]] || reject INVALID_EVENT_CREATED event_created "event=pull_request"
     ;;
-  schedule|workflow_dispatch)
+  workflow_dispatch)
     [[ -z $event_created ]] || reject INVALID_EVENT_CREATED event_created "event=$event_name"
     ;;
   *) reject INVALID_EVENT_NAME event_name ;;
@@ -39,7 +39,7 @@ esac
 created_context=${event_created:-empty}
 git check-ref-format "$event_ref" >/dev/null 2>&1 || reject INVALID_EVENT_REF event_ref "event=$event_name" "created=$created_context"
 safe_event=("event=$event_name" "created=$created_context" "ref=$event_ref")
-if [[ $event_name == push || $event_name == schedule ]]; then
+if [[ $event_name == push ]]; then
   [[ $event_ref == refs/heads/* ]] || reject INVALID_EVENT_REF_NAMESPACE event_ref "${safe_event[@]}"
 elif [[ $event_name == workflow_dispatch ]]; then
   [[ $event_ref == refs/heads/* || $event_ref == refs/tags/* ]] || reject INVALID_EVENT_REF_NAMESPACE event_ref "${safe_event[@]}"
@@ -50,7 +50,7 @@ fi
 is_sha "$head_sha" || reject INVALID_COMMIT_SHA head_sha "${safe_event[@]}"
 git cat-file -e "${head_sha}^{commit}" 2>/dev/null || reject MISSING_HEAD_OBJECT head_sha "${safe_event[@]}" "head=$head_sha"
 
-if [[ $event_name == schedule || $event_name == workflow_dispatch ]]; then
+if [[ $event_name == workflow_dispatch ]]; then
   [[ -z $before_sha ]] || reject INVALID_EVENT_IDENTITY before_sha "${safe_event[@]}" "head=$head_sha"
   resolved_base=$(git rev-list --max-parents=0 "$head_sha" | tail -n 1)
   [[ -n $resolved_base ]] || reject NO_ROOT_COMMIT history "${safe_event[@]}" "head=$head_sha"
@@ -58,7 +58,7 @@ else
   is_sha "$before_sha" || reject INVALID_COMMIT_SHA before_sha "${safe_event[@]}" "head=$head_sha"
 fi
 
-if [[ $event_name == schedule || $event_name == workflow_dispatch ]]; then
+if [[ $event_name == workflow_dispatch ]]; then
   : # Full history from the selected HEAD's root is the safe scheduled/manual range.
 elif [[ $event_name == push && $event_created == true ]]; then
   [[ $before_sha == "$zero_sha" ]] || reject INVALID_EVENT_IDENTITY before_sha "${safe_event[@]}" "before=$before_sha" "head=$head_sha"
@@ -75,7 +75,7 @@ else
   resolved_base=$before_sha
 fi
 
-if [[ $event_name == schedule || $event_name == workflow_dispatch ]]; then
+if [[ $event_name == workflow_dispatch ]]; then
   scan_range="--root $head_sha"
   commit_count=$(git rev-list --count "$head_sha" 2>/dev/null) || reject RANGE_COUNT_FAILED range "${safe_event[@]}" "resolved_base=$resolved_base" "head=$head_sha"
 else

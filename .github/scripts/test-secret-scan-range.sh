@@ -72,10 +72,11 @@ expect_success "$pr_range" "secret_scan_range event=pull_request created=empty r
   pull_request '' refs/pull/1/merge "$slice_one" "$head_sha" refs/remotes/origin/develop
 
 full_range="--root $head_sha"
-for event in schedule workflow_dispatch; do
+for event in workflow_dispatch; do
   expect_success "$full_range" "secret_scan_range event=$event created=empty ref=refs/heads/feature raw_before= resolved_base=$baseline head=$head_sha range=$full_range commit_count=3" \
     "$event" '' refs/heads/feature '' "$head_sha" refs/remotes/origin/develop
 done
+expect_failure "secret_scan_range_error code=INVALID_EVENT_NAME field=event_name" schedule '' refs/heads/feature '' "$head_sha" refs/remotes/origin/develop
 [[ $(git -C "$test_dir" log --format=%H --root "$head_sha" | wc -l | tr -d ' ') == 3 ]]
 git -C "$test_dir" log --format=%H --root "$head_sha" | grep -Fxq "$baseline"
 expect_failure "secret_scan_range_error code=INVALID_EVENT_REF_NAMESPACE field=event_ref event=push created=false ref=refs/tags/v1" \

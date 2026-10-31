@@ -4,8 +4,6 @@ on:
   push:
     branches: ['**']
   pull_request:
-  schedule:
-    - cron: "17 2 * * *"
   workflow_dispatch:
 
 # Cancel in-progress runs on the same branch to save CI minutes
@@ -264,8 +262,9 @@ jobs:
   python-slow:
     name: Python Slow Tests
     if: >-
+      github.event_name == 'pull_request' ||
       (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')) ||
-      github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+      github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     defaults:
@@ -564,14 +563,24 @@ jobs:
             fail_closed.call("REQUIRED_JOB_MISSING", "runtime_job_set", "rerun_required_jobs")
           end
           slow_result_accepted = lambda do |event_name, ref, result|
-            scheduled = (event_name == "push" && %w[refs/heads/main refs/heads/develop].include?(ref)) || %w[schedule workflow_dispatch].include?(event_name)
-            scheduled ? result == "success" : result == "skipped"
+            next false unless %w[pull_request push workflow_dispatch].include?(event_name)
+            expected_to_run = event_name == "pull_request" ||
+              (event_name == "push" && %w[refs/heads/main refs/heads/develop].include?(ref)) ||
+              event_name == "workflow_dispatch"
+            expected_to_run ? result == "success" : result == "skipped"
           end
-          unless slow_result_accepted.call("schedule", "refs/heads/main", "success") &&
-                 !slow_result_accepted.call("schedule", "refs/heads/main", "failure") &&
-                 !slow_result_accepted.call("schedule", "refs/heads/main", "cancelled") &&
-                 slow_result_accepted.call("pull_request", "refs/pull/7/merge", "skipped") &&
-                 !slow_result_accepted.call("pull_request", "refs/pull/7/merge", "success")
+          unless slow_result_accepted.call("pull_request", "refs/pull/7/merge", "success") &&
+                 !slow_result_accepted.call("pull_request", "refs/pull/7/merge", "skipped") &&
+                 !slow_result_accepted.call("pull_request", "refs/pull/7/merge", "failure") &&
+                 !slow_result_accepted.call("pull_request", "refs/pull/7/merge", "cancelled") &&
+                 slow_result_accepted.call("push", "refs/heads/feature", "skipped") &&
+                 !slow_result_accepted.call("push", "refs/heads/feature", "success") &&
+                 slow_result_accepted.call("push", "refs/heads/main", "success") &&
+                 !slow_result_accepted.call("push", "refs/heads/main", "failure") &&
+                 slow_result_accepted.call("workflow_dispatch", "refs/heads/feature", "success") &&
+                 slow_result_accepted.call("push", "refs/heads/develop", "success") &&
+                 !slow_result_accepted.call("schedule", "refs/heads/main", "skipped") &&
+                 !slow_result_accepted.call("unknown", "refs/heads/main", "skipped")
             fail_closed.call("SLOW_JOB_POLICY_SELF_TEST_FAILED", "event_result_matrix", "repair_slow_job_policy")
           end
           required.each do |id|

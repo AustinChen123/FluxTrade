@@ -83,9 +83,9 @@ def test_python_ci_treats_warnings_as_errors():
     assert "github.ref == 'refs/heads/main'" in workflow
     assert "github.ref == 'refs/heads/develop'" in workflow
     assert 'python-slow, rust-check, secret-scan' in workflow
-    assert 'scheduled ? result == "success" : result == "skipped"' in workflow
-    assert 'slow_result_accepted.call("schedule", "refs/heads/main", "failure")' in workflow
-    assert 'slow_result_accepted.call("pull_request", "refs/pull/7/merge", "skipped")' in workflow
+    assert "schedule:" not in workflow
+    assert 'slow_result_accepted.call("pull_request", "refs/pull/7/merge", "success")' in workflow
+    assert '!slow_result_accepted.call("pull_request", "refs/pull/7/merge", "skipped")' in workflow
     assert 'UV_LOCKED: "true"' in workflow
     assert 'group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}' in workflow
     assert "PYO3_PYTHON=$(uv run --no-sync python" in workflow
@@ -115,17 +115,60 @@ def test_ci_required_jobs_manifest_matches_workflow():
 @pytest.mark.parametrize(
     ("event_name", "event_ref", "slow_result", "expected_success"),
     [
-        ("schedule", "refs/heads/main", "success", True),
-        ("schedule", "refs/heads/main", "failure", False),
-        ("schedule", "refs/heads/main", "cancelled", False),
-        ("pull_request", "refs/pull/7/merge", "skipped", True),
-        ("pull_request", "refs/pull/7/merge", "success", False),
+        ("pull_request", "refs/pull/7/merge", "success", True),
+        ("pull_request", "refs/pull/7/merge", "skipped", False),
+        ("pull_request", "refs/pull/7/merge", "failure", False),
+        ("pull_request", "refs/pull/7/merge", "cancelled", False),
         ("push", "refs/heads/feature", "skipped", True),
+        ("push", "refs/heads/feature", "success", False),
+        ("push", "refs/heads/main", "failure", False),
+        ("push", "refs/heads/main", "success", True),
+        ("workflow_dispatch", "refs/heads/feature", "success", True),
+        ("schedule", "refs/heads/main", "skipped", False),
+        ("schedule", "refs/heads/main", "success", False),
+        ("unknown", "refs/heads/main", "skipped", False),
     ],
 )
 def test_refactor_gate_python_slow_event_result_policy(
     event_name: str, event_ref: str, slow_result: str, expected_success: bool
 ):
+    result = _run_refactor_gate(event_name, event_ref, slow_result)
+    assert (result.returncode == 0) is expected_success, result.stderr
+
+
+@pytest.mark.parametrize(
+    ("event_name", "event_ref"),
+    [
+        ("pull_request", "refs/pull/7/merge"),
+        ("push", "refs/heads/main"),
+        ("push", "refs/heads/develop"),
+        ("push", "refs/heads/feature"),
+        ("push", "refs/tags/v1"),
+        ("workflow_dispatch", "refs/heads/feature"),
+    ],
+)
+def test_python_slow_job_condition_matches_refactor_gate(event_name: str, event_ref: str):
+    workflow = CI_WORKFLOW.read_text()
+    match = re.search(
+        r"  python-slow:\n    name: Python Slow Tests\n    if: >-\n((?:      .*\n)+)", workflow
+    )
+    assert match is not None
+    expression = " ".join(line.strip() for line in match.group(1).splitlines())
+    assert re.fullmatch(r"[a-z_.='/ ()|&-]+", expression), expression
+    python_expression = (
+        expression.replace("github.event_name", "event_name")
+        .replace("github.ref", "event_ref")
+        .replace("||", " or ")
+        .replace("&&", " and ")
+    )
+    runs = eval(python_expression, {}, {"event_name": event_name, "event_ref": event_ref})
+    assert _run_refactor_gate(event_name, event_ref, "success").returncode == (0 if runs else 1)
+    assert _run_refactor_gate(event_name, event_ref, "skipped").returncode == (1 if runs else 0)
+
+
+def _run_refactor_gate(
+    event_name: str, event_ref: str, slow_result: str
+) -> subprocess.CompletedProcess[str]:
     workflow = CI_WORKFLOW.read_text()
     match = re.search(r"ruby <<'RUBY'\n(.*?)\n          RUBY", workflow, re.DOTALL)
     assert match is not None
@@ -148,7 +191,7 @@ def test_refactor_gate_python_slow_event_result_policy(
         GITHUB_EVENT_NAME=event_name,
         GITHUB_REF=event_ref,
     )
-    result = subprocess.run(
+    return subprocess.run(
         ["ruby", "-e", script],
         cwd=REPO_ROOT,
         env=env,
@@ -156,7 +199,6 @@ def test_refactor_gate_python_slow_event_result_policy(
         text=True,
         check=False,
     )
-    assert (result.returncode == 0) is expected_success, result.stderr
 
 
 def _write_env_file(path: Path, values: dict[str, str]) -> None:
