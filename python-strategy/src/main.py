@@ -3,8 +3,10 @@ import os
 import signal
 import sys
 from contextlib import contextmanager
+from typing import Any
 
 import structlog
+from sqlalchemy.orm import Session
 
 # Add project root to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -15,6 +17,12 @@ from src.core.consumer import (
     DataConsumer,
 )
 from src.core.engine import StrategyEngine
+from src.core.command_router import CommandResult
+from src.core.orm_models import Order, Trade
+from src.core.spider_management.runtime_owner import (
+    SpiderRuntimeComposition,
+    SpiderRuntimeOwner,
+)
 from src.core.strategy_loader import StrategyLoader
 from src.core.db import SessionLocal
 from src.core.clock import RealtimeClock
@@ -26,6 +34,7 @@ from src.core.adapter_runtime_composition import (
     runtime_factories_for_config,
     validate_runtime_config as _validate_runtime_config,
 )
+from src.core.adapters.okx_spider_transport import classify_okx_batch_response
 
 
 def _setup_logging() -> None:
@@ -200,7 +209,9 @@ def _session_scope():
         session.close()
 
 
-def main():
+def main(spider_composition: SpiderRuntimeComposition | None = None):
+    if spider_composition is not None and type(spider_composition) is not SpiderRuntimeComposition:
+        raise TypeError("Spider composition must use the private trusted input type")
     logger.info("Starting FluxTrade Strategy Service...")
     adapter_config = _adapter_config_from_env()
     audit_external_orders = (
@@ -241,6 +252,8 @@ def main():
     db_session = None
     engine = None
     adapter = None
+    spider_owner_ref: list[SpiderRuntimeOwner | None] = [None]
+    source_cleanups: list[tuple[str, Any]] = []
     clean_exit = False
     try:
         consumer.acquire_service_ownership()
@@ -262,6 +275,61 @@ def main():
             )
             raise
         try:
+            spider_callbacks: dict[str, Any] = {}
+            if spider_composition is not None:
+                owned_strategy_ids = frozenset(
+                    scope.strategy_id for scope in spider_composition.owned_scopes
+                )
+
+                def owned_strategy_id(message: dict) -> str | None:
+                    params = message.get("params")
+                    if type(params) is dict:
+                        value = params.get("id") or params.get("strategy_id")
+                        if type(value) is str:
+                            return value
+                    value = message.get("strategy_id")
+                    return value if type(value) is str else None
+
+                def handle_owned_command(message: dict) -> CommandResult | None:
+                    owner = spider_owner_ref[0]
+                    if owner is None:
+                        if owned_strategy_id(message) in owned_strategy_ids:
+                            return CommandResult(
+                                False,
+                                "Spider operation unavailable",
+                                {"reason_code": "SPIDER_OWNER_UNAVAILABLE"},
+                            )
+                        return None
+                    return owner.handle_owned_command(message)
+
+                def restore_owned_runtimes() -> frozenset[str]:
+                    owner = spider_owner_ref[0]
+                    if owner is None:
+                        return owned_strategy_ids
+                    return owner.restore_owned_runtimes()
+
+                def participate_in_order_transaction(
+                    session: Session, order: Order, trade: Trade | None
+                ) -> None:
+                    owner = spider_owner_ref[0]
+                    if owner is None:
+                        if order.strategy_id in owned_strategy_ids:
+                            raise RuntimeError("SPIDER_OWNER_UNAVAILABLE")
+                        return
+                    owner.participate_in_order_transaction(session, order, trade)
+
+                def observe_owned_order_event(order_id: str) -> None:
+                    owner = spider_owner_ref[0]
+                    if owner is None:
+                        raise RuntimeError("SPIDER_OWNER_UNAVAILABLE")
+                    owner.observe_order_event(order_id)
+
+                spider_callbacks = {
+                    "owned_strategy_command_handler": handle_owned_command,
+                    "owned_runtime_restorer": restore_owned_runtimes,
+                    "repository_transaction_participant": participate_in_order_transaction,
+                    "owned_order_event_observer": observe_owned_order_event,
+                }
             engine = StrategyEngine(
                 db_session=db_session,
                 clock=clock,
@@ -273,7 +341,30 @@ def main():
                 runtime_bootstrap_factory=runtime_bootstrap_factory,
                 runtime_capabilities_factory=runtime_capabilities_factory,
                 strategy_artifact_loader=strategy_artifact_loader,
+                **spider_callbacks,
             )
+            if spider_composition is not None:
+                selected_venues = {
+                    source.selected_venue
+                    for source in spider_composition.model_sources_by_confirmation.values()
+                }
+                transport_response_classifier = (
+                    classify_okx_batch_response if selected_venues == {"okx"} else None
+                )
+                owner = SpiderRuntimeOwner(
+                    _session_scope,
+                    engine.execution_engine.order_manager,
+                    owned_scopes=spider_composition.owned_scopes,
+                    model_sources_by_confirmation=(
+                        spider_composition.model_sources_by_confirmation
+                    ),
+                    strategy_state_manager=engine._strategy_state_manager,
+                    lifecycle_lock=engine._strategy_lifecycle_lock,
+                    order_event_lock=engine.execution_engine._order_event_apply_lock,
+                    transport_response_classifier=transport_response_classifier,
+                    profile_prerequisite=spider_composition.profile_prerequisite,
+                )
+                spider_owner_ref[0] = owner
         except Exception:
             close_adapter = getattr(adapter, "close", None)
             if callable(close_adapter):
@@ -287,6 +378,22 @@ def main():
             adapter = None
             raise
         engine.startup()
+        if spider_composition is not None and spider_composition.register_market_source is not None:
+            owner = spider_owner_ref[0]
+            if owner is None:
+                raise RuntimeError("SPIDER_OWNER_UNAVAILABLE")
+            cleanup = spider_composition.register_market_source(owner.receive_source_market)
+            if not callable(cleanup):
+                raise TypeError("Spider market source registrar must return cleanup")
+            source_cleanups.append(("market", cleanup))
+        if spider_composition is not None and spider_composition.register_time_source is not None:
+            owner = spider_owner_ref[0]
+            if owner is None:
+                raise RuntimeError("SPIDER_OWNER_UNAVAILABLE")
+            cleanup = spider_composition.register_time_source(owner.receive_source_time)
+            if not callable(cleanup):
+                raise TypeError("Spider time source registrar must return cleanup")
+            source_cleanups.append(("time", cleanup))
         consumer.configure_callbacks(
             on_message_callback=engine.on_market_data,
             channel_provider=engine.build_stream_channels,
@@ -296,6 +403,15 @@ def main():
         clean_exit = True
     finally:
         try:
+            for source_kind, cleanup in reversed(source_cleanups):
+                try:
+                    cleanup()
+                except Exception as cleanup_error:
+                    logger.warning(
+                        "Spider %s source cleanup failed: %s",
+                        source_kind,
+                        type(cleanup_error).__name__,
+                    )
             if engine is not None:
                 engine.shutdown(clean_exit=clean_exit)
             elif adapter is not None:

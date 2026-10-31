@@ -3,7 +3,31 @@
 import hashlib
 import re
 from decimal import Decimal
+from enum import Enum
 from typing import Callable, Literal, NotRequired, TypedDict, cast
+
+
+class HistoricalSequenceMode(Enum):
+    LEGACY_SHARED_SEQUENCE_V1 = "LEGACY_SHARED_SEQUENCE_V1"
+    HISTORICAL_DISJOINT_SEQUENCE_V1 = "HISTORICAL_DISJOINT_SEQUENCE_V1"
+
+
+class HistoricalDeliveryKind(Enum):
+    POLL = "POLL"
+    NATIVE = "NATIVE"
+
+
+def historical_delivery_sequence(
+    mode: HistoricalSequenceMode, kind: HistoricalDeliveryKind, counter: object
+) -> int:
+    """Map an existing historical counter into the shared DELIVERY namespace."""
+    if (not isinstance(mode, HistoricalSequenceMode)
+            or not isinstance(kind, HistoricalDeliveryKind)
+            or type(counter) is not int or not 0 <= counter <= (1 << 62) - 1):
+        raise ValueError("POLICY_EMISSION_MISMATCH")
+    if mode is HistoricalSequenceMode.LEGACY_SHARED_SEQUENCE_V1:
+        return counter
+    return 2 * counter + int(kind is HistoricalDeliveryKind.NATIVE)
 
 
 def _event_integer(value: object) -> bytes:

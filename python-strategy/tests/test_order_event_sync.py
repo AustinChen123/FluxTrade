@@ -383,25 +383,92 @@ def test_order_event_derives_context_independent_cumulative_average_from_deltas(
                 last_fill_price=Decimal("101"),
             )
         )
-        final = applier.process_exchange_order_event(
-            ExchangeOrderEvent(
-                status="filled",
-                product_id=order.product_id,
-                exchange_order_id="EX-weighted-average",
-                cumulative_filled_quantity=Decimal("0.10"),
-                last_fill_quantity=Decimal("0.06"),
-                last_fill_price=Decimal("103"),
-            )
+        final_event = ExchangeOrderEvent(
+            status="filled",
+            product_id=order.product_id,
+            exchange_order_id="EX-weighted-average",
+            cumulative_filled_quantity=Decimal("0.10"),
+            last_fill_quantity=Decimal("0.06"),
+            last_fill_price=Decimal("103"),
+            last_fill_exchange_trade_id="native-2",
+            fee=Decimal("0.02"),
+            fee_asset="USDT",
         )
+        final = applier.process_exchange_order_event(final_event)
+        replay = applier.process_exchange_order_event(final_event)
 
     assert partial["action"] == "applied"
     assert final["action"] == "applied"
+    assert replay["action"] == "applied"
     assert order.filled_quantity == Decimal("0.10")
     assert order.filled_price == Decimal("102.2")
-    assert [trade.price for trade in mock_order_repo.trades] == [
-        Decimal("101"),
-        Decimal("103"),
+    assert len(mock_order_repo.trades) == 2
+    assert [trade.order_id for trade in mock_order_repo.trades] == [order.id, order.id]
+    assert len({trade.id for trade in mock_order_repo.trades}) == 2
+    assert [trade.exchange_trade_id for trade in mock_order_repo.trades] == [
+        None,
+        "native-2",
     ]
+    assert [
+        (trade.price, trade.quantity, trade.fee, trade.fee_asset)
+        for trade in mock_order_repo.trades
+    ] == [
+        (Decimal("101"), Decimal("0.04"), Decimal("0"), "USDT"),
+        (Decimal("103"), Decimal("0.06"), Decimal("0.02"), "USDT"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "event_changes",
+    [
+        {"is_snapshot_projection": True},
+        {"last_fill_quantity": Decimal("0.20")},
+        {"last_fill_price": None},
+        {"last_fill_exchange_trade_id": "  "},
+    ],
+)
+def test_unusable_last_execution_identity_does_not_change_fill(
+    event_changes, mock_clock, mock_order_repo, order_factory, caplog
+):
+    order_manager = OrderManager(mock_order_repo, mock_clock, is_backtest=True)
+    applier = _applier(order_manager)
+    order = order_factory(
+        client_order_id="client-identity",
+        exchange_order_id="EX-identity",
+        status=OrderStatus.SUBMITTED.value,
+        quantity=Decimal("0.5"),
+        filled_quantity=Decimal("0"),
+    )
+    mock_order_repo.add_order(order)
+    event_values = {
+        "status": "partial",
+        "product_id": order.product_id,
+        "exchange_order_id": "EX-identity",
+        "cumulative_filled_quantity": Decimal("0.25"),
+        "cumulative_average_price": Decimal("100.5"),
+        "last_fill_quantity": Decimal("0.25"),
+        "last_fill_price": Decimal("100.5"),
+        "last_fill_exchange_trade_id": "native-identity",
+        "fee": Decimal("0.01"),
+        "fee_asset": "USDT",
+    }
+    event_values.update(event_changes)
+
+    result = applier.process_exchange_order_event(ExchangeOrderEvent(**event_values))
+
+    assert result["action"] == "applied"
+    assert order.filled_quantity == Decimal("0.25")
+    assert len(mock_order_repo.trades) == 1
+    trade = mock_order_repo.trades[0]
+    assert (trade.quantity, trade.price, trade.fee, trade.fee_asset) == (
+        Decimal("0.25"),
+        Decimal("100.5"),
+        Decimal("0.01"),
+        "USDT",
+    )
+    assert trade.exchange_trade_id is None
+    assert "exchange_trade_id_unusable_for_fill_delta" in caplog.text
+    assert "native-identity" not in caplog.text
 
 
 @pytest.mark.parametrize(

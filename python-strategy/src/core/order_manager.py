@@ -82,6 +82,40 @@ class OrderManager:
         client_order_id: Optional[str] = None,
         intent_payload: Optional[dict] = None,
     ) -> Order:
+        new_order = self.prepare_order(
+            signal=signal,
+            side=side,
+            order_type=order_type,
+            quantity=quantity,
+            price=price,
+            trigger_price=trigger_price,
+            client_order_id=client_order_id,
+            intent_payload=intent_payload,
+        )
+
+        self.repo.add_order(new_order)
+        logger.info(
+            "Order created %s (%s %s %s %s)",
+            new_order.id,
+            side,
+            order_type,
+            quantity,
+            signal.product_id,
+        )
+        return new_order
+
+    def prepare_order(
+        self,
+        signal: Signal,
+        side: OrderSide | str,
+        order_type: str,
+        quantity: Decimal,
+        price: Optional[Decimal] = None,
+        trigger_price: Optional[Decimal] = None,
+        client_order_id: Optional[str] = None,
+        intent_payload: Optional[dict] = None,
+    ) -> Order:
+        """Build an unsaved Order with the normal creation semantics."""
         if side.lower() not in _VALID_SIDES:
             raise ValueError(
                 f"Invalid order side: {side!r}. Must be one of {_VALID_SIDES}"
@@ -126,16 +160,6 @@ class OrderManager:
                 if intent_payload is not None
                 else None
             ),
-        )
-
-        self.repo.add_order(new_order)
-        logger.info(
-            "Order created %s (%s %s %s %s)",
-            new_order.id,
-            side,
-            order_type,
-            quantity,
-            signal.product_id,
         )
         return new_order
 
@@ -228,8 +252,14 @@ class OrderManager:
         terminal_status: OrderStatus | None = None,
         fee: Optional[Decimal] = None,
         fee_asset: Optional[str] = None,
+        *,
+        exchange_trade_id: str | None = None,
     ) -> None:
         """Record a recovered exchange fill delta and set the desired order status."""
+        if exchange_trade_id is not None and (
+            type(exchange_trade_id) is not str or not exchange_trade_id.strip()
+        ):
+            raise ValueError("invalid_exchange_trade_id")
         self._validated_fill(order.side, fill_price, fill_quantity)
         order.status = (
             terminal_status.value
@@ -244,6 +274,7 @@ class OrderManager:
             fill_quantity,
             fee=fee,
             fee_asset=fee_asset,
+            exchange_trade_id=exchange_trade_id,
             log_label="Recovered Position Update",
         )
 
@@ -255,6 +286,7 @@ class OrderManager:
         *,
         fee: Optional[Decimal] = None,
         fee_asset: Optional[str] = None,
+        exchange_trade_id: str | None = None,
         log_label: str,
     ) -> None:
         side = self._validated_fill(order.side, fill_price, fill_quantity)
@@ -264,7 +296,7 @@ class OrderManager:
         new_trade = Trade(
             id=trade_id,
             order_id=order.id,
-            exchange_trade_id=f"trd_{trade_id[:8]}",
+            exchange_trade_id=exchange_trade_id,
             product_id=order.product_id,
             side=order.side,
             price=fill_price,

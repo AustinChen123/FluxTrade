@@ -49,6 +49,8 @@ def test_order_event_owner_projects_exact_fill_without_raw_payload() -> None:
                 "ap": "20001.1250",
                 "l": "0.2500",
                 "L": "20002.5000",
+                "x": "TRADE",
+                "t": 44123,
                 "n": "0.0100",
                 "N": "USDT",
                 "er": "0",
@@ -78,11 +80,67 @@ def test_order_event_owner_projects_exact_fill_without_raw_payload() -> None:
     assert event.cumulative_average_price == Decimal("20001.1250")
     assert event.last_fill_quantity == Decimal("0.2500")
     assert event.last_fill_price == Decimal("20002.5000")
+    assert event.last_fill_exchange_trade_id == "44123"
     assert event.fee == Decimal("0.0100")
     assert event.fee_asset == "USDT"
     assert event.event_timestamp == 1_700_000_000_123
     assert event.reason == "0"
     assert event.raw is None
+
+
+@pytest.mark.parametrize(
+    ("execution_type", "trade_id", "last_quantity", "last_price", "expected"),
+    [
+        ("TRADE", 0, "0.25", "10", "0"),
+        ("TRADE", 7, "0.25", "10", "7"),
+        ("NEW", 7, "0.25", "10", None),
+        ("TRADE", True, "0.25", "10", None),
+        ("TRADE", -1, "0.25", "10", None),
+        ("TRADE", "7", "0.25", "10", None),
+        ("TRADE", 7, "0", "10", None),
+        ("TRADE", 7, "0.25", "NaN", None),
+        ("TRADE", 7, None, "10", None),
+        ("TRADE", 7, "0.25", None, None),
+    ],
+)
+def test_order_event_owner_only_projects_verified_last_trade_identity(
+    execution_type, trade_id, last_quantity, last_price, expected
+) -> None:
+    from src.core.adapters.binance_user_stream import BinanceOrderEventStream
+
+    connection = MagicMock()
+    connection.recv.return_value = json.dumps(
+        {
+            "e": "ORDER_TRADE_UPDATE",
+            "E": 7,
+            "o": {
+                "s": "BTCUSDT",
+                "c": "client",
+                "i": 8,
+                "X": "PARTIALLY_FILLED",
+                "x": execution_type,
+                "t": trade_id,
+                "l": last_quantity,
+                "L": last_price,
+                "z": "0.25",
+                "ap": "10",
+            },
+        }
+    )
+    owner = BinanceOrderEventStream(
+        client=SimpleNamespace(),
+        testnet=False,
+        resolve_client_order_id=lambda value: value,
+        monotonic=lambda: 0,
+    )
+    owner._connection = connection
+    owner._listen_key = "key"
+    owner._next_keepalive_at = 1
+
+    event = owner.poll()
+
+    assert event is not None
+    assert event.last_fill_exchange_trade_id == expected
 
 
 @pytest.mark.parametrize(

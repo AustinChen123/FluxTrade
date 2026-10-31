@@ -1,3 +1,4 @@
+import logging
 from decimal import Context, Decimal, ROUND_HALF_EVEN, localcontext
 from fractions import Fraction
 from typing import Callable, Optional
@@ -6,6 +7,8 @@ from src.core.fill_delta import FillDelta, fill_delta_from_cumulative
 from src.core.interfaces.exchange import ExchangeOrderEvent
 from src.core.models import OrderStatus
 from src.core.order_manager import PositionCachePersistenceError
+
+logger = logging.getLogger(__name__)
 
 
 def snapshot_fill_fee_rejection(
@@ -176,6 +179,16 @@ class OrderEventApplier:
                     "status": event.status,
                 }
             cache_degraded = False
+            exchange_trade_id = event.last_fill_exchange_trade_id
+            usable_exchange_trade_id = (
+                not event.is_snapshot_projection
+                and type(exchange_trade_id) is str
+                and bool(exchange_trade_id.strip())
+                and event.last_fill_quantity == fill_delta["quantity"]
+                and event.last_fill_price == fill_delta["price"]
+            )
+            if exchange_trade_id is not None and not usable_exchange_trade_id:
+                logger.warning("exchange_trade_id_unusable_for_fill_delta")
             try:
                 self.order_manager.record_fill_delta(
                     order,
@@ -186,6 +199,9 @@ class OrderEventApplier:
                     terminal_status=terminal_status,
                     fee=event.fee,
                     fee_asset=event.fee_asset,
+                    exchange_trade_id=(
+                        exchange_trade_id if usable_exchange_trade_id else None
+                    ),
                 )
             except PositionCachePersistenceError:
                 self.on_position_cache_failure()

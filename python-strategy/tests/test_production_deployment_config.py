@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import shutil
 import subprocess
+import textwrap
 import tomllib
 from pathlib import Path
 
@@ -68,11 +70,135 @@ def test_python_ci_treats_warnings_as_errors():
     workflow = CI_WORKFLOW.read_text()
 
     assert (
-        'run: uv run pytest -W error -m "not integration" '
+        'run: uv run pytest -W error -m "not integration and not slow" -n 4 '
         "--cov=src --cov-report=term-missing --cov-report=xml:coverage.xml "
         "--cov-fail-under=77"
     ) in workflow
     assert 'run: uv run pytest -W error -m "integration or rust" -v' in workflow
+    assert "  push:\n    branches: ['**']\n  pull_request:\n" in workflow
+    assert 'timeout-minutes: 60' in workflow
+    assert 'timeout-minutes: 90' in workflow
+    assert "--timeout=1800" in workflow
+    assert "github.event_name == 'push'" in workflow
+    assert "github.ref == 'refs/heads/main'" in workflow
+    assert "github.ref == 'refs/heads/develop'" in workflow
+    assert 'python-slow, rust-check, secret-scan' in workflow
+    assert "schedule:" not in workflow
+    assert 'slow_result_accepted.call("pull_request", "refs/pull/7/merge", "success")' in workflow
+    assert '!slow_result_accepted.call("pull_request", "refs/pull/7/merge", "skipped")' in workflow
+    assert 'UV_LOCKED: "true"' in workflow
+    assert 'group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}' in workflow
+    assert "PYO3_PYTHON=$(uv run --no-sync python" in workflow
+    assert "import sys, fluxtrade_core; print(sys.version); print(fluxtrade_core.__file__)" in workflow
+    assert 'addopts = "-v --timeout=300"' in PYTHON_PYPROJECT.read_text()
+
+
+def test_ci_required_jobs_manifest_matches_workflow():
+    workflow_bytes = CI_WORKFLOW.read_bytes()
+    manifest = json.loads(
+        (REPO_ROOT / ".github" / "refactor-required-jobs.json").read_text()
+    )
+
+    assert hashlib.sha256(workflow_bytes).hexdigest() == manifest["workflow_sha256"]
+    assert manifest["required_job_ids"] == [
+        "frontend-check",
+        "integration-check",
+        "python-check",
+        "python-slow",
+        "rust-check",
+        "secret-scan",
+    ]
+    assert manifest["excluded_job_ids"] == []
+    assert '  python-slow:' in workflow_bytes.decode()
+
+
+@pytest.mark.parametrize(
+    ("event_name", "event_ref", "slow_result", "expected_success"),
+    [
+        ("pull_request", "refs/pull/7/merge", "success", True),
+        ("pull_request", "refs/pull/7/merge", "skipped", False),
+        ("pull_request", "refs/pull/7/merge", "failure", False),
+        ("pull_request", "refs/pull/7/merge", "cancelled", False),
+        ("push", "refs/heads/feature", "skipped", True),
+        ("push", "refs/heads/feature", "success", False),
+        ("push", "refs/heads/main", "failure", False),
+        ("push", "refs/heads/main", "success", True),
+        ("workflow_dispatch", "refs/heads/feature", "success", True),
+        ("schedule", "refs/heads/main", "skipped", False),
+        ("schedule", "refs/heads/main", "success", False),
+        ("unknown", "refs/heads/main", "skipped", False),
+    ],
+)
+def test_refactor_gate_python_slow_event_result_policy(
+    event_name: str, event_ref: str, slow_result: str, expected_success: bool
+):
+    result = _run_refactor_gate(event_name, event_ref, slow_result)
+    assert (result.returncode == 0) is expected_success, result.stderr
+
+
+@pytest.mark.parametrize(
+    ("event_name", "event_ref"),
+    [
+        ("pull_request", "refs/pull/7/merge"),
+        ("push", "refs/heads/main"),
+        ("push", "refs/heads/develop"),
+        ("push", "refs/heads/feature"),
+        ("push", "refs/tags/v1"),
+        ("workflow_dispatch", "refs/heads/feature"),
+    ],
+)
+def test_python_slow_job_condition_matches_refactor_gate(event_name: str, event_ref: str):
+    workflow = CI_WORKFLOW.read_text()
+    match = re.search(
+        r"  python-slow:\n    name: Python Slow Tests\n    if: >-\n((?:      .*\n)+)", workflow
+    )
+    assert match is not None
+    expression = " ".join(line.strip() for line in match.group(1).splitlines())
+    assert re.fullmatch(r"[a-z_.='/ ()|&-]+", expression), expression
+    python_expression = (
+        expression.replace("github.event_name", "event_name")
+        .replace("github.ref", "event_ref")
+        .replace("||", " or ")
+        .replace("&&", " and ")
+    )
+    runs = eval(python_expression, {}, {"event_name": event_name, "event_ref": event_ref})
+    assert _run_refactor_gate(event_name, event_ref, "success").returncode == (0 if runs else 1)
+    assert _run_refactor_gate(event_name, event_ref, "skipped").returncode == (1 if runs else 0)
+
+
+def _run_refactor_gate(
+    event_name: str, event_ref: str, slow_result: str
+) -> subprocess.CompletedProcess[str]:
+    workflow = CI_WORKFLOW.read_text()
+    match = re.search(r"ruby <<'RUBY'\n(.*?)\n          RUBY", workflow, re.DOTALL)
+    assert match is not None
+    script = textwrap.dedent(match.group(1))
+    needs = {
+        job_id: {"result": "success"}
+        for job_id in (
+            "frontend-check",
+            "integration-check",
+            "python-check",
+            "python-slow",
+            "rust-check",
+            "secret-scan",
+        )
+    }
+    needs["python-slow"]["result"] = slow_result
+    env = os.environ.copy()
+    env.update(
+        NEEDS_JSON=json.dumps(needs),
+        GITHUB_EVENT_NAME=event_name,
+        GITHUB_REF=event_ref,
+    )
+    return subprocess.run(
+        ["ruby", "-e", script],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
 
 
 def _write_env_file(path: Path, values: dict[str, str]) -> None:
@@ -483,3 +609,15 @@ def test_runtime_images_can_be_overridden_for_private_builds(tmp_path: Path):
     assert services["migrate"]["image"] == env["PYTHON_STRATEGY_IMAGE"]
     assert services["python-strategy"]["image"] == env["PYTHON_STRATEGY_IMAGE"]
     assert services["control-plane"]["image"] == env["PYTHON_STRATEGY_IMAGE"]
+
+
+@pytest.mark.parametrize("mode", [("--self-test",), ()])
+def test_frontend_workflow_validator_accepts_current_workflow(mode: tuple[str, ...]):
+    result = subprocess.run(
+        ["ruby", ".github/scripts/validate-frontend-job.rb", *mode],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

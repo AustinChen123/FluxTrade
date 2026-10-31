@@ -248,6 +248,17 @@ export type BacktestResultsCandleOptions = BacktestResultsPageOptions & {
   end: number;
 };
 
+export type SpiderOrderQuery = {
+  strategy_id: string;
+  category: "ALL" | "CURRENT" | "PENDING" | "HISTORY";
+  local_order_id?: string;
+  order_created_from_ms?: number;
+  order_created_to_ms?: number;
+  limit: number;
+  offset: number;
+  view_version?: string;
+};
+
 type Page<TName extends string, T> = {
   total: number;
   limit: number;
@@ -371,6 +382,41 @@ export async function loadBacktestResultsIndex(
   );
   if (!validBacktestResultsIndexPage(value)) throw new Error("invalid_response");
   return value;
+}
+
+function spiderOrderQuery(query: SpiderOrderQuery): string {
+  const params = new URLSearchParams();
+  params.set("strategy_id", query.strategy_id);
+  params.set("category", query.category);
+  if (query.local_order_id !== undefined) params.set("local_order_id", query.local_order_id);
+  if (query.order_created_from_ms !== undefined) {
+    params.set("order_created_from_ms", String(query.order_created_from_ms));
+  }
+  if (query.order_created_to_ms !== undefined) {
+    params.set("order_created_to_ms", String(query.order_created_to_ms));
+  }
+  params.set("limit", String(query.limit));
+  params.set("offset", String(query.offset));
+  if (query.view_version !== undefined) params.set("view_version", query.view_version);
+  return params.toString();
+}
+
+export function loadSpiderOrders(query: SpiderOrderQuery, signal?: AbortSignal): Promise<unknown> {
+  return request<unknown>(`/api/v1/spider/orders?${spiderOrderQuery(query)}`, {
+    cache: "no-store",
+    signal
+  });
+}
+
+export function loadSpiderOrderTrades(
+  localOrderId: string,
+  query: SpiderOrderQuery,
+  signal?: AbortSignal
+): Promise<unknown> {
+  return request<unknown>(
+    `/api/v1/spider/orders/${encodeURIComponent(localOrderId)}/trades?${spiderOrderQuery(query)}`,
+    { cache: "no-store", signal }
+  );
 }
 
 export async function loadBacktestResult(

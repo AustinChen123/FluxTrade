@@ -68,6 +68,7 @@ type ArchitectureRole =
   | "trades-io"
   | "feature-owner"
   | "feature-presentation"
+  | "spider-orders-panel"
   | "feature-model"
   | "feature-chart"
   | "feature-demo"
@@ -84,7 +85,8 @@ type ArchitectureRole =
   | "toolchain-test"
   | "e2e-fixture"
   | "e2e-test"
-  | "e2e-real-test";
+  | "e2e-real-test"
+  | "e2e-spider-orders-test";
 
 const frontendRoot = process.cwd();
 const sourceRoot = path.resolve(process.cwd(), "src");
@@ -159,10 +161,14 @@ const expectedInventory = [
   "features/results/useBacktestResults.ts",
   "features/results/useTradePagination.test.ts",
   "features/results/useTradePagination.ts",
+  "features/strategies/SpiderOrdersPanel.tsx",
   "features/strategies/StrategyManager.test.tsx",
   "features/strategies/StrategyManager.tsx",
   "features/strategies/StrategyManagerView.test.tsx",
   "features/strategies/StrategyManagerView.tsx",
+  "features/strategies/spiderOrders.test-fixtures.ts",
+  "features/strategies/spiderOrdersModel.test.ts",
+  "features/strategies/spiderOrdersModel.ts",
   "features/strategies/strategyCommandState.test.ts",
   "features/strategies/strategyCommandState.ts",
   "features/strategies/useStrategyManager.test.ts",
@@ -214,12 +220,14 @@ const expectedInventorySet = new Set<string>(expectedInventory);
 const expectedE2eInventory = [
   "e2e/console-smoke.e2e.ts",
   "e2e/fixtures.ts",
-  "e2e/research-invalidation-real.e2e.ts"
+  "e2e/research-invalidation-real.e2e.ts",
+  "e2e/spider-orders-real.integration.ts"
 ] as const;
 
 const expectedRootExecutableInventory = [
   "playwright.config.ts",
   "playwright.integration.config.ts",
+  "playwright.spider-orders.integration.config.ts",
   "toolchain-contract.test.js",
   "vite.config.ts"
 ] as const;
@@ -230,8 +238,10 @@ const expectedOutsideImportLedger = [
   "e2e/fixtures.ts|../src/api|type-only|src/api.ts",
   "e2e/research-invalidation-real.e2e.ts|@playwright/test|value|@playwright/test",
   "e2e/research-invalidation-real.e2e.ts|node:fs|value|node:fs",
+  "e2e/spider-orders-real.integration.ts|@playwright/test|value|@playwright/test",
   "playwright.config.ts|@playwright/test|value|@playwright/test",
   "playwright.integration.config.ts|@playwright/test|value|@playwright/test",
+  "playwright.spider-orders.integration.config.ts|@playwright/test|value|@playwright/test",
   "toolchain-contract.test.js|./e2e/fixtures.ts|value|e2e/fixtures.ts",
   "toolchain-contract.test.js|./playwright.config.ts|value|playwright.config.ts",
   "toolchain-contract.test.js|node:child_process|value|node:child_process",
@@ -303,6 +313,9 @@ const expectedBareImportLedger = [
   "features/results/useBacktestResults.ts|react|value",
   "features/results/useTradePagination.test.ts|@testing-library/react|value",
   "features/results/useTradePagination.test.ts|vitest|value",
+  "features/strategies/spiderOrdersModel.test.ts|vitest|value",
+  "features/strategies/SpiderOrdersPanel.tsx|react-i18next|type-only",
+  "features/strategies/SpiderOrdersPanel.tsx|react|value",
   "features/strategies/strategyCommandState.test.ts|vitest|value",
   "features/strategies/StrategyManager.test.tsx|@testing-library/react|value",
   "features/strategies/StrategyManager.test.tsx|vitest|value",
@@ -483,12 +496,21 @@ const expectedRelativeImportLedger = [
   "features/results/useTradePagination.test.ts|./resultsModel|type-only|features/results/resultsModel.ts",
   "features/results/useTradePagination.test.ts|./useTradePagination|value|features/results/useTradePagination.ts",
   "features/results/useTradePagination.ts|../../shared/trading/useTradePagination|value|shared/trading/useTradePagination.ts",
+  "features/strategies/spiderOrdersModel.test.ts|./spiderOrders.test-fixtures|value|features/strategies/spiderOrders.test-fixtures.ts",
+  "features/strategies/spiderOrdersModel.test.ts|./spiderOrdersModel|value|features/strategies/spiderOrdersModel.ts",
+  "features/strategies/spiderOrdersModel.ts|../../shared/time/utc|value|shared/time/utc.ts",
+  "features/strategies/SpiderOrdersPanel.tsx|../../api|value|api.ts",
+  "features/strategies/SpiderOrdersPanel.tsx|../../shared/i18n|type-only|shared/i18n.ts",
+  "features/strategies/SpiderOrdersPanel.tsx|../../shared/time/presentation|value|shared/time/presentation.ts",
+  "features/strategies/SpiderOrdersPanel.tsx|./spiderOrdersModel|value|features/strategies/spiderOrdersModel.ts",
   "features/strategies/strategyCommandState.test.ts|../../api|type-only|api.ts",
   "features/strategies/strategyCommandState.test.ts|./strategyCommandState|value|features/strategies/strategyCommandState.ts",
   "features/strategies/strategyCommandState.ts|../../api|type-only|api.ts",
   "features/strategies/StrategyManager.test.tsx|../../api|type-only|api.ts",
   "features/strategies/StrategyManager.test.tsx|../../api|value|api.ts",
   "features/strategies/StrategyManager.test.tsx|../../shared/i18n|value|shared/i18n.ts",
+  "features/strategies/StrategyManager.test.tsx|./spiderOrders.test-fixtures|value|features/strategies/spiderOrders.test-fixtures.ts",
+  "features/strategies/StrategyManager.test.tsx|./spiderOrdersModel|type-only|features/strategies/spiderOrdersModel.ts",
   "features/strategies/StrategyManager.test.tsx|./StrategyManager|value|features/strategies/StrategyManager.tsx",
   "features/strategies/StrategyManager.tsx|../../shared/i18n|type-only|shared/i18n.ts",
   "features/strategies/StrategyManager.tsx|./StrategyManagerView|value|features/strategies/StrategyManagerView.tsx",
@@ -498,6 +520,7 @@ const expectedRelativeImportLedger = [
   "features/strategies/StrategyManagerView.test.tsx|./StrategyManagerView|value|features/strategies/StrategyManagerView.tsx",
   "features/strategies/StrategyManagerView.tsx|../../shared/i18n|type-only|shared/i18n.ts",
   "features/strategies/StrategyManagerView.tsx|../../shared/time/presentation|value|shared/time/presentation.ts",
+  "features/strategies/StrategyManagerView.tsx|./SpiderOrdersPanel|value|features/strategies/SpiderOrdersPanel.tsx",
   "features/strategies/StrategyManagerView.tsx|./strategyCommandState|type-only|features/strategies/strategyCommandState.ts",
   "features/strategies/useStrategyManager.test.ts|../../api|type-only|api.ts",
   "features/strategies/useStrategyManager.test.ts|../../api|type-only|api.ts",
@@ -582,6 +605,8 @@ const expectedPolicyGlobalLedger = [
   "features/research/useGaOperations.ts|window.sessionStorage.setItem()",
   "features/research/useGaOperations.ts|window.sessionStorage.setItem()",
   "features/results/BacktestResultsView.tsx|import.meta.env.DEV",
+  "features/strategies/SpiderOrdersPanel.tsx|window.clearTimeout()",
+  "features/strategies/SpiderOrdersPanel.tsx|window.setTimeout()",
   "features/strategies/useStrategyManager.ts|window.confirm()",
   "features/strategies/useStrategyManager.ts|window.confirm()",
   "features/strategies/useStrategyManager.ts|window.crypto.randomUUID()",
@@ -1091,6 +1116,7 @@ const featureModelPaths = new Set([
   "features/research/researchModel.ts",
   "features/results/resultsModel.ts",
   "features/strategies/strategyCommandState.ts",
+  "features/strategies/spiderOrdersModel.ts",
   "features/trades/tradeModel.ts"
 ]);
 const featureChartPaths = new Set([
@@ -1148,6 +1174,7 @@ function architectureRole(importer: string): ArchitectureRole {
     return "shared-trading-pager";
   }
   if (featureOwnerPaths.has(importer)) return "feature-owner";
+  if (importer === "features/strategies/SpiderOrdersPanel.tsx") return "spider-orders-panel";
   if (featurePresentationPaths.has(importer)) return "feature-presentation";
   if (featureModelPaths.has(importer)) return "feature-model";
   if (featureChartPaths.has(importer)) return "feature-chart";
@@ -1157,13 +1184,14 @@ function architectureRole(importer: string): ArchitectureRole {
     return "locale-resource-test";
   }
   if (importer === "vite.config.ts") return "vite-config";
-  if (new Set(["playwright.config.ts", "playwright.integration.config.ts"]).has(importer)) {
+  if (new Set(["playwright.config.ts", "playwright.integration.config.ts", "playwright.spider-orders.integration.config.ts"]).has(importer)) {
     return "playwright-config";
   }
   if (importer === "toolchain-contract.test.js") return "toolchain-test";
   if (importer === "e2e/fixtures.ts") return "e2e-fixture";
   if (importer === "e2e/console-smoke.e2e.ts") return "e2e-test";
   if (importer === "e2e/research-invalidation-real.e2e.ts") return "e2e-real-test";
+  if (importer === "e2e/spider-orders-real.integration.ts") return "e2e-spider-orders-test";
   if (
     expectedInventorySet.has(importer) &&
     /\.test\.[jt]sx?$/u.test(importer)
@@ -1218,6 +1246,9 @@ const outsideEdgeKeysByRole: Partial<
   "e2e-real-test": new Set([
     "@playwright/test|value|@playwright/test",
     "node:fs|value|node:fs"
+  ]),
+  "e2e-spider-orders-test": new Set([
+    "@playwright/test|value|@playwright/test"
   ])
 };
 
@@ -1259,7 +1290,8 @@ function assertBareEdge(edge: ImportEdge, role: ArchitectureRole): void {
       "toolchain-test",
       "e2e-fixture",
       "e2e-test",
-      "e2e-real-test"
+      "e2e-real-test",
+      "e2e-spider-orders-test"
     ].includes(role)
   ) {
     assertOutsideEdge(edge, role);
@@ -1330,6 +1362,7 @@ function assertBareEdge(edge: ImportEdge, role: ArchitectureRole): void {
     "research-io": new Set(["react|value"]),
     "research-ga-io": new Set(["react|value"]),
     "strategy-io": new Set(["react|value", "react-i18next|type-only"]),
+    "spider-orders-panel": new Set(["react|value", "react-i18next|type-only"]),
     "results-io": new Set(["react|value"]),
     "trades-io": new Set(["react|value"]),
     "feature-owner": new Set([
@@ -1408,7 +1441,8 @@ function assertRepositoryEdge(edge: ImportEdge, role: ArchitectureRole): void {
     "toolchain-test",
     "e2e-fixture",
     "e2e-test",
-    "e2e-real-test"
+      "e2e-real-test",
+      "e2e-spider-orders-test"
     ].includes(role)
   ) {
     assertOutsideEdge(edge, role);
@@ -1453,6 +1487,10 @@ function assertRepositoryEdge(edge: ImportEdge, role: ArchitectureRole): void {
     return;
   }
   if (role === "research-stream") denyEdge(edge);
+  if (role === "spider-orders-panel") {
+    if (edge.resolved === "api.ts" || isSameFeature(edge.importer, edge.resolved) || edge.resolved.startsWith("shared/")) return;
+    denyEdge(edge);
+  }
   if (role === "research-ga-io") {
     if (
       (!isSameFeature(edge.importer, edge.resolved) && edge.resolved !== "api.ts")
@@ -1766,6 +1804,10 @@ const allowedPolicyGlobals = new Map<string, ReadonlySet<string>>([
       "window.sessionStorage.removeItem()",
       "window.sessionStorage.setItem()"
     ])
+  ],
+  [
+    "features/strategies/SpiderOrdersPanel.tsx",
+    new Set(["window.clearTimeout()", "window.setTimeout()"])
   ],
   [
     "shared/theme.ts",
@@ -2175,10 +2217,12 @@ function assertCurrentArchitecture(): void {
     "vite.config.ts",
     "playwright.config.ts",
     "playwright.integration.config.ts",
+    "playwright.spider-orders.integration.config.ts",
     "toolchain-contract.test.js",
     "e2e/fixtures.ts",
     "e2e/console-smoke.e2e.ts",
-    "e2e/research-invalidation-real.e2e.ts"
+    "e2e/research-invalidation-real.e2e.ts",
+    "e2e/spider-orders-real.integration.ts"
   ]) {
     assertOutsideEdgeSet(importer, outsideEdges);
   }
@@ -2246,10 +2290,12 @@ describe("frontend architecture ratchet", () => {
       "vite.config.ts",
       "playwright.config.ts",
       "playwright.integration.config.ts",
+      "playwright.spider-orders.integration.config.ts",
       "toolchain-contract.test.js",
       "e2e/fixtures.ts",
       "e2e/console-smoke.e2e.ts",
-      "e2e/research-invalidation-real.e2e.ts"
+      "e2e/research-invalidation-real.e2e.ts",
+      "e2e/spider-orders-real.integration.ts"
     ]) {
       expect(() => assertOutsideEdgeSet(importer, edges)).not.toThrow();
     }
@@ -2261,10 +2307,12 @@ describe("frontend architecture ratchet", () => {
       "vite.config.ts",
       "playwright.config.ts",
       "playwright.integration.config.ts",
+      "playwright.spider-orders.integration.config.ts",
       "toolchain-contract.test.js",
       "e2e/console-smoke.e2e.ts",
       "e2e/fixtures.ts",
-      "e2e/research-invalidation-real.e2e.ts"
+      "e2e/research-invalidation-real.e2e.ts",
+      "e2e/spider-orders-real.integration.ts"
     ]) {
       const owned = edges.filter((edge) => edge.importer === importer);
       if (importer === "toolchain-contract.test.js") {
@@ -2378,6 +2426,7 @@ describe("frontend architecture ratchet", () => {
     ["features/research/useResearchWorkspace.ts", "research-io"],
     ["features/research/useGaOperations.ts", "research-ga-io"],
     ["features/strategies/useStrategyManager.ts", "strategy-io"],
+    ["features/strategies/SpiderOrdersPanel.tsx", "spider-orders-panel"],
     ["features/results/useBacktestResults.ts", "results-io"],
     ["features/trades/useBacktestTrades.ts", "trades-io"],
     ["features/research/ResearchRoute.tsx", "feature-owner"],
@@ -2398,7 +2447,8 @@ describe("frontend architecture ratchet", () => {
     ["toolchain-contract.test.js", "toolchain-test"],
     ["e2e/fixtures.ts", "e2e-fixture"],
     ["e2e/console-smoke.e2e.ts", "e2e-test"],
-    ["e2e/research-invalidation-real.e2e.ts", "e2e-real-test"]
+    ["e2e/research-invalidation-real.e2e.ts", "e2e-real-test"],
+    ["e2e/spider-orders-real.integration.ts", "e2e-spider-orders-test"]
   ] as const)("classifies %s as the exact %s role", (importer, role) => {
     expect(architectureRole(importer)).toBe(role);
   });
@@ -2774,7 +2824,7 @@ describe("frontend architecture ratchet", () => {
       /@charset|@import|url\(/
     );
     await expect(sha256(payload)).resolves.toBe(
-      "d76986b478061f42791e8f338a3b9a7a2ac7b08abbf833b2340eeb871342454a"
+      "d3a9b5d0ca7d40437eeb591a1a8fc137814a0279c09b650d75d122ff1119f4db"
     );
   });
 
@@ -3741,6 +3791,7 @@ describe("frontend architecture ratchet", () => {
     ).toEqual([
       "../../shared/i18n|type-only|shared/i18n.ts",
       "../../shared/time/presentation|value|shared/time/presentation.ts",
+      "./SpiderOrdersPanel|value|features/strategies/SpiderOrdersPanel.tsx",
       "./strategyCommandState|type-only|features/strategies/strategyCommandState.ts"
     ]);
     expect(stateSource.getText()).not.toMatch(

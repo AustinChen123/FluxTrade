@@ -1,6 +1,18 @@
 use super::*;
 
 pub(super) fn construct(input: &str, key: AccountKey) -> Result<ScenarioAccount, Fault> {
+    construct_profile(input, key, false)
+}
+
+pub(super) fn construct_gross(input: &str, key: AccountKey) -> Result<ScenarioAccount, Fault> {
+    construct_profile(input, key, true)
+}
+
+fn construct_profile(
+    input: &str,
+    key: AccountKey,
+    gross_admission_profile: bool,
+) -> Result<ScenarioAccount, Fault> {
     let value = super::super::decode(input).map_err(|_| "INVALID_SCHEMA")?;
     let rows = value.object(
         &[
@@ -39,8 +51,20 @@ pub(super) fn construct(input: &str, key: AccountKey) -> Result<ScenarioAccount,
         .iter()
         .map(product)
         .collect::<Result<Vec<_>, _>>()?;
-    ScenarioAccount::from_configured(&seed, rows["leverage"].decimal()?, products)
-        .map_err(|_| "INVALID_SCHEMA")
+    if gross_admission_profile
+        && products
+            .iter()
+            .any(|product| product.taker_fee < Decimal::ZERO || product.taker_fee > Decimal::ONE)
+    {
+        return Err("INVALID_SCHEMA");
+    }
+    ScenarioAccount::from_configured_profile(
+        &seed,
+        rows["leverage"].decimal()?,
+        products,
+        gross_admission_profile,
+    )
+    .map_err(|_| "INVALID_SCHEMA")
 }
 
 fn position(value: &Json) -> Result<SeedPosition, Fault> {

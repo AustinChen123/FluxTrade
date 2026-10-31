@@ -28,7 +28,11 @@ from src.core.models import (
 from src.core.orm_models import StrategyState
 from src.strategies.base import BaseStrategy, StrategyContextCapability
 from src.core.risk_manager import RiskManager, AccountService
-from src.core.execution import ExecutionEngine
+from src.core.execution import (
+    ExecutionEngine,
+    OrderTransactionParticipant,
+    _validate_order_transaction_participant_target,
+)
 from src.core.clock import Clock
 from src.core.interfaces import IExchangeAdapter, IOrderRepository
 from src.core.interfaces.exchange import EntryAdmissionGate, ExchangeOrderEvent
@@ -47,7 +51,11 @@ from src.core.adapters.simulated import (
 from src.core.journal import StrategyJournal
 from src.core.redis_factory import create_redis_client
 from src.core.metrics import ACTIVE_STRATEGIES, BALANCE_USDT
-from src.core.command_router import CommandRouter, StrategyStartDisposition
+from src.core.command_router import (
+    CommandResult,
+    CommandRouter,
+    StrategyStartDisposition,
+)
 from src.core.health_monitor import HealthMonitor
 from src.core.engine_heartbeat_service import EngineHeartbeatService
 from src.core.engine_boot_state_service import EngineBootStateService
@@ -213,12 +221,21 @@ class StrategyEngine:
         ] = frozenset(),
         runtime_bootstrap_factory: RuntimeBootstrapFactory | None = None,
         runtime_capabilities_factory: RuntimeCapabilitiesFactory | None = None,
+        owned_strategy_command_handler: Callable[[dict], CommandResult | None]
+        | None = None,
+        repository_transaction_participant: OrderTransactionParticipant | None = None,
+        owned_runtime_restorer: Callable[[], frozenset[str]] | None = None,
+        owned_order_event_observer: Callable[[str], None] | None = None,
         strategy_artifact_loader: Callable[
             [],
             dict[str, Type[BaseStrategy] | Type[PortfolioFactory] | str],
         ]
         | None = None,
     ):
+        _validate_order_transaction_participant_target(
+            order_repository,
+            repository_transaction_participant,
+        )
         if db_session_factory is None:
             if db_session is None:
                 raise ValueError(
@@ -233,6 +250,8 @@ class StrategyEngine:
             Type[BaseStrategy] | Type[PortfolioFactory],
         ] = {}
         self._strategy_artifact_loader = strategy_artifact_loader or (lambda: {})
+        self._owned_runtime_restorer = owned_runtime_restorer
+        self._startup_owned_strategy_ids: frozenset[str] = frozenset()
         self._strategy_lock = threading.Lock()
         self._strategy_lifecycle_locks: weakref.WeakValueDictionary[
             str, threading.Lock
@@ -430,6 +449,8 @@ class StrategyEngine:
             pending_protection_fill_processor=(
                 runtime_bootstrap.audit_pending_protection_fill
             ),
+            repository_transaction_participant=repository_transaction_participant,
+            owned_order_event_observer=owned_order_event_observer,
         )
         self._lifecycle_adapter = _EngineLifecycleAdapter(self)
         self._health_monitor = HealthMonitor(self._registry)
@@ -813,6 +834,7 @@ class StrategyEngine:
             ),
             command_router=lambda: self._command_router,
             event_logger=lambda: logger,
+            handle_owned_command=owned_strategy_command_handler,
         )
 
     def startup(
@@ -856,6 +878,8 @@ class StrategyEngine:
         run_phase(self._reconcile_startup_balance)
         run_phase(self._initialize_strategy_state_cache_on_startup)
         run_phase(self._start_strategy_state_subscriber_on_startup)
+        if self._owned_runtime_restorer is not None:
+            run_phase(self._restore_owned_runtimes_on_startup)
         if self._live_balance_asset is not None:
             run_phase(self._start_exchange_order_event_stream)
             reconciliation = run_phase(self._reconcile_recoverable_orders_on_startup)
@@ -1111,7 +1135,20 @@ class StrategyEngine:
             activate_strategy=self.activate_strategy,
             transition_to_error=self._strategy_state_manager.transition_to_error,
             event_logger=logger,
+            excluded_strategy_ids=self._startup_owned_strategy_ids,
         )
+
+    def _restore_owned_runtimes_on_startup(self) -> None:
+        """Restore explicitly owned runtimes before generic order reconciliation."""
+        if self._owned_runtime_restorer is None:
+            return
+        strategy_ids = self._owned_runtime_restorer()
+        if type(strategy_ids) is not frozenset or any(
+            type(strategy_id) is not str or not strategy_id.strip()
+            for strategy_id in strategy_ids
+        ):
+            raise TypeError("owned runtime restorer must return frozenset[str]")
+        self._startup_owned_strategy_ids = strategy_ids
 
     def test_run_strategy(self, strategy_id: str, days: int):
         """Evaluate historical data readiness without registering runtime state."""

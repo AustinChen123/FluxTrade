@@ -1,6 +1,6 @@
 import logging
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import (
     TYPE_CHECKING,
@@ -116,6 +116,7 @@ class ExchangeOrderEvent:
     event_timestamp: Optional[int] = None
     reason: Optional[str] = None
     raw: Optional[dict[str, Any]] = None
+    last_fill_exchange_trade_id: str | None = field(default=None, kw_only=True)
 
 
 class IExchangeAdapter(ABC):

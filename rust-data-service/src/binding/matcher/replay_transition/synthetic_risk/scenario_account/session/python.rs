@@ -65,6 +65,18 @@ impl PySession {
             .apply_group(&self.request(request)?)
             .map_err(error)
     }
+    #[pyo3(signature = (request, control))]
+    fn _apply_gross_response_group(
+        &mut self,
+        request: &Bound<'_, PyAny>,
+        control: &Bound<'_, PyAny>,
+    ) -> PyResult<String> {
+        let request = self.request(request)?;
+        let control = text(control)?;
+        self.inner
+            .apply_gross_response_group(&request, &control)
+            .map_err(error)
+    }
     #[pyo3(signature = (request))]
     fn capture_snapshot(&mut self, request: &Bound<'_, PyAny>) -> PyResult<String> {
         self.inner
@@ -97,6 +109,15 @@ impl PySession {
     }
     fn inspect_state(&mut self) -> PyResult<String> {
         self.inner.inspect_state().map_err(error)
+    }
+    fn _historical_cost_projection(&mut self) -> PyResult<String> {
+        self.inner.historical_cost_projection().map_err(error)
+    }
+    fn _gross_admission_projection(&mut self) -> PyResult<String> {
+        self.inner.gross_admission_projection().map_err(error)
+    }
+    fn _gross_response_projection(&mut self) -> PyResult<String> {
+        self.inner.gross_response_projection().map_err(error)
     }
 }
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {

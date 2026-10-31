@@ -9,6 +9,7 @@ from typing import Any, cast
 import pytest
 
 from src.core.backtest import spider_run_artifacts as artifacts
+from src.core.backtest import spider_policy_protocol as sequence_protocol
 from src.core.backtest import spider_run_completion_schema as completion
 from src.core.backtest import spider_run_envelope_schema as envelope
 from src.core.backtest import spider_run_evidence as evidence
@@ -66,11 +67,21 @@ def validate_inputs(values):
     completion.report(values[4])
 
 
-def h03_endpoint_observation(offset=100_001):
+def h03_endpoint_observation(offset=100_001, *, legacy=False):
     _, run = _oracle_run("H03")
     composition = _ReplayComposition._from_historical_run(run)
     cutoff = (run.range_start_ms + offset) * 16 + 6
-    assert composition._dispatch_due(cutoff)["classification"] == "SUCCESS"
+    old_sequence = pytest.MonkeyPatch() if legacy else None
+    if old_sequence is not None:
+        old_sequence.setattr(
+            sequence_protocol, "historical_delivery_sequence",
+            lambda _mode, _kind, counter: counter,
+        )
+    try:
+        assert composition._dispatch_due(cutoff)["classification"] == "SUCCESS"
+    finally:
+        if old_sequence is not None:
+            old_sequence.undo()
     requests = [
         dict(
             schema_version="snapshot_request_v1",
@@ -95,10 +106,19 @@ def test_h03_in_progress_poll_is_allowed_only_for_its_exact_future_continuation(
     assert poll["awaiting"] == "TRADING"
     capture_id = f"{poll['poll_id']}_{poll['awaiting']}"
     capture = next(row for row in observation["records"] if row["stable_id"] == capture_id)
+    raw_at = int(poll["poll_id"].removeprefix("P3_POLL_"))
+    delivery_sequence = sequence_protocol.historical_delivery_sequence(
+        sequence_protocol.HistoricalSequenceMode.HISTORICAL_DISJOINT_SEQUENCE_V1,
+        sequence_protocol.HistoricalDeliveryKind.POLL,
+        capture["key"]["schedule_sequence"],
+    )
+    has_earn = any(row["stable_id"] == f"{poll['poll_id']}_EARN" for row in observation["records"])
+    delivery_offset = 10 if has_earn else 5
     continuation = next(
         row for row in observation["records"]
         if row["kind"] == "DELIVERY" and row["classification"] == "PENDING"
-        and row["key"]["schedule_sequence"] == capture["key"]["schedule_sequence"]
+        and row["key"]["schedule_sequence"] == delivery_sequence
+        and row["key"]["visible_at"] == (raw_at + delivery_offset) * 16 + 6
     )
 
     missing = deepcopy(observation)
@@ -203,6 +223,34 @@ def test_h03_earn_if_due_uses_frozen_earn_snapshot_stage():
         for row in observation["records"]
     )
     assert evidence._historical_polls_endpoint_compatible(observation, cutoff)
+
+
+def test_h03_legacy_shared_delivery_sequences_remain_readable():
+    _, observation, cutoff = h03_endpoint_observation(100_001, legacy=True)
+    assert evidence._historical_polls_endpoint_compatible(observation, cutoff)
+
+
+def test_h03_mixed_poll_delivery_sequence_modes_are_rejected():
+    _, observation, cutoff = h03_endpoint_observation(100_001, legacy=True)
+    poll = next(row for row in observation["polls"] if row["status"] == "IN_PROGRESS")
+    capture = next(row for row in observation["records"]
+                   if row["stable_id"] == f"{poll['poll_id']}_{poll['awaiting']}")
+    raw_at = int(poll["poll_id"].removeprefix("P3_POLL_"))
+    has_earn = any(row["stable_id"] == f"{poll['poll_id']}_EARN" for row in observation["records"])
+    offset = 10 if has_earn else 5
+    expected_at = (raw_at + offset) * 16 + 6
+    delivery = next(row for row in observation["records"]
+                    if row["kind"] == "DELIVERY" and row["key"]["visible_at"] == expected_at)
+    capture_sequence = capture["key"]["schedule_sequence"]
+    delivery["key"]["schedule_sequence"] = sequence_protocol.historical_delivery_sequence(
+        sequence_protocol.HistoricalSequenceMode.HISTORICAL_DISJOINT_SEQUENCE_V1,
+        sequence_protocol.HistoricalDeliveryKind.POLL,
+        capture_sequence,
+    )
+    for key in observation["pending_keys"]:
+        if key["stable_id"] == delivery["stable_id"]:
+            key["schedule_sequence"] = delivery["key"]["schedule_sequence"]
+    assert not evidence._historical_polls_endpoint_compatible(observation, cutoff)
 
 
 def expected_checks(values):
@@ -760,5 +808,5 @@ def test_no_reconciliation_authority_and_public_import_boundary():
     assert {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)} <= {
             "copy", "hashlib", "struct", "typing", "src.core.backtest.spider_run_artifacts", "src.core.backtest.spider_run_completion_schema",
         "src.core.backtest.spider_run_reconciliation_schema", "src.core.backtest.spider_scenario_plans", "src.core.backtest.spider_run_envelope_schema",
-        "src.core.backtest.spider_configured_scale_input"}
+        "src.core.backtest.spider_configured_scale_input", "src.core.backtest.spider_policy_protocol"}
     assert not any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in {"open", "eval", "exec", "__import__"} for node in ast.walk(tree))

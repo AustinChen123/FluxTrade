@@ -305,6 +305,23 @@ class TestLiveOrderRepositoryBasics:
             assert persisted is not None
             assert persisted.product_id == "BINANCE:BTCUSDT-PERP"
 
+    def test_caller_transaction_staging_rejects_non_postgresql_session(
+        self, sqlite_order_session_factory, order_factory
+    ):
+        repo = LiveOrderRepository(db_session_factory=sqlite_order_session_factory)
+        order = order_factory(order_id="caller-stage-wrong-dialect")
+
+        with sqlite_order_session_factory() as session:
+            with session.begin():
+                with pytest.raises(
+                    RuntimeError,
+                    match="^active_postgresql_order_transaction_required$",
+                ):
+                    repo.stage_order_in_transaction(session, order)
+                assert session.in_transaction()
+
+        assert repo.get_order(order.id) is None
+
     def test_update_order_commits(
         self,
         sqlite_order_session_factory,
@@ -952,6 +969,351 @@ class TestLiveOrderRepositoryBasics:
             persisted = session.get(Order, order.id)
             assert persisted is not None
             assert persisted.exchange_order_id == "EX-999"
+
+
+class TestLiveOrderRepositoryTransactionParticipant:
+    """The optional participant shares the live order write transaction."""
+
+    @pytest.mark.parametrize("method", ["update", "ack", "cancel", "fill"])
+    @pytest.mark.parametrize("enabled", [False, True])
+    def test_participant_stages_with_actual_write_and_reads_prewrite_state(
+        self, sqlite_order_session_factory, order_factory, method, enabled
+    ):
+        from sqlalchemy import text
+
+        engine = sqlite_order_session_factory.kw["bind"]
+        with engine.begin() as connection:
+            connection.execute(
+                text("CREATE TABLE participant_marker (order_id TEXT NOT NULL)")
+            )
+        order = order_factory(order_id=f"participant-{method}", status="open")
+        LiveOrderRepository(db_session_factory=sqlite_order_session_factory).add_order(
+            order
+        )
+        if method in {"update", "fill"}:
+            order.status = "closed"
+        seen = []
+
+        def participant(session, intended_order, trade):
+            assert session.in_transaction()
+            assert intended_order.id == order.id
+            seen.append((session, trade))
+            assert (
+                session.query(Order.status).filter_by(id=order.id).scalar() == "open"
+            )
+            session.execute(
+                text("INSERT INTO participant_marker (order_id) VALUES (:id)"),
+                {"id": order.id},
+            )
+
+        repo = LiveOrderRepository(
+            db_session_factory=sqlite_order_session_factory,
+            transaction_participant=participant if enabled else None,
+        )
+        trade = None
+        trade_id: str | None = None
+        if method == "update":
+            repo.update_order(order)
+        elif method == "ack":
+            repo.update_order_exchange_id(order, "exchange-1")
+        elif method == "cancel":
+            repo.mark_order_cancelled(order.id)
+        else:
+            trade = Trade(
+                id="participant-trade",
+                order_id=order.id,
+                exchange_trade_id="participant-trade",
+                product_id=order.product_id,
+                side=order.side,
+                price=Decimal("42000"),
+                quantity=Decimal("1"),
+                fee=Decimal("0"),
+                fee_asset="USDT",
+                timestamp=1704067200000,
+            )
+            trade_id = trade.id
+            repo.persist_fill(order, trade)
+
+        assert len(seen) == int(enabled)
+        if enabled:
+            assert seen[0][1] is trade
+        with sqlite_order_session_factory() as session:
+            assert session.execute(
+                text("SELECT order_id FROM participant_marker")
+            ).scalar() == (order.id if enabled else None)
+            persisted = session.get(Order, order.id)
+            assert persisted is not None
+            if method in {"update", "fill"}:
+                assert persisted.status == "closed"
+            if method == "ack":
+                assert persisted.exchange_order_id == "exchange-1"
+            if method == "cancel":
+                assert persisted.status == OrderStatus.CANCELLED.value
+            if trade_id is not None:
+                assert session.get(Trade, trade_id) is not None
+
+    @pytest.mark.parametrize("method", ["update", "ack", "cancel", "fill"])
+    def test_participant_exception_prevents_write(
+        self, sqlite_order_session_factory, order_factory, method
+    ):
+        from sqlalchemy import text
+
+        engine = sqlite_order_session_factory.kw["bind"]
+        with engine.begin() as connection:
+            connection.execute(
+                text("CREATE TABLE participant_marker (order_id TEXT NOT NULL)")
+            )
+        order = order_factory(order_id=f"participant-fail-{method}", status="open")
+        LiveOrderRepository(db_session_factory=sqlite_order_session_factory).add_order(
+            order
+        )
+        order.status = "closed"
+
+        def fail(session, intended_order, _trade):
+            session.execute(
+                text("INSERT INTO participant_marker (order_id) VALUES (:id)"),
+                {"id": intended_order.id},
+            )
+            raise LookupError("participant failure")
+
+        repo = LiveOrderRepository(
+            db_session_factory=sqlite_order_session_factory,
+            transaction_participant=fail,
+        )
+        trade = Trade(
+            id=f"participant-fail-trade-{method}",
+            order_id=order.id,
+            exchange_trade_id="failure",
+            product_id=order.product_id,
+            side=order.side,
+            price=Decimal("42000"),
+            quantity=Decimal("1"),
+            fee=Decimal("0"),
+            fee_asset="USDT",
+            timestamp=1704067200000,
+        )
+        with pytest.raises(LookupError, match="participant failure"):
+            if method == "update":
+                repo.update_order(order)
+            elif method == "ack":
+                repo.update_order_exchange_id(order, "exchange-fail")
+            elif method == "cancel":
+                repo.mark_order_cancelled(order.id)
+            else:
+                repo.persist_fill(order, trade)
+        with sqlite_order_session_factory() as session:
+            persisted = session.get(Order, order.id)
+            assert persisted is not None
+            assert persisted.status == "open"
+            assert persisted.exchange_order_id is None
+            assert session.get(Trade, trade.id) is None
+            assert session.execute(
+                text("SELECT order_id FROM participant_marker")
+            ).scalar() is None
+
+    @pytest.mark.parametrize("method", ["update", "ack", "cancel", "fill"])
+    def test_definite_commit_failure_rolls_back_participant_and_order_writes(
+        self, sqlite_order_session_factory, order_factory, method
+    ):
+        from sqlalchemy import event, text
+
+        engine = sqlite_order_session_factory.kw["bind"]
+        with engine.begin() as connection:
+            connection.execute(
+                text("CREATE TABLE participant_marker (order_id TEXT NOT NULL)")
+            )
+        order = order_factory(order_id=f"commit-fail-{method}", status="open")
+        LiveOrderRepository(db_session_factory=sqlite_order_session_factory).add_order(
+            order
+        )
+        order_id = order.id
+        order.status = "closed"
+
+        def fail_commit(_session):
+            raise RuntimeError("definite precommit failure")
+
+        def participant(session, intended_order, _trade):
+            session.execute(
+                text("INSERT INTO participant_marker (order_id) VALUES (:id)"),
+                {"id": intended_order.id},
+            )
+
+        repo = LiveOrderRepository(
+            db_session_factory=sqlite_order_session_factory,
+            transaction_participant=participant,
+        )
+        event.listen(Session, "before_commit", fail_commit)
+        trade = Trade(
+            id=f"commit-fail-trade-{method}",
+            order_id=order_id,
+            exchange_trade_id="commit-failure",
+            product_id=order.product_id,
+            side=order.side,
+            price=Decimal("42000"),
+            quantity=Decimal("1"),
+            fee=Decimal("0"),
+            fee_asset="USDT",
+            timestamp=1704067200000,
+        )
+        try:
+            with pytest.raises(RuntimeError, match="definite precommit failure"):
+                if method == "update":
+                    repo.update_order(order)
+                elif method == "ack":
+                    repo.update_order_exchange_id(order, "commit-fail-exchange")
+                elif method == "cancel":
+                    repo.mark_order_cancelled(order_id)
+                else:
+                    repo.persist_fill(order, trade)
+        finally:
+            event.remove(Session, "before_commit", fail_commit)
+        with sqlite_order_session_factory() as session:
+            persisted = session.get(Order, order_id)
+            assert persisted is not None
+            assert persisted.status == "open"
+            assert persisted.exchange_order_id is None
+            assert session.get(Trade, trade.id) is None
+            assert session.execute(
+                text("SELECT order_id FROM participant_marker")
+            ).scalar() is None
+
+    def test_fill_participant_reads_database_before_attached_dirty_order_flush(
+        self, sqlite_order_session_factory, order_factory
+    ):
+        order = order_factory(order_id="attached-dirty-fill", status="open")
+        LiveOrderRepository(db_session_factory=sqlite_order_session_factory).add_order(
+            order
+        )
+        with sqlite_order_session_factory() as session:
+            attached = session.get(Order, order.id)
+            assert attached is not None
+            attached.status = "closed"
+            trade = Trade(
+                id="attached-dirty-trade",
+                order_id=attached.id,
+                exchange_trade_id="attached-dirty-trade",
+                product_id=attached.product_id,
+                side=attached.side,
+                price=Decimal("42000"),
+                quantity=Decimal("1"),
+                fee=Decimal("0"),
+                fee_asset="USDT",
+                timestamp=1704067200000,
+            )
+
+            def participant(db, intended, intended_trade):
+                assert db is session
+                assert intended is attached
+                assert intended_trade is trade
+                assert db.query(Order.status).filter_by(id=order.id).scalar() == "open"
+
+            LiveOrderRepository(
+                db_session=session,
+                transaction_participant=participant,
+            ).persist_fill(attached, trade)
+
+        with sqlite_order_session_factory() as session:
+            persisted = session.get(Order, order.id)
+            assert persisted is not None
+            assert persisted.status == "closed"
+            assert session.get(Trade, "attached-dirty-trade") is not None
+
+    def test_cancel_participant_reads_database_before_attached_dirty_order_flush(
+        self, sqlite_order_session_factory, order_factory
+    ):
+        order = order_factory(order_id="attached-dirty-cancel", status="open")
+        LiveOrderRepository(db_session_factory=sqlite_order_session_factory).add_order(
+            order
+        )
+        with sqlite_order_session_factory() as session:
+            attached = session.get(Order, order.id)
+            assert attached is not None
+            attached.status = "closed"
+
+            def participant(db, intended, trade):
+                assert db is session
+                assert intended is attached
+                assert trade is None
+                assert intended.status == OrderStatus.CANCELLED.value
+                assert db.query(Order.status).filter_by(id=order.id).scalar() == "open"
+
+            LiveOrderRepository(
+                db_session=session,
+                transaction_participant=participant,
+            ).mark_order_cancelled(order.id)
+
+        with sqlite_order_session_factory() as session:
+            persisted = session.get(Order, order.id)
+            assert persisted is not None
+            assert persisted.status == OrderStatus.CANCELLED.value
+
+    def test_scope_mismatch_and_missing_scoped_cancel_skip_participant(
+        self, sqlite_order_session_factory, order_factory
+    ):
+        foreign = order_factory(
+            order_id="foreign-participant-order",
+            account_profile="other-profile",
+            account_id="other-account",
+        )
+        LiveOrderRepository(db_session_factory=sqlite_order_session_factory).add_order(
+            foreign
+        )
+        invoked = []
+
+        def participant(*args):
+            invoked.append(args)
+
+        scoped = LiveOrderRepository(
+            db_session_factory=sqlite_order_session_factory,
+            account_profile="current-profile",
+            account_id="current-account",
+            transaction_participant=participant,
+        )
+        with pytest.raises(RuntimeError, match="order_account_identity_mismatch"):
+            scoped.update_order(foreign)
+        with pytest.raises(RuntimeError, match="cancellation_order_not_found"):
+            scoped.mark_order_cancelled(foreign.id)
+        assert invoked == []
+
+    def test_post_commit_refresh_failure_does_not_undo_committed_write(
+        self, sqlite_order_session_factory, order_factory, monkeypatch
+    ):
+        from sqlalchemy import text
+
+        engine = sqlite_order_session_factory.kw["bind"]
+        with engine.begin() as connection:
+            connection.execute(
+                text("CREATE TABLE participant_marker (order_id TEXT NOT NULL)")
+            )
+        order = order_factory(order_id="refresh-failure", status="open")
+        order_id = order.id
+        LiveOrderRepository(db_session_factory=sqlite_order_session_factory).add_order(
+            order
+        )
+
+        def fail_refresh(_session, _instance):
+            raise RuntimeError("refresh failed")
+
+        def participant(session, intended_order, _trade):
+            session.execute(
+                text("INSERT INTO participant_marker (order_id) VALUES (:id)"),
+                {"id": intended_order.id},
+            )
+
+        monkeypatch.setattr(Session, "refresh", fail_refresh)
+        order.status = "closed"
+        with pytest.raises(RuntimeError, match="refresh failed"):
+            LiveOrderRepository(
+                db_session_factory=sqlite_order_session_factory,
+                transaction_participant=participant,
+            ).update_order(order)
+        with sqlite_order_session_factory() as session:
+            persisted = session.get(Order, order_id)
+            assert persisted is not None
+            assert persisted.status == "closed"
+            assert session.execute(
+                text("SELECT order_id FROM participant_marker")
+            ).scalar() == order_id
 
 
 class TestLiveOrderRepositoryPositionUpdate:

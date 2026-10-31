@@ -14,7 +14,8 @@ MONEY_FIELDS = (
     "volume_contracts capacity discarded_volume market_slippage_bps reported_fee limit_price size_contracts fill_price "
     "original_size_contracts cumulative_filled_size_contracts contract_value lot_size "
     "minimum_size price_increment high_low_ratio earn equity available_equity "
-    "position_contracts last_price notional_usd cash gross_realized total_fees"
+    "position_contracts last_price notional_usd cash gross_realized total_fees "
+    "signed_base_quantity average_open_price estimated_exit_fee_rate"
 ).split()
 INTEGER_FIELDS = (
     "source_sequence effective_at scenario_ordinal valid_from valid_to matching_effective_at "
@@ -170,6 +171,33 @@ def test_configured_constructor_transports_native_owned_config_and_snapshots_inp
             "SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1", KEY, reversed_configuration
         ).inspect_state()
         assert reversed_state["valuation_context_id"] != state["valuation_context_id"]
+
+
+def test_configured_source_cost_projection_uses_native_binding_and_decimal_codec():
+    configuration = _configured_input(2)
+    codec = c.ScenarioCodec("SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1", KEY, configuration)
+    before = codec.inspect_state()
+    first = codec.historical_cost_projection()
+    second = codec.historical_cost_projection()
+    assert first == second
+    assert codec.inspect_state() == before
+    assert first["schema_version"] == "spider_source_cost_projection_v1"
+    assert first["model_id"] == "SOURCE_WEIGHTED_OPEN_COST_V1"
+    assert first["seed_fee_provenance"] == "MODELED_CONFIGURED_TAKER_RATE_V1"
+    assert first["valuation_context_id"] == before["valuation_context_id"]
+    assert first["account_version"] == before["account_version"]
+    assert [row["product_id"] for row in first["rows"]] == ["WIRE-A", "WIRE-Z"]
+    assert all(row["signed_base_quantity"] == Decimal("0")
+        and row["average_open_price"] == Decimal("0") for row in first["rows"])
+    assert all(row["estimated_exit_fee_rate"] == Decimal("0.001") for row in first["rows"])
+
+
+def test_source_cost_projection_rejects_unsupported_profile_without_poisoning():
+    codec = c.ScenarioCodec("SYNTHETIC_BTC_ETH_V1", KEY)
+    before = codec.inspect_state()
+    with pytest.raises(ValueError, match="^UNSUPPORTED_COST_PROFILE$"):
+        codec.historical_cost_projection()
+    assert codec.inspect_state() == before
 
 
 def test_configured_constructor_preserves_native_validation():

@@ -230,6 +230,9 @@ impl ScenarioAccount {
                     ],
                 );
             }
+            if self.is_gross_admission_profile() {
+                gross_admission::Projection::current(self)?.encode(e);
+            }
         }
         Ok(())
     }
@@ -244,6 +247,10 @@ impl ScenarioAccount {
     }
     fn inspection_basis(&self) -> Result<CurrentBasis, Fault> {
         let profile = match &self.profile {
+            ProfileContext::BtcEthScenario {
+                gross_admission_profile: true,
+                ..
+            } => "SYNTHETIC_CONFIGURED_GROSS_ADMISSION_V1",
             ProfileContext::BtcEthScenario { scenario, .. } if scenario.configured.is_some() => {
                 "SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1"
             }

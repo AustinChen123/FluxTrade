@@ -26,7 +26,7 @@ def allowed(source, composition=False):
         elif not composition and isinstance(node, ast.Name) and node.id == "__import__" and isinstance(node.ctx, ast.Load):
             return False
     if not composition:
-        return imports == {"hashlib", "re", "typing", "decimal"}
+        return imports == {"enum", "hashlib", "re", "typing", "decimal"}
     for node in ast.walk(tree):
         if isinstance(node, (ast.Assign, ast.AnnAssign)) and isinstance(node.value, ast.Attribute):
             if ast.unparse(node.value.value) in aliases and node.value.attr in ENTRY_POINTS:
