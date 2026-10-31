@@ -41,6 +41,7 @@ class OwnedOrderReconciliationContext:
     db_session_factory: Callable[[], ContextManager[Any]] | None
     local_positions_loader: Callable[[], list[object]] | None
     logger: logging.Logger
+    list_declared_protection_history_orders: Callable[[], list[Any]] = lambda: []
 
 
 class OwnedOrderReconciler(Protocol):

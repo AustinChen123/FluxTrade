@@ -100,6 +100,9 @@ class OrderReconciler:
                     db_session_factory=self._db_session_factory,
                     local_positions_loader=self.local_positions_loader,
                     logger=self.logger,
+                    list_declared_protection_history_orders=(
+                        self.list_declared_protection_history_orders
+                    ),
                 )
             )
             if isinstance(adapter, IExchangeAdapter)
@@ -116,6 +119,18 @@ class OrderReconciler:
         }
         return self.order_manager.repo.list_client_orders_by_statuses(
             statuses,
+            exchange_id=self._exchange_id,
+        )
+
+    def list_declared_protection_history_orders(self):
+        """Load entry snapshots and linked protection rows in the adapter scope."""
+        profile = getattr(self.adapter, "profile", None)
+        account_id = getattr(self.adapter, "account_id", None)
+        if self._exchange_id is None or profile is None or account_id is None:
+            return []
+        return self.order_manager.repo.list_declared_protection_history_orders(
+            account_profile=profile,
+            account_id=account_id,
             exchange_id=self._exchange_id,
         )
 
