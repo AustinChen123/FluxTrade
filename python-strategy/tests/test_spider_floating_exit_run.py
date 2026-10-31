@@ -45,6 +45,7 @@ from test_spider_historical_input import _initial_account_state
 _SELECTOR = "SPIDER_FLOATING_EXIT_RESEARCH_RUN_V1"
 
 
+@pytest.mark.slow
 def test_candidate_native_exit_is_persisted_and_readmitted_with_closed_family(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
@@ -276,6 +277,7 @@ def test_candidate_generic_failure_keeps_diagnostic_chain_and_durable_unknown_pr
     assert not (second_root / run.run_id / "completion.json").exists()
 
 
+@pytest.mark.slow
 def test_failed_terminal_cache_preserves_verified_batch_and_product_prefix(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
@@ -397,6 +399,7 @@ def test_failed_terminal_cache_preserves_verified_batch_and_product_prefix(
                 if row["name"] == "REPORT_PROJECTION")["result"] == "FAILED"
 
 
+@pytest.mark.slow
 def test_initial_candidate_failure_allows_only_zero_event_null_observation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):

@@ -29,6 +29,8 @@ dev = [
     "pyright>=1.1.408",
     "pytest>=9.0.2",
     "pytest-cov>=6.0.0",
+    "pytest-timeout>=2.4.0",
+    "pytest-xdist>=3.8.0",
     "ruff>=0.14.13",
 ]
 bench = [
@@ -44,11 +46,12 @@ docs = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = [".", "src"]
-addopts = "-v"
+addopts = "-v --timeout=300"
 markers = [
     "smoke: critical path tests for quick validation (select with '-m smoke')",
     "integration: tests requiring external services (Docker, Redis, Postgres)",
     "rust: tests requiring compiled Rust .so (fluxtrade_core)",
     "memory: opt-in memory pressure diagnostics",
     "performance: opt-in performance diagnostics",
+    "slow: serial call duration measured above 60 seconds",
 ]

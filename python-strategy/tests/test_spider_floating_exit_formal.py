@@ -98,6 +98,7 @@ def _expected_projection(artifacts: dict[str, Any]) -> dict[str, object]:
     }
 
 
+@pytest.mark.slow
 def test_fixed_candidate_projection_matches_full_research_and_cli(tmp_path):
     names = ("floating-cli", "floating-full-long-id", "floating-research-id")
     assert len({len(name) for name in names}) == 3
@@ -187,6 +188,7 @@ def test_fixed_candidate_projection_matches_full_research_and_cli(tmp_path):
         assert result.report_rows != rows
 
 
+@pytest.mark.slow
 def test_bayes_candidate_formal_result_retains_real_native_exit_and_fee(tmp_path):
     run_id = "floating-bayes-native"
     raw = _candidate_input(run_id, BAYES_REMAINING_COST_RISK_V1)

@@ -499,6 +499,7 @@ def _assert_g3_native(artifacts: dict[str, Any], model_id: str) -> None:
 
 
 @pytest.mark.parametrize("model_id", _MODELS)
+@pytest.mark.slow
 def test_three_product_gross_shock_matches_all_public_formal_entrances(tmp_path, capsys, model_id):
     suffix = "hl" if model_id == _MODELS[0] else "lh"
     run_ids = (
@@ -864,6 +865,7 @@ def test_legacy_paid_report_capture_limit_remains_16_mib(tmp_path, monkeypatch):
     )
 
 
+@pytest.mark.slow
 def test_legacy_floating_report_capture_limit_remains_16_mib(tmp_path, monkeypatch):
     from test_spider_floating_exit_host import _candidate, _seeded_candidate_run
     from src.core.backtest.spider_floating_exit_input import encode_spider_floating_exit_input

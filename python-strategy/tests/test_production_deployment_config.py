@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import shutil
 import subprocess
+import textwrap
 import tomllib
 from pathlib import Path
 
@@ -68,11 +70,93 @@ def test_python_ci_treats_warnings_as_errors():
     workflow = CI_WORKFLOW.read_text()
 
     assert (
-        'run: uv run pytest -W error -m "not integration" '
+        'run: uv run pytest -W error -m "not integration and not slow" -n 4 '
         "--cov=src --cov-report=term-missing --cov-report=xml:coverage.xml "
         "--cov-fail-under=77"
     ) in workflow
     assert 'run: uv run pytest -W error -m "integration or rust" -v' in workflow
+    assert "  push:\n    branches: ['**']\n  pull_request:\n" in workflow
+    assert 'timeout-minutes: 45' in workflow
+    assert 'timeout-minutes: 90' in workflow
+    assert "--timeout=1800" in workflow
+    assert "github.event_name == 'push'" in workflow
+    assert "github.ref == 'refs/heads/main'" in workflow
+    assert "github.ref == 'refs/heads/develop'" in workflow
+    assert 'python-slow, rust-check, secret-scan' in workflow
+    assert 'scheduled ? result == "success" : result == "skipped"' in workflow
+    assert 'slow_result_accepted.call("schedule", "refs/heads/main", "failure")' in workflow
+    assert 'slow_result_accepted.call("pull_request", "refs/pull/7/merge", "skipped")' in workflow
+    assert 'UV_LOCKED: "true"' in workflow
+    assert 'group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}' in workflow
+    assert "PYO3_PYTHON=$(uv run --no-sync python" in workflow
+    assert "import sys, fluxtrade_core; print(sys.version); print(fluxtrade_core.__file__)" in workflow
+    assert 'addopts = "-v --timeout=300"' in PYTHON_PYPROJECT.read_text()
+
+
+def test_ci_required_jobs_manifest_matches_workflow():
+    workflow_bytes = CI_WORKFLOW.read_bytes()
+    manifest = json.loads(
+        (REPO_ROOT / ".github" / "refactor-required-jobs.json").read_text()
+    )
+
+    assert hashlib.sha256(workflow_bytes).hexdigest() == manifest["workflow_sha256"]
+    assert manifest["required_job_ids"] == [
+        "frontend-check",
+        "integration-check",
+        "python-check",
+        "python-slow",
+        "rust-check",
+        "secret-scan",
+    ]
+    assert manifest["excluded_job_ids"] == []
+    assert '  python-slow:' in workflow_bytes.decode()
+
+
+@pytest.mark.parametrize(
+    ("event_name", "event_ref", "slow_result", "expected_success"),
+    [
+        ("schedule", "refs/heads/main", "success", True),
+        ("schedule", "refs/heads/main", "failure", False),
+        ("schedule", "refs/heads/main", "cancelled", False),
+        ("pull_request", "refs/pull/7/merge", "skipped", True),
+        ("pull_request", "refs/pull/7/merge", "success", False),
+        ("push", "refs/heads/feature", "skipped", True),
+    ],
+)
+def test_refactor_gate_python_slow_event_result_policy(
+    event_name: str, event_ref: str, slow_result: str, expected_success: bool
+):
+    workflow = CI_WORKFLOW.read_text()
+    match = re.search(r"ruby <<'RUBY'\n(.*?)\n          RUBY", workflow, re.DOTALL)
+    assert match is not None
+    script = textwrap.dedent(match.group(1))
+    needs = {
+        job_id: {"result": "success"}
+        for job_id in (
+            "frontend-check",
+            "integration-check",
+            "python-check",
+            "python-slow",
+            "rust-check",
+            "secret-scan",
+        )
+    }
+    needs["python-slow"]["result"] = slow_result
+    env = os.environ.copy()
+    env.update(
+        NEEDS_JSON=json.dumps(needs),
+        GITHUB_EVENT_NAME=event_name,
+        GITHUB_REF=event_ref,
+    )
+    result = subprocess.run(
+        ["ruby", "-e", script],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert (result.returncode == 0) is expected_success, result.stderr
 
 
 def _write_env_file(path: Path, values: dict[str, str]) -> None:

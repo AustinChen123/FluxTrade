@@ -31,6 +31,7 @@ def _for_run(run_id: str):
     return replace(request, execution_input=execution)
 
 
+@pytest.mark.slow
 def test_three_gross_entrances_share_actual_native_projection(tmp_path, capsys):
     run_ids = ("gross-cli-run", "gross-research-distinct-length", "gross-full-third-length")
     assert len({len(value) for value in run_ids}) == len(run_ids)

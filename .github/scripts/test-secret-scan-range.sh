@@ -71,6 +71,20 @@ pr_range=$slice_one..$head_sha
 expect_success "$pr_range" "secret_scan_range event=pull_request created=empty ref=refs/pull/1/merge raw_before=$slice_one resolved_base=$slice_one head=$head_sha range=$pr_range commit_count=1" \
   pull_request '' refs/pull/1/merge "$slice_one" "$head_sha" refs/remotes/origin/develop
 
+full_range="--root $head_sha"
+for event in schedule workflow_dispatch; do
+  expect_success "$full_range" "secret_scan_range event=$event created=empty ref=refs/heads/feature raw_before= resolved_base=$baseline head=$head_sha range=$full_range commit_count=3" \
+    "$event" '' refs/heads/feature '' "$head_sha" refs/remotes/origin/develop
+done
+[[ $(git -C "$test_dir" log --format=%H --root "$head_sha" | wc -l | tr -d ' ') == 3 ]]
+git -C "$test_dir" log --format=%H --root "$head_sha" | grep -Fxq "$baseline"
+expect_failure "secret_scan_range_error code=INVALID_EVENT_REF_NAMESPACE field=event_ref event=push created=false ref=refs/tags/v1" \
+  push false refs/tags/v1 "$slice_one" "$head_sha" refs/remotes/origin/develop
+expect_success "$full_range" "secret_scan_range event=workflow_dispatch created=empty ref=refs/tags/v1 raw_before= resolved_base=$baseline head=$head_sha range=$full_range commit_count=3" \
+  workflow_dispatch '' refs/tags/v1 '' "$head_sha" refs/remotes/origin/develop
+expect_failure "secret_scan_range_error code=INVALID_EVENT_REF_NAMESPACE field=event_ref event=workflow_dispatch created=empty ref=refs/notes/review" \
+  workflow_dispatch '' refs/notes/review '' "$head_sha" refs/remotes/origin/develop
+
 expect_failure "secret_scan_range_error code=INVALID_EVENT_IDENTITY field=before_sha event=push created=false ref=refs/heads/feature before=$zero_sha head=$head_sha" push false refs/heads/feature "$zero_sha" "$head_sha" refs/remotes/origin/develop
 expect_failure "secret_scan_range_error code=INVALID_EVENT_IDENTITY field=before_sha event=push created=true ref=refs/heads/feature before=$slice_one head=$head_sha" push true refs/heads/feature "$slice_one" "$head_sha" refs/remotes/origin/develop
 expect_failure "secret_scan_range_error code=INVALID_EVENT_CREATED field=event_created event=push" push $'false\ninjected=true' refs/heads/feature "$slice_one" "$head_sha" refs/remotes/origin/develop
