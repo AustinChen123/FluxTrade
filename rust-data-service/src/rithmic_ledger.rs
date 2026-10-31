@@ -26,7 +26,7 @@ mod order_dispatch;
 pub(crate) mod order_event;
 
 #[path = "connector/rithmic/order_field_policy.rs"]
-mod order_field_policy;
+pub(crate) mod order_field_policy;
 
 #[path = "connector/rithmic/order_pending.rs"]
 mod order_pending;

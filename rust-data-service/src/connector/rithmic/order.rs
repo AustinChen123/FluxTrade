@@ -138,6 +138,7 @@ mod tests {
     use super::super::order_event::decode_order_event;
     use super::*;
     use rust_decimal_macros::dec;
+    use std::str::FromStr;
 
     const EXCHANGE_ORDER_NOTIFICATION: i32 = 352;
 
@@ -1120,6 +1121,590 @@ mod tests {
                 decode_order_event(&payload, &account()).unwrap().status,
                 expected
             );
+        }
+    }
+
+    #[test]
+    fn invalid_live_price_keeps_strict_rejection_and_emits_redacted_typed_diagnostic() {
+        let payload = codec::encode(&protocol::ExchangeOrderNotification {
+            template_id: EXCHANGE_ORDER_NOTIFICATION,
+            notify_type: Some(protocol::exchange_order_notification::NotifyType::Status as i32),
+            is_snapshot: Some(false),
+            fcm_id: Some("FCM".to_string()),
+            ib_id: Some("IB".to_string()),
+            account_id: Some("ACCOUNT_ID_SECRET".to_string()),
+            basket_id: Some("BASKET_ID_SECRET".to_string()),
+            exchange_order_id: Some("ORDER_ID_SECRET".to_string()),
+            exchange: Some("CME".to_string()),
+            symbol: Some("NQU6".to_string()),
+            status: Some("OPEN".to_string()),
+            transaction_type: Some(
+                protocol::exchange_order_notification::TransactionType::Buy as i32,
+            ),
+            quantity: Some(1),
+            price: Some(-0.25),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let expected_account = AccountIdentity {
+            fcm_id: "FCM".to_string(),
+            ib_id: "IB".to_string(),
+            account_id: "ACCOUNT_ID_SECRET".to_string(),
+        };
+        let error = decode_order_event(&payload, &expected_account).unwrap_err();
+        let diagnostic = format!("{error:#}");
+        assert!(
+            diagnostic.contains("template=352 context=live notify_type=1(STATUS)"),
+            "{diagnostic}"
+        );
+        assert!(diagnostic.contains("field=price present=true raw_bits=0xbfd0000000000000"));
+        assert!(diagnostic.contains("value=-0.25 failure=negative"));
+        assert!(diagnostic.contains("identity=basket#"));
+        assert!(!diagnostic.contains("BASKET_ID_SECRET"));
+        assert!(!diagnostic.contains("ORDER_ID_SECRET"));
+        assert!(!diagnostic.contains("ACCOUNT_ID_SECRET"));
+        assert!(diagnostic.contains("invalid Rithmic order price"));
+    }
+
+    #[test]
+    fn encoded_live_352_decoder_matrix_preserves_decimal_acceptance_and_diagnostics() {
+        use protocol::exchange_order_notification::NotifyType;
+        let cases = [
+            (Some(0.0), true, None),
+            (Some(0.25), true, None),
+            (Some(12.5), true, None),
+            (Some(-0.0), true, None),
+            (Some(f64::from_bits(1)), true, None),
+            (Some(-1.0), false, Some("negative")),
+            (Some(f64::NAN), false, Some("nonfinite")),
+            (Some(f64::INFINITY), false, Some("nonfinite")),
+            (Some(f64::NEG_INFINITY), false, Some("nonfinite")),
+            (Some(1e29), false, Some("decimal_unrepresentable")),
+            (Some(f64::MAX), false, Some("decimal_unrepresentable")),
+            (None, true, None),
+        ];
+        for field in ["price", "trigger_price", "fill_price", "avg_fill_price"] {
+            for (value, accepted, failure) in cases {
+                let mut message = protocol::ExchangeOrderNotification {
+                    template_id: EXCHANGE_ORDER_NOTIFICATION,
+                    notify_type: Some(NotifyType::Status as i32),
+                    is_snapshot: Some(false),
+                    fcm_id: Some("FCM".into()),
+                    ib_id: Some("IB".into()),
+                    account_id: Some("ACCOUNT".into()),
+                    basket_id: Some("BASKET_ID_SECRET".into()),
+                    exchange_order_id: Some("ORDER_ID_SECRET".into()),
+                    exchange: Some("CME".into()),
+                    symbol: Some("NQU6".into()),
+                    status: Some("OPEN".into()),
+                    transaction_type: Some(
+                        protocol::exchange_order_notification::TransactionType::Buy as i32,
+                    ),
+                    quantity: Some(2),
+                    total_fill_size: Some(0),
+                    total_unfilled_size: Some(2),
+                    ..Default::default()
+                };
+                match field {
+                    "price" => message.price = value,
+                    "trigger_price" => message.trigger_price = value,
+                    "fill_price" => message.fill_price = value,
+                    _ => message.avg_fill_price = value,
+                }
+                let payload = codec::encode(&message).unwrap();
+                let decoded = decode_order_event(&payload, &account());
+                assert_eq!(decoded.is_ok(), accepted, "{field} {value:?}");
+                if let Some(failure) = failure {
+                    let error = decoded.unwrap_err();
+                    let text = format!("{error:#}");
+                    assert!(
+                        text.contains(&format!(
+                            "template=352 context=live notify_type=1(STATUS) field={field}"
+                        )),
+                        "{text}"
+                    );
+                    assert!(text.contains(&format!("failure={failure}")), "{text}");
+                    assert!(
+                        !text.contains("BASKET_ID_SECRET") && !text.contains("ORDER_ID_SECRET"),
+                        "{text}"
+                    );
+                    assert!(
+                        text.contains("invalid Rithmic"),
+                        "original error was not preserved: {text}"
+                    );
+                } else if let Some(value) = value {
+                    let decoded = decoded.unwrap();
+                    let actual = match field {
+                        "price" => decoded.price,
+                        "trigger_price" => decoded.trigger_price,
+                        "fill_price" => decoded.last_fill_price,
+                        _ => decoded.cumulative_average_price,
+                    };
+                    let expected = rust_decimal::Decimal::from_str(&value.to_string()).unwrap();
+                    assert_eq!(actual, Some(expected), "{field} {value:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn live_decoder_masks_short_unicode_and_control_identifiers_on_success_and_failure() {
+        use protocol::exchange_order_notification::NotifyType;
+        let identifiers = ["a", "ab", "界", "éa", "\nX", "B\nX", "🔒x"];
+        for basket_id in identifiers {
+            for order_id in identifiers {
+                for price in [0.25, -0.25] {
+                    let payload = codec::encode(&protocol::ExchangeOrderNotification {
+                        template_id: EXCHANGE_ORDER_NOTIFICATION,
+                        notify_type: Some(NotifyType::Status as i32),
+                        is_snapshot: Some(false),
+                        fcm_id: Some("FCM".into()),
+                        ib_id: Some("IB".into()),
+                        account_id: Some("ACCOUNT".into()),
+                        basket_id: Some(basket_id.into()),
+                        exchange_order_id: Some(order_id.into()),
+                        exchange: Some("CME".into()),
+                        symbol: Some("NQU6".into()),
+                        status: Some("OPEN".into()),
+                        transaction_type: Some(
+                            protocol::exchange_order_notification::TransactionType::Buy as i32,
+                        ),
+                        quantity: Some(1),
+                        price: Some(price),
+                        ..Default::default()
+                    })
+                    .unwrap();
+                    let decoded = decode_order_event(&payload, &account());
+                    if price >= 0.0 {
+                        assert!(
+                            decoded.is_ok(),
+                            "basket={basket_id:?} order={order_id:?}: {decoded:?}"
+                        );
+                    } else {
+                        let error = decoded.unwrap_err();
+                        let diagnostic = format!("{error:#}");
+                        assert!(diagnostic.contains("field=price"), "{diagnostic}");
+                        assert!(!diagnostic.contains("ACCOUNT_ID_SECRET"), "{diagnostic}");
+                        for (label, identifier) in [("basket", basket_id), ("order", order_id)] {
+                            let character_count = identifier.chars().count();
+                            let expected_mask = if character_count <= 2 {
+                                format!("{label}#masked:length={character_count}")
+                            } else {
+                                format!("{label}#suffix=**:length={character_count}")
+                            };
+                            assert!(diagnostic.contains(&expected_mask), "{diagnostic}");
+                        }
+                        assert!(!diagnostic.contains('\n'), "{diagnostic}");
+                        assert!(!diagnostic.contains('\r'), "{diagnostic}");
+                        assert!(!diagnostic.contains('\0'), "{diagnostic}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn encoded_live_quantity_failures_keep_existing_error_and_attach_integer_diagnostic() {
+        use protocol::exchange_order_notification::NotifyType;
+        let payload = codec::encode(&protocol::ExchangeOrderNotification {
+            template_id: EXCHANGE_ORDER_NOTIFICATION,
+            notify_type: Some(NotifyType::Status as i32),
+            is_snapshot: Some(false),
+            fcm_id: Some("FCM".into()),
+            ib_id: Some("IB".into()),
+            account_id: Some("ACCOUNT".into()),
+            basket_id: Some("BASKET_ID_SECRET".into()),
+            exchange: Some("CME".into()),
+            symbol: Some("NQU6".into()),
+            status: Some("OPEN".into()),
+            transaction_type: Some(
+                protocol::exchange_order_notification::TransactionType::Buy as i32,
+            ),
+            quantity: Some(2),
+            total_fill_size: Some(-1),
+            ..Default::default()
+        })
+        .unwrap();
+        let error = decode_order_event(&payload, &account()).unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("invalid Rithmic total fill size"), "{text}");
+        assert!(
+            text.contains("field=total_fill_size present=true raw_i32=-1 failure=negative"),
+            "{text}"
+        );
+        assert!(!text.contains("BASKET_ID_SECRET"), "{text}");
+    }
+
+    #[test]
+    fn live_required_fill_and_direct_quantity_failures_are_typed_at_the_original_branch() {
+        use protocol::exchange_order_notification::NotifyType;
+        let cases = [
+            (
+                NotifyType::Status,
+                Some(1),
+                Some(0),
+                Some(-1),
+                None,
+                -1,
+                "total_unfilled_size",
+                "negative",
+                "invalid Rithmic total unfilled size",
+            ),
+            (
+                NotifyType::Status,
+                Some(0),
+                None,
+                None,
+                None,
+                0,
+                "quantity",
+                "zero",
+                "invalid Rithmic order quantity",
+            ),
+            (
+                NotifyType::Status,
+                Some(1),
+                None,
+                None,
+                Some(0),
+                0,
+                "fill_size",
+                "zero",
+                "invalid Rithmic fill size",
+            ),
+            (
+                NotifyType::Status,
+                Some(1),
+                None,
+                None,
+                Some(-1),
+                -1,
+                "fill_size",
+                "negative",
+                "invalid Rithmic fill size",
+            ),
+            (
+                NotifyType::Fill,
+                Some(1),
+                Some(0),
+                None,
+                None,
+                0,
+                "total_fill_size",
+                "missing_or_zero_required",
+                "Rithmic fill event omitted positive cumulative fill size",
+            ),
+            (
+                NotifyType::Fill,
+                Some(2),
+                Some(1),
+                Some(0),
+                None,
+                1,
+                "total_fill_size",
+                "fill_totals_mismatch",
+                "Rithmic fill totals do not match order quantity",
+            ),
+        ];
+        for (
+            notify,
+            quantity,
+            filled,
+            unfilled,
+            fill_size,
+            expected_raw,
+            field,
+            failure,
+            original,
+        ) in cases
+        {
+            let payload = codec::encode(&protocol::ExchangeOrderNotification {
+                template_id: EXCHANGE_ORDER_NOTIFICATION,
+                notify_type: Some(notify as i32),
+                is_snapshot: Some(false),
+                fcm_id: Some("FCM".into()),
+                ib_id: Some("IB".into()),
+                account_id: Some("ACCOUNT".into()),
+                basket_id: Some("BASKET_ID_SECRET".into()),
+                exchange: Some("CME".into()),
+                symbol: Some("NQU6".into()),
+                status: Some("OPEN".into()),
+                transaction_type: Some(
+                    protocol::exchange_order_notification::TransactionType::Buy as i32,
+                ),
+                quantity,
+                total_fill_size: filled,
+                total_unfilled_size: unfilled,
+                fill_size,
+                ..Default::default()
+            })
+            .unwrap();
+            let error = decode_order_event(&payload, &account()).unwrap_err();
+            let text = format!("{error:#}");
+            assert!(text.contains(original), "{text}");
+            assert!(text.contains(&format!("field={field}")), "{text}");
+            if failure == "missing_or_zero_required" {
+                assert!(text.contains("present=true raw_i32=0"), "{text}");
+            } else {
+                assert!(
+                    text.contains(&format!(
+                        "present=true raw_i32={expected_raw} failure={failure}"
+                    )),
+                    "{text}"
+                );
+            }
+            assert!(text.contains("template=352 context=live"), "{text}");
+            assert!(!text.contains("BASKET_ID_SECRET"), "{text}");
+        }
+    }
+
+    #[test]
+    fn live_fill_missing_required_integer_fields_emit_missing_diagnostics() {
+        use protocol::exchange_order_notification::NotifyType;
+        let cases = [
+            (
+                Some(1),
+                None,
+                None,
+                Some(1),
+                "field=total_fill_size present=false raw_i32=N/A failure=missing_or_zero_required",
+                "Rithmic fill event omitted positive cumulative fill size",
+            ),
+            (
+                None,
+                None,
+                None,
+                Some(1),
+                "field=quantity present=false raw_i32=N/A failure=missing_required",
+                "Rithmic fill event omitted order quantity",
+            ),
+        ];
+        for (quantity, filled, unfilled, fill_size, expected_diagnostic, original) in cases {
+            let payload = codec::encode(&protocol::ExchangeOrderNotification {
+                template_id: EXCHANGE_ORDER_NOTIFICATION,
+                notify_type: Some(NotifyType::Fill as i32),
+                is_snapshot: Some(false),
+                fcm_id: Some("FCM".into()),
+                ib_id: Some("IB".into()),
+                account_id: Some("ACCOUNT".into()),
+                basket_id: Some("BASKET_ID_SECRET".into()),
+                exchange: Some("CME".into()),
+                symbol: Some("NQU6".into()),
+                status: Some("OPEN".into()),
+                transaction_type: Some(
+                    protocol::exchange_order_notification::TransactionType::Buy as i32,
+                ),
+                quantity,
+                total_fill_size: filled,
+                total_unfilled_size: unfilled,
+                fill_size,
+                ..Default::default()
+            })
+            .unwrap();
+            let error = decode_order_event(&payload, &account()).unwrap_err();
+            let text = format!("{error:#}");
+            assert!(text.contains(original), "{text}");
+            assert!(text.contains(expected_diagnostic), "{text}");
+            assert!(!text.contains("BASKET_ID_SECRET"), "{text}");
+        }
+    }
+
+    #[test]
+    fn live_decoder_keeps_notify_and_quantity_precedence_over_price_diagnostics() {
+        use protocol::exchange_order_notification::NotifyType;
+        let expected_account = account();
+        let payload = codec::encode(&protocol::ExchangeOrderNotification {
+            template_id: EXCHANGE_ORDER_NOTIFICATION,
+            notify_type: Some(NotifyType::Status as i32),
+            is_snapshot: Some(false),
+            fcm_id: Some("FCM".into()),
+            ib_id: Some("IB".into()),
+            account_id: Some("ACCOUNT".into()),
+            basket_id: Some("BASKET_ID_SECRET".into()),
+            exchange: Some("CME".into()),
+            symbol: Some("NQU6".into()),
+            status: Some("OPEN".into()),
+            transaction_type: Some(
+                protocol::exchange_order_notification::TransactionType::Buy as i32,
+            ),
+            quantity: Some(2),
+            total_fill_size: Some(-1),
+            price: Some(-1.0),
+            ..Default::default()
+        })
+        .unwrap();
+        let error = decode_order_event(&payload, &expected_account).unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("invalid Rithmic total fill size"), "{text}");
+        assert!(
+            text.contains("field=total_fill_size present=true raw_i32=-1"),
+            "{text}"
+        );
+        assert!(!text.contains("field=price"), "{text}");
+
+        let unknown = codec::encode(&protocol::ExchangeOrderNotification {
+            template_id: EXCHANGE_ORDER_NOTIFICATION,
+            notify_type: Some(99),
+            is_snapshot: Some(false),
+            fcm_id: Some("FCM".into()),
+            ib_id: Some("IB".into()),
+            account_id: Some("ACCOUNT".into()),
+            quantity: Some(-1),
+            price: Some(-1.0),
+            ..Default::default()
+        })
+        .unwrap();
+        let error = decode_order_event(&unknown, &expected_account).unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("unknown Rithmic order notify type"), "{text}");
+        assert!(!text.contains("rithmic_numeric_validation"), "{text}");
+    }
+
+    #[test]
+    fn live_cross_field_quantity_failures_keep_raw_integer_diagnostics() {
+        use protocol::exchange_order_notification::NotifyType;
+        for (filled, unfilled, field, raw, original) in [
+            (
+                Some(2),
+                None,
+                "total_fill_size",
+                2,
+                "Rithmic cumulative fill exceeds order quantity",
+            ),
+            (
+                None,
+                Some(2),
+                "total_unfilled_size",
+                2,
+                "Rithmic unfilled size exceeds order quantity",
+            ),
+        ] {
+            let payload = codec::encode(&protocol::ExchangeOrderNotification {
+                template_id: EXCHANGE_ORDER_NOTIFICATION,
+                notify_type: Some(NotifyType::Status as i32),
+                is_snapshot: Some(false),
+                fcm_id: Some("FCM".into()),
+                ib_id: Some("IB".into()),
+                account_id: Some("ACCOUNT".into()),
+                basket_id: Some("BASKET_ID_SECRET".into()),
+                exchange: Some("CME".into()),
+                symbol: Some("NQU6".into()),
+                status: Some("OPEN".into()),
+                quantity: Some(1),
+                total_fill_size: filled,
+                total_unfilled_size: unfilled,
+                transaction_type: Some(
+                    protocol::exchange_order_notification::TransactionType::Buy as i32,
+                ),
+                ..Default::default()
+            })
+            .unwrap();
+            let error = decode_order_event(&payload, &account()).unwrap_err();
+            let text = format!("{error:#}");
+            assert!(text.contains(original), "{text}");
+            assert!(
+                text.contains(&format!(
+                    "field={field} present=true raw_i32={raw} failure=exceeds_order_quantity"
+                )),
+                "{text}"
+            );
+            assert!(!text.contains("BASKET_ID_SECRET"), "{text}");
+        }
+    }
+
+    #[test]
+    fn reached_status_quantity_conflicts_keep_the_original_error_and_typed_context() {
+        use protocol::exchange_order_notification::NotifyType;
+        let cases = [
+            (
+                NotifyType::Cancel,
+                "CANCELLED",
+                Some(2),
+                Some(2),
+                "Rithmic cancel event conflicts with complete fill",
+                "complete_fill_conflict",
+            ),
+            (
+                NotifyType::Reject,
+                "REJECTED",
+                Some(2),
+                Some(2),
+                "Rithmic reject event conflicts with complete fill",
+                "complete_fill_conflict",
+            ),
+            (
+                NotifyType::Status,
+                "COMPLETE",
+                Some(2),
+                Some(0),
+                "Rithmic complete status is not fully filled",
+                "complete_status_not_filled",
+            ),
+            (
+                NotifyType::Status,
+                "OPEN",
+                Some(2),
+                Some(2),
+                "Rithmic open status conflicts with cumulative fill",
+                "open_status_conflict",
+            ),
+            (
+                NotifyType::Status,
+                "PARTIAL",
+                Some(2),
+                Some(2),
+                "Rithmic partial status conflicts with cumulative fill",
+                "partial_status_conflict",
+            ),
+            (
+                NotifyType::Status,
+                "PARTIAL",
+                Some(2),
+                Some(0),
+                "Rithmic partial status conflicts with cumulative fill",
+                "partial_status_conflict",
+            ),
+        ];
+        for (notify, status, quantity, filled, original, failure) in cases {
+            let payload = codec::encode(&protocol::ExchangeOrderNotification {
+                template_id: EXCHANGE_ORDER_NOTIFICATION,
+                notify_type: Some(notify as i32),
+                is_snapshot: Some(false),
+                fcm_id: Some("FCM".into()),
+                ib_id: Some("IB".into()),
+                account_id: Some("ACCOUNT".into()),
+                basket_id: Some("BASKET_ID_SECRET".into()),
+                exchange_order_id: Some("ORDER_ID_SECRET".into()),
+                exchange: Some("CME".into()),
+                symbol: Some("NQU6".into()),
+                status: Some(status.into()),
+                transaction_type: Some(
+                    protocol::exchange_order_notification::TransactionType::Buy as i32,
+                ),
+                quantity,
+                total_fill_size: filled,
+                total_unfilled_size: Some(0),
+                ..Default::default()
+            })
+            .unwrap();
+            let error = decode_order_event(&payload, &account()).unwrap_err();
+            let text = format!("{error:#}");
+            assert!(text.contains(original), "{text}");
+            assert!(
+                text.contains("field=total_fill_size present=true"),
+                "{text}"
+            );
+            assert!(
+                text.contains(&format!("raw_i32={} failure={failure}", filled.unwrap())),
+                "{text}"
+            );
+            assert!(
+                text.contains("template=352 context=live notify_type="),
+                "{text}"
+            );
+            assert!(!text.contains("BASKET_ID_SECRET"), "{text}");
+            assert!(!text.contains("ORDER_ID_SECRET"), "{text}");
         }
     }
 
