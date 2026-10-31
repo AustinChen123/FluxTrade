@@ -1,6 +1,9 @@
 use super::{
     codec,
-    order_field_policy::optional_nonnegative_decimal,
+    order_field_policy::{
+        optional_nonnegative_decimal, optional_nonnegative_decimal_with_diagnostic,
+        optional_quantity_with_diagnostic, required_quantity_with_diagnostic, NumericFieldContext,
+    },
     protocol,
     session::{classify_response_codes, ensure_success, ResponseDisposition},
 };
@@ -287,7 +290,7 @@ pub(crate) fn decode_order_snapshot_event(
             let response: protocol::RithmicOrderNotification = codec::decode(payload)?;
             if response.is_snapshot == Some(true) {
                 return Ok(OrderSnapshotEvent::Snapshot(Box::new(
-                    rithmic_order_snapshot(response, expected_account)?,
+                    rithmic_order_snapshot(response, expected_account, "snapshot")?,
                 )));
             }
             let account = account_identity(response.fcm_id, response.ib_id, response.account_id)?;
@@ -299,6 +302,63 @@ pub(crate) fn decode_order_snapshot_event(
         }
         template_id => anyhow::bail!("unsupported Rithmic order snapshot template {template_id}"),
     }
+}
+
+#[cfg(test)]
+pub(crate) fn invalid_snapshot_quantity_diagnostic_for_binding_test() -> anyhow::Error {
+    let expected_account = AccountIdentity {
+        fcm_id: "FCM".to_string(),
+        ib_id: "IB".to_string(),
+        account_id: "ACCOUNT_ID_SECRET".to_string(),
+    };
+    let payload = codec::encode(&protocol::RithmicOrderNotification {
+        template_id: RITHMIC_ORDER_NOTIFICATION,
+        notify_type: Some(protocol::rithmic_order_notification::NotifyType::Complete as i32),
+        is_snapshot: Some(true),
+        fcm_id: Some("FCM".to_string()),
+        ib_id: Some("IB".to_string()),
+        account_id: Some("ACCOUNT_ID_SECRET".to_string()),
+        basket_id: Some("BASKET_ID_SECRET_123".to_string()),
+        exchange_order_id: Some("ORDER_ID_SECRET_456".to_string()),
+        exchange: Some("CME".to_string()),
+        symbol: Some("NQU6".to_string()),
+        status: Some("OPEN".to_string()),
+        transaction_type: Some(protocol::rithmic_order_notification::TransactionType::Buy as i32),
+        quantity: None,
+        ..Default::default()
+    })
+    .expect("encode snapshot with missing quantity");
+    decode_order_snapshot_event(&payload, "binding-test", &expected_account)
+        .expect_err("missing snapshot quantity is rejected")
+}
+
+#[cfg(test)]
+pub(crate) fn invalid_snapshot_price_diagnostic_for_binding_test() -> anyhow::Error {
+    let expected_account = AccountIdentity {
+        fcm_id: "FCM".to_string(),
+        ib_id: "IB".to_string(),
+        account_id: "ACCOUNT_ID_SECRET".to_string(),
+    };
+    let payload = codec::encode(&protocol::RithmicOrderNotification {
+        template_id: RITHMIC_ORDER_NOTIFICATION,
+        notify_type: Some(protocol::rithmic_order_notification::NotifyType::Complete as i32),
+        is_snapshot: Some(true),
+        fcm_id: Some("FCM".to_string()),
+        ib_id: Some("IB".to_string()),
+        account_id: Some("ACCOUNT_ID_SECRET".to_string()),
+        basket_id: Some("BASKET_ID_SECRET_123".to_string()),
+        exchange_order_id: Some("ORDER_ID_SECRET_456".to_string()),
+        exchange: Some("CME".to_string()),
+        symbol: Some("NQU6".to_string()),
+        status: Some("COMPLETE".to_string()),
+        transaction_type: Some(protocol::rithmic_order_notification::TransactionType::Buy as i32),
+        quantity: Some(1),
+        price: Some(-1.0),
+        ..Default::default()
+    })
+    .expect("encode invalid snapshot price fixture");
+    decode_order_snapshot_event(&payload, "binding-test", &expected_account)
+        .expect_err("invalid snapshot price is rejected")
 }
 
 pub(crate) fn is_order_snapshot_response(template_id: i32) -> bool {
@@ -321,6 +381,18 @@ fn order_snapshot_from_notification(
         account == *expected_account,
         "Rithmic order response account mismatch"
     );
+    let numeric_context = NumericFieldContext::new(
+        EXCHANGE_ORDER_NOTIFICATION,
+        "snapshot",
+        response.notify_type,
+        response.notify_type.and_then(|value| {
+            protocol::exchange_order_notification::NotifyType::try_from(value)
+                .ok()
+                .map(|notify_type| notify_type.as_str_name())
+        }),
+        response.basket_id.as_deref(),
+        response.exchange_order_id.as_deref(),
+    );
     Ok(OrderSnapshot {
         account,
         client_order_id: optional_text(response.user_tag),
@@ -340,16 +412,45 @@ fn order_snapshot_from_notification(
         completion_reason: None,
         report_text: optional_text(response.report_text),
         transaction_type: transaction_type(response.transaction_type)?,
-        quantity: positive_quantity(response.quantity, "order quantity")?,
-        price: optional_nonnegative_decimal(response.price, "order price")?,
-        trigger_price: optional_nonnegative_decimal(response.trigger_price, "trigger price")?,
+        quantity: required_quantity_with_diagnostic(
+            response.quantity,
+            "order quantity",
+            "quantity",
+            numeric_context.clone(),
+        )?,
+        price: optional_nonnegative_decimal_with_diagnostic(
+            response.price,
+            "order price",
+            "price",
+            numeric_context.clone(),
+        )?,
+        trigger_price: optional_nonnegative_decimal_with_diagnostic(
+            response.trigger_price,
+            "trigger price",
+            "trigger_price",
+            numeric_context.clone(),
+        )?,
         price_type: exchange_price_type(response.price_type)?,
         bracket_type: exchange_bracket_type(response.bracket_type)?,
-        filled_quantity: optional_quantity(response.total_fill_size, "total_fill_size")?,
-        unfilled_quantity: optional_quantity(response.total_unfilled_size, "total_unfilled_size")?,
-        average_fill_price: optional_nonnegative_decimal(
+        filled_quantity: optional_quantity_with_diagnostic(
+            response.total_fill_size,
+            "total_fill_size",
+            "total_fill_size",
+            false,
+            numeric_context.clone(),
+        )?,
+        unfilled_quantity: optional_quantity_with_diagnostic(
+            response.total_unfilled_size,
+            "total_unfilled_size",
+            "total_unfilled_size",
+            false,
+            numeric_context.clone(),
+        )?,
+        average_fill_price: optional_nonnegative_decimal_with_diagnostic(
             response.avg_fill_price,
             "average fill price",
+            "avg_fill_price",
+            numeric_context,
         )?,
         timestamp_ms: optional_epoch_millis(response.ssboe, response.usecs)?,
     })
@@ -417,14 +518,13 @@ pub(crate) fn decode_order_history_event(
                 return Ok(OrderHistoryEvent::NonStateChange);
             }
             let diagnostic = format!(
-                "Rithmic order-history notification notify_type={:?} status={:?} basket_id={:?} has_quantity={}",
+                "Rithmic order-history notification notify_type={:?} status={:?} has_quantity={}",
                 response.notify_type,
                 response.status,
-                response.basket_id,
                 response.quantity.is_some(),
             );
-            let order =
-                rithmic_order_snapshot(response, expected_account).with_context(|| diagnostic)?;
+            let order = rithmic_order_snapshot(response, expected_account, "history")
+                .with_context(|| diagnostic)?;
             ensure!(
                 order.basket_id == expected_basket_id,
                 "Rithmic order-history basket ID mismatch"
@@ -505,11 +605,24 @@ fn ensure_exchange_history_identity(
 fn rithmic_order_snapshot(
     response: protocol::RithmicOrderNotification,
     expected_account: &AccountIdentity,
+    source: &'static str,
 ) -> Result<OrderSnapshot> {
     let account = account_identity(response.fcm_id, response.ib_id, response.account_id)?;
     ensure!(
         account == *expected_account,
         "Rithmic order-history account mismatch"
+    );
+    let numeric_context = NumericFieldContext::new(
+        RITHMIC_ORDER_NOTIFICATION,
+        source,
+        response.notify_type,
+        response.notify_type.and_then(|value| {
+            protocol::rithmic_order_notification::NotifyType::try_from(value)
+                .ok()
+                .map(|notify_type| notify_type.as_str_name())
+        }),
+        response.basket_id.as_deref(),
+        response.exchange_order_id.as_deref(),
     );
     Ok(OrderSnapshot {
         account,
@@ -531,16 +644,45 @@ fn rithmic_order_snapshot(
         completion_reason: optional_text(response.completion_reason),
         report_text: optional_text(response.report_text),
         transaction_type: transaction_type_value(response.transaction_type)?,
-        quantity: positive_quantity(response.quantity, "order quantity")?,
-        price: optional_nonnegative_decimal(response.price, "order price")?,
-        trigger_price: optional_nonnegative_decimal(response.trigger_price, "trigger price")?,
+        quantity: required_quantity_with_diagnostic(
+            response.quantity,
+            "order quantity",
+            "quantity",
+            numeric_context.clone(),
+        )?,
+        price: optional_nonnegative_decimal_with_diagnostic(
+            response.price,
+            "order price",
+            "price",
+            numeric_context.clone(),
+        )?,
+        trigger_price: optional_nonnegative_decimal_with_diagnostic(
+            response.trigger_price,
+            "trigger price",
+            "trigger_price",
+            numeric_context.clone(),
+        )?,
         price_type: rithmic_price_type(response.price_type)?,
         bracket_type: rithmic_bracket_type(response.bracket_type)?,
-        filled_quantity: optional_quantity(response.total_fill_size, "total_fill_size")?,
-        unfilled_quantity: optional_quantity(response.total_unfilled_size, "total_unfilled_size")?,
-        average_fill_price: optional_nonnegative_decimal(
+        filled_quantity: optional_quantity_with_diagnostic(
+            response.total_fill_size,
+            "total_fill_size",
+            "total_fill_size",
+            false,
+            numeric_context.clone(),
+        )?,
+        unfilled_quantity: optional_quantity_with_diagnostic(
+            response.total_unfilled_size,
+            "total_unfilled_size",
+            "total_unfilled_size",
+            false,
+            numeric_context.clone(),
+        )?,
+        average_fill_price: optional_nonnegative_decimal_with_diagnostic(
             response.avg_fill_price,
             "average fill price",
+            "avg_fill_price",
+            numeric_context,
         )?,
         timestamp_ms: optional_epoch_millis(response.ssboe, response.usecs)?,
     })
@@ -837,21 +979,6 @@ fn rithmic_notification_type(value: i32) -> Result<String> {
     protocol::rithmic_order_notification::NotifyType::try_from(value)
         .context("unknown Rithmic order-history notify type")
         .map(|value| value.as_str_name().to_string())
-}
-
-fn positive_quantity(value: Option<i32>, field: &str) -> Result<Decimal> {
-    let value = value.with_context(|| format!("missing Rithmic {field}"))?;
-    ensure!(value > 0, "invalid Rithmic {field}");
-    Ok(Decimal::from(value))
-}
-
-fn optional_quantity(value: Option<i32>, field: &str) -> Result<Option<Decimal>> {
-    value
-        .map(|value| {
-            ensure!(value >= 0, "invalid Rithmic {field}");
-            Ok(Decimal::from(value))
-        })
-        .transpose()
 }
 
 fn positive_u64_quantity(value: Option<u64>, field: &str) -> Result<Decimal> {
@@ -1183,6 +1310,9 @@ mod tests {
                 ib_id: Some("IB".to_string()),
                 account_id: Some(account_id.to_string()),
                 basket_id: Some(basket_id.to_string()),
+                // Supplemental 352 history is intentionally not a price-conversion route.
+                price: Some(-1.0),
+                fill_price: Some(f64::NAN),
                 ..Default::default()
             })
             .unwrap()
@@ -1503,6 +1633,673 @@ mod tests {
         })
         .unwrap();
         assert!(decode_order_snapshot_event(&sparse_snapshot, "orders", &account()).is_err());
+    }
+
+    #[test]
+    fn snapshot_and_history_numeric_rejections_report_their_actual_context() {
+        let exchange_snapshot = codec::encode(&protocol::ExchangeOrderNotification {
+            template_id: EXCHANGE_ORDER_NOTIFICATION,
+            notify_type: Some(protocol::exchange_order_notification::NotifyType::Status as i32),
+            is_snapshot: Some(true),
+            fcm_id: Some("FCM".to_string()),
+            ib_id: Some("IB".to_string()),
+            account_id: Some("ACCOUNT_ID_SECRET".to_string()),
+            basket_id: Some("BASKET_ID_SECRET".to_string()),
+            exchange_order_id: Some("ORDER_ID_SECRET".to_string()),
+            exchange: Some("CME".to_string()),
+            symbol: Some("NQU6".to_string()),
+            status: Some("OPEN".to_string()),
+            transaction_type: Some(
+                protocol::exchange_order_notification::TransactionType::Buy as i32,
+            ),
+            quantity: Some(1),
+            price: Some(-0.25),
+            ..Default::default()
+        })
+        .unwrap();
+        let diagnostic_account = AccountIdentity {
+            fcm_id: "FCM".to_string(),
+            ib_id: "IB".to_string(),
+            account_id: "ACCOUNT_ID_SECRET".to_string(),
+        };
+        let error = decode_order_snapshot_event(&exchange_snapshot, "orders", &diagnostic_account)
+            .unwrap_err();
+        let diagnostic = format!("{error:#}");
+        assert!(
+            diagnostic.contains("template=352 context=snapshot notify_type=1(STATUS)"),
+            "{diagnostic}"
+        );
+        assert!(diagnostic.contains("field=price present=true"));
+        assert!(!diagnostic.contains("BASKET_ID_SECRET"));
+        assert!(!diagnostic.contains("ORDER_ID_SECRET"));
+        assert!(!diagnostic.contains("ACCOUNT_ID_SECRET"));
+
+        let history_notification = protocol::RithmicOrderNotification {
+            template_id: RITHMIC_ORDER_NOTIFICATION,
+            notify_type: Some(protocol::rithmic_order_notification::NotifyType::Complete as i32),
+            is_snapshot: Some(true),
+            fcm_id: Some("FCM".to_string()),
+            ib_id: Some("IB".to_string()),
+            account_id: Some("ACCOUNT_ID_SECRET".to_string()),
+            basket_id: Some("BASKET_ID_SECRET".to_string()),
+            exchange_order_id: Some("ORDER_ID_SECRET".to_string()),
+            exchange: Some("CME".to_string()),
+            symbol: Some("NQU6".to_string()),
+            status: Some("COMPLETE".to_string()),
+            transaction_type: Some(
+                protocol::rithmic_order_notification::TransactionType::Buy as i32,
+            ),
+            quantity: Some(1),
+            trigger_price: Some(-1.0),
+            ..Default::default()
+        };
+        let rithmic_snapshot = codec::encode(&history_notification).unwrap();
+        let error = decode_order_snapshot_event(&rithmic_snapshot, "orders", &diagnostic_account)
+            .unwrap_err();
+        let diagnostic = format!("{error:#}");
+        assert!(diagnostic.contains("template=351 context=snapshot"));
+        assert!(diagnostic.contains("field=trigger_price present=true"));
+        assert!(!diagnostic.contains("BASKET_ID_SECRET"));
+        assert!(!diagnostic.contains("ORDER_ID_SECRET"));
+        assert!(!diagnostic.contains("ACCOUNT_ID_SECRET"));
+
+        let history = codec::encode(&history_notification).unwrap();
+        let error = decode_order_history_event(
+            &history,
+            "history",
+            &diagnostic_account,
+            "BASKET_ID_SECRET",
+        )
+        .unwrap_err();
+        let diagnostic = format!("{error:#}");
+        let complete = protocol::rithmic_order_notification::NotifyType::Complete;
+        assert!(diagnostic.contains(&format!(
+            "template=351 context=history notify_type={}({})",
+            complete as i32,
+            complete.as_str_name()
+        )));
+        assert!(diagnostic.contains("field=trigger_price present=true"));
+        assert!(diagnostic.contains("failure=negative"));
+        assert!(!diagnostic.contains("BASKET_ID_SECRET"));
+        assert!(!diagnostic.contains("ORDER_ID_SECRET"));
+        assert!(!diagnostic.contains("ACCOUNT_ID_SECRET"));
+    }
+
+    #[test]
+    fn encoded_351_snapshot_decoder_reports_all_supported_price_fields() {
+        let values = [
+            Some(0.0),
+            Some(0.25),
+            Some(12.5),
+            Some(-0.0),
+            Some(f64::from_bits(1)),
+            Some(-1.0),
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+            Some(f64::NEG_INFINITY),
+            Some(1e29),
+            Some(f64::MAX),
+            None,
+        ];
+        for field in ["price", "trigger_price", "avg_fill_price"] {
+            for value in values {
+                let mut row = protocol::RithmicOrderNotification {
+                    template_id: RITHMIC_ORDER_NOTIFICATION,
+                    notify_type: Some(
+                        protocol::rithmic_order_notification::NotifyType::Complete as i32,
+                    ),
+                    is_snapshot: Some(true),
+                    fcm_id: Some("FCM".into()),
+                    ib_id: Some("IB".into()),
+                    account_id: Some("ACCOUNT_ID_SECRET".into()),
+                    basket_id: Some("BASKET_ID_SECRET".into()),
+                    exchange_order_id: Some("ORDER_ID_SECRET".into()),
+                    exchange: Some("CME".into()),
+                    symbol: Some("NQU6".into()),
+                    status: Some("COMPLETE".into()),
+                    transaction_type: Some(
+                        protocol::rithmic_order_notification::TransactionType::Buy as i32,
+                    ),
+                    quantity: Some(1),
+                    ..Default::default()
+                };
+                match field {
+                    "price" => row.price = value,
+                    "trigger_price" => row.trigger_price = value,
+                    _ => row.avg_fill_price = value,
+                }
+                let payload = codec::encode(&row).unwrap();
+                let decoded = decode_order_snapshot_event(
+                    &payload,
+                    "orders",
+                    &AccountIdentity {
+                        fcm_id: "FCM".into(),
+                        ib_id: "IB".into(),
+                        account_id: "ACCOUNT_ID_SECRET".into(),
+                    },
+                );
+                let invalid = value
+                    .is_some_and(|number| number < 0.0 || !number.is_finite() || number >= 1e29);
+                assert_eq!(
+                    decoded.is_err(),
+                    invalid,
+                    "{field} {value:?}: {:?}",
+                    decoded.as_ref().err()
+                );
+                if invalid {
+                    let error = decoded.unwrap_err();
+                    let text = format!("{error:#}");
+                    assert!(
+                        text.contains("template=351 context=snapshot notify_type="),
+                        "{text}"
+                    );
+                    assert!(text.contains(&format!("field={field}")), "{text}");
+                    assert!(
+                        text.contains(&format!("raw_bits=0x{:016x}", value.unwrap().to_bits())),
+                        "{text}"
+                    );
+                    let failure = if !value.unwrap().is_finite() {
+                        "nonfinite"
+                    } else if value.unwrap() < 0.0 {
+                        "negative"
+                    } else {
+                        "decimal_unrepresentable"
+                    };
+                    assert!(text.contains(&format!("failure={failure}")), "{text}");
+                    assert!(
+                        !text.contains("BASKET_ID_SECRET")
+                            && !text.contains("ORDER_ID_SECRET")
+                            && !text.contains("ACCOUNT_ID_SECRET"),
+                        "{text}"
+                    );
+                } else {
+                    let OrderSnapshotEvent::Snapshot(order) = decoded.unwrap() else {
+                        panic!("expected decoded snapshot order")
+                    };
+                    let actual = match field {
+                        "price" => order.price,
+                        "trigger_price" => order.trigger_price,
+                        _ => order.average_fill_price,
+                    };
+                    assert_eq!(
+                        actual,
+                        value.map(|number| Decimal::from_str(&number.to_string()).unwrap()),
+                        "{field} {value:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn encoded_352_snapshot_decoder_matrix_uses_the_real_status_constant() {
+        let status = protocol::exchange_order_notification::NotifyType::Status;
+        let values = [
+            Some(0.0),
+            Some(0.25),
+            Some(12.5),
+            Some(-0.0),
+            Some(f64::from_bits(1)),
+            Some(-1.0),
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+            Some(f64::NEG_INFINITY),
+            Some(1e29),
+            Some(f64::MAX),
+            None,
+        ];
+        for field in ["price", "trigger_price", "avg_fill_price"] {
+            for value in values {
+                let mut row = protocol::ExchangeOrderNotification {
+                    template_id: EXCHANGE_ORDER_NOTIFICATION,
+                    notify_type: Some(status as i32),
+                    is_snapshot: Some(true),
+                    fcm_id: Some("FCM".into()),
+                    ib_id: Some("IB".into()),
+                    account_id: Some("ACCOUNT_ID_SECRET".into()),
+                    basket_id: Some("BASKET_ID_SECRET".into()),
+                    exchange_order_id: Some("ORDER_ID_SECRET".into()),
+                    exchange: Some("CME".into()),
+                    symbol: Some("NQU6".into()),
+                    status: Some("OPEN".into()),
+                    quantity: Some(1),
+                    // 352 snapshot conversion intentionally ignores fill_price.
+                    fill_price: Some(-1.0),
+                    transaction_type: Some(
+                        protocol::exchange_order_notification::TransactionType::Buy as i32,
+                    ),
+                    ..Default::default()
+                };
+                match field {
+                    "price" => row.price = value,
+                    "trigger_price" => row.trigger_price = value,
+                    _ => row.avg_fill_price = value,
+                }
+                let payload = codec::encode(&row).unwrap();
+                let result = decode_order_snapshot_event(
+                    &payload,
+                    "orders",
+                    &AccountIdentity {
+                        fcm_id: "FCM".into(),
+                        ib_id: "IB".into(),
+                        account_id: "ACCOUNT_ID_SECRET".into(),
+                    },
+                );
+                let invalid = value
+                    .is_some_and(|number| number < 0.0 || !number.is_finite() || number >= 1e29);
+                assert_eq!(result.is_err(), invalid, "{field} {value:?}");
+                if invalid {
+                    let error = result.unwrap_err();
+                    let text = format!("{error:#}");
+                    assert!(
+                        text.contains(&format!(
+                            "template=352 context=snapshot notify_type={}({})",
+                            status as i32,
+                            status.as_str_name()
+                        )),
+                        "{text}"
+                    );
+                    assert!(text.contains(&format!("field={field}")), "{text}");
+                    assert!(
+                        text.contains(&format!("raw_bits=0x{:016x}", value.unwrap().to_bits())),
+                        "{text}"
+                    );
+                    let failure = if !value.unwrap().is_finite() {
+                        "nonfinite"
+                    } else if value.unwrap() < 0.0 {
+                        "negative"
+                    } else {
+                        "decimal_unrepresentable"
+                    };
+                    assert!(text.contains(&format!("failure={failure}")), "{text}");
+                    assert!(
+                        !text.contains("BASKET_ID_SECRET")
+                            && !text.contains("ORDER_ID_SECRET")
+                            && !text.contains("ACCOUNT_ID_SECRET"),
+                        "{text}"
+                    );
+                } else {
+                    let OrderSnapshotEvent::Snapshot(order) = result.unwrap() else {
+                        panic!("expected decoded snapshot order")
+                    };
+                    let actual = match field {
+                        "price" => order.price,
+                        "trigger_price" => order.trigger_price,
+                        _ => order.average_fill_price,
+                    };
+                    assert_eq!(
+                        actual,
+                        value.map(|number| Decimal::from_str(&number.to_string()).unwrap()),
+                        "{field} {value:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn encoded_351_history_decoder_reports_supported_price_field_matrix() {
+        let notify = protocol::rithmic_order_notification::NotifyType::Complete;
+        let values = [
+            Some(0.0),
+            Some(0.25),
+            Some(12.5),
+            Some(-0.0),
+            Some(f64::from_bits(1)),
+            Some(-1.0),
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+            Some(f64::NEG_INFINITY),
+            Some(1e29),
+            Some(f64::MAX),
+            None,
+        ];
+        let expected_account = AccountIdentity {
+            fcm_id: "FCM".into(),
+            ib_id: "IB".into(),
+            account_id: "ACCOUNT_ID_SECRET".into(),
+        };
+        for field in ["price", "trigger_price", "avg_fill_price"] {
+            for value in values {
+                let mut row = protocol::RithmicOrderNotification {
+                    template_id: RITHMIC_ORDER_NOTIFICATION,
+                    notify_type: Some(notify as i32),
+                    fcm_id: Some("FCM".into()),
+                    ib_id: Some("IB".into()),
+                    account_id: Some("ACCOUNT_ID_SECRET".into()),
+                    basket_id: Some("BASKET_ID_SECRET".into()),
+                    exchange_order_id: Some("ORDER_ID_SECRET".into()),
+                    exchange: Some("CME".into()),
+                    symbol: Some("NQU6".into()),
+                    status: Some("COMPLETE".into()),
+                    transaction_type: Some(
+                        protocol::rithmic_order_notification::TransactionType::Buy as i32,
+                    ),
+                    quantity: Some(1),
+                    ..Default::default()
+                };
+                match field {
+                    "price" => row.price = value,
+                    "trigger_price" => row.trigger_price = value,
+                    _ => row.avg_fill_price = value,
+                }
+                let payload = codec::encode(&row).unwrap();
+                let result = decode_order_history_event(
+                    &payload,
+                    "history",
+                    &expected_account,
+                    "BASKET_ID_SECRET",
+                );
+                let invalid = value
+                    .is_some_and(|number| number < 0.0 || !number.is_finite() || number >= 1e29);
+                assert_eq!(result.is_err(), invalid, "{field} {value:?}");
+                if invalid {
+                    let error = result.unwrap_err();
+                    let text = format!("{error:#}");
+                    assert!(
+                        text.contains(&format!(
+                            "template=351 context=history notify_type={}({})",
+                            notify as i32,
+                            notify.as_str_name()
+                        )),
+                        "{text}"
+                    );
+                    assert!(text.contains(&format!("field={field}")), "{text}");
+                    assert!(
+                        text.contains(&format!("raw_bits=0x{:016x}", value.unwrap().to_bits())),
+                        "{text}"
+                    );
+                    let failure = if !value.unwrap().is_finite() {
+                        "nonfinite"
+                    } else if value.unwrap() < 0.0 {
+                        "negative"
+                    } else {
+                        "decimal_unrepresentable"
+                    };
+                    assert!(text.contains(&format!("failure={failure}")), "{text}");
+                    assert!(
+                        !text.contains("BASKET_ID_SECRET")
+                            && !text.contains("ORDER_ID_SECRET")
+                            && !text.contains("ACCOUNT_ID_SECRET"),
+                        "{text}"
+                    );
+                } else if let Some(value) = value {
+                    let OrderHistoryEvent::Notification(order) = result.unwrap() else {
+                        panic!("expected decoded history row")
+                    };
+                    let actual = match field {
+                        "price" => order.price,
+                        "trigger_price" => order.trigger_price,
+                        _ => order.average_fill_price,
+                    };
+                    assert_eq!(
+                        actual,
+                        Some(Decimal::from_str(&value.to_string()).unwrap()),
+                        "{field} {value:?}"
+                    );
+                } else {
+                    let OrderHistoryEvent::Notification(order) = result.unwrap() else {
+                        panic!("expected decoded history row")
+                    };
+                    let actual = match field {
+                        "price" => order.price,
+                        "trigger_price" => order.trigger_price,
+                        _ => order.average_fill_price,
+                    };
+                    assert_eq!(actual, None, "{field} absent price must remain absent");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn encoded_snapshot_quantity_failure_reports_presence_and_raw_integer() {
+        for (quantity, expected) in [
+            (Some(0), "present=true raw_i32=0 failure=zero"),
+            (None, "present=false raw_i32=N/A failure=missing"),
+        ] {
+            let payload = codec::encode(&protocol::RithmicOrderNotification {
+                template_id: RITHMIC_ORDER_NOTIFICATION,
+                notify_type: Some(
+                    protocol::rithmic_order_notification::NotifyType::Complete as i32,
+                ),
+                is_snapshot: Some(true),
+                fcm_id: Some("FCM".into()),
+                ib_id: Some("IB".into()),
+                account_id: Some("ACCOUNT_ID_SECRET".into()),
+                basket_id: Some("BASKET_ID_SECRET".into()),
+                exchange_order_id: Some("ORDER_ID_SECRET".into()),
+                exchange: Some("CME".into()),
+                symbol: Some("NQU6".into()),
+                status: Some("COMPLETE".into()),
+                transaction_type: Some(
+                    protocol::rithmic_order_notification::TransactionType::Buy as i32,
+                ),
+                quantity,
+                ..Default::default()
+            })
+            .unwrap();
+            let error = decode_order_snapshot_event(
+                &payload,
+                "orders",
+                &AccountIdentity {
+                    fcm_id: "FCM".into(),
+                    ib_id: "IB".into(),
+                    account_id: "ACCOUNT_ID_SECRET".into(),
+                },
+            )
+            .unwrap_err();
+            let text = format!("{error:#}");
+            assert!(text.contains("field=quantity"), "{text}");
+            assert!(text.contains(expected), "{text}");
+            assert!(
+                !text.contains("ACCOUNT_ID_SECRET")
+                    && !text.contains("BASKET_ID_SECRET")
+                    && !text.contains("ORDER_ID_SECRET"),
+                "{text}"
+            );
+            assert!(
+                text.contains(if quantity.is_some() {
+                    "invalid Rithmic order quantity"
+                } else {
+                    "missing Rithmic order quantity"
+                }),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn encoded_exchange_snapshot_quantity_matrix_reports_352_diagnostics() {
+        let encode_snapshot = |quantity, total_fill_size, total_unfilled_size| {
+            codec::encode(&protocol::ExchangeOrderNotification {
+                template_id: EXCHANGE_ORDER_NOTIFICATION,
+                notify_type: Some(protocol::exchange_order_notification::NotifyType::Status as i32),
+                is_snapshot: Some(true),
+                fcm_id: Some("FCM".into()),
+                ib_id: Some("IB".into()),
+                account_id: Some("ACCOUNT".into()),
+                basket_id: Some("BASKET_ID_SECRET".into()),
+                exchange_order_id: Some("ORDER_ID_SECRET".into()),
+                exchange: Some("CME".into()),
+                symbol: Some("MNQU6".into()),
+                status: Some("COMPLETE".into()),
+                transaction_type: Some(
+                    protocol::exchange_order_notification::TransactionType::Buy as i32,
+                ),
+                quantity,
+                total_fill_size,
+                total_unfilled_size,
+                ..Default::default()
+            })
+            .unwrap()
+        };
+
+        let cases = [
+            (
+                "quantity",
+                None,
+                None,
+                None,
+                "present=false raw_i32=N/A failure=missing",
+                "missing Rithmic order quantity",
+            ),
+            (
+                "quantity",
+                Some(0),
+                None,
+                None,
+                "present=true raw_i32=0 failure=zero",
+                "invalid Rithmic order quantity",
+            ),
+            (
+                "quantity",
+                Some(-2),
+                None,
+                None,
+                "present=true raw_i32=-2 failure=negative",
+                "invalid Rithmic order quantity",
+            ),
+            (
+                "total_fill_size",
+                Some(1),
+                Some(-3),
+                None,
+                "present=true raw_i32=-3 failure=negative",
+                "invalid Rithmic total_fill_size",
+            ),
+            (
+                "total_unfilled_size",
+                Some(1),
+                None,
+                Some(-4),
+                "present=true raw_i32=-4 failure=negative",
+                "invalid Rithmic total_unfilled_size",
+            ),
+        ];
+        for (field, quantity, filled, unfilled, raw, inner) in cases {
+            let payload = encode_snapshot(quantity, filled, unfilled);
+            let error = decode_order_snapshot_event(&payload, "orders", &account()).unwrap_err();
+            let text = format!("{error:#}");
+            assert!(text.contains("template=352 context=snapshot"), "{text}");
+            assert!(text.contains(&format!("field={field}")), "{text}");
+            assert!(text.contains(raw), "{text}");
+            assert!(text.contains(inner), "{text}");
+            assert!(!text.contains("ACCOUNT_ID_SECRET"), "{text}");
+            assert!(!text.contains("BASKET_ID_SECRET"), "{text}");
+            assert!(!text.contains("ORDER_ID_SECRET"), "{text}");
+        }
+
+        for (filled, unfilled) in [(None, None), (Some(0), Some(0))] {
+            let payload = encode_snapshot(Some(5), filled, unfilled);
+            let OrderSnapshotEvent::Snapshot(snapshot) =
+                decode_order_snapshot_event(&payload, "orders", &account()).unwrap()
+            else {
+                panic!("expected decoded 352 snapshot");
+            };
+            assert_eq!(snapshot.quantity, dec!(5));
+            assert_eq!(snapshot.filled_quantity, filled.map(Decimal::from));
+            assert_eq!(snapshot.unfilled_quantity, unfilled.map(Decimal::from));
+        }
+    }
+
+    #[test]
+    fn snapshot_and_history_optional_quantities_keep_zero_absence_and_negative_diagnostics() {
+        for field in ["total_fill_size", "total_unfilled_size"] {
+            for value in [None, Some(0), Some(-1)] {
+                let mut row = protocol::RithmicOrderNotification {
+                    template_id: RITHMIC_ORDER_NOTIFICATION,
+                    notify_type: Some(
+                        protocol::rithmic_order_notification::NotifyType::Open as i32,
+                    ),
+                    is_snapshot: Some(true),
+                    fcm_id: Some("FCM".into()),
+                    ib_id: Some("IB".into()),
+                    account_id: Some("ACCOUNT".into()),
+                    basket_id: Some("BASKET_ID_SECRET".into()),
+                    exchange_order_id: Some("ORDER_ID_SECRET".into()),
+                    exchange: Some("CME".into()),
+                    symbol: Some("NQU6".into()),
+                    status: Some("OPEN".into()),
+                    transaction_type: Some(
+                        protocol::rithmic_order_notification::TransactionType::Buy as i32,
+                    ),
+                    quantity: Some(1),
+                    ..Default::default()
+                };
+                match field {
+                    "total_fill_size" => row.total_fill_size = value,
+                    _ => row.total_unfilled_size = value,
+                }
+                let payload = codec::encode(&row).unwrap();
+                let result = decode_order_snapshot_event(&payload, "orders", &account());
+                assert_eq!(
+                    result.is_err(),
+                    value == Some(-1),
+                    "{field} {value:?}: {:?}",
+                    result.as_ref().err()
+                );
+                if value == Some(-1) {
+                    let text = format!("{:#}", result.unwrap_err());
+                    assert!(
+                        text.contains(&format!(
+                            "field={field} present=true raw_i32=-1 failure=negative"
+                        )),
+                        "{text}"
+                    );
+                    assert!(text.contains("template=351 context=snapshot"), "{text}");
+                    assert!(!text.contains("ACCOUNT_ID_SECRET"), "{text}");
+                } else {
+                    let OrderSnapshotEvent::Snapshot(order) = result.unwrap() else {
+                        panic!("expected snapshot order")
+                    };
+                    let actual = if field == "total_fill_size" {
+                        order.filled_quantity
+                    } else {
+                        order.unfilled_quantity
+                    };
+                    assert_eq!(actual, value.map(Decimal::from));
+                }
+
+                let mut history = protocol::RithmicOrderNotification {
+                    is_snapshot: None,
+                    ..row
+                };
+                match field {
+                    "total_fill_size" => history.total_fill_size = value,
+                    _ => history.total_unfilled_size = value,
+                }
+                let payload = codec::encode(&history).unwrap();
+                let result =
+                    decode_order_history_event(&payload, "history", &account(), "BASKET_ID_SECRET");
+                assert_eq!(
+                    result.is_err(),
+                    value == Some(-1),
+                    "history {field} {value:?}"
+                );
+                if value == Some(-1) {
+                    let text = format!("{:#}", result.unwrap_err());
+                    assert!(
+                        text.contains(&format!(
+                            "field={field} present=true raw_i32=-1 failure=negative"
+                        )),
+                        "{text}"
+                    );
+                    assert!(text.contains("template=351 context=history"), "{text}");
+                    assert!(!text.contains("ACCOUNT_ID_SECRET"), "{text}");
+                } else {
+                    let OrderHistoryEvent::Notification(order) = result.unwrap() else {
+                        panic!("expected history notification")
+                    };
+                    let actual = if field == "total_fill_size" {
+                        order.filled_quantity
+                    } else {
+                        order.unfilled_quantity
+                    };
+                    assert_eq!(actual, value.map(Decimal::from));
+                }
+            }
+        }
     }
 
     #[test]

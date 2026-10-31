@@ -162,6 +162,21 @@ pub(crate) fn optional_quantity_with_diagnostic(
     })
 }
 
+pub(crate) fn required_quantity_with_diagnostic(
+    value: Option<i32>,
+    field: &str,
+    diagnostic_field: &str,
+    context: NumericFieldContext,
+) -> Result<Decimal> {
+    let Some(raw) = value else {
+        return Err(anyhow::anyhow!("missing Rithmic {field}").context(
+            QuantityFieldDiagnostic::new(context, diagnostic_field, None, "missing"),
+        ));
+    };
+    optional_quantity_with_diagnostic(Some(raw), field, diagnostic_field, true, context)
+        .map(|v| v.expect("required quantity is present"))
+}
+
 impl NumericFieldDiagnostic {
     fn new(
         value: f64,
