@@ -232,6 +232,7 @@ def test_candidate_rejects_mixed_or_invalid_entry_before_run_directory(tmp_path:
     assert not (tmp_path / run.run_id).exists()
 
 
+@pytest.mark.slow
 def test_candidate_generic_failure_keeps_diagnostic_chain_and_durable_unknown_priority(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
 ):
