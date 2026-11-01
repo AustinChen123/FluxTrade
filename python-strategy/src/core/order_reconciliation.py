@@ -568,6 +568,43 @@ class OrderReconciler:
                     ),
                 )
 
+            if (
+                terminal_status in {OrderStatus.CANCELLED, OrderStatus.FAILED}
+                and order.type in {"stop_loss", "take_profit", "trailing_stop"}
+                and type(snapshot.filled_quantity) is Decimal
+                and snapshot.filled_quantity == 0
+                and (order.filled_quantity or Decimal("0")) == 0
+            ):
+                # Route authoritative zero-fill protective terminals through
+                # the shared applier. It owns the one classifier and any alert.
+                applied = self.process_exchange_order_event(
+                    exchange_snapshot_to_order_event(order.product_id, snapshot),
+                    allow_remote_side_effects=False,
+                )
+                action = str(applied.get("action", "unresolved_event_application"))
+                if action in {"applied", "applied_position_cache_failed"}:
+                    self._mark_reconciled(order)
+                    return self._repair_result(
+                        (
+                            action
+                            if action == "applied_position_cache_failed"
+                            else self._terminal_repair_action(terminal_status)
+                        ),
+                        reason=self._terminal_no_delta_reason(
+                            normalized_status,
+                            fill_state,
+                        ),
+                    )
+                self._mark_reconciled(order)
+                return self._repair_result(
+                    action,
+                    reason=str(applied.get("failure") or action),
+                    unresolved=action.startswith("unresolved_")
+                    or action in {"unknown_order", "unknown_status"},
+                    verification_blocked=action
+                    in {"unknown_order", "unknown_status"},
+                )
+
             order.status = terminal_status.value
             self.order_manager.repo.update_order(order)
             if terminal_status in {OrderStatus.CANCELLED, OrderStatus.FAILED}:

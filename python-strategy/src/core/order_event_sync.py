@@ -8,6 +8,12 @@ from src.core.interfaces.exchange import ExchangeOrderEvent
 from src.core.models import OrderStatus
 from src.core.order_manager import PositionCachePersistenceError
 from src.core.notifications import NotificationSink
+from src.core.protection_alerts import ProtectionAlert
+from src.core.protection_observation import (
+    Application as ProtectionApplication,
+    ProtectionObservation,
+    TerminalValidity as ProtectionTerminalValidity,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +52,11 @@ class OrderEventApplier:
         remote_follow_up_required: Callable[[object, str], bool] | None = None,
         on_position_cache_failure: Callable[[], None] | None = None,
         notification_sink: NotificationSink | None = None,
+        protection_observation_for_terminal: Callable[
+            [object, ExchangeOrderEvent, str, Decimal],
+            tuple[ProtectionObservation, ProtectionAlert | None] | None,
+        ]
+        | None = None,
     ) -> None:
         self.order_manager = order_manager
         self.journal_fill = journal_fill
@@ -68,6 +79,9 @@ class OrderEventApplier:
         )
         self.on_position_cache_failure = on_position_cache_failure or (lambda: None)
         self.notification_sink = notification_sink
+        self.protection_observation_for_terminal = (
+            protection_observation_for_terminal
+        )
 
     def process_exchange_order_event(
         self,
@@ -220,25 +234,61 @@ class OrderEventApplier:
             cache_degraded = False
             self._apply_exchange_order_event_status(order, event_state, event)
 
+        protection_alert: ProtectionAlert | None = None
         if terminal_failure_state:
             if fill_delta["quantity"] > 0:
                 self.fail_pending_conditionals_for_terminal_entry(order)
-            protective_failure = self.protective_terminal_without_fill_failure(order)
-            if protective_failure is not None:
-                self.write_conditional_warning(
-                    event_subtype="protective_order_terminal_without_fill",
-                    order=order,
-                    failures=[protective_failure],
-                )
-                return {
-                    "action": "unresolved_protective_terminal_without_fill",
-                    "order_id": order.id,
-                    "status": event.status,
-                    "state": event_state,
-                    "fill_quantity": fill_delta["quantity"],
-                    "exchange_order_id": order.exchange_order_id,
-                    "failure": protective_failure,
-                }
+            else:
+                invalid_protection_observation = False
+                try:
+                    classified = (
+                        self.protection_observation_for_terminal(
+                            order, event, event_state, fill_delta["quantity"]
+                        )
+                        if self.protection_observation_for_terminal is not None
+                        else None
+                    )
+                except Exception:
+                    # Preserve the legacy terminal failure path if classification
+                    # evidence cannot be resolved.
+                    classified = None
+                if classified is not None:
+                    observation, protection_alert = classified
+                    if (
+                        observation.terminal_validity
+                        is ProtectionTerminalValidity.VALID
+                        and observation.application is ProtectionApplication.SAFE_APPLIED
+                    ):
+                        pass
+                    else:
+                        invalid_protection_observation = (
+                            observation.reason == "invalid_lineage"
+                        )
+                        protection_alert = None
+                        classified = None
+                if classified is None:
+                    protective_failure = (
+                        self.protective_terminal_without_fill_failure(order)
+                    )
+                    if invalid_protection_observation and protective_failure is None:
+                        protective_failure = {
+                            "reason": "invalid_protective_terminal_observation"
+                        }
+                    if protective_failure is not None:
+                        self.write_conditional_warning(
+                            event_subtype="protective_order_terminal_without_fill",
+                            order=order,
+                            failures=[protective_failure],
+                        )
+                        return {
+                            "action": "unresolved_protective_terminal_without_fill",
+                            "order_id": order.id,
+                            "status": event.status,
+                            "state": event_state,
+                            "fill_quantity": fill_delta["quantity"],
+                            "exchange_order_id": order.exchange_order_id,
+                            "failure": protective_failure,
+                        }
 
         # Post-fill actions key off persisted state, not the event delta:
         # a replayed event (crash recovery, resync, duplicate stream message)
@@ -315,7 +365,7 @@ class OrderEventApplier:
                     "failure": cancel_failure,
                 }
 
-        return {
+        result = {
             "action": self._applied_action(cache_degraded),
             "order_id": order.id,
             "status": event.status,
@@ -323,6 +373,14 @@ class OrderEventApplier:
             "fill_quantity": fill_delta["quantity"],
             "exchange_order_id": order.exchange_order_id,
         }
+        if protection_alert is not None and self.notification_sink is not None:
+            try:
+                self.notification_sink.emit(protection_alert)
+            except Exception:
+                # Notification delivery is best effort and never changes the
+                # already-applied trading outcome.
+                pass
+        return result
 
     @staticmethod
     def _applied_action(cache_degraded: bool) -> str:

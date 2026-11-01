@@ -1,9 +1,13 @@
 from collections.abc import Callable
+from decimal import Decimal
+from typing import cast
 from unittest.mock import MagicMock
 
 import pytest
 
 from src.core.generic_order_event_stream import GenericOrderEventStream
+from src.core.execution import ExecutionEngine
+from src.core.interfaces.exchange import ExchangeOrderEvent
 
 _APPLIED = {"action": "applied"}
 
@@ -60,6 +64,7 @@ def _service(
     adapter: object,
     stop_event: _StopEvent | None = None,
     process_result: object = _APPLIED,
+    processor: Callable[[object], object] | None = None,
     recoverable_orders_loader: Callable[[], list[object]] = list,
 ):
     current = {"adapter": adapter, "worker": None}
@@ -75,7 +80,7 @@ def _service(
 
     def process_event(value: object) -> object:
         events.append(f"process:{value}")
-        return process_result
+        return processor(value) if processor is not None else process_result
 
     service = GenericOrderEventStream(
         adapter_loader=lambda: current["adapter"],
@@ -131,6 +136,106 @@ def test_start_preserves_worker_metadata_fences_and_dispatch_order() -> None:
     ]
     assert current["worker"].name == "exchange-order-events"
     assert current["worker"].daemon is True
+
+
+def test_safe_zero_fill_terminal_result_does_not_latch_generic_stream() -> None:
+    events: list[str] = []
+    adapter = MagicMock()
+    adapter.start_order_event_stream.return_value = None
+    event = ExchangeOrderEvent(
+        status="canceled",
+        product_id="BTC/USDT",
+        client_order_id="protective-sl",
+        exchange_order_id="exchange-sl",
+        cumulative_filled_quantity=Decimal("0"),
+    )
+    adapter.poll_order_event.side_effect = [event, None]
+    service, _current, stop_event, logger = _service(events, adapter=adapter)
+
+    def process_event(value: object) -> object:
+        assert value is event
+        stop_event.set()
+        return {"action": "applied"}
+
+    service._process_event = process_event
+    service.start()
+
+    assert stop_event.is_set()
+    assert "latch" not in events
+    assert "halt" not in events
+    logger.error.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["canceled", "cancelled", "rejected", "expired", "expired_in_match", "failed"],
+)
+def test_terminal_aliases_use_real_shared_applier_without_stream_halt(
+    status,
+    mock_db_session,
+    mock_clock,
+    mock_exchange_adapter,
+    mock_order_repo,
+    signal_factory,
+) -> None:
+    engine = ExecutionEngine(
+        db_session=mock_db_session,
+        clock=mock_clock,
+        adapter=mock_exchange_adapter,
+        order_repository=mock_order_repo,
+        is_backtest=True,
+    )
+    entry_id = engine.execute_signal(
+        signal_factory(
+            price=Decimal("42000"),
+            stop_loss=Decimal("41000"),
+            take_profit=Decimal("43000"),
+        )
+    )
+    entry = mock_order_repo.orders[entry_id]
+    engine.process_exchange_order_event(
+        ExchangeOrderEvent(
+            status="filled",
+            product_id=entry.product_id,
+            exchange_order_id=entry.exchange_order_id,
+            cumulative_filled_quantity=entry.quantity,
+            cumulative_average_price=entry.price,
+        )
+    )
+    stop_loss = next(
+        order for order in mock_order_repo.orders.values() if order.type == "stop_loss"
+    )
+    entry.intent_payload["system_placed_protection"] = "SL"
+    entry.intent_payload["system_placed_protection_revision"] = "strategy-r7"
+    event = ExchangeOrderEvent(
+        status=status,
+        product_id=stop_loss.product_id,
+        exchange_order_id=stop_loss.exchange_order_id,
+        cumulative_filled_quantity=Decimal("0"),
+    )
+    stop_event = _StopEvent([])
+    adapter = MagicMock()
+    adapter.start_order_event_stream.return_value = None
+    adapter.poll_order_event.side_effect = [event, None]
+    events: list[str] = []
+    service, _current, stop_event, logger = _service(
+        events,
+        adapter=adapter,
+        stop_event=stop_event,
+        processor=lambda value: engine.process_exchange_order_event(
+            cast(ExchangeOrderEvent, value)
+        ),
+    )
+
+    service.start()
+
+    expected_status = (
+        "CANCELLED" if status in {"canceled", "cancelled"} else "failed"
+    )
+    assert stop_loss.status == expected_status
+    assert "latch" not in events
+    assert "halt" not in events
+    logger.error.assert_not_called()
 
 
 def test_start_restores_current_orders_before_provider_stream_and_poll() -> None:
