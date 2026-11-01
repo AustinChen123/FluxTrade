@@ -229,3 +229,18 @@ def test_success_preserves_exact_reconnect_order() -> None:
         "leadership",
         "resume",
     ]
+
+
+def test_safe_zero_fill_terminal_repair_allows_reconnect_resume() -> None:
+    service, dependencies = _service(generation=2)
+    dependencies.reconcile_owned_orders.return_value = {
+        "recoverable_count": 1,
+        "auto_resume_safe": True,
+        "results": [{"repair_action": "applied", "unresolved": False}],
+    }
+
+    assert service.reconcile_if_needed() is True
+
+    dependencies.reconcile_owned_orders.assert_called_once_with("profile", "ACCOUNT")
+    dependencies.adapter.start_order_event_stream.assert_called_once_with()
+    dependencies.resume_after_reconcile.assert_called_once_with()

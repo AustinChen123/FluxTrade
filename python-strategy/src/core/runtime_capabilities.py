@@ -12,6 +12,7 @@ from src.core.interfaces.conditional_orders import (
 )
 from src.core.interfaces.exchange import ExchangeOrderEvent
 from src.core.models import Candlestick, Signal
+from src.core.notifications import NotificationSink
 
 if TYPE_CHECKING:
     from src.core.execution import ExecutionEngine, ExitDecision
@@ -307,6 +308,7 @@ class RuntimeCapabilitiesFactory(Protocol):
         stop_event: threading.Event,
         callbacks: RuntimeCallbacks,
         logger: logging.Logger,
+        notification_sink: NotificationSink | None,
     ) -> RuntimeCapabilities: ...
 
 

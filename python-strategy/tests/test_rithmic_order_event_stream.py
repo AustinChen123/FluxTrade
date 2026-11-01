@@ -1,3 +1,4 @@
+from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -7,6 +8,7 @@ from src.core.adapters.rithmic_order_event_stream import (
     RithmicOrderEventStreamService,
 )
 from src.core.adapters.rithmic_adapter import RithmicUnmappedOrderEvent
+from src.core.interfaces.exchange import ExchangeOrderEvent
 
 
 def _service(adapter, **overrides):
@@ -124,8 +126,14 @@ def test_empty_poll_waits_without_processing() -> None:
     dependencies["stop_event"].wait.assert_called_once_with(0.05)
 
 
-def test_applied_event_completes_without_lockdown() -> None:
-    event = SimpleNamespace(product_id="RITHMIC:NQ-202609")
+def test_safe_zero_fill_terminal_application_completes_without_lockdown() -> None:
+    event = ExchangeOrderEvent(
+        status="canceled",
+        product_id="RITHMIC:NQ-202609",
+        client_order_id="protective-sl",
+        exchange_order_id="exchange-sl",
+        cumulative_filled_quantity=Decimal("0"),
+    )
     adapter = MagicMock()
     adapter.poll_order_event.return_value = event
     owner, dependencies = _service(

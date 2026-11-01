@@ -54,6 +54,16 @@ class IOrderRepository(ABC):
         """
         return []
 
+    def list_declared_protection_history_orders(
+        self,
+        *,
+        account_profile: str | None,
+        account_id: str | None,
+        exchange_id: str,
+    ) -> list[Order]:
+        """Return declared entry parents and linked children at any status."""
+        return []
+
     def list_orders_by_statuses(
         self,
         statuses: set[str],

@@ -187,6 +187,32 @@ def _load_error(result: dict) -> str:
 
 
 class TestProductionSources:
+    @pytest.mark.parametrize("declaration", ["NONE", "SL", "TP", "SL+TP"])
+    def test_catalog_protection_declaration_is_exposed_with_catalog_revision(
+        self, tmp_path, declaration
+    ):
+        _write_catalog(tmp_path, system_placed_protection=declaration)
+        catalog_path = tmp_path / StrategyLoader.CATALOG_NAME
+        catalog_revision = hashlib.sha256(catalog_path.read_bytes()).hexdigest()
+
+        strategy = _strategy_class(
+            StrategyLoader.scan_directory(str(tmp_path))["stable_strategy_v1"]
+        )
+
+        assert (
+            getattr(strategy, "__fluxtrade_system_placed_protection__")
+            == declaration
+        )
+        assert getattr(strategy, "__fluxtrade_catalog_sha256__") == catalog_revision
+
+    @pytest.mark.parametrize("declaration", ["", "NO", "STOP", None, 1])
+    def test_catalog_rejects_invalid_protection_declaration(self, tmp_path, declaration):
+        _write_catalog(tmp_path, system_placed_protection=declaration)
+
+        error = _load_error(StrategyLoader.scan_directory(str(tmp_path)))
+
+        assert "system_placed_protection" in error
+
     def test_empty_read_only_primary_has_no_legacy_fallback(self, tmp_path):
         with _read_only_tree(tmp_path):
             assert StrategyLoader.scan_production_sources(str(tmp_path)) == {}

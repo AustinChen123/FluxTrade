@@ -1,3 +1,4 @@
+import logging
 from dataclasses import dataclass
 from decimal import Decimal
 from importlib import import_module
@@ -96,6 +97,8 @@ class _SnapshotLoader(Protocol):
 
 _T = TypeVar("_T")
 
+_LOGGER = logging.getLogger("RithmicAdapter")
+
 
 @dataclass(frozen=True)
 class RithmicRecoveryItem:
@@ -132,15 +135,25 @@ def load_rithmic_recovery_snapshot(
             basket_ids.add(str(parent_basket_id))
     basket_ids = sorted(basket_ids)
     if not basket_ids:
-        return loader(profile, account_id)
+        try:
+            return loader(profile, account_id)
+        except Exception as error:
+            diagnostic = getattr(error, "diagnostic", None)
+            _LOGGER.warning("Rithmic ledger snapshot failed%s", f": {diagnostic}" if diagnostic else "")
+            raise
     start_seconds = max(0, min(int(order.timestamp) for order in orders) // 1000 - 1)
-    return loader(
-        profile,
-        account_id,
-        recovery_basket_ids=basket_ids,
-        fill_start_index=start_seconds,
-        fill_finish_index=now_seconds + 1,
-    )
+    try:
+        return loader(
+            profile,
+            account_id,
+            recovery_basket_ids=basket_ids,
+            fill_start_index=start_seconds,
+            fill_finish_index=now_seconds + 1,
+        )
+    except Exception as error:
+        diagnostic = getattr(error, "diagnostic", None)
+        _LOGGER.warning("Rithmic ledger snapshot failed%s", f": {diagnostic}" if diagnostic else "")
+        raise
 
 
 def build_rithmic_recovery_plan(
@@ -453,6 +466,7 @@ def _classify_order(
         ),
         cumulative_filled_quantity=cumulative_quantity,
         cumulative_average_price=cumulative_average,
+        protection_alert_source="repair_snapshot",
         event_timestamp=(
             remote.timestamp_ms
             if remote is not None

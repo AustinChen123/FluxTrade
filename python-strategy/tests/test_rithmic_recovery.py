@@ -1046,6 +1046,46 @@ def test_default_snapshot_loader_resolves_the_native_extension_export(monkeypatc
     loader.assert_called_once_with("test", "ACCOUNT")
 
 
+@pytest.mark.parametrize("with_basket", [False, True])
+def test_snapshot_loader_logs_typed_numeric_diagnostic_at_warning(caplog, with_basket):
+    diagnostic = (
+        "rithmic_numeric_validation template=351 context=history notify_type=2(STATUS) "
+        "field=price present=true raw_bits=0xbff0000000000000 value=-1 "
+        "failure=negative identity=basket#0123456789abcdef order#absent"
+    )
+    diagnostic_error = RuntimeError(diagnostic)
+    setattr(diagnostic_error, "diagnostic", diagnostic)
+    loader = Mock(side_effect=diagnostic_error)
+    orders = [local_order(exchange_order_id="synthetic-basket")] if with_basket else []
+
+    with caplog.at_level(logging.WARNING, logger="RithmicAdapter"):
+        with pytest.raises(RuntimeError, match="rithmic_numeric_validation"):
+            load_rithmic_recovery_snapshot("test", "ACCOUNT", orders, 1_700_000_200, loader)
+
+    assert any(
+        record.levelno >= logging.WARNING and diagnostic in record.getMessage()
+        for record in caplog.records
+    )
+    assert "BASKET_ID_SECRET" not in caplog.text
+    assert "ORDER_ID_SECRET" not in caplog.text
+    assert "ACCOUNT_ID_SECRET" not in caplog.text
+
+
+@pytest.mark.parametrize("with_basket", [False, True])
+def test_snapshot_warning_never_logs_untrusted_exception_text(caplog, with_basket):
+    sentinels = "ACCOUNT_ID_SECRET_123 BASKET_ID_SECRET_123 USER_SECRET_123 CREDENTIAL_SECRET_123"
+    error = RuntimeError(sentinels)
+    orders = [local_order(exchange_order_id="synthetic-basket")] if with_basket else []
+    loader = Mock(side_effect=error)
+    with caplog.at_level(logging.WARNING, logger="RithmicAdapter"):
+        with pytest.raises(RuntimeError) as caught:
+            load_rithmic_recovery_snapshot("test", "ACCOUNT", orders, 1_700_000_200, loader)
+    assert caught.value is error
+    warnings = [record for record in caplog.records if record.levelno >= logging.WARNING]
+    assert warnings
+    assert all(sentinel not in record.getMessage() for record in warnings for sentinel in sentinels.split())
+
+
 def test_snapshot_loader_includes_persisted_native_parent_basket():
     loader = Mock(return_value=snapshot())
     child = local_order(
@@ -1352,6 +1392,52 @@ def test_reconciler_applies_owned_event_without_remote_side_effects_and_audits(
         "completed",
     ]
     assert db.commit.call_count == 2
+
+
+def test_owned_zero_fill_terminal_safe_application_keeps_recovery_resumable():
+    order = local_order(
+        type="stop_loss",
+        side="sell",
+        status="SUBMITTED",
+        filled_quantity=Decimal("0"),
+        intent_payload={"pending_entry_order_id": "entry-1"},
+    )
+    repo = MagicMock()
+    repo.list_client_orders_by_statuses.return_value = [order]
+    processor = Mock(return_value={"action": "applied"})
+    reconciler = owned_reconciler(
+        adapter=MagicMock(),
+        order_manager=SimpleNamespace(repo=repo),
+        clock=SimpleNamespace(now=lambda: 1_700_000_200),
+        db_session_factory=lambda: nullcontext(MagicMock()),
+        process_exchange_order_event=processor,
+        place_pending_protection_for_filled_entries=Mock(),
+        fail_pending_conditionals_for_terminal_entry=Mock(),
+        protective_terminal_without_fill_failure=Mock(),
+        cancel_protective_order_when_sibling_closed=Mock(),
+        cancel_linked_conditional_for_protection_fill=Mock(),
+        local_positions_loader=lambda: [],
+    )
+    remote = remote_order(
+        status="CANCELLED",
+        notification_type="CANCEL",
+        transaction_type="SELL",
+        filled_quantity="0",
+        unfilled_quantity="2",
+    )
+
+    result = reconciler.reconcile(
+        snapshot_loader=Mock(return_value=snapshot(orders=[remote])),
+    )
+
+    processor.assert_called_once()
+    assert processor.call_args.kwargs == {"allow_remote_side_effects": False}
+    applied_event = processor.call_args.args[0]
+    assert applied_event.status == "cancelled"
+    assert applied_event.cumulative_filled_quantity == Decimal("0")
+    assert result["unresolved_count"] == 0
+    assert result["verification_blocked_count"] == 0
+    assert result["auto_resume_safe"] is True
 
 
 @pytest.mark.parametrize(

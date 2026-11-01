@@ -1266,7 +1266,9 @@ class TestOrderTypeDetection:
         assert len(mock_exchange_adapter.open_orders) == 1
         assert mock_exchange_adapter.open_orders[0].type == "limit"
         assert mock_exchange_adapter.open_orders[0].intent_payload == {
-            "legacy_price_source": "signal.value"
+            "legacy_price_source": "signal.value",
+            "system_placed_protection": "UNDECLARED",
+            "system_placed_protection_revision": None,
         }
 
     def test_signal_without_price_creates_market(
@@ -9172,7 +9174,7 @@ class TestAuditedExecution:
         )
         return engine, entry, stop_loss, take_profit
 
-    def test_protective_cancel_without_fill_reports_gap(
+    def test_undeclared_protective_cancel_is_applied_without_alert(
         self,
         mock_db_session,
         mock_clock,
@@ -9180,8 +9182,380 @@ class TestAuditedExecution:
         mock_order_repo,
         signal_factory,
     ):
-        """A stop_loss cancelled with zero fill while entry is filled → unresolved gap."""
+        """An undeclared zero-fill protective terminal applies without a gap."""
         engine, entry, stop_loss, take_profit = self._setup_engine_with_filled_entry(
+            mock_db_session,
+            mock_clock,
+            mock_exchange_adapter,
+            mock_order_repo,
+            signal_factory,
+        )
+
+        result = engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="canceled",
+                product_id=stop_loss.product_id,
+                exchange_order_id=stop_loss.exchange_order_id,
+                cumulative_filled_quantity=Decimal("0"),
+            )
+        )
+
+        assert result["action"] == "applied"
+        assert stop_loss.status == OrderStatus.CANCELLED.value
+        assert take_profit.status == OrderStatus.SUBMITTED.value
+        assert not any(
+            isinstance(call.args[0], SystemEvent)
+            and call.args[0].event_subtype == "protective_order_terminal_without_fill"
+            for call in mock_db_session.add.call_args_list
+        )
+
+    @pytest.mark.parametrize(
+        ("declaration", "child_type"),
+        [
+            ("SL", "stop_loss"),
+            ("TP", "take_profit"),
+            ("SL+TP", "stop_loss"),
+            ("SL+TP", "take_profit"),
+        ],
+    )
+    def test_declared_missing_leg_is_applied_and_enqueued_once(
+        self,
+        declaration,
+        child_type,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        signal_factory,
+    ):
+        engine, entry, stop_loss, take_profit = self._setup_engine_with_filled_entry(
+            mock_db_session,
+            mock_clock,
+            mock_exchange_adapter,
+            mock_order_repo,
+            signal_factory,
+        )
+        entry.intent_payload["system_placed_protection"] = declaration
+        entry.intent_payload["system_placed_protection_revision"] = "strategy-r7"
+        mock_db_session.get.reset_mock()
+        mock_db_session.get.side_effect = AssertionError(
+            "existing exposure must use its immutable entry snapshot"
+        )
+        sink = MagicMock()
+        engine._order_event_applier.notification_sink = sink
+        child = stop_loss if child_type == "stop_loss" else take_profit
+
+        result = engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="canceled",
+                product_id=child.product_id,
+                exchange_order_id=child.exchange_order_id,
+                cumulative_filled_quantity=Decimal("0"),
+            )
+        )
+
+        assert result["action"] == "applied"
+        sink.emit.assert_called_once()
+        alert = sink.emit.call_args.args[0]
+        assert alert.entry_declaration == declaration
+        assert alert.declaration_revision == "strategy-r7"
+        assert alert.entry_id == str(entry.id)
+        assert alert.order_id == str(child.id)
+        assert dict(alert.diagnostics)["source"] == "live_event"
+
+    @pytest.mark.parametrize("linked_order_id", [7, [], {}, ""])
+    def test_malformed_persisted_sibling_link_keeps_unresolved_action(
+        self,
+        linked_order_id,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        signal_factory,
+    ):
+        engine, entry, stop_loss, _take_profit = self._setup_engine_with_filled_entry(
+            mock_db_session,
+            mock_clock,
+            mock_exchange_adapter,
+            mock_order_repo,
+            signal_factory,
+        )
+        entry.intent_payload["system_placed_protection"] = "SL"
+        entry.intent_payload["system_placed_protection_revision"] = "strategy-r7"
+        stop_loss.intent_payload["linked_order_id"] = linked_order_id
+        sink = MagicMock()
+        engine._order_event_applier.notification_sink = sink
+
+        result = engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="canceled",
+                product_id=stop_loss.product_id,
+                exchange_order_id=stop_loss.exchange_order_id,
+                cumulative_filled_quantity=Decimal("0"),
+            )
+        )
+
+        assert result["action"] == "unresolved_protective_terminal_without_fill"
+        sink.emit.assert_not_called()
+
+    @pytest.mark.parametrize("invalid_side", ["unknown", "buy"])
+    def test_unknown_or_entry_side_protective_child_stays_unresolved(
+        self,
+        invalid_side,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        signal_factory,
+    ):
+        engine, entry, stop_loss, _take_profit = self._setup_engine_with_filled_entry(
+            mock_db_session,
+            mock_clock,
+            mock_exchange_adapter,
+            mock_order_repo,
+            signal_factory,
+        )
+        entry.intent_payload["system_placed_protection"] = "SL"
+        entry.intent_payload["system_placed_protection_revision"] = "strategy-r7"
+        stop_loss.side = invalid_side
+        sink = MagicMock()
+        engine._order_event_applier.notification_sink = sink
+
+        result = engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="canceled",
+                product_id=stop_loss.product_id,
+                exchange_order_id=stop_loss.exchange_order_id,
+                cumulative_filled_quantity=Decimal("0"),
+            )
+        )
+
+        assert result["action"] == "unresolved_protective_terminal_without_fill"
+        sink.emit.assert_not_called()
+
+    def test_sibling_on_entry_side_keeps_unresolved_action(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        signal_factory,
+    ):
+        engine, entry, stop_loss, take_profit = self._setup_engine_with_filled_entry(
+            mock_db_session,
+            mock_clock,
+            mock_exchange_adapter,
+            mock_order_repo,
+            signal_factory,
+        )
+        entry.intent_payload["system_placed_protection"] = "SL+TP"
+        entry.intent_payload["system_placed_protection_revision"] = "strategy-r7"
+        take_profit.side = entry.side
+        sink = MagicMock()
+        engine._order_event_applier.notification_sink = sink
+
+        result = engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="canceled",
+                product_id=stop_loss.product_id,
+                exchange_order_id=stop_loss.exchange_order_id,
+                cumulative_filled_quantity=Decimal("0"),
+            )
+        )
+
+        assert result["action"] == "unresolved_protective_terminal_without_fill"
+        sink.emit.assert_not_called()
+
+    def test_invalid_sibling_relationship_cannot_be_hidden_by_filled_row(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        signal_factory,
+    ):
+        engine, entry, stop_loss, take_profit = self._setup_engine_with_filled_entry(
+            mock_db_session,
+            mock_clock,
+            mock_exchange_adapter,
+            mock_order_repo,
+            signal_factory,
+        )
+        entry.intent_payload["system_placed_protection"] = "SL"
+        entry.intent_payload["system_placed_protection_revision"] = "strategy-r7"
+        stop_loss.intent_payload["linked_order_id"] = str(take_profit.id)
+        take_profit.intent_payload["linked_order_id"] = "unrelated-child"
+        take_profit.status = OrderStatus.FILLED.value
+        sink = MagicMock()
+        engine._order_event_applier.notification_sink = sink
+
+        result = engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="canceled",
+                product_id=stop_loss.product_id,
+                exchange_order_id=stop_loss.exchange_order_id,
+                cumulative_filled_quantity=Decimal("0"),
+            )
+        )
+
+        assert result["action"] == "unresolved_protective_terminal_without_fill"
+        sink.emit.assert_not_called()
+
+    def test_absent_optional_sibling_link_remains_valid(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        signal_factory,
+    ):
+        engine, entry, stop_loss, _take_profit = self._setup_engine_with_filled_entry(
+            mock_db_session,
+            mock_clock,
+            mock_exchange_adapter,
+            mock_order_repo,
+            signal_factory,
+        )
+        entry.intent_payload["system_placed_protection"] = "SL"
+        entry.intent_payload["system_placed_protection_revision"] = "strategy-r7"
+        stop_loss.intent_payload.pop("linked_order_id")
+        sink = MagicMock()
+        engine._order_event_applier.notification_sink = sink
+
+        result = engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="canceled",
+                product_id=stop_loss.product_id,
+                exchange_order_id=stop_loss.exchange_order_id,
+                cumulative_filled_quantity=Decimal("0"),
+            )
+        )
+
+        assert result["action"] == "applied"
+        sink.emit.assert_called_once()
+
+    def test_expired_in_match_alias_uses_applier_normalized_state(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        signal_factory,
+    ):
+        engine, entry, stop_loss, _take_profit = self._setup_engine_with_filled_entry(
+            mock_db_session,
+            mock_clock,
+            mock_exchange_adapter,
+            mock_order_repo,
+            signal_factory,
+        )
+        entry.intent_payload["system_placed_protection"] = "SL"
+        entry.intent_payload["system_placed_protection_revision"] = "strategy-r7"
+        sink = MagicMock()
+        engine._order_event_applier.notification_sink = sink
+
+        result = engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="expired_in_match",
+                product_id=stop_loss.product_id,
+                exchange_order_id=stop_loss.exchange_order_id,
+                cumulative_filled_quantity=Decimal("0"),
+            )
+        )
+
+        assert result["action"] == "applied"
+        assert result["state"] == "expired"
+        sink.emit.assert_called_once()
+
+    @pytest.mark.parametrize(
+        ("declaration", "child_type", "flat_exposure"),
+        [
+            ("NONE", "stop_loss", False),
+            ("SL", "take_profit", False),
+            ("SL", "stop_loss", True),
+        ],
+    )
+    def test_valid_zero_fill_without_open_declared_leg_has_no_alert(
+        self,
+        declaration,
+        child_type,
+        flat_exposure,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        signal_factory,
+    ):
+        engine, entry, stop_loss, take_profit = self._setup_engine_with_filled_entry(
+            mock_db_session,
+            mock_clock,
+            mock_exchange_adapter,
+            mock_order_repo,
+            signal_factory,
+        )
+        entry.intent_payload["system_placed_protection"] = declaration
+        entry.intent_payload["system_placed_protection_revision"] = "strategy-r7"
+        if flat_exposure:
+            engine._position_loader = lambda _strategy_id, _product_id: None
+        sink = MagicMock()
+        engine._order_event_applier.notification_sink = sink
+        child = stop_loss if child_type == "stop_loss" else take_profit
+
+        result = engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="canceled",
+                product_id=child.product_id,
+                exchange_order_id=child.exchange_order_id,
+                cumulative_filled_quantity=Decimal("0"),
+            )
+        )
+
+        assert result["action"] == "applied"
+        sink.emit.assert_not_called()
+
+    def test_alert_delivery_failure_does_not_change_application(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        signal_factory,
+    ):
+        engine, entry, stop_loss, _take_profit = self._setup_engine_with_filled_entry(
+            mock_db_session,
+            mock_clock,
+            mock_exchange_adapter,
+            mock_order_repo,
+            signal_factory,
+        )
+        entry.intent_payload["system_placed_protection"] = "SL"
+        entry.intent_payload["system_placed_protection_revision"] = "strategy-r7"
+        sink = MagicMock()
+        sink.emit.side_effect = OSError("sink unavailable")
+        engine._order_event_applier.notification_sink = sink
+
+        result = engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="canceled",
+                product_id=stop_loss.product_id,
+                exchange_order_id=stop_loss.exchange_order_id,
+                cumulative_filled_quantity=Decimal("0"),
+            )
+        )
+
+        assert result["action"] == "applied"
+        assert stop_loss.status == OrderStatus.CANCELLED.value
+        sink.emit.assert_called_once()
+
+    def test_absent_cumulative_fill_evidence_keeps_existing_unresolved_action(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        signal_factory,
+    ):
+        engine, _entry, stop_loss, _take_profit = self._setup_engine_with_filled_entry(
             mock_db_session,
             mock_clock,
             mock_exchange_adapter,
@@ -9198,15 +9572,40 @@ class TestAuditedExecution:
         )
 
         assert result["action"] == "unresolved_protective_terminal_without_fill"
-        assert stop_loss.status == OrderStatus.CANCELLED.value
-        assert take_profit.status == OrderStatus.SUBMITTED.value
-        system_event = next(
-            call.args[0]
-            for call in mock_db_session.add.call_args_list
-            if isinstance(call.args[0], SystemEvent)
-            and call.args[0].event_subtype == "protective_order_terminal_without_fill"
+
+    def test_contradictory_last_fill_cannot_be_classified_as_authoritative_zero(
+        self,
+        mock_db_session,
+        mock_clock,
+        mock_exchange_adapter,
+        mock_order_repo,
+        signal_factory,
+    ):
+        engine, entry, stop_loss, _take_profit = self._setup_engine_with_filled_entry(
+            mock_db_session,
+            mock_clock,
+            mock_exchange_adapter,
+            mock_order_repo,
+            signal_factory,
         )
-        assert system_event.related_order_id == stop_loss.id
+        entry.intent_payload["system_placed_protection"] = "SL"
+        entry.intent_payload["system_placed_protection_revision"] = "strategy-r7"
+        sink = MagicMock()
+        engine._order_event_applier.notification_sink = sink
+
+        result = engine.process_exchange_order_event(
+            ExchangeOrderEvent(
+                status="canceled",
+                product_id=stop_loss.product_id,
+                exchange_order_id=stop_loss.exchange_order_id,
+                cumulative_filled_quantity=Decimal("0"),
+                last_fill_quantity=Decimal("1"),
+                last_fill_price=Decimal("41000"),
+            )
+        )
+
+        assert result["action"] == "unresolved_protective_terminal_without_fill"
+        sink.emit.assert_not_called()
 
     def test_oco_sibling_cancel_after_fill_not_reported_as_gap(
         self,
@@ -9271,7 +9670,7 @@ class TestAuditedExecution:
 
         assert engine._protective_terminal_without_fill_failure(stop_loss) is None
 
-    def test_reconcile_reports_gap_for_protective_cancelled_without_fill(
+    def test_reconcile_applies_declared_missing_leg_and_enqueues_once(
         self,
         mock_db_session,
         mock_clock,
@@ -9279,7 +9678,7 @@ class TestAuditedExecution:
         mock_order_repo,
         signal_factory,
     ):
-        """Reconcile path: SUBMITTED protective cancelled by exchange with no fill → unresolved."""
+        """Repair returns the safe terminal outcome and emits one declared-leg alert."""
         audit_session = mock_db_session
         engine = ExecutionEngine(
             db_session=mock_db_session,
@@ -9308,6 +9707,10 @@ class TestAuditedExecution:
                 cumulative_average_price=entry.price,
             )
         )
+        entry.intent_payload["system_placed_protection"] = "SL"
+        entry.intent_payload["system_placed_protection_revision"] = "strategy-r7"
+        sink = MagicMock()
+        engine._order_event_applier.notification_sink = sink
 
         def lookup(client_order_id, product_id, *, order_type=None):
             order = next(
@@ -9341,11 +9744,18 @@ class TestAuditedExecution:
 
         payload = engine.reconcile_recoverable_client_orders()
 
-        assert payload["unresolved_count"] >= 1
-        assert any(
-            r["repair_action"] == "unresolved_protective_terminal_without_fill"
-            for r in payload["results"]
+        assert payload["unresolved_count"] == 0
+        assert payload["verification_blocked_count"] == 0
+        assert sink.emit.call_count == 1
+        assert dict(sink.emit.call_args.args[0].diagnostics)["source"] == (
+            "repair_snapshot"
         )
+        assert all(
+            result["repair_action"] == "marked_cancelled"
+            for result in payload["results"]
+            if result["decision"] == "exchange_closed"
+            and result["order_id"] != entry.id
+        ), payload["results"]
 
     def test_uncertain_submit_preserves_submitted_leg_and_marks_pending_new_leg(
         self,

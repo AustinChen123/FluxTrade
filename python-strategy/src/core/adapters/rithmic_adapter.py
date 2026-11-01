@@ -65,6 +65,7 @@ from src.core.product_registry import (
 class RithmicExchangeAdapter(IExchangeAdapter):
     """Rithmic ORDER adapter with explicit startup after ledger recovery."""
 
+    exchange_id = "rithmic"
     requires_runtime_capabilities = True
 
     def __init__(
@@ -432,6 +433,10 @@ class RithmicExchangeAdapter(IExchangeAdapter):
             with self._client_lock:
                 event = self._require_client().poll_event()
         except RuntimeError as error:
+            diagnostic = getattr(error, "diagnostic", None)
+            self.logger.warning(
+                "Rithmic order event decode failed%s", f": {diagnostic}" if diagnostic else ""
+            )
             raise _map_runtime_error("rithmic_order_event_failed", error) from error
         if event is None:
             return None

@@ -1,11 +1,14 @@
 use super::{
     codec,
     ledger::{AccountIdentity, TransactionType},
+    order_field_policy::{
+        optional_nonnegative_decimal_with_diagnostic, optional_quantity_with_diagnostic,
+        NumericFieldContext, QuantityFieldDiagnostic,
+    },
     protocol,
 };
 use anyhow::{ensure, Context, Result};
 use rust_decimal::Decimal;
-use std::str::FromStr;
 
 const EXCHANGE_ORDER_NOTIFICATION: i32 = 352;
 
@@ -54,17 +57,41 @@ pub(crate) fn decode_order_event(
         account == *expected_account,
         "Rithmic live order event account mismatch"
     );
-    let notify_type = protocol::exchange_order_notification::NotifyType::try_from(
-        response
-            .notify_type
-            .context("missing Rithmic order notify type")?,
-    )
-    .context("unknown Rithmic order notify type")?;
-    let cumulative_filled_quantity =
-        optional_nonnegative_quantity(response.total_fill_size, "total fill size")?;
-    let unfilled_quantity =
-        optional_nonnegative_quantity(response.total_unfilled_size, "total unfilled size")?;
-    let quantity = optional_positive_quantity(response.quantity, "order quantity")?.or_else(|| {
+    let raw_notify_type = response
+        .notify_type
+        .context("missing Rithmic order notify type")?;
+    let notify_type = protocol::exchange_order_notification::NotifyType::try_from(raw_notify_type)
+        .context("unknown Rithmic order notify type")?;
+    let numeric_context = NumericFieldContext::new(
+        EXCHANGE_ORDER_NOTIFICATION,
+        "live",
+        Some(raw_notify_type),
+        Some(notify_type.as_str_name()),
+        response.basket_id.as_deref(),
+        response.exchange_order_id.as_deref(),
+    );
+    let cumulative_filled_quantity = optional_quantity_with_diagnostic(
+        response.total_fill_size,
+        "total fill size",
+        "total_fill_size",
+        false,
+        numeric_context.clone(),
+    )?;
+    let unfilled_quantity = optional_quantity_with_diagnostic(
+        response.total_unfilled_size,
+        "total unfilled size",
+        "total_unfilled_size",
+        false,
+        numeric_context.clone(),
+    )?;
+    let quantity = optional_quantity_with_diagnostic(
+        response.quantity,
+        "order quantity",
+        "quantity",
+        true,
+        numeric_context.clone(),
+    )?
+    .or_else(|| {
         // Only an explicitly complete Fill proves the missing original quantity.
         (notify_type == protocol::exchange_order_notification::NotifyType::Fill
             && unfilled_quantity == Some(Decimal::ZERO))
@@ -78,6 +105,12 @@ pub(crate) fn decode_order_event(
         quantity,
         cumulative_filled_quantity,
         unfilled_quantity,
+        numeric_context.clone(),
+        RawOrderQuantities {
+            quantity: response.quantity,
+            filled: response.total_fill_size,
+            unfilled: response.total_unfilled_size,
+        },
     )?;
     Ok(OrderEvent {
         account,
@@ -96,16 +129,39 @@ pub(crate) fn decode_order_event(
         transaction_type: transaction_type(response.transaction_type)?,
         quantity,
         unfilled_quantity,
-        price: optional_nonnegative_decimal(response.price, "order price")?,
-        trigger_price: optional_nonnegative_decimal(response.trigger_price, "trigger price")?,
+        price: optional_nonnegative_decimal_with_diagnostic(
+            response.price,
+            "order price",
+            "price",
+            numeric_context.clone(),
+        )?,
+        trigger_price: optional_nonnegative_decimal_with_diagnostic(
+            response.trigger_price,
+            "trigger price",
+            "trigger_price",
+            numeric_context.clone(),
+        )?,
         price_type: optional_exchange_price_type(response.price_type)?,
         bracket_type: optional_exchange_bracket_type(response.bracket_type)?,
-        last_fill_quantity: optional_positive_quantity(response.fill_size, "fill size")?,
-        last_fill_price: optional_nonnegative_decimal(response.fill_price, "fill price")?,
+        last_fill_quantity: optional_quantity_with_diagnostic(
+            response.fill_size,
+            "fill size",
+            "fill_size",
+            true,
+            numeric_context.clone(),
+        )?,
+        last_fill_price: optional_nonnegative_decimal_with_diagnostic(
+            response.fill_price,
+            "fill price",
+            "fill_price",
+            numeric_context.clone(),
+        )?,
         cumulative_filled_quantity,
-        cumulative_average_price: optional_nonnegative_decimal(
+        cumulative_average_price: optional_nonnegative_decimal_with_diagnostic(
             response.avg_fill_price,
             "average fill price",
+            "avg_fill_price",
+            numeric_context,
         )?,
         timestamp_ms: optional_epoch_millis(response.ssboe, response.usecs)?,
     })
@@ -115,10 +171,73 @@ pub(crate) fn is_order_event(template_id: i32) -> bool {
     template_id == EXCHANGE_ORDER_NOTIFICATION
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn invalid_price_diagnostic_for_binding_test() -> anyhow::Error {
+    let expected_account = AccountIdentity {
+        fcm_id: "FCM".to_string(),
+        ib_id: "IB".to_string(),
+        account_id: "ACCOUNT_ID_SECRET".to_string(),
+    };
+    let payload = codec::encode(&protocol::ExchangeOrderNotification {
+        template_id: EXCHANGE_ORDER_NOTIFICATION,
+        notify_type: Some(protocol::exchange_order_notification::NotifyType::Status as i32),
+        is_snapshot: Some(false),
+        fcm_id: Some("FCM".to_string()),
+        ib_id: Some("IB".to_string()),
+        account_id: Some("ACCOUNT_ID_SECRET".to_string()),
+        basket_id: Some("BASKET_ID_SECRET_123".to_string()),
+        exchange_order_id: Some("ORDER_ID_SECRET_456".to_string()),
+        exchange: Some("CME".to_string()),
+        symbol: Some("NQU6".to_string()),
+        status: Some("OPEN".to_string()),
+        transaction_type: Some(protocol::exchange_order_notification::TransactionType::Buy as i32),
+        quantity: Some(1),
+        price: Some(-1.0),
+        ..Default::default()
+    })
+    .expect("encode invalid price fixture");
+    decode_order_event(&payload, &expected_account).expect_err("invalid price is rejected")
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn invalid_quantity_diagnostic_for_binding_test() -> anyhow::Error {
+    let expected_account = AccountIdentity {
+        fcm_id: "FCM".to_string(),
+        ib_id: "IB".to_string(),
+        account_id: "ACCOUNT_ID_SECRET".to_string(),
+    };
+    let payload = codec::encode(&protocol::ExchangeOrderNotification {
+        template_id: EXCHANGE_ORDER_NOTIFICATION,
+        notify_type: Some(protocol::exchange_order_notification::NotifyType::Status as i32),
+        is_snapshot: Some(false),
+        fcm_id: Some("FCM".to_string()),
+        ib_id: Some("IB".to_string()),
+        account_id: Some("ACCOUNT_ID_SECRET".to_string()),
+        basket_id: Some("BASKET_ID_SECRET_123".to_string()),
+        exchange_order_id: Some("ORDER_ID_SECRET_456".to_string()),
+        exchange: Some("CME".to_string()),
+        symbol: Some("NQU6".to_string()),
+        status: Some("OPEN".to_string()),
+        transaction_type: Some(protocol::exchange_order_notification::TransactionType::Buy as i32),
+        quantity: Some(0),
+        ..Default::default()
+    })
+    .expect("encode invalid quantity fixture");
+    decode_order_event(&payload, &expected_account).expect_err("invalid quantity is rejected")
+}
+
 pub(crate) fn notification_is_snapshot(payload: &[u8]) -> Result<bool> {
     ensure_template(payload)?;
     let response: protocol::ExchangeOrderNotification = codec::decode(payload)?;
     Ok(response.is_snapshot == Some(true))
+}
+
+struct RawOrderQuantities {
+    quantity: Option<i32>,
+    filled: Option<i32>,
+    unfilled: Option<i32>,
 }
 
 fn classify_status(
@@ -127,19 +246,37 @@ fn classify_status(
     quantity: Option<Decimal>,
     cumulative_filled: Option<Decimal>,
     unfilled: Option<Decimal>,
+    context: NumericFieldContext,
+    raw: RawOrderQuantities,
 ) -> Result<String> {
     use protocol::exchange_order_notification::NotifyType;
     if let (Some(filled), Some(quantity)) = (cumulative_filled, quantity) {
-        ensure!(
-            filled <= quantity,
-            "Rithmic cumulative fill exceeds order quantity"
-        );
+        if filled > quantity {
+            return Err(
+                anyhow::anyhow!("Rithmic cumulative fill exceeds order quantity").context(
+                    QuantityFieldDiagnostic::new(
+                        context.clone(),
+                        "total_fill_size",
+                        raw.filled,
+                        "exceeds_order_quantity",
+                    ),
+                ),
+            );
+        }
     }
     if let (Some(unfilled), Some(quantity)) = (unfilled, quantity) {
-        ensure!(
-            unfilled <= quantity,
-            "Rithmic unfilled size exceeds order quantity"
-        );
+        if unfilled > quantity {
+            return Err(
+                anyhow::anyhow!("Rithmic unfilled size exceeds order quantity").context(
+                    QuantityFieldDiagnostic::new(
+                        context.clone(),
+                        "total_unfilled_size",
+                        raw.unfilled,
+                        "exceeds_order_quantity",
+                    ),
+                ),
+            );
+        }
     }
     if quantity.is_none()
         && cumulative_filled.is_some_and(|filled| filled > Decimal::ZERO)
@@ -152,15 +289,40 @@ fn classify_status(
     }
     let status = match notify_type {
         NotifyType::Fill => {
-            let quantity = quantity.context("Rithmic fill event omitted order quantity")?;
+            let quantity = quantity.ok_or_else(|| {
+                anyhow::anyhow!("Rithmic fill event omitted order quantity").context(
+                    QuantityFieldDiagnostic::new(
+                        context.clone(),
+                        "quantity",
+                        raw.quantity,
+                        "missing_required",
+                    ),
+                )
+            })?;
             let filled = cumulative_filled
                 .filter(|filled| *filled > Decimal::ZERO)
-                .context("Rithmic fill event omitted positive cumulative fill size")?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Rithmic fill event omitted positive cumulative fill size")
+                        .context(QuantityFieldDiagnostic::new(
+                            context.clone(),
+                            "total_fill_size",
+                            raw.filled,
+                            "missing_or_zero_required",
+                        ))
+                })?;
             if let Some(unfilled) = unfilled {
-                ensure!(
-                    filled + unfilled == quantity,
-                    "Rithmic fill totals do not match order quantity"
-                );
+                if filled + unfilled != quantity {
+                    return Err(
+                        anyhow::anyhow!("Rithmic fill totals do not match order quantity").context(
+                            QuantityFieldDiagnostic::new(
+                                context.clone(),
+                                "total_fill_size",
+                                raw.filled,
+                                "fill_totals_mismatch",
+                            ),
+                        ),
+                    );
+                }
             }
             if filled == quantity {
                 "filled"
@@ -169,11 +331,23 @@ fn classify_status(
             }
         }
         NotifyType::Cancel => {
-            ensure_terminal_fill_is_incomplete("cancel", quantity, cumulative_filled)?;
+            ensure_terminal_fill_is_incomplete(
+                "cancel",
+                quantity,
+                cumulative_filled,
+                &context,
+                raw,
+            )?;
             "cancelled"
         }
         NotifyType::Reject => {
-            ensure_terminal_fill_is_incomplete("reject", quantity, cumulative_filled)?;
+            ensure_terminal_fill_is_incomplete(
+                "reject",
+                quantity,
+                cumulative_filled,
+                &context,
+                raw,
+            )?;
             "rejected"
         }
         NotifyType::NotCancelled => "cancel_rejected",
@@ -183,7 +357,7 @@ fn classify_status(
             {
                 return classify_fill_progress(quantity, cumulative_filled);
             }
-            return normalize_status(raw_status, quantity, cumulative_filled);
+            return normalize_status(raw_status, quantity, cumulative_filled, &context, raw);
         }
         NotifyType::NotModified => "modify_rejected",
     };
@@ -194,15 +368,30 @@ fn ensure_terminal_fill_is_incomplete(
     notification: &str,
     quantity: Option<Decimal>,
     cumulative_filled: Option<Decimal>,
+    context: &NumericFieldContext,
+    raw: RawOrderQuantities,
 ) -> Result<()> {
     if let Some(filled) = cumulative_filled.filter(|filled| *filled > Decimal::ZERO) {
-        let quantity = quantity.with_context(|| {
-            format!("Rithmic {notification} event with fills omitted order quantity")
+        let quantity = quantity.ok_or_else(|| {
+            anyhow::anyhow!("Rithmic {notification} event with fills omitted order quantity")
+                .context(QuantityFieldDiagnostic::new(
+                    context.clone(),
+                    "quantity",
+                    raw.quantity,
+                    "missing_required",
+                ))
         })?;
-        ensure!(
-            filled < quantity,
-            "Rithmic {notification} event conflicts with complete fill"
-        );
+        if filled >= quantity {
+            return Err(anyhow::anyhow!(
+                "Rithmic {notification} event conflicts with complete fill"
+            )
+            .context(QuantityFieldDiagnostic::new(
+                context.clone(),
+                "total_fill_size",
+                raw.filled,
+                "complete_fill_conflict",
+            )));
+        }
     }
     Ok(())
 }
@@ -231,6 +420,8 @@ fn normalize_status(
     raw_status: Option<&str>,
     quantity: Option<Decimal>,
     cumulative_filled: Option<Decimal>,
+    context: &NumericFieldContext,
+    raw: RawOrderQuantities,
 ) -> Result<String> {
     let normalized = raw_status
         .map(str::trim)
@@ -246,35 +437,76 @@ fn normalize_status(
                 "partially_filled"
             }
             Some(filled) if quantity.is_none() && filled > Decimal::ZERO => "quantity_unresolved",
-            Some(_) => anyhow::bail!("Rithmic open status conflicts with cumulative fill"),
+            Some(_) => {
+                return Err(
+                    anyhow::anyhow!("Rithmic open status conflicts with cumulative fill").context(
+                        QuantityFieldDiagnostic::new(
+                            context.clone(),
+                            "total_fill_size",
+                            raw.filled,
+                            "open_status_conflict",
+                        ),
+                    ),
+                );
+            }
         },
         "partial" | "partially_filled" | "partiallyfilled" => {
             let Some(quantity) = quantity else {
-                ensure!(
-                    cumulative_filled.is_some_and(|filled| filled > Decimal::ZERO),
-                    "Rithmic partial status conflicts with cumulative fill"
-                );
+                if !cumulative_filled.is_some_and(|filled| filled > Decimal::ZERO) {
+                    return Err(anyhow::anyhow!(
+                        "Rithmic partial status conflicts with cumulative fill"
+                    )
+                    .context(QuantityFieldDiagnostic::new(
+                        context.clone(),
+                        "total_fill_size",
+                        raw.filled,
+                        "partial_status_conflict",
+                    )));
+                }
                 return Ok("quantity_unresolved".to_string());
             };
-            ensure!(
-                cumulative_filled
-                    .is_some_and(|filled| { filled > Decimal::ZERO && filled < quantity }),
-                "Rithmic partial status conflicts with cumulative fill"
-            );
+            if !cumulative_filled.is_some_and(|filled| filled > Decimal::ZERO && filled < quantity)
+            {
+                return Err(anyhow::anyhow!(
+                    "Rithmic partial status conflicts with cumulative fill"
+                )
+                .context(QuantityFieldDiagnostic::new(
+                    context.clone(),
+                    "total_fill_size",
+                    raw.filled,
+                    "partial_status_conflict",
+                )));
+            }
             "partially_filled"
         }
         "complete" | "completed" | "filled" => {
             let Some(quantity) = quantity else {
-                ensure!(
-                    cumulative_filled.is_some_and(|filled| filled > Decimal::ZERO),
-                    "Rithmic complete status is not fully filled"
-                );
+                if !cumulative_filled.is_some_and(|filled| filled > Decimal::ZERO) {
+                    return Err(
+                        anyhow::anyhow!("Rithmic complete status is not fully filled").context(
+                            QuantityFieldDiagnostic::new(
+                                context.clone(),
+                                "total_fill_size",
+                                raw.filled,
+                                "complete_status_not_filled",
+                            ),
+                        ),
+                    );
+                }
                 return Ok("quantity_unresolved".to_string());
             };
-            ensure!(
-                cumulative_filled == Some(quantity),
-                "Rithmic complete status is not fully filled"
-            );
+            if cumulative_filled != Some(quantity) {
+                return Err(
+                    anyhow::anyhow!("Rithmic complete status is not fully filled").context(
+                        QuantityFieldDiagnostic::new(
+                            context.clone(),
+                            "total_fill_size",
+                            raw.filled,
+                            "complete_status_not_filled",
+                        ),
+                    ),
+                );
+            }
             "filled"
         }
         "cancel" | "canceled" | "cancelled" => "cancelled",
@@ -375,34 +607,6 @@ fn optional_exchange_bracket_type(value: Option<i32>) -> Result<Option<String>> 
                 BracketType::TargetAndStopStatic => "target_and_stop_static",
             }
             .to_string())
-        })
-        .transpose()
-}
-
-fn optional_positive_quantity(value: Option<i32>, field: &str) -> Result<Option<Decimal>> {
-    value
-        .map(|value| {
-            ensure!(value > 0, "invalid Rithmic {field}");
-            Ok(Decimal::from(value))
-        })
-        .transpose()
-}
-
-fn optional_nonnegative_quantity(value: Option<i32>, field: &str) -> Result<Option<Decimal>> {
-    value
-        .map(|value| {
-            ensure!(value >= 0, "invalid Rithmic {field}");
-            Ok(Decimal::from(value))
-        })
-        .transpose()
-}
-
-fn optional_nonnegative_decimal(value: Option<f64>, field: &str) -> Result<Option<Decimal>> {
-    value
-        .map(|value| {
-            ensure!(value.is_finite() && value >= 0.0, "invalid Rithmic {field}");
-            Decimal::from_str(&value.to_string())
-                .with_context(|| format!("invalid Rithmic {field}"))
         })
         .transpose()
 }

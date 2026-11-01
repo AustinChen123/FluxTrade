@@ -1,8 +1,10 @@
+import json
 import logging
 import threading
 import time as _time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Callable, ContextManager, Optional, cast
 from sqlalchemy.orm import Session
@@ -70,6 +72,18 @@ from src.core import execution_journal
 from src.core import execution_portfolio_exposure
 from src.core import execution_verified_net_reduction
 from src.core.order_event_sync import OrderEventApplier
+from src.core.notifications import NotificationSink
+from src.core.protection_alerts import ProtectionAlert
+from src.core.protection_observation import (
+    AlertEligibility,
+    Declaration,
+    ExposureEvidence,
+    FillEvidence,
+    LegRelation,
+    ProtectionObservation,
+    classify_protective_terminal,
+)
+from src.core.protection_lineage import protection_lineage_is_valid
 from src.core.order_reconciliation import OrderReconciler
 from src.core.portfolio_runtime import PortfolioExposureSnapshot
 from src.core.signal_order_intent import (
@@ -140,6 +154,7 @@ class ExecutionEngine:
         entry_candle_freshness_enabled: bool = False,
         repository_transaction_participant: OrderTransactionParticipant | None = None,
         owned_order_event_observer: Callable[[str], None] | None = None,
+        notification_sink: NotificationSink | None = None,
     ):
         _validate_order_transaction_participant_target(
             order_repository,
@@ -158,6 +173,7 @@ class ExecutionEngine:
             order_event_processor or process_order_event_without_venue_policy
         )
         self._owned_order_event_observer = owned_order_event_observer
+        self.notification_sink = notification_sink
         self._pending_protection_fill_processor = (
             pending_protection_fill_processor
             or audit_pending_protection_without_venue_policy
@@ -268,6 +284,10 @@ class ExecutionEngine:
             ),
             remote_follow_up_required=self._remote_follow_up_required,
             on_position_cache_failure=self._latch_fill_position_cache_failure,
+            notification_sink=notification_sink,
+            protection_observation_for_terminal=(
+                self._classify_protection_terminal_observation
+            ),
         )
         self._order_reconciler = OrderReconciler(
             adapter=self.adapter,
@@ -720,6 +740,231 @@ class ExecutionEngine:
             "entry_order_id": str(entry_order_id),
             "reason": "protective_terminal_without_fill",
         }
+
+    def _classify_protection_terminal_observation(
+        self,
+        order,
+        event: ExchangeOrderEvent,
+        event_state: str,
+        fill_quantity: Decimal,
+    ) -> tuple[ProtectionObservation, ProtectionAlert | None] | None:
+        """Resolve immutable entry facts, then use the sole pure classifier."""
+        leg_by_type = {
+            "stop_loss": LegRelation.SL,
+            "trailing_stop": LegRelation.SL,
+            "take_profit": LegRelation.TP,
+        }
+        leg = leg_by_type.get(order.type)
+        if leg is None:
+            return None
+        payload = order.intent_payload
+        payload_valid = isinstance(payload, dict)
+        payload = payload if payload_valid else {}
+        entry_id = payload.get("pending_entry_order_id")
+        if not isinstance(entry_id, str) or not entry_id:
+            return (
+                classify_protective_terminal(
+                    declaration=Declaration.INVALID,
+                    leg=LegRelation.INVALID,
+                    fill=FillEvidence.MISSING,
+                    exposure=ExposureEvidence.UNKNOWN,
+                    identity_valid=False,
+                    evidence_valid=False,
+                ),
+                None,
+            )
+        entry = self.order_manager.repo.get_order(entry_id)
+        if entry is None:
+            return (
+                classify_protective_terminal(
+                    declaration=Declaration.INVALID,
+                    leg=LegRelation.INVALID,
+                    fill=FillEvidence.MISSING,
+                    exposure=ExposureEvidence.UNKNOWN,
+                    identity_valid=False,
+                    evidence_valid=False,
+                ),
+                None,
+            )
+        entry_payload = (
+            entry.intent_payload if isinstance(entry.intent_payload, dict) else {}
+        )
+        entry_payload_valid = entry.intent_payload is None or isinstance(
+            entry.intent_payload, dict
+        )
+
+        declaration_value = entry_payload.get(
+            "system_placed_protection", "UNDECLARED"
+        )
+        declaration_by_value = {item.value: item for item in Declaration}
+        declaration = declaration_by_value.get(
+            declaration_value if isinstance(declaration_value, str) else ""
+        )
+        if declaration is None:
+            declaration = Declaration.INVALID
+        revision = entry_payload.get("system_placed_protection_revision")
+        snapshot_valid = declaration in {
+            Declaration.UNDECLARED,
+            Declaration.NONE,
+        } and (
+            declaration is Declaration.UNDECLARED
+            or (isinstance(revision, str) and bool(revision))
+        )
+        if declaration in {Declaration.SL, Declaration.TP, Declaration.SL_TP}:
+            snapshot_valid = isinstance(revision, str) and bool(revision)
+        if declaration is Declaration.UNDECLARED and revision is not None:
+            snapshot_valid = False
+
+        sibling_id = payload.get("linked_order_id")
+        sibling = (
+            self.order_manager.repo.get_order(sibling_id)
+            if isinstance(sibling_id, str) and sibling_id
+            else None
+        )
+        order_quantity = order.quantity or Decimal("0")
+        entry_quantity = entry.quantity or Decimal("0")
+        lineage_valid = payload_valid and protection_lineage_is_valid(
+            order=order,
+            entry=entry,
+            sibling=sibling,
+            event_product_id=event.product_id,
+        )
+        identity_valid = (
+            lineage_valid
+            and order_quantity.is_finite()
+            and order_quantity > 0
+            and entry_quantity.is_finite()
+            and entry_quantity > 0
+            and entry_payload_valid
+            and snapshot_valid
+        )
+        local_filled = order.filled_quantity or Decimal("0")
+        if event.cumulative_filled_quantity is None:
+            fill_evidence = FillEvidence.MISSING
+        elif event.cumulative_filled_quantity < local_filled:
+            fill_evidence = FillEvidence.STALE
+        elif event.cumulative_filled_quantity > 0 or fill_quantity > 0:
+            if event.cumulative_filled_quantity < (order.quantity or Decimal("0")):
+                fill_evidence = FillEvidence.PARTIAL
+            else:
+                fill_evidence = FillEvidence.POSITIVE
+        elif event.cumulative_filled_quantity == 0 and local_filled == 0:
+            fill_evidence = FillEvidence.ZERO
+        else:
+            fill_evidence = FillEvidence.CONTRADICTORY
+
+        entry_filled = entry.filled_quantity or Decimal("0")
+        if (
+            not entry_filled.is_finite()
+            or entry_filled < 0
+            or entry_filled > entry_quantity
+        ):
+            exposure = ExposureEvidence.UNKNOWN
+            identity_valid = False
+        elif entry_filled == 0:
+            exposure = ExposureEvidence.FLAT
+        elif self._position_loader is None:
+            # Without a position authority, retain the prior OCO completion
+            # interpretation; otherwise the filled parent is open evidence.
+            exposure = (
+                ExposureEvidence.FLAT
+                if sibling is not None
+                and sibling.status
+                in {OrderStatus.FILLED.value, OrderStatus.LIQUIDATED.value}
+                else ExposureEvidence.OPEN
+            )
+        else:
+            try:
+                position = self._position_loader(entry.strategy_id, entry.product_id)
+            except Exception:
+                exposure = ExposureEvidence.UNKNOWN
+            else:
+                if position is None:
+                    exposure = ExposureEvidence.FLAT
+                else:
+                    quantity = getattr(position, "quantity", None)
+                    side = getattr(getattr(position, "side", None), "value", None)
+                    entry_side = str(getattr(entry.side, "value", entry.side)).lower()
+                    expected_side = "LONG" if entry_side == "buy" else "SHORT"
+                    if (
+                        type(quantity) is Decimal
+                        and quantity.is_finite()
+                        and quantity > 0
+                        and side == expected_side
+                    ):
+                        exposure = ExposureEvidence.OPEN
+                    else:
+                        exposure = ExposureEvidence.UNKNOWN
+
+        observation = classify_protective_terminal(
+            declaration=declaration,
+            leg=leg,
+            fill=fill_evidence,
+            exposure=exposure,
+            identity_valid=identity_valid,
+            evidence_valid=(
+                event_state in {"cancelled", "rejected", "expired", "failed"}
+                and event.cumulative_filled_quantity is not None
+                and event.cumulative_filled_quantity == local_filled == 0
+                and event.last_fill_quantity in {None, Decimal("0")}
+                and event.last_fill_price is None
+                and (
+                    event.cumulative_average_price is None
+                    or event.cumulative_average_price == 0
+                )
+                and (event.fee is None or event.fee == 0)
+            ),
+            identity_failure_reason=(
+                None if lineage_valid else "invalid_lineage"
+            ),
+        )
+        alert = None
+        if observation.alert_eligibility is AlertEligibility.LOSS_ALERT:
+            try:
+                evidence_id = (
+                    event.exchange_order_id
+                    or event.client_order_id
+                    or str(order.id)
+                )
+                occurred_at = (
+                    datetime.fromtimestamp(event.event_timestamp / 1000, tz=timezone.utc)
+                    if event.event_timestamp is not None
+                    else datetime.now(timezone.utc)
+                )
+                alert = ProtectionAlert.create(
+                    event_type="protection_loss",
+                    severity="critical",
+                    reason=observation.reason,
+                    entry_id=entry_id,
+                    evidence_id=evidence_id,
+                    occurred_at=occurred_at,
+                    strategy_id=str(entry.strategy_id),
+                    product_id=str(entry.product_id),
+                    account_id=(
+                        str(entry.account_id) if entry.account_id is not None else None
+                    ),
+                    entry_declaration=declaration.value,
+                    declaration_revision=(
+                        str(revision) if revision is not None else None
+                    ),
+                    order_id=str(order.id),
+                    diagnostics=(
+                        ("terminal_status", event.status.lower()),
+                        ("fill_state", "zero"),
+                        (
+                            "source",
+                            event.protection_alert_source
+                            or (
+                                "repair_snapshot"
+                                if event.is_snapshot_projection
+                                else "live_event"
+                            ),
+                        ),
+                    ),
+                )
+            except Exception:
+                alert = None
+        return observation, alert
 
     def _remote_follow_up_required(self, order, event_state: str) -> bool:
         if order.type in {"market", "limit"}:
@@ -1321,13 +1566,15 @@ class ExecutionEngine:
         limit_price = resolved_intent.limit_price
 
         # 1. Create Entry Order in DB
+        intent_payload = self._signal_order_intent(signal, resolved_intent) or {}
+        intent_payload.update(self._entry_protection_snapshot(signal))
         order = self.order_manager.create_order(
             signal=signal,
             side=side,
             order_type=order_type,
             quantity=qty,
             price=limit_price,
-            intent_payload=self._signal_order_intent(signal, resolved_intent) or None,
+            intent_payload=intent_payload or None,
         )
         self._attach_min_notional_reference_price(order, candle)
         conditional_orders = self._create_conditional_orders(signal, order, qty, candle)
@@ -1457,6 +1704,7 @@ class ExecutionEngine:
             },
             **self._signal_order_intent(signal, resolved_intent),
         }
+        intent_payload.update(self._entry_protection_snapshot(signal))
         order = self.order_manager.create_order(
             signal=signal,
             side=side,
@@ -2067,6 +2315,56 @@ class ExecutionEngine:
         if resolved_intent.uses_legacy_value_fallback:
             payload["legacy_price_source"] = "signal.value"
         return payload
+
+    def _entry_protection_snapshot(self, signal: Signal) -> dict[str, object]:
+        """Read catalog declaration once for this new entry's durable intent."""
+        if signal.type not in {SignalType.LONG, SignalType.SHORT}:
+            return {}
+        if self._db_session_factory is None and self._db_session is None:
+            return {
+                "system_placed_protection": "UNDECLARED",
+                "system_placed_protection_revision": None,
+            }
+        if self._db_session_factory is not None:
+            with self._db_session_factory() as db:
+                strategy = db.get(Strategy, signal.strategy_id)
+                raw_configuration = (
+                    cast(str | None, strategy.configuration_json)
+                    if isinstance(strategy, Strategy)
+                    else None
+                )
+        else:
+            assert self._db_session is not None
+            strategy = self._db_session.get(Strategy, signal.strategy_id)
+            raw_configuration = (
+                cast(str | None, strategy.configuration_json)
+                if isinstance(strategy, Strategy)
+                else None
+            )
+        try:
+            configuration = json.loads(raw_configuration or "{}")
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("strategy configuration_json is invalid") from exc
+        if not isinstance(configuration, dict):
+            raise ValueError("strategy configuration_json must contain an object")
+        declaration = configuration.get("system_placed_protection", "UNDECLARED")
+        if not isinstance(declaration, str) or declaration not in {
+            "UNDECLARED",
+            "NONE",
+            "SL",
+            "TP",
+            "SL+TP",
+        }:
+            raise ValueError("invalid system_placed_protection declaration")
+        revision = configuration.get("system_placed_protection_revision")
+        if declaration == "UNDECLARED":
+            revision = None
+        elif not isinstance(revision, str) or not revision:
+            raise ValueError("system_placed_protection revision is required")
+        return {
+            "system_placed_protection": declaration,
+            "system_placed_protection_revision": revision,
+        }
 
     def _resolve_order_intent_or_reject(
         self,

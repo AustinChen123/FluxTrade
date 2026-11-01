@@ -41,6 +41,7 @@ class OwnedOrderReconciliationContext:
     db_session_factory: Callable[[], ContextManager[Any]] | None
     local_positions_loader: Callable[[], list[object]] | None
     logger: logging.Logger
+    list_declared_protection_history_orders: Callable[[], list[Any]] = lambda: []
 
 
 class OwnedOrderReconciler(Protocol):
@@ -116,6 +117,7 @@ class ExchangeOrderEvent:
     event_timestamp: Optional[int] = None
     reason: Optional[str] = None
     raw: Optional[dict[str, Any]] = None
+    protection_alert_source: Optional[str] = None
     last_fill_exchange_trade_id: str | None = field(default=None, kw_only=True)
 
 

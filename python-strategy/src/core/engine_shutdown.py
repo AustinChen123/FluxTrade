@@ -25,6 +25,7 @@ class EngineShutdownService:
         close_redis: Callable[[], None],
         close_entry_gate: Callable[[], None],
         event_logger: logging.Logger,
+        stop_notifications: Callable[[float], object] | None = None,
     ) -> None:
         self._mark_stopping = mark_stopping
         self._shutdown_executor = shutdown_executor
@@ -36,30 +37,35 @@ class EngineShutdownService:
         self._close_redis = close_redis
         self._close_entry_gate = close_entry_gate
         self._logger = event_logger
+        self._stop_notifications = stop_notifications
 
     def shutdown(self, *, timeout: float, clean_exit: bool) -> None:
-        self._logger.info("StrategyEngine shutting down...")
-        self._mark_stopping()
-        self._shutdown_executor()
-
-        for load_thread in self._thread_loaders:
-            thread = load_thread()
-            if thread is not None and thread.is_alive():
-                thread.join(timeout=timeout)
-
-        self._close_adapter()
-        self._shutdown_strategy_state()
-
-        if clean_exit and self._clean_persistence_allowed():
-            self._persist_clean()
-
         try:
-            self._close_redis()
-        except Exception as exc:
-            self._logger.warning("Error closing Redis: %s", exc)
+            self._logger.info("StrategyEngine shutting down...")
+            self._mark_stopping()
+            self._shutdown_executor()
 
-        self._close_entry_gate()
-        self._logger.info("StrategyEngine shutdown complete.")
+            for load_thread in self._thread_loaders:
+                thread = load_thread()
+                if thread is not None and thread.is_alive():
+                    thread.join(timeout=timeout)
+
+            self._close_adapter()
+            self._shutdown_strategy_state()
+
+            if clean_exit and self._clean_persistence_allowed():
+                self._persist_clean()
+
+            try:
+                self._close_redis()
+            except Exception as exc:
+                self._logger.warning("Error closing Redis: %s", exc)
+
+            self._close_entry_gate()
+            self._logger.info("StrategyEngine shutdown complete.")
+        finally:
+            if self._stop_notifications is not None:
+                self._stop_notifications(timeout)
 
     def _close_adapter(self) -> None:
         close_adapter = getattr(self._adapter_loader(), "close", None)

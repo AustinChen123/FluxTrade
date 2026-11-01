@@ -273,6 +273,67 @@ class LiveOrderRepository(IOrderRepository):
                 )
             return query.all()
 
+    def list_declared_protection_history_orders(
+        self,
+        *,
+        account_profile: str | None,
+        account_id: str | None,
+        exchange_id: str,
+    ) -> list[Order]:
+        """Return scoped declared parents and linked children, including terminal rows."""
+        if (
+            not isinstance(account_profile, str)
+            or not account_profile.strip()
+            or not isinstance(account_id, str)
+            or not account_id.strip()
+            or not isinstance(exchange_id, str)
+            or not exchange_id.strip()
+        ):
+            return []
+        profile = account_profile.strip()
+        owner_account = account_id.strip()
+        with self._db_session_factory() as db:
+            rows = (
+                self._scope(db.query(Order))
+                .filter(
+                    Order.account_profile == profile,
+                    Order.account_id == owner_account,
+                    func.lower(Order.exchange_id) == exchange_id.casefold(),
+                )
+                .order_by(Order.timestamp, Order.id)
+                .all()
+            )
+        parents = []
+        parent_ids: set[str] = set()
+        parent_client_ids: set[str] = set()
+        for order in rows:
+            payload = order.intent_payload
+            declaration = (
+                payload.get("system_placed_protection")
+                if isinstance(payload, dict)
+                else None
+            )
+            if declaration not in {"NONE", "SL", "TP", "SL+TP"}:
+                continue
+            parents.append(order)
+            parent_ids.add(str(order.id))
+            if order.client_order_id:
+                parent_client_ids.add(str(order.client_order_id))
+
+        selected = {str(order.id): order for order in parents}
+        for order in rows:
+            payload = order.intent_payload
+            if not isinstance(payload, dict):
+                continue
+            linked_parent_id = payload.get("pending_entry_order_id")
+            native_parent_client_id = payload.get("native_parent_client_order_id")
+            if (
+                str(linked_parent_id) in parent_ids
+                or str(native_parent_client_id) in parent_client_ids
+            ):
+                selected[str(order.id)] = order
+        return sorted(selected.values(), key=lambda order: (order.timestamp, order.id))
+
     def list_orders_by_statuses(
         self,
         statuses: set[str],

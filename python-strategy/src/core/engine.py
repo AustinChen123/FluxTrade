@@ -61,6 +61,7 @@ from src.core.engine_heartbeat_service import EngineHeartbeatService
 from src.core.engine_boot_state_service import EngineBootStateService
 from src.core.engine_shutdown import EngineShutdownService
 from src.core.generic_order_event_stream import GenericOrderEventStream
+from src.core.notifications import NotificationDispatcher
 from src.core.engine_runtime_reconciliation_service import (
     EngineRuntimeReconciliationService,
 )
@@ -427,6 +428,7 @@ class StrategyEngine:
             generic_interval_resolver=_runtime_reconciliation_interval_from_env,
         )
 
+        self.notification_dispatcher = NotificationDispatcher()
         self.execution_engine = ExecutionEngine(
             db_session,
             clock,
@@ -451,6 +453,7 @@ class StrategyEngine:
             ),
             repository_transaction_participant=repository_transaction_participant,
             owned_order_event_observer=owned_order_event_observer,
+            notification_sink=self.notification_dispatcher,
         )
         self._lifecycle_adapter = _EngineLifecycleAdapter(self)
         self._health_monitor = HealthMonitor(self._registry)
@@ -563,6 +566,7 @@ class StrategyEngine:
             recoverable_orders_loader=lambda: (
                 self.execution_engine.list_recoverable_client_orders()
             ),
+            notification_sink=self.notification_dispatcher,
         )
         runtime_callbacks = RuntimeCallbacks(
             is_running=lambda: self.running,
@@ -613,6 +617,7 @@ class StrategyEngine:
                 stop_event=self._order_event_stop,
                 callbacks=runtime_callbacks,
                 logger=logger,
+                notification_sink=self.notification_dispatcher,
             )
             if runtime_capabilities_factory is not None
             else NoopRuntimeCapabilities(
@@ -757,6 +762,9 @@ class StrategyEngine:
                 else None
             ),
             event_logger=logger,
+            stop_notifications=lambda timeout: self.notification_dispatcher.stop(
+                timeout=timeout
+            ),
         )
         self._ops_command_service = OpsCommandService(
             operation_lock=lambda: self._ops_command_lock,
@@ -865,6 +873,7 @@ class StrategyEngine:
                 raise
             return result
 
+        self.notification_dispatcher.start()
         # Start fail-closed so the command listener can accept a manual clear
         # while startup waits on a persisted LOCKDOWN state.
         run_phase(self._halt_for_kill_switch)
