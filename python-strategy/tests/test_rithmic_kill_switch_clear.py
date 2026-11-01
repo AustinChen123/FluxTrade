@@ -263,3 +263,19 @@ def test_failure_matrix_preserves_restart_resume_and_result(
 
     assert owner.calls == expected_calls
     assert owner.resume.called is resumed
+
+
+def test_safe_zero_fill_terminal_repair_allows_manual_clear_preparation():
+    service, owner = _build_service(
+        summary={
+            "recoverable_count": 1,
+            "auto_resume_safe": True,
+            "results": [{"repair_action": "applied", "unresolved": False}],
+        }
+    )
+
+    assert service.prepare() == (True, 7)
+
+    owner.reconcile.assert_called_once_with("test", "ACCOUNT")
+    owner.start.assert_called_once_with()
+    owner.publish.assert_called_once()

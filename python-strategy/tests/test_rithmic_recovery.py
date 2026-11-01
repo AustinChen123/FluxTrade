@@ -1394,6 +1394,52 @@ def test_reconciler_applies_owned_event_without_remote_side_effects_and_audits(
     assert db.commit.call_count == 2
 
 
+def test_owned_zero_fill_terminal_safe_application_keeps_recovery_resumable():
+    order = local_order(
+        type="stop_loss",
+        side="sell",
+        status="SUBMITTED",
+        filled_quantity=Decimal("0"),
+        intent_payload={"pending_entry_order_id": "entry-1"},
+    )
+    repo = MagicMock()
+    repo.list_client_orders_by_statuses.return_value = [order]
+    processor = Mock(return_value={"action": "applied"})
+    reconciler = owned_reconciler(
+        adapter=MagicMock(),
+        order_manager=SimpleNamespace(repo=repo),
+        clock=SimpleNamespace(now=lambda: 1_700_000_200),
+        db_session_factory=lambda: nullcontext(MagicMock()),
+        process_exchange_order_event=processor,
+        place_pending_protection_for_filled_entries=Mock(),
+        fail_pending_conditionals_for_terminal_entry=Mock(),
+        protective_terminal_without_fill_failure=Mock(),
+        cancel_protective_order_when_sibling_closed=Mock(),
+        cancel_linked_conditional_for_protection_fill=Mock(),
+        local_positions_loader=lambda: [],
+    )
+    remote = remote_order(
+        status="CANCELLED",
+        notification_type="CANCEL",
+        transaction_type="SELL",
+        filled_quantity="0",
+        unfilled_quantity="2",
+    )
+
+    result = reconciler.reconcile(
+        snapshot_loader=Mock(return_value=snapshot(orders=[remote])),
+    )
+
+    processor.assert_called_once()
+    assert processor.call_args.kwargs == {"allow_remote_side_effects": False}
+    applied_event = processor.call_args.args[0]
+    assert applied_event.status == "cancelled"
+    assert applied_event.cumulative_filled_quantity == Decimal("0")
+    assert result["unresolved_count"] == 0
+    assert result["verification_blocked_count"] == 0
+    assert result["auto_resume_safe"] is True
+
+
 @pytest.mark.parametrize(
     ("collection_name", "exchange"),
     [
