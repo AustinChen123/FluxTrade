@@ -953,9 +953,12 @@ class ExecutionEngine:
                         ("fill_state", "zero"),
                         (
                             "source",
-                            "repair_snapshot"
-                            if event.is_snapshot_projection
-                            else "live_event",
+                            event.protection_alert_source
+                            or (
+                                "repair_snapshot"
+                                if event.is_snapshot_projection
+                                else "live_event"
+                            ),
                         ),
                     ),
                 )

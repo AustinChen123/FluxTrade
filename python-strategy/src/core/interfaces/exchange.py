@@ -117,6 +117,7 @@ class ExchangeOrderEvent:
     event_timestamp: Optional[int] = None
     reason: Optional[str] = None
     raw: Optional[dict[str, Any]] = None
+    protection_alert_source: Optional[str] = None
     last_fill_exchange_trade_id: str | None = field(default=None, kw_only=True)
 
 

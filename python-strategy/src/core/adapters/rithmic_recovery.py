@@ -466,6 +466,7 @@ def _classify_order(
         ),
         cumulative_filled_quantity=cumulative_quantity,
         cumulative_average_price=cumulative_average,
+        protection_alert_source="repair_snapshot",
         event_timestamp=(
             remote.timestamp_ms
             if remote is not None
