@@ -43,7 +43,7 @@ pytestmark = [
     ),
 ]
 
-_REVISION = "6d8a1e2f4c90"
+_REVISION = "71d3a8c4e205"
 _PREDECESSOR = "f47c2a91d683"
 _ROW_TABLES = (
     "alembic_version",
