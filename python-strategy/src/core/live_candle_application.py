@@ -22,7 +22,10 @@ from src.core.market_data.profiles.decision_application import MarketDataDecisio
 from src.core.market_data.profiles.decision_application_store import (
     DecisionBatchIntegrityError,
     DecisionBatchRecord,
+    MarketExitHandoffInput,
+    append_exit_handoffs,
     append_decision_batch,
+    read_exit_handoffs,
     read_decision_batch,
 )
 
@@ -247,7 +250,11 @@ class LiveCandleApplicationService:
                 )
 
     def _persist(
-        self, candle: Candlestick, pending: MarketDataDecisionBatch | None = None
+        self,
+        candle: Candlestick,
+        pending: MarketDataDecisionBatch | None = None,
+        *,
+        handoffs: tuple[MarketExitHandoffInput, ...] = (),
     ) -> None:
         if self._environment_identity() != "live":
             return
@@ -262,6 +269,17 @@ class LiveCandleApplicationService:
             != self._application_identity(candle)
         ):
             raise DecisionBatchIntegrityError()
+        if any(
+            (
+                item.environment,
+                item.product_id,
+                item.timeframe,
+                item.timestamp,
+            ) != self._application_identity(candle)
+            for item in handoffs
+        ):
+            raise DecisionBatchIntegrityError()
+        commit_attempted = False
         with self._db_session_factory() as db:
             try:
                 ensure_product_registered(db, candle.product_id)
@@ -313,10 +331,51 @@ class LiveCandleApplicationService:
                 if pending is not None:
                     db.flush()
                     append_decision_batch(db, pending)
+                if handoffs:
+                    db.flush()
+                    append_exit_handoffs(db, handoffs)
+                commit_attempted = True
                 db.commit()
-            except Exception:
-                db.rollback()
+            except Exception as error:
+                try:
+                    db.rollback()
+                except Exception:
+                    if not commit_attempted:
+                        raise
+                if commit_attempted and handoffs:
+                    try:
+                        with self._db_session_factory() as verify_db:
+                            receipt = verify_db.get(
+                                MarketDataApplication, self._application_identity(candle)
+                            )
+                            records = read_exit_handoffs(
+                                verify_db,
+                                environment=self._environment_identity(),
+                                product_id=candle.product_id,
+                                timeframe=candle.timeframe,
+                                bar_start_ms=candle.timestamp,
+                            )
+                        expected = {row.signal_key: row for row in handoffs}
+                        actual = {row["signal_key"]: row for row in records}
+                        receipt_matches = (
+                            receipt is not None
+                            and self._application_values(receipt) == self._candle_values(candle)
+                        )
+                        if receipt_matches and set(actual) == set(expected) and all(
+                            key in actual
+                            and actual[key]["handoff_id"] == row.handoff_id
+                            and actual[key]["signal_digest"] == row.signal_digest
+                            for key, row in expected.items()
+                        ):
+                            return
+                        if receipt is not None or records:
+                            raise CandleCommitUnknown() from error
+                    except CandleCommitUnknown:
+                        raise
+                    except Exception as verify_error:
+                        raise CandleCommitUnknown() from verify_error
                 raise
+
 
     @contextmanager
     def application_fence(self, candle: Candlestick) -> Iterator[None]:
@@ -396,3 +455,10 @@ class LiveCandleApplicationService:
                 apply_new=apply_new,
                 rebuild_applied=rebuild_applied,
             )
+
+
+class CandleCommitUnknown(RuntimeError):
+    """The receipt/handoff transaction outcome could not be authoritatively read."""
+
+    def __init__(self) -> None:
+        super().__init__("live candle transaction commit outcome is unknown")
