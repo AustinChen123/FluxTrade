@@ -8,6 +8,7 @@ from sqlalchemy import (
     Date,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     Numeric,
@@ -17,7 +18,7 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, declarative_base, mapped_column
 
 Base = declarative_base()
@@ -65,7 +66,6 @@ class MarketDataApplication(Base):
         CheckConstraint("decision_contract_version IS NULL OR decision_contract_version = 1", name="ck_mda_decision_contract"),
         UniqueConstraint("environment", "product_id", "timeframe", "timestamp", "decision_contract_version", name="uq_mda_decision_contract"),
     )
-
     environment = Column(String(64), primary_key=True)
     product_id = Column(String, ForeignKey("product.id"), primary_key=True)
     timeframe = Column(String, primary_key=True)
@@ -75,12 +75,94 @@ class MarketDataApplication(Base):
     low = Column(Numeric, nullable=False)
     close = Column(Numeric, nullable=False)
     volume = Column(Numeric, nullable=False)
-    applied_at = Column(
-        DateTime(timezone=True),
-        nullable=False,
-        server_default=func.now(),
+    applied_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class RithmicExitAttempt(Base):
+    __tablename__ = "rithmic_exit_attempt"
+    attempt_id = Column(UUID(as_uuid=False), primary_key=True)
+    account_id = Column(String(128), nullable=False)
+    account_profile = Column(String(128), nullable=False)
+    product_id = Column(String(64), nullable=False)
+    intent_key = Column(String(128), nullable=False, unique=True)
+    state = Column(String(32), nullable=False)
+    correlation = Column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    last_observation = Column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    owner_id = Column(String(128), nullable=True)
+    fence = Column(BigInteger, nullable=False, server_default=text("0"))
+    lease_until = Column(DateTime(timezone=True), nullable=True)
+    dispatch_started_at = Column(DateTime(timezone=True), nullable=True)
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    disposition_code = Column(String(64), nullable=True)
+    disposition_detail = Column(Text, nullable=True)
+    next_action_at = Column(DateTime(timezone=True), nullable=True)
+    version = Column(BigInteger, nullable=False, server_default=text("0"))
+    parent_attempt_id = Column(UUID(as_uuid=False), ForeignKey("rithmic_exit_attempt.attempt_id"), nullable=True)
+    sender_process_instance_id = Column(String(128), nullable=True)
+    dispatch_epoch = Column(BigInteger, nullable=True)
+    quiescence_evidence = Column(JSONB, nullable=True)
+    __table_args__ = (
+        CheckConstraint("state IN ('PREPARED','MAY_HAVE_SENT','ACCEPTED','FOLLOWUP_PENDING','VERIFYING','UNRESOLVED','SUPERSEDED_RESIDUAL','COMPLETED','VERIFIED_NOOP')", name="ck_rea_state"),
+        CheckConstraint("fence >= 0 AND version >= 0 AND (dispatch_epoch IS NULL OR dispatch_epoch >= 0)", name="ck_rea_versions"),
+        CheckConstraint("(state NOT IN ('COMPLETED','VERIFIED_NOOP','SUPERSEDED_RESIDUAL') OR next_action_at IS NULL)", name="ck_rea_terminal_action"),
+        UniqueConstraint("parent_attempt_id", name="uq_rea_parent"),
+        Index("uq_rea_active_target", "account_id", "account_profile", "product_id", unique=True,
+              postgresql_where=text("state NOT IN ('COMPLETED','VERIFIED_NOOP','SUPERSEDED_RESIDUAL')")),
+        Index("ix_rea_due", "next_action_at", "updated_at"),
     )
 
+
+class RithmicExitTargetAuthority(Base):
+    __tablename__ = "rithmic_exit_target_authority"
+    account_id = Column(String(128), primary_key=True)
+    account_profile = Column(String(128), primary_key=True)
+    product_id = Column(String(64), primary_key=True)
+    dispatch_epoch = Column(BigInteger, nullable=False, server_default=text("0"))
+    process_instance_id = Column(String(128), nullable=True)
+    current_attempt_id = Column(UUID(as_uuid=False), ForeignKey("rithmic_exit_attempt.attempt_id"), nullable=True)
+    current_fence = Column(BigInteger, nullable=True)
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    __table_args__ = (
+        CheckConstraint("dispatch_epoch >= 0 AND (current_fence IS NULL OR current_fence >= 0)", name="ck_reta_epoch_fence"),
+    )
+
+
+class MarketExitHandoff(Base):
+    __tablename__ = "market_exit_handoff"
+    handoff_id = Column(UUID(as_uuid=False), primary_key=True)
+    environment = Column(String(64), nullable=False)
+    product_id = Column(String(64), nullable=False)
+    timeframe = Column(String(32), nullable=False)
+    timestamp = Column(BigInteger, nullable=False)
+    signal_key = Column(String(128), nullable=False)
+    emission_ordinal = Column(Integer, nullable=False)
+    signal_payload = Column(JSONB, nullable=False)
+    signal_digest = Column(String(64), nullable=False)
+    execution_scope_id = Column(String(128), nullable=True)
+    strategy_id = Column(String(128), nullable=True)
+    strategy_version = Column(String(128), nullable=True)
+    config_hash = Column(String(64), nullable=True)
+    account_id = Column(String(128), nullable=True)
+    account_profile = Column(String(128), nullable=True)
+    cause_generation = Column(BigInteger, nullable=True)
+    status = Column(String(24), nullable=False, server_default=text("'QUEUED'"))
+    failure_detail = Column(Text, nullable=True)
+    attempt_id = Column(UUID(as_uuid=False), ForeignKey("rithmic_exit_attempt.attempt_id"), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["environment", "product_id", "timeframe", "timestamp"],
+            ["market_data_application.environment", "market_data_application.product_id", "market_data_application.timeframe", "market_data_application.timestamp"],
+            ondelete="RESTRICT", name="fk_meh_receipt",
+        ),
+        UniqueConstraint("environment", "product_id", "timeframe", "timestamp", "signal_key", name="uq_meh_signal"),
+        CheckConstraint("emission_ordinal >= 0", name="ck_meh_ordinal"),
+        CheckConstraint("signal_digest ~ '^[0-9a-f]{64}$'", name="ck_meh_digest"),
+        CheckConstraint("status IN ('QUEUED','LEASED','COMPLETED','VERIFIED_NOOP','UNRESOLVED')", name="ck_meh_status"),
+        CheckConstraint("(strategy_version IS NULL) = (strategy_id IS NULL)", name="ck_meh_strategy_pair"),
+        CheckConstraint("(account_id IS NULL) = (account_profile IS NULL)", name="ck_meh_account_pair"),
+        Index("ix_meh_pending", "status", "created_at"),
+    )
 
 class ResearchDataset(Base):
     __tablename__ = "research_dataset"
