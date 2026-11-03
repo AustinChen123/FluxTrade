@@ -371,10 +371,25 @@ fn runtime_error(py: Python<'_>, error: anyhow::Error) -> PyErr {
         .into_value(py)
         .into_bound(py)
         .into_any();
+    let [stage, stable_error_code, safe_cause] = failure.safe_fields();
+    if let Ok(safe) = super::rithmic_diagnostic::safe_diagnostic(
+        py,
+        &error,
+        stage,
+        stable_error_code,
+        safe_cause,
+        retryable,
+        Some((
+            connect_phase,
+            connect_failure_kind,
+            session_failure_reason,
+            provider_response_code,
+        )),
+    ) {
+        let _ = super::rithmic_diagnostic::attach_safe_diagnostic(&target, safe);
+    }
     if let Some(diagnostic) = diagnostic {
-        if target.setattr("diagnostic", diagnostic).is_err() {
-            return PyRuntimeError::new_err("Rithmic ledger snapshot failed");
-        }
+        let _ = target.setattr("diagnostic", diagnostic);
     }
     project_runtime_error_target(
         failure,
@@ -440,6 +455,40 @@ mod tests {
     use pyo3::types::PyModule;
     use rust_decimal_macros::dec;
     use std::ffi::CString;
+
+    fn assert_profile_lease_legacy_tuple(value: &Bound<'_, PyAny>) {
+        assert!(value.is_instance_of::<PyRuntimeError>());
+        for (attribute, expected) in [
+            ("stage", "profile_lease"),
+            ("stable_error_code", "profile_lease_failed"),
+            ("safe_cause", "profile lease failed"),
+            ("connect_phase", "unclassified"),
+            ("connect_failure_kind", "unclassified"),
+            ("session_failure_reason", "unclassified"),
+        ] {
+            assert_eq!(
+                value
+                    .getattr(attribute)
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                expected
+            );
+        }
+        assert!(value
+            .getattr("retryable")
+            .unwrap()
+            .extract::<bool>()
+            .unwrap());
+        assert_eq!(
+            value
+                .getattr("provider_response_code")
+                .unwrap()
+                .extract::<Option<u32>>()
+                .unwrap(),
+            None
+        );
+    }
 
     #[test]
     fn decoded_snapshot_diagnostic_reaches_recovery_warning() {
@@ -761,14 +810,11 @@ unclassified_internal|unclassified_ledger_snapshot_failure|ledger snapshot faile
                     .unwrap(),
                 Some(13)
             );
-            assert_eq!(
-                value
-                    .getattr("retryable")
-                    .unwrap()
-                    .extract::<bool>()
-                    .unwrap(),
-                false
-            );
+            assert!(!value
+                .getattr("retryable")
+                .unwrap()
+                .extract::<bool>()
+                .unwrap());
             assert!(!value.to_string().contains("provider-secret"));
             assert!(!value
                 .getattr("safe_cause")
@@ -997,6 +1043,151 @@ class FailsProviderResponseCode(RuntimeError):
                     .unwrap(),
                 ("Rithmic ledger snapshot failed".to_string(),)
             );
+        });
+    }
+
+    #[test]
+    fn safe_diagnostic_attachment_failure_preserves_legacy_retry_fields() {
+        let _project_import_guard = crate::binding::embedded_python_project_import_lock();
+        Python::with_gil(|py| {
+            crate::binding::rithmic_diagnostic::fail_next_attachment_for_test();
+            let source = anyhow::anyhow!("injected source").context(PROFILE_LEASE_FAILURE);
+            let projected = runtime_error(py, source);
+            let value = projected.value(py);
+            assert_profile_lease_legacy_tuple(value);
+            assert!(!value.hasattr("safe_diagnostic").unwrap());
+        });
+    }
+
+    #[test]
+    fn safe_diagnostic_construction_failure_preserves_legacy_retry_fields() {
+        let _project_import_guard = crate::binding::embedded_python_project_import_lock();
+        Python::with_gil(|py| {
+            crate::binding::rithmic_diagnostic::fail_next_construction_for_test();
+            let source = anyhow::anyhow!("construction failure").context(PROFILE_LEASE_FAILURE);
+            let projected = runtime_error(py, source);
+            let value = projected.value(py);
+            assert_profile_lease_legacy_tuple(value);
+            assert!(!value.hasattr("safe_diagnostic").unwrap());
+        });
+    }
+
+    #[test]
+    fn native_projection_variants_traverse_real_ledger_classifier_and_recovery_decision() {
+        let _project_import_guard = crate::binding::embedded_python_project_import_lock();
+        Python::with_gil(|py| {
+            let sys = PyModule::import(py, "sys").unwrap();
+            let paths = sys.getattr("path").unwrap();
+            let version_info = sys.getattr("version_info").unwrap();
+            let major: u8 = version_info.get_item(0).unwrap().extract().unwrap();
+            let minor: u8 = version_info.get_item(1).unwrap().extract().unwrap();
+            let repository_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .expect("rust-data-service should be inside the repository");
+            for path in [
+                repository_root.join(format!(
+                    "python-strategy/.venv/lib/python{major}.{minor}/site-packages"
+                )),
+                repository_root.join("python-strategy"),
+            ] {
+                paths
+                    .call_method1("insert", (0, path.to_string_lossy().as_ref()))
+                    .unwrap();
+            }
+            let source = CString::new(
+                r#"
+import logging
+from types import SimpleNamespace
+from src.core.adapters.rithmic_owned_order_reconciliation import (
+    RithmicOwnedOrderReconciler, _classify_ledger_snapshot_failure,
+)
+from src.core.adapters.rithmic_runtime_recovery import RithmicRuntimeRecoveryService
+
+def run(native_error, expect_detail):
+    classified = _classify_ledger_snapshot_failure(native_error)
+    assert classified == (
+        "RuntimeError", "profile_lease", "profile_lease_failed",
+        "profile lease failed", True,
+    ), classified
+    class Adapter:
+        def restore_order_groups(self, _orders): pass
+        def close(self): pass
+    context = SimpleNamespace(
+        db_session_factory=object(),
+        list_recoverable_client_orders=lambda: [],
+        now_seconds=lambda: 0,
+        logger=logging.getLogger("f4-native-classifier"),
+    )
+    owner = RithmicOwnedOrderReconciler(
+        adapter=Adapter(), profile="PROFILE", account_id="ACCOUNT",
+        validate_snapshot_identities=lambda _snapshot: None, context=context,
+    )
+    owner._write_recovery_audit = lambda payload, **_kwargs: payload
+    def loader(*_args, **_kwargs): raise native_error
+    summary = owner.reconcile(snapshot_loader=loader)
+    assert summary["snapshot_retryable"] is True
+    assert summary["snapshot_error_stage"] == "profile_lease"
+    assert summary["snapshot_error_code"] == "profile_lease_failed"
+    assert ("safe_diagnostic" in summary) is expect_detail
+
+    calls = {"halt": 0, "stop": 0, "lockdown": [], "resume": 0, "diagnostics": []}
+    service = RithmicRuntimeRecoveryService(
+        adapter=Adapter(), profile="PROFILE", account_id="ACCOUNT",
+        halt_for_reconcile=lambda **_kw: calls.__setitem__("halt", calls["halt"] + 1) or True,
+        stop_order_event_stream=lambda **_kw: calls.__setitem__("stop", calls["stop"] + 1) or True,
+        reconcile_owned_orders=lambda *_args: owner.reconcile(snapshot_loader=loader),
+        publish_authoritative_summary=lambda _summary: None,
+        assert_runtime_leadership=lambda: None,
+        start_order_event_stream=lambda: True,
+        resume_after_reconcile=lambda: calls.__setitem__("resume", calls["resume"] + 1),
+        lockdown=calls["lockdown"].append, logger=logging.getLogger("f4-native-classifier"),
+        monotonic_seconds=lambda: 0, maintenance_active=lambda: False,
+        diagnostic_sink=lambda diagnostic: calls["diagnostics"].append(diagnostic) or True,
+    )
+    assert service.run_once() is False
+    assert calls["halt"] == calls["stop"] == 1, calls
+    assert calls["lockdown"] == [] and calls["resume"] == 0, calls
+    assert len(calls["diagnostics"]) == int(expect_detail), calls
+"#
+                .trim()
+                .to_string(),
+            )
+            .unwrap();
+            let filename = CString::new("rithmic_native_classifier_decision.py").unwrap();
+            let module_name = CString::new("rithmic_native_classifier_decision").unwrap();
+            let module = PyModule::from_code(
+                py,
+                source.as_c_str(),
+                filename.as_c_str(),
+                module_name.as_c_str(),
+            )
+            .unwrap();
+
+            for projection in ["normal", "attachment_failure", "construction_failure"] {
+                if projection == "attachment_failure" {
+                    crate::binding::rithmic_diagnostic::fail_next_attachment_for_test();
+                } else if projection == "construction_failure" {
+                    crate::binding::rithmic_diagnostic::fail_next_construction_for_test();
+                }
+                let error = runtime_error(
+                    py,
+                    anyhow::anyhow!("injected native source").context(PROFILE_LEASE_FAILURE),
+                );
+                let value = error.value(py);
+                let has_detail = value.hasattr("safe_diagnostic").unwrap();
+                assert_eq!(has_detail, projection == "normal");
+                module.setattr("native_error", value).unwrap();
+                module
+                    .getattr("run")
+                    .unwrap()
+                    .call1((value, has_detail))
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "native {projection} classifier/recovery decision failed: {}",
+                            error.value(py)
+                        )
+                    });
+            }
         });
     }
 
