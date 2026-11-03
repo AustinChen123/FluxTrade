@@ -70,8 +70,8 @@ def test_dispatcher_commits_only_worker_owned_session() -> None:
 
     dispatcher = OpsDiagnosticDispatcher(session_factory=sessions)
     assert dispatcher.submit(_diagnostic())
-    assert committed.wait(2)
-    deadline = time.monotonic() + 2
+    assert committed.wait(30)
+    deadline = time.monotonic() + 30
     while dispatcher.counters["committed"] != 1 and time.monotonic() < deadline:
         time.sleep(0.005)
     session.commit.assert_called_once()
@@ -83,11 +83,13 @@ def test_blocked_db_does_not_block_producer_and_queue_stays_bounded(caplog) -> N
     caplog.set_level(logging.INFO)
     entered = threading.Event()
     release = threading.Event()
+    release_timed_out = threading.Event()
 
     @contextmanager
     def blocked_sessions() -> Iterator[MagicMock]:
         entered.set()
-        release.wait(5)
+        if not release.wait(30):
+            release_timed_out.set()
         yield MagicMock()
 
     dispatcher = OpsDiagnosticDispatcher(
@@ -98,8 +100,8 @@ def test_blocked_db_does_not_block_producer_and_queue_stays_bounded(caplog) -> N
     start = time.monotonic()
     assert dispatcher.submit(_diagnostic())
     assert time.monotonic() - start < 0.1
-    assert entered.wait(1)
-    deadline = time.monotonic() + 1
+    assert entered.wait(30)
+    deadline = time.monotonic() + 30
     while "Ops diagnostic dispatcher health" not in caplog.text and time.monotonic() < deadline:
         time.sleep(0.005)
     assert "Ops diagnostic dispatcher health" in caplog.text
@@ -115,24 +117,27 @@ def test_blocked_db_does_not_block_producer_and_queue_stays_bounded(caplog) -> N
     assert dispatcher.submit(_diagnostic()) is False
     assert dispatcher.counters["dropped"] == 3
     release.set()
-    deadline = time.monotonic() + 2
+    deadline = time.monotonic() + 30
     while dispatcher.counters["committed"] == 0 and time.monotonic() < deadline:
         time.sleep(0.005)
     assert dispatcher.counters["accepted"] == 2
     assert dispatcher.counters["committed"] == 1
     assert dispatcher.counters["dropped"] == 3
     assert dispatcher.counters["queued"] == 0
+    assert not release_timed_out.is_set(), "blocked session release timed out"
 
 
 def test_indefinitely_blocked_commit_isolated_and_reported_stalled(caplog) -> None:
     caplog.set_level(logging.INFO)
     entered = threading.Event()
     release = threading.Event()
+    release_timed_out = threading.Event()
     session = MagicMock()
 
     def blocked_commit() -> None:
         entered.set()
-        release.wait()
+        if not release.wait(30):
+            release_timed_out.set()
 
     session.commit.side_effect = blocked_commit
 
@@ -147,8 +152,8 @@ def test_indefinitely_blocked_commit_isolated_and_reported_stalled(caplog) -> No
         stall_after_seconds=0.02,
     )
     assert dispatcher.submit(_diagnostic())
-    assert entered.wait(1)
-    deadline = time.monotonic() + 1
+    assert entered.wait(30)
+    deadline = time.monotonic() + 30
     while not dispatcher.counters["stalled"] and time.monotonic() < deadline:
         time.sleep(0.002)
     assert dispatcher.counters["stalled"] is True
@@ -157,17 +162,18 @@ def test_indefinitely_blocked_commit_isolated_and_reported_stalled(caplog) -> No
     assert dispatcher.counters["dropped"] == 1
     assert dispatcher.counters["queued"] == 1
     assert dispatcher.counters["available"] is True
-    deadline = time.monotonic() + 1
+    deadline = time.monotonic() + 30
     while "'stalled': True" not in caplog.text and time.monotonic() < deadline:
         time.sleep(0.002)
     assert "'stalled': True" in caplog.text
     dispatcher.stop()
     release.set()
-    deadline = time.monotonic() + 2
+    deadline = time.monotonic() + 30
     while dispatcher.counters["committed"] < 1 and time.monotonic() < deadline:
         time.sleep(0.002)
     assert dispatcher.counters["committed"] == 1
     assert dispatcher.counters["dropped"] == 2
+    assert not release_timed_out.is_set(), "blocked commit release timed out"
 
 
 def test_thread_start_failure_is_unavailable_without_sync_fallback() -> None:
@@ -256,11 +262,11 @@ def test_rejected_or_contended_admission_does_not_wait_for_lock(rejected) -> Non
     try:
         thread = threading.Thread(target=submit_none)
         thread.start()
-        assert entered.wait(1)
+        assert entered.wait(30)
         assert returned.wait(0.1)
     finally:
         dispatcher._lock.release()
-    thread.join(timeout=1)
+    thread.join(timeout=30)
     assert dispatcher.counters["dropped"] == 1
     dispatcher.stop()
 

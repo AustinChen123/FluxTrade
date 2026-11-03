@@ -115,7 +115,7 @@ pub(super) async fn connection_with_server(
             _ => tokio::time::sleep(Duration::from_millis(100)).await,
         }
     });
-    let mut connection = connect(&url, login(), Duration::from_secs(1))
+    let mut connection = connect(&url, login(), Duration::from_secs(30))
         .await
         .unwrap();
     if outbound {

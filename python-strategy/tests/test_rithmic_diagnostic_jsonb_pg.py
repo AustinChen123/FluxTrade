@@ -243,7 +243,7 @@ def test_rust_binding_diagnostic_is_committed_as_postgres_jsonb() -> None:
         terminal_diagnostic = diagnostic_from_exception(terminal_error)
         startup_diagnostic = diagnostic_from_exception(startup_error)
         assert terminal_diagnostic is not None and startup_diagnostic is not None
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + 30
         while (
             dispatcher.counters["committed"] + dispatcher.counters["dropped"] < 9
             and time.monotonic() < deadline

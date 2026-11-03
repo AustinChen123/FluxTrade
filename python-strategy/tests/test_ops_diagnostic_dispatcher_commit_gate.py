@@ -38,6 +38,7 @@ def test_blocked_diagnostic_commit_does_not_gate_safety_or_clear(
     regular_sessions = sessionmaker(bind=db_engine)
     commit_entered = threading.Event()
     release_commit = threading.Event()
+    release_commit_timed_out = threading.Event()
 
     @contextmanager
     def blocked_commit_sessions() -> Iterator[Session]:
@@ -46,7 +47,8 @@ def test_blocked_diagnostic_commit_does_not_gate_safety_or_clear(
 
             def blocked_commit() -> None:
                 commit_entered.set()
-                assert release_commit.wait(3)
+                if not release_commit.wait(30):
+                    release_commit_timed_out.set()
                 commit()
 
             session.commit = blocked_commit  # type: ignore[method-assign]
@@ -56,7 +58,7 @@ def test_blocked_diagnostic_commit_does_not_gate_safety_or_clear(
         session_factory=blocked_commit_sessions, queue_capacity=2
     )
     assert dispatcher.submit(_diagnostic())
-    assert commit_entered.wait(1)
+    assert commit_entered.wait(30)
 
     execution = MagicMock()
     execution.order_manager.repo.list_orders_by_statuses.return_value = []
@@ -82,10 +84,11 @@ def test_blocked_diagnostic_commit_does_not_gate_safety_or_clear(
     dispatcher.stop()
     assert time.monotonic() - stopped_at < 0.1
     release_commit.set()
-    deadline = time.monotonic() + 2
+    deadline = time.monotonic() + 30
     while dispatcher.counters["committed"] < 1 and time.monotonic() < deadline:
         time.sleep(0.005)
     assert dispatcher.counters["committed"] == 1
+    assert not release_commit_timed_out.is_set(), "blocked commit release timed out"
     assert safety.latest_kill_switch_state() == "OK"
     with regular_sessions() as session:
         rows = list(session.execute(select(SystemEvent)).scalars())

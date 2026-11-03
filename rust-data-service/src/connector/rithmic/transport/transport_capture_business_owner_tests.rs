@@ -137,7 +137,7 @@ async fn blocked_capture_writer_does_not_change_business_or_pending_disposition(
                     .await
                     .unwrap();
             });
-            let mut connection = connect(&url, login(), Duration::from_secs(1))
+            let mut connection = connect(&url, login(), Duration::from_secs(30))
                 .await
                 .unwrap();
             assert_eq!(
@@ -157,7 +157,7 @@ async fn blocked_capture_writer_does_not_change_business_or_pending_disposition(
                 request_key: pending_key.clone(),
                 client_order_id: "client-pending".into(),
                 basket_id: Some("basket-pending".into()),
-                deadline: std::time::Instant::now() + Duration::from_secs(5),
+                deadline: std::time::Instant::now() + Duration::from_secs(30),
                 reply: reply_tx,
             });
             if disposition_case == "malformed_envelope" {

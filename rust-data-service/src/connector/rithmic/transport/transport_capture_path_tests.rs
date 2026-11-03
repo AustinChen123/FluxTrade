@@ -77,7 +77,7 @@ async fn actual_receive_path_matrix_preserves_payload_with_capture_sink_states()
                     .await
                     .unwrap();
             });
-            let mut connection = connect(&url, login(), Duration::from_secs(1))
+            let mut connection = connect(&url, login(), Duration::from_secs(30))
                 .await
                 .unwrap();
             assert_eq!(
@@ -202,7 +202,7 @@ async fn production_send_payload_enqueues_capture_before_socket_result() {
         send_heartbeat_response(&mut socket).await;
         drop(socket);
     });
-    let mut connection = connect(&url, login(), Duration::from_secs(1))
+    let mut connection = connect(&url, login(), Duration::from_secs(30))
         .await
         .unwrap();
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
@@ -222,7 +222,7 @@ async fn production_send_payload_enqueues_capture_before_socket_result() {
     let _ = connection
         .send_payload_with_capture(payload, &capture)
         .await;
-    assert!(receiver.recv_timeout(Duration::from_secs(1)).is_ok());
+    assert!(receiver.recv_timeout(Duration::from_secs(30)).is_ok());
     assert_eq!(capture.counts().0, 1);
     assert_eq!(capture.counts().1, 1);
     server.await.unwrap();

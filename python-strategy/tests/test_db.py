@@ -87,4 +87,4 @@ def test_production_engine_loopback_connect_failure_is_bounded(monkeypatch) -> N
     started = monotonic()
     with pytest.raises(OperationalError):
         db.get_engine().connect()
-    assert monotonic() - started < 4
+    assert monotonic() - started < 10

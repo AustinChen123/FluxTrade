@@ -119,7 +119,7 @@ def test_driver_rollback_and_session_close_failures_are_counted_without_retry_ow
         health_interval_seconds=60,
     )
     assert dispatcher.submit(_diagnostic())
-    deadline = time.monotonic() + 2
+    deadline = time.monotonic() + 30
     while dispatcher.counters["dropped"] != 1 and time.monotonic() < deadline:
         time.sleep(0.005)
     assert dispatcher.counters["accepted"] == 1
@@ -210,11 +210,14 @@ def test_ops_safety_persists_redacted_rithmic_kill_switch_reason() -> None:
 def test_dead_worker_is_not_replaced_and_producers_fail_fast() -> None:
     entered = threading.Event()
     release = threading.Event()
+    release_timed_out = threading.Event()
 
     @contextmanager
     def dying_sessions() -> Iterator[MagicMock]:
         entered.set()
-        assert release.wait(1)
+        if not release.wait(30):
+            release_timed_out.set()
+            raise SystemExit("test release gate timed out")
         raise SystemExit("worker exits unexpectedly")
         yield MagicMock()
 
@@ -234,10 +237,11 @@ def test_dead_worker_is_not_replaced_and_producers_fail_fast() -> None:
             thread_factory=capture_worker,
         )
         assert dispatcher.submit(_diagnostic())
-        assert entered.wait(1)
+        assert entered.wait(30)
         assert dispatcher.submit(_diagnostic())
         release.set()
-        worker_refs[0].join(1)
+        worker_refs[0].join(30)
+        assert not release_timed_out.is_set(), "worker release gate timed out"
         assert not worker_refs[0].is_alive()
         counters = dispatcher.counters
         assert counters["available"] is False

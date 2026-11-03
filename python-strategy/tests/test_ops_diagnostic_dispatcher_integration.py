@@ -42,7 +42,7 @@ def _write_from_fresh_dispatcher_process(db_path: str, label: str, result: Any) 
     )
     assert value is not None
     assert owner.submit(value)
-    deadline = time.monotonic() + 3
+    deadline = time.monotonic() + 30
     while owner.counters["committed"] < 1 and time.monotonic() < deadline:
         time.sleep(0.005)
     owner_state = owner.counters
@@ -77,7 +77,7 @@ def _block_dispatcher_process(db_path: str, result: Any) -> None:
     )
     assert first is not None
     assert owner.submit(first)
-    assert entered.wait(3)
+    assert entered.wait(30)
     assert owner.submit(first)
     result.put(owner.counters)
     threading.Event().wait(30)
@@ -110,10 +110,10 @@ def test_python_dispatcher_owner_restarts_in_a_fresh_os_process(tmp_path: Path) 
             args=(db_path, label, result),
         )
         child.start()
-        child.join(10)
+        child.join(30)
         assert not child.is_alive(), f"{label} dispatcher process did not exit"
         assert child.exitcode == 0
-        assert result.get(timeout=2) == label
+        assert result.get(timeout=30) == label
 
     # A process crash can lose an in-flight and a queued optional diagnostic.
     # It does not replay committed rows; a fresh process owns a new dispatcher.
@@ -122,11 +122,11 @@ def test_python_dispatcher_owner_restarts_in_a_fresh_os_process(tmp_path: Path) 
         args=(db_path, result),
     )
     crashing.start()
-    crash_state = result.get(timeout=5)
+    crash_state = result.get(timeout=30)
     assert crash_state["accepted"] == 2
     assert crash_state["queued"] == 1
     crashing.terminate()
-    crashing.join(10)
+    crashing.join(30)
     assert not crashing.is_alive()
 
     restarted = context.Process(
@@ -134,17 +134,20 @@ def test_python_dispatcher_owner_restarts_in_a_fresh_os_process(tmp_path: Path) 
         args=(db_path, "after-crash", result),
     )
     restarted.start()
-    restarted.join(10)
+    restarted.join(30)
     assert not restarted.is_alive()
     assert restarted.exitcode == 0
-    assert result.get(timeout=2) == "after-crash"
+    assert result.get(timeout=30) == "after-crash"
 
-    with create_engine(f"sqlite:///{db_path}").connect() as connection:
+    db_engine = create_engine(f"sqlite:///{db_path}")
+    with db_engine.connect() as connection:
         payloads = list(
             connection.execute(select(SystemEvent.payload).order_by(SystemEvent.id))
         )
+    db_engine.dispose()
     assert len(payloads) == 3
     assert all(row.payload["safe_diagnostic"]["template_id"] == 352 for row in payloads)
+
 
 def test_real_stream_restart_and_drift_safety_survive_blocked_dispatcher(
     tmp_path: Path,
@@ -154,12 +157,15 @@ def test_real_stream_restart_and_drift_safety_survive_blocked_dispatcher(
     sessions = sessionmaker(bind=db_engine)
     open_entered = threading.Event()
     release_open = threading.Event()
+    release_open_timed_out = threading.Event()
 
     @contextmanager
     def blocked_then_real_sessions() -> Iterator[Session]:
         if not open_entered.is_set():
             open_entered.set()
-            assert release_open.wait(3)
+            if not release_open.wait(120):
+                release_open_timed_out.set()
+                raise TimeoutError("blocked diagnostic session release timed out")
         with sessions() as session:
             yield session
 
@@ -229,12 +235,12 @@ def test_real_stream_restart_and_drift_safety_survive_blocked_dispatcher(
             diagnostic_dispatcher=dispatcher,
         )
         assert service.start()
-        stream_workers[-1].join(1)
+        stream_workers[-1].join(30)
         assert not stream_workers[-1].is_alive()
         return service
 
     start_terminal_stream()
-    assert open_entered.wait(1)
+    assert open_entered.wait(30)
     # ORDER stream restart reuses the same process dispatcher while its DB
     # session factory is still blocked on the first diagnostic.
     start_terminal_stream()
@@ -259,9 +265,10 @@ def test_real_stream_restart_and_drift_safety_survive_blocked_dispatcher(
     assert clear_result == {"cleared": True, "reason": None}
     assert ops_safety.latest_kill_switch_state() == "OK"
     release_open.set()
-    deadline = time.monotonic() + 2
+    deadline = time.monotonic() + 30
     while dispatcher.counters["committed"] < 3 and time.monotonic() < deadline:
         time.sleep(0.005)
+    assert not release_open_timed_out.is_set(), "dispatcher session gate timed out"
     assert dispatcher.counters["committed"] == 3
     assert ops_safety.latest_kill_switch_state() == "OK"
 

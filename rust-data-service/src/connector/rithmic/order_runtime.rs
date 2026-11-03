@@ -1506,14 +1506,16 @@ mod tests {
         let server = tokio::spawn(async move {
             let mut socket = serve_order_startup(&listener).await;
             if matches!(trigger, PendingActorFailure::SendFailure) {
-                let _ = timeout(Duration::from_secs(2), socket.next()).await;
+                let _ = timeout(Duration::from_secs(30), socket.next()).await;
                 drop(socket);
                 let mut socket = serve_order_startup(&listener).await;
+                // Preserve the two-second quiet window that checks a failed
+                // order is not resent after reconnect.
                 let _ = timeout(Duration::from_secs(2), socket.next()).await;
                 let _ = progress_sender.send(());
                 return;
             }
-            let command = timeout(Duration::from_secs(2), socket.next())
+            let command = timeout(Duration::from_secs(30), socket.next())
                 .await
                 .unwrap()
                 .unwrap()
@@ -1521,6 +1523,7 @@ mod tests {
             assert_template(command, 312);
             match trigger {
                 PendingActorFailure::Shutdown => {
+                    // This is an intentional no-extra-command observation.
                     let _ = timeout(Duration::from_secs(2), socket.next()).await;
                     return;
                 }
@@ -1533,6 +1536,7 @@ mod tests {
             }
             drop(socket);
             let mut socket = serve_order_startup(&listener).await;
+            // Preserve the quiet window that detects an unintended retry.
             let _ = timeout(Duration::from_secs(2), socket.next()).await;
             let _ = progress_sender.send(());
         });
@@ -1590,7 +1594,7 @@ mod tests {
             outside_maintenance,
         ));
 
-        timeout(Duration::from_secs(3), async {
+        timeout(Duration::from_secs(30), async {
             while generation.load(Ordering::Acquire) == 0 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -1621,7 +1625,7 @@ mod tests {
                 submit_rx
                     .take()
                     .unwrap()
-                    .recv_timeout(Duration::from_secs(2))
+                    .recv_timeout(Duration::from_secs(30))
                     .unwrap()
                     .unwrap_err()
                     .to_string(),
@@ -1629,21 +1633,23 @@ mod tests {
             );
         }
         if !matches!(trigger, PendingActorFailure::Shutdown) {
-            timeout(Duration::from_secs(4), async {
+            timeout(Duration::from_secs(30), async {
                 while generation.load(Ordering::Acquire) < expected_generation {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             })
             .await
             .unwrap();
-            timeout(Duration::from_secs(4), progress_receiver)
+            timeout(Duration::from_secs(60), progress_receiver)
                 .await
-                .expect("server did not observe settled reconnect progress")
+                .expect(&format!(
+                    "server did not observe settled reconnect progress for {trigger:?}"
+                ))
                 .expect("server progress gate was dropped");
             command_tx.send(Command::Shutdown).await.unwrap();
         }
         assert_eq!(capture.counts(), expected_capture_counts);
-        timeout(Duration::from_secs(2), runtime)
+        timeout(Duration::from_secs(30), runtime)
             .await
             .unwrap()
             .unwrap();

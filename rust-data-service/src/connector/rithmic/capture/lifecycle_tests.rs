@@ -187,7 +187,7 @@ async fn process_owner_captures_loopback_order_pnl_reconnect_while_blocked() {
     let mut connection = super::connect_with_capture(
         &url,
         login.clone(),
-        std::time::Duration::from_secs(1),
+        std::time::Duration::from_secs(30),
         capture.clone(),
     )
     .await
@@ -213,7 +213,7 @@ async fn process_owner_captures_loopback_order_pnl_reconnect_while_blocked() {
     let mut reconnected = super::connect_with_capture(
         &url,
         login,
-        std::time::Duration::from_secs(1),
+        std::time::Duration::from_secs(30),
         capture.clone(),
     )
     .await
@@ -264,7 +264,7 @@ async fn process_owner_captures_loopback_order_pnl_reconnect_while_blocked() {
         assert_eq!(health.3, 3);
     } else {
         owner.release_without_join();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while capture.health_counts().1 == 0 && std::time::Instant::now() < deadline {
             std::thread::yield_now();
         }

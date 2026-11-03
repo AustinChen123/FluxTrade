@@ -49,7 +49,7 @@ fn fresh_os_process_restart_keeps_committed_capture_records_once() {
                 std::mem::forget(owner);
                 println!("BLOCKED_WRITER_SHUTDOWN_RETURNED");
             } else {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
                 while !process_capture().health_counts().4 && std::time::Instant::now() < deadline {
                     std::thread::yield_now();
                 }
@@ -89,7 +89,7 @@ fn fresh_os_process_restart_keeps_committed_capture_records_once() {
         initialize_process_capture();
         let connection_id = if mode == "first" { 101 } else { 202 };
         process_capture().attempt(Direction::Outbound, Some(312), 0, connection_id, &[]);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while process_capture().counters.written.load(Ordering::Relaxed) != 1
             && std::time::Instant::now() < deadline
         {
