@@ -37,7 +37,8 @@ use super::order_pending::{
 };
 #[cfg(test)]
 use super::order_session::{
-    connect_and_prepare_runtime, retryable_order_session_failure, SUBSCRIBE_KEY, TRADE_ROUTES_KEY,
+    connect_and_prepare_runtime, connect_and_prepare_runtime_with_capture,
+    retryable_order_session_failure, SUBSCRIBE_KEY, TRADE_ROUTES_KEY,
 };
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(45);
@@ -537,7 +538,7 @@ where
     }
 }
 
-fn handle_payload(
+pub(super) fn handle_payload(
     payload: Vec<u8>,
     account: &AccountIdentity,
     pending: &mut Option<Pending>,
@@ -559,6 +560,10 @@ fn handle_payload(
 }
 #[cfg(test)]
 mod tests {
+    use super::super::capture::{
+        self, CaptureHandle, CounterHandle, Direction as CaptureDirection, TestOwnerWriter,
+        TestWriterState,
+    };
     use super::super::ledger::TransactionType;
     use super::super::{
         codec,
@@ -1477,22 +1482,37 @@ mod tests {
         assert_eq!(codec::template_id(&payload).unwrap(), expected);
     }
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Debug)]
     enum PendingActorFailure {
         Shutdown,
         Timeout,
+        SendFailure,
         ConnectionLoss,
+        CallerCancelled,
     }
 
     async fn assert_actor_pending_failure(
         trigger: PendingActorFailure,
         expected_reason: &str,
         expected_generation: u64,
+        capture: CaptureHandle,
+        fail_send: bool,
+        expected_capture_counts: (u64, u64, u64),
+        owner: Option<(tempfile::TempDir, TestOwnerWriter)>,
     ) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (progress_sender, progress_receiver) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             let mut socket = serve_order_startup(&listener).await;
+            if matches!(trigger, PendingActorFailure::SendFailure) {
+                let _ = timeout(Duration::from_secs(2), socket.next()).await;
+                drop(socket);
+                let mut socket = serve_order_startup(&listener).await;
+                let _ = timeout(Duration::from_secs(2), socket.next()).await;
+                let _ = progress_sender.send(());
+                return;
+            }
             let command = timeout(Duration::from_secs(2), socket.next())
                 .await
                 .unwrap()
@@ -1507,11 +1527,14 @@ mod tests {
                 PendingActorFailure::Timeout => {
                     tokio::time::sleep(Duration::from_millis(300)).await;
                 }
+                PendingActorFailure::SendFailure => {}
                 PendingActorFailure::ConnectionLoss => {}
+                PendingActorFailure::CallerCancelled => {}
             }
             drop(socket);
             let mut socket = serve_order_startup(&listener).await;
             let _ = timeout(Duration::from_secs(2), socket.next()).await;
+            let _ = progress_sender.send(());
         });
 
         let login = LoginParameters::new(
@@ -1531,10 +1554,13 @@ mod tests {
         let profile = match trigger {
             PendingActorFailure::Shutdown => "order-pending-shutdown-loopback",
             PendingActorFailure::Timeout => "order-pending-timeout-loopback",
+            PendingActorFailure::SendFailure => "order-pending-send-failure-loopback",
             PendingActorFailure::ConnectionLoss => "order-pending-loss-loopback",
+            PendingActorFailure::CallerCancelled => "order-pending-cancelled-loopback",
         };
         let lease = ProfileLease::acquire(profile).unwrap();
         let runtime_generation = Arc::clone(&generation);
+        let capture_for_connect = capture.clone();
         let runtime = tokio::spawn(run_with_connector(
             lease,
             command_rx,
@@ -1543,11 +1569,23 @@ mod tests {
             runtime_generation,
             ready_tx,
             move || {
+                let capture_for_attempt = capture_for_connect.clone();
                 let runtime = RuntimeConfig {
                     url: url.clone(),
                     login: login.clone(),
                 };
-                async move { connect_and_prepare_runtime(runtime, Some("ACCOUNT")).await }
+                async move {
+                    let mut prepared = connect_and_prepare_runtime_with_capture(
+                        runtime,
+                        Some("ACCOUNT"),
+                        capture_for_attempt,
+                    )
+                    .await?;
+                    if fail_send {
+                        prepared.0.fail_next_send_for_test();
+                    }
+                    Ok(prepared)
+                }
             },
             outside_maintenance,
         ));
@@ -1560,6 +1598,7 @@ mod tests {
         .await
         .unwrap();
         let (submit_tx, submit_rx) = std_mpsc::sync_channel(1);
+        let mut submit_rx = Some(submit_rx);
         command_tx
             .send(Command::Submit {
                 order: test_order(),
@@ -1571,18 +1610,24 @@ mod tests {
             })
             .await
             .unwrap();
+        if matches!(trigger, PendingActorFailure::CallerCancelled) {
+            drop(submit_rx.take());
+        }
         if matches!(trigger, PendingActorFailure::Shutdown) {
             command_tx.send(Command::Shutdown).await.unwrap();
         }
-        assert_eq!(
-            submit_rx
-                .recv_timeout(Duration::from_secs(2))
-                .unwrap()
-                .unwrap_err()
-                .to_string(),
-            expected_reason
-        );
-
+        if !matches!(trigger, PendingActorFailure::CallerCancelled) {
+            assert_eq!(
+                submit_rx
+                    .take()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap()
+                    .unwrap_err()
+                    .to_string(),
+                expected_reason
+            );
+        }
         if !matches!(trigger, PendingActorFailure::Shutdown) {
             timeout(Duration::from_secs(4), async {
                 while generation.load(Ordering::Acquire) < expected_generation {
@@ -1591,8 +1636,13 @@ mod tests {
             })
             .await
             .unwrap();
+            timeout(Duration::from_secs(4), progress_receiver)
+                .await
+                .expect("server did not observe settled reconnect progress")
+                .expect("server progress gate was dropped");
             command_tx.send(Command::Shutdown).await.unwrap();
         }
+        assert_eq!(capture.counts(), expected_capture_counts);
         timeout(Duration::from_secs(2), runtime)
             .await
             .unwrap()
@@ -1600,6 +1650,77 @@ mod tests {
         server.await.unwrap();
         assert_eq!(generation.load(Ordering::Acquire), expected_generation);
         assert!(!connected.load(Ordering::Acquire));
+        drop(capture);
+        if let Some((root, writer)) = owner {
+            let (_path, _counts) = writer.release_and_join();
+            drop(root);
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ActorCaptureState {
+        Disabled,
+        Enabled,
+        Blocked,
+        Full,
+        Unavailable,
+    }
+
+    async fn actor_capture_case(
+        trigger: PendingActorFailure,
+        state: ActorCaptureState,
+        fail_send: bool,
+        expected_reason: &str,
+        expected_generation: u64,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let (capture, owner, expected_counts) = match state {
+            ActorCaptureState::Disabled => {
+                let (sender, _receiver) = std::sync::mpsc::sync_channel(1);
+                (
+                    CaptureHandle::disabled(sender, CounterHandle::default()),
+                    None,
+                    (0, 0, 0),
+                )
+            }
+            _ => {
+                let writer_state = match state {
+                    ActorCaptureState::Enabled => TestWriterState::Healthy,
+                    ActorCaptureState::Blocked | ActorCaptureState::Full => {
+                        TestWriterState::Blocked
+                    }
+                    ActorCaptureState::Unavailable => TestWriterState::Dead,
+                    ActorCaptureState::Disabled => unreachable!(),
+                };
+                let owner = capture::test_owner_writer(root.path(), writer_state);
+                if matches!(state, ActorCaptureState::Full) {
+                    owner.capture.attempt(
+                        CaptureDirection::Outbound,
+                        Some(312),
+                        1,
+                        999,
+                        b"prefill",
+                    );
+                    (owner.capture.clone(), Some(owner), (4, 1, 3))
+                } else if matches!(state, ActorCaptureState::Unavailable) {
+                    (owner.capture.clone(), Some(owner), (3, 0, 0))
+                } else if matches!(state, ActorCaptureState::Blocked) {
+                    (owner.capture.clone(), Some(owner), (3, 1, 2))
+                } else {
+                    (owner.capture.clone(), Some(owner), (3, 3, 0))
+                }
+            }
+        };
+        assert_actor_pending_failure(
+            trigger,
+            expected_reason,
+            expected_generation,
+            capture,
+            fail_send,
+            expected_counts,
+            owner.map(|owner| (root, owner)),
+        )
+        .await;
     }
 
     fn test_order() -> NewOrder {
@@ -1916,24 +2037,78 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn actor_pending_failure_disposition_matrix_is_exact() {
-        assert_actor_pending_failure(
+        actor_capture_case(
             PendingActorFailure::Shutdown,
+            ActorCaptureState::Disabled,
+            false,
             "Rithmic order runtime stopped",
             1,
         )
         .await;
-        assert_actor_pending_failure(
+        actor_capture_case(
             PendingActorFailure::Timeout,
+            ActorCaptureState::Enabled,
+            false,
             "Rithmic order command timed out; result is ambiguous",
             2,
         )
         .await;
-        assert_actor_pending_failure(
-            PendingActorFailure::ConnectionLoss,
-            "Rithmic order command result is ambiguous",
-            2,
-        )
-        .await;
+        for state in [
+            ActorCaptureState::Disabled,
+            ActorCaptureState::Enabled,
+            ActorCaptureState::Blocked,
+            ActorCaptureState::Full,
+            ActorCaptureState::Unavailable,
+        ] {
+            actor_capture_case(
+                PendingActorFailure::Timeout,
+                state,
+                false,
+                "Rithmic order command timed out; result is ambiguous",
+                2,
+            )
+            .await;
+            actor_capture_case(
+                PendingActorFailure::SendFailure,
+                state,
+                true,
+                "Rithmic new-order result is ambiguous: Rithmic binary write timed out",
+                2,
+            )
+            .await;
+        }
+        for state in [
+            ActorCaptureState::Disabled,
+            ActorCaptureState::Enabled,
+            ActorCaptureState::Blocked,
+            ActorCaptureState::Full,
+            ActorCaptureState::Unavailable,
+        ] {
+            actor_capture_case(
+                PendingActorFailure::ConnectionLoss,
+                state,
+                false,
+                "Rithmic order command result is ambiguous",
+                2,
+            )
+            .await;
+        }
+        for state in [
+            ActorCaptureState::Disabled,
+            ActorCaptureState::Enabled,
+            ActorCaptureState::Blocked,
+            ActorCaptureState::Full,
+            ActorCaptureState::Unavailable,
+        ] {
+            actor_capture_case(
+                PendingActorFailure::CallerCancelled,
+                state,
+                false,
+                "Rithmic order command result is ambiguous",
+                2,
+            )
+            .await;
+        }
     }
 
     #[test]
