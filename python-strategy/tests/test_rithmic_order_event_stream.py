@@ -267,12 +267,44 @@ def test_leadership_loss_during_unmapped_handling_stops_without_lockdown() -> No
 
 def test_terminal_loop_failure_logs_once_halts_and_stops_worker() -> None:
     adapter = MagicMock()
-    adapter.poll_order_event.side_effect = RuntimeError("invalid event")
-    owner, dependencies = _service(adapter)
+    error = RuntimeError("account_id=ACCOUNT_SECRET exception-text")
+    setattr(
+        error,
+        "safe_diagnostic",
+        {
+            "schema_version": 1,
+            "source_stage": "order_event",
+            "stable_error_code": "rithmic_order_event_failed",
+            "safe_cause": "unclassified",
+            "retryable": False,
+        },
+    )
+    adapter.poll_order_event.side_effect = error
+    calls: list[str] = []
+    dispatcher = MagicMock()
+    dispatcher.submit.side_effect = lambda diagnostic: calls.append("diagnostic")
+    owner, dependencies = _service(
+        adapter,
+        halt_submissions=MagicMock(side_effect=lambda: calls.append("halt")),
+        diagnostic_dispatcher=dispatcher,
+    )
 
     owner._run()
 
-    dependencies["logger"].exception.assert_called_once_with(
+    dependencies["logger"].error.assert_called_once_with(
         "Exchange order event stream failed; submissions remain halted"
     )
     dependencies["halt_submissions"].assert_called_once_with()
+    dispatcher.submit.assert_called_once()
+    submitted = dispatcher.submit.call_args.args[0]
+    assert submitted is not None
+    assert submitted.as_dict() == {
+        "schema_version": 1,
+        "source_stage": "order_event",
+        "stable_error_code": "rithmic_order_event_failed",
+        "safe_cause": "unclassified",
+        "retryable": False,
+    }
+    assert calls == ["halt", "diagnostic"]
+    assert "ACCOUNT_SECRET" not in str(dependencies["logger"].mock_calls)
+    assert "exception-text" not in str(dependencies["logger"].mock_calls)

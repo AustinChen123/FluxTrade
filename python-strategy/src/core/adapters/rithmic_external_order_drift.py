@@ -6,6 +6,12 @@ import threading
 from collections.abc import Callable
 from logging import Logger
 
+from src.core.safe_diagnostics import (
+    SafeDiagnostic,
+    diagnostic_from_drift_reason,
+    safe_lockdown_reason,
+)
+
 
 class RithmicExternalOrderDriftService:
     """Serialize external-order detection against kill-switch clear."""
@@ -20,6 +26,7 @@ class RithmicExternalOrderDriftService:
         assert_runtime_leadership: Callable[[], None],
         resume_after_reconcile: Callable[[], None],
         logger: Logger,
+        diagnostic_sink: Callable[[SafeDiagnostic | None], bool] | None = None,
     ) -> None:
         self._halt_submissions = halt_submissions
         self._clear_local_halt = clear_local_halt
@@ -28,6 +35,7 @@ class RithmicExternalOrderDriftService:
         self._assert_runtime_leadership = assert_runtime_leadership
         self._resume_after_reconcile = resume_after_reconcile
         self._logger = logger
+        self._diagnostic_sink = diagnostic_sink
         self._lock = threading.Lock()
         self._pending = False
         self._generation = 0
@@ -48,12 +56,20 @@ class RithmicExternalOrderDriftService:
             self._pending = True
             self._generation += 1
             self._halt_submissions()
+        safe_reason = safe_lockdown_reason(reason)
         self._logger.error(
             "%s; submissions locked pending authoritative reconciliation",
-            reason,
+            safe_reason,
         )
         if first_detection:
-            self._persist_lockdown(reason)
+            self._persist_lockdown(safe_reason or "rithmic_unclassified_drift")
+        # Diagnostic projection/admission follows both authoritative writes.
+        # Its dispatcher is best-effort and may be contended or unavailable.
+        if self._diagnostic_sink is not None:
+            try:
+                self._diagnostic_sink(diagnostic_from_drift_reason(reason))
+            except Exception:
+                pass
 
     def finalize_clear(
         self,
@@ -72,7 +88,12 @@ class RithmicExternalOrderDriftService:
                 self._pending = True
                 self._halt_submissions()
         if drift_advanced:
-            self._persist_lockdown("rithmic_external_order_detected_during_clear")
+            self._persist_lockdown(
+                safe_lockdown_reason(
+                    "rithmic_external_order_detected_during_clear"
+                )
+                or "rithmic_unclassified_drift"
+            )
         self._assert_runtime_leadership()
         self._resume_after_reconcile()
 

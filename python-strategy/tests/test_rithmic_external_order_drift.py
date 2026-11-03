@@ -86,7 +86,7 @@ def test_generation_advance_during_clear_reasserts_lockdown(
     dependencies["clear_local_halt"].assert_not_called()
     dependencies["halt_submissions"].assert_called_once_with()
     dependencies["persist_lockdown_state"].assert_called_once_with(
-        "rithmic_external_order_detected_during_clear"
+        "rithmic_external_order_detected_during_clear: diagnostic_details_redacted"
     )
     dependencies["persist_redis_lockdown"].assert_called_once_with()
     dependencies["assert_runtime_leadership"].assert_called_once_with()

@@ -9,6 +9,12 @@ from time import monotonic
 from typing import Any, Protocol, cast
 from zoneinfo import ZoneInfo
 
+from src.core.safe_diagnostics import (
+    SafeDiagnostic,
+    diagnostic_from_exception,
+    diagnostic_from_payload,
+)
+
 
 _FAILURE_RETRY_DELAYS_SECONDS = (900.0, 1_800.0, 3_600.0, 14_400.0)
 _SUCCESS_RECHECK_DELAY_SECONDS = 300.0
@@ -77,6 +83,7 @@ class RithmicRuntimeRecoveryService:
         maintenance_active: Callable[[], bool] = (
             rithmic_maintenance_active
         ),
+        diagnostic_sink: Callable[[SafeDiagnostic | None], bool] | None = None,
     ) -> None:
         self._adapter = adapter
         self._profile = profile
@@ -94,6 +101,7 @@ class RithmicRuntimeRecoveryService:
         self._failure_retry_delays_seconds = failure_retry_delays_seconds
         self._success_recheck_delay_seconds = success_recheck_delay_seconds
         self._maintenance_active = maintenance_active
+        self._diagnostic_sink = diagnostic_sink
         self._next_attempt_at = 0.0
         self._consecutive_failures = 0
         self._last_result_safe = False
@@ -169,21 +177,24 @@ class RithmicRuntimeRecoveryService:
 
         summary: dict[str, Any] | None = None
         failure_reason: str | None = None
+        failure_diagnostic: SafeDiagnostic | None = None
         requires_global_lockdown = False
         self._adapter.close()
         try:
             summary = self._reconcile_owned_orders(self._profile, self._account_id)
-        except Exception:
-            self._logger.exception("Periodic Rithmic ledger reconciliation failed")
+        except Exception as error:
+            self._logger.error("Periodic Rithmic ledger reconciliation failed")
             failure_reason = "rithmic_runtime_reconciliation_failed"
+            failure_diagnostic = diagnostic_from_exception(error)
         else:
             if summary.get("auto_resume_safe") is True:
                 try:
                     self._publish_authoritative_summary(summary)
-                except Exception:
-                    self._logger.exception("Periodic Rithmic ledger projection failed")
+                except Exception as error:
+                    self._logger.error("Periodic Rithmic ledger projection failed")
                     failure_reason = "rithmic_runtime_reconciliation_failed"
                     requires_global_lockdown = True
+                    failure_diagnostic = diagnostic_from_exception(error)
             else:
                 failure_reason = "rithmic_runtime_reconciliation_unresolved"
                 requires_global_lockdown = not _is_transient_provider_summary(
@@ -201,12 +212,15 @@ class RithmicRuntimeRecoveryService:
                 "Rithmic maintenance started after ledger verification; "
                 "order stream restart deferred"
             )
+            self._submit_diagnostic(
+                failure_diagnostic or self._summary_diagnostic(summary)
+            )
             return False
         stream_connected = False
         try:
             stream_connected = self._start_order_event_stream()
-        except Exception:
-            self._logger.exception(
+        except Exception as error:
+            self._logger.error(
                 "Order stream restart failed after periodic Rithmic reconciliation"
             )
             self._adapter.close()
@@ -214,6 +228,7 @@ class RithmicRuntimeRecoveryService:
                 failure_reason = (
                     "rithmic_runtime_reconciliation_stream_restart_failed"
                 )
+            failure_diagnostic = diagnostic_from_exception(error)
         else:
             if failure_reason is None and not stream_connected:
                 failure_reason = (
@@ -225,6 +240,7 @@ class RithmicRuntimeRecoveryService:
             if requires_global_lockdown:
                 self._lockdown(failure_reason)
             self._record_failure(now)
+            self._submit_diagnostic(failure_diagnostic or self._summary_diagnostic(summary))
             self._logger.warning(
                 "Periodic Rithmic recovery remains entry-blocked: reason=%s",
                 failure_reason,
@@ -239,7 +255,27 @@ class RithmicRuntimeRecoveryService:
             successful_summary["recoverable_count"],
         )
         self._record_success(now)
+        self._submit_diagnostic(self._summary_diagnostic(successful_summary))
         return True
+
+    def _summary_diagnostic(self, summary: dict[str, Any] | None) -> SafeDiagnostic | None:
+        if summary is None:
+            return None
+        diagnostic = diagnostic_from_payload(summary.get("safe_diagnostic"))
+        if diagnostic is not None:
+            return diagnostic
+        nested = summary.get("snapshot_diagnostics")
+        if isinstance(nested, dict):
+            return diagnostic_from_payload(nested.get("safe_diagnostic"))
+        return None
+
+    def _submit_diagnostic(self, diagnostic: SafeDiagnostic | None) -> None:
+        if self._diagnostic_sink is None or diagnostic is None:
+            return
+        try:
+            self._diagnostic_sink(diagnostic)
+        except Exception:
+            self._logger.debug("Optional Rithmic recovery diagnostic was not admitted")
 
     def _record_failure(self, now: float) -> None:
         if self._post_maintenance_attempts_remaining is not None:

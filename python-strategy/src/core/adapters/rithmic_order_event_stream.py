@@ -9,6 +9,8 @@ from typing import Any, Protocol
 
 from src.core.interfaces.exchange import ExchangeOrderEvent
 from src.core.notifications import NotificationSink
+from src.core.ops_diagnostic_dispatcher import OpsDiagnosticDispatcher
+from src.core.safe_diagnostics import diagnostic_from_exception
 
 from .rithmic_adapter import RithmicUnmappedOrderEvent
 
@@ -47,6 +49,7 @@ class RithmicOrderEventStreamService:
         on_runtime_started: Callable[[], bool],
         logger: Logger,
         notification_sink: NotificationSink | None = None,
+        diagnostic_dispatcher: OpsDiagnosticDispatcher | None = None,
     ) -> None:
         self._adapter = adapter
         self._stop_event = stop_event
@@ -60,6 +63,7 @@ class RithmicOrderEventStreamService:
         self._on_runtime_started = on_runtime_started
         self._logger = logger
         self.notification_sink = notification_sink
+        self._diagnostic_dispatcher = diagnostic_dispatcher
 
     def start(self, *, halt_on_failure: bool = True) -> bool:
         try:
@@ -106,11 +110,15 @@ class RithmicOrderEventStreamService:
                         symbol=error.symbol,
                     )
                 )
-            except Exception:
-                self._logger.exception(
+            except Exception as error:
+                self._logger.error(
                     "Exchange order event stream failed; submissions remain halted"
                 )
                 self._halt_submissions()
+                if self._diagnostic_dispatcher is not None:
+                    self._diagnostic_dispatcher.submit(
+                        diagnostic_from_exception(error)
+                    )
                 return
 
     def _classify(

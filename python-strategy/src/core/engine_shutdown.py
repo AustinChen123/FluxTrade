@@ -26,6 +26,7 @@ class EngineShutdownService:
         close_entry_gate: Callable[[], None],
         event_logger: logging.Logger,
         stop_notifications: Callable[[float], object] | None = None,
+        stop_diagnostics: Callable[[], object] | None = None,
     ) -> None:
         self._mark_stopping = mark_stopping
         self._shutdown_executor = shutdown_executor
@@ -38,6 +39,7 @@ class EngineShutdownService:
         self._close_entry_gate = close_entry_gate
         self._logger = event_logger
         self._stop_notifications = stop_notifications
+        self._stop_diagnostics = stop_diagnostics
 
     def shutdown(self, *, timeout: float, clean_exit: bool) -> None:
         try:
@@ -66,6 +68,8 @@ class EngineShutdownService:
         finally:
             if self._stop_notifications is not None:
                 self._stop_notifications(timeout)
+            if self._stop_diagnostics is not None:
+                self._stop_diagnostics()
 
     def _close_adapter(self) -> None:
         close_adapter = getattr(self._adapter_loader(), "close", None)
