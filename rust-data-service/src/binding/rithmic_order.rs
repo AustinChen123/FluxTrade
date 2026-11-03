@@ -403,6 +403,27 @@ fn runtime_error(py: Python<'_>, error: anyhow::Error) -> PyErr {
         .into_value(py)
         .into_bound(py)
         .into_any();
+    let safe_cause = error
+        .downcast_ref::<crate::rithmic_ledger::order_field_policy::NumericFieldDiagnostic>()
+        .map(|value| value.safe_fields().5)
+        .or_else(|| {
+            error
+                .downcast_ref::<crate::rithmic_ledger::order_field_policy::QuantityFieldDiagnostic>(
+                )
+                .map(|value| value.safe_fields().5)
+        })
+        .unwrap_or("unclassified");
+    if let Ok(safe) = super::rithmic_diagnostic::safe_diagnostic(
+        py,
+        &error,
+        "order_event",
+        "rithmic_order_event_failed",
+        safe_cause,
+        false,
+        None,
+    ) {
+        let _ = super::rithmic_diagnostic::attach_safe_diagnostic(&target, safe);
+    }
     if let Some(diagnostic) = diagnostic {
         if target.setattr("diagnostic", diagnostic).is_err() {
             return PyRuntimeError::new_err("Rithmic order event failed");
@@ -498,7 +519,9 @@ def run(expected_field):
                     panic!("live warning integration failed: {}", error.value(py))
                 });
             let quantity =
-                crate::rithmic_ledger::order_event::invalid_quantity_diagnostic_for_binding_test();
+                crate::rithmic_ledger::order_event::invalid_quantity_diagnostic_for_binding_test(
+                    -2,
+                );
             let projected_quantity = runtime_error(py, quantity);
             module
                 .setattr("native_error", projected_quantity.value(py))
@@ -738,4 +761,6 @@ def run(expected_field):
             );
         });
     }
+
+    mod diagnostic_tests;
 }

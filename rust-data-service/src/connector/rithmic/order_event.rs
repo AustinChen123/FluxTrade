@@ -202,7 +202,7 @@ pub(crate) fn invalid_price_diagnostic_for_binding_test() -> anyhow::Error {
 
 #[cfg(test)]
 #[allow(dead_code)]
-pub(crate) fn invalid_quantity_diagnostic_for_binding_test() -> anyhow::Error {
+pub(crate) fn invalid_quantity_diagnostic_for_binding_test(raw_quantity: i32) -> anyhow::Error {
     let expected_account = AccountIdentity {
         fcm_id: "FCM".to_string(),
         ib_id: "IB".to_string(),
@@ -221,7 +221,7 @@ pub(crate) fn invalid_quantity_diagnostic_for_binding_test() -> anyhow::Error {
         symbol: Some("NQU6".to_string()),
         status: Some("OPEN".to_string()),
         transaction_type: Some(protocol::exchange_order_notification::TransactionType::Buy as i32),
-        quantity: Some(0),
+        quantity: Some(raw_quantity),
         ..Default::default()
     })
     .expect("encode invalid quantity fixture");
