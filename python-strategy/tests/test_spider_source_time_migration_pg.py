@@ -48,7 +48,8 @@ pytestmark = [
 ]
 
 _PREDECESSOR = "4c2f8a91d5e7"
-_REVISION = "6d8a1e2f4c90"
+_SOURCE_TIME_REVISION = "6d8a1e2f4c90"
+_REVISION = "71d3a8c4e205"
 
 
 def _source_time_values(
@@ -251,12 +252,14 @@ def test_predecessor_roundtrip_preserves_legacy_financial_source_and_transport_f
     assert before_legacy.runtime_rows
     database_name = cast(str, engine.url.database)
 
+    _downgrade(database_name, _SOURCE_TIME_REVISION)
+    source_time_checks = _check_map(engine)
     _downgrade(database_name, _PREDECESSOR)
     assert _legacy_tape_snapshot(engine) == before_legacy
     predecessor_checks = _check_map(engine)
     changed_checks = {
-        key for key in before_checks.keys() | predecessor_checks.keys()
-        if before_checks.get(key) != predecessor_checks.get(key)
+        key for key in source_time_checks.keys() | predecessor_checks.keys()
+        if source_time_checks.get(key) != predecessor_checks.get(key)
     }
     assert changed_checks == {
         ("spider_runtime_delivery", "ck_spider_runtime_delivery_kind"),
@@ -266,6 +269,8 @@ def test_predecessor_roundtrip_preserves_legacy_financial_source_and_transport_f
         revision = connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
     assert revision == _PREDECESSOR
 
+    _upgrade(database_name, _SOURCE_TIME_REVISION)
+    assert _check_map(engine) == source_time_checks
     _upgrade(database_name, "head")
     assert _schema_fingerprint(engine) == before_schema
     assert _check_map(engine) == before_checks

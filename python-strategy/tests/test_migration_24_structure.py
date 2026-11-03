@@ -11,7 +11,7 @@ from alembic.script import ScriptDirectory
 
 ROOT = Path(__file__).resolve().parents[2] / "database"
 REVISION = "d8a61c3f9b42"
-NEWEST_REVISION = "6d8a1e2f4c90"
+NEWEST_REVISION = "71d3a8c4e205"
 
 
 def test_latest_revision_is_the_only_head():
@@ -21,7 +21,7 @@ def test_latest_revision_is_the_only_head():
 
     assert script.get_heads() == [NEWEST_REVISION]
     newest = script.get_revision(NEWEST_REVISION)
-    assert newest is not None and newest.down_revision == "4c2f8a91d5e7"
+    assert newest is not None and newest.down_revision == "6d8a1e2f4c90"
 
 
 def _migration_sql(direction: str) -> str:
