@@ -5,6 +5,9 @@ mod bar;
 mod codec;
 
 #[allow(dead_code)]
+pub(super) mod capture;
+
+#[allow(dead_code)]
 mod config;
 
 pub(crate) mod emergency;

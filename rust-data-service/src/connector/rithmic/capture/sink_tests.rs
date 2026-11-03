@@ -1,6 +1,5 @@
 use super::*;
 
-
 fn duplicate_capture_handle(capture: &CaptureHandle) -> CaptureHandle {
     CaptureHandle {
         sender: capture.sender.clone(),

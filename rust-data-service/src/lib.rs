@@ -10,6 +10,16 @@ pub mod volume_profile;
 /// A Python module implemented in Rust.
 #[pymodule]
 fn fluxtrade_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    #[cfg(all(feature = "rithmic", not(test)))]
+    {
+        crate::rithmic_ledger::initialize_capture_owner();
+    }
+    #[cfg(feature = "rithmic")]
+    {
+        m.add_function(wrap_pyfunction!(shutdown_rithmic_capture, m)?)?;
+        let atexit = m.py().import("atexit")?;
+        atexit.call_method1("register", (m.getattr("shutdown_rithmic_capture")?,))?;
+    }
     // Data Models
     m.add_class::<binding::models::Candlestick>()?;
     m.add_class::<binding::models::Order>()?;
@@ -54,6 +64,12 @@ fn fluxtrade_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     binding::matcher::register_synthetic_scenario(m)?;
 
     Ok(())
+}
+
+#[cfg(feature = "rithmic")]
+#[pyfunction]
+fn shutdown_rithmic_capture() {
+    crate::rithmic_ledger::shutdown_capture_owner();
 }
 
 #[cfg(test)]
