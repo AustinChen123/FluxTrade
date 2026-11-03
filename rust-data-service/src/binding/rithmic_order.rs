@@ -763,4 +763,6 @@ def run(expected_field):
     }
 
     mod diagnostic_tests;
+    #[path = "failure_tests.rs"]
+    mod failure_tests;
 }
