@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import io
+import logging
 from datetime import datetime
 from decimal import Decimal
 from types import SimpleNamespace
@@ -36,6 +38,7 @@ def _service(
         start_order_event_stream=MagicMock(return_value=True),
         resume_after_reconcile=MagicMock(),
         lockdown=MagicMock(),
+        diagnostic_sink=MagicMock(return_value=True),
         logger=MagicMock(),
     )
     service = RithmicRuntimeRecoveryService(
@@ -53,8 +56,219 @@ def _service(
         logger=dependencies.logger,
         monotonic_seconds=lambda: clock[0],
         maintenance_active=lambda: False,
+        diagnostic_sink=dependencies.diagnostic_sink,
     )
     return service, dependencies
+
+
+@pytest.mark.parametrize("include_native_detail", (True, False))
+def test_periodic_failure_emits_safe_detail_after_lockdown_decision(
+    include_native_detail: bool,
+) -> None:
+    diagnostic = {
+        "schema_version": 1,
+        "source_stage": "ledger_snapshot",
+        "stable_error_code": "rithmic_order_event_failed",
+        "retryable": True,
+    }
+    service, dependencies = _service()
+    dependencies.reconcile_owned_orders.return_value = {
+        "recoverable_count": 0,
+        "auto_resume_safe": False,
+        "snapshot_retryable": True,
+        "snapshot_diagnostics": (
+            {"safe_diagnostic": diagnostic} if include_native_detail else {}
+        ),
+    }
+
+    assert service.run_once() is False
+
+    dependencies.lockdown.assert_not_called()
+    if include_native_detail:
+        dependencies.diagnostic_sink.assert_called_once()
+        assert dependencies.diagnostic_sink.call_args.args[0].as_dict() == diagnostic
+    else:
+        dependencies.diagnostic_sink.assert_not_called()
+
+
+def test_restart_exception_projects_typed_detail_after_safe_log() -> None:
+    diagnostic = {
+        "schema_version": 1,
+        "source_stage": "order_snapshot",
+        "stable_error_code": "order_snapshot_failed",
+        "retryable": True,
+    }
+    error = RuntimeError("REDACTED_SENTINEL")
+    setattr(error, "safe_diagnostic", diagnostic)
+    service, dependencies = _service()
+    dependencies.start_order_event_stream.side_effect = error
+
+    assert service.run_once() is False
+
+    dependencies.diagnostic_sink.assert_called_once()
+    assert dependencies.diagnostic_sink.call_args.args[0].as_dict() == diagnostic
+    assert "REDACTED_SENTINEL" not in repr(dependencies.logger.error.call_args)
+
+
+@pytest.mark.parametrize("include_native_detail", (True, False))
+def test_native_projection_failure_detail_does_not_change_recovery_decision(
+    include_native_detail: bool,
+) -> None:
+    diagnostic = {
+        "schema_version": 1,
+        "source_stage": "order_event",
+        "stable_error_code": "rithmic_order_event_failed",
+        "safe_cause": "unclassified",
+        "retryable": False,
+    }
+    error = RuntimeError("native projection failure with PRIVATE_SENTINEL")
+    if include_native_detail:
+        setattr(error, "safe_diagnostic", diagnostic)
+    service, dependencies = _service()
+    dependencies.reconcile_owned_orders.side_effect = error
+
+    assert service.run_once() is False
+
+    dependencies.lockdown.assert_not_called()
+    dependencies.halt_for_reconcile.assert_called_once_with(timeout=30.0)
+    dependencies.stop_order_event_stream.assert_called_once_with(timeout=30.0)
+    dependencies.adapter.close.assert_called_once_with()
+    dependencies.start_order_event_stream.assert_called_once_with()
+    dependencies.resume_after_reconcile.assert_not_called()
+    if include_native_detail:
+        dependencies.diagnostic_sink.assert_called_once()
+        assert dependencies.diagnostic_sink.call_args.args[0].as_dict() == diagnostic
+    else:
+        dependencies.diagnostic_sink.assert_not_called()
+    assert "PRIVATE_SENTINEL" not in repr(dependencies.logger.error.call_args)
+
+
+@pytest.mark.parametrize("sink_outcome", ("success", "false", "raise"))
+@pytest.mark.parametrize("include_native_detail", (True, False))
+def test_diagnostic_sink_exit_preserves_recovery_retry_and_lockdown_decision(
+    sink_outcome: str, include_native_detail: bool
+) -> None:
+    service, dependencies = _service()
+    diagnostic = {
+        "schema_version": 1,
+        "source_stage": "order_snapshot",
+        "stable_error_code": "order_snapshot_failed",
+        "retryable": False,
+    }
+    dependencies.reconcile_owned_orders.return_value = {
+        "recoverable_count": 0,
+        "auto_resume_safe": False,
+        "snapshot_retryable": False,
+        "snapshot_diagnostics": (
+            {"safe_diagnostic": diagnostic} if include_native_detail else {}
+        ),
+    }
+    if sink_outcome == "false":
+        dependencies.diagnostic_sink.return_value = False
+    elif sink_outcome == "raise":
+        dependencies.diagnostic_sink.side_effect = RuntimeError("diagnostic driver failed")
+
+    assert service.run_once() is False
+    dependencies.halt_for_reconcile.assert_called_once()
+    dependencies.stop_order_event_stream.assert_called_once()
+    dependencies.lockdown.assert_called_once_with(
+        "rithmic_runtime_reconciliation_unresolved"
+    )
+    dependencies.resume_after_reconcile.assert_not_called()
+    if include_native_detail:
+        dependencies.diagnostic_sink.assert_called_once()
+    else:
+        dependencies.diagnostic_sink.assert_not_called()
+
+
+def test_maintenance_after_failed_reconcile_still_emits_typed_detail() -> None:
+    diagnostic = {
+        "schema_version": 1,
+        "source_stage": "order_snapshot",
+        "stable_error_code": "order_snapshot_failed",
+        "retryable": True,
+    }
+    error = RuntimeError("REDACTED_SENTINEL")
+    setattr(error, "safe_diagnostic", diagnostic)
+    service, dependencies = _service()
+    dependencies.reconcile_owned_orders.side_effect = error
+    service._maintenance_active = MagicMock(side_effect=(False, False, True))
+
+    assert service.run_once() is False
+
+    dependencies.lockdown.assert_not_called()
+    dependencies.diagnostic_sink.assert_called_once()
+    assert "REDACTED_SENTINEL" not in repr(dependencies.logger.error.call_args)
+
+
+@pytest.mark.parametrize(
+    ("failure_site", "maintenance"),
+    (("reconcile", False), ("projection", False), ("restart", False), ("reconcile", True)),
+)
+def test_recovery_failures_use_real_safe_logs_without_exception_chains(
+    failure_site: str, maintenance: bool
+) -> None:
+    diagnostic = {
+        "schema_version": 1,
+        "source_stage": "order_snapshot",
+        "stable_error_code": "order_snapshot_failed",
+        "retryable": True,
+    }
+    cause = ValueError("CHAINED_CAUSE_SENTINEL")
+    error = RuntimeError("RECONCILE_MESSAGE_SENTINEL")
+    error.__cause__ = cause
+    setattr(error, "safe_diagnostic", diagnostic)
+    service, dependencies = _service()
+    expected_log = {
+        "reconcile": "Periodic Rithmic ledger reconciliation failed",
+        "projection": "Periodic Rithmic ledger projection failed",
+        "restart": "Order stream restart failed after periodic Rithmic reconciliation",
+    }
+    if failure_site == "reconcile":
+        dependencies.reconcile_owned_orders.side_effect = error
+    elif failure_site == "projection":
+        dependencies.publish_authoritative_summary.side_effect = error
+    else:
+        dependencies.start_order_event_stream.side_effect = error
+    if maintenance:
+        service._maintenance_active = MagicMock(side_effect=(False, False, True))
+    stream = io.StringIO()
+    logger = logging.getLogger("f4.recovery.redaction.test")
+    logger.setLevel(logging.ERROR)
+    logger.propagate = False
+
+    class CapturingHandler(logging.StreamHandler[io.StringIO]):
+        records: list[logging.LogRecord]
+
+        def __init__(self) -> None:
+            self.records = []
+            super().__init__(stream)
+
+        def emit(self, record: logging.LogRecord) -> None:
+            self.records.append(record)
+            super().emit(record)
+
+    handler = CapturingHandler()
+    logger.addHandler(handler)
+    service._logger = logger
+    try:
+        assert service.run_once() is False
+    finally:
+        logger.removeHandler(handler)
+        handler.close()
+
+    rendered = stream.getvalue()
+    assert rendered.strip() == expected_log[failure_site]
+    assert "SENTINEL" not in rendered
+    assert dependencies.diagnostic_sink.call_args.args[0].as_dict() == diagnostic
+    assert handler.records[0].exc_info is None
+    assert handler.records[0].stack_info is None
+    if failure_site == "projection":
+        dependencies.lockdown.assert_called_once_with(
+            "rithmic_runtime_reconciliation_failed"
+        )
+    else:
+        dependencies.lockdown.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -179,10 +393,15 @@ def test_post_maintenance_verification_is_limited_to_three_attempts() -> None:
     assert dependencies.halt_for_reconcile.call_count == 3
     assert dependencies.stop_order_event_stream.call_count == 3
     dependencies.lockdown.assert_not_called()
-    dependencies.logger.error.assert_called_once_with(
+    dependencies.logger.error.assert_called_with(
         "Post-maintenance Rithmic verification exhausted; "
         "provider I/O remains quiescent until a new maintenance "
         "recovery epoch or service restart"
+    )
+    assert dependencies.logger.error.call_count == 4
+    assert all(
+        call.args[0] == "Periodic Rithmic ledger reconciliation failed"
+        for call in dependencies.logger.error.call_args_list[:3]
     )
 
 
