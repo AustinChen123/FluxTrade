@@ -101,6 +101,27 @@ impl QuantityFieldDiagnostic {
             failure,
         }
     }
+
+    #[allow(dead_code)]
+    pub(crate) fn safe_fields(
+        &self,
+    ) -> (
+        i32,
+        &'static str,
+        Option<i32>,
+        &str,
+        Option<i32>,
+        &'static str,
+    ) {
+        (
+            self.context.template_id,
+            self.context.source,
+            self.context.notify_type,
+            &self.field,
+            self.value,
+            self.failure,
+        )
+    }
 }
 
 impl Display for QuantityFieldDiagnostic {
@@ -195,6 +216,22 @@ impl NumericFieldDiagnostic {
             failure,
             redacted_identity: context.redacted_identity,
         }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn safe_fields(&self) -> (i32, &'static str, Option<i32>, &str, u64, &'static str) {
+        (
+            self.template_id,
+            self.source,
+            self.notify_type,
+            &self.field,
+            self.raw_bits,
+            match self.failure {
+                NumericFailureClass::Negative => "negative",
+                NumericFailureClass::Nonfinite => "nonfinite",
+                NumericFailureClass::DecimalUnrepresentable => "decimal_unrepresentable",
+            },
+        )
     }
 }
 
