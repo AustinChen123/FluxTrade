@@ -1845,6 +1845,49 @@ def test_reconciler_snapshot_failure_falls_back_atomically(
     assert result["external_orders"] == []
 
 
+def test_reconciler_persists_validated_nested_diagnostic_without_exception_text():
+    repo = MagicMock()
+    repo.list_client_orders_by_statuses.return_value = []
+    db = MagicMock()
+    reconciler = owned_reconciler(
+        adapter=MagicMock(),
+        order_manager=SimpleNamespace(repo=repo),
+        clock=SimpleNamespace(now=lambda: 1_700_000_200),
+        db_session_factory=lambda: nullcontext(db),
+        process_exchange_order_event=Mock(),
+        place_pending_protection_for_filled_entries=Mock(),
+        fail_pending_conditionals_for_terminal_entry=Mock(),
+        protective_terminal_without_fill_failure=Mock(),
+        cancel_protective_order_when_sibling_closed=Mock(),
+        cancel_linked_conditional_for_protection_fill=Mock(),
+        local_positions_loader=lambda: [],
+    )
+    error = RuntimeError("account_id=ACCOUNT_SECRET arbitrary-provider-text")
+    for name, value in {
+        "stage": "order_snapshot",
+        "stable_error_code": "order_snapshot_failed",
+        "safe_cause": "snapshot_unavailable",
+        "retryable": True,
+        "safe_diagnostic": {
+            "schema_version": 1,
+            "source_stage": "ledger_snapshot",
+            "stable_error_code": "order_snapshot_failed",
+            "safe_cause": "snapshot_unavailable",
+            "retryable": True,
+            "connect_phase": "unclassified",
+        },
+    }.items():
+        setattr(error, name, value)
+
+    result = reconciler.reconcile(snapshot_loader=Mock(side_effect=error))
+
+    payload = db.add.call_args.args[0].payload
+    assert result["auto_resume_safe"] is False
+    assert payload["safe_diagnostic"] == getattr(error, "safe_diagnostic")
+    assert "ACCOUNT_SECRET" not in repr(payload)
+    assert "arbitrary-provider-text" not in repr(payload)
+
+
 @pytest.mark.parametrize(
     ("order_overrides", "reason"),
     [

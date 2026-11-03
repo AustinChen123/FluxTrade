@@ -6,6 +6,7 @@ from src.core.adapters.rithmic_recovery import (
     load_rithmic_recovery_snapshot,
 )
 from src.core.audit_service import write_system_event
+from src.core.safe_diagnostics import diagnostic_from_exception
 from src.core.interfaces.exchange import (
     ExchangeError,
     IExchangeAdapter,
@@ -169,13 +170,16 @@ class RithmicOwnedOrderReconciler:
             error_type, error_stage, error_code, error_cause, error_retryable = (
                 _classify_ledger_snapshot_failure(exc)
             )
-            snapshot_diagnostics = {
+            snapshot_diagnostics: dict[str, object] = {
                 "snapshot_error_type": error_type,
                 "snapshot_error_stage": error_stage,
                 "snapshot_error_code": error_code,
                 "snapshot_error_cause": error_cause,
                 "snapshot_retryable": error_retryable,
             }
+            safe_diagnostic = diagnostic_from_exception(exc)
+            if safe_diagnostic is not None:
+                snapshot_diagnostics["safe_diagnostic"] = safe_diagnostic.as_dict()
             self.context.logger.error(
                 "Rithmic ledger snapshot acquisition failed",
                 extra=snapshot_diagnostics,
