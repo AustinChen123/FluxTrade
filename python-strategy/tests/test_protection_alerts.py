@@ -7,6 +7,7 @@ from src.core.protection_alerts import (
     ProtectionAlert,
     stable_event_id,
 )
+from src.core.safe_diagnostics import SafeDiagnostic
 
 
 def test_alert_is_bounded_redacted_versioned_and_stably_identified():
@@ -47,3 +48,44 @@ def test_alert_is_bounded_redacted_versioned_and_stably_identified():
             "id", "type", "warning", "2026-10-31T00:00:00+00:00", "reason",
             schema_version=2,
         )
+
+
+def test_alert_serializes_only_validated_nested_safe_diagnostic():
+    diagnostic = SafeDiagnostic.create(
+        {
+            "source_stage": "order_event",
+            "stable_error_code": "rithmic_order_event_failed",
+            "safe_cause": "nonfinite",
+            "template_id": 352,
+            "field": "price",
+            "raw_bits": 9221120237041090560,
+            "retryable": False,
+        }
+    )
+    assert diagnostic is not None
+    alert = ProtectionAlert.create(
+        event_type="protection_loss",
+        severity="critical",
+        reason="bounded reason",
+        entry_id="entry-1",
+        evidence_id="event-2",
+        safe_diagnostic=diagnostic,
+    )
+    line = alert.to_json_line()
+    assert alert.safe_diagnostic_status == "included"
+    assert b'"schema_version":1' in line
+    assert b'"raw_bits":9221120237041090560' in line
+
+    invalid = ProtectionAlert.create(
+        event_type="protection_loss",
+        severity="critical",
+        reason="bounded reason",
+        entry_id="entry-1",
+        evidence_id="event-3",
+        safe_diagnostic=SafeDiagnostic(
+            schema_version=2, fields=(("stable_error_code", "future_code"),)
+        ),
+    )
+    invalid_line = invalid.to_json_line()
+    assert invalid.safe_diagnostic_status == "invalid_omitted"
+    assert b'"safe_diagnostic":null' in invalid_line

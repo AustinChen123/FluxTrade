@@ -8,6 +8,8 @@ import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+from src.core.safe_diagnostics import SafeDiagnostic
+
 DEFAULT_ALERTS_PATH = "/var/log/fluxtrade/protection-alerts.jsonl"
 ALERTS_PATH_ENV = "FLUXTRADE_PROTECTION_ALERTS_PATH"
 MAX_RECORD_BYTES = 4096
@@ -43,6 +45,8 @@ class ProtectionAlert:
     order_id: str | None = None
     evidence_id: str | None = None
     diagnostics: tuple[tuple[str, str], ...] = ()
+    safe_diagnostic: SafeDiagnostic | None = None
+    safe_diagnostic_status: str = "absent"
     schema_version: int = 1
 
     def __post_init__(self) -> None:
@@ -68,6 +72,26 @@ class ProtectionAlert:
             if len(diagnostics) == _MAX_DIAGNOSTICS:
                 break
         object.__setattr__(self, "diagnostics", tuple(diagnostics))
+        safe_diagnostic = self.safe_diagnostic
+        if isinstance(safe_diagnostic, SafeDiagnostic):
+            validated = (
+                SafeDiagnostic.create(dict(safe_diagnostic.fields))
+                if safe_diagnostic.schema_version == 1
+                else None
+            )
+            object.__setattr__(self, "safe_diagnostic", validated)
+            object.__setattr__(
+                self,
+                "safe_diagnostic_status",
+                "included" if validated is not None else "invalid_omitted",
+            )
+        else:
+            object.__setattr__(self, "safe_diagnostic", None)
+            object.__setattr__(
+                self,
+                "safe_diagnostic_status",
+                "absent" if safe_diagnostic is None else "invalid_omitted",
+            )
         if self.schema_version != 1:
             raise ValueError("unsupported protection alert schema version")
         try:
@@ -123,11 +147,25 @@ class ProtectionAlert:
             "order_id": self.order_id,
             "evidence_id": self.evidence_id,
             "diagnostics": dict(self.diagnostics),
+            "safe_diagnostic": (
+                self.safe_diagnostic.as_dict()
+                if self.safe_diagnostic is not None
+                else None
+            ),
+            "safe_diagnostic_status": self.safe_diagnostic_status,
         }
         encoded = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
         record = encoded.encode("ascii") + b"\n"
         if len(record) > MAX_RECORD_BYTES:
-            raise ValueError("protection alert record exceeds maximum size")
+            if self.safe_diagnostic is None:
+                raise ValueError("protection alert record exceeds maximum size")
+            payload["safe_diagnostic"] = None
+            payload["safe_diagnostic_status"] = "oversize_omitted"
+            record = json.dumps(
+                payload, ensure_ascii=True, separators=(",", ":")
+            ).encode("ascii") + b"\n"
+            if len(record) > MAX_RECORD_BYTES:
+                raise ValueError("protection alert record exceeds maximum size")
         return record
 
 
