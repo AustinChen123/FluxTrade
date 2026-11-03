@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "startup_tests.rs"]
+mod startup_tests;
+
 fn duplicate_capture_handle(capture: &CaptureHandle) -> CaptureHandle {
     CaptureHandle {
         sender: capture.sender.clone(),
