@@ -19,11 +19,12 @@ import os
 from hashlib import sha256
 from pathlib import Path
 import pstats
+import signal
 import subprocess
 import sys
 import time
 from threading import Thread
-from typing import Any, cast, Sequence
+from typing import Any, IO, cast, Sequence
 
 from src.core.backtest.spider_run_admission import _LIMIT, _P3_JOURNAL_LIMIT, admit_spider_run
 
@@ -35,6 +36,61 @@ _PROFILE_FUNCTIONS = {
     "_execute_historical", "capture", "persist", "capture_owner_evidence", "_public_scheduler_observation",
     "_normalized", "apply_group", "historical_market_step", "inspect_state", "capture_snapshot",
 }
+_READER_JOIN_TIMEOUT_SECONDS = 30
+
+
+def _cleanup_process(
+    process: subprocess.Popen[str],
+    started_readers: list[tuple[Thread, IO[str]]],
+    pipe_wrappers: list[IO[str] | None],
+) -> tuple[list[Exception], bool]:
+    errors: list[Exception] = []
+
+    try:
+        if process.poll() is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+    except Exception as error:
+        errors.append(error)
+    finally:
+        try:
+            process.wait()
+        except Exception as error:
+            errors.append(error)
+
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except Exception as error:
+        errors.append(error)
+
+    live_streams: set[int] = set()
+    for reader, stream in started_readers:
+        try:
+            reader.join(timeout=_READER_JOIN_TIMEOUT_SECONDS)
+        except Exception as error:
+            errors.append(error)
+        try:
+            if reader.is_alive():
+                live_streams.add(id(stream))
+        except Exception as error:
+            errors.append(error)
+
+    pipe_drain_timeout = bool(live_streams)
+    if pipe_drain_timeout:
+        errors.append(RuntimeError("BENCHMARK_PIPE_DRAIN_TIMEOUT"))
+
+    for stream in pipe_wrappers:
+        if stream is not None and id(stream) not in live_streams:
+            try:
+                stream.close()
+            except Exception as error:
+                errors.append(error)
+
+    return errors, pipe_drain_timeout
 
 
 def _limits() -> dict[str, int]:
@@ -80,27 +136,45 @@ def run(
     if profile:
         child_command = [sys.executable, "-m", "cProfile", "-o", str(profile_path), *child_command[1:]]
     start = time.perf_counter()
+    captured: dict[str, list[str]] = {"stdout": [], "stderr": []}
+    started_readers: list[tuple[Thread, IO[str]]] = []
+    pipe_wrappers: list[IO[str] | None] = [None, None]
+    primary_error: BaseException | None = None
     process = subprocess.Popen(
         child_command, cwd=Path(__file__).resolve().parents[1],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
+        start_new_session=True,
     )
-    if process.stdout is None or process.stderr is None:
-        raise RuntimeError("SUBPROCESS_PIPE_UNAVAILABLE")
-    captured: dict[str, list[str]] = {"stdout": [], "stderr": []}
+    try:
+        pipe_wrappers[0] = process.stdout
+        pipe_wrappers[1] = process.stderr
+        if process.stdout is None or process.stderr is None:
+            raise RuntimeError("SUBPROCESS_PIPE_UNAVAILABLE")
 
-    def drain(stream, destination: list[str]) -> None:
-        destination.append(stream.read())
+        def drain(stream: IO[str], destination: list[str]) -> None:
+            destination.append(stream.read())
 
-    readers = (
-        Thread(target=drain, args=(process.stdout, captured["stdout"]), daemon=True),
-        Thread(target=drain, args=(process.stderr, captured["stderr"]), daemon=True),
-    )
-    for reader in readers:
-        reader.start()
-    _pid, wait_status, usage = os.wait4(process.pid, 0)
-    process.returncode = os.waitstatus_to_exitcode(wait_status)
-    for reader in readers:
-        reader.join()
+        readers = (
+            (Thread(target=drain, args=(process.stdout, captured["stdout"]), daemon=True), process.stdout),
+            (Thread(target=drain, args=(process.stderr, captured["stderr"]), daemon=True), process.stderr),
+        )
+        for reader, stream in readers:
+            reader.start()
+            started_readers.append((reader, stream))
+        _pid, wait_status, usage = os.wait4(process.pid, 0)
+        process.returncode = os.waitstatus_to_exitcode(wait_status)
+    except BaseException as error:
+        primary_error = error
+        raise
+    finally:
+        cleanup_errors, pipe_drain_timeout = _cleanup_process(process, started_readers, pipe_wrappers)
+        if primary_error is not None:
+            for cleanup_error in cleanup_errors:
+                primary_error.add_note(f"benchmark cleanup error: {cleanup_error!r}")
+        elif pipe_drain_timeout:
+            raise RuntimeError("BENCHMARK_PIPE_DRAIN_TIMEOUT")
+        elif cleanup_errors:
+            raise cleanup_errors[0]
     wall = time.perf_counter() - start
     stdout = "".join(captured["stdout"])
     stderr = "".join(captured["stderr"])
