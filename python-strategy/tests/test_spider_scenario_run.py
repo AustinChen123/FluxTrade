@@ -15,6 +15,7 @@ from typing import Any, Callable, cast
 import pytest
 
 from src.core.backtest import spider_scenario_run as run, synthetic_scenario_codec as wire
+from src.core.backtest import spider_historical_execution as historical_execution
 from src.core.backtest import spider_configured_scale_input as scale
 from src.core.backtest import spider_policy as spider_policy
 from src.core.backtest import spider_policy_protocol as policy_protocol
@@ -158,7 +159,7 @@ def test_real_runs_registration_order_exact_artifacts_and_one_admission(tmp_path
     attempt = read(tmp_path, "r1", "attempt.json")[0]
     assert attempt["native_artifact_sha256"] == sha256(Path(wire.loaded_native_artifact_path()).read_bytes()).hexdigest()
     records = [(name.encode(), sha256((run._ROOT / name).read_bytes()).digest()) for name in sorted(run._PROGRAM)]
-    assert len(records) == len(set(run._PROGRAM)) == 20
+    assert len(records) == len(set(run._PROGRAM)) == 21
     assert "python-strategy/src/core/backtest/synthetic_policy_dispatch.py" in run._PROGRAM
     assert "python-strategy/src/core/backtest/spider_execution_input.py" in run._PROGRAM
     assert "python-strategy/src/core/backtest/spider_paid_endpoint.py" in run._PROGRAM
@@ -470,9 +471,11 @@ def test_historical_input_rejections_precede_store_and_owner(tmp_path, monkeypat
         selector = PLAN_IDS[0]
     store_calls = []
     monkeypatch.setattr(run._Store, "create", lambda *args, **kwargs: store_calls.append(args))
-    monkeypatch.setattr(run, "_ReplayComposition", SimpleNamespace(
+    owner_guard = SimpleNamespace(
         _from_historical_run=lambda *_: pytest.fail("historical owner constructed before admission"),
-    ))
+    )
+    monkeypatch.setattr(historical_execution, "_ReplayComposition", owner_guard)
+    assert historical_execution._ReplayComposition is owner_guard
     result = run.run_spider_scenario(str(tmp_path), value.run_id, selector, supplied)
     assert result == dict(run_id=value.run_id, outcome="REJECTED", reason="UNSUPPORTED_CONFIGURATION")
     assert not store_calls and list(tmp_path.iterdir()) == []
@@ -509,7 +512,11 @@ def test_historical_timeline_and_coverage_reject_before_store_or_owner(tmp_path,
     raw = _historical_canonical(encoded)
     store_calls = []
     monkeypatch.setattr(run._Store, "create", lambda *args, **kwargs: store_calls.append(args))
-    monkeypatch.setattr(run, "_ReplayComposition", lambda *a, **k: pytest.fail("owner created before preflight"))
+    def owner_guard(*_args, **_kwargs):
+        pytest.fail("owner created before preflight")
+
+    monkeypatch.setattr(historical_execution, "_ReplayComposition", owner_guard)
+    assert historical_execution._ReplayComposition is owner_guard
     result = run.run_spider_scenario(str(tmp_path), value.run_id, run._P3_SELECTOR, raw)
     assert result == dict(run_id=value.run_id, outcome="REJECTED", reason="UNSUPPORTED_CONFIGURATION")
     assert store_calls == []
@@ -857,16 +864,38 @@ def test_historical_filled_market_append_failure_keeps_native_mutation_and_unper
 
 def test_historical_endpoint_mutation_is_rejected_by_existing_admission(tmp_path, monkeypatch):
     value, raw = historical_input("historical-endpoint-mutation")
-    original = run._admit
+    original = historical_execution._admit
+    calls = []
     def tamper(path):
+        calls.append(path)
         endpoint_path = path / "endpoint.json"
         endpoint = decode_jsonl(endpoint_path.read_bytes())[0]
         endpoint["terminal_reason"] = "SCHEDULED_MTM"
         endpoint_path.write_bytes(canonical_bytes(endpoint) + b"\n")
         return original(path)
-    monkeypatch.setattr(run, "_admit", tamper)
+    monkeypatch.setattr(historical_execution, "_admit", tamper)
     result = run.run_spider_scenario(str(tmp_path), value.run_id, run._P3_SELECTOR, raw)
+    assert calls == [tmp_path / value.run_id]
     assert result == dict(run_id=value.run_id, outcome="FAILED", reason="ARTIFACT_MISMATCH")
+
+
+def test_moved_historical_executor_resolves_owner_from_execution_module(monkeypatch):
+    value, _raw = historical_input("historical-owner-module-seam")
+    calls = []
+    expected = RuntimeError("OWNER_SEAM_PROBE")
+
+    class OwnerProbe:
+        @staticmethod
+        def _from_historical_run(received):
+            calls.append(received)
+            raise expected
+
+    monkeypatch.setattr(historical_execution, "_ReplayComposition", OwnerProbe)
+    with pytest.raises(RuntimeError) as caught:
+        historical_execution._execute_historical(object(), {}, value)
+
+    assert caught.value is expected
+    assert calls == [value]
 
 
 def test_historical_completed_bundle_rejects_one_byte_truncated_endpoint(tmp_path, monkeypatch):
@@ -1382,7 +1411,7 @@ def test_configured_runner_projects_finalizes_and_admits_exact_forty_barriers(tm
     assert finalizes[0]["reconciliation"]["result"] == "OK"
     assert admissions[0][0]["decision"] == "ACCEPT" and admissions[0][1] == admissions[0][2]
     assert len(owners) == 1
-    assert len(run._PROGRAM) == 20
+    assert len(run._PROGRAM) == 21
     assert "python-strategy/src/core/backtest/synthetic_policy_dispatch.py" in run._PROGRAM
     assert "python-strategy/src/core/backtest/spider_execution_input.py" in run._PROGRAM
     assert "python-strategy/src/core/backtest/spider_paid_endpoint.py" in run._PROGRAM
