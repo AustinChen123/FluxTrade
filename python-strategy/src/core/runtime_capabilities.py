@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from src.core.ops_safety import OpsSafetyService
     from src.core.risk_manager import AccountService
     from src.core.runtime_environment import RuntimeEnvironment
+    from src.core.ops_diagnostic_dispatcher import OpsDiagnosticDispatcher
 
 
 OrderEventApply = Callable[[ExchangeOrderEvent], dict[str, object]]
@@ -309,6 +310,7 @@ class RuntimeCapabilitiesFactory(Protocol):
         callbacks: RuntimeCallbacks,
         logger: logging.Logger,
         notification_sink: NotificationSink | None,
+        diagnostic_dispatcher: OpsDiagnosticDispatcher | None,
     ) -> RuntimeCapabilities: ...
 
 

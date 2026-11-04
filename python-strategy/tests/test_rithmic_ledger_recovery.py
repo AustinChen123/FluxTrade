@@ -138,8 +138,7 @@ def test_startup_ledger_error_returns_fixed_blocked_result_and_logs_once(caplog)
     assert len(records) == 1
     assert records[0].levelno == logging.ERROR
     assert records[0].getMessage() == "Startup order reconciliation failed"
-    assert records[0].exc_info is not None
-    assert records[0].exc_info[1] is error
+    assert records[0].exc_info is None
 
 
 def test_startup_projection_error_marks_result_unsafe_and_logs_once(caplog):
@@ -298,3 +297,60 @@ def test_engine_compatibility_method_contains_only_one_owner_delegation():
     assert "summary.get" not in source
     assert "Decimal(" not in source
     assert "logger." not in source
+
+
+def test_startup_failure_carries_only_validated_safe_diagnostic(caplog) -> None:
+    error = RuntimeError("ACCOUNT_SECRET arbitrary-provider-text")
+    setattr(
+        error,
+        "safe_diagnostic",
+        {
+            "schema_version": 1,
+            "source_stage": "ledger_snapshot",
+            "stable_error_code": "order_snapshot_failed",
+            "safe_cause": "snapshot_unavailable",
+            "retryable": True,
+        },
+    )
+    service, _reconcile, publish = _service(reconcile_error=error)
+
+    result = service.reconcile_startup()
+
+    assert result["auto_resume_safe"] is False
+    assert result["safe_diagnostic"]["stable_error_code"] == "order_snapshot_failed"
+    assert "ACCOUNT_SECRET" not in repr(result)
+    assert "arbitrary-provider-text" not in caplog.text
+    publish.assert_not_called()
+
+
+@pytest.mark.parametrize("detail_present", (True, False))
+@pytest.mark.parametrize("sink_outcome", ("accepted", "rejected", "raising"))
+def test_composed_startup_failure_has_one_engine_owned_admission(
+    detail_present: bool, sink_outcome: str
+) -> None:
+    diagnostic = {
+        "schema_version": 1,
+        "source_stage": "ledger_snapshot",
+        "stable_error_code": "order_snapshot_failed",
+        "retryable": True,
+    }
+    failure = RuntimeError("private provider error")
+    if detail_present:
+        setattr(failure, "safe_diagnostic", diagnostic)
+    service, _reconcile, _publish = _service(reconcile_error=failure)
+    dispatcher = MagicMock()
+    if sink_outcome == "rejected":
+        dispatcher.submit.return_value = False
+    elif sink_outcome == "raising":
+        dispatcher.submit.side_effect = RuntimeError("driver failure")
+    engine = StrategyEngine.__new__(StrategyEngine)
+    engine._startup_auto_recovery_allowed = False
+    engine.ops_diagnostic_dispatcher = dispatcher
+
+    summary = service.reconcile_startup()
+    assert engine._can_auto_resume_after_startup_recovery(summary) is False
+
+    assert summary["auto_resume_safe"] is False
+    assert dispatcher.submit.call_count == int(detail_present)
+    if detail_present:
+        assert dispatcher.submit.call_args.args[0].as_dict() == diagnostic

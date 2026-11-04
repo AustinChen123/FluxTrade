@@ -28,6 +28,7 @@ from src.core.audit_service import write_system_event
 from src.core.execution import FlattenPending
 from src.core.models import OrderStatus
 from src.core.orm_models import SystemEvent
+from src.core.safe_diagnostics import safe_lockdown_reason
 
 OPS_KILL_SWITCH_STRATEGY_ID = "__ops_kill_switch__"
 
@@ -197,7 +198,11 @@ class OpsSafetyService:
     ) -> None:
         self._write_event(
             actor=actor,
-            reason=reason,
+            reason=(
+                safe_lockdown_reason(reason)
+                if reason is not None and reason.startswith("rithmic_")
+                else reason
+            ),
             result={"state": state},
             event_subtype="kill_switch_state",
             operation_id=operation_id,

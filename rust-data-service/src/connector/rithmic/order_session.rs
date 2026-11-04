@@ -80,6 +80,7 @@ pub(super) async fn connect_and_prepare(
         runtime,
         account_id,
         Arc::new(|| transport::maintenance_active(Utc::now())),
+        None,
     )
     .await
 }
@@ -94,27 +95,56 @@ pub(super) async fn connect_and_prepare_runtime(
     UserType,
     Vec<TradeRoute>,
 )> {
-    connect_and_prepare_runtime_guarded(runtime, account_id, Arc::new(|| false)).await
+    connect_and_prepare_runtime_guarded(runtime, account_id, Arc::new(|| false), None).await
 }
 
-async fn connect_and_prepare_runtime_guarded(
+#[cfg(test)]
+pub(super) async fn connect_and_prepare_runtime_with_capture(
     runtime: config::RuntimeConfig,
     account_id: Option<&str>,
-    maintenance_active: MaintenanceGuard,
+    capture: super::capture::CaptureHandle,
 ) -> Result<(
     RithmicConnection,
     AccountIdentity,
     UserType,
     Vec<TradeRoute>,
 )> {
-    let mut connection = transport::connect_with_maintenance_guard(
-        &runtime.url,
-        runtime.login,
-        RESPONSE_TIMEOUT,
-        maintenance_active,
-    )
-    .await
-    .map_err(classify_order_session_failure)?;
+    connect_and_prepare_runtime_guarded(runtime, account_id, Arc::new(|| false), Some(capture))
+        .await
+}
+
+async fn connect_and_prepare_runtime_guarded(
+    runtime: config::RuntimeConfig,
+    account_id: Option<&str>,
+    maintenance_active: MaintenanceGuard,
+    capture: Option<super::capture::CaptureHandle>,
+) -> Result<(
+    RithmicConnection,
+    AccountIdentity,
+    UserType,
+    Vec<TradeRoute>,
+)> {
+    let connect = async {
+        if let Some(capture) = capture {
+            transport::connect_with_maintenance_guard_and_capture(
+                &runtime.url,
+                runtime.login,
+                RESPONSE_TIMEOUT,
+                maintenance_active,
+                capture,
+            )
+            .await
+        } else {
+            transport::connect_with_maintenance_guard(
+                &runtime.url,
+                runtime.login,
+                RESPONSE_TIMEOUT,
+                maintenance_active,
+            )
+            .await
+        }
+    };
+    let mut connection = connect.await.map_err(classify_order_session_failure)?;
     wait_for_heartbeat(&mut connection, "ORDER")
         .await
         .map_err(classify_order_session_failure)?;

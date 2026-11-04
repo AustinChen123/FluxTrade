@@ -30,7 +30,17 @@ def get_engine():
     with _lock:
         if _engine is not None:
             return _engine
-        _engine = create_engine(_build_database_url(), echo=False)
+        # The pool/connect bounds also apply to diagnostic worker sessions
+        # created from SessionLocal. A timeout fails the caller closed; it does
+        # not change the semantics of an already-running authoritative
+        # transaction. Diagnostic statements add their narrower SET LOCAL
+        # statement_timeout in OpsDiagnosticDispatcher.
+        _engine = create_engine(
+            _build_database_url(),
+            echo=False,
+            pool_timeout=3,
+            connect_args={"connect_timeout": 3},
+        )
         return _engine
 
 

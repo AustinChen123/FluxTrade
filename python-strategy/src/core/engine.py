@@ -74,6 +74,10 @@ from src.core.market_data.profiles.bootstrap_seed import BootstrapKey, Bootstrap
 from src.core.strategy_activation_request_store import ProfileActivationRequestStore
 from src.core.market_data.profiles.decision_owner import IdentityResolver
 from src.core.ops_safety import OpsSafetyService
+from src.core.ops_diagnostic_dispatcher import (
+    get_process_ops_diagnostic_dispatcher,
+)
+from src.core.safe_diagnostics import diagnostic_from_payload
 from src.core.ops_command_service import OpsCommandService
 from src.core.runtime_reconcile import PositionAuthorityState, RuntimeReconciliationJob
 from src.core.runtime_artifact_registry import RuntimeArtifactRegistry
@@ -245,6 +249,11 @@ class StrategyEngine:
             self._db_session_factory = lambda: nullcontext(db_session)
         else:
             self._db_session_factory = db_session_factory
+        self.ops_diagnostic_dispatcher = (
+            get_process_ops_diagnostic_dispatcher(session_factory=db_session_factory)
+            if db_session_factory is not None
+            else None
+        )
         self.clock = clock
         self.loaded_classes: Dict[
             str,
@@ -618,6 +627,7 @@ class StrategyEngine:
                 callbacks=runtime_callbacks,
                 logger=logger,
                 notification_sink=self.notification_dispatcher,
+                diagnostic_dispatcher=self.ops_diagnostic_dispatcher,
             )
             if runtime_capabilities_factory is not None
             else NoopRuntimeCapabilities(
@@ -764,6 +774,11 @@ class StrategyEngine:
             event_logger=logger,
             stop_notifications=lambda timeout: self.notification_dispatcher.stop(
                 timeout=timeout
+            ),
+            stop_diagnostics=(
+                self.ops_diagnostic_dispatcher.stop
+                if self.ops_diagnostic_dispatcher is not None
+                else None
             ),
         )
         self._ops_command_service = OpsCommandService(
@@ -1039,11 +1054,27 @@ class StrategyEngine:
         return reconciled
 
     def _can_auto_resume_after_startup_recovery(self, summary: dict | None) -> bool:
-        return bool(
+        allowed = bool(
             self._startup_auto_recovery_allowed
             and summary
             and summary.get("auto_resume_safe") is True
         )
+        if summary is not None and self.ops_diagnostic_dispatcher is not None:
+            diagnostic = diagnostic_from_payload(summary.get("safe_diagnostic"))
+            if diagnostic is None:
+                nested = summary.get("snapshot_diagnostics")
+                if isinstance(nested, dict):
+                    diagnostic = diagnostic_from_payload(
+                        nested.get("safe_diagnostic")
+                    )
+            if diagnostic is not None:
+                try:
+                    self.ops_diagnostic_dispatcher.submit(diagnostic)
+                except Exception:
+                    logger.warning(
+                        "Startup diagnostic delivery failed; recovery remains blocked"
+                    )
+        return allowed
 
     def _start_command_listener(self):
         """Start the Redis strategy-control listener."""

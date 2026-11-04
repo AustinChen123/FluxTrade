@@ -4,11 +4,24 @@ mod codec;
 #[path = "connector/rithmic/config.rs"]
 mod config;
 
+#[path = "connector/rithmic/capture.rs"]
+#[allow(dead_code)]
+mod capture;
+
 #[path = "connector/rithmic/ledger.rs"]
 pub(crate) mod ledger;
 
 #[path = "connector/rithmic/ledger_runtime.rs"]
 pub(crate) mod ledger_runtime;
+
+#[allow(dead_code)]
+pub(crate) fn initialize_capture_owner() {
+    capture::initialize_process_capture();
+}
+
+pub(crate) fn shutdown_capture_owner() {
+    capture::shutdown_process_capture();
+}
 
 #[path = "connector/rithmic/last_trade_snapshot.rs"]
 pub(crate) mod last_trade_snapshot;

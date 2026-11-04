@@ -20,6 +20,10 @@ use tokio_tungstenite::{
 use tracing::{info, warn};
 
 type RithmicSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+#[cfg(test)]
+pub(crate) use super::capture::{
+    test_owner_writer, Direction as CaptureDirection, TestWriterState,
+};
 pub(crate) type MaintenanceGuard = Arc<dyn Fn() -> bool + Send + Sync>;
 const MAINTENANCE_POLL_DELAY: Duration = Duration::from_secs(15 * 60);
 const POST_MAINTENANCE_VERIFICATION_ATTEMPTS: u8 = 3;
@@ -326,6 +330,10 @@ pub(crate) struct RithmicConnection {
     heartbeat_deadline: Instant,
     awaiting_heartbeat: bool,
     maintenance_active: MaintenanceGuard,
+    capture_connection_id: u64,
+    capture: super::capture::CaptureHandle,
+    #[cfg(test)]
+    fail_next_send: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -691,6 +699,41 @@ pub(crate) async fn connect_with_maintenance_guard(
     response_timeout: Duration,
     maintenance_active: MaintenanceGuard,
 ) -> Result<RithmicConnection> {
+    let capture = super::capture::process_capture().clone();
+    connect_with_maintenance_guard_and_capture(
+        url,
+        login,
+        response_timeout,
+        maintenance_active,
+        capture,
+    )
+    .await
+}
+
+#[cfg(test)]
+pub(crate) async fn connect_with_capture(
+    url: &str,
+    login: LoginParameters,
+    response_timeout: Duration,
+    capture: super::capture::CaptureHandle,
+) -> Result<RithmicConnection> {
+    connect_with_maintenance_guard_and_capture(
+        url,
+        login,
+        response_timeout,
+        Arc::new(|| false),
+        capture,
+    )
+    .await
+}
+
+pub(super) async fn connect_with_maintenance_guard_and_capture(
+    url: &str,
+    login: LoginParameters,
+    response_timeout: Duration,
+    maintenance_active: MaintenanceGuard,
+    capture: super::capture::CaptureHandle,
+) -> Result<RithmicConnection> {
     let mut session = RithmicSession::new(login);
 
     ensure_provider_io_allowed(maintenance_active.as_ref())
@@ -783,6 +826,10 @@ pub(crate) async fn connect_with_maintenance_guard(
         heartbeat_deadline,
         awaiting_heartbeat: true,
         maintenance_active,
+        capture_connection_id: super::capture::next_connection_id(),
+        capture,
+        #[cfg(test)]
+        fail_next_send: false,
     })
 }
 
@@ -797,8 +844,56 @@ where
 }
 
 impl RithmicConnection {
+    #[cfg(test)]
+    pub(crate) fn fail_next_send_for_test(&mut self) {
+        self.fail_next_send = true;
+    }
+
     pub(crate) async fn send_payload(&mut self, payload: Vec<u8>) -> Result<()> {
+        let capture = self.capture.clone();
+        self.send_payload_with_capture(payload, &capture).await
+    }
+
+    async fn send_payload_with_capture(
+        &mut self,
+        payload: Vec<u8>,
+        capture: &super::capture::CaptureHandle,
+    ) -> Result<()> {
         ensure_provider_io_allowed(self.maintenance_active.as_ref())?;
+        let template_id = codec::capture_template_id(&payload);
+        if template_id.is_none() {
+            capture.note_auth_exclusion();
+        }
+        if payload.len() > 256 * 1024 {
+            capture.note_oversize();
+        }
+        if matches!(template_id, Some(10 | 11)) {
+            capture.note_auth_exclusion();
+        }
+        if super::capture::eligible_template(super::capture::Direction::Outbound, template_id) {
+            #[cfg(test)]
+            let inject_send_failure = std::mem::take(&mut self.fail_next_send);
+            #[cfg(not(test))]
+            let inject_send_failure = false;
+            let socket = &mut self.socket;
+            let response_timeout = self.response_timeout;
+            return super::capture::before_outbound_write(
+                capture,
+                template_id,
+                payload,
+                self.capture_connection_id,
+                move |payload| async move {
+                    if inject_send_failure {
+                        Err(mark_retryable_transport(anyhow::anyhow!(
+                            "Rithmic binary write timed out"
+                        )))
+                    } else {
+                        send_binary(socket, payload, response_timeout).await
+                    }
+                },
+            )
+            .await;
+        }
         send_binary(&mut self.socket, payload, self.response_timeout).await
     }
 
@@ -825,6 +920,19 @@ impl RithmicConnection {
     where
         N: Fn() -> bool,
     {
+        let capture = self.capture.clone();
+        self.next_event_guarded_with_capture(maintenance_active, &capture)
+            .await
+    }
+
+    async fn next_event_guarded_with_capture<N>(
+        &mut self,
+        maintenance_active: N,
+        capture: &super::capture::CaptureHandle,
+    ) -> Result<ConnectionEvent>
+    where
+        N: Fn() -> bool,
+    {
         loop {
             ensure_provider_io_allowed(&maintenance_active)?;
             let message = tokio::select! {
@@ -847,7 +955,26 @@ impl RithmicConnection {
                 };
                 match classify_message(message)? {
                     IncomingMessage::Payload(payload) => {
-                        if self.session.accept_control(&payload)? {
+                        let template_id = codec::capture_template_id(&payload);
+                        if template_id.is_none() {
+                            capture.note_auth_exclusion();
+                        }
+                        if payload.len() > 256 * 1024 {
+                            capture.note_oversize();
+                        }
+                        if matches!(template_id, Some(10 | 11)) {
+                            capture.note_auth_exclusion();
+                        }
+                        let accepted_control = super::capture::before_action(
+                            capture,
+                            super::capture::Direction::Inbound,
+                            template_id,
+                            payload.len(),
+                            self.capture_connection_id,
+                            &payload,
+                            || self.session.accept_control(&payload),
+                        )?;
+                        if accepted_control {
                             ensure!(
                                 self.awaiting_heartbeat,
                                 "Rithmic sent an unexpected heartbeat response"
@@ -1010,7 +1137,22 @@ fn classify_message(message: Message) -> Result<IncomingMessage> {
 }
 
 #[cfg(test)]
-mod tests {
+#[path = "transport/transport_capture_business_owner_tests.rs"]
+mod capture_business_owner_tests;
+#[cfg(test)]
+#[path = "capture/lifecycle_tests.rs"]
+mod capture_lifecycle_tests;
+#[cfg(test)]
+#[path = "transport/transport_capture_path_tests.rs"]
+mod capture_path_tests;
+
+#[cfg(test)]
+#[path = "transport/transport_capture_sink_matrix.rs"]
+mod capture_sink_matrix;
+
+#[cfg(test)]
+pub(crate) mod tests {
+
     use super::super::session::{Plant, RithmicSession, SessionState};
     use super::super::{codec, protocol};
     use super::*;
@@ -1739,7 +1881,7 @@ mod tests {
         assert!(!formatted.contains("also-sensitive"));
     }
 
-    fn login() -> LoginParameters {
+    pub(super) fn login() -> LoginParameters {
         LoginParameters::new(
             "test-user".to_string(),
             "test-password".to_string(),
@@ -2042,7 +2184,7 @@ mod tests {
         );
     }
 
-    async fn serve_handshake(
+    pub(super) async fn serve_handshake(
         listener: &TcpListener,
         heartbeat_interval: f64,
     ) -> WebSocketStream<TcpStream> {
@@ -2092,7 +2234,7 @@ mod tests {
         login
     }
 
-    async fn send_heartbeat_response(socket: &mut WebSocketStream<TcpStream>) {
+    pub(super) async fn send_heartbeat_response(socket: &mut WebSocketStream<TcpStream>) {
         socket
             .send(Message::Binary(
                 codec::encode(&protocol::ResponseHeartbeat {

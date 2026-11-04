@@ -36,6 +36,7 @@ from src.core.adapters.rithmic_runtime_recovery import (
 )
 from src.core.adapters.rithmic_strategy_exit import RithmicStrategyExitService
 from src.core.execution import ExecutionEngine, ExitDecision
+from src.core.engine import StrategyEngine
 from src.core.interfaces import IExchangeAdapter
 from src.core.interfaces.conditional_orders import ConditionalOrderRecord
 from src.core.interfaces.exchange import ExchangeOrderEvent
@@ -1513,6 +1514,65 @@ def test_rithmic_composition_builds_the_complete_shared_owner_graph() -> None:
 
     owners.order_event_stream._on_runtime_started()
     runtime_started.assert_called_once_with()
+
+
+@pytest.mark.parametrize("include_detail", (True, False))
+@pytest.mark.parametrize("sink_result", ("accepted", "rejected", "raising"))
+def test_composed_startup_failure_is_admitted_once_by_engine(
+    include_detail: bool, sink_result: str
+) -> None:
+    adapter = RithmicExchangeAdapter(
+        profile="test",
+        account_id="ACCOUNT",
+        instruments={
+            "RITHMIC:NQ-202609": {
+                "exchange": "CME",
+                "quantity_step": "1",
+                "price_tick": "0.25",
+            }
+        },
+        client_factory=MagicMock(),
+    )
+    execution_engine = _execution_engine()
+    failure = RuntimeError("provider detail must not be logged")
+    if include_detail:
+        setattr(
+            failure,
+            "safe_diagnostic",
+            {
+                "schema_version": 1,
+                "source_stage": "ledger_snapshot",
+                "stable_error_code": "order_snapshot_failed",
+                "retryable": True,
+            },
+        )
+    execution_engine.reconcile_owned_orders.side_effect = failure
+    dispatcher = MagicMock()
+    if sink_result == "rejected":
+        dispatcher.submit.return_value = False
+    elif sink_result == "raising":
+        dispatcher.submit.side_effect = RuntimeError("optional sink failure")
+    owners = build_rithmic_runtime_owners(
+        adapter=adapter,
+        profile="test",
+        account_id="ACCOUNT",
+        execution_engine=execution_engine,
+        account_service=MagicMock(spec=AccountService),
+        ops_safety=MagicMock(spec=OpsSafetyService),
+        stop_event=MagicMock(),
+        callbacks=_callbacks(),
+        logger=MagicMock(),
+        diagnostic_dispatcher=dispatcher,
+    )
+    summary = owners.reconcile_startup(lambda: {})
+    assert summary is not None
+    engine = StrategyEngine.__new__(StrategyEngine)
+    engine._startup_auto_recovery_allowed = False
+    engine.ops_diagnostic_dispatcher = dispatcher
+
+    assert engine._can_auto_resume_after_startup_recovery(summary) is False
+    assert summary["auto_resume_safe"] is False
+    assert dispatcher.submit.call_count == int(include_detail)
 
 
 def test_runtime_recovery_restart_failure_does_not_claim_global_halt() -> None:

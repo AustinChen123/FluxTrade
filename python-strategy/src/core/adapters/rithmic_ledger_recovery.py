@@ -8,6 +8,7 @@ from logging import Logger
 from typing import Any
 
 from .rithmic_runtime_recovery import rithmic_maintenance_active
+from src.core.safe_diagnostics import diagnostic_from_exception
 
 
 class RithmicLedgerRecoveryService:
@@ -50,14 +51,18 @@ class RithmicLedgerRecoveryService:
                 self._profile,
                 self._account_id,
             )
-        except Exception:
-            self._logger.exception("Startup order reconciliation failed")
-            return {
+        except Exception as error:
+            self._logger.error("Startup order reconciliation failed")
+            summary: dict[str, Any] = {
                 "recoverable_count": 0,
                 "unresolved_count": 1,
                 "verification_blocked_count": 1,
                 "auto_resume_safe": False,
             }
+            safe_diagnostic = diagnostic_from_exception(error)
+            if safe_diagnostic is not None:
+                summary["safe_diagnostic"] = safe_diagnostic.as_dict()
+            return summary
 
         try:
             self.publish_authoritative_summary(summary)

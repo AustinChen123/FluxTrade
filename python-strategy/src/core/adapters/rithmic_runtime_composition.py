@@ -58,6 +58,7 @@ from src.core.interfaces.conditional_orders import (
 from src.core.interfaces.exchange import ExchangeOrderEvent
 from src.core.models import Candlestick, Signal, SignalType
 from src.core.notifications import NotificationSink
+from src.core.ops_diagnostic_dispatcher import OpsDiagnosticDispatcher
 from src.core.ops_safety import OpsSafetyService
 from src.core.risk_manager import AccountService
 from src.core.runtime_capabilities import (
@@ -534,6 +535,7 @@ def build_rithmic_runtime_owners(
     callbacks: RithmicRuntimeCallbacks,
     logger: logging.Logger,
     notification_sink: NotificationSink | None = None,
+    diagnostic_dispatcher: OpsDiagnosticDispatcher | None = None,
 ) -> RithmicRuntimeOwners:
     """Build Rithmic owners without performing external I/O."""
 
@@ -671,6 +673,7 @@ def build_rithmic_runtime_owners(
         on_runtime_started=callbacks.on_runtime_started,
         logger=logger,
         notification_sink=notification_sink,
+        diagnostic_dispatcher=diagnostic_dispatcher,
     )
     runtime_recovery = (
         RithmicRuntimeRecoveryService(
@@ -694,6 +697,11 @@ def build_rithmic_runtime_owners(
             resume_after_reconcile=lambda: (execution_engine.resume_after_reconcile()),
             lockdown=callbacks.lockdown,
             logger=logger,
+            diagnostic_sink=(
+                diagnostic_dispatcher.submit
+                if diagnostic_dispatcher is not None
+                else None
+            ),
         )
         if ledger_recovery is not None
         else None
@@ -709,6 +717,9 @@ def build_rithmic_runtime_owners(
         assert_runtime_leadership=callbacks.assert_runtime_leadership,
         resume_after_reconcile=lambda: execution_engine.resume_after_reconcile(),
         logger=logger,
+        diagnostic_sink=(
+            diagnostic_dispatcher.submit if diagnostic_dispatcher is not None else None
+        ),
     )
     strategy_exit = RithmicStrategyExitService(
         adapter=adapter,

@@ -8999,7 +8999,10 @@ class TestExchangeOrderEventThread:
         assert engine.ops_safety.persist_kill_switch_state.call_args_list[-1] == call(
             "LOCKDOWN",
             actor="rithmic_order_stream",
-            reason="rithmic_external_order_detected_during_clear",
+            reason=(
+                "rithmic_external_order_detected_during_clear: "
+                "diagnostic_details_redacted"
+            ),
         )
         engine.execution_engine.resume_after_reconcile.assert_called_once_with()
 
@@ -9105,7 +9108,10 @@ class TestExchangeOrderEventThread:
         assert engine.ops_safety.persist_kill_switch_state.call_args_list[-1] == call(
             "LOCKDOWN",
             actor="rithmic_order_stream",
-            reason="rithmic_external_order_detected_during_clear",
+            reason=(
+                "rithmic_external_order_detected_during_clear: "
+                "diagnostic_details_redacted"
+            ),
         )
         engine.execution_engine.resume_after_reconcile.assert_called_once_with()
 
