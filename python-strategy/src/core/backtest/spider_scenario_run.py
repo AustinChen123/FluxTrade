@@ -13,6 +13,7 @@ from src.core.backtest.spider_run_envelope_schema import endpoint as _endpoint, 
 from src.core.backtest.spider_run_evidence import ReconciliationProjectionError as _ProjectionError, build_endpoint_artifacts as _build
 from src.core.backtest.spider_run_admission import admit_spider_run as _admit
 from src.core.backtest.spider_run_store import SpiderRunStore as _Store, SpiderRunStoreError as _StoreError
+from src.core.backtest.spider_run_errors import classify_historical_failure as _classify_historical_failure
 from src.core.backtest.synthetic_scenario_replay import _ReplayComposition, ReplayPersistenceError as _PersistenceError, _ScheduleError
 from src.core.backtest.spider_paid_endpoint import _classify_paid_endpoint_result as _classify_paid, _error as _paid_error
 from src.core.backtest.spider_run_execution_schema import canonical_paid_bytes as _paid_bytes, execution_context_from_input as _execution_context_from_input, validate_execution_artifact as _validate_execution_artifact
@@ -53,7 +54,7 @@ from src.core.backtest.spider_run_artifacts import (
 _ROOT = _Path(__file__).resolve().parents[4]
 _PROGRAM = tuple("python-strategy/src/core/backtest/" + name + ".py" for name in (
     "synthetic_scenario_codec", "synthetic_scenario_replay", "synthetic_policy_dispatch", "spider_policy", "spider_policy_protocol", "spider_run_admission",
-    "spider_run_artifacts", "spider_run_completion_schema", "spider_run_envelope_schema", "spider_run_evidence",
+    "spider_run_artifacts", "spider_run_completion_schema", "spider_run_envelope_schema", "spider_run_evidence", "spider_run_errors",
     "spider_run_native_schema", "spider_run_reconciliation_schema", "spider_run_store", "spider_historical_execution", "spider_scenario_plan_liquidation",
     "spider_scenario_plan_o03", "spider_scenario_plan_scheduled", "spider_scenario_plans", "spider_scenario_run",
     "spider_execution_input", "spider_paid_endpoint"))
@@ -985,7 +986,8 @@ def _invoke(
         return failed(error)
     except Exception as error:
         native = _wire._native_failure(error)
-        reason = "NATIVE_FAULT" if native else "ENDPOINT_RECONCILIATION_FAILED" if isinstance(error, _ProjectionError) else "UNEXPECTED_EXCEPTION"
+        classification = _classify_historical_failure(error, "OUTER_INVOCATION", native, False)
+        reason = classification.reason
         if ((paid_invocation or floating_invocation or gross_invocation) and store is not None and paid_state.get("paid_endpoint") is not None
                 and store._state in ("RUNNING", "FAILED")
                 and not (store._path / "paid_endpoint.json").exists()):
@@ -999,13 +1001,13 @@ def _invoke(
             except _StoreError as newer:
                 return failed(newer)
         if floating_invocation or gross_invocation:
-            if native is None and not isinstance(error, _ProjectionError):
+            if not classification.handled:
                 _LOGGER.exception(
                     "gross research invocation failed" if gross_invocation
                     else "floating-exit research invocation failed"
                 )
             return response("FAILED", reason)
-        if native or isinstance(error, _ProjectionError):
+        if classification.handled:
             return response("FAILED", reason)
         raise
 

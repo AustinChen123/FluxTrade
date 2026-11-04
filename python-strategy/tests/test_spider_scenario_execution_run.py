@@ -124,6 +124,20 @@ def test_historical_executor_source_is_in_program_digest(monkeypatch):
     monkeypatch.setattr(Path, "read_bytes", mutate_executor_only)
     assert _program_hash() != before
 
+
+def test_error_owner_source_is_in_program_digest(monkeypatch):
+    target = scenario._ROOT / "python-strategy/src/core/backtest/spider_run_errors.py"
+    assert "python-strategy/src/core/backtest/spider_run_errors.py" in scenario._P3_PROGRAM
+    before = _program_hash()
+    original_read_bytes = Path.read_bytes
+
+    def mutate_error_owner_only(path: Path) -> bytes:
+        raw = original_read_bytes(path)
+        return raw + b"\n# digest-only mutation\n" if path == target else raw
+
+    monkeypatch.setattr(Path, "read_bytes", mutate_error_owner_only)
+    assert _program_hash() != before
+
 @pytest.mark.parametrize(
     "case", ["wrong_selector", "mixed_inputs", "missing_input", "malformed_input", "nested_run_id"],
 )

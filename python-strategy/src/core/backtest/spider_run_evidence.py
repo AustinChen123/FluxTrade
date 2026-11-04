@@ -29,6 +29,7 @@ from src.core.backtest.spider_run_envelope_schema import (
 from src.core.backtest.spider_run_reconciliation_schema import _CHECKS, reconciliation as _validate
 from src.core.backtest.spider_configured_scale_input import _configured_scale_projection_oracle
 from src.core.backtest.spider_scenario_plans import plan_bundle as _plan_bundle
+from src.core.backtest.spider_run_errors import ReconciliationProjectionError
 
 _INITIAL = "artifact:endpoint.json#/initial_owner_evidence"
 _FINAL = "artifact:endpoint.json#/final_owner_evidence"
@@ -40,15 +41,6 @@ _P2_PLAN_SHA256 = "8235c952a5d199825a2a77842b03f49e213ef707c0f30b24d8bf623fde53c
 
 class _IndexFallback(Exception):
     """Internal signal to discard a guarded index and use the original scan."""
-
-
-class ReconciliationProjectionError(ValueError):
-    """Required evidence cannot be represented by the frozen eleven shapes."""
-
-    reason = "ENDPOINT_RECONCILIATION_FAILED"
-
-    def __init__(self) -> None:
-        super().__init__(self.reason)
 
 
 def _historical_snapshot_matches(owner: dict[str, _Any], cutoff: int,

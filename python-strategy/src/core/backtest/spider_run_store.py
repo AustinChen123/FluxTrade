@@ -12,7 +12,8 @@ from typing import Any, cast
 from src.core.backtest.spider_run_artifacts import _P3_RUN_CONTRACT, _boundary, _configuration_context, _historical_context, _require, _text, canonical_bytes, configuration_context, decode_jsonl, historical_context, validate_artifact
 from src.core.backtest.spider_run_completion_schema import _ARTIFACTS, completion, report as validate_report
 from src.core.backtest.spider_run_envelope_schema import endpoint as validate_endpoint, journal as validate_journal, journal_record
-from src.core.backtest.spider_run_evidence import ReconciliationProjectionError, _context_chain, build_reconciliation
+from src.core.backtest.spider_run_errors import ReconciliationProjectionError, SpiderRunStoreError
+from src.core.backtest.spider_run_evidence import _context_chain, build_reconciliation
 from src.core.backtest.spider_run_reconciliation_schema import reconciliation as validate_reconciliation
 from src.core.backtest.spider_historical_input import _validate_historical_run_link
 from src.core.backtest.spider_run_execution_schema import (
@@ -51,14 +52,6 @@ from src.core.backtest.spider_run_artifacts import (
     historical_context as validate_historical_context,
 )
 from src.core.backtest.spider_historical_input import historical_context_for_input
-
-
-class SpiderRunStoreError(Exception):
-    def __init__(self, reason: str, requested_failure_reason: str | None = None, primary_failure: dict | None = None):
-        super().__init__(reason)
-        self.reason = reason
-        self.requested_failure_reason = requested_failure_reason
-        self.primary_failure = deepcopy(primary_failure)
 
 
 def _report_validator(attempt: dict[str, Any]):

@@ -5,12 +5,12 @@ from typing import Any as _Any, cast as _cast
 from src.core.backtest.spider_run_artifacts import canonical_bytes as _bytes, decode_canonical as _decode
 from src.core.backtest.spider_run_evidence import build_endpoint_artifacts as _build
 from src.core.backtest.spider_run_admission import admit_spider_run as _admit
-from src.core.backtest.spider_run_store import SpiderRunStoreError as _StoreError
 from src.core.backtest.synthetic_scenario_replay import (
     _ReplayComposition,
     ReplayPersistenceError as _PersistenceError,
 )
 from src.core.backtest.spider_historical_input import HistoricalRunInput as _HistoricalRunInput
+from src.core.backtest.spider_run_errors import classify_historical_failure as _classify_failure
 
 
 def _normalized(value):
@@ -87,15 +87,14 @@ def _execute_historical(store, attempt, run: _HistoricalRunInput):
             )
             store.append_journal(row)
         except Exception as error:
-            primary = (error.primary_failure if isinstance(error, _StoreError)
-                       else dict(kind="PERSISTENCE", reason="EVIDENCE_CAPTURE_FAILED"))
-            if isinstance(error, _StoreError) and error.reason == "PUBLICATION_DURABILITY_UNKNOWN":
-                closed = True
+            decision = _classify_failure(error, "CALLBACK_PERSIST", None, closed)
+            if decision.propagate_original:
+                closed = decision.closed
                 raise error
             try:
-                store.publish_failure("PERSISTENCE_FAILED", primary)
+                store.publish_failure(decision.reason, decision.primary_failure)
             finally:
-                closed = True
+                closed = decision.closed
             raise _PersistenceError() from error
         journal.append(row)
 

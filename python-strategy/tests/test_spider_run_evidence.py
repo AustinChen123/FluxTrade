@@ -1479,5 +1479,6 @@ def test_no_reconciliation_authority_and_public_import_boundary():
     assert {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)} <= {
             "copy", "enum", "hashlib", "struct", "typing", "src.core.backtest.spider_run_artifacts", "src.core.backtest.spider_run_completion_schema",
         "src.core.backtest.spider_run_reconciliation_schema", "src.core.backtest.spider_scenario_plans", "src.core.backtest.spider_run_envelope_schema",
-        "src.core.backtest.spider_configured_scale_input", "src.core.backtest.spider_policy_protocol"}
+        "src.core.backtest.spider_configured_scale_input", "src.core.backtest.spider_policy_protocol",
+        "src.core.backtest.spider_run_errors"}
     assert not any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in {"open", "eval", "exec", "__import__"} for node in ast.walk(tree))
