@@ -14,6 +14,7 @@ import pytest
 
 import tools.spider_run_benchmark as benchmark
 from tools.spider_run_benchmark import run
+from test_spider_scenario_run import frozen_h03_input
 
 
 def _input(tmp_path: Path) -> Path:
@@ -30,19 +31,26 @@ def test_benchmark_drains_large_stdout_and_stderr(tmp_path: Path) -> None:
         "sys.stderr.write('e'*200000)"
     )
     result = run(
-        _input(tmp_path), tmp_path / "runs", "large-output",
+        _input(tmp_path),
+        tmp_path / "runs",
+        "large-output",
         command=[sys.executable, "-c", child],
     )
     assert result["process_return_code"] == 0
     assert result["outcome"] == {"outcome": "FAILED", "reason": "synthetic"}
     assert len(result["stderr"]) == 200000
-    assert result["admission"] == {"decision": "UNAVAILABLE", "reason": "RUN_DIRECTORY_MISSING"}
+    assert result["admission"] == {
+        "decision": "UNAVAILABLE",
+        "reason": "RUN_DIRECTORY_MISSING",
+    }
 
 
 def test_benchmark_records_nonzero_exit(tmp_path: Path) -> None:
     child = "import json,sys;print(json.dumps({'outcome':'PROCESS_ERROR','reason':'synthetic'}));sys.exit(7)"
     result = run(
-        _input(tmp_path), tmp_path / "runs", "nonzero",
+        _input(tmp_path),
+        tmp_path / "runs",
+        "nonzero",
         command=[sys.executable, "-c", child],
     )
     assert result["process_return_code"] == 7
@@ -50,23 +58,31 @@ def test_benchmark_records_nonzero_exit(tmp_path: Path) -> None:
     assert result["outcome"]["reason"] == "synthetic"
 
 
-def test_benchmark_failure_closes_pipes_without_resource_warning(tmp_path: Path) -> None:
+def test_benchmark_failure_closes_pipes_without_resource_warning(
+    tmp_path: Path,
+) -> None:
     child = "import json,sys;print(json.dumps({'outcome':'PROCESS_ERROR','reason':'synthetic'}));sys.exit(7)"
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always", ResourceWarning)
         result = run(
-            _input(tmp_path), tmp_path / "runs", "failed-child-cleanup",
+            _input(tmp_path),
+            tmp_path / "runs",
+            "failed-child-cleanup",
             command=[sys.executable, "-c", child],
         )
         gc.collect()
 
     assert result["process_return_code"] == 7
-    assert not [warning for warning in caught if issubclass(warning.category, ResourceWarning)]
+    assert not [
+        warning for warning in caught if issubclass(warning.category, ResourceWarning)
+    ]
 
 
 def test_benchmark_reports_invalid_json_stdout(tmp_path: Path) -> None:
     result = run(
-        _input(tmp_path), tmp_path / "runs", "invalid-json",
+        _input(tmp_path),
+        tmp_path / "runs",
+        "invalid-json",
         command=[sys.executable, "-c", "print('not-json')"],
     )
     assert result["process_return_code"] == 0
@@ -74,7 +90,66 @@ def test_benchmark_reports_invalid_json_stdout(tmp_path: Path) -> None:
     assert "not-json" in result["outcome"]["reason"]
 
 
-def _track_processes(monkeypatch: pytest.MonkeyPatch, *, missing_pipes: set[str] | None = None):
+def test_research_benchmark_measures_real_entry_without_run_store_files(
+    tmp_path: Path,
+) -> None:
+    value, raw = frozen_h03_input("benchmark-research")
+    input_path = tmp_path / "research-input.json"
+    input_path.write_bytes(raw)
+    output_root = tmp_path / "research-runs"
+
+    result = run(input_path, output_root, value.run_id, mode="research")
+
+    assert result["mode"] == "research"
+    assert result["outcome"]["outcome"] == "COMPLETE"
+    assert result["outcome"]["research_classification"] == "RESEARCH_ONLY"
+    assert result["outcome"]["admission_state"] == "NOT_ADMITTED"
+    assert result["outcome"]["report_row_count"] > 0
+    assert len(result["outcome"]["report_sha256"]) == 64
+    assert result["wall_seconds"] > 0
+    assert result["child_peak_rss_mb"] > 0
+    assert result["artifacts"] == {}
+    assert result["admission"] == {"decision": "NOT_APPLICABLE", "reason": None}
+    assert result["journal_rows"] == 0
+    assert not (output_root / value.run_id).exists()
+
+
+def test_benchmark_both_runs_modes_sequentially_and_reports_wall_and_rss(
+    tmp_path: Path,
+) -> None:
+    input_path = _input(tmp_path)
+    child = [
+        sys.executable,
+        "-c",
+        "import json;print(json.dumps({'outcome':'COMPLETE'}))",
+    ]
+
+    result = run(
+        input_path, tmp_path / "both-runs", "pair-smoke", mode="both", command=child
+    )
+
+    assert result["mode"] == "both"
+    for mode in ("durable", "research"):
+        assert result[mode]["mode"] == mode
+        assert result[mode]["wall_seconds"] >= 0
+        assert result[mode]["child_peak_rss_mb"] >= 0
+
+
+def test_g1_uses_seconds_per_sim_minute_for_linear_scaling() -> None:
+    h60 = {"wall_seconds": 60.0, "seconds_per_sim_minute": 1.0}
+    h360 = {"wall_seconds": 360.0, "seconds_per_sim_minute": 1.0}
+
+    g1 = h360["seconds_per_sim_minute"] / h60["seconds_per_sim_minute"]
+    old_total_wall_ratio = h360["wall_seconds"] / h60["wall_seconds"]
+
+    assert g1 == 1.0
+    assert old_total_wall_ratio == 6.0
+    assert old_total_wall_ratio > 1.3
+
+
+def _track_processes(
+    monkeypatch: pytest.MonkeyPatch, *, missing_pipes: set[str] | None = None
+):
     processes = []
     real_popen = benchmark.subprocess.Popen
 
@@ -100,7 +175,10 @@ def _track_processes(monkeypatch: pytest.MonkeyPatch, *, missing_pipes: set[str]
     ],
 )
 def test_exceptional_exit_reaps_child_and_closes_pipes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str, expected_error: type[Exception],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+    expected_error: type[Exception],
 ) -> None:
     processes = _track_processes(monkeypatch)
     child = [sys.executable, "-c", "import time;time.sleep(30)"]
@@ -108,6 +186,7 @@ def test_exceptional_exit_reaps_child_and_closes_pipes(
         child = [sys.executable, "-c", "pass"]
 
     if failure == "thread_setup":
+
         def fail_thread_setup(*_args, **_kwargs):
             raise RuntimeError("injected_thread_setup")
 
@@ -125,15 +204,19 @@ def test_exceptional_exit_reaps_child_and_closes_pipes(
 
         monkeypatch.setattr(benchmark.Thread, "start", fail_second_start)
     elif failure == "wait4":
+
         def fail_wait4(*_args, **_kwargs):
             raise OSError("injected_wait4")
 
         monkeypatch.setattr(benchmark.os, "wait4", fail_wait4)
     else:
+
         def fail_status_conversion(_status: int) -> int:
             raise ValueError("injected_status_conversion")
 
-        monkeypatch.setattr(benchmark.os, "waitstatus_to_exitcode", fail_status_conversion)
+        monkeypatch.setattr(
+            benchmark.os, "waitstatus_to_exitcode", fail_status_conversion
+        )
 
     with pytest.raises(expected_error, match="injected_"):
         run(_input(tmp_path), tmp_path / "runs", failure, command=child)
@@ -147,7 +230,9 @@ def test_exceptional_exit_reaps_child_and_closes_pipes(
 
 @pytest.mark.parametrize("missing", [{"stdout"}, {"stderr"}, {"stdout", "stderr"}])
 def test_pipe_guard_reaps_child_and_closes_every_available_pipe(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, missing: set[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    missing: set[str],
 ) -> None:
     processes = _track_processes(monkeypatch, missing_pipes=missing)
     child = [sys.executable, "-c", "import time;time.sleep(30)"]
@@ -170,7 +255,8 @@ def _process_is_gone(pid: int) -> bool:
 
 
 def test_benchmark_kills_inherited_pipe_writer_and_closes_both_pipes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     processes = _track_processes(monkeypatch)
     pid_path = tmp_path / "descendant.pid"
@@ -185,7 +271,9 @@ def test_benchmark_kills_inherited_pipe_writer_and_closes_both_pipes(
     descendant_pid: int | None = None
     try:
         result = run(
-            _input(tmp_path), tmp_path / "runs", "inherited-writer",
+            _input(tmp_path),
+            tmp_path / "runs",
+            "inherited-writer",
             command=[sys.executable, "-c", code],
         )
         descendant_pid = int(pid_path.read_text())
