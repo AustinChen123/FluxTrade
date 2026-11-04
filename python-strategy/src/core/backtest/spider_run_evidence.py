@@ -22,6 +22,10 @@ from src.core.backtest.spider_run_artifacts import (
     _historical_context,
     canonical_bytes as _bytes,
 )
+from src.core.backtest.spider_historical_report_projection import (
+    FinalOwnerEvidenceValues as _FinalOwnerEvidenceValues,
+    project_historical_report as _project_historical_report,
+)
 from src.core.backtest.spider_run_completion_schema import report as _validate_report
 from src.core.backtest.spider_run_envelope_schema import (
     endpoint as _validate_endpoint, journal_record as _validate_journal_record,
@@ -1116,10 +1120,15 @@ def _historical_report(run_id: str, attempt: dict[str, _Any], journal: list[dict
     trading = final["trading_fact"]["immutable_payload"]
     positions = _required(final["positions_fact"]["immutable_payload"], "rows")
     orders = _required(final["open_orders_fact"]["immutable_payload"], "rows")
-    rows = []
+    products_by_id = {}
+    fills_by_product = []
+    refs_by_product = []
+    account_values = None
+    configuration_context = None
+    historical_context = None
     for product in context.products:
         position = next((row for row in positions if row["product_id"] == product), None)
-        relevant_refs: list[str] = []
+        refs: list[str] = []
         fills: list[str] = []
         for row in journal:
             payload = row["payload"]
@@ -1129,30 +1138,42 @@ def _historical_report(run_id: str, attempt: dict[str, _Any], journal: list[dict
                                        if item["product_id"] == product), None)
                 if result_product is not None:
                     related = True
-                    fills.extend("SOURCE:" + fill["source_event_id"] for fill in result_product["fills"])
+                    fills.extend(fill["source_event_id"] for fill in result_product["fills"])
             elif row["record_kind"] == "SOURCE_GROUP_RESULT":
                 related = any(member.get("payload", {}).get("product_id") == product
                               for member in payload["request"]["members"])
             if related:
-                relevant_refs.append(f"journal:{row['journal_seq']}")
-        relevant_refs.append(_FINAL)
-        rows.append(dict(
-            schema_version="spider_product_report_v1", run_id=run_id, product_id=product,
-            terminal_reason=attempt["terminal_policy"],
+                refs.append(f"journal:{row['journal_seq']}")
+        products_by_id[product] = dict(
             position_contracts=_required(position, "position_contracts") if position is not None else "0",
             mark_price=_required(position, "last_price") if position is not None else None,
             notional_usd=_required(position, "notional_usd") if position is not None else "0",
-            open_orders=[row for row in orders if row["product_id"] == product],
-            committed_execution_refs=fills, source_evidence_refs=relevant_refs,
-            account_cash=_required(inspection, "cash"),
-            account_equity=_required(trading, "equity"),
-            account_available_equity=_required(trading, "available_equity"),
-            account_gross_realized=_required(inspection, "gross_realized"),
-            account_total_fees=_required(inspection, "total_fees"),
-            configuration_context=_configuration_context(context),
-            historical_context=_historical_context(historical),
-        ))
-    return rows
+            open_orders=tuple(row for row in orders if row["product_id"] == product),
+        )
+        fills_by_product.append(tuple(fills))
+        refs_by_product.append(tuple(refs))
+        if account_values is None:
+            account_values = (
+                _required(inspection, "cash"), _required(trading, "equity"),
+                _required(trading, "available_equity"), _required(inspection, "gross_realized"),
+                _required(inspection, "total_fees"),
+            )
+            configuration_context = _configuration_context(context)
+            historical_context = _historical_context(historical)
+    assert account_values is not None and configuration_context is not None and historical_context is not None
+    final_owner_values = _cast(_FinalOwnerEvidenceValues, dict(
+        account_cash=account_values[0], account_equity=account_values[1],
+        account_available_equity=account_values[2], account_gross_realized=account_values[3],
+        account_total_fees=account_values[4], products_by_id=products_by_id,
+    ))
+    return list(_project_historical_report(
+        run_id=run_id, product_order=context.products, terminal_reason=attempt["terminal_policy"],
+        fill_source_event_ids_by_product=tuple(fills_by_product),
+        journal_evidence_refs_by_product=tuple(refs_by_product),
+        final_owner_evidence=final_owner_values,
+        configuration_context=configuration_context,
+        historical_context=historical_context,
+    ))
 
 
 def _historical_endpoint(run_id: str, attempt: dict[str, _Any], status: dict[str, _Any],

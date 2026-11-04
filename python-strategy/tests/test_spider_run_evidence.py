@@ -4,6 +4,8 @@ import ast
 from copy import deepcopy
 from hashlib import sha256
 from pathlib import Path
+import subprocess
+import sys
 from typing import Any, cast
 
 import pytest
@@ -13,6 +15,7 @@ from src.core.backtest import spider_policy_protocol as sequence_protocol
 from src.core.backtest import spider_run_completion_schema as completion
 from src.core.backtest import spider_run_envelope_schema as envelope
 from src.core.backtest import spider_run_evidence as evidence
+from src.core.backtest import spider_historical_report_projection as projection
 from src.core.backtest.spider_run_reconciliation_schema import reconciliation
 from src.core.backtest.spider_scenario_plans import PLAN_IDS, plan_bundle
 from src.core.backtest.spider_historical_input import historical_planned_coverage
@@ -25,6 +28,55 @@ NAMES = ["PLANNED_COVERAGE_COMPLETE", "PROCESSED_EQUALS_PERSISTED", "JOURNAL_CON
          "ENDPOINT_SNAPSHOT_VERSION_MATCH", "NO_UNRESOLVED_QUEUE", "NO_UNRESOLVED_POLL", "NO_UNSUBMITTED_CALLBACK_ACTION", "TERMINAL_POLICY_MATCH", "REPORT_PROJECTION_MATCH"]
 INITIAL = "artifact:endpoint.json#/initial_owner_evidence"
 FINAL = "artifact:endpoint.json#/final_owner_evidence"
+
+
+def test_historical_projection_import_closure_is_pure_and_mutation_sensitive():
+    path = Path(projection.__file__)
+    source = path.read_text()
+    allowed_imports = {"typing": {"Any", "TypedDict"}}
+
+    def assert_allowed_imports(text):
+        tree = ast.parse(text)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    assert alias.name in allowed_imports
+            elif isinstance(node, ast.ImportFrom):
+                assert node.level == 0 and node.module in allowed_imports
+                assert {alias.name for alias in node.names} <= allowed_imports[node.module]
+
+    assert_allowed_imports(source)
+    mutations = (
+        "\nimport pathlib\n",
+        "\nfrom src.core.backtest import spider_run_native_schema\n",
+        "\nfrom . import spider_run_artifacts\n",
+    )
+    for mutation in mutations:
+        with pytest.raises(AssertionError):
+            assert_allowed_imports(source + mutation)
+
+    closure_check = """
+import sys
+import src.core.backtest.spider_historical_report_projection
+allowed_core = {
+    'src.core', 'src.core.backtest',
+    'src.core.backtest.spider_historical_report_projection',
+}
+banned = {
+    'src.core.backtest.spider_run_artifacts', 'src.core.backtest.spider_run_store',
+    'src.core.backtest.spider_run_admission', 'src.core.backtest.spider_run_evidence',
+    'src.core.backtest.spider_run_native_schema',
+}
+loaded_core = {name for name in sys.modules
+               if name == 'src.core' or name.startswith('src.core.')}
+assert not (loaded_core - allowed_core), sorted(loaded_core - allowed_core)
+assert not (loaded_core & banned), sorted(loaded_core & banned)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", closure_check], cwd=Path(__file__).parents[1],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def fixture(index=0):
@@ -1480,5 +1532,6 @@ def test_no_reconciliation_authority_and_public_import_boundary():
             "copy", "enum", "hashlib", "struct", "typing", "src.core.backtest.spider_run_artifacts", "src.core.backtest.spider_run_completion_schema",
         "src.core.backtest.spider_run_reconciliation_schema", "src.core.backtest.spider_scenario_plans", "src.core.backtest.spider_run_envelope_schema",
         "src.core.backtest.spider_configured_scale_input", "src.core.backtest.spider_policy_protocol",
+        "src.core.backtest.spider_historical_report_projection",
         "src.core.backtest.spider_run_errors"}
     assert not any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in {"open", "eval", "exec", "__import__"} for node in ast.walk(tree))

@@ -15,6 +15,7 @@ from typing import Any, Callable, cast
 import pytest
 
 from src.core.backtest import spider_scenario_run as run, synthetic_scenario_codec as wire
+from src.core.backtest import spider_run_evidence as run_evidence
 from src.core.backtest import spider_historical_execution as historical_execution
 from src.core.backtest import spider_configured_scale_input as scale
 from src.core.backtest import spider_policy as spider_policy
@@ -159,7 +160,7 @@ def test_real_runs_registration_order_exact_artifacts_and_one_admission(tmp_path
     attempt = read(tmp_path, "r1", "attempt.json")[0]
     assert attempt["native_artifact_sha256"] == sha256(Path(wire.loaded_native_artifact_path()).read_bytes()).hexdigest()
     records = [(name.encode(), sha256((run._ROOT / name).read_bytes()).digest()) for name in sorted(run._PROGRAM)]
-    assert len(records) == len(set(run._PROGRAM)) == 22
+    assert len(records) == len(set(run._PROGRAM)) == 23
     assert "python-strategy/src/core/backtest/synthetic_policy_dispatch.py" in run._PROGRAM
     assert "python-strategy/src/core/backtest/spider_execution_input.py" in run._PROGRAM
     assert "python-strategy/src/core/backtest/spider_paid_endpoint.py" in run._PROGRAM
@@ -195,6 +196,39 @@ def test_public_historical_run_uses_existing_store_and_admission(tmp_path, parti
     assert (tmp_path / value.run_id / "historical_input.json").read_bytes() == raw
 
 
+def test_historical_report_bytes_match_head_e872b973(tmp_path):
+    value, raw = historical_input("report-byte-head")
+    result = run.run_spider_scenario(str(tmp_path), value.run_id, run._P3_SELECTOR, raw)
+    assert result == dict(run_id=value.run_id, outcome="ADMITTED", reason=None)
+    report_bytes = (tmp_path / value.run_id / "report.jsonl").read_bytes()
+    # Captured by the real durable caller/store on HEAD e872b973 before extraction.
+    assert len(report_bytes) == 5926
+    assert sha256(report_bytes).hexdigest() == "84d9933d07023f8b07dd46ae6eca10a0d5b513812e9597d1cfbf892a35f2a16a"
+
+
+def test_historical_projection_error_occurs_after_final_captures_like_head(tmp_path, monkeypatch):
+    value, raw = historical_input("report-error-head")
+    captured = []
+    capture = wire.ScenarioCodec.capture_snapshot
+
+    def capture_and_record(owner, request):
+        captured.append(request["snapshot_id"])
+        return capture(owner, request)
+
+    def fail_after_final(*args, **kwargs):
+        raise run_evidence.ReconciliationProjectionError("HEAD_REPORT_PROJECTION_FAILURE")
+
+    monkeypatch.setattr(wire.ScenarioCodec, "capture_snapshot", capture_and_record)
+    monkeypatch.setattr(run_evidence, "_historical_report", fail_after_final)
+    result = run.run_spider_scenario(str(tmp_path), value.run_id, run._P3_SELECTOR, raw)
+    assert result == dict(run_id=value.run_id, outcome="FAILED", reason="ENDPOINT_RECONCILIATION_FAILED")
+    assert captured[-3:] == ["FINAL-TRADING", "FINAL-POSITIONS", "FINAL-OPEN-ORDERS"]
+    assert captured.count("FINAL-TRADING") == captured.count("FINAL-POSITIONS") == captured.count("FINAL-OPEN-ORDERS") == 1
+    directory = tmp_path / value.run_id
+    assert sha256((directory / "journal.jsonl").read_bytes()).hexdigest() == "a09014fd2774fea79155fd0f88381af1bebaefc1c14a6a11b46284ee212e75f0"
+    status = cast(dict[str, Any], decode_canonical((directory / "status.json").read_bytes().rstrip(b"\n")))
+    assert status["state"] == "FAILED" and status["primary_failure"] is None
+    assert sha256((directory / "status.json").read_bytes()).hexdigest() == "2fd1f940df3df47755c6bf031a4516b088a66e0608574b434b5b0fe0c590d335"
 @pytest.mark.parametrize("variant,expected_margin,expected_available,expected_actions", [
     ("A", Decimal("1200"), Decimal("8800"), "global"),
     ("B", Decimal("900"), Decimal("9100"), "individual"),
@@ -1411,7 +1445,7 @@ def test_configured_runner_projects_finalizes_and_admits_exact_forty_barriers(tm
     assert finalizes[0]["reconciliation"]["result"] == "OK"
     assert admissions[0][0]["decision"] == "ACCEPT" and admissions[0][1] == admissions[0][2]
     assert len(owners) == 1
-    assert len(run._PROGRAM) == 22
+    assert len(run._PROGRAM) == 23
     assert "python-strategy/src/core/backtest/synthetic_policy_dispatch.py" in run._PROGRAM
     assert "python-strategy/src/core/backtest/spider_execution_input.py" in run._PROGRAM
     assert "python-strategy/src/core/backtest/spider_paid_endpoint.py" in run._PROGRAM

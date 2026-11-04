@@ -1640,6 +1640,19 @@ def test_historical_store_finalize_and_admission_accept_real_native_bundle(tmp_p
     assert status["state"] == "RUNNING"
 
 
+def test_real_store_recomputes_report_and_rejects_corrupted_supplied_projection(tmp_path):
+    run, _, _, _, artifacts, _, store = _historical_endpoint_case(
+        tmp_path, partial_fill=True, return_store=True,
+    )
+    corrupted = deepcopy(artifacts["report"])
+    corrupted[0]["account_cash"] = "999999"
+    with pytest.raises(SpiderRunStoreError):
+        store.finalize(artifacts["endpoint"], artifacts["reconciliation"], corrupted)
+    assert (store._path / "status.json").exists()
+    status = cast(dict[str, Any], decode_canonical((store._path / "status.json").read_bytes().rstrip(b"\n")))
+    assert status["state"] == "RUNNING"
+
+
 @pytest.mark.parametrize("mutation", [
     "missing_input", "truncated_input", "changed_input", "symlink_input", "hardlink_input",
     "context_mismatch", "hash_mismatch", "incomplete_frontier", "reconciliation_mismatch",
