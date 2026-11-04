@@ -160,7 +160,8 @@ def test_durable_ports_module_import_closure_and_manifest(monkeypatch):
     module_path = scenario._ROOT / "python-strategy/src/core/backtest/spider_historical_durable_ports.py"
     source = module_path.read_text()
     allowed = {
-        "typing": {"Any", "Protocol"},
+        "typing": {"Any"},
+        "src.core.backtest.spider_historical_ports": {"EvidenceSink"},
         "src.core.backtest.spider_run_admission": {"admit_spider_run"},
         "src.core.backtest.spider_run_evidence": {"build_endpoint_artifacts"},
         "src.core.backtest.spider_run_store": {"SpiderRunStore"},
@@ -185,10 +186,11 @@ def test_durable_ports_module_import_closure_and_manifest(monkeypatch):
 import sys
 import src.core.backtest.spider_historical_durable_ports
 required = {
+    'src.core.backtest.spider_historical_ports',
     'src.core.backtest.spider_run_admission',
     'src.core.backtest.spider_run_evidence',
     'src.core.backtest.spider_run_store',
-}
+        }
 assert required <= set(sys.modules), sorted(required - set(sys.modules))
 assert not any(name.endswith(('spider_historical_research_entry', 'spider_research_evidence_sink'))
                for name in sys.modules)

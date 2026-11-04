@@ -9,7 +9,7 @@ from src.core.backtest.synthetic_scenario_replay import (
 )
 from src.core.backtest.spider_historical_input import HistoricalRunInput as _HistoricalRunInput
 from src.core.backtest.spider_run_errors import classify_historical_failure as _classify_failure
-from src.core.backtest.spider_historical_durable_ports import DurableHistoricalOutputAdapter as _DurableOutput
+from src.core.backtest.spider_historical_ports import EvidenceSink
 
 
 def _normalized(value):
@@ -32,9 +32,7 @@ def _owner_requests(account, cutoff, prefix):
             for kind in ("TRADING", "POSITIONS", "OPEN_ORDERS")]
 
 
-def _execute_historical(store, attempt, run: _HistoricalRunInput):
-    journal = []
-    output = _DurableOutput(store, attempt, run, journal)
+def _execute_historical(attempt, run: _HistoricalRunInput, output: EvidenceSink):
     previous_owner = None
     closed = False
     ordinal = 0
@@ -58,8 +56,9 @@ def _execute_historical(store, attempt, run: _HistoricalRunInput):
             return
         ordinal += 1
         boundary = dict(ordinal=ordinal, journal_seq=ordinal, barrier_id=key["stable_id"])
-        last_boundary = boundary
+        last_boundary = dict(ordinal=ordinal, kind=kind, event_key=key["stable_id"])
         try:
+            output.note_boundary(boundary, kind)
             output.checkpoint(boundary, kind)
             payload = _normalized(observed)
             before_version = after_version = None
@@ -96,7 +95,10 @@ def _execute_historical(store, attempt, run: _HistoricalRunInput):
                 closed = decision.closed
                 raise error
             try:
-                store.publish_failure(decision.reason, decision.primary_failure)
+                output.fail(
+                    decision.classification, decision.reason, decision.primary_failure,
+                    last_boundary, last_recorded_ordinal,
+                )
             finally:
                 closed = decision.closed
             raise _PersistenceError() from error
@@ -112,8 +114,9 @@ def _execute_historical(store, attempt, run: _HistoricalRunInput):
     if result["classification"] != "SUCCESS":
         reason, primary = _terminal(result, closed)
         if not closed:
-            output.fail(result["classification"], reason, primary, last_boundary, last_recorded_ordinal)
-        return reason
+            returned = output.fail(result["classification"], reason, primary, last_boundary, last_recorded_ordinal)
+            return reason if returned is None else returned
+        return output.failure_result if output.failure_result is not None else reason
     final_capture = capture(cutoff, "FINAL", include_scheduler=True)
     return output.finish(
         initial, final_capture["owner_evidence"], final_capture["scheduler_observation"],

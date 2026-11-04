@@ -141,7 +141,14 @@ def test_real_callers_match_head_error_matrix():
                     events.append(["publish", reason, primary])
                     if newer:
                         raise store.SpiderRunStoreError("PUBLICATION_FAILED", reason, primary)
-                callback_store = SimpleNamespace(mark_processed=mark, append_journal=append, publish_failure=publish_callback)
+                callback_output = SimpleNamespace(
+                    failure_result=None, checkpoint=mark, persist=append,
+                    retain=lambda _row: None,
+                    note_boundary=lambda _boundary, _kind: None,
+                    fail=lambda _classification, reason, primary, _boundary, _ordinal:
+                        publish_callback(reason, primary),
+                    finish=lambda *_args: None,
+                )
                 def trace(frame, event, arg):
                     if (event == "return" and frame.f_code.co_filename == executor.__file__
                             and frame.f_code.co_name in ("persist", "_execute_historical")):
@@ -154,8 +161,9 @@ def test_real_callers_match_head_error_matrix():
                     sys.settrace(trace)
                     try:
                         result = executor._execute_historical(
-                            callback_store, {"configuration_context": {}, "historical_context": {}},
+                            {"configuration_context": {}, "historical_context": {}},
                             cast(Any, SimpleNamespace(run_id="probe", range_start_ms=0, range_end_ms=1)),
+                            cast(Any, callback_output),
                         )
                         outcome = ["return", result]
                     except BaseException as caught:
@@ -210,8 +218,8 @@ def test_real_store_failure_outcomes_and_artifact_bytes_match_head(tmp_path, mon
         outer_errors = {"outer_projection": scenario._ProjectionError(), "outer_native": scenario._wire._native.ScenarioReplayInputError("probe"),
                         "outer_memory": MemoryError("outer"), "outer_keyboard": KeyboardInterrupt("outer"),
                         "outer_base": BaseException("outer"), "outer_nested": nested, "outer_newer": scenario._ProjectionError()}
-        def execute(owner, *args):
-            observed.append(owner)
+        def execute(_attempt, *args):
+            observed.append(args[-1]._store)
             raise outer_errors.get(case, AssertionError("invalid case"))
         def unlink(path, *args, **kwargs):
             target = ".endpoint.json.tmp" if case == "endpoint_unlink" else ".completion.json.tmp"
@@ -293,4 +301,8 @@ def test_durable_publication_guard_and_callback_catch_match_head_structure():
     # AST fingerprints captured from HEAD 651b3cd0 before the port extraction.
     assert digest(failed) == "d87093802d02b6f30e002a661742edc8f6b1dbf2ed67fd970044d3336a19d690"
     assert handlers_digest == "50f0d1651b24acf70aa680ddb1d7079ed1ff353ddcbc2cc5ee3e82028ee7ede8"
-    assert digest(callback_handler) == "51ad35a41e587919a3b45c6438e4244c5efcb89dacb8692b499ac6015897ff65"
+    assert isinstance(callback_handler.type, ast.Name) and callback_handler.type.id == "Exception"
+    assert ast.unparse(callback_handler.body[-1]) == "raise _PersistenceError() from error"
+    assert any(isinstance(node, ast.Call) and ast.unparse(node.func) == "output.fail"
+               for node in ast.walk(callback_handler))
+    assert ast.unparse(persist.body[-2]) == "output.retain(row)"

@@ -1,38 +1,29 @@
 """Durable implementation of historical checkpoint and evidence ports."""
 
-from typing import Any, Protocol
+from typing import Any
 
+from src.core.backtest.spider_historical_ports import EvidenceSink
 from src.core.backtest.spider_run_admission import admit_spider_run
 from src.core.backtest.spider_run_evidence import build_endpoint_artifacts
 from src.core.backtest.spider_run_store import SpiderRunStore
 
 
-class ExecutionCheckpointPort(Protocol):
-    def checkpoint(self, boundary: dict[str, Any], kind: str) -> None: ...
-
-
-class EvidenceSink(Protocol):
-    def persist(self, row: dict[str, Any]) -> None: ...
-    def retain(self, row: dict[str, Any]) -> None: ...
-    def fail(self, classification: str, reason: str, primary: dict[str, Any] | None,
-             last_processed_boundary: dict[str, Any] | None,
-             last_fully_recorded_row_ordinal: int | None) -> None: ...
-    def finish(self, initial_owner_evidence: dict[str, Any], final_owner_evidence: dict[str, Any],
-               final_scheduler_observation: dict[str, Any], terminal: str,
-               normalized_context: dict[str, Any]) -> str | None: ...
-
-
-class DurableHistoricalOutputAdapter:
+class DurableHistoricalOutputAdapter(EvidenceSink):
     """Preserve the existing store calls at the shared loop's durable ports."""
 
-    def __init__(self, store: SpiderRunStore, attempt: dict[str, Any], run: Any, journal: list[dict[str, Any]]):
+    failure_result = None
+
+    def __init__(self, store: SpiderRunStore, attempt: dict[str, Any], run: Any):
         self._store = store
         self._attempt = attempt
         self._run = run
-        self._journal = journal
+        self._journal: list[dict[str, Any]] = []
 
     def checkpoint(self, boundary: dict[str, Any], kind: str) -> None:
         self._store.mark_processed(boundary, record_kind=kind)
+
+    def note_boundary(self, boundary: dict[str, Any], kind: str) -> None:
+        return None
 
     def persist(self, row: dict[str, Any]) -> None:
         self._store.append_journal(row)

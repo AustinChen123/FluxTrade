@@ -46,6 +46,7 @@ from src.core.backtest.spider_run_artifacts import decode_canonical as _decode  
 from src.core.backtest.spider_historical_execution import (
     _execute_historical, _normalized, _owner_requests, _terminal,
 )
+from src.core.backtest.spider_historical_durable_ports import DurableHistoricalOutputAdapter as _DurableHistoricalOutput
 from src.core.backtest.spider_run_artifacts import (
     configuration_context as _configuration_context,
     historical_context as _historical_context,
@@ -66,7 +67,10 @@ _P2_CONFIG_SHA256 = "807054044bdd182274509535ecf8bbc4598f00b6a92b598c6228129a6ff
 _P2_RUN_CONTRACT = "SPIDER_SYNTHETIC_P2_CONFIGURED_RUN_V1"
 _P3_RUN_CONTRACT = "SPIDER_HISTORICAL_RESEARCH_RUN_V1"
 _P3_PROGRAM = (*_PROGRAM, "python-strategy/src/core/backtest/spider_historical_input.py",
-               "python-strategy/src/core/backtest/spider_historical_replay.py")
+               "python-strategy/src/core/backtest/spider_historical_replay.py",
+               "python-strategy/src/core/backtest/spider_historical_ports.py",
+               "python-strategy/src/core/backtest/spider_historical_research_output.py",
+               "python-strategy/src/core/backtest/spider_historical_research_entry.py")
 _PAID_SELECTOR = "SPIDER_PAID_RESEARCH_RUN_V1"
 _PAID_RUN_CONTRACT = _PAID_SELECTOR
 _PAID_PROGRAM = (*_P3_PROGRAM,
@@ -968,7 +972,10 @@ def _invoke(
             assert historical_attempt is not None
             if store.register(historical_attempt, historical_input=historical_input) != "NATIVE_CONSTRUCTION_ALLOWED":
                 raise RuntimeError("INVALID_STORE_ACKNOWLEDGEMENT")
-            reason = _execute_historical(store, historical_attempt, historical_run)
+            reason = _execute_historical(
+                historical_attempt, historical_run,
+                _DurableHistoricalOutput(store, historical_attempt, historical_run),
+            )
             return response("ADMITTED" if reason is None else "FAILED", reason)
         try:
             bundle, hashes = _configuration(selector, run_id, select)

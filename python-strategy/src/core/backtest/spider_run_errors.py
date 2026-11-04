@@ -34,6 +34,7 @@ ReconciliationProjectionError.__module__ = "src.core.backtest.spider_run_evidenc
 class HistoricalFailure:
     """Pure callback or outer-invocation classification; no publication authority."""
 
+    classification: str
     reason: str
     primary_failure: dict | None
     closed: bool
@@ -43,7 +44,7 @@ class HistoricalFailure:
 
 def classify_historical_failure(
     error: Exception,
-    phase: Literal["CALLBACK_PERSIST", "OUTER_INVOCATION"],
+    phase: Literal["CALLBACK_PERSIST", "OUTER_INVOCATION", "INPUT_REJECTION"],
     native_failure: dict | None,
     closed: bool,
 ) -> HistoricalFailure:
@@ -54,12 +55,19 @@ def classify_historical_failure(
             else dict(kind="PERSISTENCE", reason="EVIDENCE_CAPTURE_FAILED")
         )
         if isinstance(error, SpiderRunStoreError) and error.reason == "PUBLICATION_DURABILITY_UNKNOWN":
-            return HistoricalFailure(error.reason, primary, True, True, True)
-        return HistoricalFailure("PERSISTENCE_FAILED", primary, True, True, False)
+            return HistoricalFailure("PERSISTENCE_FAILED", error.reason, primary, True, True, True)
+        return HistoricalFailure("PERSISTENCE_FAILED", "PERSISTENCE_FAILED", primary, True, True, False)
     if phase == "OUTER_INVOCATION":
         if native_failure is not None:
-            return HistoricalFailure("NATIVE_FAULT", dict(kind="NATIVE", reason=native_failure["reason"]), closed, True, False)
+            return HistoricalFailure("NATIVE_FAULT", "NATIVE_FAULT", dict(kind="NATIVE", reason=native_failure["reason"]), closed, True, False)
+        if isinstance(error, SpiderRunStoreError):
+            classification = "DURABILITY_UNKNOWN" if error.reason == "PUBLICATION_DURABILITY_UNKNOWN" else "PERSISTENCE_FAILED"
+            return HistoricalFailure(classification, error.reason, error.primary_failure, closed, True, False)
         if isinstance(error, ReconciliationProjectionError):
-            return HistoricalFailure("ENDPOINT_RECONCILIATION_FAILED", None, closed, True, False)
-        return HistoricalFailure("UNEXPECTED_EXCEPTION", None, closed, False, False)
+            return HistoricalFailure("ENDPOINT_RECONCILIATION_FAILED", "ENDPOINT_RECONCILIATION_FAILED", None, closed, True, False)
+        return HistoricalFailure("UNEXPECTED_EXCEPTION", "UNEXPECTED_EXCEPTION", None, closed, False, False)
+    if phase == "INPUT_REJECTION":
+        if isinstance(error, (OSError, ValueError, TypeError, KeyError)):
+            return HistoricalFailure("UNSUPPORTED_CONFIGURATION", "UNSUPPORTED_CONFIGURATION", None, False, True, False)
+        return HistoricalFailure("UNEXPECTED_EXCEPTION", "UNEXPECTED_EXCEPTION", None, closed, False, False)
     raise ValueError("INVALID_HISTORICAL_FAILURE_PHASE")

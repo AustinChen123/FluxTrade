@@ -1034,7 +1034,7 @@ def test_moved_historical_executor_resolves_owner_from_execution_module(monkeypa
 
     monkeypatch.setattr(historical_execution, "_ReplayComposition", OwnerProbe)
     with pytest.raises(RuntimeError) as caught:
-        historical_execution._execute_historical(object(), {}, value)
+        historical_execution._execute_historical({}, value, cast(Any, object()))
 
     assert caught.value is expected
     assert calls == [value]
