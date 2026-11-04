@@ -9,6 +9,7 @@ from typing import Any, cast
 import pytest
 
 from src.core.backtest import spider_configured_scale_input as scale
+from src.core.backtest import spider_historical_input as historical_input_module
 from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_canonical, historical_context
 from src.core.backtest.spider_historical_input import (
     BAR_DURATION_MS,
@@ -450,6 +451,26 @@ def test_validated_input_token_has_no_public_constructor_and_is_immutable():
         setattr(token, "semantic_hash", "0" * 64)
     with pytest.raises(FrozenInstanceError):
         setattr(token.run, "run_id", "mutated")
+
+
+def test_validated_input_token_uses_slots_and_public_decoder_keeps_validation_count(monkeypatch):
+    run = _valid_run()
+    raw = encode_historical_run_input(run)
+    assert "__slots__" in ValidatedHistoricalInput.__dict__
+    token = _validate_historical_input_once(run)
+    assert not hasattr(token, "__dict__")
+
+    calls = 0
+    original = historical_input_module.validate_historical_input
+
+    def counted(value):
+        nonlocal calls
+        calls += 1
+        return original(value)
+
+    monkeypatch.setattr(historical_input_module, "validate_historical_input", counted)
+    assert decode_historical_run_input(raw) == run
+    assert calls == 2  # public decoder keeps its HEAD validator plus canonical-encoder validation
 
 
 def _mutable_subclass(node):

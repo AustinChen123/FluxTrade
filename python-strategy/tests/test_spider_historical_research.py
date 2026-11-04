@@ -14,6 +14,8 @@ import tempfile
 from typing import Any, cast
 import pytest
 from src.core.backtest import spider_historical_execution as execution
+from src.core.backtest import spider_historical_input as historical_input_module
+from src.core.backtest import spider_historical_replay as historical_replay
 from src.core.backtest import spider_historical_research_entry as entry
 from src.core.backtest import spider_historical_research_output as research_output
 from src.core.backtest import spider_run_admission as admission
@@ -122,6 +124,9 @@ _ALLOWED_EXTERNAL_IMPORTS = {
         "HistoricalInputError",
         "HistoricalRunInput",
         "POLL_OPEN_ORDERS_FAILURE_PROFILE",
+        "_decode_historical_run_input_validated",
+        "_historical_context_for_validated_input",
+        "_UnapprovedHistoricalInputTree",
         "_canonical",
         "_validate_configured_spec_timeline",
         "decode_historical_run_input",
@@ -211,6 +216,9 @@ _ENTRY_IMPORTS = {
     "src.core.backtest.synthetic_scenario_codec",
     "src.core.backtest.spider_historical_execution._execute_historical",
     "src.core.backtest.spider_historical_input.HistoricalInputError",
+    "src.core.backtest.spider_historical_input._decode_historical_run_input_validated",
+    "src.core.backtest.spider_historical_input._historical_context_for_validated_input",
+    "src.core.backtest.spider_historical_input._UnapprovedHistoricalInputTree",
     "src.core.backtest.spider_historical_input.decode_historical_run_input",
     "src.core.backtest.spider_historical_input.decode_p2_configuration",
     "src.core.backtest.spider_historical_input.historical_context_for_input",
@@ -336,10 +344,10 @@ _HEAD_INPUT_EXCEPTION_CASES = (
     ("SpiderRunStoreError", store.SpiderRunStoreError, ("MATRIX_ERROR",), False),
 )
 _HEAD_INPUT_PHASES = (
-    ("_decode_historical_input", "decode_historical_run_input"),
-    ("_validate_historical_input", "validate_historical_input"),
+    ("_decode_historical_input_validated", "_decode_historical_run_input_validated"),
+    ("__module_validate_historical_input", "__module_validate_historical_input"),
     ("_decode_p2_configuration", "decode_p2_configuration"),
-    ("_historical_context_for_input", "historical_context_for_input"),
+    ("_historical_context_for_validated_input", "_historical_context_for_validated_input"),
 )
 
 
@@ -810,6 +818,34 @@ def test_research_entry_executes_real_fixture_and_matches_durable_order(tmp_path
     original_dretain = scenario._DurableHistoricalOutput.retain
     original_rretain = research_output.ResearchEvidenceSink.retain
     durable_finish_inputs, research_finish_inputs = ([], [])
+    validation_calls = [0]
+    validated_preparations = {"durable": 0, "research": 0}
+    original_validate = historical_input_module.validate_historical_input
+    original_configuration = scenario._historical_configuration
+    original_prepare = historical_replay._prepare_historical_replay_validated
+
+    def counted_validate(run):
+        validation_calls[0] += 1
+        return original_validate(run)
+
+    def counted_configuration(*args, **kwargs):
+        before = validation_calls[0]
+        result = original_configuration(*args, **kwargs)
+        assert validation_calls[0] - before == 1
+        return result
+
+    def counted_prepare(token):
+        validated_preparations[mode[0]] += 1
+        before = validation_calls[0]
+        result = original_prepare(token)
+        assert validation_calls[0] == before
+        return result
+
+    monkeypatch.setattr(historical_input_module, "validate_historical_input", counted_validate)
+    monkeypatch.setattr(scenario, "_validate_historical_input", counted_validate)
+    monkeypatch.setattr(historical_replay, "validate_historical_input", counted_validate)
+    monkeypatch.setattr(historical_replay, "_prepare_historical_replay_validated", counted_prepare)
+    monkeypatch.setattr(scenario, "_historical_configuration", counted_configuration)
     original_dfinish = scenario._DurableHistoricalOutput.finish
     original_rfinish = research_output.ResearchEvidenceSink.finish
 
@@ -844,12 +880,15 @@ def test_research_entry_executes_real_fixture_and_matches_durable_order(tmp_path
         "outcome": "ADMITTED",
         "reason": None,
     }
+    assert validated_preparations["durable"] == 1
     durable_endpoint = read(tmp_path, value.run_id, "endpoint.json")[0]
     durable_report = read(tmp_path, value.run_id, "report.jsonl")
     durable_journal = read(tmp_path, value.run_id, "journal.jsonl")
     mode[0] = "research"
+    research_before = validation_calls[0]
     result = entry.run_historical_research(raw)
     assert isinstance(result, research_output.ResearchRunResult)
+    assert validation_calls[0] - research_before == 1
     assert (result.research_classification, result.admission_state) == (
         "RESEARCH_ONLY",
         "NOT_ADMITTED",
@@ -871,6 +910,32 @@ def test_research_entry_executes_real_fixture_and_matches_durable_order(tmp_path
             for fill in product["fills"]
         )
     )
+
+
+def test_research_entry_falls_back_to_raw_validation_for_unapproved_token_tree(monkeypatch):
+    _value, raw = _small_input("research-token-fallback")
+    install_frozen_h03_order(monkeypatch)
+    calls = [0]
+    original = historical_input_module.validate_historical_input
+
+    def counted(run):
+        calls[0] += 1
+        return original(run)
+
+    def non_exact_tree(_raw):
+        raise historical_input_module._UnapprovedHistoricalInputTree(
+            "historical input tree is not an approved immutable DTO graph"
+        )
+
+    monkeypatch.setattr(entry, "_decode_historical_run_input_validated", non_exact_tree)
+    monkeypatch.setattr(historical_input_module, "validate_historical_input", counted)
+    monkeypatch.setattr(entry, "validate_historical_input", counted)
+    monkeypatch.setattr(historical_replay, "validate_historical_input", counted)
+
+    result = entry.run_historical_research(raw)
+
+    assert isinstance(result, research_output.ResearchRunResult)
+    assert calls[0] == 5
 
 
 def test_failure_dto_schema_has_no_economic_fields():
@@ -919,8 +984,8 @@ def test_head_input_rejections_match_durable_outcomes(tmp_path, monkeypatch, cas
         monkeypatch.setattr(entry, "_POLICY_SOURCE", "0" * 64)
     else:
         fault = cast(type[Exception], case)("input rejection")
-        monkeypatch.setattr(scenario, "_decode_historical_input", _raise(fault))
-        monkeypatch.setattr(entry, "decode_historical_run_input", _raise(fault))
+        monkeypatch.setattr(scenario, "_decode_historical_input_validated", _raise(fault))
+        monkeypatch.setattr(entry, "_decode_historical_run_input_validated", _raise(fault))
     durable = scenario.run_spider_scenario(str(tmp_path), value.run_id, scenario._P3_SELECTOR, raw)
     result = entry.run_historical_research(raw)
     assert isinstance(result, research_output.ResearchFailureResult)
@@ -973,7 +1038,10 @@ def test_input_exception_phase_matrix_matches_a0996166(
     durable_fault = _input_fault(error_type, args)
     research_fault = _input_fault(error_type, args)
     with pytest.MonkeyPatch.context() as scope:
-        scope.setattr(scenario, durable_hook, _raise(durable_fault))
+        if durable_hook == "__module_validate_historical_input":
+            scope.setattr(historical_input_module, "validate_historical_input", _raise(durable_fault))
+        else:
+            scope.setattr(scenario, durable_hook, _raise(durable_fault))
         durable = _observe_input_call(
             lambda: scenario.run_spider_scenario(
                 str(tmp_path),
@@ -984,7 +1052,10 @@ def test_input_exception_phase_matrix_matches_a0996166(
             durable_fault,
         )
     with pytest.MonkeyPatch.context() as scope:
-        scope.setattr(entry, research_hook, _raise(research_fault))
+        if research_hook == "__module_validate_historical_input":
+            scope.setattr(historical_input_module, "validate_historical_input", _raise(research_fault))
+        else:
+            scope.setattr(entry, research_hook, _raise(research_fault))
         research = _observe_input_call(
             lambda: entry.run_historical_research(raw),
             research_fault,
@@ -1477,13 +1548,13 @@ def test_research_import_closure_and_forbidden_import_mutation():
     _assert_runtime_static_allowlist(graph)
     assert _imports(graph["spider_historical_research_entry"]) <= _ENTRY_IMPORTS
     assert _imports(graph["spider_historical_research_output"]) <= _OUTPUT_IMPORTS
-    needle = "        run = decode_historical_run_input(raw)"
+    needle = "            token = _decode_historical_run_input_validated(raw)"
     for imported in (
         "from src.core.backtest.spider_run_store import SpiderRunStore",
         "from .spider_run_store import SpiderRunStore",
         "from . import spider_run_store as store_module",
     ):
-        mutated = graph[_ENTRY].replace(needle, f"        {imported}\n{needle}", 1)
+        mutated = graph[_ENTRY].replace(needle, f"            {imported}\n{needle}", 1)
         with pytest.raises(AssertionError, match="forbidden research import"):
             _local_modules({_ENTRY: mutated})
     allowed = sorted(_ALLOWED_CORE | {"src.core", "src.core.backtest"})

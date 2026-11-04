@@ -26,7 +26,7 @@ from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_canon
 from src.core.backtest.spider_run_admission import admit_spider_run
 from src.core.backtest.spider_run_store import SpiderRunStore
 from src.core.backtest.spider_scenario_plans import PLAN_IDS, plan_bundle
-from src.core.backtest.spider_historical_input import HistoricalRunInput
+from src.core.backtest.spider_historical_input import HistoricalRunInput, ValidatedHistoricalInput
 from src.core.backtest.spider_historical_input import (
     _canonical as _historical_canonical,
     encode_historical_run_input,
@@ -99,7 +99,8 @@ def frozen_h03_factory(original: Callable[..., run._ReplayComposition]):
         run: object, *, paid_endpoint=None, gross_response: bool = False,
     ) -> run._ReplayComposition:
         composition = original(run, paid_endpoint=paid_endpoint, gross_response=gross_response)
-        queue_frozen_h03_order(composition, cast(HistoricalRunInput, run))
+        historical_run = run.run if type(run) is ValidatedHistoricalInput else run
+        queue_frozen_h03_order(composition, cast(HistoricalRunInput, historical_run))
         return composition
 
     return with_frozen_order
@@ -195,6 +196,23 @@ def test_public_historical_run_uses_existing_store_and_admission(tmp_path, parti
     assert bool(fills) is partial_fill
     assert artifacts["report.jsonl"]
     assert (tmp_path / value.run_id / "historical_input.json").read_bytes() == raw
+
+
+def test_durable_entry_falls_back_to_raw_validation_when_token_is_unavailable(tmp_path, monkeypatch):
+    value, raw = historical_input("durable-token-fallback")
+
+    def reject_private_tree(_raw):
+        from src.core.backtest.spider_historical_input import _UnapprovedHistoricalInputTree
+
+        raise _UnapprovedHistoricalInputTree(
+            "historical input tree is not an approved immutable DTO graph"
+        )
+
+    monkeypatch.setattr(run, "_decode_historical_input_validated", reject_private_tree)
+    result = run.run_spider_scenario(str(tmp_path), value.run_id, run._P3_SELECTOR, raw)
+
+    assert result == dict(run_id=value.run_id, outcome="ADMITTED", reason=None)
+    assert read(tmp_path, value.run_id, "journal.jsonl")
 
 
 def test_historical_report_bytes_match_head_e872b973(tmp_path):

@@ -5,7 +5,7 @@ from decimal import Decimal as _Decimal
 from hashlib import sha256 as _sha256
 import logging as _logging
 from pathlib import Path as _Path
-from typing import Any as _Any, cast as _cast
+from typing import Any as _Any, Literal as _Literal, cast as _cast, overload as _overload
 
 from src.core.backtest import spider_policy_protocol as _protocol, spider_scenario_plans as _plans, synthetic_scenario_codec as _wire
 from src.core.backtest.spider_run_artifacts import _HASHES, _HASH_NAMES, _IDENTITIES, _configuration_context as _context_payload, _object, _require, _text, canonical_bytes as _bytes, canonical_decimal_text as _decimal_text, encode_jsonl as _jsonl, validate_artifact as _validate
@@ -35,7 +35,12 @@ from src.core.backtest.spider_gross_observation import project_gross_observation
 from src.core.backtest.spider_historical_input import (
     SCHEMA_ID as _P3_SELECTOR,
     HistoricalInputError as _HistoricalInputError,
+    ValidatedHistoricalInput as _ValidatedHistoricalInput,
     decode_historical_run_input as _decode_historical_input,
+    _decode_historical_run_input_validated as _decode_historical_input_validated,
+    _UnapprovedHistoricalInputTree as _UnapprovedHistoricalInputTree,
+    _historical_context_for_validated_input as _historical_context_for_validated_input,
+    _historical_planned_coverage_for_input as _historical_coverage_for_input,
     decode_p2_configuration as _decode_p2_configuration,
     historical_context_for_input as _historical_context_for_input,
     historical_planned_coverage as _historical_planned_coverage,
@@ -173,13 +178,28 @@ def _configuration(selector, run_id, select):
     return bundle, [bundle["plan_sha256"], program.hexdigest(), native, policy]
 
 
-def _historical_configuration(raw: bytes, run_id: str):
+@_overload
+def _historical_configuration(raw: bytes, run_id: str) -> tuple[_Any, _Any, list[str]]: ...
+
+
+@_overload
+def _historical_configuration(
+    raw: bytes, run_id: str, *, _tokenized: _Literal[True],
+) -> tuple[_Any, _Any, list[str], _ValidatedHistoricalInput | None]: ...
+
+
+def _historical_configuration(raw: bytes, run_id: str, *, _tokenized: bool = False):
     if type(raw) is not bytes:
         raise _HistoricalInputError("historical input bytes are required")
-    run = _decode_historical_input(raw)
+    try:
+        token = _decode_historical_input_validated(raw) if _tokenized else None
+    except _UnapprovedHistoricalInputTree:
+        # Non-exact DTO trees keep the pre-token validation path.
+        token = None
+    run = token.run if token is not None else _decode_historical_input(raw)
     if run.run_id != run_id:
         raise _HistoricalInputError("historical run id does not match invocation")
-    semantic_hash = _validate_historical_input(run)
+    semantic_hash = token.semantic_hash if token is not None else _validate_historical_input(run)
     policy = _P3_POLICY_SOURCE
     if policy != _P3_POLICY_SOURCE or policy != run.policy_source_sha256:
         raise _HistoricalInputError("current policy source does not match historical input")
@@ -193,7 +213,10 @@ def _historical_configuration(raw: bytes, run_id: str):
         products=list(run.ordered_products),
     ))._asdict()
     context["products"] = list(context["products"])
-    history = _historical_context(_historical_context_for_input(run))._asdict()
+    history_input = (_historical_context_for_validated_input(token) if token is not None
+                     else _historical_context_for_input(run))
+    coverage = _historical_coverage_for_input(token) if token is not None else _historical_planned_coverage(run)
+    history = _historical_context(history_input)._asdict()
     plan = dict(
         schema_version="spider_historical_research_run_v1",
         scenario_plan_id=_P3_SELECTOR,
@@ -201,7 +224,7 @@ def _historical_configuration(raw: bytes, run_id: str):
         account_key=dict(venue="SPIDER_HISTORICAL_RESEARCH", environment="RESEARCH_ONLY",
                          account=run.account_key),
         terminal_policy="MTM_PRESERVE_OPEN_V1",
-        planned_coverage=_historical_planned_coverage(run),
+        planned_coverage=coverage,
     )
     bundle = dict(plan=plan, configuration_context=context, historical_context=history)
     program = _sha256()
@@ -209,7 +232,8 @@ def _historical_configuration(raw: bytes, run_id: str):
         encoded = name.encode()
         program.update(len(encoded).to_bytes(8, "big") + encoded + _sha256((_ROOT / name).read_bytes()).digest())
     native = _sha256(_Path(_wire.loaded_native_artifact_path()).read_bytes()).hexdigest()
-    return run, bundle, [semantic_hash, program.hexdigest(), native, policy]
+    result = (run, bundle, [semantic_hash, program.hexdigest(), native, policy])
+    return (*result, token) if _tokenized else result
 
 
 def _paid_configuration(raw: bytes, run_id: str):
@@ -903,6 +927,7 @@ def _invoke(
                         error.reason)
     historical_run = None
     historical_attempt = None
+    historical_token = None
     paid_request = None
     paid_attempt = None
     floating_request = None
@@ -938,7 +963,9 @@ def _invoke(
         if selector != _P3_SELECTOR or type(historical_input) is not bytes:
             return response("REJECTED", "UNSUPPORTED_CONFIGURATION")
         try:
-            historical_run, bundle, hashes = _historical_configuration(historical_input, run_id)
+            historical_run, bundle, hashes, historical_token = _historical_configuration(
+                historical_input, run_id, _tokenized=True,
+            )
             historical_attempt = _attempt(run_id, selector, bundle, hashes, _P3_RUN_CONTRACT)
         except (OSError, ValueError, TypeError, KeyError):
             return response("REJECTED", "UNSUPPORTED_CONFIGURATION")
@@ -973,7 +1000,7 @@ def _invoke(
             if store.register(historical_attempt, historical_input=historical_input) != "NATIVE_CONSTRUCTION_ALLOWED":
                 raise RuntimeError("INVALID_STORE_ACKNOWLEDGEMENT")
             reason = _execute_historical(
-                historical_attempt, historical_run,
+                historical_attempt, historical_token or historical_run,
                 _DurableHistoricalOutput(store, historical_attempt, historical_run),
             )
             return response("ADMITTED" if reason is None else "FAILED", reason)

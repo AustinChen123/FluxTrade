@@ -13,6 +13,7 @@ from src.core.backtest import spider_policy_protocol as policy_protocol
 from src.core.backtest.spider_historical_input import (
     HistoricalBar,
     POLL_OPEN_ORDERS_FAILURE_PROFILE,
+    ValidatedHistoricalInput,
     historical_market_step_clock,
     historical_market_step_in_range,
 )
@@ -504,12 +505,17 @@ class _ReplayComposition:
         from src.core.backtest.spider_historical_replay import (
             _historical_market_item,
             _prepare_historical_replay,
+            _prepare_historical_replay_validated,
             _restore_initial_policy,
         )
         from src.core.backtest.spider_historical_input import HistoricalRunInput
 
-        historical_run = cast(HistoricalRunInput, run)
-        prepared = _prepare_historical_replay(historical_run)
+        if type(run) is ValidatedHistoricalInput:
+            historical_run = run.run
+            prepared = _prepare_historical_replay_validated(run)
+        else:
+            historical_run = cast(HistoricalRunInput, run)
+            prepared = _prepare_historical_replay(historical_run)
         configuration = deepcopy(prepared.configuration)
         configuration["seed_effective_at"] = cast(int, configuration["seed_effective_at"]) * 16
         for product in cast(list[dict[str, Any]], configuration["products"]):
@@ -585,6 +591,18 @@ class _ReplayComposition:
             if result["classification"] != "PENDING":
                 raise ValueError("INVALID_SCHEMA")
         return composition
+
+    @classmethod
+    def _from_validated_historical_input(
+        cls, token: ValidatedHistoricalInput, *, paid_endpoint: PaidEndpoint | None = None,
+        gross_response: bool = False,
+    ) -> "_ReplayComposition":
+        """Private same-run construction seam; raw callers retain their guard."""
+        if type(token) is not ValidatedHistoricalInput:
+            raise TypeError("validated historical input token required")
+        return cls._from_historical_run(
+            token, paid_endpoint=paid_endpoint, gross_response=gross_response,
+        )
 
     def _historical_node_item(
         self, bar_open_ms: int, step_index: int, sequence: int,

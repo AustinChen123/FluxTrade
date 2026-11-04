@@ -65,6 +65,14 @@ def historical_market_step_in_range(bar_open_ms: int, step_index: int, range_end
 def historical_planned_coverage(run: HistoricalRunInput) -> list[dict[str, object]]:
     """Return input-only P3 market/cache/timer coverage in scheduler-key order."""
     validate_historical_input(run)
+    return _historical_planned_coverage_for_run(run)
+
+
+def _historical_planned_coverage_for_input(token: ValidatedHistoricalInput) -> list[dict[str, object]]:
+    return _historical_planned_coverage_for_run(token.run)
+
+
+def _historical_planned_coverage_for_run(run: HistoricalRunInput) -> list[dict[str, object]]:
     scheduled: list[tuple[int, int, int, str, str]] = []
     step_sequence = 0
     cache_sequence = 0
@@ -316,6 +324,10 @@ class ValidatedHistoricalInput:
             raise TypeError("ValidatedHistoricalInput must come from its validator")
         object.__setattr__(self, "run", run)
         object.__setattr__(self, "semantic_hash", semantic_hash)
+
+
+class _UnapprovedHistoricalInputTree(TypeError):
+    """Private signal that validation succeeded but this graph cannot be tokenized."""
 
 
 def _valid_hash(value: str) -> bool:
@@ -786,7 +798,9 @@ def _validate_historical_input_once(run: HistoricalRunInput) -> ValidatedHistori
     """
     semantic_hash = validate_historical_input(run)
     if not _is_structurally_immutable_historical_input_tree(run):
-        raise TypeError("historical input tree is not an approved immutable DTO graph")
+        raise _UnapprovedHistoricalInputTree(
+            "historical input tree is not an approved immutable DTO graph"
+        )
     return ValidatedHistoricalInput(
         _VALIDATED_INPUT_CONSTRUCTION_SEAL,
         run,
@@ -856,6 +870,16 @@ def _semantic_input_projection(run: HistoricalRunInput, *, model_id: str | None 
 def historical_context_for_input(run: HistoricalRunInput) -> dict[str, object]:
     """Build detached, category-specific identity hashes for validated historical evidence."""
     input_hash = validate_historical_input(run)
+    return _historical_context_for_validated_run(run, input_hash)
+
+
+def _historical_context_for_validated_input(token: ValidatedHistoricalInput) -> dict[str, object]:
+    return _historical_context_for_validated_run(token.run, token.semantic_hash)
+
+
+def _historical_context_for_validated_run(
+    run: HistoricalRunInput, input_hash: str,
+) -> dict[str, object]:
     source_hash = _digest({
         "trade_manifest": asdict(run.trade_manifest),
         "mark_manifest": asdict(run.mark_manifest),
@@ -1047,6 +1071,10 @@ def encode_historical_run_input(run: HistoricalRunInput) -> bytes:
     if type(run) is not HistoricalRunInput:
         raise HistoricalInputError("invalid run DTO")
     validate_historical_input(run)
+    return _encode_historical_run_input_validated_run(run)
+
+
+def _encode_historical_run_input_validated_run(run: HistoricalRunInput) -> bytes:
     value: dict[str, object] = {key: getattr(run, key) for key in _RUN_INPUT_KEYS}
     value["parameters"] = _parameter_projection(run.parameters)
     for field in ("configuration_bytes", "initial_policy_cache", "initial_account_state"):
@@ -1062,8 +1090,7 @@ def encode_historical_run_input(run: HistoricalRunInput) -> bytes:
     return _canonical(value)
 
 
-def decode_historical_run_input(raw: bytes) -> HistoricalRunInput:
-    """Decode canonical historical input bytes and revalidate before returning."""
+def _decode_historical_run_input(raw: bytes, *, validated: bool) -> HistoricalRunInput | ValidatedHistoricalInput:
     value = _decode_canonical(raw)
     row = _codec_object(value, _RUN_INPUT_KEYS, "historical run")
     raw_parameters = row["parameters"]
@@ -1110,10 +1137,23 @@ def decode_historical_run_input(raw: bytes) -> HistoricalRunInput:
         "initial_account_state": _codec_bytes(row["initial_account_state"], "initial account state"),
     })
     run = HistoricalRunInput(**cast(Any, decoded))
-    validate_historical_input(run)
-    if encode_historical_run_input(run) != raw:
+    token = _validate_historical_input_once(run) if validated else None
+    if not validated:
+        validate_historical_input(run)
+    if ( _encode_historical_run_input_validated_run(run) if validated
+         else encode_historical_run_input(run)) != raw:
         raise HistoricalInputError("noncanonical historical run encoding")
-    return run
+    return token if token is not None else run
+
+
+def decode_historical_run_input(raw: bytes) -> HistoricalRunInput:
+    """Decode canonical historical input bytes and preserve the raw public contract."""
+    return cast(HistoricalRunInput, _decode_historical_run_input(raw, validated=False))
+
+
+def _decode_historical_run_input_validated(raw: bytes) -> ValidatedHistoricalInput:
+    """Private ingress decoder; validated token remains inside this run."""
+    return cast(ValidatedHistoricalInput, _decode_historical_run_input(raw, validated=True))
 
 
 def _validate_historical_run_link(

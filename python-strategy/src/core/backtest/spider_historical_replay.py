@@ -10,6 +10,7 @@ from src.core.backtest.spider_historical_input import (
     HistoricalBar,
     HistoricalInputError,
     HistoricalRunInput,
+    ValidatedHistoricalInput,
     _validate_configured_spec_timeline,
     _canonical,
     decode_p2_configuration,
@@ -133,6 +134,17 @@ def _closed_market_snapshots(
 def _prepare_historical_replay(run: HistoricalRunInput) -> _PreparedHistoricalReplay:
     """Finish admission and deterministic projections before constructing an owner."""
     contract_hash = validate_historical_input(run)
+    return _prepare_historical_replay_with_identity(run, contract_hash)
+
+
+def _prepare_historical_replay_validated(token: ValidatedHistoricalInput) -> _PreparedHistoricalReplay:
+    """Private same-run seam; token was minted at ingress before side effects."""
+    return _prepare_historical_replay_with_identity(token.run, token.semantic_hash)
+
+
+def _prepare_historical_replay_with_identity(
+    run: HistoricalRunInput, contract_hash: str,
+) -> _PreparedHistoricalReplay:
     configuration = decode_p2_configuration(
         run.configuration_bytes, run.configuration_sha256, run.ordered_products
     )

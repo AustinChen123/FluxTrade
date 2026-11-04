@@ -7,7 +7,10 @@ from src.core.backtest.synthetic_scenario_replay import (
     _ReplayComposition,
     ReplayPersistenceError as _PersistenceError,
 )
-from src.core.backtest.spider_historical_input import HistoricalRunInput as _HistoricalRunInput
+from src.core.backtest.spider_historical_input import (
+    HistoricalRunInput as _HistoricalRunInput,
+    ValidatedHistoricalInput as _ValidatedHistoricalInput,
+)
 from src.core.backtest.spider_run_errors import classify_historical_failure as _classify_failure
 from src.core.backtest.spider_historical_ports import EvidenceSink
 
@@ -32,13 +35,21 @@ def _owner_requests(account, cutoff, prefix):
             for kind in ("TRADING", "POSITIONS", "OPEN_ORDERS")]
 
 
-def _execute_historical(attempt, run: _HistoricalRunInput, output: EvidenceSink):
+def _execute_historical(
+    attempt, token: _ValidatedHistoricalInput | _HistoricalRunInput, output: EvidenceSink,
+):
     previous_owner = None
     closed = False
     ordinal = 0
     last_boundary = None
     last_recorded_ordinal = None
-    composition = _ReplayComposition._from_historical_run(run)
+    if type(token) is _ValidatedHistoricalInput:
+        validated = _cast(_ValidatedHistoricalInput, token)
+        run = validated.run
+        composition = _ReplayComposition._from_validated_historical_input(validated)
+    else:
+        run = _cast(_HistoricalRunInput, token)
+        composition = _ReplayComposition._from_historical_run(run)
     configuration = attempt["configuration_context"]
     historical = attempt["historical_context"]
 
