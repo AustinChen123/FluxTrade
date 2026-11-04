@@ -5,9 +5,10 @@ This module deliberately has no network, provider, or financial-owner imports.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from datetime import datetime
 from decimal import Decimal
+from enum import Enum
 from hashlib import sha256
 import json
 import re
@@ -253,6 +254,68 @@ class HistoricalRunInput:
             raise HistoricalInputError("run collections must be immutable tuples")
         if any(type(pair) is not tuple or len(pair) != 2 for pair in self.parameters):
             raise HistoricalInputError("parameters must be immutable key/value pairs")
+
+
+_VALIDATED_INPUT_CONSTRUCTION_SEAL = object()
+# The current DTO tree has no enum leaves. A future enum field must add its
+# exact, reviewed enum class here; accepting arbitrary Enum subclasses is not safe.
+_VALIDATED_INPUT_ENUM_TYPES: tuple[type[Enum], ...] = ()
+
+
+def _is_structurally_immutable_historical_input_tree(
+    value: object,
+    *,
+    _root: bool = True,
+) -> bool:
+    """Accept only the exact frozen DTO graph and its approved immutable leaves."""
+    value_type = type(value)
+    if _root and value_type is not HistoricalRunInput:
+        return False
+    if value is None:
+        return not _root
+    if (value_type is str or value_type is bytes or value_type is int
+            or value_type is bool or value_type is Decimal):
+        return not _root
+    if any(value_type is enum_type for enum_type in _VALIDATED_INPUT_ENUM_TYPES):
+        return not _root
+    if value_type is tuple:
+        return not _root and all(
+            _is_structurally_immutable_historical_input_tree(item, _root=False)
+            for item in cast(tuple[object, ...], value)
+        )
+    if not (
+        value_type is HistoricalRunInput
+        or value_type is HistoricalBar
+        or value_type is InstrumentSpecEvidence
+        or value_type is SourceManifest
+    ):
+        return False
+    return all(
+        _is_structurally_immutable_historical_input_tree(
+            getattr(value, item.name),
+            _root=False,
+        )
+        for item in fields(cast(Any, value))
+    )
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class ValidatedHistoricalInput:
+    """Private proof that this immutable run passed the canonical validator."""
+
+    run: HistoricalRunInput
+    semantic_hash: str
+
+    def __init__(
+        self,
+        seal: object,
+        run: HistoricalRunInput,
+        semantic_hash: str,
+    ) -> None:
+        if seal is not _VALIDATED_INPUT_CONSTRUCTION_SEAL:
+            raise TypeError("ValidatedHistoricalInput must come from its validator")
+        object.__setattr__(self, "run", run)
+        object.__setattr__(self, "semantic_hash", semantic_hash)
 
 
 def _valid_hash(value: str) -> bool:
@@ -713,6 +776,22 @@ def validate_historical_input(run: HistoricalRunInput) -> str:
             ):
                 raise HistoricalInputError("endpoint configured spec differs from run evidence")
     return _digest(_semantic_input_projection(run))
+
+
+def _validate_historical_input_once(run: HistoricalRunInput) -> ValidatedHistoricalInput:
+    """Validate once and bind its hash; reject non-exact trees privately.
+
+    Validation errors propagate unchanged. A valid but non-approved tree raises
+    TypeError here only; internal adopters should fall back to per-call checks.
+    """
+    semantic_hash = validate_historical_input(run)
+    if not _is_structurally_immutable_historical_input_tree(run):
+        raise TypeError("historical input tree is not an approved immutable DTO graph")
+    return ValidatedHistoricalInput(
+        _VALIDATED_INPUT_CONSTRUCTION_SEAL,
+        run,
+        semantic_hash,
+    )
 
 
 def _validate_configured_spec_timeline(

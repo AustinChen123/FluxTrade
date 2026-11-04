@@ -1,10 +1,10 @@
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, field as dataclass_field, fields, make_dataclass, replace
 from decimal import Decimal
 from hashlib import sha256
 from pathlib import Path
 import ast
 import re
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -19,6 +19,9 @@ from src.core.backtest.spider_historical_input import (
     HistoricalRunInput,
     InstrumentSpecEvidence,
     SourceManifest,
+    ValidatedHistoricalInput,
+    _validate_historical_input_once,
+    _is_structurally_immutable_historical_input_tree,
     admit_before_construction,
     decode_historical_run_input,
     decode_p2_configuration,
@@ -384,6 +387,158 @@ def test_historical_run_input_codec_roundtrips_exact_types_and_semantic_hash(mod
     assert decoded.initial_account_state == run.initial_account_state
     assert validate_historical_input(decoded) == validate_historical_input(run)
     assert encode_historical_run_input(decoded) == encoded
+
+
+@pytest.mark.parametrize("model_id", ["OHLC4_OPEN_HIGH_LOW_CLOSE_V1", "OHLC4_OPEN_LOW_HIGH_CLOSE_V1"])
+def test_validated_input_token_binds_run_and_exact_semantic_hash(model_id):
+    run = replace(_valid_run(), model_id=model_id)
+    token = _validate_historical_input_once(run)
+
+    assert type(token) is ValidatedHistoricalInput
+    assert token.run is run
+    assert token.semantic_hash == validate_historical_input(run)
+    decoded = decode_historical_run_input(encode_historical_run_input(run))
+    decoded_token = _validate_historical_input_once(decoded)
+    assert decoded_token.run is decoded
+    assert decoded_token.semantic_hash == token.semantic_hash
+
+
+def _exception_signature(call):
+    try:
+        call()
+    except Exception as error:
+        cause = error.__cause__
+        return (
+            type(error),
+            error.args,
+            None if cause is None else (type(cause), cause.args),
+        )
+    pytest.fail("expected historical input validation to fail")
+
+
+@pytest.mark.parametrize("invalid_case", ["wrong_type", "schema", "parameters", "cause"])
+def test_validated_input_factory_preserves_validator_errors(invalid_case):
+    run: Any = _valid_run()
+    if invalid_case == "wrong_type":
+        run = object()
+    elif invalid_case == "schema":
+        run = replace(run, schema_version="unsupported")
+    elif invalid_case == "parameters":
+        run = replace(run, parameters=(("defaultN", 1.0),))
+    else:
+        run = replace(run, initial_account_state=b"{")
+
+    original_error = _exception_signature(lambda: validate_historical_input(run))
+    token_error = _exception_signature(lambda: _validate_historical_input_once(run))
+    assert token_error == original_error
+    if invalid_case == "cause":
+        assert token_error[2] is not None
+
+
+def test_validated_input_token_has_no_public_constructor_and_is_immutable():
+    run = _valid_run()
+    token = _validate_historical_input_once(run)
+    token_constructor = cast(Any, ValidatedHistoricalInput)
+
+    with pytest.raises(TypeError):
+        token_constructor(run, token.semantic_hash)
+    with pytest.raises(TypeError, match="must come from its validator"):
+        token_constructor(object(), run, token.semantic_hash)
+    with pytest.raises(FrozenInstanceError):
+        setattr(token, "run", replace(run, run_id="replacement"))
+    with pytest.raises(FrozenInstanceError):
+        setattr(token, "semantic_hash", "0" * 64)
+    with pytest.raises(FrozenInstanceError):
+        setattr(token.run, "run_id", "mutated")
+
+
+def _mutable_subclass(node):
+    base_type = type(node)
+    subclass = make_dataclass(
+        f"Mutable{base_type.__name__}",
+        [("labels", list[str], dataclass_field(default_factory=list))],
+        bases=(base_type,),
+        frozen=True,
+        slots=True,
+    )
+    values = {item.name: getattr(node, item.name) for item in fields(node)}
+    return cast(Any, subclass)(**values)
+
+
+def _immutable_subclass(node):
+    base_type = type(node)
+    subclass = make_dataclass(
+        f"Extended{base_type.__name__}",
+        [("label", str, dataclass_field(default="extension"))],
+        bases=(base_type,),
+        frozen=True,
+        slots=True,
+    )
+    values = {item.name: getattr(node, item.name) for item in fields(node)}
+    return cast(Any, subclass)(**values)
+
+
+@pytest.mark.parametrize(
+    "node_name",
+    [
+        "root",
+        "trade_manifest",
+        "mark_manifest",
+        "trade_bar",
+        "mark_bar",
+        "spec_before",
+        "spec_after",
+    ],
+)
+def test_structural_gate_requires_exact_dto_node_types(node_name):
+    run = _valid_run()
+    nodes = {
+        "root": run,
+        "trade_manifest": run.trade_manifest,
+        "mark_manifest": run.mark_manifest,
+        "trade_bar": run.trade_bars[0],
+        "mark_bar": run.mark_bars[0],
+        "spec_before": run.spec_before[0],
+        "spec_after": run.spec_after[0],
+    }
+    assert _is_structurally_immutable_historical_input_tree(run)
+    extended = _immutable_subclass(nodes[node_name])
+    if node_name == "root":
+        candidate = extended
+    elif node_name in {"trade_manifest", "mark_manifest"}:
+        candidate = replace(run, **{node_name: extended})
+    elif node_name in {"trade_bar", "mark_bar"}:
+        field_name = "trade_bars" if node_name == "trade_bar" else "mark_bars"
+        rows = getattr(run, field_name)
+        candidate = replace(run, **{field_name: (extended, *rows[1:])})
+    else:
+        rows = getattr(run, node_name)
+        candidate = replace(run, **{node_name: (extended, *rows[1:])})
+    assert not _is_structurally_immutable_historical_input_tree(candidate)
+
+
+def test_token_factory_rejects_mutable_top_level_run_subclass():
+    run = _valid_run()
+    extended = _mutable_subclass(run)
+    original_hash = validate_historical_input(extended)
+
+    with pytest.raises(TypeError, match="not an approved immutable DTO graph"):
+        _validate_historical_input_once(extended)
+    extended.labels.append("mutable after public validation")
+    assert validate_historical_input(extended) != original_hash
+
+
+@pytest.mark.parametrize("manifest_field", ["trade_manifest", "mark_manifest"])
+def test_token_factory_rejects_mutable_nested_manifest_subclass(manifest_field):
+    run = _valid_run()
+    extended = _mutable_subclass(getattr(run, manifest_field))
+    candidate = replace(run, **{manifest_field: extended})
+    original_hash = validate_historical_input(candidate)
+
+    with pytest.raises(TypeError, match="not an approved immutable DTO graph"):
+        _validate_historical_input_once(candidate)
+    extended.labels.append("mutable after public validation")
+    assert validate_historical_input(candidate) != original_hash
 
 
 def test_historical_run_input_codec_preserves_decimal_parameter_tag():
