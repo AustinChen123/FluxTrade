@@ -3,14 +3,13 @@
 from typing import Any as _Any, cast as _cast
 
 from src.core.backtest.spider_run_artifacts import canonical_bytes as _bytes, decode_canonical as _decode
-from src.core.backtest.spider_run_evidence import build_endpoint_artifacts as _build
-from src.core.backtest.spider_run_admission import admit_spider_run as _admit
 from src.core.backtest.synthetic_scenario_replay import (
     _ReplayComposition,
     ReplayPersistenceError as _PersistenceError,
 )
 from src.core.backtest.spider_historical_input import HistoricalRunInput as _HistoricalRunInput
 from src.core.backtest.spider_run_errors import classify_historical_failure as _classify_failure
+from src.core.backtest.spider_historical_durable_ports import DurableHistoricalOutputAdapter as _DurableOutput
 
 
 def _normalized(value):
@@ -35,8 +34,12 @@ def _owner_requests(account, cutoff, prefix):
 
 def _execute_historical(store, attempt, run: _HistoricalRunInput):
     journal = []
+    output = _DurableOutput(store, attempt, run, journal)
     previous_owner = None
     closed = False
+    ordinal = 0
+    last_boundary = None
+    last_recorded_ordinal = None
     composition = _ReplayComposition._from_historical_run(run)
     configuration = attempt["configuration_context"]
     historical = attempt["historical_context"]
@@ -50,13 +53,14 @@ def _execute_historical(store, attempt, run: _HistoricalRunInput):
         return _normalized(captured)
 
     def persist(kind, key, observed):
-        nonlocal previous_owner, closed
+        nonlocal previous_owner, closed, ordinal, last_boundary, last_recorded_ordinal
         if kind == "DELIVERY_ATTEMPT":
             return
-        ordinal = len(journal) + 1
+        ordinal += 1
         boundary = dict(ordinal=ordinal, journal_seq=ordinal, barrier_id=key["stable_id"])
+        last_boundary = boundary
         try:
-            store.mark_processed(boundary, record_kind=kind)
+            output.checkpoint(boundary, kind)
             payload = _normalized(observed)
             before_version = after_version = None
             if kind == "SOURCE_GROUP_RESULT":
@@ -85,7 +89,7 @@ def _execute_historical(store, attempt, run: _HistoricalRunInput):
                 account_version_after=after_version, payload=payload,
                 configuration_context=configuration, historical_context=historical,
             )
-            store.append_journal(row)
+            output.persist(row)
         except Exception as error:
             decision = _classify_failure(error, "CALLBACK_PERSIST", None, closed)
             if decision.propagate_original:
@@ -96,7 +100,8 @@ def _execute_historical(store, attempt, run: _HistoricalRunInput):
             finally:
                 closed = decision.closed
             raise _PersistenceError() from error
-        journal.append(row)
+        output.retain(row)
+        last_recorded_ordinal = ordinal
 
     composition._evidence_callback = persist
     start = run.range_start_ms * 16
@@ -107,15 +112,11 @@ def _execute_historical(store, attempt, run: _HistoricalRunInput):
     if result["classification"] != "SUCCESS":
         reason, primary = _terminal(result, closed)
         if not closed:
-            store.publish_failure(reason, primary)
+            output.fail(result["classification"], reason, primary, last_boundary, last_recorded_ordinal)
         return reason
     final_capture = capture(cutoff, "FINAL", include_scheduler=True)
-    status = store._status("RUNNING")
-    artifacts = _build(
-        run.run_id, attempt, status, journal, initial, final_capture["owner_evidence"],
-        final_capture["scheduler_observation"],
+    return output.finish(
+        initial, final_capture["owner_evidence"], final_capture["scheduler_observation"],
+        attempt["terminal_policy"],
+        dict(configuration_context=configuration, historical_context=historical),
     )
-    if store.finalize(**artifacts) != "COMPLETE_PUBLISHED":
-        raise RuntimeError("INVALID_STORE_ACKNOWLEDGEMENT")
-    admitted = _admit(store._path)
-    return None if admitted["decision"] == "ACCEPT" else admitted["reason"]

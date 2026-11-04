@@ -17,6 +17,7 @@ import pytest
 from src.core.backtest import spider_scenario_run as run, synthetic_scenario_codec as wire
 from src.core.backtest import spider_run_evidence as run_evidence
 from src.core.backtest import spider_historical_execution as historical_execution
+from src.core.backtest import spider_historical_durable_ports as durable_ports
 from src.core.backtest import spider_configured_scale_input as scale
 from src.core.backtest import spider_policy as spider_policy
 from src.core.backtest import spider_policy_protocol as policy_protocol
@@ -160,7 +161,7 @@ def test_real_runs_registration_order_exact_artifacts_and_one_admission(tmp_path
     attempt = read(tmp_path, "r1", "attempt.json")[0]
     assert attempt["native_artifact_sha256"] == sha256(Path(wire.loaded_native_artifact_path()).read_bytes()).hexdigest()
     records = [(name.encode(), sha256((run._ROOT / name).read_bytes()).digest()) for name in sorted(run._PROGRAM)]
-    assert len(records) == len(set(run._PROGRAM)) == 23
+    assert len(records) == len(set(run._PROGRAM)) == 24
     assert "python-strategy/src/core/backtest/synthetic_policy_dispatch.py" in run._PROGRAM
     assert "python-strategy/src/core/backtest/spider_execution_input.py" in run._PROGRAM
     assert "python-strategy/src/core/backtest/spider_paid_endpoint.py" in run._PROGRAM
@@ -229,6 +230,113 @@ def test_historical_projection_error_occurs_after_final_captures_like_head(tmp_p
     status = cast(dict[str, Any], decode_canonical((directory / "status.json").read_bytes().rstrip(b"\n")))
     assert status["state"] == "FAILED" and status["primary_failure"] is None
     assert sha256((directory / "status.json").read_bytes()).hexdigest() == "2fd1f940df3df47755c6bf031a4516b088a66e0608574b434b5b0fe0c590d335"
+
+
+def test_durable_ports_preserve_callback_order_and_five_finish_inputs(tmp_path, monkeypatch):
+    value, raw = historical_input("durable-ports", partial_fill=True)
+    adapter = durable_ports.DurableHistoricalOutputAdapter
+    calls = []
+    finish_args = []
+    finish_attempts = []
+    normalized_captures = []
+    snapshot_ids = []
+    original_checkpoint, original_persist = adapter.checkpoint, adapter.persist
+    original_retain, original_fail, original_finish = adapter.retain, adapter.fail, adapter.finish
+    original_normalized = historical_execution._normalized
+    original_requests = historical_execution._owner_requests
+    original_build = durable_ports.build_endpoint_artifacts
+    build_args = []
+
+    def checkpoint(self, boundary, kind):
+        calls.append(("checkpoint", boundary.copy(), kind))
+        return original_checkpoint(self, boundary, kind)
+
+    def persist(self, row):
+        calls.append(("persist", row))
+        return original_persist(self, row)
+
+    def retain(self, row):
+        calls.append(("retain", row))
+        return original_retain(self, row)
+
+    def fail(self, *args):
+        calls.append(("fail", args))
+        return original_fail(self, *args)
+
+    def finish(self, *args):
+        finish_args.append(args)
+        finish_attempts.append(self._attempt)
+        return original_finish(self, *args)
+
+    def normalized(raw_value):
+        result = original_normalized(raw_value)
+        if type(result) is dict and "owner_evidence" in result:
+            normalized_captures.append(result)
+        return result
+
+    def owner_requests(account, cutoff, prefix):
+        requests = original_requests(account, cutoff, prefix)
+        snapshot_ids.extend(request["snapshot_id"] for request in requests)
+        return requests
+
+    def build(*args):
+        build_args.append(args)
+        return original_build(*args)
+
+    monkeypatch.setattr(adapter, "checkpoint", checkpoint)
+    monkeypatch.setattr(adapter, "persist", persist)
+    monkeypatch.setattr(adapter, "retain", retain)
+    monkeypatch.setattr(adapter, "fail", fail)
+    monkeypatch.setattr(adapter, "finish", finish)
+    monkeypatch.setattr(historical_execution, "_normalized", normalized)
+    monkeypatch.setattr(historical_execution, "_owner_requests", owner_requests)
+    monkeypatch.setattr(durable_ports, "build_endpoint_artifacts", build)
+    assert run.run_spider_scenario(str(tmp_path), value.run_id, run._P3_SELECTOR, raw) == (
+        dict(run_id=value.run_id, outcome="ADMITTED", reason=None)
+    )
+    rows = read(tmp_path, value.run_id, "journal.jsonl")
+    assert len(calls) == 3 * len(rows) and calls[-1][0] == "retain"
+    for index, row in enumerate(rows):
+        checkpoint_call, persist_call, retain_call = calls[index * 3:index * 3 + 3]
+        assert checkpoint_call == ("checkpoint", dict(ordinal=index + 1, journal_seq=index + 1,
+                                                         barrier_id=row["barrier_id"]), row["record_kind"])
+        assert persist_call == ("persist", row) and retain_call == ("retain", row)
+    assert not any(call[0] == "fail" for call in calls) and len(finish_args) == len(build_args) == 1
+    initial, final_owner, final_observation, terminal, context = finish_args[0]
+    final_capture = next(item for item in reversed(normalized_captures) if "scheduler_observation" in item)
+    assert initial is normalized_captures[0]["owner_evidence"]
+    assert final_owner is final_capture["owner_evidence"]
+    assert final_observation is final_capture["scheduler_observation"]
+    assert build_args[0][4] is initial and build_args[0][5] is final_owner and build_args[0][6] is final_observation
+    attempt = finish_attempts[0]
+    assert terminal == attempt["terminal_policy"]
+    assert context["configuration_context"] is attempt["configuration_context"]
+    assert context["historical_context"] is attempt["historical_context"]
+    assert snapshot_ids.count("INITIAL-TRADING") == snapshot_ids.count("FINAL-TRADING") == 1
+    assert snapshot_ids.count("FINAL-POSITIONS") == snapshot_ids.count("FINAL-OPEN-ORDERS") == 1
+
+
+def test_durable_fail_port_publishes_terminal_reason_without_extra_callback(tmp_path, monkeypatch):
+    value, raw = historical_input("durable-port-terminal")
+    original_fail = durable_ports.DurableHistoricalOutputAdapter.fail
+    failures = []
+
+    def terminal_dispatch(_self, _cutoff):
+        return dict(classification="TERMINAL", reason="CALLBACK_FAILED")
+
+    def fail(self, *args):
+        failures.append(args)
+        return original_fail(self, *args)
+
+    monkeypatch.setattr(run._ReplayComposition, "_dispatch_due", terminal_dispatch)
+    monkeypatch.setattr(durable_ports.DurableHistoricalOutputAdapter, "fail", fail)
+    result = run.run_spider_scenario(str(tmp_path), value.run_id, run._P3_SELECTOR, raw)
+    assert result == dict(run_id=value.run_id, outcome="FAILED", reason="CALLBACK_FAILED")
+    assert failures == [("TERMINAL", "CALLBACK_FAILED", dict(kind="CALLBACK", reason="CALLBACK_FAILED"), None, None)]
+    assert read(tmp_path, value.run_id, "journal.jsonl") == []
+    status = read(tmp_path, value.run_id, "status.json")[0]
+    assert status["state"] == "FAILED" and status["primary_failure"] == dict(kind="CALLBACK", reason="CALLBACK_FAILED")
+    assert not (tmp_path / value.run_id / "completion.json").exists()
 @pytest.mark.parametrize("variant,expected_margin,expected_available,expected_actions", [
     ("A", Decimal("1200"), Decimal("8800"), "global"),
     ("B", Decimal("900"), Decimal("9100"), "individual"),
@@ -898,7 +1006,7 @@ def test_historical_filled_market_append_failure_keeps_native_mutation_and_unper
 
 def test_historical_endpoint_mutation_is_rejected_by_existing_admission(tmp_path, monkeypatch):
     value, raw = historical_input("historical-endpoint-mutation")
-    original = historical_execution._admit
+    original = durable_ports.admit_spider_run
     calls = []
     def tamper(path):
         calls.append(path)
@@ -907,7 +1015,7 @@ def test_historical_endpoint_mutation_is_rejected_by_existing_admission(tmp_path
         endpoint["terminal_reason"] = "SCHEDULED_MTM"
         endpoint_path.write_bytes(canonical_bytes(endpoint) + b"\n")
         return original(path)
-    monkeypatch.setattr(historical_execution, "_admit", tamper)
+    monkeypatch.setattr(durable_ports, "admit_spider_run", tamper)
     result = run.run_spider_scenario(str(tmp_path), value.run_id, run._P3_SELECTOR, raw)
     assert calls == [tmp_path / value.run_id]
     assert result == dict(run_id=value.run_id, outcome="FAILED", reason="ARTIFACT_MISMATCH")
@@ -1445,7 +1553,7 @@ def test_configured_runner_projects_finalizes_and_admits_exact_forty_barriers(tm
     assert finalizes[0]["reconciliation"]["result"] == "OK"
     assert admissions[0][0]["decision"] == "ACCEPT" and admissions[0][1] == admissions[0][2]
     assert len(owners) == 1
-    assert len(run._PROGRAM) == 23
+    assert len(run._PROGRAM) == 24
     assert "python-strategy/src/core/backtest/synthetic_policy_dispatch.py" in run._PROGRAM
     assert "python-strategy/src/core/backtest/spider_execution_input.py" in run._PROGRAM
     assert "python-strategy/src/core/backtest/spider_paid_endpoint.py" in run._PROGRAM

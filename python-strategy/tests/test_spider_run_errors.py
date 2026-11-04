@@ -13,6 +13,7 @@ from typing import Any, cast
 from unittest.mock import patch
 
 from src.core.backtest import spider_historical_execution as executor
+from src.core.backtest import spider_historical_durable_ports as durable_ports
 from src.core.backtest import spider_run_errors as errors
 from src.core.backtest import spider_run_evidence as evidence
 from src.core.backtest import spider_run_store as store
@@ -142,8 +143,12 @@ def test_real_callers_match_head_error_matrix():
                         raise store.SpiderRunStoreError("PUBLICATION_FAILED", reason, primary)
                 callback_store = SimpleNamespace(mark_processed=mark, append_journal=append, publish_failure=publish_callback)
                 def trace(frame, event, arg):
-                    if event == "return" and frame.f_code.co_name in ("persist", "_execute_historical"):
-                        closed.append((frame.f_code.co_name, frame.f_locals.get("closed")))
+                    if (event == "return" and frame.f_code.co_filename == executor.__file__
+                            and frame.f_code.co_name in ("persist", "_execute_historical")):
+                        # The callback's closed value is a closure cell. If BaseException bypasses
+                        # its Exception handler, CPython may omit the untouched cell from f_locals;
+                        # the enclosing executor initializes that value to False.
+                        closed.append((frame.f_code.co_name, frame.f_locals.get("closed", False)))
                     return trace
                 with patch.object(executor, "_ReplayComposition", SimpleNamespace(_from_historical_run=lambda run: composition)):
                     sys.settrace(trace)
@@ -167,7 +172,8 @@ def test_real_store_failure_outcomes_and_artifact_bytes_match_head(tmp_path, mon
     from test_spider_scenario_run import historical_input
     from tools.spider_run_compare import _EXPECTED_DIFFERENCES, _canonical
     cases = ("create", "mark_unknown", "append_oserror", "append_store", "append_memory", "append_keyboard", "append_base", "append_newer", "outer_projection", "outer_native", "outer_memory", "outer_keyboard", "outer_base", "outer_nested", "outer_newer", "retain_memory", "endpoint_unlink", "completion_unlink")
-    append_line = next(n.lineno for n in ast.walk(ast.parse(Path(executor.__file__).read_text())) if isinstance(n, ast.Call) and ast.unparse(n.func) == "journal.append")
+    retain_line = next(n.lineno for n in ast.walk(ast.parse(Path(durable_ports.__file__).read_text()))
+                       if isinstance(n, ast.Call) and ast.unparse(n.func) == "self._journal.append")
     matrix = {}
     for case in cases:
         case_root = tmp_path / case
@@ -214,10 +220,11 @@ def test_real_store_failure_outcomes_and_artifact_bytes_match_head(tmp_path, mon
                 raise OSError("unlink")
             return original_unlink(path, *args, **kwargs)
         def trace(frame, event, arg):
+            if (frame.f_code.co_filename == durable_ports.__file__ and event == "line"
+                    and frame.f_lineno == retain_line and case == "retain_memory"):
+                closed.append(["retain", frame.f_back.f_locals.get("closed")])
+                raise retain_error
             if frame.f_code.co_filename == executor.__file__:
-                if event == "line" and frame.f_lineno == append_line and case == "retain_memory":
-                    closed.append(["retain", frame.f_locals.get("closed")])
-                    raise retain_error
                 if event == "return" and frame.f_code.co_name in ("persist", "_execute_historical"):
                     closed.append([frame.f_code.co_name, frame.f_locals.get("closed")])
             return trace
@@ -268,3 +275,22 @@ def test_classifier_has_one_owner_and_no_writer_capability():
     )) == 1
     assert {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)} == {"copy", "dataclasses", "typing"}
     assert not any(isinstance(n, (ast.Import, ast.Call)) and (isinstance(n, ast.Import) or getattr(n.func, "id", "") in {"open", "eval", "exec", "__import__"}) for n in ast.walk(tree))
+
+
+def test_durable_publication_guard_and_callback_catch_match_head_structure():
+    scenario_tree = ast.parse(Path(scenario.__file__).read_text())
+    invoke = next(node for node in scenario_tree.body if isinstance(node, ast.FunctionDef) and node.name == "_invoke")
+    failed = next(node for node in invoke.body if isinstance(node, ast.FunctionDef) and node.name == "failed")
+    handlers = [node for node in ast.walk(invoke) if isinstance(node, ast.ExceptHandler)]
+    executor_tree = ast.parse(Path(executor.__file__).read_text())
+    execute = next(node for node in executor_tree.body if isinstance(node, ast.FunctionDef) and node.name == "_execute_historical")
+    persist = next(node for node in ast.walk(execute) if isinstance(node, ast.FunctionDef) and node.name == "persist")
+    callback_handler = next(node for node in ast.walk(persist) if isinstance(node, ast.ExceptHandler))
+    def digest(value):
+        return hashlib.sha256(ast.dump(value, include_attributes=False).encode()).hexdigest()
+
+    handlers_digest = hashlib.sha256("\n".join(ast.dump(node, include_attributes=False) for node in handlers).encode()).hexdigest()
+    # AST fingerprints captured from HEAD 651b3cd0 before the port extraction.
+    assert digest(failed) == "d87093802d02b6f30e002a661742edc8f6b1dbf2ed67fd970044d3336a19d690"
+    assert handlers_digest == "50f0d1651b24acf70aa680ddb1d7079ed1ff353ddcbc2cc5ee3e82028ee7ede8"
+    assert digest(callback_handler) == "51ad35a41e587919a3b45c6438e4244c5efcb89dacb8692b499ac6015897ff65"

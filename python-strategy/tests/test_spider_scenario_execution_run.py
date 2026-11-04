@@ -1,11 +1,14 @@
 """Actual-native paid scenario orchestration and same-store admission tests."""
 
 from dataclasses import replace
+import ast
 from hashlib import sha256
 import inspect
 import os
 from pathlib import Path
+import subprocess
 import stat
+import sys
 from typing import Any, cast
 
 import pytest
@@ -151,6 +154,50 @@ def test_historical_projection_source_is_in_program_digest(monkeypatch):
 
     monkeypatch.setattr(Path, "read_bytes", mutate_projection_only)
     assert _program_hash() != before
+
+
+def test_durable_ports_module_import_closure_and_manifest(monkeypatch):
+    module_path = scenario._ROOT / "python-strategy/src/core/backtest/spider_historical_durable_ports.py"
+    source = module_path.read_text()
+    allowed = {
+        "typing": {"Any", "Protocol"},
+        "src.core.backtest.spider_run_admission": {"admit_spider_run"},
+        "src.core.backtest.spider_run_evidence": {"build_endpoint_artifacts"},
+        "src.core.backtest.spider_run_store": {"SpiderRunStore"},
+    }
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            assert all(alias.name in allowed for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            assert node.level == 0 and node.module in allowed
+            assert {alias.name for alias in node.names} <= allowed[node.module]
+    assert "python-strategy/src/core/backtest/spider_historical_durable_ports.py" in scenario._P3_PROGRAM
+    before = _program_hash()
+    original_read_bytes = Path.read_bytes
+
+    def mutate_ports_only(path: Path) -> bytes:
+        raw = original_read_bytes(path)
+        return raw + b"\n# digest-only mutation\n" if path == module_path else raw
+
+    monkeypatch.setattr(Path, "read_bytes", mutate_ports_only)
+    assert _program_hash() != before
+    closure = """
+import sys
+import src.core.backtest.spider_historical_durable_ports
+required = {
+    'src.core.backtest.spider_run_admission',
+    'src.core.backtest.spider_run_evidence',
+    'src.core.backtest.spider_run_store',
+}
+assert required <= set(sys.modules), sorted(required - set(sys.modules))
+assert not any(name.endswith(('spider_historical_research_entry', 'spider_research_evidence_sink'))
+               for name in sys.modules)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", closure], cwd=scenario._ROOT / "python-strategy",
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
 
 @pytest.mark.parametrize(
     "case", ["wrong_selector", "mixed_inputs", "missing_input", "malformed_input", "nested_run_id"],

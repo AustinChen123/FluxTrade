@@ -54,7 +54,7 @@ from src.core.backtest.spider_run_artifacts import (
 _ROOT = _Path(__file__).resolve().parents[4]
 _PROGRAM = tuple("python-strategy/src/core/backtest/" + name + ".py" for name in (
     "synthetic_scenario_codec", "synthetic_scenario_replay", "synthetic_policy_dispatch", "spider_policy", "spider_policy_protocol", "spider_run_admission",
-    "spider_run_artifacts", "spider_run_completion_schema", "spider_run_envelope_schema", "spider_run_evidence", "spider_historical_report_projection", "spider_run_errors",
+    "spider_run_artifacts", "spider_run_completion_schema", "spider_run_envelope_schema", "spider_run_evidence", "spider_historical_report_projection", "spider_historical_durable_ports", "spider_run_errors",
     "spider_run_native_schema", "spider_run_reconciliation_schema", "spider_run_store", "spider_historical_execution", "spider_scenario_plan_liquidation",
     "spider_scenario_plan_o03", "spider_scenario_plan_scheduled", "spider_scenario_plans", "spider_scenario_run",
     "spider_execution_input", "spider_paid_endpoint"))
