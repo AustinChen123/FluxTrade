@@ -779,3 +779,123 @@ def test_paid_evidence_owner_forbids_replay_store_and_io_dependencies():
         "src.core.backtest.synthetic_scenario_replay",
         "src.core.backtest.spider_run_store",
     }
+
+def _exception_tree(error: BaseException) -> tuple[object, ...]:
+    def visit(current: BaseException | None, seen: frozenset[int]) -> object:
+        if current is None:
+            return None
+        if id(current) in seen:
+            return ("cycle", type(current).__module__, type(current).__qualname__)
+        path = seen | {id(current)}
+        return (
+            type(current).__module__,
+            type(current).__qualname__,
+            current.args,
+            current.__suppress_context__,
+            visit(current.__cause__, path),
+            visit(current.__context__, path),
+        )
+
+    return cast(tuple[object, ...], visit(error, frozenset()))
+
+
+def _malformed_paid_reconciliation_inputs(raw: bytes) -> list[tuple[str, bytes]]:
+    wrapper = cast(dict[str, Any], decode_canonical(raw))
+    cases: list[tuple[str, bytes]] = []
+    for field in sorted(wrapper):
+        row = deepcopy(wrapper)
+        del row[field]
+        cases.append((f"outer-missing-{field}", canonical_bytes(row)))
+    for field in sorted(wrapper):
+        row = deepcopy(wrapper)
+        row[field] = []
+        cases.append((f"outer-wrong-{field}", canonical_bytes(row)))
+    row = deepcopy(wrapper)
+    row["extra"] = 1
+    cases.append(("outer-extra", canonical_bytes(row)))
+    historical = cast(dict[str, Any], wrapper["historical_input"])
+    for field in sorted(historical):
+        row = deepcopy(wrapper)
+        del cast(dict[str, Any], row["historical_input"])[field]
+        cases.append((f"history-missing-{field}", canonical_bytes(row)))
+    for field in sorted(historical):
+        row = deepcopy(wrapper)
+        cast(dict[str, Any], row["historical_input"])[field] = []
+        cases.append((f"history-wrong-{field}", canonical_bytes(row)))
+    row = deepcopy(wrapper)
+    cast(dict[str, Any], row["historical_input"])["extra"] = 1
+    cases.append(("history-extra", canonical_bytes(row)))
+    for label, nested in (
+        ("empty", {}),
+        ("non-dict", []),
+        ("missing-schema", {"x": 1}),
+        ("history-empty", {"schema_version": "spider_historical_research_run_v1"}),
+        ("nested-list", []),
+    ):
+        row = deepcopy(wrapper)
+        row["historical_input"] = nested
+        cases.append((f"nested-{label}", canonical_bytes(row)))
+    cases.extend((("empty-bytes", b""), ("non-utf8", b"\xff")))
+    return cases
+
+
+def test_paid_reconciliation_invalid_input_exception_chains_match_head():
+    from src.core.backtest import spider_execution_input as execution_input_module
+    from src.core.backtest.spider_run_artifacts import decode_canonical as decode_json
+
+    artifacts, facts = _bundle()
+    cases = _malformed_paid_reconciliation_inputs(artifacts["execution_input.json"])
+    assert len(cases) == 97
+    for label, encoded in cases:
+        changed = dict(artifacts, **{"execution_input.json": encoded})
+        expected_decoder = (
+            decode_json
+            if label in ("empty-bytes", "non-utf8")
+            else execution_input_module.decode_spider_execution_input
+        )
+        with pytest.raises(BaseException) as expected:
+            expected_decoder(encoded)
+        with pytest.raises(BaseException) as actual:
+            evidence.build_execution_reconciliation(facts["run_id"], changed)
+        assert _exception_tree(actual.value) == _exception_tree(expected.value), label
+
+
+@pytest.mark.parametrize("force_fallback,expected_calls", [(False, 1), (True, 15)])
+def test_paid_reconciliation_mints_one_local_token_or_uses_head_fallback(
+    monkeypatch,
+    force_fallback,
+    expected_calls,
+):
+    from hashlib import sha256
+    from src.core.backtest import spider_execution_input as execution_input_module
+    from src.core.backtest import spider_historical_input as historical_input_module
+
+    artifacts, facts = _bundle()
+    original_validator = historical_input_module.validate_historical_input
+    calls: list[object] = []
+
+    def count_validator(run):
+        calls.append(run)
+        return original_validator(run)
+
+    monkeypatch.setattr(
+        historical_input_module, "validate_historical_input", count_validator
+    )
+    monkeypatch.setattr(
+        execution_input_module, "validate_historical_input", count_validator
+    )
+    if force_fallback:
+        monkeypatch.setattr(
+            execution_input_module,
+            "_is_approved_historical_input_tree",
+            lambda _run: False,
+        )
+
+    result = evidence.build_execution_reconciliation(facts["run_id"], artifacts)
+    assert len(calls) == expected_calls
+    assert sha256(canonical_bytes(result)).hexdigest() == (
+        "c54478bdaf5c3618ba41a5d5ab0b2bbe138015e14409d401750e86b688ae57bb"
+    )
+    assert sha256(artifacts["report.jsonl"]).hexdigest() == (
+        "489b3a5b832bade9b24b21fabcf314c013fe1b90d3d09d695ca730b8533c1231"
+    )
