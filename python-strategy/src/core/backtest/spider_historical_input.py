@@ -1162,10 +1162,11 @@ def _validate_historical_run_link(
     """Decode and link exact persisted historical bytes to one validated P3 attempt."""
     if type(raw) is not bytes:
         raise HistoricalInputError("invalid historical input bytes")
-    run = decode_historical_run_input(raw)
-    if encode_historical_run_input(run) != raw:
+    token = _decode_historical_run_input_validated(raw)
+    run = token.run
+    if _encode_historical_run_input_validated_run(run) != raw:
         raise HistoricalInputError("noncanonical historical input bytes")
-    semantic_hash = validate_historical_input(run)
+    semantic_hash = token.semantic_hash
     configuration = decode_p2_configuration(
         run.configuration_bytes, run.configuration_sha256, run.ordered_products,
     )
@@ -1175,7 +1176,7 @@ def _validate_historical_run_link(
         configuration_sha256=run.configuration_sha256,
         products=list(run.ordered_products),
     ))
-    expected_history = historical_context(historical_context_for_input(run))
+    expected_history = historical_context(_historical_context_for_validated_input(token))
     account_key = attempt.get("account_key")
     if (run.run_id != expected_run_id or attempt.get("run_id") != run.run_id
             or attempt.get("run_contract_id") != SCHEMA_ID
@@ -1198,7 +1199,7 @@ def _validate_historical_run_link(
                 model_version=expected_history.model_version,
             )
             or type(account_key) is not dict or account_key.get("account") != run.account_key
-            or attempt.get("planned_coverage") != historical_planned_coverage(run)):
+            or attempt.get("planned_coverage") != _historical_planned_coverage_for_input(token)):
         raise HistoricalInputError("historical input does not match attempt")
     hashes = attempt.get("input_contract_hashes")
     if type(hashes) is not list or len(hashes) != len(_HASHES):

@@ -2,6 +2,7 @@
 
 import ast
 import os
+from dataclasses import replace
 from copy import deepcopy
 from hashlib import sha256
 from pathlib import Path
@@ -10,6 +11,7 @@ from typing import Any, Protocol, cast
 import pytest
 
 from src.core.backtest import spider_run_store as module
+from src.core.backtest import spider_historical_input as historical_input_module
 from src.core.backtest.spider_run_admission import admit_spider_run
 from src.core.backtest.spider_run_artifacts import (
     canonical_bytes,
@@ -379,6 +381,47 @@ def test_historical_registration_persists_input_and_dynamic_journal_frontier(tmp
     with pytest.raises(ValueError, match="INVALID_ARTIFACT"):
         store.finalize({}, {}, [])
     assert not any((store._path / name).exists() for name in ("endpoint.json", "reconciliation.json", "report.jsonl", "completion.json"))
+
+
+def test_historical_registration_validates_once_and_link_rejects_a_stale_token(tmp_path, monkeypatch):
+    run, raw, attempt = historical_registration()
+    original_full_validator = historical_input_module.validate_historical_input
+    validation_calls = 0
+    def count_validation(value):
+        nonlocal validation_calls
+        validation_calls += 1
+        return original_full_validator(value)
+    monkeypatch.setattr(historical_input_module, "validate_historical_input", count_validation)
+    original = historical_input_module._validate_historical_input_once
+    tokens = []
+    def capture(value):
+        token = original(value)
+        tokens.append(token)
+        return token
+    monkeypatch.setattr(historical_input_module, "_validate_historical_input_once", capture)
+    store = module.SpiderRunStore.create(str(tmp_path), run.run_id)
+    assert store.register(attempt, historical_input=raw) == "NATIVE_CONSTRUCTION_ALLOWED"
+    assert len(tokens) == validation_calls == 1 and tokens[0].run == run
+
+    changed = replace(run, run_id="fresh-recompute")
+    changed_attempt = deepcopy(attempt)
+    changed_attempt["run_id"] = changed.run_id
+    changed_raw = encode_historical_run_input(changed)
+    before_recompute = validation_calls
+    assert historical_input_module._validate_historical_run_link(
+        changed_raw, changed_attempt, changed.run_id
+    ) == changed
+    assert len(tokens) == 2 and validation_calls == before_recompute + 1
+    assert tokens[1] is not tokens[0]
+    monkeypatch.setattr(
+        historical_input_module, "_decode_historical_run_input_validated",
+        lambda _: tokens[0],
+    )
+    with pytest.raises(ValueError):
+        historical_input_module._validate_historical_run_link(
+            changed_raw, changed_attempt, changed.run_id
+        )
+    assert validation_calls == before_recompute + 1
 
 
 @pytest.mark.parametrize("case", ["missing_input", "bad_input_bytes", "wrong_context", "wrong_coverage", "wrong_run_id"])

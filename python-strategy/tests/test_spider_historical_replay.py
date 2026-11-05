@@ -12,6 +12,7 @@ import pytest
 
 from src.core.backtest import synthetic_scenario_codec as wire
 from src.core.backtest import synthetic_scenario_replay as replay_module
+from src.core.backtest import spider_historical_input as historical_input_module
 from src.core.backtest.spider_run_admission import admit_spider_run
 from src.core.backtest.spider_policy import DEFAULTS
 from src.core.backtest.spider_historical_input import (
@@ -1620,13 +1621,34 @@ def test_historical_endpoint_and_reconciliation_project_authoritative_market_evi
 
 
 @pytest.mark.parametrize("partial_fill", [False, True])
-def test_historical_store_finalize_and_admission_accept_real_native_bundle(tmp_path, partial_fill):
+def test_historical_store_finalize_and_admission_accept_real_native_bundle(tmp_path, partial_fill, monkeypatch):
     run, attempt, status, journal, artifacts, _, store = _historical_endpoint_case(
         tmp_path, partial_fill=partial_fill, return_store=True,
     )
+    original_full_validator = historical_input_module.validate_historical_input
+    validation_calls = 0
+    def count_validation(value):
+        nonlocal validation_calls
+        validation_calls += 1
+        return original_full_validator(value)
+    monkeypatch.setattr(historical_input_module, "validate_historical_input", count_validation)
+    original_validate = historical_input_module._validate_historical_input_once
+    tokens = []
+    def capture_token(run):
+        token = original_validate(run)
+        tokens.append(token)
+        return token
+    monkeypatch.setattr(historical_input_module, "_validate_historical_input_once", capture_token)
     assert store.finalize(artifacts["endpoint"], artifacts["reconciliation"], artifacts["report"]) == "COMPLETE_PUBLISHED"
+    assert len(tokens) == validation_calls == 1
+    finalize_token = tokens[0]
+    for name, rows in (("endpoint.json", [artifacts["endpoint"]]),
+                       ("reconciliation.json", [artifacts["reconciliation"]]),
+                       ("report.jsonl", artifacts["report"])):
+        assert (store._path / name).read_bytes() == b"".join(canonical_bytes(row) + b"\n" for row in rows)
     raw_input = (store._path / "historical_input.json").read_bytes()
     assert raw_input == encode_historical_run_input(run)
+    before_admission = validation_calls
     manifest = cast(dict[str, Any], decode_canonical((store._path / "completion.json").read_bytes().rstrip(b"\n")))
     input_metadata = manifest["artifacts"][-1]
     assert input_metadata == dict(
@@ -1634,6 +1656,8 @@ def test_historical_store_finalize_and_admission_accept_real_native_bundle(tmp_p
         sha256=sha256(raw_input).hexdigest(), byte_count=len(raw_input), row_count=1,
     )
     admitted = admit_spider_run(store._path)
+    assert len(tokens) == 2 and validation_calls == before_admission + 1
+    assert tokens[1] is not finalize_token
     assert admitted["decision"] == "ACCEPT", admitted
     assert admitted["artifacts"]["historical_input.json"]["run_id"] == run.run_id
     assert admitted["artifacts"]["journal.jsonl"] == journal
