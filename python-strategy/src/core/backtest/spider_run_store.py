@@ -15,7 +15,12 @@ from src.core.backtest.spider_run_envelope_schema import endpoint as validate_en
 from src.core.backtest.spider_run_errors import ReconciliationProjectionError, SpiderRunStoreError
 from src.core.backtest.spider_run_evidence import _context_chain, build_reconciliation
 from src.core.backtest.spider_run_reconciliation_schema import reconciliation as validate_reconciliation
-from src.core.backtest.spider_historical_input import _validate_historical_run_link
+from src.core.backtest.spider_historical_input import (
+    ValidatedHistoricalInput,
+    _historical_context_for_validated_input,
+    _validate_historical_run_link,
+    historical_context_for_input,
+)
 from src.core.backtest.spider_run_execution_schema import (
     _COMPLETION_ARTIFACTS as _EXECUTION_COMPLETION_ARTIFACTS,
     _GROSS_COMPLETION_ARTIFACTS,
@@ -25,14 +30,15 @@ from src.core.backtest.spider_run_execution_schema import (
     canonical_gross_paid_bytes,
     canonical_paid_bytes,
     execution_context_from_input,
+    _execution_context_for_input,
     gross_execution_context_from_input,
     floating_exit_context_from_input,
     validate_execution_artifact,
 )
 from src.core.backtest.spider_run_execution_evidence import build_execution_reconciliation
 from src.core.backtest.spider_execution_input import (
+    _decode_spider_execution_input_validated,
     decode_spider_execution_input,
-    validate_spider_execution_input,
 )
 from src.core.backtest.spider_floating_exit_input import (
     decode_spider_floating_exit_input,
@@ -51,7 +57,6 @@ from src.core.backtest.spider_run_artifacts import (
     gross_execution_context as validate_gross_execution_context,
     historical_context as validate_historical_context,
 )
-from src.core.backtest.spider_historical_input import historical_context_for_input
 
 
 def _report_validator(attempt: dict[str, Any]):
@@ -215,6 +220,7 @@ class SpiderRunStore:
                                 gross_execution: bool = False) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
         if type(raw) is not bytes:
             raise ValueError("INVALID_ARTIFACT")
+        historical_token: ValidatedHistoricalInput | None = None
         if gross_execution:
             gross_request = decode_spider_gross_execution_input(raw)
             wrapper_hash = validate_spider_gross_execution_input(gross_request)
@@ -228,11 +234,15 @@ class SpiderRunStore:
             execution = floating_exit_context_from_input(raw)
             context = validate_floating_exit_context(execution)
         else:
-            request = decode_spider_execution_input(raw)
-            wrapper_hash = validate_spider_execution_input(request)
-            execution = execution_context_from_input(raw)
+            request, historical_token, wrapper_hash = _decode_spider_execution_input_validated(raw)
+            execution = (
+                _execution_context_for_input(request, wrapper_hash)
+                if historical_token is not None else execution_context_from_input(raw)
+            )
             context = validate_execution_context(execution)
         run = request.historical_input
+        if historical_token is not None and historical_token.run is not run:
+            raise ValueError("INVALID_ARTIFACT")
         if run.run_id != self._run_id:
             raise ValueError("INVALID_ARTIFACT")
         validate_execution_artifact("attempt.json", canonical_bytes(attempt) + b"\n", execution_context=execution)
@@ -245,7 +255,11 @@ class SpiderRunStore:
             configuration_sha256=run.configuration_sha256,
             products=list(run.ordered_products),
         ))._asdict() | {"products": list(run.ordered_products)}
-        historical = validate_historical_context(historical_context_for_input(run))._asdict()
+        history_value = (
+            _historical_context_for_validated_input(historical_token)
+            if historical_token is not None else historical_context_for_input(run)
+        )
+        historical = validate_historical_context(history_value)._asdict()
         if (attempt["run_id"] != self._run_id
                 or attempt["configuration_context"] != configuration
                 or attempt["historical_context"] != historical
@@ -265,9 +279,16 @@ class SpiderRunStore:
                     attempt["policy_source_sha256"],
                 ]):
             raise ValueError("INVALID_ARTIFACT")
-        from src.core.backtest.spider_run_execution_evidence import _expected_coverage
+        from src.core.backtest.spider_run_execution_evidence import (
+            _expected_coverage,
+            _expected_coverage_validated,
+        )
 
-        if attempt["planned_coverage"] != _expected_coverage(request, wrapper_hash):
+        expected_coverage = (
+            _expected_coverage_validated(request, wrapper_hash, historical_token)
+            if historical_token is not None else _expected_coverage(request, wrapper_hash)
+        )
+        if attempt["planned_coverage"] != expected_coverage:
             raise ValueError("INVALID_ARTIFACT")
         return execution, configuration, historical
 

@@ -12,6 +12,7 @@ from typing import cast
 from src.core.backtest import spider_run_envelope_schema as envelope
 from src.core.backtest import spider_run_native_schema as native
 from src.core.backtest.spider_execution_input import (
+    SpiderExecutionInput,
     decode_spider_execution_input,
     validate_spider_execution_input,
 )
@@ -128,6 +129,12 @@ def execution_context_from_input(raw: bytes) -> dict[str, object]:
     """Validate original wrapper bytes and derive the exact persisted context."""
     value = decode_spider_execution_input(raw)
     contract_hash = validate_spider_execution_input(value)
+    return _execution_context_for_input(value, contract_hash)
+
+
+def _execution_context_for_input(
+    value: SpiderExecutionInput, contract_hash: str,
+) -> dict[str, object]:
     return dict(
         schema_version="spider_execution_context_v1",
         policy_id=value.policy_id,

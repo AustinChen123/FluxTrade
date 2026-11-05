@@ -34,6 +34,8 @@ from src.core.backtest.spider_gross_execution_input import (
 from src.core.backtest.spider_floating_exit_policy import decide_floating_exits
 from src.core.backtest.spider_bayes_replay import prepare_closed15m_source14
 from src.core.backtest.spider_historical_input import (
+    ValidatedHistoricalInput,
+    _historical_planned_coverage_for_input,
     historical_context_for_input,
     historical_market_step_clock,
     historical_planned_coverage,
@@ -120,6 +122,21 @@ def _key(value: object) -> tuple[int, int, int, str]:
 def _expected_coverage(request: SpiderExecutionInput, contract_hash: str) -> list[dict[str, object]]:
     run = request.historical_input
     rows = historical_planned_coverage(run)
+    return _expected_coverage_from_rows(request, contract_hash, rows)
+
+
+def _expected_coverage_validated(
+    request: SpiderExecutionInput, contract_hash: str, token: ValidatedHistoricalInput,
+) -> list[dict[str, object]]:
+    return _expected_coverage_from_rows(
+        request, contract_hash, _historical_planned_coverage_for_input(token),
+    )
+
+
+def _expected_coverage_from_rows(
+    request: SpiderExecutionInput, contract_hash: str, rows: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    run = request.historical_input
     scheduled: list[tuple[tuple[int, int, int, str], str, str]] = []
     step_seq = cache_seq = 0
     for entry in rows:
