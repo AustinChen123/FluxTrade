@@ -21,6 +21,7 @@ from src.core.backtest.spider_historical_input import (
     InstrumentSpecEvidence,
     SourceManifest,
     ValidatedHistoricalInput,
+    _is_approved_historical_input_tree,
     _validate_historical_input_once,
     _is_structurally_immutable_historical_input_tree,
     admit_before_construction,
@@ -536,6 +537,22 @@ def test_structural_gate_requires_exact_dto_node_types(node_name):
         rows = getattr(run, node_name)
         candidate = replace(run, **{node_name: (extended, *rows[1:])})
     assert not _is_structurally_immutable_historical_input_tree(candidate)
+
+
+def test_approved_tree_predicate_never_raises_for_unexpected_values(monkeypatch):
+    assert _is_approved_historical_input_tree(_valid_run())
+    assert all(not _is_approved_historical_input_tree(value)
+               for value in (None, object(), [], {"unexpected": "tree"}))
+
+    def broken_checker(_value, **_kwargs):
+        raise RuntimeError("malformed tree probe")
+
+    monkeypatch.setattr(
+        historical_input_module,
+        "_is_structurally_immutable_historical_input_tree",
+        broken_checker,
+    )
+    assert not _is_approved_historical_input_tree(object())
 
 
 def test_token_factory_rejects_mutable_top_level_run_subclass():

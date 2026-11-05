@@ -15,6 +15,7 @@ from src.core.backtest import spider_historical_input as historical_input_module
 from src.core.backtest.spider_run_admission import admit_spider_run
 from src.core.backtest.spider_run_artifacts import (
     canonical_bytes,
+    decode_canonical,
     decode_jsonl,
     validate_artifact,
 )
@@ -422,6 +423,38 @@ def test_historical_registration_validates_once_and_link_rejects_a_stale_token(t
             changed_raw, changed_attempt, changed.run_id
         )
     assert validation_calls == before_recompute + 1
+
+
+@pytest.mark.parametrize("field", ["schema_version", "run_id", "timer_period_ms", "funding_mode"])
+@pytest.mark.parametrize("boundary_name", ["registration", "finalize_metadata"])
+def test_p3_invalid_fields_keep_head_error_taxonomy(tmp_path, field, boundary_name):
+    run, raw, attempt = historical_registration()
+    invalid = cast(dict[str, Any], decode_canonical(raw))
+    invalid[field] = []
+    invalid_raw = canonical_bytes(invalid)
+    with pytest.raises(historical_input_module.HistoricalInputError) as legacy_error:
+        historical_input_module.decode_historical_run_input(invalid_raw)
+
+    store = module.SpiderRunStore.create(str(tmp_path), run.run_id)
+    if boundary_name == "registration":
+        with pytest.raises(ValueError, match="INVALID_ARTIFACT") as caught:
+            store.register(attempt, historical_input=invalid_raw)
+        assert caught.value.__cause__ is not None
+        assert type(caught.value.__cause__) is type(legacy_error.value)
+        assert caught.value.__cause__.args == legacy_error.value.args
+        assert store._state == "CREATED"
+        assert list(store._path.iterdir()) == []
+    else:
+        assert store.register(attempt, historical_input=raw) == "NATIVE_CONSTRUCTION_ALLOWED"
+        persisted = store._path / "historical_input.json"
+        persisted.write_bytes(invalid_raw)
+        with pytest.raises(module.SpiderRunStoreError) as caught:
+            store._historical_input_metadata(attempt)
+        assert caught.value.reason == "ENDPOINT_RECONCILIATION_FAILED"
+        assert caught.value.__cause__ is not None
+        assert type(caught.value.__cause__) is type(legacy_error.value)
+        assert caught.value.__cause__.args == legacy_error.value.args
+        assert store._state == "RUNNING"
 
 
 @pytest.mark.parametrize("case", ["missing_input", "bad_input_bytes", "wrong_context", "wrong_coverage", "wrong_run_id"])

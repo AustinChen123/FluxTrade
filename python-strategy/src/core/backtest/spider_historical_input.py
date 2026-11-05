@@ -307,6 +307,14 @@ def _is_structurally_immutable_historical_input_tree(
     )
 
 
+def _is_approved_historical_input_tree(value: object) -> bool:
+    """Return false for every malformed or unexpected tree without raising."""
+    try:
+        return _is_structurally_immutable_historical_input_tree(value)
+    except Exception:
+        return False
+
+
 @dataclass(frozen=True, slots=True, init=False)
 class ValidatedHistoricalInput:
     """Private proof that this immutable run passed the canonical validator."""
@@ -1090,7 +1098,9 @@ def _encode_historical_run_input_validated_run(run: HistoricalRunInput) -> bytes
     return _canonical(value)
 
 
-def _decode_historical_run_input(raw: bytes, *, validated: bool) -> HistoricalRunInput | ValidatedHistoricalInput:
+def _decode_historical_run_input(
+    raw: bytes, *, validated: bool, candidate_only: bool = False,
+) -> HistoricalRunInput | ValidatedHistoricalInput:
     value = _decode_canonical(raw)
     row = _codec_object(value, _RUN_INPUT_KEYS, "historical run")
     raw_parameters = row["parameters"]
@@ -1137,6 +1147,8 @@ def _decode_historical_run_input(raw: bytes, *, validated: bool) -> HistoricalRu
         "initial_account_state": _codec_bytes(row["initial_account_state"], "initial account state"),
     })
     run = HistoricalRunInput(**cast(Any, decoded))
+    if candidate_only:
+        return run
     token = _validate_historical_input_once(run) if validated else None
     if not validated:
         validate_historical_input(run)
@@ -1144,6 +1156,13 @@ def _decode_historical_run_input(raw: bytes, *, validated: bool) -> HistoricalRu
          else encode_historical_run_input(run)) != raw:
         raise HistoricalInputError("noncanonical historical run encoding")
     return token if token is not None else run
+
+
+def _decode_historical_run_input_candidate(raw: bytes) -> HistoricalRunInput:
+    """Decode a DTO without validation so a local adopter can test eligibility."""
+    return cast(HistoricalRunInput, _decode_historical_run_input(
+        raw, validated=False, candidate_only=True,
+    ))
 
 
 def decode_historical_run_input(raw: bytes) -> HistoricalRunInput:
