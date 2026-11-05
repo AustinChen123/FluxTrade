@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import replace
 from decimal import Decimal as D
 from hashlib import sha256
+from pathlib import Path
+import sys
 from typing import Any, cast
 
 import pytest
@@ -23,6 +26,12 @@ from src.core.backtest.spider_gross_execution_input import (
     validate_spider_gross_execution_input,
 )
 from src.core.backtest.spider_gross_response import GrossResponseEpisode
+from src.core.backtest import (
+    spider_gross_execution_input as gross_input_module,
+    spider_historical_input,
+    spider_run_store,
+    spider_scenario_run,
+)
 from src.core.backtest.synthetic_scenario_replay import _ReplayComposition
 from src.core.backtest.spider_execution_input import validate_spider_execution_input
 from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_canonical
@@ -30,10 +39,170 @@ from test_spider_paid_endpoint_native import _seeded_two_product_run
 from test_spider_historical_input import (
     HistoricalBar,
     _initial_account_state,
+    _immutable_subclass,
     _manifest,
     _rows,
     _run_with_configuration,
 )
+
+
+@pytest.fixture(scope="module")
+def _gross_registration_case() -> tuple[bytes, dict[str, Any], str]:
+    value = _gross_input()
+    run_id = value.execution_input.historical_input.run_id
+    raw = encode_spider_gross_execution_input(value)
+    _, _, attempt = spider_scenario_run._gross_configuration(raw, run_id)
+    return raw, attempt, run_id
+
+
+def _gross_exception_chain(error: BaseException | None):
+    if error is None:
+        return None
+    return (
+        type(error).__module__, type(error).__qualname__, error.args,
+        _gross_exception_chain(error.__cause__), _gross_exception_chain(error.__context__),
+        error.__suppress_context__,
+    )
+
+
+@pytest.mark.parametrize("mutation", [
+    "missing:schema_version", "wrong:schema_version",
+    "missing:policy_id", "wrong:policy_id",
+    "missing:native_profile_id", "wrong:native_profile_id",
+    "missing:admission_policy_id", "wrong:admission_policy_id",
+    "missing:response_policy_id", "wrong:response_policy_id",
+    "missing:response_parameters", "wrong:response_parameters",
+    "missing:authorization_scope", "wrong:authorization_scope",
+    "missing:model_id", "wrong:model_id",
+    "missing:execution_input", "wrong:execution_input",
+    "extra", "nested-empty", "nested-missing-history", "nested-history-empty",
+    "nested-history-none", "nested-not-dict", "malformed-bytes", "non-utf8",
+    "non-exact-manifest",
+])
+def test_gross_registration_head_error_chain_matrix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    _gross_registration_case: tuple[bytes, dict[str, Any], str], mutation: str,
+):
+    raw, attempt, run_id = _gross_registration_case
+    if mutation == "non-exact-manifest":
+        original_manifest = spider_historical_input._decode_manifest
+        monkeypatch.setattr(
+            spider_historical_input, "_decode_manifest",
+            lambda value: _immutable_subclass(original_manifest(value)),
+        )
+    if mutation == "malformed-bytes":
+        malformed = b"{"
+    elif mutation == "non-utf8":
+        malformed = b"\xff"
+    else:
+        row = cast(dict[str, Any], decode_canonical(raw))
+        if mutation.startswith("missing:"):
+            row.pop(mutation.split(":", 1)[1])
+        elif mutation.startswith("wrong:"):
+            field = mutation.split(":", 1)[1]
+            row[field] = "NOT_NULL" if field == "model_id" else None
+        elif mutation == "extra":
+            row["extra"] = True
+        elif mutation == "nested-empty":
+            row["execution_input"] = {}
+        elif mutation == "nested-missing-history":
+            row["execution_input"].pop("historical_input")
+        elif mutation == "nested-history-empty":
+            row["execution_input"]["historical_input"] = {}
+        elif mutation == "nested-history-none":
+            row["execution_input"]["historical_input"] = None
+        elif mutation == "nested-not-dict":
+            row["execution_input"] = []
+        malformed = canonical_bytes(row)
+    with pytest.raises(Exception) as head_error:
+        decode_spider_gross_execution_input(malformed)
+    root = tmp_path / "gross"
+    root.mkdir()
+    store = spider_run_store.SpiderRunStore.create(str(root), run_id)
+    with pytest.raises(ValueError) as registration_error:
+        store.register(deepcopy(attempt), gross_execution_input=malformed)
+    error = registration_error.value
+    assert error.args == ("INVALID_ARTIFACT",)
+    assert _gross_exception_chain(error.__cause__) == _gross_exception_chain(head_error.value)
+    assert error.__context__ is error.__cause__ and error.__suppress_context__
+    assert store._state == "CREATED" and list(store._path.iterdir()) == []
+
+
+def test_gross_registration_token_counts_fallback_and_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    _gross_registration_case: tuple[bytes, dict[str, Any], str],
+):
+    raw, attempt, run_id = _gross_registration_case
+    original = spider_historical_input.validate_historical_input
+    original_register = spider_run_store.SpiderRunStore._execution_registration
+    module_calls = all_calls = 0
+
+    def counted(value):
+        nonlocal module_calls
+        module_calls += 1
+        return original(value)
+
+    def profile(frame, event, _arg):
+        nonlocal all_calls
+        if event == "call" and frame.f_code is original.__code__:
+            all_calls += 1
+
+    def measured(self, *args, **kwargs):
+        sys.setprofile(profile)
+        try:
+            return original_register(self, *args, **kwargs)
+        finally:
+            sys.setprofile(None)
+
+    monkeypatch.setattr(spider_historical_input, "validate_historical_input", counted)
+    monkeypatch.setattr(spider_run_store.SpiderRunStore, "_execution_registration", measured)
+    roots = []
+    stores = []
+    for label, unsafe in (("exact", False), ("fallback", True)):
+        root = tmp_path / label
+        root.mkdir()
+        roots.append(root)
+        with monkeypatch.context() as patch:
+            if unsafe:
+                patch.setattr(gross_input_module, "_is_approved_historical_input_tree", lambda _run: False)
+            store = spider_run_store.SpiderRunStore.create(str(root), run_id)
+            stores.append(store)
+            assert store.register(deepcopy(attempt), gross_execution_input=raw) == "NATIVE_CONSTRUCTION_ALLOWED"
+        assert (module_calls, all_calls) == ((1, 1) if not unsafe else (10, 23))
+        module_calls = all_calls = 0
+    for name in ("attempt.json", "status.json", "execution_input.json", "journal.jsonl"):
+        assert (stores[0]._path / name).read_bytes() == (stores[1]._path / name).read_bytes()
+    assert (stores[0]._path / "execution_input.json").read_bytes() == raw
+
+
+def test_gross_registration_rejects_a_token_bound_to_another_decoded_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    _gross_registration_case: tuple[bytes, dict[str, Any], str],
+):
+    raw, _attempt, run_id = _gross_registration_case
+    original_decode = spider_run_store._decode_spider_gross_execution_input_validated
+    _old_value, stale_token, _old_hash, _old_base_hash = original_decode(raw)
+    request = decode_spider_gross_execution_input(raw)
+    changed_run = replace(
+        request.execution_input.historical_input, run_id=f"{run_id}-fresh",
+    )
+    changed_request = replace(
+        request,
+        execution_input=replace(request.execution_input, historical_input=changed_run),
+    )
+    changed_raw = encode_spider_gross_execution_input(changed_request)
+    fresh_value, _fresh_token, gross_hash, base_hash = original_decode(changed_raw)
+    _, _, changed_attempt = spider_scenario_run._gross_configuration(changed_raw, changed_run.run_id)
+    monkeypatch.setattr(
+        spider_run_store, "_decode_spider_gross_execution_input_validated",
+        lambda _raw: (fresh_value, stale_token, gross_hash, base_hash),
+    )
+    root = tmp_path / "stale-token"
+    root.mkdir()
+    store = spider_run_store.SpiderRunStore.create(str(root), changed_run.run_id)
+    with pytest.raises(ValueError, match="INVALID_ARTIFACT"):
+        store.register(changed_attempt, gross_execution_input=changed_raw)
+    assert store._state == "CREATED" and list(store._path.iterdir()) == []
 
 
 def _gross_input() -> SpiderGrossExecutionInput:

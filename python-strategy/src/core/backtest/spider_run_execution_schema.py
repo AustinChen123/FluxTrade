@@ -22,6 +22,7 @@ from src.core.backtest.spider_floating_exit_input import (
     validate_spider_floating_exit_input,
 )
 from src.core.backtest.spider_gross_execution_input import (
+    SpiderGrossExecutionInput,
     decode_spider_gross_execution_input,
     validate_spider_gross_execution_input,
 )
@@ -179,6 +180,12 @@ def gross_execution_context_from_input(raw: bytes) -> dict[str, object]:
     value = decode_spider_gross_execution_input(raw)
     gross_hash = validate_spider_gross_execution_input(value)
     base_hash = validate_spider_execution_input(value.execution_input)
+    return _gross_execution_context_for_input(value, gross_hash, base_hash)
+
+
+def _gross_execution_context_for_input(
+    value: SpiderGrossExecutionInput, gross_hash: str, base_hash: str,
+) -> dict[str, object]:
     run = value.execution_input
     return dict(
         schema_version="spider_gross_execution_context_v1",

@@ -32,6 +32,7 @@ from src.core.backtest.spider_run_execution_schema import (
     execution_context_from_input,
     _execution_context_for_input,
     gross_execution_context_from_input,
+    _gross_execution_context_for_input,
     floating_exit_context_from_input,
     _floating_exit_context_for_input,
     validate_execution_artifact,
@@ -46,8 +47,8 @@ from src.core.backtest.spider_floating_exit_input import (
     decode_spider_floating_exit_input,
 )
 from src.core.backtest.spider_gross_execution_input import (
+    _decode_spider_gross_execution_input_validated,
     decode_spider_gross_execution_input,
-    validate_spider_gross_execution_input,
 )
 from src.core.backtest.spider_run_artifacts import (
     _HASH_NAMES,
@@ -223,10 +224,15 @@ class SpiderRunStore:
             raise ValueError("INVALID_ARTIFACT")
         historical_token: ValidatedHistoricalInput | None = None
         if gross_execution:
-            gross_request = decode_spider_gross_execution_input(raw)
-            wrapper_hash = validate_spider_gross_execution_input(gross_request)
+            gross_request, historical_token, wrapper_hash, base_hash = (
+                _decode_spider_gross_execution_input_validated(raw)
+            )
             request = gross_request.execution_input
-            execution = gross_execution_context_from_input(raw)
+            execution = (
+                _gross_execution_context_for_input(gross_request, wrapper_hash, base_hash)
+                if historical_token is not None and base_hash is not None
+                else gross_execution_context_from_input(raw)
+            )
             context = validate_gross_execution_context(execution)
         elif floating_exit:
             floating_request, historical_token, wrapper_hash, base_hash = (
