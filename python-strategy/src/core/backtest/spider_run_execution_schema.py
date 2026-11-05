@@ -17,6 +17,7 @@ from src.core.backtest.spider_execution_input import (
     validate_spider_execution_input,
 )
 from src.core.backtest.spider_floating_exit_input import (
+    SpiderFloatingExitInput,
     decode_spider_floating_exit_input,
     validate_spider_floating_exit_input,
 )
@@ -150,6 +151,12 @@ def floating_exit_context_from_input(raw: bytes) -> dict[str, object]:
     value = decode_spider_floating_exit_input(raw)
     candidate_hash = validate_spider_floating_exit_input(value)
     base_hash = validate_spider_execution_input(value.execution_input)
+    return _floating_exit_context_for_input(value, candidate_hash, base_hash)
+
+
+def _floating_exit_context_for_input(
+    value: SpiderFloatingExitInput, candidate_hash: str, base_hash: str,
+) -> dict[str, object]:
     run = value.execution_input
     return dict(
         schema_version="spider_floating_exit_context_v1",

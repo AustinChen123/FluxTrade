@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
+import sys
 from typing import Any, cast
 
 import pytest
 
 from src.core.backtest import spider_run_store, spider_scenario_run
-from src.core.backtest.spider_floating_exit_input import encode_spider_floating_exit_input
+from src.core.backtest import spider_floating_exit_input, spider_historical_input
+from src.core.backtest.spider_floating_exit_input import (
+    decode_spider_floating_exit_input,
+    encode_spider_floating_exit_input,
+)
 from src.core.backtest.spider_run_admission import admit_spider_run
 from src.core.backtest.spider_run_artifacts import (
     canonical_bytes,
@@ -40,9 +46,184 @@ from test_spider_floating_exit_host import (
     D,
 )
 from test_spider_historical_input import _initial_account_state
+from test_spider_historical_input import _immutable_subclass
 
 
 _SELECTOR = "SPIDER_FLOATING_EXIT_RESEARCH_RUN_V1"
+
+
+def _exception_chain(error: BaseException | None):
+    if error is None:
+        return None
+    return (
+        type(error).__module__, type(error).__qualname__, error.args,
+        _exception_chain(error.__cause__), _exception_chain(error.__context__),
+        error.__suppress_context__,
+    )
+
+
+def _floating_registration_fixture():
+    run = _seeded_candidate_run(minutes=22)
+    request = _candidate(run, FIXED_REMAINING_COST_TP_V1,
+                         cutoff=run.range_start_ms + 20 * 60_000)
+    raw = encode_spider_floating_exit_input(request)
+    _, _, attempt = spider_scenario_run._floating_configuration(raw, run.run_id)
+    return run, request, raw, attempt
+
+
+def test_floating_registration_token_counts_fallback_bytes_and_stale_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    run, request, raw, attempt = _floating_registration_fixture()
+    original_validator = spider_historical_input.validate_historical_input
+    original_registration = spider_run_store.SpiderRunStore._execution_registration
+    original_decode = spider_run_store._decode_spider_floating_exit_input_validated
+    module_calls = 0
+    all_calls = 0
+    validation_frames = []
+    decoded = []
+
+    def count_module_alias(value):
+        nonlocal module_calls
+        module_calls += 1
+        return original_validator(value)
+
+    def count_all_aliases(frame, event, _arg):
+        nonlocal all_calls
+        if event == "call" and frame.f_code is original_validator.__code__:
+            all_calls += 1
+            caller = frame.f_back
+            validation_frames.append((caller.f_code.co_filename, caller.f_code.co_name, caller.f_lineno))
+
+    def capture_decode(value):
+        result = original_decode(value)
+        decoded.append(result)
+        return result
+
+    def measured_registration(self, *args, **kwargs):
+        sys.setprofile(count_all_aliases)
+        try:
+            return original_registration(self, *args, **kwargs)
+        finally:
+            sys.setprofile(None)
+
+    monkeypatch.setattr(spider_historical_input, "validate_historical_input", count_module_alias)
+    monkeypatch.setattr(spider_run_store, "_decode_spider_floating_exit_input_validated", capture_decode)
+    monkeypatch.setattr(spider_run_store.SpiderRunStore, "_execution_registration", measured_registration)
+
+    exact_root = tmp_path / "exact"
+    exact_root.mkdir()
+    exact_store = spider_run_store.SpiderRunStore.create(str(exact_root), run.run_id)
+    assert exact_store.register(deepcopy(attempt), floating_exit_input=raw) == "NATIVE_CONSTRUCTION_ALLOWED"
+    assert module_calls == all_calls == 1, validation_frames
+    exact_value, exact_token, exact_hash, exact_base_hash = decoded[-1]
+    assert exact_token is not None and exact_token.run is exact_value.execution_input.historical_input
+    assert exact_hash and exact_base_hash
+
+    fallback_root = tmp_path / "fallback"
+    fallback_root.mkdir()
+    module_calls = all_calls = 0
+    with monkeypatch.context() as fallback_patch:
+        fallback_patch.setattr(
+            spider_floating_exit_input,
+            "_is_approved_historical_input_tree",
+            lambda _value: False,
+        )
+        fallback_store = spider_run_store.SpiderRunStore.create(str(fallback_root), run.run_id)
+        assert fallback_store.register(deepcopy(attempt), floating_exit_input=raw) == (
+            "NATIVE_CONSTRUCTION_ALLOWED"
+        )
+    assert module_calls == 10 and all_calls == 29
+    assert decoded[-1][1] is None
+    for name in ("attempt.json", "status.json", "execution_input.json"):
+        assert (exact_store._path / name).read_bytes() == (fallback_store._path / name).read_bytes()
+
+    changed_run = replace(
+        request.execution_input.historical_input,
+        run_id=request.execution_input.historical_input.run_id + "-fresh",
+    )
+    changed_request = replace(
+        request,
+        execution_input=replace(
+            request.execution_input,
+            historical_input=changed_run,
+        ),
+    )
+    changed_raw = encode_spider_floating_exit_input(changed_request)
+    fresh_value, _fresh_token, changed_hash, changed_base_hash = original_decode(changed_raw)
+    changed_attempt = deepcopy(attempt)
+    changed_attempt["run_id"] = changed_run.run_id
+    stale_token = cast(Any, exact_token)
+    monkeypatch.setattr(
+        spider_run_store,
+        "_decode_spider_floating_exit_input_validated",
+        lambda _raw: (fresh_value, stale_token, changed_hash, changed_base_hash),
+    )
+    stale_root = tmp_path / "stale"
+    stale_root.mkdir()
+    stale_store = spider_run_store.SpiderRunStore.create(str(stale_root), changed_run.run_id)
+    with pytest.raises(ValueError, match="INVALID_ARTIFACT"):
+        stale_store.register(changed_attempt, floating_exit_input=changed_raw)
+    assert stale_store._state == "CREATED" and list(stale_store._path.iterdir()) == []
+
+
+def test_floating_non_exact_manifest_fallback_preserves_error_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    _run, _request, raw, attempt = _floating_registration_fixture()
+    original_manifest = spider_historical_input._decode_manifest
+
+    def extended_manifest(value):
+        return _immutable_subclass(original_manifest(value))
+
+    monkeypatch.setattr(spider_historical_input, "_decode_manifest", extended_manifest)
+    with pytest.raises(Exception) as public_error:
+        decode_spider_floating_exit_input(raw)
+    root = tmp_path / "non-exact"
+    root.mkdir()
+    store = spider_run_store.SpiderRunStore.create(str(root), cast(str, attempt["run_id"]))
+    with pytest.raises(ValueError, match="INVALID_ARTIFACT") as registered_error:
+        store.register(attempt, floating_exit_input=raw)
+    assert registered_error.value.__cause__ is not None
+    assert _exception_chain(registered_error.value.__cause__) == _exception_chain(public_error.value)
+    assert store._state == "CREATED" and list(store._path.iterdir()) == []
+
+
+@pytest.mark.parametrize("mutate", [
+    pytest.param(lambda row: row.update(execution_input={}), id="nested-empty"),
+    pytest.param(lambda row: row["execution_input"].pop("historical_input"), id="nested-missing-history"),
+    pytest.param(lambda row: row["execution_input"].update(policy_id="BAD", historical_input=None), id="nested-wrong-identity-history"),
+    pytest.param(lambda row: row["execution_input"].update(extra=True, historical_input=None), id="nested-extra-history"),
+    pytest.param(lambda row: row.pop("schema_version"), id="missing-schema-version"),
+    pytest.param(lambda row: row.update(schema_version=None), id="wrong-schema-version"),
+    pytest.param(lambda row: row.pop("policy_id"), id="missing-policy-id"),
+    pytest.param(lambda row: row.update(policy_id=None), id="wrong-policy-id"),
+    pytest.param(lambda row: row.pop("decision_policy_id"), id="missing-decision-policy-id"),
+    pytest.param(lambda row: row.update(decision_policy_id=None), id="wrong-decision-policy-id"),
+    pytest.param(lambda row: row.pop("model_id"), id="missing-model-id"),
+    pytest.param(lambda row: row.update(model_id=None), id="wrong-model-id"),
+    pytest.param(lambda row: row.pop("execution_input"), id="missing-execution-input"),
+    pytest.param(lambda row: row.update(execution_input=None), id="wrong-execution-input"),
+])
+def test_malformed_floating_registration_preserves_legacy_exception_chain(
+    tmp_path: Path, mutate,
+):
+    run, _request, raw, attempt = _floating_registration_fixture()
+    row = cast(dict[str, Any], decode_canonical(raw))
+    mutate(row)
+    malformed = canonical_bytes(row)
+    with pytest.raises(Exception) as legacy_error:
+        decode_spider_floating_exit_input(malformed)
+    root = tmp_path / "malformed"
+    root.mkdir()
+    store = spider_run_store.SpiderRunStore.create(str(root), run.run_id)
+    with pytest.raises(ValueError, match="INVALID_ARTIFACT") as registered_error:
+        store.register(attempt, floating_exit_input=malformed)
+    error = registered_error.value
+    assert error.args == ("INVALID_ARTIFACT",)
+    assert _exception_chain(error.__cause__) == _exception_chain(legacy_error.value)
+    assert error.__context__ is error.__cause__ and error.__suppress_context__
+    assert store._state == "CREATED" and list(store._path.iterdir()) == []
 
 
 @pytest.mark.slow

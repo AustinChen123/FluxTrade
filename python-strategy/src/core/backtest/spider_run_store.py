@@ -33,6 +33,7 @@ from src.core.backtest.spider_run_execution_schema import (
     _execution_context_for_input,
     gross_execution_context_from_input,
     floating_exit_context_from_input,
+    _floating_exit_context_for_input,
     validate_execution_artifact,
 )
 from src.core.backtest.spider_run_execution_evidence import build_execution_reconciliation
@@ -41,8 +42,8 @@ from src.core.backtest.spider_execution_input import (
     decode_spider_execution_input,
 )
 from src.core.backtest.spider_floating_exit_input import (
+    _decode_spider_floating_exit_input_validated,
     decode_spider_floating_exit_input,
-    validate_spider_floating_exit_input,
 )
 from src.core.backtest.spider_gross_execution_input import (
     decode_spider_gross_execution_input,
@@ -228,10 +229,15 @@ class SpiderRunStore:
             execution = gross_execution_context_from_input(raw)
             context = validate_gross_execution_context(execution)
         elif floating_exit:
-            floating_request = decode_spider_floating_exit_input(raw)
-            wrapper_hash = validate_spider_floating_exit_input(floating_request)
+            floating_request, historical_token, wrapper_hash, base_hash = (
+                _decode_spider_floating_exit_input_validated(raw)
+            )
             request = floating_request.execution_input
-            execution = floating_exit_context_from_input(raw)
+            execution = (
+                _floating_exit_context_for_input(floating_request, wrapper_hash, base_hash)
+                if historical_token is not None and base_hash is not None
+                else floating_exit_context_from_input(raw)
+            )
             context = validate_floating_exit_context(execution)
         else:
             request, historical_token, wrapper_hash = _decode_spider_execution_input_validated(raw)
