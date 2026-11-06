@@ -111,8 +111,13 @@ def test_real_callers_match_head_error_matrix():
                     return fake
                 def execute(*args):
                     raise error
+                def historical_configuration(*_args, **kwargs):
+                    legacy = (object(), {}, [])
+                    return (*legacy, None) if kwargs.get("_tokenized") else legacy
                 with patch.object(scenario, "_Store", SimpleNamespace(create=create)), \
-                     patch.object(scenario, "_historical_configuration", return_value=(object(), {}, {})), \
+                     patch.object(
+                         scenario, "_historical_configuration", side_effect=historical_configuration,
+                     ), \
                      patch.object(scenario, "_attempt", return_value={}), \
                      patch.object(scenario, "_execute_historical", execute):
                     try:
