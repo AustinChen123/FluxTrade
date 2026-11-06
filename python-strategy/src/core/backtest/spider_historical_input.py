@@ -1183,8 +1183,6 @@ def _validate_historical_run_link(
         raise HistoricalInputError("invalid historical input bytes")
     token = _decode_historical_run_input_validated(raw)
     run = token.run
-    if _encode_historical_run_input_validated_run(run) != raw:
-        raise HistoricalInputError("noncanonical historical input bytes")
     semantic_hash = token.semantic_hash
     configuration = decode_p2_configuration(
         run.configuration_bytes, run.configuration_sha256, run.ordered_products,

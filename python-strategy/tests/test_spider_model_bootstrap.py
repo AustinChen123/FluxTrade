@@ -267,6 +267,43 @@ def _source_market_payload(run, prepared, snapshot_id="a" * 64):
     })
 
 
+def test_model_bootstrap_reuses_validated_input_and_preserves_legacy_fallback(monkeypatch):
+    from src.core.backtest import spider_execution_input, spider_historical_input, spider_historical_replay
+    from src.core.spider_management import model_bootstrap
+
+    run = _admitted_run()
+    confirmation = _confirmation(run)
+    selection = _selection(run, confirmation)
+    original = spider_historical_input.validate_historical_input
+    original_mint = spider_historical_input._validate_historical_input_once
+    calls = []
+    mints = []
+
+    def count_validation(value):
+        calls.append(value)
+        return original(value)
+
+    def count_mint(value):
+        mints.append(value)
+        return original_mint(value)
+
+    for module in (spider_historical_input, spider_historical_replay, spider_execution_input, model_bootstrap):
+        monkeypatch.setattr(module, "validate_historical_input", count_validation)
+    monkeypatch.setattr(model_bootstrap, "_validate_historical_input_once", count_mint)
+
+    validated = _prepare(run, selection, confirmation)
+    assert calls == [run]
+    assert mints == [run]
+
+    calls.clear()
+    mints.clear()
+    monkeypatch.setattr(model_bootstrap, "_is_approved_historical_input_tree", lambda _value: False)
+    legacy = _prepare(run, selection, confirmation)
+    assert calls == [run, run, run, run]
+    assert not mints
+    assert validated == legacy
+
+
 def test_source_market_codec_replaces_only_decimal_observation_fields():
     run = _admitted_run()
     confirmation = _confirmation(run)

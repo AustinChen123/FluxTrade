@@ -94,6 +94,28 @@ def test_builder_is_deterministic_and_obeys_window_decimal_and_ordering(tmp_path
     assert end not in all_source_times
 
 
+def test_builder_validates_once_and_keeps_public_canonical_bytes(tmp_path: Path, monkeypatch) -> None:
+    from tools import spider_historical_fixture as fixture_tool
+    from src.core.backtest import spider_historical_input
+
+    candle_root, meta_root, start, _end = _source_tree(tmp_path)
+    original = spider_historical_input.validate_historical_input
+    calls = []
+
+    def count_validation(run):
+        calls.append(run)
+        return original(run)
+
+    monkeypatch.setattr(spider_historical_input, "validate_historical_input", count_validation)
+    raw = fixture_tool.build_input(
+        products=_PRODUCTS, horizon_minutes=3, start_ms=start, run_id="one-validation",
+        candle_root=candle_root, meta_root=meta_root,
+    )
+    assert len(calls) == 1
+    decoded = decode_historical_run_input(raw)
+    assert encode_historical_run_input(decoded) == raw
+
+
 def test_builder_reports_exact_missing_candle_after_valid_metadata(tmp_path: Path) -> None:
     expected = tmp_path / "candles" / f"{_PRODUCTS[1]}_1m_mark.csv.gz"
     candle_root, meta_root, start, _end = _source_tree(tmp_path, missing=expected)

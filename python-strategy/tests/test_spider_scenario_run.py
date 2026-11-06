@@ -15,6 +15,7 @@ from typing import Any, Callable, cast
 import pytest
 
 from src.core.backtest import spider_scenario_run as run, synthetic_scenario_codec as wire
+from src.core.backtest import spider_historical_input as historical_codec
 from src.core.backtest import spider_run_evidence as run_evidence
 from src.core.backtest import spider_historical_execution as historical_execution
 from src.core.backtest import spider_historical_durable_ports as durable_ports
@@ -179,13 +180,37 @@ def test_invalid_transport_never_creates(tmp_path, field, value):
 
 
 @pytest.mark.parametrize("partial_fill", [False, True])
-def test_public_historical_run_uses_existing_store_and_admission(tmp_path, partial_fill):
+def test_public_historical_run_uses_existing_store_and_admission(tmp_path, monkeypatch, partial_fill):
     value, raw = historical_input("historical-fill" if partial_fill else "historical-flat",
                                   partial_fill=partial_fill)
     result = run.run_spider_scenario(str(tmp_path), value.run_id, run._P3_SELECTOR, raw)
     assert result == dict(run_id=value.run_id, outcome="ADMITTED", reason=None)
+
+    validators, mints, encodings = [], [], []
+    original_validate = historical_codec.validate_historical_input
+    original_mint = historical_codec._validate_historical_input_once
+    original_encode = historical_codec._encode_historical_run_input_validated_run
+
+    def count_validation(run_input):
+        validators.append(run_input)
+        return original_validate(run_input)
+
+    def count_mint(run_input):
+        mints.append(run_input)
+        return original_mint(run_input)
+
+    def count_encoding(run_input):
+        encodings.append(run_input)
+        return original_encode(run_input)
+
+    monkeypatch.setattr(historical_codec, "validate_historical_input", count_validation)
+    monkeypatch.setattr(historical_codec, "_validate_historical_input_once", count_mint)
+    monkeypatch.setattr(
+        historical_codec, "_encode_historical_run_input_validated_run", count_encoding
+    )
     admitted = admit_spider_run(tmp_path / value.run_id)
     assert admitted["decision"] == "ACCEPT"
+    assert len(validators) == len(mints) == len(encodings) == 1
     artifacts = admitted["artifacts"]
     assert artifacts["historical_input.json"]["run_id"] == value.run_id
     assert artifacts["attempt.json"]["run_contract_id"] == run._P3_RUN_CONTRACT

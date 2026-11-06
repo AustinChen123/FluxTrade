@@ -30,8 +30,8 @@ from src.core.backtest.spider_historical_input import (
     HistoricalRunInput,
     InstrumentSpecEvidence,
     SourceManifest,
-    encode_historical_run_input,
-    validate_historical_input,
+    _encode_historical_run_input_validated_run,
+    _validate_historical_input_once,
 )
 from src.core.backtest.spider_run_artifacts import canonical_bytes
 from src.core.backtest.spider_scenario_run import _P3_POLICY_SOURCE
@@ -223,8 +223,8 @@ def build_input(
         Decimal("10"), "MODELLING_ASSUMPTION", 5000, start + 5000, "UTC", 1, 5001, 2, 2,
         "POLL_ORDERED_V1", "MTM_PRESERVE_OPEN_V1", canonical_bytes(cache), account,
     )
-    validate_historical_input(run)
-    return encode_historical_run_input(run)
+    token = _validate_historical_input_once(run)
+    return _encode_historical_run_input_validated_run(token.run)
 
 
 def main() -> None:
