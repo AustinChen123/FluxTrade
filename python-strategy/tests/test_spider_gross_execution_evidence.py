@@ -936,3 +936,207 @@ def test_actual_native_economic_terminal_bundle_is_stored_and_admitted(
             facts["report"]["gross_observation"]["final_obligation_state"][
                 "native_state"]["gross_admission"]["effective_equity"]
         )
+
+
+def _gross_reconciliation_exception_tree(error: BaseException | None):
+    if error is None:
+        return None
+    return (
+        type(error).__module__, type(error).__qualname__, error.args,
+        error.__suppress_context__,
+        _gross_reconciliation_exception_tree(error.__cause__),
+        _gross_reconciliation_exception_tree(error.__context__),
+    )
+
+
+def _gross_reconciliation_invalid_inputs(raw: bytes) -> list[tuple[str, bytes]]:
+    from src.core.backtest.spider_run_artifacts import canonical_bytes
+
+    wrapper = cast(dict[str, Any], decode_canonical(raw))
+    cases: list[tuple[str, bytes]] = []
+
+    def add(label: str, value: object) -> None:
+        cases.append((label, value if type(value) is bytes else canonical_bytes(value)))
+
+    for field in sorted(wrapper):
+        row = deepcopy(wrapper)
+        del row[field]
+        add(f"outer-missing-{field}", row)
+    for field in sorted(wrapper):
+        row = deepcopy(wrapper)
+        row[field] = []
+        add(f"outer-wrong-{field}", row)
+    row = deepcopy(wrapper)
+    row["extra"] = 1
+    add("outer-extra", row)
+    execution = cast(dict[str, Any], wrapper["execution_input"])
+    for field in sorted(execution):
+        row = deepcopy(wrapper)
+        del cast(dict[str, Any], row["execution_input"])[field]
+        add(f"execution-missing-{field}", row)
+    for field in sorted(execution):
+        row = deepcopy(wrapper)
+        cast(dict[str, Any], row["execution_input"])[field] = []
+        add(f"execution-wrong-{field}", row)
+    history = cast(dict[str, Any], execution["historical_input"])
+    for field in sorted(history):
+        row = deepcopy(wrapper)
+        del cast(dict[str, Any], row["execution_input"])["historical_input"][field]
+        add(f"history-missing-{field}", row)
+    for field in sorted(history):
+        row = deepcopy(wrapper)
+        cast(dict[str, Any], row["execution_input"])["historical_input"][field] = []
+        add(f"history-wrong-{field}", row)
+    for label, value in (("empty", {}), ("list", []), ("none", None)):
+        row = deepcopy(wrapper)
+        cast(dict[str, Any], row["execution_input"])["historical_input"] = value
+        add(f"history-{label}", row)
+    add("empty-bytes", b"")
+    add("non-utf8", b"\xff")
+    return cases
+
+
+def test_gross_reconciliation_invalid_exception_chains_match_head():
+    from src.core.backtest.spider_execution_input import decode_spider_execution_input
+    from src.core.backtest.spider_gross_execution_input import decode_spider_gross_execution_input
+
+    artifacts, facts = _actual_gross_bundle()
+    empty_artifacts = {name: b"" for name in (
+        "attempt.json", "status.json", "execution_input.json", "journal.jsonl",
+        "paid_endpoint.json", "report.jsonl",
+    )}
+    for label, encoded in _gross_reconciliation_invalid_inputs(artifacts["execution_input.json"]):
+        changed = dict(empty_artifacts, **{"execution_input.json": encoded})
+        if label in ("empty-bytes", "non-utf8"):
+            expected_decoder = decode_canonical
+        else:
+            decoded = decode_canonical(encoded)
+            expected_decoder = (
+                decode_spider_gross_execution_input
+                if type(decoded) is dict
+                and decoded.get("schema_version") == "spider_gross_execution_input_v1"
+                else decode_spider_execution_input
+            )
+        with pytest.raises(BaseException) as expected:
+            expected_decoder(encoded)
+        with pytest.raises(BaseException) as actual:
+            evidence.build_execution_reconciliation(facts["run_id"], changed)
+        assert _gross_reconciliation_exception_tree(actual.value) == (
+            _gross_reconciliation_exception_tree(expected.value)
+        ), label
+
+
+@pytest.mark.parametrize(("force_fallback", "expected_calls"), [(False, 1), (True, 24)])
+def test_gross_reconciliation_mints_fresh_token_or_matches_head_fallback(
+    monkeypatch: pytest.MonkeyPatch, force_fallback: bool, expected_calls: int,
+):
+    import hashlib
+    import sys
+    from src.core.backtest import spider_gross_execution_input as gross_input
+    from src.core.backtest import spider_historical_input as historical_input
+    from src.core.backtest.spider_execution_input import validate_spider_execution_input
+    from src.core.backtest.spider_gross_execution_input import (
+        decode_spider_gross_execution_input, validate_spider_gross_execution_input,
+    )
+    from src.core.backtest.spider_run_execution_schema import gross_execution_context_from_input
+
+    artifacts, facts = _actual_gross_bundle()
+    raw = artifacts["execution_input.json"]
+    value = decode_spider_gross_execution_input(raw)
+    expected_hash = validate_spider_gross_execution_input(value)
+    expected_base_hash = validate_spider_execution_input(value.execution_input)
+    original_validator = historical_input.validate_historical_input
+    validator_calls = [0]
+
+    def profile(frame: Any, event: str, _arg: object) -> None:
+        if event == "call" and frame.f_code is original_validator.__code__:
+            validator_calls[0] += 1
+
+    decoded: list[Any] = []
+    contexts: list[dict[str, object]] = []
+    legacy_contexts: list[bytes] = []
+    checked_tokens: list[object] = []
+    journal_tokens: list[object] = []
+    original_decode = evidence._decode_spider_gross_execution_input_validated
+    original_context = evidence.gross_execution_context
+    original_legacy_context = evidence.gross_execution_context_from_input
+    original_input_check = evidence._input_check
+    original_journal_check = evidence._journal_check
+
+    def capture_decode(candidate: bytes):
+        result = original_decode(candidate)
+        decoded.append(result)
+        return result
+
+    def capture_context(wire: dict[str, object]):
+        contexts.append(wire)
+        return original_context(wire)
+
+    def capture_legacy_context(candidate: bytes):
+        legacy_contexts.append(candidate)
+        return original_legacy_context(candidate)
+
+    def capture_input_check(*args: Any, **kwargs: Any):
+        checked_tokens.append(kwargs.get("historical_token"))
+        return original_input_check(*args, **kwargs)
+
+    def capture_journal_check(*args: Any, **kwargs: Any):
+        journal_tokens.append(args[8] if len(args) > 8 else kwargs.get("historical_token"))
+        return original_journal_check(*args, **kwargs)
+
+    monkeypatch.setattr(evidence, "_decode_spider_gross_execution_input_validated", capture_decode)
+    monkeypatch.setattr(evidence, "gross_execution_context", capture_context)
+    monkeypatch.setattr(evidence, "gross_execution_context_from_input", capture_legacy_context)
+    monkeypatch.setattr(evidence, "_input_check", capture_input_check)
+    monkeypatch.setattr(evidence, "_journal_check", capture_journal_check)
+    if force_fallback:
+        monkeypatch.setattr(gross_input, "_is_approved_historical_input_tree", lambda _run: False)
+
+    sys.setprofile(profile)
+    try:
+        result = evidence.build_execution_reconciliation(facts["run_id"], artifacts)
+    finally:
+        sys.setprofile(None)
+
+    assert validator_calls[0] == expected_calls
+    assert len(decoded) == 1
+    decoded_value, token, wrapper_hash, base_hash = decoded[0]
+    assert decoded_value == value
+    assert wrapper_hash == expected_hash
+    if force_fallback:
+        assert token is None and base_hash is None
+        assert checked_tokens == [None] and journal_tokens == [None]
+        assert legacy_contexts == [raw]
+        assert contexts == [gross_execution_context_from_input(raw)]
+    else:
+        assert token is not None and token.run is decoded_value.execution_input.historical_input
+        assert base_hash == expected_base_hash
+        assert checked_tokens == [token] and journal_tokens == [token]
+        assert legacy_contexts == []
+        assert len(contexts) == 1
+        assert contexts[0]["execution_input_sha256"] == expected_hash
+        assert contexts[0]["base_execution_input_sha256"] == expected_base_hash
+        assert {key for key in contexts[0] if key.endswith("_sha256")} == {
+            "execution_input_sha256", "base_execution_input_sha256",
+        }
+    assert result["result"] == "OK"
+    assert hashlib.sha256(canonical_bytes(result)).hexdigest() == (
+        "4a598b8a029298f43482699a6e1319e956a00c004a6e70393f75b54f715cdd3f"
+    )
+
+
+def test_gross_reconciliation_rejects_foreign_historical_token():
+    from src.core.backtest.spider_historical_input import _validate_historical_input_once
+
+    _artifacts, facts = _actual_gross_bundle()
+    request = facts["request"]
+    foreign = replace(request.execution_input.historical_input, run_id="foreign-gross-run")
+    token = _validate_historical_input_once(foreign)
+    assert token.run is not request.execution_input.historical_input
+    assert not evidence._input_check(
+        "", {}, {}, {}, {}, request.execution_input, cast(Any, None), cast(Any, None),
+        cast(Any, None), gross_execution=True, historical_token=token,
+    )
+    assert not evidence._journal_check(
+        "", {}, {}, [], {}, request.execution_input, "", {}, token,
+    )

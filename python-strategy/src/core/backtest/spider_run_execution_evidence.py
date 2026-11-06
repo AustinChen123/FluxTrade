@@ -29,8 +29,9 @@ from src.core.backtest.spider_floating_exit_input import (
     decode_spider_floating_exit_input,
 )
 from src.core.backtest.spider_gross_execution_input import (
+    _decode_spider_gross_execution_input_validated,
     decode_spider_gross_execution_input,
-    validate_spider_gross_execution_input,
+    validate_spider_gross_execution_input,  # noqa: F401 - retained module-level validation seam
 )
 from src.core.backtest.spider_floating_exit_policy import decide_floating_exits
 from src.core.backtest.spider_bayes_replay import prepare_closed15m_source14
@@ -69,6 +70,7 @@ from src.core.backtest.spider_run_execution_schema import (
     _CHECKS,
     _execution_context_for_input,
     _floating_exit_context_for_input,
+    _gross_execution_context_for_input,
     execution_context_from_input,
     floating_exit_context_from_input,
     gross_execution_context_from_input,
@@ -1415,10 +1417,16 @@ def build_execution_reconciliation(run_id: str, artifacts: Mapping[str, bytes]) 
     floating_request = None
     historical_token: ValidatedHistoricalInput | None = None
     if gross_execution:
-        gross_request = decode_spider_gross_execution_input(raw_input)
+        gross_request, historical_token, wrapper_hash, base_hash = (
+            _decode_spider_gross_execution_input_validated(raw_input)
+        )
         request = gross_request.execution_input
-        wrapper_hash = validate_spider_gross_execution_input(gross_request)
-        execution_context_wire = gross_execution_context_from_input(raw_input)
+        if historical_token is None or base_hash is None:
+            execution_context_wire = gross_execution_context_from_input(raw_input)
+        else:
+            execution_context_wire = _gross_execution_context_for_input(
+                gross_request, wrapper_hash, base_hash,
+            )
         context = gross_execution_context(execution_context_wire)
         artifact_schema = _GROSS_SCHEMA
     elif floating_exit:
