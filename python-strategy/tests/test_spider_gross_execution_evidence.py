@@ -1026,7 +1026,7 @@ def test_gross_reconciliation_invalid_exception_chains_match_head():
         ), label
 
 
-@pytest.mark.parametrize(("force_fallback", "expected_calls"), [(False, 1), (True, 24)])
+@pytest.mark.parametrize(("force_fallback", "expected_calls"), [(False, 1), (True, 16)])
 def test_gross_reconciliation_mints_fresh_token_or_matches_head_fallback(
     monkeypatch: pytest.MonkeyPatch, force_fallback: bool, expected_calls: int,
 ):

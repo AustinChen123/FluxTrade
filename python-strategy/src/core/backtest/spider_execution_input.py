@@ -194,7 +194,8 @@ def _decode_spider_execution_input(
 
 def decode_spider_execution_input(raw: bytes) -> SpiderExecutionInput:
     """Decode exact wrapper JSON, reuse the immutable P3 decoder, and recheck bytes."""
-    return cast(SpiderExecutionInput, _decode_spider_execution_input(raw, validated=False))
+    decoded = _decode_spider_execution_input(raw, validated=True)
+    return cast(tuple[SpiderExecutionInput, ValidatedHistoricalInput | None, str], decoded)[0]
 
 
 def _decode_spider_execution_input_validated(
@@ -212,6 +213,6 @@ def _decode_spider_execution_input_validated(
     except _UnapprovedHistoricalInputTree:
         fallback = True
     if fallback:
-        value = decode_spider_execution_input(raw)
+        value = cast(SpiderExecutionInput, _decode_spider_execution_input(raw, validated=False))
         return value, None, validate_spider_execution_input(value)
     raise AssertionError("unreachable validated Spider execution decode state")

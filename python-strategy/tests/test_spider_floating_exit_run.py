@@ -133,7 +133,7 @@ def test_floating_registration_token_counts_fallback_bytes_and_stale_token(
         assert fallback_store.register(deepcopy(attempt), floating_exit_input=raw) == (
             "NATIVE_CONSTRUCTION_ALLOWED"
         )
-    assert module_calls == 10 and all_calls == 29
+    assert module_calls == 6 and all_calls == 21
     assert decoded[-1][1] is None
     for name in ("attempt.json", "status.json", "execution_input.json"):
         assert (exact_store._path / name).read_bytes() == (fallback_store._path / name).read_bytes()

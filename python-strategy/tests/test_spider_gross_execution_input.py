@@ -168,7 +168,7 @@ def test_gross_registration_token_counts_fallback_and_bytes(
             store = spider_run_store.SpiderRunStore.create(str(root), run_id)
             stores.append(store)
             assert store.register(deepcopy(attempt), gross_execution_input=raw) == "NATIVE_CONSTRUCTION_ALLOWED"
-        assert (module_calls, all_calls) == ((1, 1) if not unsafe else (10, 23))
+        assert (module_calls, all_calls) == ((1, 1) if not unsafe else (6, 15))
         module_calls = all_calls = 0
     for name in ("attempt.json", "status.json", "execution_input.json", "journal.jsonl"):
         assert (stores[0]._path / name).read_bytes() == (stores[1]._path / name).read_bytes()
