@@ -25,8 +25,8 @@ from src.core.backtest.spider_execution_input import (
 )
 from src.core.backtest.spider_floating_exit_input import (
     SpiderFloatingExitInput,
+    _decode_spider_floating_exit_input_validated,
     decode_spider_floating_exit_input,
-    validate_spider_floating_exit_input,
 )
 from src.core.backtest.spider_gross_execution_input import (
     decode_spider_gross_execution_input,
@@ -68,6 +68,7 @@ from src.core.backtest.spider_run_execution_schema import (
     _GROSS_SCHEMA,
     _CHECKS,
     _execution_context_for_input,
+    _floating_exit_context_for_input,
     execution_context_from_input,
     floating_exit_context_from_input,
     gross_execution_context_from_input,
@@ -279,6 +280,8 @@ def _input_check(run_id: str, attempt: dict[str, Any], status: dict[str, Any],
                  execution_context_wire: dict[str, object] | None = None,
                  historical_token: ValidatedHistoricalInput | None = None) -> bool:
     run = request.historical_input
+    if historical_token is not None and historical_token.run is not run:
+        return False
     wrapper_hash = contract_hash or validate_spider_execution_input(request)
     try:
         config = decode_canonical(run.configuration_bytes)
@@ -331,6 +334,8 @@ def _journal_check(run_id: str, attempt: dict[str, Any], status: dict[str, Any],
                    request: SpiderExecutionInput, contract_hash: str,
                    endpoint: dict[str, Any],
                    historical_token: ValidatedHistoricalInput | None = None) -> bool:
+    if historical_token is not None and historical_token.run is not request.historical_input:
+        return False
     coverage = (_expected_coverage(request, contract_hash) if historical_token is None
                 else _expected_coverage_validated(request, contract_hash, historical_token))
     boundary = (dict(ordinal=len(journal), journal_seq=len(journal), barrier_id=journal[-1]["barrier_id"])
@@ -1417,10 +1422,16 @@ def build_execution_reconciliation(run_id: str, artifacts: Mapping[str, bytes]) 
         context = gross_execution_context(execution_context_wire)
         artifact_schema = _GROSS_SCHEMA
     elif floating_exit:
-        floating_request = decode_spider_floating_exit_input(raw_input)
-        wrapper_hash = validate_spider_floating_exit_input(floating_request)
+        floating_request, historical_token, wrapper_hash, base_hash = (
+            _decode_spider_floating_exit_input_validated(raw_input)
+        )
         request = floating_request.execution_input
-        context = floating_exit_context(floating_exit_context_from_input(raw_input))
+        if historical_token is None or base_hash is None:
+            context = floating_exit_context(floating_exit_context_from_input(raw_input))
+        else:
+            context = floating_exit_context(
+                _floating_exit_context_for_input(floating_request, wrapper_hash, base_hash)
+            )
         artifact_schema = _FLOATING_SCHEMA
     else:
         request, historical_token, wrapper_hash = _decode_spider_execution_input_validated(raw_input)

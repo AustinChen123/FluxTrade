@@ -899,3 +899,265 @@ def test_paid_reconciliation_mints_one_local_token_or_uses_head_fallback(
     assert sha256(artifacts["report.jsonl"]).hexdigest() == (
         "489b3a5b832bade9b24b21fabcf314c013fe1b90d3d09d695ca730b8533c1231"
     )
+
+
+def _malformed_floating_reconciliation_inputs(raw: bytes) -> list[tuple[str, bytes]]:
+    wrapper = cast(dict[str, Any], decode_canonical(raw))
+    cases: list[tuple[str, bytes]] = []
+
+    def add(label: str, value: object) -> None:
+        cases.append((label, value if type(value) is bytes else canonical_bytes(value)))
+
+    for field in sorted(wrapper):
+        row = deepcopy(wrapper)
+        del row[field]
+        add(f"outer-missing-{field}", row)
+    for field in sorted(wrapper):
+        row = deepcopy(wrapper)
+        row[field] = []
+        add(f"outer-wrong-{field}", row)
+    row = deepcopy(wrapper)
+    row["extra"] = 1
+    add("outer-extra", row)
+    execution = cast(dict[str, Any], wrapper["execution_input"])
+    for field in sorted(execution):
+        row = deepcopy(wrapper)
+        del cast(dict[str, Any], row["execution_input"])[field]
+        add(f"execution-missing-{field}", row)
+    for field in sorted(execution):
+        row = deepcopy(wrapper)
+        cast(dict[str, Any], row["execution_input"])[field] = []
+        add(f"execution-wrong-{field}", row)
+    row = deepcopy(wrapper)
+    cast(dict[str, Any], row["execution_input"])["extra"] = 1
+    add("execution-extra", row)
+    historical = cast(dict[str, Any], execution["historical_input"])
+    for field in sorted(historical):
+        row = deepcopy(wrapper)
+        del cast(dict[str, Any], cast(dict[str, Any], row["execution_input"])["historical_input"])[field]
+        add(f"history-missing-{field}", row)
+    for field in sorted(historical):
+        row = deepcopy(wrapper)
+        cast(dict[str, Any], cast(dict[str, Any], row["execution_input"])["historical_input"])[field] = []
+        add(f"history-wrong-{field}", row)
+    row = deepcopy(wrapper)
+    cast(dict[str, Any], cast(dict[str, Any], row["execution_input"])["historical_input"])["extra"] = 1
+    add("history-extra", row)
+    for label, value in (("empty", {}), ("list", []), ("missing-schema", {"x": 1})):
+        row = deepcopy(wrapper)
+        cast(dict[str, Any], row["execution_input"])["historical_input"] = value
+        add(f"history-shape-{label}", row)
+    add("empty-bytes", b"")
+    add("non-utf8", b"\xff")
+    return cases
+
+
+def test_floating_reconciliation_invalid_exception_chains_match_head():
+    from src.core.backtest import spider_execution_input as execution_input_module
+    from src.core.backtest.spider_floating_exit_input import decode_spider_floating_exit_input
+    from src.core.backtest.spider_run_artifacts import decode_canonical as decode_json
+    from test_spider_floating_exit_run import _floating_registration_fixture
+
+    run, _request, raw, _attempt = _floating_registration_fixture()
+    artifacts = {
+        name: b""
+        for name in (
+            "attempt.json", "status.json", "journal.jsonl", "execution_input.json",
+            "paid_endpoint.json", "report.jsonl",
+        )
+    }
+    cases = _malformed_floating_reconciliation_inputs(raw)
+    assert len(cases) == 106
+    for label, encoded in cases:
+        changed = dict(artifacts, **{"execution_input.json": encoded})
+        if label in ("empty-bytes", "non-utf8"):
+            expected_decoder = decode_json
+        elif label in ("outer-missing-schema_version", "outer-wrong-schema_version"):
+            expected_decoder = execution_input_module.decode_spider_execution_input
+        else:
+            expected_decoder = decode_spider_floating_exit_input
+        with pytest.raises(BaseException) as expected:
+            expected_decoder(encoded)
+        with pytest.raises(BaseException) as actual:
+            evidence.build_execution_reconciliation(run.run_id, changed)
+        assert _exception_tree(actual.value) == _exception_tree(expected.value), label
+
+
+def test_reconciliation_projection_helpers_reject_foreign_historical_tokens():
+    from src.core.backtest.spider_historical_input import _validate_historical_input_once
+    from test_spider_floating_exit_run import _floating_registration_fixture
+
+    _run, floating, _raw, _attempt = _floating_registration_fixture()
+    request = floating.execution_input
+    foreign_run = replace(request.historical_input, run_id="foreign-reconciliation-run")
+    foreign_token = _validate_historical_input_once(foreign_run)
+    assert foreign_token.run is not request.historical_input
+    assert not evidence._input_check(
+        "", {}, {}, {}, {}, request, cast(Any, None), cast(Any, None), cast(Any, None),
+        historical_token=foreign_token,
+    )
+    assert not evidence._journal_check(
+        "", {}, {}, [], {}, request, "", {}, foreign_token,
+    )
+
+
+@pytest.fixture(scope="module")
+def _floating_reconciliation_input():
+    from test_spider_floating_exit_run import _floating_registration_fixture
+
+    return _floating_registration_fixture()
+
+
+def _floating_validation_counter(monkeypatch):
+    from src.core.backtest import spider_bayes_replay, spider_execution_input, spider_historical_input
+
+    original = spider_historical_input.validate_historical_input
+    calls: list[object] = []
+
+    def count(run):
+        calls.append(run)
+        return original(run)
+
+    for module in (spider_historical_input, spider_execution_input, spider_bayes_replay):
+        monkeypatch.setattr(module, "validate_historical_input", count)
+    return calls
+
+
+def _stop_after_floating_context(monkeypatch, captured):
+    class ContextReady(Exception):
+        pass
+
+    def stop(context):
+        captured.append(context)
+        raise ContextReady
+
+    monkeypatch.setattr(evidence, "floating_exit_context", stop)
+    return ContextReady
+
+
+def test_valid_floating_reconciliation_uses_fresh_token_and_correct_hash_fields(
+    _floating_reconciliation_input, monkeypatch,
+):
+    from src.core.backtest.spider_execution_input import validate_spider_execution_input
+    from src.core.backtest.spider_floating_exit_input import (
+        _decode_spider_floating_exit_input_validated,
+        validate_spider_floating_exit_input,
+    )
+    from src.core.backtest.spider_run_execution_schema import floating_exit_context_from_input
+
+    run, floating, raw, _attempt = _floating_reconciliation_input
+    request = floating.execution_input
+    expected_wrapper_hash = validate_spider_floating_exit_input(floating)
+    expected_base_hash = validate_spider_execution_input(request)
+    expected_legacy_context = floating_exit_context_from_input(raw)
+    calls = _floating_validation_counter(monkeypatch)
+    decoded = []
+    projections = []
+    legacy_contexts = []
+    contexts = []
+    original_decode = _decode_spider_floating_exit_input_validated
+    original_projection = evidence._floating_exit_context_for_input
+    original_legacy_context = evidence.floating_exit_context_from_input
+
+    def capture_decode(value):
+        result = original_decode(value)
+        decoded.append(result)
+        return result
+
+    def capture_projection(value, wrapper_hash, base_hash):
+        projections.append((value, wrapper_hash, base_hash))
+        return original_projection(value, wrapper_hash, base_hash)
+
+    def capture_legacy_context(value):
+        legacy_contexts.append(value)
+        return original_legacy_context(value)
+
+    monkeypatch.setattr(evidence, "_decode_spider_floating_exit_input_validated", capture_decode)
+    monkeypatch.setattr(evidence, "_floating_exit_context_for_input", capture_projection)
+    monkeypatch.setattr(evidence, "floating_exit_context_from_input", capture_legacy_context)
+    stop = _stop_after_floating_context(monkeypatch, contexts)
+    artifacts = {name: b"" for name in (
+        "attempt.json", "status.json", "journal.jsonl", "execution_input.json",
+        "paid_endpoint.json", "report.jsonl",
+    )}
+    artifacts["execution_input.json"] = raw
+    with pytest.raises(stop):
+        evidence.build_execution_reconciliation(run.run_id, artifacts)
+
+    assert len(decoded) == 1
+    decoded_input, token, wrapper_hash, base_hash = decoded[0]
+    assert decoded_input == floating and token is not None
+    assert token.run is decoded_input.execution_input.historical_input
+    assert len(calls) == 1
+    assert projections == [(floating, expected_wrapper_hash, expected_base_hash)]
+    assert wrapper_hash == expected_wrapper_hash
+    assert base_hash == expected_base_hash
+    assert legacy_contexts == []
+    assert contexts == [expected_legacy_context]
+    assert contexts[0]["execution_input_sha256"] == expected_wrapper_hash
+    assert contexts[0]["base_execution_input_sha256"] == expected_base_hash
+
+
+def test_ineligible_floating_reconciliation_uses_legacy_decoder_and_context(
+    _floating_reconciliation_input, monkeypatch,
+):
+    from src.core.backtest import spider_execution_input as execution_input_module
+    from src.core.backtest import spider_floating_exit_input as floating_input_module
+    from src.core.backtest.spider_execution_input import validate_spider_execution_input
+    from src.core.backtest.spider_floating_exit_input import (
+        _decode_spider_floating_exit_input_validated,
+        validate_spider_floating_exit_input,
+    )
+    from src.core.backtest.spider_run_execution_schema import floating_exit_context_from_input
+
+    run, floating, raw, _attempt = _floating_reconciliation_input
+    expected_context = floating_exit_context_from_input(raw)
+    expected_hash = validate_spider_floating_exit_input(floating)
+    expected_base_hash = validate_spider_execution_input(floating.execution_input)
+    calls = _floating_validation_counter(monkeypatch)
+    decoded = []
+    projections = []
+    legacy_contexts = []
+    contexts = []
+    original_decode = _decode_spider_floating_exit_input_validated
+    original_projection = evidence._floating_exit_context_for_input
+    original_legacy_context = evidence.floating_exit_context_from_input
+
+    monkeypatch.setattr(floating_input_module, "_is_approved_historical_input_tree", lambda _run: False)
+    monkeypatch.setattr(execution_input_module, "_is_approved_historical_input_tree", lambda _run: False)
+
+    def capture_decode(value):
+        result = original_decode(value)
+        decoded.append(result)
+        return result
+
+    def capture_projection(*args):
+        projections.append(args)
+        return original_projection(*args)
+
+    def capture_legacy_context(value):
+        legacy_contexts.append(value)
+        return original_legacy_context(value)
+
+    monkeypatch.setattr(evidence, "_decode_spider_floating_exit_input_validated", capture_decode)
+    monkeypatch.setattr(evidence, "_floating_exit_context_for_input", capture_projection)
+    monkeypatch.setattr(evidence, "floating_exit_context_from_input", capture_legacy_context)
+    stop = _stop_after_floating_context(monkeypatch, contexts)
+    artifacts = {name: b"" for name in (
+        "attempt.json", "status.json", "journal.jsonl", "execution_input.json",
+        "paid_endpoint.json", "report.jsonl",
+    )}
+    artifacts["execution_input.json"] = raw
+    with pytest.raises(stop):
+        evidence.build_execution_reconciliation(run.run_id, artifacts)
+
+    assert len(decoded) == 1
+    decoded_input, token, wrapper_hash, base_hash = decoded[0]
+    assert decoded_input == floating and token is None
+    assert wrapper_hash == expected_hash and base_hash is None
+    assert len(calls) == 27
+    assert projections == []
+    assert legacy_contexts == [raw]
+    assert contexts == [expected_context]
+    assert contexts[0]["execution_input_sha256"] == expected_hash
+    assert contexts[0]["base_execution_input_sha256"] == expected_base_hash
