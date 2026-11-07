@@ -703,6 +703,21 @@ fn historical_downstream_context_failure_discards_staged_mark_candidate() {
         &[("ROLLBACK-ORDER", 1)],
     );
     owner.historical_market_step(&initial).unwrap();
+    owner
+        .request_cancel(&risk_transition::cancel::RequestInput {
+            stamp: source::stamp("ROLLBACK-CANCEL", 16_007, 40),
+            targets: vec![(
+                "ROLLBACK-ORDER".into(),
+                risk_transition::cancel::Reason::ExplicitScenario,
+            )],
+        })
+        .unwrap();
+    let saved_batches: std::collections::BTreeMap<_, _> = owner
+        .cancel_facts
+        .batch_rows_snapshot()
+        .into_iter()
+        .collect();
+    assert!(!saved_batches.is_empty());
     let saved: std::collections::BTreeMap<_, _> = owner
         .transition
         .contexts
@@ -727,6 +742,12 @@ fn historical_downstream_context_failure_discards_staged_mark_candidate() {
         owner.historical_market_step(&input),
         Err("VERSION_OVERFLOW")
     );
+    let after_batches: std::collections::BTreeMap<_, _> = owner
+        .cancel_facts
+        .batch_rows_snapshot()
+        .into_iter()
+        .collect();
+    assert_eq!(after_batches, saved_batches);
     let after: std::collections::BTreeMap<_, _> = owner
         .transition
         .contexts
