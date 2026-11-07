@@ -33,14 +33,17 @@ from src.core.backtest.spider_run_execution_schema import (
 from src.core.backtest.spider_run_execution_evidence import (
     build_execution_reconciliation as _build_execution_reconciliation,
 )
+from src.core.backtest.spider_artifact_limits import (
+    DEFAULT_LIMIT as _LIMIT,
+    GROSS_REPORT_LIMIT as _GROSS_REPORT_LIMIT,  # noqa: F401 - compatibility policy alias
+    artifact_limit as _artifact_limit,
+    oversize_reason as _oversize_reason,
+)
 
 _NAMES = tuple(name for name, _ in _ARTIFACTS)
 _ALL = (*_NAMES, "completion.json")
 _P3_NAMES = tuple(name for name, _ in _P3_ARTIFACTS)
 _P3_ALL = (*_P3_NAMES, "completion.json")
-_LIMIT = 16_777_216
-_P3_JOURNAL_LIMIT = 33_554_432
-_GROSS_REPORT_LIMIT = 33_554_432
 _POLICY = "eb6ab34d8685fb59e286f5ffda8af24cbecf3e5ab2c729c585ccdca797cac336"
 _P2_SELECTOR = "SPIDER_P2_CONFIGURED_SCALE_V1"
 _P2_RUN_CONTRACT = "SPIDER_SYNTHETIC_P2_CONFIGURED_RUN_V1"
@@ -202,10 +205,10 @@ def _admit_execution(directory: int, manifest: dict[str, _Any], completion_raw: 
     bad = []
     for name in names:
         try:
-            limit = (
-                _GROSS_REPORT_LIMIT if gross_execution and name == "report.jsonl" else
-                _P3_JOURNAL_LIMIT if name == "journal.jsonl" else _LIMIT
-            )
+            limit = _artifact_limit(
+                "paid_gross" if gross_execution else "paid_floating" if floating_exit else "paid_execution",
+                "v1", name,
+            ) or _LIMIT
             captured[name] = _capture(
                 directory, name, exclusive=name == "execution_input.json", limit=limit,
             )
@@ -397,13 +400,19 @@ def _admit(directory: int) -> dict[str, _Any]:
     if unsafe:
         return _reject("UNSAFE_ARTIFACT_PATH", tuple(unsafe))
     captured, bad = {}, []
+    p3_journal_oversize = False
     for name in names:
         try:
-            limit = _P3_JOURNAL_LIMIT if historical_manifest and name == "journal.jsonl" else _LIMIT
+            limit = (_artifact_limit("P3", "v1", name) if historical_manifest else
+                     _artifact_limit("P1", "v1", name)) or _LIMIT
             captured[name] = _capture(directory, name, exclusive=name == "historical_input.json", limit=limit)
         except _Unsafe:
             unsafe.append(name)
-        except (OSError, _Oversize):
+        except _Oversize:
+            bad.append(name)
+            if historical_manifest and name == "journal.jsonl":
+                p3_journal_oversize = True
+        except OSError:
             bad.append(name)
     if unsafe:
         return _reject("UNSAFE_ARTIFACT_PATH", tuple(unsafe))
@@ -437,7 +446,10 @@ def _admit(directory: int) -> dict[str, _Any]:
                 raise
             bad.append(name)
     if bad:
-        return _reject("ARTIFACT_MISMATCH", tuple(name for name in names if name in bad))
+        reason = (_oversize_reason("P3", "v1", "journal.jsonl")
+                  if historical_manifest and p3_journal_oversize and bad == ["journal.jsonl"]
+                  else "ARTIFACT_MISMATCH")
+        return _reject(reason, tuple(name for name in names if name in bad))
     for name, value in values.items():
         rows = value if name.endswith(".jsonl") else [value]
         if any(not _run_id(row.get("run_id")) or row["run_id"] != manifest["run_id"] for row in rows):

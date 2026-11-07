@@ -1664,6 +1664,23 @@ def test_historical_store_finalize_and_admission_accept_real_native_bundle(tmp_p
     assert status["state"] == "RUNNING"
 
 
+def test_legacy_v1_admits_a_legal_journal_row_over_one_mib(tmp_path):
+    _, _, _, journal, artifacts, _, store = _historical_endpoint_case(
+        tmp_path, partial_fill=False, return_store=True,
+    )
+    journal[0]["causal_parent_ids"] = ["legacy-parent-" + "x" * (1_048_576 + 32)]
+    raw_journal = b"".join(canonical_bytes(row) + b"\n" for row in journal)
+    assert len(canonical_bytes(journal[0])) + 1 > 1_048_576
+    assert len(raw_journal) <= 33_554_432
+    (store._path / "journal.jsonl").write_bytes(raw_journal)
+    assert store.finalize(
+        artifacts["endpoint"], artifacts["reconciliation"], artifacts["report"],
+    ) == "COMPLETE_PUBLISHED"
+    admitted = admit_spider_run(store._path)
+    assert admitted["decision"] == "ACCEPT", admitted
+    assert admitted["artifacts"]["journal.jsonl"] == journal
+
+
 def test_real_store_recomputes_report_and_rejects_corrupted_supplied_projection(tmp_path):
     run, _, _, _, artifacts, _, store = _historical_endpoint_case(
         tmp_path, partial_fill=True, return_store=True,

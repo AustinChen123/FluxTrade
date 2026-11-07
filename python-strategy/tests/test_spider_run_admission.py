@@ -10,6 +10,7 @@ from typing import Any, cast
 import pytest
 
 from src.core.backtest import spider_run_admission as admission
+from src.core.backtest.spider_artifact_limits import DEFAULT_LIMIT, LEG32
 from src.core.backtest.spider_run_artifacts import canonical_bytes
 from test_spider_run_artifacts import configuration_context
 from test_spider_run_evidence import RUN, expected_checks, fixture
@@ -18,6 +19,30 @@ NAMES = ("attempt.json", "status.json", "journal.jsonl", "endpoint.json", "recon
 SCHEMAS = ("spider_attempt_v1", "spider_status_v1", "spider_journal_record_v1", "spider_endpoint_v1", "spider_reconciliation_v1", "spider_product_report_v1")
 DIAGNOSTIC = ("completion.json", "status.json", "journal.jsonl")
 FRONTIER = ("attempt.json", "status.json", "journal.jsonl", "completion.json")
+
+# Outcomes were run against a HEAD export at 5ec93e46; J1 changes only the
+# P3 journal over-limit reason in the single oversize-only case.
+_HEAD_FAILURES = {
+    **{case: ("MISSING_COMPLETE_MANIFEST", DIAGNOSTIC) for case in (
+        "status_oserror", "journal_oserror", "status_oversize", "invalid_journal",
+        "wrong_status_schema", "paid_status_validation",
+        *(f"hostile_{kind}_{journal}" for kind in ("deep", "integer")
+          for journal in ("missing", "symlink", "oversize")),
+        "hostile_16_32_deep", "hostile_16_32_integer",
+    )},
+    "completion_oserror": ("INVALID_MANIFEST", ("completion.json",)),
+    "completion_oversize": ("ARTIFACT_MISMATCH", ("completion.json",)),
+    "unknown_family": ("INVALID_MANIFEST", ("completion.json",)),
+    "unknown_encoding": ("INVALID_MANIFEST", ("completion.json",)),
+    "artifact_oserror": ("ARTIFACT_MISMATCH", ("endpoint.json",)),
+    "artifact_oversize": ("ARTIFACT_MISMATCH", ("endpoint.json",)),
+    "artifact_unsafe": ("UNSAFE_ARTIFACT_PATH", ("endpoint.json",)),
+    "p1_journal_oversize_bad_endpoint": ("ARTIFACT_MISMATCH", ("journal.jsonl", "endpoint.json")),
+    "p3_journal_missing": ("ARTIFACT_MISMATCH", ("journal.jsonl",)),
+    "p3_journal_unreadable": ("ARTIFACT_MISMATCH", ("journal.jsonl",)),
+    "p3_journal_oversize_only": ("ARTIFACT_MISMATCH", ("journal.jsonl",)),
+    "p3_journal_oversize_bad_endpoint": ("ARTIFACT_MISMATCH", ("journal.jsonl", "endpoint.json")),
+}
 
 
 def framed(value, name):
@@ -163,9 +188,9 @@ def test_actual_file_metadata_is_not_trusted(tmp_path, mutation):
     if mutation == "bytes":
         (tmp_path / "endpoint.json").write_bytes(b"{}\n")
     elif mutation == "oversize":
-        (tmp_path / "endpoint.json").write_bytes(b" " * (16_777_216 + 1))
+        (tmp_path / "endpoint.json").write_bytes(b" " * (DEFAULT_LIMIT + 1))
     elif mutation == "oversize_journal":
-        (tmp_path / "journal.jsonl").write_bytes(b" " * (16_777_216 + 1))
+        (tmp_path / "journal.jsonl").write_bytes(b" " * (DEFAULT_LIMIT + 1))
     elif mutation == "semantic_digest":
         manifest["endpoint_state_digest"] = "f" * 64
     else:
@@ -174,11 +199,11 @@ def test_actual_file_metadata_is_not_trusted(tmp_path, mutation):
     rejected(tmp_path, "ARTIFACT_MISMATCH", ("journal.jsonl",) if mutation == "oversize_journal" else ("endpoint.json",))
 
 
-def test_valid_p3_manifest_widens_only_journal_capture(tmp_path, monkeypatch):
+def _p3_manifest_for_admission(tmp_path, *, include_input=False):
     from src.core.backtest.spider_historical_input import historical_context_for_input
     from test_spider_scenario_run import historical_input
 
-    historical, _ = historical_input("limit-routing")
+    historical, encoded = historical_input("limit-routing")
     values = bundle(tmp_path)
     manifest = values["completion.json"]
     manifest.update(
@@ -193,45 +218,151 @@ def test_valid_p3_manifest_widens_only_journal_capture(tmp_path, monkeypatch):
         path="historical_input.json", schema_version="spider_historical_research_run_v1",
         sha256="f" * 64, byte_count=1, row_count=1,
     ))
+    if include_input:
+        (tmp_path / "historical_input.json").write_bytes(encoded)
+        manifest["artifacts"][-1].update(sha256=sha256(encoded).hexdigest(), byte_count=len(encoded))
     (tmp_path / "completion.json").write_bytes(framed(manifest, "completion.json"))
     admission._completion(manifest)
-
-    original_capture = admission._capture
-    limits = {}
-
-    def observe_capture(directory, name, **kwargs):
-        limits[name] = kwargs.get("limit", 16_777_216)
-        return original_capture(directory, name, **kwargs)
-
-    monkeypatch.setattr(admission, "_capture", observe_capture)
-    admitted = admission.admit_spider_run(tmp_path)
-    assert admitted == dict(decision="REJECT", reason="ARTIFACT_MISMATCH", evidence=("historical_input.json",))
-    assert limits == {
-        "completion.json": 16_777_216,
-        "attempt.json": 16_777_216,
-        "status.json": 16_777_216,
-        "journal.jsonl": 33_554_432,
-        "endpoint.json": 16_777_216,
-        "reconciliation.json": 16_777_216,
-        "report.jsonl": 16_777_216,
-        "historical_input.json": 16_777_216,
-    }
+    return manifest
 
 
-def test_invalid_historical_manifest_rejects_before_artifact_capture(tmp_path, monkeypatch):
+@pytest.mark.parametrize("unsafe_kind", [None, "hardlink", "symlink", "directory"])
+def test_p3_oversize_keeps_unsafe_precedence(tmp_path, unsafe_kind):
+    _p3_manifest_for_admission(tmp_path)
+    source = tmp_path / "input-source.json"
+    source.write_bytes(b"{}")
+    historical = tmp_path / "historical_input.json"
+    if unsafe_kind == "hardlink":
+        os.link(source, historical)
+    elif unsafe_kind == "symlink":
+        historical.symlink_to(source)
+    elif unsafe_kind == "directory":
+        historical.mkdir()
+    with (tmp_path / "journal.jsonl").open("wb") as stream:
+        stream.truncate(LEG32 + 1)
+    result = admission.admit_spider_run(tmp_path)
+    if unsafe_kind is None:
+        assert result == dict(decision="REJECT", reason="ARTIFACT_MISMATCH", evidence=("journal.jsonl", "historical_input.json"))
+    else:
+        assert result == dict(decision="REJECT", reason="UNSAFE_ARTIFACT_PATH", evidence=("historical_input.json",))
+
+
+@pytest.mark.parametrize("case", tuple(_HEAD_FAILURES))
+def test_public_admission_matches_head_failure_matrix(tmp_path, monkeypatch, case):
     values = bundle(tmp_path)
-    values["completion.json"]["historical_context"] = []
-    (tmp_path / "completion.json").write_bytes(framed(values["completion.json"], "completion.json"))
-    original_capture = admission._capture
-    captures = []
+    target = {
+        "status_oserror": "status.json", "journal_oserror": "journal.jsonl",
+        "completion_oserror": "completion.json", "artifact_oserror": "endpoint.json",
+        "p3_journal_unreadable": "journal.jsonl",
+    }.get(case)
+    if (case.startswith("hostile_") and not case.startswith("hostile_16_32_")) or case in {
+        "status_oserror", "journal_oserror", "status_oversize", "invalid_journal",
+        "wrong_status_schema", "paid_status_validation",
+    }:
+        (tmp_path / "completion.json").unlink()
+    if case.startswith("hostile_"):
+        if case.startswith("hostile_16_32_"):
+            kind = case.removeprefix("hostile_16_32_")
+            (tmp_path / "completion.json").unlink()
+            status = values["status.json"]
+            (tmp_path / "status.json").write_bytes(framed(status, "status.json"))
+            hostile = (b'{"nested":' + b"[" * 2000 + b"0" + b"]" * 2000 + b"}\n"
+                       if kind.endswith("deep") else b'{"n":' + b"1" * 4301 + b"}\n")
+            (tmp_path / "journal.jsonl").write_bytes(
+                b" " * (DEFAULT_LIMIT + 1 - len(hostile)) + hostile,
+            )
+        else:
+            kind, journal_state = case.removeprefix("hostile_").split("_", 1)
+            status = (b'{"nested":' + b"[" * 2000 + b"0" + b"]" * 2000 + b"}\n"
+                      if kind == "deep" else b'{"n":' + b"1" * 4301 + b"}\n")
+            (tmp_path / "status.json").write_bytes(status)
+            journal_path = tmp_path / "journal.jsonl"
+            if journal_state == "missing":
+                journal_path.unlink()
+            elif journal_state == "symlink":
+                journal_path.unlink()
+                journal_path.symlink_to(tmp_path / "missing")
+            else:
+                journal_path.write_bytes(b"x" * (DEFAULT_LIMIT + 1))
+    elif case == "status_oversize":
+        (tmp_path / "status.json").write_bytes(b"x" * (DEFAULT_LIMIT + 1))
+    elif case == "invalid_journal":
+        (tmp_path / "journal.jsonl").write_bytes(b"{invalid}\n")
+    elif case == "wrong_status_schema":
+        (tmp_path / "status.json").write_bytes(framed({"schema_version": "unknown_status_v9"}, "status.json"))
+    elif case == "paid_status_validation":
+        (tmp_path / "status.json").write_bytes(framed(
+            {"schema_version": admission._EXECUTION_SCHEMA["status.json"]}, "status.json",
+        ))
+    elif case == "completion_oversize":
+        (tmp_path / "completion.json").write_bytes(b"x" * (DEFAULT_LIMIT + 1))
+    elif case in {"unknown_family", "unknown_encoding"}:
+        manifest = values["completion.json"]
+        if case == "unknown_family":
+            manifest["schema_version"] = "unknown_completion_v9"
+        write_bundle(tmp_path, values)
+        if case == "unknown_encoding":
+            values["completion.json"]["artifacts"][2]["schema_version"] = "unknown_journal_v9"
+            (tmp_path / "completion.json").write_bytes(framed(values["completion.json"], "completion.json"))
+    elif case == "artifact_oversize":
+        (tmp_path / "endpoint.json").write_bytes(b"x" * (DEFAULT_LIMIT + 1))
+    elif case == "artifact_unsafe":
+        endpoint = tmp_path / "endpoint.json"
+        endpoint.unlink()
+        endpoint.symlink_to(tmp_path / "missing")
+    elif case.startswith("p3_journal_"):
+        _p3_manifest_for_admission(tmp_path, include_input=True)
+        journal_path = tmp_path / "journal.jsonl"
+        if case == "p3_journal_missing":
+            journal_path.unlink()
+        elif case in {"p3_journal_oversize_only", "p3_journal_oversize_bad_endpoint"}:
+            with journal_path.open("wb") as stream:
+                stream.truncate(LEG32 + 1)
+            if case.endswith("bad_endpoint"):
+                (tmp_path / "endpoint.json").write_bytes(b"{}\n")
+    elif case == "p1_journal_oversize_bad_endpoint":
+        with (tmp_path / "journal.jsonl").open("wb") as stream:
+            stream.truncate(DEFAULT_LIMIT + 1)
+        (tmp_path / "endpoint.json").write_bytes(b"{}\n")
+
+    capture, capture_names = admission._capture, []
 
     def observe_capture(directory, name, **kwargs):
-        captures.append((name, kwargs.get("limit", 16_777_216)))
-        return original_capture(directory, name, **kwargs)
+        capture_names.append(name)
+        if name == target and target is not None:
+            raise PermissionError("matrix fault")
+        return capture(directory, name, **kwargs)
 
     monkeypatch.setattr(admission, "_capture", observe_capture)
-    rejected(tmp_path, "INVALID_MANIFEST", ("completion.json",))
-    assert captures == [("completion.json", 16_777_216)]
+    reason, evidence = _HEAD_FAILURES[case]
+    if case == "p3_journal_oversize_only" and os.environ.get("J1_HEAD_ORACLE") != "1":
+        reason = "ARTIFACT_LIMIT_EXCEEDED"
+    assert admission.admit_spider_run(tmp_path) == dict(decision="REJECT", reason=reason, evidence=evidence)
+    if case in {"unknown_family", "unknown_encoding"}:
+        assert capture_names == ["completion.json"]
+
+
+@pytest.mark.parametrize("family,flags", [
+    ("paid_execution", {}), ("paid_floating", {"floating_exit": True}),
+    ("paid_gross", {"gross_execution": True}),
+])
+def test_paid_limits_route_through_production_capture(monkeypatch, family, flags):
+    names = (admission._GROSS_NAMES if flags.get("gross_execution") else
+             admission._FLOATING_NAMES if flags.get("floating_exit") else admission._EXECUTION_NAMES)
+    calls = {}
+    monkeypatch.setattr(admission, "_regular", lambda *args: None)
+
+    def capture(directory, name, **kwargs):
+        calls[name] = kwargs["limit"]
+        raise admission._Oversize()
+
+    monkeypatch.setattr(admission, "_capture", capture)
+    result = admission._admit_execution(0, {}, b"{}\n", **flags)
+    assert result["reason"] == "ARTIFACT_MISMATCH"
+    assert calls == {
+        name: LEG32 if name == "journal.jsonl" or (family == "paid_gross" and name == "report.jsonl") else DEFAULT_LIMIT
+        for name in names
+    }
 
 
 def test_capture_honors_explicit_limit(tmp_path):
@@ -346,4 +477,5 @@ def test_import_boundary():
         "src.core.backtest.spider_historical_input",
         "src.core.backtest.spider_run_envelope_schema", "src.core.backtest.spider_run_evidence",
         "src.core.backtest.spider_run_reconciliation_schema", "src.core.backtest.spider_scenario_plans",
-        "src.core.backtest.spider_run_execution_schema", "src.core.backtest.spider_run_execution_evidence"}
+        "src.core.backtest.spider_run_execution_schema", "src.core.backtest.spider_run_execution_evidence",
+        "src.core.backtest.spider_artifact_limits"}
