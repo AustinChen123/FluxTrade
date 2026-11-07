@@ -21,6 +21,7 @@ mod gross_response;
 mod gross_response_tests;
 mod group;
 mod historical;
+mod history_map;
 mod hypothetical_settlement;
 mod inspection;
 pub(super) mod mark_history;

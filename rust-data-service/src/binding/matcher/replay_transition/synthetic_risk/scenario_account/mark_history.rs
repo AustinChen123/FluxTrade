@@ -341,7 +341,7 @@ mod tests {
     }
 
     #[test]
-    fn rpds_backend_stays_private_to_mark_history_module() {
+    fn rpds_backend_stays_private_to_history_map_adapters() {
         fn rust_files(path: &std::path::Path, output: &mut Vec<std::path::PathBuf>) {
             for entry in std::fs::read_dir(path).unwrap() {
                 let path = entry.unwrap().path();
@@ -359,7 +359,10 @@ mod tests {
             .join("src/binding/matcher/replay_transition/synthetic_risk/scenario_account.rs");
         let subtree = crate_root
             .join("src/binding/matcher/replay_transition/synthetic_risk/scenario_account");
-        let allowed = subtree.join("mark_history.rs");
+        let allowed = [
+            subtree.join("mark_history.rs"),
+            subtree.join("history_map.rs"),
+        ];
         let mut files = vec![parent, account];
         rust_files(&subtree, &mut files);
         let forbidden = [
@@ -369,7 +372,7 @@ mod tests {
             "SharedPointer",
             "ArcTK",
         ];
-        for file in files.into_iter().filter(|file| file != &allowed) {
+        for file in files.into_iter().filter(|file| !allowed.contains(file)) {
             let source = std::fs::read_to_string(&file).unwrap();
             for token in forbidden {
                 assert!(
@@ -380,8 +383,10 @@ mod tests {
             }
         }
 
-        let source = std::fs::read_to_string(&allowed).unwrap();
+        let source = std::fs::read_to_string(&allowed[0]).unwrap();
         check_mark_history_source(&source, MARK_HISTORY_API).unwrap();
+        let source = std::fs::read_to_string(&allowed[1]).unwrap();
+        check_mark_history_source(&source, HISTORY_MAP_API).unwrap();
         for fixture in [
             "type Hidden = RedBlackTreeMapSync<i64, Mark>;\npub(super) fn leak() -> Hidden { todo!() }",
             "use rpds::RedBlackTreeMapSync as Backend;\npub(super) fn leak() -> Backend<i64, Mark> { todo!() }",
@@ -419,6 +424,19 @@ mod tests {
         "pub(in crate::binding::matcher::replay_transition::synthetic_risk) fn mark_at( &self, product: &Product, at: i64, ) -> Result<&Mark, Fault>",
         "pub(in crate::binding::matcher::replay_transition::synthetic_risk::scenario_account) fn stage_historical_update< 'a, >( &self, at: i64, steps: impl IntoIterator<Item = (&'a Product, Decimal)>, ) -> Result<Self, Fault>",
         "pub(super) fn to_vec_for_test(&self) -> Vec<Mark>",
+    ];
+
+    const HISTORY_MAP_API: &[&str] = &[
+        "pub(super) struct HistoryMap<K: Ord, V>(PersistentTree<K, V>)",
+        "pub(super) fn new() -> Self",
+        "pub(super) fn get<Q>(&self, key: &Q) -> Option<&V> where K: Borrow<Q>, Q: Ord + ?Sized,",
+        "pub(super) fn contains_key<Q>(&self, key: &Q) -> bool where K: Borrow<Q>, Q: Ord + ?Sized,",
+        "pub(super) fn insert(&mut self, key: K, value: V)",
+        "pub(super) fn iter(&self) -> impl Iterator<Item = (&K, &V)>",
+        "pub(super) fn values(&self) -> impl Iterator<Item = &V>",
+        "pub(super) fn len(&self) -> usize",
+        "pub(super) fn is_empty(&self) -> bool",
+        "pub(super) fn clear(&mut self)",
     ];
 
     fn check_mark_history_source(source: &str, allowlist: &[&str]) -> Result<(), String> {
