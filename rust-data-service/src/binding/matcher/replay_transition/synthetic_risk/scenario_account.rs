@@ -248,7 +248,7 @@ struct ScenarioAccount {
     seed_orders: BTreeSet<String>,
     seed_executions: BTreeSet<Hash>,
     commit_sequence: u64,
-    intent_results: BTreeMap<String, admission::AdmissionResult>,
+    intent_results: history_map::HistoryMap<String, admission::AdmissionResult>,
     // Only the future execution writer may publish a receipt; seeds have none.
     execution_receipts: BTreeMap<Hash, execution::CommittedExecution>,
     pending_actions: Vec<Infallible>,
@@ -742,7 +742,7 @@ impl ScenarioAccount {
             seed_intents,
             seed_executions,
             commit_sequence,
-            intent_results: BTreeMap::new(),
+            intent_results: history_map::HistoryMap::new(),
             execution_receipts: BTreeMap::new(),
             pending_actions: Vec::new(),
             cancel_facts: Default::default(),
