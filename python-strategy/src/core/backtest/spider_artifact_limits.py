@@ -1,5 +1,7 @@
 """Single source of truth for versioned Spider artifact byte limits."""
 
+from collections.abc import Mapping
+
 DEFAULT_LIMIT = 16_777_216
 LEG32 = 33_554_432
 PAID_JOURNAL_LIMIT = LEG32
@@ -69,6 +71,74 @@ P3_V2_RECONCILIATION_FLOOR = DEFAULT_LIMIT
 P3_V2_ENDPOINT_FLOOR = DEFAULT_LIMIT
 P3_V2_X2_COEFFICIENT = (19_048_383, 6_119)
 P3_V2_E2_COEFFICIENT = (10_790_164, 6_119)
+
+
+def _ceil_div(numerator: int, denominator: int) -> int:
+    return (numerator + denominator - 1) // denominator
+
+
+def p3_v2_scope_refused(structural_bytes: int, l_wire: int) -> bool:
+    """Apply D2.3 registration refusal at inclusive byte ceilings."""
+    if (
+        type(structural_bytes) is not int
+        or type(l_wire) is not int
+        or min(structural_bytes, l_wire) < 0
+    ):
+        raise ValueError("INVALID_ARTIFACT")
+    return structural_bytes > P3_V2_JOURNAL_CAP or l_wire > P3_V2_JOURNAL_CAP
+
+
+def p3_v2_scope_budget(coverage: Mapping[str, int]) -> dict[str, object]:
+    """Return the pure P3-v2 registration and runtime budgets for valid coverage."""
+    if not isinstance(coverage, Mapping) or any(
+        kind not in P3_V2_COVERAGE_KINDS for kind in coverage
+    ):
+        raise ValueError("INVALID_ARTIFACT")
+    if any(type(count) is not int or count < 0 for count in coverage.values()):
+        raise ValueError("INVALID_ARTIFACT")
+    counts = {kind: coverage.get(kind, 0) for kind in P3_V2_COVERAGE_KINDS}
+    total = sum(counts.values())
+    market_steps = counts["HISTORICAL_MARKET_STEP"]
+    if total == 0:
+        raise ValueError("INVALID_ARTIFACT")
+
+    row_counts = {
+        kind: _ceil_div(sum(counts[key] for key in basis) * numerator, denominator)
+        for kind, basis in P3_V2_COVERAGE_BASIS.items()
+        if basis is not None
+        for numerator, denominator in (P3_V2_MULTIPLIERS[kind],)
+    }
+    kind_budgets = {
+        kind: row_counts[kind] * P3_V2_ROW_CAPS[kind] for kind in row_counts
+    }
+    table_max = P3_V2_DEFS_PER_MARKET * market_steps
+    table_bytes_max = table_max * P3_V2_DEFCAP
+    structural_bytes = P3_V2_HEADER_BYTES + sum(kind_budgets.values()) + table_bytes_max
+    l_wire = market_steps * P3_V2_ROW_MIN
+    refused = p3_v2_scope_refused(structural_bytes, l_wire)
+    u_wire = None if refused else P3_V2_JOURNAL_CAP
+    x2 = max(
+        P3_V2_RECONCILIATION_FLOOR,
+        _ceil_div(P3_V2_X2_COEFFICIENT[0] * total, P3_V2_X2_COEFFICIENT[1]),
+    )
+    e2 = max(
+        P3_V2_ENDPOINT_FLOOR,
+        _ceil_div(P3_V2_E2_COEFFICIENT[0] * total, P3_V2_E2_COEFFICIENT[1]),
+    )
+    return {
+        "row_counts": row_counts,
+        "kind_budgets": kind_budgets,
+        "table_max": table_max,
+        "table_bytes_max": table_bytes_max,
+        "structural_bytes": structural_bytes,
+        "B_SG": P3_V2_JOURNAL_CAP - structural_bytes,
+        "L_wire": l_wire,
+        "U_wire": u_wire,
+        "J2": P3_V2_JOURNAL_CAP if not refused else None,
+        "X2": x2,
+        "E2": e2,
+        "refused": refused,
+    }
 
 
 def artifact_limit(family: str, encoding: str, artifact: str) -> int | None:

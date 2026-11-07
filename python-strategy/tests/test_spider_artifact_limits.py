@@ -106,3 +106,157 @@ def test_p3_v2_closed_record_kinds_match_common_schema():
 
     schema_kinds = set(schema._KINDS) | {schema._P3_KIND}
     assert schema_kinds - {"DELIVERY_ATTEMPT"} == limits.P3_V2_RECORD_KINDS
+
+
+# Captured with the v2 D5.2 closed slots and D5.3 canonical bytes. H01-H10
+# came from the real research executor; F-IN/H60/H360 from stored replay rows.
+P3_V2_FIXTURES = (
+    ("F-IN", (287, 96, 24), (459303, 1177725, 616274, 346894), 80, 30894),
+    ("H01", (23, 8, 2), (38460, 95284, 65035, 279066), 17, 6385),
+    ("H02", (4, 2, 0), (10786, 15720, 9063, 0), 9, 2252),
+    ("H03", (20, 7, 1), (30976, 78652, 39553, 0), 0, 0),
+    ("H04", (20, 7, 1), (33379, 81822, 42231, 0), 7, 1828),
+    ("H05", (4, 2, 0), (9395, 15004, 7869, 0), 2, 503),
+    ("H06-A", (1, 1, 0), (4431, 5480, 5612, 0), 0, 0),
+    ("H06-B", (1, 1, 0), (4431, 5363, 4292, 0), 0, 0),
+    ("H08", (11, 4, 1), (18302, 46125, 23968, 0), 2, 491),
+    ("H09", (11, 4, 1), (18823, 45525, 24109, 0), 4, 962),
+    ("H10", (0, 1, 0), (5284, 0, 0, 0), 2, 530),
+    ("H60", (719, 240, 60), (1194812, 3004779, 1985534, 9492559), 482, 184479),
+    ("H360", (4319, 1440, 360), (6891086, 18364493, 9853802, 15081552), 724, 276840),
+)
+
+
+def test_p3_v2_fixture_calibration_admits_all_executable_scopes():
+    kinds = (
+        "HISTORICAL_MARKET_RESULT",
+        "SNAPSHOT_FACT",
+        "CALLBACK_RESULT",
+        "SOURCE_GROUP_RESULT",
+    )
+    for name, (timers, market, cache), actual, definitions, def_bytes in P3_V2_FIXTURES:
+        budget = limits.p3_v2_scope_budget(
+            dict(zip(limits.P3_V2_COVERAGE_KINDS, (market, cache, timers), strict=True))
+        )
+        total = timers + market + cache
+        expected_rows = {
+            "HISTORICAL_MARKET_RESULT": (11 * market + 9) // 10,
+            "SNAPSHOT_FACT": (12 * total + 4) // 5,
+            "CALLBACK_RESULT": (27 * total + 9) // 10,
+        }
+        expected_budgets = {
+            "HISTORICAL_MARKET_RESULT": expected_rows["HISTORICAL_MARKET_RESULT"]
+            * 5933,
+            "SNAPSHOT_FACT": expected_rows["SNAPSHOT_FACT"] * 1572,
+            "CALLBACK_RESULT": expected_rows["CALLBACK_RESULT"] * 1544,
+        }
+        assert budget["row_counts"] == expected_rows, name
+        assert budget["kind_budgets"] == expected_budgets, name
+        actual_by_kind = dict(zip(kinds, actual, strict=True))
+        assert (
+            not budget["refused"]
+            and budget["U_wire"] == budget["J2"] == limits.P3_V2_JOURNAL_CAP
+        ), name
+        assert budget["L_wire"] <= limits.P3_V2_JOURNAL_CAP, name
+        assert all(actual_by_kind[k] <= budget["kind_budgets"][k] for k in kinds[:3]), (
+            name
+        )
+        assert actual_by_kind["SOURCE_GROUP_RESULT"] <= budget["B_SG"], name
+        assert (
+            definitions <= budget["table_max"]
+            and def_bytes <= budget["table_bytes_max"]
+        ), name
+        assert def_bytes <= definitions * limits.P3_V2_DEFCAP, name
+
+
+def test_p3_v2_bounds_are_inclusive_and_refuse_only_above_limit():
+    assert (
+        limits.p3_v2_scope_refused(limits.P3_V2_JOURNAL_CAP, limits.P3_V2_JOURNAL_CAP)
+        is False
+    )
+    assert limits.p3_v2_scope_refused(limits.P3_V2_JOURNAL_CAP + 1, 0) is True
+    assert limits.p3_v2_scope_refused(0, limits.P3_V2_JOURNAL_CAP + 1) is True
+    one = limits.p3_v2_scope_budget({"HISTORICAL_MARKET_STEP": 1})
+    assert one["row_counts"] == {
+        "HISTORICAL_MARKET_RESULT": 2,
+        "SNAPSHOT_FACT": 3,
+        "CALLBACK_RESULT": 3,
+    }
+
+
+def test_p3_v2_h360_derived_budget_matches_fixed_arithmetic():
+    budget = limits.p3_v2_scope_budget(
+        {
+            "HISTORICAL_TIMER": 4319,
+            "HISTORICAL_MARKET_STEP": 1440,
+            "HISTORICAL_MARKET_CACHE": 360,
+        }
+    )
+    assert budget["row_counts"] == {
+        "HISTORICAL_MARKET_RESULT": 1584,
+        "SNAPSHOT_FACT": 14686,
+        "CALLBACK_RESULT": 16522,
+    }
+    assert (budget["table_max"], budget["table_bytes_max"]) == (7200, 3_060_000)
+    assert (budget["structural_bytes"], budget["B_SG"], budget["L_wire"]) == (
+        61_054_232,
+        28_424_253,
+        2_291_040,
+    )
+    assert (budget["U_wire"], budget["J2"], budget["X2"], budget["E2"]) == (
+        89_478_485,
+        89_478_485,
+        19_048_383,
+        limits.DEFAULT_LIMIT,
+    )
+
+
+def test_p3_v2_coverage_rejects_empty_malformed_and_unknown_inputs():
+    for value in (
+        {},
+        {"HISTORICAL_TIMER": 0},
+        {"UNKNOWN": 1},
+        {"HISTORICAL_TIMER": True},
+        {"HISTORICAL_TIMER": -1},
+        {"HISTORICAL_TIMER": 1.0},
+    ):
+        try:
+            limits.p3_v2_scope_budget(value)
+        except ValueError as exc:
+            assert exc.args == ("INVALID_ARTIFACT",)
+        else:
+            raise AssertionError(value)
+    for structural, minimum in ((True, 0), (-1, 0), (0, -1), (0.0, 0)):
+        try:
+            limits.p3_v2_scope_refused(structural, minimum)
+        except ValueError as exc:
+            assert exc.args == ("INVALID_ARTIFACT",)
+        else:
+            raise AssertionError((structural, minimum))
+
+
+def test_p3_v2_uses_python_integers_and_scope_budgets_are_monotone():
+    huge = 10**100
+    result = limits.p3_v2_scope_budget(
+        {"HISTORICAL_TIMER": huge, "HISTORICAL_MARKET_STEP": huge}
+    )
+    assert result["refused"] is True
+    small = limits.p3_v2_scope_budget(
+        {
+            "HISTORICAL_TIMER": 719,
+            "HISTORICAL_MARKET_STEP": 240,
+            "HISTORICAL_MARKET_CACHE": 60,
+        }
+    )
+    large = limits.p3_v2_scope_budget(
+        {
+            "HISTORICAL_TIMER": 720,
+            "HISTORICAL_MARKET_STEP": 240,
+            "HISTORICAL_MARKET_CACHE": 60,
+        }
+    )
+    assert large["structural_bytes"] >= small["structural_bytes"]
+    assert large["X2"] >= small["X2"] and large["E2"] >= small["E2"]
+    assert large["B_SG"] <= small["B_SG"]
+    scaled = limits.p3_v2_scope_budget({"HISTORICAL_TIMER": 10_000})
+    assert (scaled["X2"], scaled["E2"]) == (31_129_896, 17_633_869)
