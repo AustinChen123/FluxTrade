@@ -8,10 +8,20 @@ import pytest
 pytestmark = pytest.mark.rust
 
 
-def _native_invariant_fault() -> Exception:
+def _native_error_type(name: str):
+    """Expose native exception types only through the approved test boundary."""
     import fluxtrade_core as native
 
-    return native.ScenarioReplayInvariantError("NATIVE_INVARIANT")
+    return {
+        "ScenarioReplayInputError": native.ScenarioReplayInputError,
+        "ScenarioReplayLookupError": native.ScenarioReplayLookupError,
+        "ScenarioReplayConflictError": native.ScenarioReplayConflictError,
+        "ScenarioReplayInvariantError": native.ScenarioReplayInvariantError,
+    }[name]
+
+
+def _native_invariant_fault() -> Exception:
+    return _native_error_type("ScenarioReplayInvariantError")("NATIVE_INVARIANT")
 
 
 def test_scheduler_classifier_uses_only_exact_closed_native_types():

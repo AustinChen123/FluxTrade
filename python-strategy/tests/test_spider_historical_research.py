@@ -25,6 +25,7 @@ from src.core.backtest import spider_scenario_run as scenario
 from src.core.backtest import synthetic_scenario_codec as wire
 from src.core.backtest.spider_historical_input import HistoricalInputError
 from src.core.backtest.synthetic_scenario_replay import _ReplayComposition
+from test_synthetic_scenario_native import _native_error_type
 from test_spider_scenario_run import frozen_h03_input, install_frozen_h03_order, read
 
 _BASE = Path(__file__).parents[1] / "src/core/backtest"
@@ -270,68 +271,68 @@ _HEAD_INPUT_EXCEPTION_CASES = (
     ("SystemExit", SystemExit, ("MATRIX_ERROR",), False),
     (
         "ScenarioReplayInputError",
-        wire._native.ScenarioReplayInputError,
+        _native_error_type("ScenarioReplayInputError"),
         ("MATRIX_ERROR",),
         True,
     ),
-    ("ScenarioReplayInputErrorEmpty", wire._native.ScenarioReplayInputError, (), True),
+    ("ScenarioReplayInputErrorEmpty", _native_error_type("ScenarioReplayInputError"), (), True),
     (
         "ScenarioReplayInputErrorOdd",
-        wire._native.ScenarioReplayInputError,
+        _native_error_type("ScenarioReplayInputError"),
         ("ODD", "ARGS", 3),
         True,
     ),
     (
         "ScenarioReplayLookupError",
-        wire._native.ScenarioReplayLookupError,
+        _native_error_type("ScenarioReplayLookupError"),
         ("MATRIX_ERROR",),
         False,
     ),
     (
         "ScenarioReplayLookupErrorEmpty",
-        wire._native.ScenarioReplayLookupError,
+        _native_error_type("ScenarioReplayLookupError"),
         (),
         False,
     ),
     (
         "ScenarioReplayLookupErrorOdd",
-        wire._native.ScenarioReplayLookupError,
+        _native_error_type("ScenarioReplayLookupError"),
         ("ODD", "ARGS", 3),
         False,
     ),
     (
         "ScenarioReplayConflictError",
-        wire._native.ScenarioReplayConflictError,
+        _native_error_type("ScenarioReplayConflictError"),
         ("MATRIX_ERROR",),
         True,
     ),
     (
         "ScenarioReplayConflictErrorEmpty",
-        wire._native.ScenarioReplayConflictError,
+        _native_error_type("ScenarioReplayConflictError"),
         (),
         True,
     ),
     (
         "ScenarioReplayConflictErrorOdd",
-        wire._native.ScenarioReplayConflictError,
+        _native_error_type("ScenarioReplayConflictError"),
         ("ODD", "ARGS", 3),
         True,
     ),
     (
         "ScenarioReplayInvariantError",
-        wire._native.ScenarioReplayInvariantError,
+        _native_error_type("ScenarioReplayInvariantError"),
         ("MATRIX_ERROR",),
         False,
     ),
     (
         "ScenarioReplayInvariantErrorEmpty",
-        wire._native.ScenarioReplayInvariantError,
+        _native_error_type("ScenarioReplayInvariantError"),
         (),
         False,
     ),
     (
         "ScenarioReplayInvariantErrorOdd",
-        wire._native.ScenarioReplayInvariantError,
+        _native_error_type("ScenarioReplayInvariantError"),
         ("ODD", "ARGS", 3),
         False,
     ),
@@ -794,10 +795,10 @@ def _raise(error):
 def _classified_error(case):
     primary = {"kind": "PERSISTENCE", "reason": "ARTIFACT_WRITE_FAILED"}
     native = {
-        "native_input": wire._native.ScenarioReplayInputError,
-        "native_lookup": wire._native.ScenarioReplayLookupError,
-        "native_conflict": wire._native.ScenarioReplayConflictError,
-        "native_invariant": wire._native.ScenarioReplayInvariantError,
+        "native_input": _native_error_type("ScenarioReplayInputError"),
+        "native_lookup": _native_error_type("ScenarioReplayLookupError"),
+        "native_conflict": _native_error_type("ScenarioReplayConflictError"),
+        "native_invariant": _native_error_type("ScenarioReplayInvariantError"),
     }
     if case in native:
         return native[case]("CLASSIFIED_FAILURE")
@@ -1120,7 +1121,7 @@ def test_classified_exception_classes_match_head_return_vs_research_dto(tmp_path
 def _exercise_failure_selector(monkeypatch, case):
     _value, raw = _small_input("c6-" + case)
     install_frozen_h03_order(monkeypatch)
-    fault = wire._native.ScenarioReplayInvariantError(case.upper() + "_FAULT")
+    fault = _native_error_type("ScenarioReplayInvariantError")(case.upper() + "_FAULT")
     filled, captures, calls = ([], [], [])
     original_core = _ReplayComposition._capture_owner_evidence_core
     original_capture = _ReplayComposition.capture_owner_evidence
@@ -1250,7 +1251,7 @@ def _exercise_failure_selector(monkeypatch, case):
 
 def _frontier_error(kind):
     if kind == "native":
-        return wire._native.ScenarioReplayInvariantError("FRONTIER_NATIVE")
+        return _native_error_type("ScenarioReplayInvariantError")("FRONTIER_NATIVE")
     if kind == "persistence":
         return store.SpiderRunStoreError(
             "ARTIFACT_WRITE_FAILED",

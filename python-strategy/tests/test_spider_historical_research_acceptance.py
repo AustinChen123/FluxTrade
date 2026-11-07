@@ -27,6 +27,7 @@ from src.core.backtest.spider_run_artifacts import (
     encode_jsonl,
 )
 from tools.spider_run_compare import compare
+from test_synthetic_scenario_native import _native_error_type
 from test_spider_scenario_run import frozen_h03_input, install_frozen_h03_order
 
 _S0 = Path(
@@ -338,14 +339,14 @@ def _run_failure_pair(tmp_path, monkeypatch, failure: str):
         key = (node["bar_open_ms"], node["step_index"])
         seen[mode[0]].append(("market", key))
         if failure == "forced_event" and key == (target_ms, 0):
-            raise wire._native.ScenarioReplayInvariantError("C7_FORCED_FAILURE")
+            raise _native_error_type("ScenarioReplayInvariantError")("C7_FORCED_FAILURE")
         return original_market(self, node)
 
     def capture(self, cutoff, *requests):
         ids = [request["snapshot_id"] for request in requests]
         seen[mode[0]].append(("capture", cutoff, tuple(ids)))
         if failure == "capture_fault" and ids[0].startswith("MARKET-"):
-            raise wire._native.ScenarioReplayInvariantError("C7_CAPTURE_FAILURE")
+            raise _native_error_type("ScenarioReplayInvariantError")("C7_CAPTURE_FAILURE")
         return original_capture(self, cutoff, *requests)
 
     def retain(original):
@@ -370,7 +371,7 @@ def _run_failure_pair(tmp_path, monkeypatch, failure: str):
                 )
             )
             if failure == "retain_fault" and row["journal_seq"] == 1:
-                raise wire._native.ScenarioReplayInvariantError("C7_RETAIN_FAILURE")
+                raise _native_error_type("ScenarioReplayInvariantError")("C7_RETAIN_FAILURE")
             result = original(self, row)
             if mode[0] == "durable":
                 durable_retained_ordinals.append(row["journal_seq"])

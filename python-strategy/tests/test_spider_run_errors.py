@@ -18,7 +18,7 @@ from src.core.backtest import spider_run_errors as errors
 from src.core.backtest import spider_run_evidence as evidence
 from src.core.backtest import spider_run_store as store
 from src.core.backtest import spider_scenario_run as scenario
-from src.core.backtest import synthetic_scenario_codec as wire
+from test_synthetic_scenario_native import _native_error_type
 
 _HEAD_MATRIX_SHA256 = "df9d0f169032c7cfceac06422cd07d4167795f7363060edfa5c387191c4a722b"
 
@@ -76,7 +76,7 @@ def test_projection_subclass_omitted_reason_matches_head():
 
 
 def _error_cases():
-    native = wire._native.ScenarioReplayInputError
+    native = _native_error_type("ScenarioReplayInputError")
     return {"BaseExceptionGroup": BaseExceptionGroup("probe", [KeyboardInterrupt("inner")]),
             "ProjectionChild": ProjectionChild(), "ScenarioReplayInputErrorChild": type("ScenarioReplayInputErrorChild", (native,), {})("probe"),
             "StoreChild": StoreChild("PUBLICATION_DURABILITY_UNKNOWN")}
@@ -220,7 +220,7 @@ def test_real_store_failure_outcomes_and_artifact_bytes_match_head(tmp_path, mon
             return original_append(owner, *args, **kwargs)
         nested = RuntimeError("wrapped")
         nested.__cause__ = scenario._ProjectionError()
-        outer_errors = {"outer_projection": scenario._ProjectionError(), "outer_native": scenario._wire._native.ScenarioReplayInputError("probe"),
+        outer_errors = {"outer_projection": scenario._ProjectionError(), "outer_native": _native_error_type("ScenarioReplayInputError")("probe"),
                         "outer_memory": MemoryError("outer"), "outer_keyboard": KeyboardInterrupt("outer"),
                         "outer_base": BaseException("outer"), "outer_nested": nested, "outer_newer": scenario._ProjectionError()}
         def execute(_attempt, *args):
