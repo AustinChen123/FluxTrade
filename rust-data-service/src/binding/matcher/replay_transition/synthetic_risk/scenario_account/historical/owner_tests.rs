@@ -673,8 +673,44 @@ fn historical_step_commits_through_the_existing_execution_owner() {
 
 #[test]
 fn historical_downstream_context_failure_discards_staged_mark_candidate() {
-    let (seed, products) = configured_ab();
+    let (mut seed, products) = configured_ab();
+    seed.orders.push(SeedOrder {
+        intent_id: "ROLLBACK-INTENT".into(),
+        order_id: "ROLLBACK-ORDER".into(),
+        client_id: "ROLLBACK-CLIENT".into(),
+        strategy_id: "ROLLBACK-STRATEGY".into(),
+        product: ProfileProduct::BtcEth(products[0].product.clone()),
+        side: Side::Short,
+        price: d("109"),
+        reduce_only: false,
+        original: d("1"),
+        filled: Decimal::ZERO,
+        canceled: Decimal::ZERO,
+        remaining: d("1"),
+        status: "OPEN".into(),
+    });
     let mut owner = ScenarioAccount::from_configured(&seed, d("10"), products).unwrap();
+    let initial = node_input(
+        &owner,
+        NodeBar {
+            model: "OHLC4_OPEN_HIGH_LOW_CLOSE_V1",
+            bar_open_ms: 1_000,
+            step_index: 0,
+            a_ohlc: [d("100"), d("105"), d("95"), d("100")],
+            a_volume: "8",
+            a_mark: [d("100"), d("105"), d("95"), d("100")],
+        },
+        &[("ROLLBACK-ORDER", 1)],
+    );
+    owner.historical_market_step(&initial).unwrap();
+    let saved: std::collections::BTreeMap<_, _> = owner
+        .transition
+        .contexts
+        .iter()
+        .map(|(key, receipt)| (key.clone(), receipt.clone()))
+        .collect();
+    assert!(!saved.is_empty());
+    owner.state_version = u64::MAX - 1;
     let input = node_input(
         &owner,
         NodeBar {
@@ -685,15 +721,19 @@ fn historical_downstream_context_failure_discards_staged_mark_candidate() {
             a_volume: "8",
             a_mark: [d("100"), d("110"), d("90"), d("105")],
         },
-        &[],
+        &[("ROLLBACK-ORDER", 1)],
     );
-    owner.state_version = u64::MAX;
-    let before = owner.clone();
     assert_eq!(
         owner.historical_market_step(&input),
         Err("VERSION_OVERFLOW")
     );
-    assert_eq!(owner, before);
+    let after: std::collections::BTreeMap<_, _> = owner
+        .transition
+        .contexts
+        .iter()
+        .map(|(key, receipt)| (key.clone(), receipt.clone()))
+        .collect();
+    assert_eq!(after, saved);
 }
 
 #[test]

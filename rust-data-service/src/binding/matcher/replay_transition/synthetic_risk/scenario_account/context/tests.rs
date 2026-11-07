@@ -148,6 +148,121 @@ fn configure_spec_change(row: &mut ConfiguredProduct, at: i64, tick: &str) {
     ];
 }
 
+fn owned_context_rows(owner: &ScenarioAccount) -> std::collections::BTreeMap<String, Receipt> {
+    owner
+        .transition
+        .contexts
+        .iter()
+        .map(|(key, receipt)| (key.clone(), receipt.clone()))
+        .collect()
+}
+
+#[test]
+fn nonempty_context_history_publication_and_rollback_match_owned_rows() {
+    use super::super::group::{Group, Input as GroupInput, Member};
+
+    let (mut seed, config, marks) = fixture();
+    seed.effective_at = 999;
+    seed.orders.clear();
+    let mut original = ScenarioAccount::from_seed(&seed, &config, &marks).unwrap();
+    let mut first = activation(
+        &original,
+        1000,
+        Rows::Tiers(
+            [Product::Btc, Product::Eth]
+                .into_iter()
+                .map(|product| (product, "tier-v1".into(), "tier-v2".into(), 1000))
+                .collect(),
+        ),
+    );
+    first.stamp.event_id = "prior-context".into();
+    original.activate_context(&first).unwrap();
+    let saved = owned_context_rows(&original);
+    assert_eq!(saved.len(), 1);
+
+    let mut success = original.clone();
+    let mut second = activation(&success, 1001, mark_rows_vec(&marks, 1001));
+    second.stamp.event_id = "published-context".into();
+    let (expected_receipt, _) = success.prepare_context(&second).unwrap();
+    let mut published = saved.clone();
+    published.insert(second.stamp.event_id.clone(), expected_receipt.clone());
+    let receipt = success.activate_context(&second).unwrap();
+    assert_eq!(receipt, expected_receipt);
+    assert_eq!(owned_context_rows(&success), published);
+    assert_eq!(success.activate_context(&second).unwrap(), receipt);
+    assert_eq!(owned_context_rows(&success), published);
+    let mut conflict = second.clone();
+    conflict.expected_after[0] ^= 1;
+    assert_eq!(
+        success.activate_context(&conflict),
+        Err("EVENT_ID_CONFLICT")
+    );
+    assert_eq!(owned_context_rows(&success), published);
+
+    for (event_id, panic) in [("before-error", false), ("before-panic", true)] {
+        let mut owner = original.clone();
+        let mut input = activation(&owner, 1002, mark_rows_vec(&marks, 1002));
+        input.stamp.event_id = event_id.into();
+        let result = owner.activate_context_checked(&input, |stage| {
+            if stage == Stage::BeforeSwap {
+                if panic {
+                    panic!("before-swap injection");
+                }
+                Err("BEFORE_SWAP_INJECTED")
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(
+            result,
+            Err(if panic {
+                "CONTEXT_PANIC"
+            } else {
+                "BEFORE_SWAP_INJECTED"
+            })
+        );
+        assert_eq!(owned_context_rows(&owner), saved);
+    }
+
+    let mut after = original.clone();
+    let mut after_input = activation(&after, 1003, mark_rows_vec(&marks, 1003));
+    after_input.stamp.event_id = "after-swap-error".into();
+    let (after_receipt, _) = after.prepare_context(&after_input).unwrap();
+    assert_eq!(
+        after.activate_context_checked(&after_input, |stage| {
+            if stage == Stage::AfterSwap {
+                Err("AFTER_SWAP_INJECTED")
+            } else {
+                Ok(())
+            }
+        }),
+        Err("AFTER_SWAP_INJECTED")
+    );
+    let mut retained = saved.clone();
+    retained.insert(after_input.stamp.event_id.clone(), after_receipt);
+    assert_eq!(owned_context_rows(&after), retained);
+
+    let mut grouped = original.clone();
+    let mut group_input = activation(&grouped, 1004, mark_rows_vec(&marks, 1004));
+    group_input.stamp.event_id = "group-context".into();
+    let (group_receipt, _) = grouped.prepare_context(&group_input).unwrap();
+    let group = Group {
+        group_id: "nonempty-context-group".into(),
+        account_key: grouped.key.clone(),
+        ordering_contract_id: "S_order_v1".into(),
+        group_effective_at: group_input.stamp.effective_at,
+        declared_member_count: 1,
+        members: vec![Member {
+            stamp: group_input.stamp.clone(),
+            input: GroupInput::Context(group_input.clone()),
+        }],
+    };
+    grouped.apply_group(&group).unwrap();
+    let mut group_rows = saved;
+    group_rows.insert(group_input.stamp.event_id, group_receipt);
+    assert_eq!(owned_context_rows(&grouped), group_rows);
+}
+
 fn configure_tier_change(row: &mut ConfiguredProduct, at: i64, mmr: &str) {
     let mut old = row.tiers[0].clone();
     old.interval.to = Some(at);
