@@ -26,11 +26,8 @@ import time
 from threading import Thread
 from typing import Any, IO, cast, Sequence
 
-from src.core.backtest.spider_run_admission import (
-    _LIMIT,
-    _P3_JOURNAL_LIMIT,
-    admit_spider_run,
-)
+from src.core.backtest.spider_artifact_limits import DEFAULT_LIMIT as _LIMIT, artifact_limit
+from src.core.backtest.spider_run_admission import admit_spider_run
 
 _ARTIFACT_NAMES = {
     "attempt.json",
@@ -113,7 +110,7 @@ def _cleanup_process(
 
 def _limits() -> dict[str, int]:
     return {
-        name: _P3_JOURNAL_LIMIT if name == "journal.jsonl" else _LIMIT
+        name: artifact_limit("P3", "v1", name) or _LIMIT
         for name in _ARTIFACT_NAMES
     }
 
