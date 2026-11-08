@@ -131,3 +131,12 @@ def independent_source_group_wire(row):
     if definitions:
         wire["order_defs"] = definitions
     return canonical_bytes(wire) + b"\n"
+
+
+def assert_j6_reader_accepts(store, expected_rows):
+    """Require the committed J6 reader to recover exact row values and types."""
+    rows, _ = store._reread_artifact(
+        "journal.jsonl", module.validate_journal, attempt=store._attempt,
+    )
+    if canonical_bytes(rows) != canonical_bytes(expected_rows):
+        raise AssertionError("writer output differs from J6 reader rows")

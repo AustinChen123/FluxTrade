@@ -22,6 +22,8 @@ data = json.load(sys.stdin)
 store = module.SpiderRunStore(Path(data["path"]), data["run_id"])
 store._attempt = data["attempt"]
 store._state = "RUNNING"
+store._p3_v2_write_enabled = True
+if not store._writes_p3_v2_journal(): os._exit(85)
 row = data["row"]
 boundary = dict(ordinal=row["journal_seq"], journal_seq=row["journal_seq"], barrier_id=row["barrier_id"])
 store.mark_processed(boundary, record_kind=row["record_kind"])
@@ -30,6 +32,7 @@ real_write = module._write
 real_publish = store._publish
 def write(path, raw, append=False):
     if Path(path).name == "journal.jsonl":
+        if json.loads(raw)["schema_version"] != "spider_journal_record_v2": os._exit(86)
         if point == "before_journal_fsync": os._exit(81)
         real_write(path, raw, append)
         if point == "after_journal_fsync": os._exit(82)
@@ -77,7 +80,7 @@ def test_v2_crash_restart_at_each_append_commit_boundary(
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
     process = subprocess.run(
         [sys.executable, "-c", _CHILD], input=child_input, text=True,
-        cwd=Path.cwd(), env=environment, check=False, timeout=30,
+        cwd=Path(__file__).parents[1], env=environment, check=False, timeout=30,
     )
     assert process.returncode == exit_code
 
@@ -85,6 +88,8 @@ def test_v2_crash_restart_at_each_append_commit_boundary(
     status_bytes = (store._path / "status.json").read_bytes()
     if journal_complete:
         assert journal_bytes.endswith(b"\n") and journal_bytes.count(b"\n") == 1
+        record = json.loads(journal_bytes)
+        assert record["schema_version"] == "spider_journal_record_v2"
     else:
         assert journal_bytes == b""
     assert b'"persisted_boundary":' in status_bytes

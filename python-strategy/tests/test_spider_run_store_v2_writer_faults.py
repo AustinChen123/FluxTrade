@@ -7,9 +7,12 @@ from pathlib import Path
 import pytest
 
 from src.core.backtest import spider_run_store as module
+from src.core.backtest import spider_projection_size as projection_size
 from src.core.backtest.spider_run_artifacts import canonical_bytes
-from spider_run_store_v2_fixtures import empty_v2_writer, p3_v2_finalize_fixture
-from spider_run_store_v2_fixtures import callback_row, independent_source_group_wire, source_group_row
+from spider_run_store_v2_fixtures import (
+    assert_j6_reader_accepts, callback_row, empty_v2_writer,
+    independent_source_group_wire, p3_v2_finalize_fixture, source_group_row,
+)
 
 
 def test_v2_e4_failed_publication_stays_running_and_blocks_next_append(
@@ -67,9 +70,9 @@ def test_v2_append_rejects_each_scope_budget_axis_before_file_publish(
 
     monkeypatch.setattr(module.artifact_limits, "p3_v2_scope_budget", bounded_budget)
     if axis == "material":
-        monkeypatch.setattr(module.artifact_limits, "P3_V2_MATERIAL_CEILING", 0)
+        monkeypatch.setattr(projection_size, "P3_V2_MATERIAL_CEILING", 0)
     elif axis == "ratio":
-        monkeypatch.setattr(module.artifact_limits, "P3_V2_EXP_MAX", 0)
+        monkeypatch.setattr(projection_size, "P3_V2_EXP_MAX", 0)
     store.mark_processed(dict(ordinal=1, journal_seq=1, barrier_id=row["barrier_id"]), record_kind="CALLBACK_RESULT")
     before = {path.name: path.read_bytes() for path in store._path.iterdir() if path.is_file()}
     with pytest.raises(module.SpiderRunStoreError) as caught:
@@ -106,6 +109,7 @@ def test_v2_sg_budget_exact_and_plus_one_at_append(tmp_path, real_p3_artifacts, 
         store.append_journal(row)
         assert journal.read_bytes() == wire
         assert store._p3_v2_kind_bytes["SOURCE_GROUP_RESULT"] == len(wire)
+        assert_j6_reader_accepts(store, [row])
 
 
 @pytest.mark.parametrize("axis,minus_one", [("table_count", False), ("table_bytes", False),
@@ -143,6 +147,7 @@ def test_v2_order_table_budget_boundaries_use_wire_definitions(
         store.append_journal(row)
         assert journal.read_bytes() == independent_source_group_wire(row)
         assert store._p3_v2_definition_bytes == definition_bytes
+        assert_j6_reader_accepts(store, [row])
 
 
 @pytest.mark.parametrize("definition_size", [4_096, 4_097])
@@ -191,6 +196,7 @@ def test_v2_definition_size_ceiling_is_inclusive_with_real_file_io(
         store.append_journal(row)
         assert journal.read_bytes().endswith(b"\n")
         assert store._p3_v2_definition_bytes == 4_096
+        assert_j6_reader_accepts(store, [row])
     else:
         with pytest.raises(module.SpiderRunStoreError) as caught:
             store.append_journal(row)

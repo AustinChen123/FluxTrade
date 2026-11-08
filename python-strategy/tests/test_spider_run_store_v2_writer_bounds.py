@@ -5,20 +5,21 @@ from copy import deepcopy
 import pytest
 
 from src.core.backtest import spider_run_store as module
+from src.core.backtest import spider_projection_size as projection_size
 from src.core.backtest.spider_projection_size import canonical_jsonl_row_len
 from src.core.backtest.spider_run_artifacts import canonical_bytes
 from spider_run_store_v2_fixtures import (
-    callback_row, empty_v2_writer, independent_source_group_wire, p3_v2_finalize_fixture,
-    source_group_row,
+    assert_j6_reader_accepts, callback_row, empty_v2_writer,
+    independent_source_group_wire, p3_v2_finalize_fixture, source_group_row,
 )
 
 
 ROW_MAX = 1_048_576  # v2 D2.4 inclusive 1 MiB wire-row ceiling.
 
 
-@pytest.mark.parametrize("delta,admitted", [(-1, True), (0, True), (1, False)])
-def test_v2_writer_row_max_is_inclusive_with_real_file_io(
-    tmp_path, real_p3_artifacts, delta, admitted, monkeypatch,
+@pytest.mark.parametrize("delta", [-1, 0, 1])
+def test_v2_wire_row_max_inclusive_with_real_file_io(
+    tmp_path, real_p3_artifacts, delta, monkeypatch,
 ):
     store, values, _, _ = p3_v2_finalize_fixture(tmp_path, real_p3_artifacts)
     journal = empty_v2_writer(store)
@@ -31,18 +32,24 @@ def test_v2_writer_row_max_is_inclusive_with_real_file_io(
         return budget
 
     monkeypatch.setattr(module.artifact_limits, "p3_v2_scope_budget", row_budget)
+    # Isolate the wire ROW_MAX check; expanded-row acceptance is exercised below
+    # with the unmodified shared J6 helper.
+    monkeypatch.setattr(module, "projected_jsonl_budget_ok", lambda **kwargs: True)
     row = callback_row(store, values, ROW_MAX + delta)
+    expected_v2 = deepcopy(row)
+    expected_v2["schema_version"] = "spider_journal_record_v2"
+    del expected_v2["configuration_context"]
+    del expected_v2["historical_context"]
+    assert len(canonical_bytes(row)) + 1 > ROW_MAX
+    assert len(canonical_bytes(expected_v2)) + 1 == ROW_MAX + delta
     boundary = dict(ordinal=1, journal_seq=1, barrier_id=row["barrier_id"])
     store.mark_processed(boundary, record_kind=row["record_kind"])
     before_append = {path.name: path.read_bytes() for path in store._path.iterdir() if path.is_file()}
 
-    if admitted:
+    if delta <= 0:
         store.append_journal(row)
-        raw = journal.read_bytes()
-        assert len(raw) == ROW_MAX + delta
-        assert raw.endswith(b"\n")
-        assert store._p3_v2_wire_bytes == len(raw)
-        assert store._p3_v2_kind_bytes["CALLBACK_RESULT"] == len(raw)
+        assert len(journal.read_bytes()) == ROW_MAX + delta
+        assert store._p3_v2_wire_bytes == ROW_MAX + delta
     else:
         with pytest.raises(module.SpiderRunStoreError) as caught:
             store.append_journal(row)
@@ -54,6 +61,75 @@ def test_v2_writer_row_max_is_inclusive_with_real_file_io(
         assert store._p3_v2_projected_bytes == store._p3_v2_definition_bytes == 0
         with pytest.raises(RuntimeError, match="INVALID_STORE_OPERATION"):
             store.append_journal(row)
+
+
+@pytest.mark.parametrize("delta", [-1, 0, 1])
+def test_v2_projected_row_max_is_inclusive_and_j6_reader_closed(
+    tmp_path, real_p3_artifacts, delta, monkeypatch,
+):
+    store, values, _, _ = p3_v2_finalize_fixture(tmp_path, real_p3_artifacts)
+    journal = empty_v2_writer(store)
+    original_coverage = store._attempt["planned_coverage"]
+    store._attempt["planned_coverage"] = [
+        dict(item, ordinal=scope * len(original_coverage) + index + 1,
+             barrier_id=f"{item['barrier_id']}_{scope}")
+        for scope in range(20)
+        for index, item in enumerate(original_coverage)
+    ]
+    normalized = deepcopy(store._attempt)
+    normalized["artifact_encoding"] = "artifact_encoding_v1"
+    module.validate_artifact(normalized)
+
+    seed = callback_row(store, values, 4_096)
+    seed_v2 = deepcopy(seed)
+    seed_v2["schema_version"] = "spider_journal_record_v2"
+    del seed_v2["configuration_context"]
+    del seed_v2["historical_context"]
+    expanded_overhead = (len(canonical_bytes(seed)) + 1) - (len(canonical_bytes(seed_v2)) + 1)
+    target_projected = ROW_MAX + delta
+    row = callback_row(store, values, target_projected - expanded_overhead)
+    assert len(canonical_bytes(row)) + 1 == target_projected
+    wire_row = deepcopy(row)
+    wire_row["schema_version"] = "spider_journal_record_v2"
+    del wire_row["configuration_context"]
+    del wire_row["historical_context"]
+    expected_wire = len(canonical_bytes(wire_row)) + 1
+    assert expected_wire < ROW_MAX
+    assert len(canonical_bytes(row)) + 1 == target_projected
+
+    store.mark_processed(
+        dict(ordinal=1, journal_seq=1, barrier_id=row["barrier_id"]),
+        record_kind="CALLBACK_RESULT",
+    )
+    before = {path.name: path.read_bytes() for path in store._path.iterdir() if path.is_file()}
+    if delta == 1:
+        with pytest.raises(module.SpiderRunStoreError) as caught:
+            store.append_journal(row)
+        assert caught.value.primary_failure["reason"] == "ARTIFACT_LIMIT_EXCEEDED"
+        assert {path.name: path.read_bytes() for path in store._path.iterdir() if path.is_file()} == before
+        assert store._p3_v2_wire_bytes == 0 and store._p3_v2_projected_bytes == 0
+        assert store._p3_v2_kind_rows == {} and store._p3_v2_codec_state == ()
+        with pytest.raises(RuntimeError, match="INVALID_STORE_OPERATION"):
+            store.append_journal(row)
+    else:
+        store.append_journal(row)
+        assert len(journal.read_bytes()) == expected_wire
+        assert store._p3_v2_projected_bytes == target_projected
+        assert_j6_reader_accepts(store, [row])
+
+
+def test_v2_writer_acceptance_roundtrips_each_real_fixture_row_through_j6_reader(
+    tmp_path, real_p3_artifacts,
+):
+    store, values, _, _ = p3_v2_finalize_fixture(tmp_path, real_p3_artifacts)
+    empty_v2_writer(store)
+    for index, row in enumerate(values[2], start=1):
+        store.mark_processed(
+            dict(ordinal=index, journal_seq=index, barrier_id=row["barrier_id"]),
+            record_kind=row["record_kind"],
+        )
+        store.append_journal(row)
+        assert_j6_reader_accepts(store, values[2][:index])
 
 
 @pytest.mark.parametrize("axis,one_byte_over", [
@@ -91,7 +167,7 @@ def test_v2_writer_cumulative_budget_limits_are_inclusive(
 
     monkeypatch.setattr(module.artifact_limits, "p3_v2_scope_budget", bounded_budget)
     if axis == "material":
-        monkeypatch.setattr(module.artifact_limits, "P3_V2_MATERIAL_CEILING", expected_material_bytes - int(one_byte_over))
+        monkeypatch.setattr(projection_size, "P3_V2_MATERIAL_CEILING", expected_material_bytes - int(one_byte_over))
     store.mark_processed(dict(ordinal=1, journal_seq=1, barrier_id=row["barrier_id"]), record_kind="CALLBACK_RESULT")
     before = {path.name: path.read_bytes() for path in store._path.iterdir() if path.is_file()}
     if one_byte_over:
@@ -105,6 +181,7 @@ def test_v2_writer_cumulative_budget_limits_are_inclusive(
         assert len(journal.read_bytes()) == expected_wire_bytes
         assert store._p3_v2_wire_bytes == expected_wire_bytes
         assert store._p3_v2_projected_bytes == expected_material_bytes
+        assert_j6_reader_accepts(store, [row])
 
 
 @pytest.mark.parametrize("one_byte_over", [False, True])
@@ -137,3 +214,4 @@ def test_v2_source_group_byte_budget_exact_and_plus_one_real_file_io(
         assert journal.read_bytes() == expected_raw
         assert len(journal.read_bytes()) == wire_limit
         assert store._p3_v2_kind_bytes["SOURCE_GROUP_RESULT"] == wire_limit
+        assert_j6_reader_accepts(store, [row])

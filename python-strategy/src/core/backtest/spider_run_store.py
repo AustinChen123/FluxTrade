@@ -20,7 +20,10 @@ from src.core.backtest.spider_run_reconciliation_schema import reconciliation as
 from src.core.backtest import spider_artifact_limits as artifact_limits
 from src.core.backtest.spider_journal_reader_v2 import read_p3_v2_journal
 from src.core.backtest.spider_journal_codec_v2 import encode_p3_v2_row_with_context_gate
-from src.core.backtest.spider_projection_size import canonical_jsonl_row_len
+from src.core.backtest.spider_projection_size import (
+    canonical_jsonl_row_len,
+    projected_jsonl_budget_ok,
+)
 from src.core.backtest.spider_historical_input import (
     ValidatedHistoricalInput,
     _historical_context_for_validated_input,
@@ -477,7 +480,16 @@ class SpiderRunStore:
         if p3_v2_write and type(row) is dict and row.get("record_kind") == "DELIVERY_ATTEMPT":
             self._barrier_failed = True
             raise SpiderRunStoreError("CODEC_UNSUPPORTED_ROW")
-        journal_record(row, execution=self._execution_context if paid else None)
+        try:
+            journal_record(row, execution=self._execution_context if paid else None)
+        except ValueError as error:
+            if not p3_v2_write:
+                raise
+            self._barrier_failed = True
+            raise SpiderRunStoreError(
+                "PERSISTENCE_FAILED", "PERSISTENCE_FAILED",
+                dict(kind="PERSISTENCE", reason="CODEC_UNSUPPORTED_ROW"),
+            ) from error
         boundary = dict(ordinal=row["journal_seq"], journal_seq=row["journal_seq"], barrier_id=row["barrier_id"])
         expected_kind = (self._processed_kind if historical or paid
                          else self._attempt["planned_coverage"][boundary["ordinal"] - 1]["record_kind"])
@@ -535,14 +547,18 @@ class SpiderRunStore:
                 definition_bytes = self._p3_v2_definition_bytes + sum(
                     len(item) for item in added_definitions
                 )
-                next_projected_bytes += canonical_jsonl_row_len(row)
+                next_row_projected_bytes = canonical_jsonl_row_len(row)
+                next_projected_bytes += next_row_projected_bytes
                 if (self._p3_v2_wire_bytes + len(raw) > budget["J2"]
                         or next_kind_bytes[kind] > cap
                         or (kind != "SOURCE_GROUP_RESULT" and next_kind_rows[kind] > row_cap)
                         or len(next_codec_state) > budget["table_max"]
                         or definition_bytes > budget["table_bytes_max"]
-                        or next_projected_bytes > artifact_limits.P3_V2_MATERIAL_CEILING
-                        or next_projected_bytes > artifact_limits.P3_V2_EXP_MAX * (self._p3_v2_wire_bytes + len(raw))):
+                        or not projected_jsonl_budget_ok(
+                            wire_bytes=self._p3_v2_wire_bytes + len(raw),
+                            projected_bytes=next_projected_bytes,
+                            row_projected_bytes=next_row_projected_bytes,
+                        )):
                     raise SpiderRunStoreError("ARTIFACT_LIMIT_EXCEEDED")
                 if any(len(item) > artifact_limits.P3_V2_MAX_DEFINITION_BYTES for item in next_codec_state):
                     raise SpiderRunStoreError("ARTIFACT_LIMIT_EXCEEDED")

@@ -9,8 +9,9 @@ import pytest
 
 from src.core.backtest import spider_run_store as module
 from src.core.backtest.spider_run_artifacts import canonical_bytes
-from spider_run_store_v2_fixtures import empty_v2_writer, p3_v2_finalize_fixture
-from spider_run_store_v2_fixtures import callback_row
+from spider_run_store_v2_fixtures import (
+    callback_row, empty_v2_writer, p3_v2_finalize_fixture, source_group_row,
+)
 
 
 def test_v2_codec_refusal_is_named_terminal_and_precedes_file_write(
@@ -32,6 +33,62 @@ def test_v2_codec_refusal_is_named_terminal_and_precedes_file_write(
     with pytest.raises(RuntimeError, match="INVALID_STORE_OPERATION"):
         store.append_journal(row)
     assert journal.read_bytes() == b""
+
+
+def test_v2_invalid_order_slot_refusal_is_named_terminal_before_file_write(
+    tmp_path, real_p3_artifacts,
+):
+    store, values, _, _ = p3_v2_finalize_fixture(tmp_path, real_p3_artifacts)
+    journal = empty_v2_writer(store)
+    row = source_group_row(store, values)
+    for phase in ("before", "after"):
+        slots = row["payload"][f"owner_evidence_{phase}"]["open_orders_fact"]["immutable_payload"]["rows"]
+        if slots:
+            slots[0]["unsupported_field"] = "reject"
+            break
+    else:
+        raise AssertionError("fixture must contain an order slot")
+    boundary = dict(ordinal=1, journal_seq=1, barrier_id=row["barrier_id"])
+    store.mark_processed(boundary, record_kind="SOURCE_GROUP_RESULT")
+    before = {path.name: path.read_bytes() for path in store._path.iterdir() if path.is_file()}
+
+    with pytest.raises(module.SpiderRunStoreError) as caught:
+        store.append_journal(row)
+    assert caught.value.reason == "PERSISTENCE_FAILED"
+    assert caught.value.primary_failure["reason"] == "CODEC_UNSUPPORTED_ROW"
+    assert {path.name: path.read_bytes() for path in store._path.iterdir() if path.is_file()} == before
+    assert store._p3_v2_wire_bytes == 0 and store._p3_v2_codec_state == ()
+    with pytest.raises(RuntimeError, match="INVALID_STORE_OPERATION"):
+        store.append_journal(source_group_row(store, values))
+    assert journal.read_bytes() == b""
+
+
+def test_v1_invalid_order_slot_refusal_keeps_legacy_retry_and_bytes(
+    tmp_path, real_p3_artifacts,
+):
+    store, values, _, _ = p3_v2_finalize_fixture(tmp_path, real_p3_artifacts)
+    journal = empty_v2_writer(store)
+    store._attempt["artifact_encoding"] = "artifact_encoding_v1"
+    row = source_group_row(store, values)
+    invalid = deepcopy(row)
+    for phase in ("before", "after"):
+        slots = invalid["payload"][f"owner_evidence_{phase}"]["open_orders_fact"]["immutable_payload"]["rows"]
+        if slots:
+            slots[0]["unsupported_field"] = "reject"
+            break
+    else:
+        raise AssertionError("fixture must contain an order slot")
+    store.mark_processed(
+        dict(ordinal=1, journal_seq=1, barrier_id=row["barrier_id"]),
+        record_kind="SOURCE_GROUP_RESULT",
+    )
+    before = {path.name: path.read_bytes() for path in store._path.iterdir() if path.is_file()}
+    with pytest.raises(ValueError):
+        store.append_journal(invalid)
+    assert {path.name: path.read_bytes() for path in store._path.iterdir() if path.is_file()} == before
+    assert not store._barrier_failed
+    store.append_journal(row)
+    assert journal.read_bytes() == canonical_bytes(row) + b"\n"
 
 
 def test_v1_encoding_never_uses_v2_writer_even_if_flag_enabled(tmp_path, real_p3_artifacts):
