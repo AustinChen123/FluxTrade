@@ -375,6 +375,41 @@ def test_completion_coverage_kinds_are_historical_context_specific():
         schema.completion(legacy)
 
 
+def test_p3_v2_completion_table_is_closed_and_selected_by_wire_schema():
+    expected = tuple(
+        (path, "spider_journal_record_v2" if path == "journal.jsonl" else f"spider_{name}_v1")
+        for path, name in zip(
+            [*PATHS, "historical_input.json"],
+            [*SCHEMAS, "historical_research_run"],
+            strict=True,
+        )
+    )
+    assert schema._P3_V2_ARTIFACTS == expected
+
+    value = manifest()
+    value.update(
+        configuration_context=configured_context(),
+        historical_context=historical_context_row()._asdict(),
+        terminal_reason="MTM_PRESERVE_OPEN_V1",
+    )
+    value["planned_coverage"] = [
+        {"ordinal": 1, "barrier_id": "P3_TIMER_86405000", "record_kind": "HISTORICAL_TIMER"}
+    ]
+    value["artifacts"][2]["schema_version"] = "spider_journal_record_v2"
+    value["artifacts"].append(
+        dict(path="historical_input.json", schema_version="spider_historical_research_run_v1",
+             sha256=HASH, byte_count=100, row_count=1)
+    )
+    schema.completion(value)
+
+    value["artifacts"][2]["schema_version"] = "spider_journal_record_v1"
+    schema.completion(value)
+    value["artifacts"][2]["schema_version"] = "spider_journal_record_v2"
+    value["artifacts"][3]["schema_version"] = "spider_endpoint_v2"
+    with pytest.raises(ValueError):
+        schema.completion(value)
+
+
 def test_embedded_artifact_contexts_remain_dict_only():
     raw = configured_context()
     typed = configuration_context(raw)
