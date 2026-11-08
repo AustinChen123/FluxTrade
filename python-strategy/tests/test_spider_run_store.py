@@ -1,6 +1,7 @@
 """Causal filesystem durability gates using independent detached fixtures."""
 
 import ast
+import importlib.util
 import os
 from dataclasses import replace
 from copy import deepcopy
@@ -668,6 +669,37 @@ def test_finalize_rereads_and_completion_visibility_freezes(tmp_path, monkeypatc
             store.publish_failure("PUBLICATION_FAILED", None)
 
 
+_STORE_IMPORT_FORBIDDEN_WORDS = ("plans", "codec", "scheduler", "policy", "admission")
+# JOURNAL_AB_DESIGN_v3 T7 S7 assigns append encoding to this persistence store;
+# this store-owned codec is allowed while strategy/scenario codecs stay forbidden.
+_STORE_IMPORT_ALLOWED = frozenset({"src.core.backtest.spider_journal_codec_v2"})
+
+
+def _store_forbidden_imports(source: str) -> set[str]:
+    tree = ast.parse(source)
+    imports: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imports.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                relative = "." * node.level + (node.module or "")
+                base = importlib.util.resolve_name(relative, "src.core.backtest")
+            else:
+                base = node.module or ""
+            if base:
+                imports.add(base)
+                # Symbols imported from this exact allowed module remain in its boundary.
+                if base not in _STORE_IMPORT_ALLOWED:
+                    imports.update(f"{base}.{alias.name}" for alias in node.names)
+    forbidden = {
+        name for name in imports
+        if any(word in name for word in _STORE_IMPORT_FORBIDDEN_WORDS)
+        or name.rsplit(".", 1)[-1].startswith("spider_scenario_plan")
+    } - _STORE_IMPORT_ALLOWED
+    return forbidden
+
+
 def test_programming_error_and_import_boundary(tmp_path, monkeypatch):
     store, values, recon = prepared(tmp_path)
     ready(store, values)
@@ -676,6 +708,18 @@ def test_programming_error_and_import_boundary(tmp_path, monkeypatch):
     monkeypatch.setattr(module, "build_reconciliation", broken)
     with pytest.raises(RuntimeError, match="programming"):
         store.finalize(values[3], recon, values[4])
-    tree = ast.parse(Path(module.__file__).read_text())
-    imports = {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)}
-    assert not any(any(word in (name or "") for word in ("plans", "codec", "scheduler", "policy", "admission")) for name in imports)
+    source = Path(module.__file__).read_text()
+    assert not _store_forbidden_imports(source)
+
+
+@pytest.mark.parametrize("forbidden_import", [
+    "import src.core.backtest.synthetic_scenario_codec as scenario_codec",
+    "from src.core.backtest import spider_scenario_plan_o03 as plan_module",
+    "import src.core.backtest.spider_policy as policy_module",
+    "from src.core.backtest import spider_run_admission as admission_module",
+    "from src.core.spider_management.source_checkpoint_codec import *",
+])
+def test_store_import_boundary_resolves_aliases_and_rejects_forbidden_modules(forbidden_import):
+    source = Path(module.__file__).read_text()
+    with pytest.raises(AssertionError):
+        assert not _store_forbidden_imports(f"{source}\n{forbidden_import}\n")
