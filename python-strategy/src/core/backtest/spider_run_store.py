@@ -19,6 +19,8 @@ from src.core.backtest.spider_run_evidence import _context_chain, build_reconcil
 from src.core.backtest.spider_run_reconciliation_schema import reconciliation as validate_reconciliation
 from src.core.backtest import spider_artifact_limits as artifact_limits
 from src.core.backtest.spider_journal_reader_v2 import read_p3_v2_journal
+from src.core.backtest.spider_journal_codec_v2 import encode_p3_v2_row_with_context_gate
+from src.core.backtest.spider_projection_size import canonical_jsonl_row_len
 from src.core.backtest.spider_historical_input import (
     ValidatedHistoricalInput,
     _historical_context_for_validated_input,
@@ -146,11 +148,26 @@ class SpiderRunStore:
         self._floating_exit = False
         self._gross_execution = False
         self._p3_v2_journal_metadata: dict[str, object] | None = None
+        self._p3_v2_write_enabled = False
+        self._p3_v2_codec_state: tuple[bytes, ...] = ()
+        self._p3_v2_wire_bytes = 0
+        self._p3_v2_kind_bytes: dict[str, int] = {}
+        self._p3_v2_kind_rows: dict[str, int] = {}
+        self._p3_v2_projected_bytes = 0
+        self._p3_v2_definition_bytes = 0
+        self._p3_v2_journal_hasher = sha256()
 
     def _is_execution(self) -> bool:
         return self._attempt.get("run_contract_id") in (
             "SPIDER_PAID_RESEARCH_RUN_V1", "SPIDER_FLOATING_EXIT_RESEARCH_RUN_V1",
             "SPIDER_GROSS_PROTECTED_RESEARCH_RUN_V1",
+        )
+
+    def _writes_p3_v2_journal(self) -> bool:
+        return (
+            self._p3_v2_write_enabled
+            and self._attempt.get("run_contract_id") == _P3_RUN_CONTRACT
+            and self._attempt.get("artifact_encoding") == "artifact_encoding_v2"
         )
 
     def _execution_schema(self) -> dict[str, str]:
@@ -413,6 +430,10 @@ class SpiderRunStore:
         _boundary(boundary)
         ordinal = self._persisted["ordinal"] + 1 if self._persisted else 1
         historical = self._attempt["run_contract_id"] == _P3_RUN_CONTRACT
+        p3_v2_write = self._writes_p3_v2_journal()
+        if p3_v2_write and record_kind == "DELIVERY_ATTEMPT":
+            self._barrier_failed = True
+            raise SpiderRunStoreError("CODEC_UNSUPPORTED_ROW")
         paid = self._is_execution()
         coverage = self._attempt["planned_coverage"]
         if historical:
@@ -451,9 +472,13 @@ class SpiderRunStore:
     def append_journal(self, row: dict[str, Any]) -> None:
         self._allowed("RUNNING")
         paid = self._is_execution()
+        historical = self._attempt["run_contract_id"] == _P3_RUN_CONTRACT
+        p3_v2_write = self._writes_p3_v2_journal()
+        if p3_v2_write and type(row) is dict and row.get("record_kind") == "DELIVERY_ATTEMPT":
+            self._barrier_failed = True
+            raise SpiderRunStoreError("CODEC_UNSUPPORTED_ROW")
         journal_record(row, execution=self._execution_context if paid else None)
         boundary = dict(ordinal=row["journal_seq"], journal_seq=row["journal_seq"], barrier_id=row["barrier_id"])
-        historical = self._attempt["run_contract_id"] == _P3_RUN_CONTRACT
         expected_kind = (self._processed_kind if historical or paid
                          else self._attempt["planned_coverage"][boundary["ordinal"] - 1]["record_kind"])
         if (self._barrier_failed or self._processed is None or self._processed == self._persisted or boundary != self._processed
@@ -474,7 +499,71 @@ class SpiderRunStore:
         except ReconciliationProjectionError as error:
             raise SpiderRunStoreError("ENDPOINT_RECONCILIATION_FAILED") from error
         try:
-            _write(self._path / "journal.jsonl", canonical_bytes(row) + b"\n", append=True)
+            next_codec_state = self._p3_v2_codec_state
+            next_kind_bytes = self._p3_v2_kind_bytes
+            next_kind_rows = self._p3_v2_kind_rows
+            next_projected_bytes = self._p3_v2_projected_bytes
+            next_definition_bytes = self._p3_v2_definition_bytes
+            if p3_v2_write:
+                coverage: dict[str, int] = {}
+                for item in self._attempt["planned_coverage"]:
+                    kind = item["record_kind"]
+                    coverage[kind] = coverage.get(kind, 0) + 1
+                budget = cast(dict[str, Any], artifact_limits.p3_v2_scope_budget(coverage))
+                if budget["refused"]:
+                    raise SpiderRunStoreError("ARTIFACT_LIMIT_EXCEEDED")
+                try:
+                    encoded, next_codec_state = encode_p3_v2_row_with_context_gate(
+                        row, self._p3_v2_codec_state,
+                        validate_v1=lambda candidate: journal_record(candidate),
+                        check_context_chain=lambda candidate: _context_chain(self._attempt, candidate),
+                    )
+                except ValueError as error:
+                    raise SpiderRunStoreError("CODEC_UNSUPPORTED_ROW") from error
+                raw = canonical_bytes(encoded) + b"\n"
+                if len(raw) > artifact_limits.P3_V2_ROW_MAX:
+                    raise SpiderRunStoreError("ARTIFACT_LIMIT_EXCEEDED")
+                kind = row["record_kind"]
+                next_kind_bytes = dict(self._p3_v2_kind_bytes)
+                next_kind_rows = dict(self._p3_v2_kind_rows)
+                next_kind_bytes[kind] = next_kind_bytes.get(kind, 0) + len(raw)
+                next_kind_rows[kind] = next_kind_rows.get(kind, 0) + 1
+                cap = budget["B_SG"] if kind == "SOURCE_GROUP_RESULT" else budget["kind_budgets"].get(kind)
+                row_cap = budget["row_counts"].get(kind)
+                previous_definition_count = len(self._p3_v2_codec_state)
+                added_definitions = next_codec_state[previous_definition_count:]
+                definition_bytes = self._p3_v2_definition_bytes + sum(
+                    len(item) for item in added_definitions
+                )
+                next_projected_bytes += canonical_jsonl_row_len(row)
+                if (self._p3_v2_wire_bytes + len(raw) > budget["J2"]
+                        or next_kind_bytes[kind] > cap
+                        or (kind != "SOURCE_GROUP_RESULT" and next_kind_rows[kind] > row_cap)
+                        or len(next_codec_state) > budget["table_max"]
+                        or definition_bytes > budget["table_bytes_max"]
+                        or next_projected_bytes > artifact_limits.P3_V2_MATERIAL_CEILING
+                        or next_projected_bytes > artifact_limits.P3_V2_EXP_MAX * (self._p3_v2_wire_bytes + len(raw))):
+                    raise SpiderRunStoreError("ARTIFACT_LIMIT_EXCEEDED")
+                if any(len(item) > artifact_limits.P3_V2_MAX_DEFINITION_BYTES for item in next_codec_state):
+                    raise SpiderRunStoreError("ARTIFACT_LIMIT_EXCEEDED")
+                next_definition_bytes = definition_bytes
+            else:
+                raw = canonical_bytes(row) + b"\n"
+            _write(self._path / "journal.jsonl", raw, append=True)
+            if p3_v2_write:
+                self._p3_v2_codec_state = next_codec_state
+                self._p3_v2_kind_bytes = next_kind_bytes
+                self._p3_v2_kind_rows = next_kind_rows
+                self._p3_v2_wire_bytes += len(raw)
+                self._p3_v2_projected_bytes = next_projected_bytes
+                self._p3_v2_definition_bytes = next_definition_bytes
+                self._p3_v2_journal_hasher.update(raw)
+                self._p3_v2_journal_metadata = dict(
+                    schema_version="spider_journal_record_v2",
+                    sha256=self._p3_v2_journal_hasher.hexdigest(),
+                    byte_count=self._p3_v2_wire_bytes,
+                    row_count=sum(self._p3_v2_kind_rows.values()),
+                )
             if historical or paid:
                 self._historical_barrier_ids.add(boundary["barrier_id"])
             self._persisted = deepcopy(self._processed)

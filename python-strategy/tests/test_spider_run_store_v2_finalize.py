@@ -1,3 +1,4 @@
+# pyright: reportGeneralTypeIssues=false, reportOptionalSubscript=false
 """P3 v2 finalize lifecycle tests over real durable files."""
 
 import inspect
@@ -11,7 +12,7 @@ import pytest
 from src.core.backtest import spider_projection_size as projection_size
 from src.core.backtest import spider_run_store as module
 from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_jsonl
-from spider_run_store_v2_fixtures import p3_v2_finalize_fixture
+from spider_run_store_v2_fixtures import empty_v2_writer, p3_v2_finalize_fixture
 
 
 def test_v2_finalize_uses_projection_but_completion_records_wire_bytes(tmp_path, real_p3_artifacts):
@@ -35,6 +36,156 @@ def test_v2_finalize_uses_projection_but_completion_records_wire_bytes(tmp_path,
     assert decode_jsonl((store._path / "endpoint.json").read_bytes()) == [values[3]]
     assert decode_jsonl((store._path / "report.jsonl").read_bytes()) == values[4]
     assert store._state == "FROZEN"
+
+
+def test_v2_write_path_appends_then_finalizes_from_real_wire_file(tmp_path, real_p3_artifacts):
+    store, values, recon, _ = p3_v2_finalize_fixture(tmp_path, real_p3_artifacts)
+    journal_path = store._path / "journal.jsonl"
+    journal_path.write_bytes(b"")
+    store._p3_v2_journal_metadata = dict(
+        schema_version="spider_journal_record_v2", sha256=sha256(b"").hexdigest(),
+        byte_count=0, row_count=0,
+    )
+    store._p3_v2_journal_hasher = sha256()
+    store._p3_v2_wire_bytes = 0
+    store._p3_v2_kind_bytes = {}
+    store._p3_v2_kind_rows = {}
+    store._p3_v2_codec_state = ()
+    store._p3_v2_projected_bytes = 0
+    store._p3_v2_definition_bytes = 0
+    store._processed = None
+    store._persisted = None
+    store._processed_kind = None
+    store._historical_barrier_ids.clear()
+    store._p3_v2_write_enabled = True
+
+    for row in values[2]:
+        boundary = dict(
+            ordinal=row["journal_seq"], journal_seq=row["journal_seq"],
+            barrier_id=row["barrier_id"],
+        )
+        store.mark_processed(boundary, record_kind=row["record_kind"])
+        store.append_journal(row)
+
+    wire = journal_path.read_bytes()
+    assert wire.endswith(b"\n")
+    assert wire.count(b"\n") == len(values[2])
+    assert store._p3_v2_journal_metadata == dict(
+        schema_version="spider_journal_record_v2", sha256=sha256(wire).hexdigest(),
+        byte_count=len(wire), row_count=len(values[2]),
+    )
+    wire_rows = decode_jsonl(wire)
+    expected_kind_bytes = {}
+    expected_kind_rows = {}
+    expected_definition_bytes = 0
+    for item in wire_rows:
+        kind = item["record_kind"]
+        expected_kind_bytes[kind] = expected_kind_bytes.get(kind, 0) + len(canonical_bytes(item)) + 1
+        expected_kind_rows[kind] = expected_kind_rows.get(kind, 0) + 1
+        expected_definition_bytes += sum(len(canonical_bytes(definition)) for definition in item.get("order_defs", []))
+    assert store._p3_v2_kind_bytes == expected_kind_bytes
+    assert store._p3_v2_kind_rows == expected_kind_rows
+    assert store._p3_v2_definition_bytes == expected_definition_bytes
+    assert store._p3_v2_projected_bytes == sum(projection_size.canonical_jsonl_row_len(row) for row in values[2])
+    assert store._p3_v2_codec_state == tuple(
+        canonical_bytes(definition)
+        for item in wire_rows for definition in item.get("order_defs", [])
+    )
+    assert store.finalize(values[3], recon, values[4]) == "COMPLETE_PUBLISHED"
+    manifest = decode_jsonl((store._path / "completion.json").read_bytes())[0]
+    entry = next(item for item in manifest["artifacts"] if item["path"] == "journal.jsonl")
+    assert entry["sha256"] == sha256(wire).hexdigest()
+    assert entry["byte_count"] == len(wire)
+    assert entry["row_count"] == len(values[2])
+
+
+def test_v2_write_precheck_rejects_before_file_or_counter_commit(tmp_path, real_p3_artifacts, monkeypatch):
+    store, values, _, _ = p3_v2_finalize_fixture(tmp_path, real_p3_artifacts)
+    empty_v2_writer(store)
+    row = values[2][0]
+    boundary = dict(ordinal=1, journal_seq=1, barrier_id=row["barrier_id"])
+    store.mark_processed(boundary, record_kind=row["record_kind"])
+    original_budget = module.artifact_limits.p3_v2_scope_budget
+    monkeypatch.setattr(module.artifact_limits, "p3_v2_scope_budget", lambda coverage: original_budget(coverage) | {"J2": 0})
+    before = {path.name: path.read_bytes() for path in store._path.iterdir() if path.is_file()}
+    with pytest.raises(module.SpiderRunStoreError) as caught:
+        store.append_journal(row)
+    assert caught.value.reason == "PERSISTENCE_FAILED"
+    assert caught.value.primary_failure["reason"] == "ARTIFACT_LIMIT_EXCEEDED"
+    assert {path.name: path.read_bytes() for path in store._path.iterdir() if path.is_file()} == before
+    assert store._p3_v2_wire_bytes == 0 and store._p3_v2_codec_state == ()
+    with pytest.raises(RuntimeError, match="INVALID_STORE_OPERATION"):
+        store.mark_processed(dict(ordinal=1, journal_seq=1, barrier_id=row["barrier_id"]), record_kind=row["record_kind"])
+
+
+def test_v2_write_failure_keeps_partial_tail_and_does_not_commit_candidate(tmp_path, real_p3_artifacts, monkeypatch):
+    store, values, _, _ = p3_v2_finalize_fixture(tmp_path, real_p3_artifacts)
+    journal = empty_v2_writer(store)
+    row = values[2][0]
+    store.mark_processed(dict(ordinal=1, journal_seq=1, barrier_id=row["barrier_id"]), record_kind=row["record_kind"])
+    original_write = module._write
+
+    def partial_write(path, raw, append=False):
+        if Path(path).name == "journal.jsonl":
+            with Path(path).open("ab") as stream:
+                stream.write(raw[: max(1, len(raw) // 2)])
+            raise module.SpiderRunStoreError("ARTIFACT_WRITE_FAILED")
+        return original_write(path, raw, append)
+
+    monkeypatch.setattr(module, "_write", partial_write)
+    with pytest.raises(module.SpiderRunStoreError) as caught:
+        store.append_journal(row)
+    assert caught.value.reason == "PERSISTENCE_FAILED"
+    assert 0 < journal.stat().st_size < len(canonical_bytes(row)) + 1
+    assert store._p3_v2_wire_bytes == 0 and store._p3_v2_codec_state == ()
+    with pytest.raises(RuntimeError, match="INVALID_STORE_OPERATION"):
+        store.append_journal(row)
+
+
+def test_v2_durable_row_then_status_failure_commits_wire_state_and_is_terminal(tmp_path, real_p3_artifacts, monkeypatch):
+    store, values, _, _ = p3_v2_finalize_fixture(tmp_path, real_p3_artifacts)
+    journal = empty_v2_writer(store)
+    row = values[2][0]
+    store.mark_processed(dict(ordinal=1, journal_seq=1, barrier_id=row["barrier_id"]), record_kind=row["record_kind"])
+    old_status = (store._path / "status.json").read_bytes()
+    original_publish = store._publish
+
+    def fail_running_status(name, raw):
+        if name == "status.json" and b'"state":"RUNNING"' in raw:
+            raise module.SpiderRunStoreError("ARTIFACT_WRITE_FAILED")
+        return original_publish(name, raw)
+
+    monkeypatch.setattr(store, "_publish", fail_running_status)
+    with pytest.raises(module.SpiderRunStoreError) as caught:
+        store.append_journal(row)
+    wire = journal.read_bytes()
+    assert caught.value.reason == "PERSISTENCE_FAILED"
+    assert caught.value.primary_failure["reason"] == "ARTIFACT_WRITE_FAILED"
+    assert wire.endswith(b"\n") and wire.count(b"\n") == 1
+    assert (store._path / "status.json").read_bytes() == old_status
+    assert store._p3_v2_wire_bytes == len(wire)
+    assert store._p3_v2_journal_metadata["sha256"] == sha256(wire).hexdigest()
+    assert store._persisted == store._processed
+    with pytest.raises(RuntimeError, match="INVALID_STORE_OPERATION"):
+        store.mark_processed(dict(ordinal=2, journal_seq=2, barrier_id="after-status-error"), record_kind=row["record_kind"])
+
+
+def test_v2_delivery_attempt_rejected_at_mark_before_status_or_journal_write(tmp_path, real_p3_artifacts):
+    store, values, _, _ = p3_v2_finalize_fixture(tmp_path, real_p3_artifacts)
+    journal = empty_v2_writer(store)
+    before = {path.name: path.read_bytes() for path in store._path.iterdir() if path.is_file()}
+    with pytest.raises(module.SpiderRunStoreError) as caught:
+        store.mark_processed(dict(ordinal=1, journal_seq=1, barrier_id="delivery"), record_kind="DELIVERY_ATTEMPT")
+    assert caught.value.reason == "CODEC_UNSUPPORTED_ROW"
+    assert {path.name: path.read_bytes() for path in store._path.iterdir() if path.is_file()} == before
+    assert journal.read_bytes() == b"" and store._p3_v2_wire_bytes == 0
+    store._processed = dict(ordinal=1, journal_seq=1, barrier_id="delivery")
+    store._processed_kind = "DELIVERY_ATTEMPT"
+    with pytest.raises(module.SpiderRunStoreError) as append_error:
+        store.append_journal({"record_kind": "DELIVERY_ATTEMPT"})
+    assert append_error.value.reason == "CODEC_UNSUPPORTED_ROW"
+    assert {path.name: path.read_bytes() for path in store._path.iterdir() if path.is_file()} == before
+    assert journal.read_bytes() == b"" and store._p3_v2_wire_bytes == 0
 
 
 def test_v2_finalize_drops_each_journal_projection_and_preserves_partial_publication(tmp_path,
