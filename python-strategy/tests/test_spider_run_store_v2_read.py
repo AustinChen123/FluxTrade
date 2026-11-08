@@ -4,71 +4,15 @@ from copy import deepcopy
 from hashlib import sha256
 import signal
 import os
-from typing import Any, cast
+from typing import cast
 
 import pytest
 
 from src.core.backtest import spider_run_store as module
-from src.core.backtest.spider_journal_codec_v2 import encode_p3_v2_row_with_context_gate
 from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_jsonl, validate_artifact
 from src.core.backtest.spider_run_envelope_schema import journal as validate_journal
 
-
-@pytest.fixture(scope="module")
-def real_p3_artifacts(tmp_path_factory):
-    from test_spider_scenario_run import historical_input as make_historical_input
-    from src.core.backtest.spider_scenario_run import run_spider_scenario
-
-    root = tmp_path_factory.mktemp("j6-real-p3")
-    run, raw = make_historical_input("j6-real-p3")
-    assert run_spider_scenario(str(root), run.run_id, "SPIDER_HISTORICAL_RESEARCH_RUN_V1", raw) == {
-        "run_id": run.run_id, "outcome": "ADMITTED", "reason": None,
-    }
-    return {
-        name: (root / run.run_id / name).read_bytes()
-        for name in ("attempt.json", "status.json", "journal.jsonl", "endpoint.json",
-                     "reconciliation.json", "report.jsonl", "historical_input.json")
-    }
-
-
-def p3_v2_finalize_fixture(tmp_path, real_artifacts):
-    values: list[Any] = [
-        decode_jsonl(real_artifacts["attempt.json"])[0],
-        decode_jsonl(real_artifacts["status.json"])[0],
-        decode_jsonl(real_artifacts["journal.jsonl"]),
-        decode_jsonl(real_artifacts["endpoint.json"])[0],
-        decode_jsonl(real_artifacts["report.jsonl"]),
-    ]
-    attempt = deepcopy(values[0])
-    store = module.SpiderRunStore.create(str(tmp_path), cast(str, attempt["run_id"]))
-    attempt["artifact_encoding"] = "artifact_encoding_v2"
-    state = ()
-    wire_rows = []
-    for row in values[2]:
-        encoded, state = encode_p3_v2_row_with_context_gate(
-            row, state,
-            validate_v1=module.journal_record,
-            check_context_chain=lambda candidate: module._context_chain(values[0], candidate),
-        )
-        wire_rows.append(encoded)
-    validate_journal(values[2])
-    journal_raw = b"".join(canonical_bytes(row) + b"\n" for row in wire_rows)
-    store._attempt = attempt
-    store._processed = deepcopy(cast(dict[str, Any], values[1]["processed_boundary"]))
-    store._persisted = deepcopy(cast(dict[str, Any], values[1]["persisted_boundary"]))
-    store._state = "RUNNING"
-    store._publish("historical_input.json", real_artifacts["historical_input.json"])
-    store._publish("attempt.json", canonical_bytes(attempt) + b"\n")
-    store._publish("status.json", canonical_bytes(store._status("RUNNING")) + b"\n")
-    store._publish("journal.jsonl", journal_raw)
-    store._p3_v2_journal_metadata = dict(
-        schema_version="spider_journal_record_v2",
-        sha256=sha256(journal_raw).hexdigest(),
-        byte_count=len(journal_raw),
-        row_count=len(wire_rows),
-    )
-    recon = decode_jsonl(real_artifacts["reconciliation.json"])[0]
-    return store, values, recon, journal_raw
+from spider_run_store_v2_fixtures import p3_v2_finalize_fixture
 
 
 def test_v2_read_caps_follow_the_policy_table_and_scope_budget(tmp_path, real_p3_artifacts):

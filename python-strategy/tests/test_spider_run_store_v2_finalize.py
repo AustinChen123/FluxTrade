@@ -11,24 +11,7 @@ import pytest
 from src.core.backtest import spider_projection_size as projection_size
 from src.core.backtest import spider_run_store as module
 from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_jsonl
-from test_spider_run_store_v2_read import p3_v2_finalize_fixture
-
-
-@pytest.fixture(scope="module")
-def real_p3_artifacts(tmp_path_factory):
-    from test_spider_scenario_run import historical_input as make_historical_input
-    from src.core.backtest.spider_scenario_run import run_spider_scenario
-
-    root = tmp_path_factory.mktemp("j6-real-p3-finalize")
-    run, raw = make_historical_input("j6-real-p3-finalize")
-    assert run_spider_scenario(str(root), run.run_id, "SPIDER_HISTORICAL_RESEARCH_RUN_V1", raw) == {
-        "run_id": run.run_id, "outcome": "ADMITTED", "reason": None,
-    }
-    return {
-        name: (root / run.run_id / name).read_bytes()
-        for name in ("attempt.json", "status.json", "journal.jsonl", "endpoint.json",
-                     "reconciliation.json", "report.jsonl", "historical_input.json")
-    }
+from spider_run_store_v2_fixtures import p3_v2_finalize_fixture
 
 
 def test_v2_finalize_uses_projection_but_completion_records_wire_bytes(tmp_path, real_p3_artifacts):
