@@ -506,3 +506,53 @@ def test_reader_rejects_kinds_outside_v2_closed_set(tmp_path, kind):
     path.write_bytes(raw)
     with pytest.raises(ValueError, match="ARTIFACT_MISMATCH"):
         _read(path, raw)
+
+
+@pytest.mark.parametrize("kind", [None, [], {}, 0, True])
+def test_reader_rejects_non_string_record_kind_as_named_mismatch(tmp_path, kind):
+    wire = _wire_row()
+    wire["record_kind"] = kind
+    raw = _raw(wire)
+    path = tmp_path / "record-kind.jsonl"
+    path.write_bytes(raw)
+    with pytest.raises(ValueError, match="ARTIFACT_MISMATCH"):
+        _read(path, raw)
+
+
+@pytest.mark.parametrize("schema", [None, [], {}, 0, True, "wrong"])
+def test_reader_rejects_non_v2_schema_value_as_named_mismatch(tmp_path, schema):
+    wire = _wire_row()
+    wire["schema_version"] = schema
+    raw = _raw(wire)
+    path = tmp_path / "schema-version.jsonl"
+    path.write_bytes(raw)
+    with pytest.raises(ValueError, match="ARTIFACT_MISMATCH"):
+        _read(path, raw)
+
+
+@pytest.mark.parametrize("root", [None, [], {}, 0, "bad"])
+def test_reader_rejects_non_object_wire_row_as_named_mismatch(tmp_path, root):
+    raw = canonical_bytes(root) + b"\n"
+    path = tmp_path / "root.jsonl"
+    path.write_bytes(raw)
+    with pytest.raises(ValueError, match="ARTIFACT_MISMATCH"):
+        _read(path, raw)
+
+
+@pytest.mark.parametrize("definitions", [None, True, 0, {}, "bad"])
+def test_reader_rejects_non_list_order_defs_as_named_mismatch(
+    tmp_path, definitions
+):
+    wire = _wire_row(
+        {
+            "request": {"working_orders": []},
+            "working_orders_snapshot": [],
+        },
+        "HISTORICAL_MARKET_RESULT",
+    )
+    wire["order_defs"] = definitions
+    raw = _raw(wire)
+    path = tmp_path / "order-defs.jsonl"
+    path.write_bytes(raw)
+    with pytest.raises(ValueError, match="ARTIFACT_MISMATCH"):
+        _read(path, raw)
