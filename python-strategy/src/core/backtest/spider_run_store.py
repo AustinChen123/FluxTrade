@@ -765,8 +765,14 @@ class SpiderRunStore:
             raise SpiderRunStoreError("ENDPOINT_RECONCILIATION_FAILED") from error
         if computed["result"] != "OK" or canonical_bytes(computed) != canonical_bytes(supplied):
             raise SpiderRunStoreError("ENDPOINT_RECONCILIATION_FAILED")
+        if self._attempt.get("artifact_encoding") == "artifact_encoding_v2":
+            expected_wire_metadata = dict(path="journal.jsonl", **(self._p3_v2_journal_metadata or {}))
+            if reread[2][1] != expected_wire_metadata or first_journal_metadata != reread[2][1]:
+                raise SpiderRunStoreError("ENDPOINT_RECONCILIATION_FAILED")
+        del journal
+        reread[2] = (None, reread[2][1])
         self._publish("status.json", canonical_bytes(self._status("COMPLETE")) + b"\n")
-        complete_status, status_metadata = self._reread("status.json", validate_artifact)
+        complete_status, status_metadata = self._reread_artifact("status.json", validate_artifact)
         if complete_status != self._status("COMPLETE"):
             raise SpiderRunStoreError("ENDPOINT_RECONCILIATION_FAILED")
         metadata = [entry for _, entry in reread]
@@ -783,7 +789,7 @@ class SpiderRunStore:
             manifest["historical_context"] = _historical_context(attempt["historical_context"])
         completion(manifest)
         try:
-            _context_chain(attempt, complete_status, journal, final, supplied, rows, manifest)
+            _context_chain(attempt, complete_status, final, supplied, rows, manifest)
         except ReconciliationProjectionError as error:
             raise SpiderRunStoreError("ENDPOINT_RECONCILIATION_FAILED") from error
         self._publish("completion.json", canonical_bytes(manifest) + b"\n")
