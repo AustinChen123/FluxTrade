@@ -57,6 +57,8 @@ def _decode_wire_row(line: bytes) -> dict[str, object]:
         _raise("ARTIFACT_MISMATCH")
     if type(row) is not dict or row.get("schema_version") != _V2_SCHEMA:
         _raise("ARTIFACT_MISMATCH")
+    if "configuration_context" in row or "historical_context" in row:
+        _raise("ARTIFACT_MISMATCH")
     kind = row.get("record_kind")
     if type(kind) is not str or kind not in limits.P3_V2_RECORD_KINDS:
         _raise("ARTIFACT_MISMATCH")
