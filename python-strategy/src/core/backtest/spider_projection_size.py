@@ -1,3 +1,4 @@
+# pyright: reportArgumentType=false, reportIndexIssue=false, reportAttributeAccessIssue=false
 """Exact size accounting for P3-v2 journal rows and v1 projections."""
 
 from collections.abc import Sequence
@@ -9,6 +10,8 @@ from src.core.backtest.spider_artifact_limits import (
     P3_V2_ROW_MAX,
 )
 from src.core.backtest.spider_run_artifacts import canonical_bytes
+from src.core.backtest.spider_journal_slots_v2 import SLOT_LIST
+from src.core.backtest.spider_journal_slot_classifier_v2 import classify_p3_v2_slots
 
 _MARKET_SCHEMA_V1 = "spider_journal_record_v1"
 _MARKET_SCHEMA_V2 = "spider_journal_record_v2"
@@ -20,19 +23,12 @@ def canonical_jsonl_row_len(row_v1: object) -> int:
 
 
 def _replace_refs(
-    row: dict[str, object],
-    path: tuple[str, ...],
+    parent: dict[str, object],
+    leaf: str,
     prior: Sequence[object],
     definitions: list[object],
 ) -> None:
-    value: object = row
-    for key in path[:-1]:
-        if type(value) is not dict or key not in value:
-            raise ValueError("ARTIFACT_MISMATCH")
-        value = value[key]
-    if type(value) is not dict or type(value.get(path[-1])) is not list:
-        raise ValueError("ARTIFACT_MISMATCH")
-    indexes = cast(list[object], value[path[-1]])
+    indexes = cast(list[object], parent[leaf])
     resolved = []
     for index in indexes:
         if (
@@ -44,7 +40,7 @@ def _replace_refs(
         resolved.append(
             prior[index] if index < len(prior) else definitions[index - len(prior)]
         )
-    value[path[-1]] = resolved
+    parent[leaf] = resolved
 
 
 def materialize_v1_row(
@@ -53,35 +49,16 @@ def materialize_v1_row(
     contexts: tuple[object, object],
 ) -> tuple[dict[str, object], list[object]]:
     """Restore one wire row's refs, contexts and v1 schema without copying history."""
+    slots = classify_p3_v2_slots(row_v2)
+    if slots is None:
+        raise ValueError("ARTIFACT_MISMATCH")
     definitions = row_v2.pop("order_defs", [])
     if type(definitions) is not list:
         raise ValueError("ARTIFACT_MISMATCH")
     new_definitions = cast(list[object], definitions)
-    paths: tuple[tuple[str, ...], ...] = ()
-    kind = row_v2["record_kind"]
-    if kind == "HISTORICAL_MARKET_RESULT":
-        paths = (
-            ("payload", "request", "working_orders"),
-            ("payload", "working_orders_snapshot"),
-        )
-    elif kind == "SOURCE_GROUP_RESULT":
-        paths = tuple(
-            ("payload", side, "open_orders_fact", "immutable_payload", "rows")
-            for side in ("owner_evidence_before", "owner_evidence_after")
-        )
-    elif kind == "SNAPSHOT_FACT":
-        fact = cast(
-            dict[str, object], cast(dict[str, object], row_v2["payload"])["fact"]
-        )
-        immutable = fact.get("immutable_payload")
-        if (
-            fact.get("snapshot_kind") == "OPEN_ORDERS"
-            and type(immutable) is dict
-            and immutable.get("outcome") == "SUCCESS"
-        ):
-            paths = (("payload", "fact", "immutable_payload", "rows"),)
-    for path in paths:
-        _replace_refs(row_v2, path, prior_definitions, new_definitions)
+    for _, _, slot_state, parent, leaf in slots:
+        if slot_state == SLOT_LIST:
+            _replace_refs(parent, leaf, prior_definitions, new_definitions)
     row_v2["schema_version"] = _MARKET_SCHEMA_V1
     row_v2["configuration_context"], row_v2["historical_context"] = contexts
     return row_v2, new_definitions
@@ -89,35 +66,14 @@ def materialize_v1_row(
 
 def _reference_lists(row: dict[str, object]) -> list[list[object]]:
     """Return only the fixed D5.2 slots, in their protocol traversal order."""
-    payload = cast(dict[str, object], row["payload"])
-    kind = row["record_kind"]
-    if kind == "HISTORICAL_MARKET_RESULT":
-        request = cast(dict[str, object], payload["request"])
-        return [
-            cast(list[object], request["working_orders"]),
-            cast(list[object], payload["working_orders_snapshot"]),
-        ]
-    if kind == "SOURCE_GROUP_RESULT":
-        result: list[list[object]] = []
-        for side in ("owner_evidence_before", "owner_evidence_after"):
-            evidence = cast(dict[str, object], payload[side])
-            fact = cast(dict[str, object], evidence["open_orders_fact"])
-            immutable = cast(dict[str, object], fact["immutable_payload"])
-            result.append(cast(list[object], immutable["rows"]))
-        return result
-    if kind == "SNAPSHOT_FACT":
-        fact = cast(dict[str, object], payload["fact"])
-        if fact.get("snapshot_kind") == "OPEN_ORDERS":
-            immutable_value = fact.get("immutable_payload")
-            if type(immutable_value) is not dict:
-                raise ValueError("ARTIFACT_MISMATCH")
-            immutable = cast(dict[str, object], immutable_value)
-            if immutable.get("outcome") == "SUCCESS":
-                rows = immutable.get("rows")
-                if type(rows) is not list:
-                    raise ValueError("ARTIFACT_MISMATCH")
-                return [cast(list[object], rows)]
-    return []
+    slots = classify_p3_v2_slots(row)
+    if slots is None:
+        raise ValueError("ARTIFACT_MISMATCH")
+    return [
+        cast(list[object], parent[leaf])
+        for _, _, slot_state, parent, leaf in slots
+        if slot_state == SLOT_LIST
+    ]
 
 
 def _definition_member_bytes(definitions: list[object]) -> int:
