@@ -188,3 +188,137 @@ def test_growth_after_eof_does_not_change_owned_buffer(monkeypatch, tmp_path):
     result = _read(path, raw)
     assert result.wire_metadata == _metadata(raw)
     assert path.read_bytes() == raw + b"later"
+
+
+def test_wire_line_cap_is_inclusive_and_plus_one_refuses():
+    prefix = b'{"payload":{"pad":"'
+    suffix = b'"},"record_kind":"CALLBACK_RESULT","schema_version":"spider_journal_record_v2"}\n'
+    exact = prefix + b"x" * (limits.P3_V2_ROW_MAX - len(prefix) - len(suffix)) + suffix
+    over = (
+        prefix + b"x" * (limits.P3_V2_ROW_MAX + 1 - len(prefix) - len(suffix)) + suffix
+    )
+    assert len(exact) == limits.P3_V2_ROW_MAX
+    assert len(over) == limits.P3_V2_ROW_MAX + 1
+    assert list(reader._iter_owned_lines(bytearray(exact))) == [exact[:-1]]
+    with pytest.raises(ValueError, match="ARTIFACT_LIMIT_EXCEEDED"):
+        list(reader._iter_owned_lines(bytearray(over)))
+
+
+def test_v1_decoder_keeps_accepting_rows_over_v2_row_cap():
+    row = {"payload": {"pad": "x" * limits.P3_V2_ROW_MAX}}
+    raw = canonical_bytes(row) + b"\n"
+    assert len(raw) > limits.P3_V2_ROW_MAX
+    assert decode_jsonl(raw) == [row]
+
+
+def test_per_kind_row_and_wire_byte_budget_boundaries_are_exact(tmp_path):
+    raw = _wire()
+    path = tmp_path / "journal.jsonl"
+    path.write_bytes(raw)
+    projected = (
+        len(
+            canonical_bytes(
+                {
+                    "schema_version": "spider_journal_record_v1",
+                    "record_kind": "CALLBACK_RESULT",
+                    "payload": {"result": "ok"},
+                    "configuration_context": CONTEXTS[0],
+                    "historical_context": CONTEXTS[1],
+                }
+            )
+        )
+        + 1
+    )
+    wire_bytes = len(raw)
+    assert projected > wire_bytes
+    budget = _budget(raw)
+    caps = dict(budget["kind_budgets"])
+    caps["CALLBACK_RESULT"] = wire_bytes
+    row_caps = dict(budget["row_counts"])
+    row_caps["CALLBACK_RESULT"] = 1
+    budget.update(kind_budgets=caps, row_counts=row_caps)
+    result = _read(path, raw, budget)
+    assert len(result.rows) == 1
+    assert result.counters["kind_bytes"]["CALLBACK_RESULT"] == wire_bytes
+    caps["CALLBACK_RESULT"] -= 1
+    with pytest.raises(ValueError, match="ARTIFACT_LIMIT_EXCEEDED"):
+        _read(path, raw, budget)
+    caps["CALLBACK_RESULT"] = wire_bytes
+    row_caps["CALLBACK_RESULT"] = 0
+    with pytest.raises(ValueError, match="ARTIFACT_LIMIT_EXCEEDED"):
+        _read(path, raw, budget)
+
+
+def test_definition_table_count_bytes_and_definition_size_boundaries(tmp_path):
+    definition = {"order_id": "a"}
+    payload = {"request": {"working_orders": [0]}, "working_orders_snapshot": [0]}
+    raw = _wire(payload=payload, kind="HISTORICAL_MARKET_RESULT", defs=[definition])
+    path = tmp_path / "journal.jsonl"
+    path.write_bytes(raw)
+    budget = _budget(raw, table_max=1, table_bytes_max=len(canonical_bytes(definition)))
+    assert len(_read(path, raw, budget).rows) == 1
+    budget["table_max"] = 0
+    with pytest.raises(ValueError, match="ARTIFACT_LIMIT_EXCEEDED"):
+        _read(path, raw, budget)
+    budget["table_max"] = 1
+    budget["table_bytes_max"] -= 1
+    with pytest.raises(ValueError, match="ARTIFACT_LIMIT_EXCEEDED"):
+        _read(path, raw, budget)
+
+
+def test_per_definition_limit_is_inclusive_and_plus_one_refuses(tmp_path):
+    def row_with_definition(size: int) -> bytes:
+        base = {"x": ""}
+        padding = size - len(canonical_bytes(base))
+        definition = {"x": "a" * padding}
+        assert len(canonical_bytes(definition)) == size
+        return _wire(
+            payload={
+                "request": {"working_orders": [0]},
+                "working_orders_snapshot": [0],
+            },
+            kind="HISTORICAL_MARKET_RESULT",
+            defs=[definition],
+        )
+
+    exact = row_with_definition(limits.P3_V2_MAX_DEFINITION_BYTES)
+    path = tmp_path / "journal.jsonl"
+    path.write_bytes(exact)
+    assert len(_read(path, exact).rows) == 1
+    over = row_with_definition(limits.P3_V2_MAX_DEFINITION_BYTES + 1)
+    path.write_bytes(over)
+    with pytest.raises(ValueError, match="ARTIFACT_LIMIT_EXCEEDED"):
+        _read(path, over)
+
+
+def test_source_group_remainder_budget_is_enforced_inclusive(tmp_path):
+    empty_evidence = {"open_orders_fact": {"immutable_payload": {"rows": []}}}
+    raw = _wire(
+        payload={
+            "owner_evidence_before": empty_evidence,
+            "owner_evidence_after": empty_evidence,
+        },
+        kind="SOURCE_GROUP_RESULT",
+    )
+    path = tmp_path / "journal.jsonl"
+    path.write_bytes(raw)
+    projection = {
+        "schema_version": "spider_journal_record_v1",
+        "record_kind": "SOURCE_GROUP_RESULT",
+        "payload": {
+            "owner_evidence_before": empty_evidence,
+            "owner_evidence_after": empty_evidence,
+        },
+        "configuration_context": CONTEXTS[0],
+        "historical_context": CONTEXTS[1],
+    }
+    wire_bytes = len(raw)
+    projected_bytes = len(canonical_bytes(projection)) + 1
+    assert projected_bytes > wire_bytes
+    budget = _budget(raw, B_SG=wire_bytes)
+    result = _read(path, raw, budget)
+    assert len(result.rows) == 1
+    assert result.counters["kind_bytes"]["SOURCE_GROUP_RESULT"] == wire_bytes
+    budget["B_SG"] -= 1
+    with pytest.raises(ValueError, match="ARTIFACT_LIMIT_EXCEEDED"):
+        _read(path, raw, budget)
