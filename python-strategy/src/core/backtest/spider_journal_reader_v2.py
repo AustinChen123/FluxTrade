@@ -1,4 +1,5 @@
 # pyright: reportArgumentType=false, reportIndexIssue=false, reportAttributeAccessIssue=false
+import hashlib
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -12,7 +13,11 @@ from src.core.backtest.spider_projection_size import (
     projected_jsonl_budget_ok,
     projected_v1_jsonl_row_len,
 )
-from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_canonical
+from src.core.backtest.spider_run_artifacts import (
+    canonical_bytes,
+    decode_canonical,
+    decode_jsonl,
+)
 from src.core.backtest.spider_journal_slots_v2 import SLOT_LIST
 from src.core.backtest.spider_journal_slot_classifier_v2 import classify_p3_v2_slots
 
@@ -228,3 +233,50 @@ def read_p3_v2_journal(
 
     result = _pass_two(owned, contexts=contexts)
     return P3V2JournalRead(result, metadata, first)
+
+
+def _contexts_from_retained_attempt_bytes(
+    attempt_bytes: object, expected_sha256: object
+) -> tuple[dict[str, object], dict[str, object]]:
+    if (
+        type(attempt_bytes) is not bytes
+        or type(expected_sha256) is not str
+        or hashlib.sha256(attempt_bytes).hexdigest() != expected_sha256
+    ):
+        _raise("INVALID_ARTIFACT")
+    try:
+        attempts = decode_jsonl(attempt_bytes)
+    except (UnicodeError, ValueError, RecursionError):
+        _raise("INVALID_ARTIFACT")
+    if len(attempts) != 1:
+        _raise("INVALID_ARTIFACT")
+    attempt = attempts[0]
+    configuration = attempt.get("configuration_context")
+    historical = attempt.get("historical_context")
+    if type(configuration) is not dict or type(historical) is not dict:
+        _raise("INVALID_ARTIFACT")
+    return cast(dict[str, object], configuration), cast(dict[str, object], historical)
+
+
+def read_p3_v2_journal_from_attempt_bytes(
+    path: str | os.PathLike[str],
+    *,
+    expected_metadata: Mapping[str, object],
+    retained_attempt_bytes: object,
+    expected_attempt_sha256: object,
+    budget: Mapping[str, object],
+) -> P3V2JournalRead:
+    """Read v2 rows and reattach contexts from the verified retained attempt.
+
+    The caller supplies the exact bytes captured and validated for this run;
+    this function verifies their digest and never reopens an attempt path.
+    """
+    contexts = _contexts_from_retained_attempt_bytes(
+        retained_attempt_bytes, expected_attempt_sha256
+    )
+    return read_p3_v2_journal(
+        path,
+        expected_metadata=expected_metadata,
+        contexts=contexts,
+        budget=budget,
+    )
