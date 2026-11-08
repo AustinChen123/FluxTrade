@@ -325,3 +325,184 @@ def test_real_policy_kind_budget_counts_wire_bytes_at_exact_and_plus_one(
     over_path.write_bytes(raw)
     with pytest.raises(ValueError, match="ARTIFACT_LIMIT_EXCEEDED"):
         _read(over_path, raw, budget=one_over)
+
+
+@pytest.mark.parametrize(
+    "kind,path",
+    [
+        ("CALLBACK_RESULT", ("payload",)),
+        ("SNAPSHOT_FACT", ("payload",)),
+        ("SNAPSHOT_FACT", ("payload", "fact")),
+        ("SNAPSHOT_FACT", ("payload", "fact", "immutable_payload")),
+        (
+            "SNAPSHOT_FACT",
+            ("payload", "fact", "immutable_payload", "rows"),
+        ),
+        ("HISTORICAL_MARKET_RESULT", ("payload",)),
+        ("HISTORICAL_MARKET_RESULT", ("payload", "request")),
+        (
+            "HISTORICAL_MARKET_RESULT",
+            ("payload", "request", "working_orders"),
+        ),
+        ("HISTORICAL_MARKET_RESULT", ("payload", "working_orders_snapshot")),
+        ("SOURCE_GROUP_RESULT", ("payload",)),
+        ("SOURCE_GROUP_RESULT", ("payload", "owner_evidence_before")),
+        (
+            "SOURCE_GROUP_RESULT",
+            ("payload", "owner_evidence_before", "open_orders_fact"),
+        ),
+        (
+            "SOURCE_GROUP_RESULT",
+            (
+                "payload",
+                "owner_evidence_before",
+                "open_orders_fact",
+                "immutable_payload",
+            ),
+        ),
+        (
+            "SOURCE_GROUP_RESULT",
+            (
+                "payload",
+                "owner_evidence_before",
+                "open_orders_fact",
+                "immutable_payload",
+                "rows",
+            ),
+        ),
+        ("SOURCE_GROUP_RESULT", ("payload", "owner_evidence_after")),
+        (
+            "SOURCE_GROUP_RESULT",
+            ("payload", "owner_evidence_after", "open_orders_fact"),
+        ),
+        (
+            "SOURCE_GROUP_RESULT",
+            (
+                "payload",
+                "owner_evidence_after",
+                "open_orders_fact",
+                "immutable_payload",
+            ),
+        ),
+        (
+            "SOURCE_GROUP_RESULT",
+            (
+                "payload",
+                "owner_evidence_after",
+                "open_orders_fact",
+                "immutable_payload",
+                "rows",
+            ),
+        ),
+    ],
+)
+def test_every_reference_path_rejects_non_container_types(tmp_path, kind, path):
+    valid_payloads = {
+        "CALLBACK_RESULT": {"result": "ok"},
+        "SNAPSHOT_FACT": {
+            "fact": {
+                "snapshot_kind": "OPEN_ORDERS",
+                "immutable_payload": {"outcome": "SUCCESS", "rows": []},
+            }
+        },
+        "HISTORICAL_MARKET_RESULT": {
+            "request": {"working_orders": []},
+            "working_orders_snapshot": [],
+        },
+        "SOURCE_GROUP_RESULT": {
+            "owner_evidence_before": {
+                "open_orders_fact": {"immutable_payload": {"rows": []}}
+            },
+            "owner_evidence_after": {
+                "open_orders_fact": {"immutable_payload": {"rows": []}}
+            },
+        },
+    }
+    bad_types = (
+        (None, {}, 0, "bad")
+        if path[-1]
+        in {
+            "rows",
+            "working_orders",
+            "working_orders_snapshot",
+        }
+        else (None, [], 0, "bad")
+    )
+    for index, bad_type in enumerate(bad_types):
+        row = {
+            "schema_version": "spider_journal_record_v2",
+            "record_kind": kind,
+            "payload": valid_payloads[kind],
+        }
+        target = row
+        for key in path[:-1]:
+            target = target[key]
+        target[path[-1]] = bad_type
+        raw = _raw(row)
+        journal_path = tmp_path / f"malformed-{index}.jsonl"
+        journal_path.write_bytes(raw)
+        with pytest.raises(ValueError, match="ARTIFACT_MISMATCH"):
+            _read(journal_path, raw)
+
+
+def test_open_orders_failure_payload_does_not_require_success_rows(tmp_path):
+    raw = _raw(
+        _wire_row(
+            {
+                "fact": {
+                    "snapshot_kind": "OPEN_ORDERS",
+                    "immutable_payload": {"outcome": "FAILURE"},
+                }
+            },
+            "SNAPSHOT_FACT",
+        )
+    )
+    journal_path = tmp_path / "failure.jsonl"
+    journal_path.write_bytes(raw)
+    result = _read(journal_path, raw)
+    assert result.rows[0]["payload"]["fact"]["immutable_payload"] == {
+        "outcome": "FAILURE"
+    }
+
+
+def test_empty_journal_is_a_complete_two_pass_input(tmp_path):
+    raw = b""
+    path = tmp_path / "journal.jsonl"
+    path.write_bytes(raw)
+    result = _read(path, raw, cap=0)
+    assert result.rows == []
+    assert result.counters == {
+        "rows": 0,
+        "projected_bytes": 0,
+        "kind_bytes": {kind: 0 for kind in limits.P3_V2_RECORD_KINDS},
+        "kind_rows": {kind: 0 for kind in limits.P3_V2_RECORD_KINDS},
+        "definition_count": 0,
+        "definition_bytes": 0,
+    }
+
+
+def test_row_with_order_defs_projects_same_row_references(tmp_path):
+    definition = {"order_id": "order-1", "symbol": "BTC-USDT-SWAP"}
+    wire = _wire_row(
+        {"request": {"working_orders": [0]}, "working_orders_snapshot": [0]},
+        "HISTORICAL_MARKET_RESULT",
+    )
+    wire["order_defs"] = [definition]
+    raw = _raw(wire)
+    path = tmp_path / "journal.jsonl"
+    path.write_bytes(raw)
+
+    result = _read(path, raw)
+
+    assert result.rows[0]["payload"]["request"]["working_orders"] == [definition]
+    assert result.rows[0]["payload"]["working_orders_snapshot"] == [definition]
+    assert "order_defs" not in result.rows[0]
+
+
+@pytest.mark.parametrize("kind", ["DELIVERY_ATTEMPT", "UNKNOWN"])
+def test_reader_rejects_kinds_outside_v2_closed_set(tmp_path, kind):
+    raw = _raw(_wire_row(kind=kind))
+    path = tmp_path / "journal.jsonl"
+    path.write_bytes(raw)
+    with pytest.raises(ValueError, match="ARTIFACT_MISMATCH"):
+        _read(path, raw)
