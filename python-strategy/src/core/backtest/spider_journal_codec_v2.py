@@ -1,6 +1,8 @@
 # pyright: reportArgumentType=false, reportIndexIssue=false, reportAttributeAccessIssue=false
 """Pure B1 order interning for P3-v2 journal rows."""
 
+from collections.abc import Callable
+
 from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_canonical
 from src.core.backtest.spider_journal_slots_v2 import SLOT_LIST
 from src.core.backtest.spider_journal_slot_classifier_v2 import classify_p3_v2_slots
@@ -101,3 +103,24 @@ def encode_p3_v2_row(
     if row_definitions:
         result["order_defs"] = row_definitions
     return result, state + tuple(appended)
+
+
+def encode_p3_v2_row_with_context_gate(
+    row: object,
+    prior_state: object = _EMPTY_STATE,
+    *,
+    validate_v1: Callable[[object], None],
+    check_context_chain: Callable[[object], object],
+) -> tuple[dict[str, object], tuple[bytes, ...]]:
+    """Validate, context-gate, intern, then strip P3 attempt contexts.
+
+    The callbacks are the existing envelope validator and attempt context-chain
+    checker. Their exceptions propagate unchanged; neither B1 nor stripping is
+    reached unless both checks have completed.
+    """
+    validate_v1(row)
+    check_context_chain(row)
+    encoded, next_state = encode_p3_v2_row(row, prior_state)
+    del encoded["configuration_context"]
+    del encoded["historical_context"]
+    return encoded, next_state

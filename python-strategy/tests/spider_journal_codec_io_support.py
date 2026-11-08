@@ -133,9 +133,10 @@ def _assert_source_import_boundary(source_text):
         imported.module: [(alias.name, alias.asname) for alias in imported.names]
         for imported in imports
     }
-    assert len(imports) == 3
+    assert len(imports) == 4
     assert all(imported.level == 0 for imported in imports)
     assert actual == {
+        "collections.abc": [("Callable", None)],
         "src.core.backtest.spider_run_artifacts": [
             ("canonical_bytes", None),
             ("decode_canonical", None),
