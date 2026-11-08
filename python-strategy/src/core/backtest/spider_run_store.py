@@ -10,7 +10,9 @@ from pathlib import Path
 from typing import Any, cast
 
 from src.core.backtest.spider_run_artifacts import _P3_RUN_CONTRACT, _boundary, _configuration_context, _historical_context, _require, _text, canonical_bytes, configuration_context, decode_jsonl, historical_context, validate_artifact
-from src.core.backtest.spider_run_completion_schema import _ARTIFACTS, completion, report as validate_report
+from src.core.backtest.spider_run_completion_schema import (
+    _ARTIFACTS, _P3_V2_ARTIFACTS, completion, report as validate_report,
+)
 from src.core.backtest.spider_run_envelope_schema import endpoint as validate_endpoint, journal as validate_journal, journal_record
 from src.core.backtest.spider_run_errors import ReconciliationProjectionError, SpiderRunStoreError
 from src.core.backtest.spider_run_evidence import _context_chain, build_reconciliation
@@ -709,9 +711,14 @@ class SpiderRunStore:
                 contexts=(attempt["configuration_context"], attempt["historical_context"]),
                 budget=artifact_limits.p3_v2_scope_budget(coverage),
             )
-            validator(result.rows)
+            try:
+                validator(result.rows)
+            except ValueError as error:
+                if error.args == ("INVALID_ARTIFACT",):
+                    raise SpiderRunStoreError("ARTIFACT_MISMATCH") from error
+                raise
             if any(row["run_id"] != self._run_id for row in result.rows):
-                raise ValueError("INVALID_ARTIFACT")
+                raise SpiderRunStoreError("ARTIFACT_MISMATCH")
         except OSError as error:
             raise SpiderRunStoreError("PUBLICATION_FAILED") from error
         except ValueError as error:
@@ -755,6 +762,47 @@ class SpiderRunStore:
             raise SpiderRunStoreError("ENDPOINT_RECONCILIATION_FAILED")
         return limit
 
+    def _p3_v2_value_metadata(self, name: str, value: Any) -> dict[str, Any]:
+        limit = self._p3_v2_artifact_limit(name)
+        rows = value if name.endswith(".jsonl") else (value,)
+        digest = sha256()
+        byte_count = 0
+        row_count = 0
+        for row in rows:
+            raw = canonical_bytes(row) + b"\n"
+            byte_count += len(raw)
+            if byte_count > limit:
+                raise SpiderRunStoreError("ARTIFACT_LIMIT_EXCEEDED")
+            digest.update(raw)
+            row_count += 1
+        schema = dict(_P3_V2_ARTIFACTS)[name]
+        return dict(path=name, schema_version=schema, sha256=digest.hexdigest(),
+                    byte_count=byte_count, row_count=row_count)
+
+    def _p3_v2_completion_bytes(
+        self, attempt: dict[str, Any], endpoint: dict[str, Any], reconciliation: dict[str, Any],
+        metadata: list[dict[str, Any]],
+    ) -> bytes:
+        manifest = dict(
+            schema_version="spider_completion_v1", run_id=self._run_id, state="COMPLETE",
+            terminal_reason=endpoint["terminal_reason"],
+            input_contract_hashes=attempt["input_contract_hashes"],
+            planned_coverage=attempt["planned_coverage"],
+            processed_boundary=self._processed, persisted_boundary=self._persisted,
+            endpoint_state_digest=sha256(canonical_bytes(endpoint)).hexdigest(),
+            reconciliation_digest=sha256(canonical_bytes(reconciliation)).hexdigest(),
+            artifacts=metadata,
+        )
+        if "configuration_context" in attempt:
+            manifest["configuration_context"] = _configuration_context(attempt["configuration_context"])
+        if "historical_context" in attempt:
+            manifest["historical_context"] = _historical_context(attempt["historical_context"])
+        completion(manifest)
+        raw = canonical_bytes(manifest) + b"\n"
+        if len(raw) > self._p3_v2_artifact_limit("completion.json"):
+            raise SpiderRunStoreError("ARTIFACT_LIMIT_EXCEEDED")
+        return raw
+
     def _read_p3_v2_artifact(self, name: str) -> bytes:
         path = self._path / name
         if path.is_symlink() or not path.is_file():
@@ -782,15 +830,36 @@ class SpiderRunStore:
                 raise ValueError("INVALID_ARTIFACT")
         if any(row["run_id"] != self._run_id for row in report):
             raise ValueError("INVALID_ARTIFACT")
+        p3_v2 = self._attempt.get("artifact_encoding") == "artifact_encoding_v2"
+        preflight_completion: bytes | None = None
+        complete_status_raw: bytes | None = None
         try:
-            current_attempt = self._reread_artifact("attempt.json", validate_artifact)[0]
+            current_attempt, attempt_metadata = self._reread_artifact("attempt.json", validate_artifact)
             current_status = self._reread_artifact("status.json", validate_artifact)[0]
+            if p3_v2:
+                complete_status_raw = canonical_bytes(self._status("COMPLETE")) + b"\n"
+                if len(complete_status_raw) > self._p3_v2_artifact_limit("status.json"):
+                    raise SpiderRunStoreError("ARTIFACT_LIMIT_EXCEEDED")
             current_journal, first_journal_metadata = self._reread_artifact(
                 "journal.jsonl", validate_journal, attempt=current_attempt,
             )
             _context_chain(current_attempt, current_status, current_journal, endpoint, reconciliation, report)
             historical_metadata = self._historical_input_metadata(current_attempt) if historical else None
             del current_journal
+            if p3_v2:
+                preflight_metadata = [
+                    attempt_metadata,
+                    self._p3_v2_value_metadata("status.json", self._status("COMPLETE")),
+                    first_journal_metadata,
+                    self._p3_v2_value_metadata("endpoint.json", endpoint),
+                    self._p3_v2_value_metadata("reconciliation.json", reconciliation),
+                    self._p3_v2_value_metadata("report.jsonl", report),
+                ]
+                if historical_metadata is not None:
+                    preflight_metadata.append(historical_metadata)
+                preflight_completion = self._p3_v2_completion_bytes(
+                    current_attempt, endpoint, reconciliation, preflight_metadata,
+                )
         except ReconciliationProjectionError as error:
             raise SpiderRunStoreError("ENDPOINT_RECONCILIATION_FAILED") from error
         for name, value in [("endpoint.json", endpoint), ("reconciliation.json", reconciliation), ("report.jsonl", report)]:
@@ -822,7 +891,10 @@ class SpiderRunStore:
                 raise SpiderRunStoreError("ENDPOINT_RECONCILIATION_FAILED")
         del journal
         reread[2] = (None, reread[2][1])
-        self._publish("status.json", canonical_bytes(self._status("COMPLETE")) + b"\n")
+        actual_complete_status_raw = canonical_bytes(self._status("COMPLETE")) + b"\n"
+        if p3_v2 and actual_complete_status_raw != complete_status_raw:
+            raise SpiderRunStoreError("ENDPOINT_RECONCILIATION_FAILED")
+        self._publish("status.json", actual_complete_status_raw)
         complete_status, status_metadata = self._reread_artifact("status.json", validate_artifact)
         if complete_status != self._status("COMPLETE"):
             raise SpiderRunStoreError("ENDPOINT_RECONCILIATION_FAILED")
@@ -843,5 +915,8 @@ class SpiderRunStore:
             _context_chain(attempt, complete_status, final, supplied, rows, manifest)
         except ReconciliationProjectionError as error:
             raise SpiderRunStoreError("ENDPOINT_RECONCILIATION_FAILED") from error
-        self._publish("completion.json", canonical_bytes(manifest) + b"\n")
+        completion_raw = canonical_bytes(manifest) + b"\n"
+        if p3_v2 and completion_raw != preflight_completion:
+            raise SpiderRunStoreError("ENDPOINT_RECONCILIATION_FAILED")
+        self._publish("completion.json", completion_raw)
         return "COMPLETE_PUBLISHED"

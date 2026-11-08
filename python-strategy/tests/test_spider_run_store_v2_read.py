@@ -327,7 +327,7 @@ def test_v2_reread_rejects_foreign_run_id_without_trusting_valid_wire_metadata(t
     )
     with pytest.raises(module.SpiderRunStoreError) as caught:
         store._reread_artifact("journal.jsonl", validate_journal, attempt=attempt)
-    assert caught.value.reason == "ENDPOINT_RECONCILIATION_FAILED"
+    assert caught.value.reason == "ARTIFACT_MISMATCH"
     assert (store._path / "journal.jsonl").read_bytes() == foreign
 
 

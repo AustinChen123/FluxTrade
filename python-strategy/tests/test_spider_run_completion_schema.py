@@ -410,6 +410,43 @@ def test_p3_v2_completion_table_is_closed_and_selected_by_wire_schema():
         schema.completion(value)
 
 
+def p3_v2_completion_manifest() -> dict[str, Any]:
+    value = manifest()
+    value.update(
+        configuration_context=configured_context(),
+        historical_context=historical_context_row()._asdict(),
+        terminal_reason="MTM_PRESERVE_OPEN_V1",
+    )
+    value["planned_coverage"] = [
+        {"ordinal": 1, "barrier_id": "P3_TIMER_86405000", "record_kind": "HISTORICAL_TIMER"}
+    ]
+    value["artifacts"][2]["schema_version"] = "spider_journal_record_v2"
+    value["artifacts"].append(
+        dict(path="historical_input.json", schema_version="spider_historical_research_run_v1",
+             sha256=HASH, byte_count=100, row_count=1)
+    )
+    return value
+
+
+def test_p3_v2_artifacts_require_historical_context():
+    value = manifest()
+    value["artifacts"][2]["schema_version"] = "spider_journal_record_v2"
+    value["artifacts"].append(
+        dict(path="historical_input.json", schema_version="spider_historical_research_run_v1",
+             sha256=HASH, byte_count=100, row_count=1)
+    )
+    with pytest.raises(ValueError):
+        schema.completion(value)
+
+
+@pytest.mark.parametrize("artifacts", [None, [None], ["not-an-artifact-object"]])
+def test_p3_v2_completion_rejects_malformed_artifact_lists(artifacts):
+    value = p3_v2_completion_manifest()
+    value["artifacts"] = artifacts
+    with pytest.raises(ValueError):
+        schema.completion(value)
+
+
 def test_embedded_artifact_contexts_remain_dict_only():
     raw = configured_context()
     typed = configuration_context(raw)

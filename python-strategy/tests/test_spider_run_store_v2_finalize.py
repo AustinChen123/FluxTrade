@@ -99,10 +99,138 @@ def test_v2_finalize_drops_each_journal_projection_and_preserves_partial_publica
     assert store._state == "RUNNING"
     assert (store._path / "journal.jsonl").read_bytes() == raw
     assert (store._path / "status.json").read_bytes() == before["status.json"]
+    after = {p.name: p.read_bytes() for p in store._path.iterdir() if p.is_file()}
+    assert after[".endpoint.json.tmp"]
+    assert {name: after[name] for name in before} == before
+
+
+def test_v2_unknown_projected_field_is_named_and_rejected_before_any_finalize_write(tmp_path,
+                                                                                   real_p3_artifacts):
+    store, values, recon, raw = p3_v2_finalize_fixture(tmp_path, real_p3_artifacts)
+    rows = decode_jsonl(raw)
+    rows[0]["unapproved_field"] = "x"
+    bad = b"".join(canonical_bytes(row) + b"\n" for row in rows)
+    (store._path / "journal.jsonl").write_bytes(bad)
+    store._p3_v2_journal_metadata = dict(
+        schema_version="spider_journal_record_v2", sha256=sha256(bad).hexdigest(),
+        byte_count=len(bad), row_count=len(rows),
+    )
+    before = {path.name: path.read_bytes() for path in store._path.iterdir() if path.is_file()}
+    for _ in range(2):
+        with pytest.raises(module.SpiderRunStoreError) as caught:
+            store.finalize(values[3], recon, values[4])
+        assert caught.value.reason == "ARTIFACT_MISMATCH"
+        assert {path.name: path.read_bytes() for path in store._path.iterdir() if path.is_file()} == before
+        assert store._state == "RUNNING"
+
+
+@pytest.mark.parametrize("limited_artifact", [
+    "endpoint.json", "reconciliation.json", "report.jsonl", "status.json", "completion.json",
+])
+def test_v2_finalize_prechecks_generated_artifact_caps_before_first_write(tmp_path, real_p3_artifacts,
+                                                                          monkeypatch, limited_artifact):
+    store, values, recon, _ = p3_v2_finalize_fixture(tmp_path, real_p3_artifacts)
+    original_limit = store._p3_v2_artifact_limit
+    status_raw = (store._path / "status.json").read_bytes()
+    cap = len(status_raw) if limited_artifact == "status.json" else 1
+    monkeypatch.setattr(
+        store, "_p3_v2_artifact_limit",
+        lambda name: cap if name == limited_artifact else original_limit(name),
+    )
+    before = {path.name: path.read_bytes() for path in store._path.iterdir() if path.is_file()}
+    with pytest.raises(module.SpiderRunStoreError) as caught:
+        store.finalize(values[3], recon, values[4])
+    assert caught.value.reason == "ARTIFACT_LIMIT_EXCEEDED"
+    assert {path.name: path.read_bytes() for path in store._path.iterdir() if path.is_file()} == before
+    assert store._state == "RUNNING"
+    with pytest.raises(module.SpiderRunStoreError) as retry:
+        store.finalize(values[3], recon, values[4])
+    assert retry.value.reason == "ARTIFACT_LIMIT_EXCEEDED"
+    assert {path.name: path.read_bytes() for path in store._path.iterdir() if path.is_file()} == before
+    assert store._state == "RUNNING"
+
+
+@pytest.mark.parametrize("failure,reason", [
+    ("link", "PUBLICATION_FAILED"),
+    ("sync", "PUBLICATION_DURABILITY_UNKNOWN"),
+])
+def test_v2_completion_link_and_directory_sync_failure_states(tmp_path, real_p3_artifacts,
+                                                               monkeypatch, failure, reason):
+    store, values, recon, raw = p3_v2_finalize_fixture(tmp_path, real_p3_artifacts)
+    original_link, original_sync = module.os.link, module._sync
+
+    def fail_completion_link(source, destination):
+        if Path(destination).name == "completion.json":
+            raise OSError("injected completion link failure")
+        return original_link(source, destination)
+
+    def fail_completion_sync(directory):
+        if (Path(directory) / "completion.json").exists():
+            raise module.SpiderRunStoreError("PUBLICATION_DURABILITY_UNKNOWN")
+        return original_sync(directory)
+
+    if failure == "link":
+        monkeypatch.setattr(module.os, "link", fail_completion_link)
+    else:
+        monkeypatch.setattr(module, "_sync", fail_completion_sync)
+    with pytest.raises(module.SpiderRunStoreError) as caught:
+        store.finalize(values[3], recon, values[4])
+    assert caught.value.reason == reason
+    assert (store._path / "journal.jsonl").read_bytes() == raw
+    assert b'"state":"COMPLETE"' in (store._path / "status.json").read_bytes()
+    if failure == "link":
+        assert store._state == "RUNNING"
+        assert not (store._path / "completion.json").exists()
+        assert (store._path / ".completion.json.tmp").is_file()
+        expected_retry = "PUBLICATION_FAILED"
+    else:
+        assert store._state == "FROZEN"
+        assert (store._path / "completion.json").is_file()
+        expected_retry = "INVALID_STORE_OPERATION"
+    before = {path.name: path.read_bytes() for path in store._path.iterdir() if path.is_file()}
+    with pytest.raises((module.SpiderRunStoreError, RuntimeError)) as retry:
+        store.finalize(values[3], recon, values[4])
+    retry_reason = getattr(retry.value, "reason", str(retry.value))
+    assert retry_reason == expected_retry
+    after = {path.name: path.read_bytes() for path in store._path.iterdir() if path.is_file()}
+    assert all(after[name] == content for name, content in before.items())
+    if failure == "link":
+        assert ".endpoint.json.tmp" in after
+    else:
+        assert after == before
+
+
+@pytest.fixture(scope="module")
+def shared_partial_tail_fixture(tmp_path_factory, real_p3_artifacts):
+    root = tmp_path_factory.mktemp("j6-partial-tail")
+    return p3_v2_finalize_fixture(root, real_p3_artifacts)
+
+
+@pytest.mark.parametrize("bytes_removed_from_tail", range(1, 4377))
+def test_v2_partial_tail_at_every_final_row_byte_rejects_repeatedly(bytes_removed_from_tail,
+                                                                    shared_partial_tail_fixture):
+    store, values, recon, raw = shared_partial_tail_fixture
+    start = raw.rfind(b"\n", 0, -1) + 1
+    assert len(raw) - start == 4377
+    cut = len(raw) - bytes_removed_from_tail
+    assert start < cut < len(raw)
+    partial = raw[:cut]
+    (store._path / "journal.jsonl").write_bytes(partial)
+    store._p3_v2_journal_metadata = dict(
+        schema_version="spider_journal_record_v2", sha256=sha256(partial).hexdigest(),
+        byte_count=len(partial), row_count=partial.count(b"\n"),
+    )
+    before = {path.name: path.read_bytes() for path in store._path.iterdir() if path.is_file()}
+    for _ in range(2):
+        with pytest.raises(module.SpiderRunStoreError) as caught:
+            store.finalize(values[3], recon, values[4])
+        assert caught.value.reason == "ENDPOINT_RECONCILIATION_FAILED"
+        assert {path.name: path.read_bytes() for path in store._path.iterdir() if path.is_file()} == before
+        assert store._state == "RUNNING"
 
 
 @pytest.mark.parametrize("failure", ["metadata", "missing_metadata", "mixed", "partial", "projection",
-                                     "attempt", "foreign_run_id"])
+                                     "attempt", "oversized_attempt", "foreign_run_id"])
 def test_v2_finalize_read_failures_leave_real_files_and_running_status(tmp_path, real_p3_artifacts,
                                                                        monkeypatch, failure):
     store, values, recon, raw = p3_v2_finalize_fixture(tmp_path, real_p3_artifacts)
@@ -121,6 +249,10 @@ def test_v2_finalize_read_failures_leave_real_files_and_running_status(tmp_path,
             schema_version="spider_journal_record_v2", sha256=sha256(bad).hexdigest(),
             byte_count=len(bad), row_count=len(rows),
         )
+    elif failure == "oversized_attempt":
+        attempt = deepcopy(store._attempt)
+        attempt["planned_coverage"][0]["barrier_id"] = "x" * module.artifact_limits.DEFAULT_LIMIT
+        attempt_path.write_bytes(canonical_bytes(attempt) + b"\n")
     elif failure == "mixed":
         rows = decode_jsonl(raw)
         rows[0]["schema_version"] = "spider_journal_record_v1"
@@ -145,13 +277,17 @@ def test_v2_finalize_read_failures_leave_real_files_and_running_status(tmp_path,
         attempt_path.write_bytes(canonical_bytes(attempt) + b"\n")
     journal_before = journal_path.read_bytes()
     status_before = (store._path / "status.json").read_bytes()
-    with pytest.raises(module.SpiderRunStoreError) as caught:
-        store.finalize(values[3], recon, values[4])
-    assert caught.value.reason == ("ARTIFACT_LIMIT_EXCEEDED" if failure == "projection"
-                                   else "ENDPOINT_RECONCILIATION_FAILED")
-    assert journal_path.read_bytes() == journal_before
-    assert (store._path / "status.json").read_bytes() == status_before
-    assert not any((store._path / name).exists() for name in (
-        "endpoint.json", "reconciliation.json", "report.jsonl", "completion.json",
-    ))
-    assert store._state == "RUNNING"
+    before = {path.name: path.read_bytes() for path in store._path.iterdir() if path.is_file()}
+    expected_reason = (
+        "ARTIFACT_LIMIT_EXCEEDED" if failure in ("projection", "oversized_attempt")
+        else "ARTIFACT_MISMATCH" if failure == "foreign_run_id"
+        else "ENDPOINT_RECONCILIATION_FAILED"
+    )
+    for _ in range(2):
+        with pytest.raises(module.SpiderRunStoreError) as caught:
+            store.finalize(values[3], recon, values[4])
+        assert caught.value.reason == expected_reason
+        assert journal_path.read_bytes() == journal_before
+        assert (store._path / "status.json").read_bytes() == status_before
+        assert {path.name: path.read_bytes() for path in store._path.iterdir() if path.is_file()} == before
+        assert store._state == "RUNNING"
