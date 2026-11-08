@@ -156,6 +156,33 @@ def test_v2_reread_dispatch_returns_projection_and_wire_identity(tmp_path, real_
     assert attempt_metadata["schema_version"] == "spider_attempt_v1"
 
 
+def test_journal_real_read_oserror_named_and_fd_closed(tmp_path, real_p3_artifacts, monkeypatch):
+    import os
+
+    store, *_ = p3_v2_finalize_fixture(tmp_path, real_p3_artifacts)
+    before = {path.name: path.read_bytes() for path in store._path.iterdir()}
+    original_read = os.read
+    journal_inode = (store._path / "journal.jsonl").stat().st_ino
+    failed_descriptors = []
+
+    def fail_journal_read(fd, size):
+        if os.fstat(fd).st_ino == journal_inode:
+            failed_descriptors.append(fd)
+            raise OSError("injected journal read error")
+        return original_read(fd, size)
+
+    monkeypatch.setattr(os, "read", fail_journal_read)
+    for _ in range(2):
+        with pytest.raises(module.SpiderRunStoreError) as caught:
+            store._reread_artifact(
+                "journal.jsonl", validate_journal, attempt=store._attempt,
+            )
+        assert caught.value.reason == "PUBLICATION_FAILED"
+        assert {path.name: path.read_bytes() for path in store._path.iterdir()} == before
+        with pytest.raises(OSError):
+            os.fstat(failed_descriptors[-1])
+
+
 def test_v2_attempt_is_normalized_only_for_the_legacy_schema_validator(tmp_path, real_p3_artifacts,
                                                                        monkeypatch):
     store, _, _, _ = p3_v2_finalize_fixture(tmp_path, real_p3_artifacts)
