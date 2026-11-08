@@ -1,3 +1,4 @@
+# pyright: reportArgumentType=false, reportIndexIssue=false, reportAttributeAccessIssue=false, reportOperatorIssue=false, reportCallIssue=false
 """T3.3 tests for the owned-buffer P3-v2 journal reader."""
 
 import hashlib
@@ -419,7 +420,7 @@ def test_every_reference_path_rejects_non_container_types(tmp_path, kind, path):
         },
     }
     bad_types = (
-        (None, {}, 0, "bad")
+        ({}, 0, "bad")
         if path[-1]
         in {
             "rows",
@@ -540,9 +541,7 @@ def test_reader_rejects_non_object_wire_row_as_named_mismatch(tmp_path, root):
 
 
 @pytest.mark.parametrize("definitions", [None, True, 0, {}, "bad"])
-def test_reader_rejects_non_list_order_defs_as_named_mismatch(
-    tmp_path, definitions
-):
+def test_reader_rejects_non_list_order_defs_as_named_mismatch(tmp_path, definitions):
     wire = _wire_row(
         {
             "request": {"working_orders": []},

@@ -1,3 +1,4 @@
+# pyright: reportArgumentType=false, reportIndexIssue=false, reportAttributeAccessIssue=false
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -12,6 +13,8 @@ from src.core.backtest.spider_projection_size import (
     projected_v1_jsonl_row_len,
 )
 from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_canonical
+from src.core.backtest.spider_journal_slots_v2 import SLOT_LIST
+from src.core.backtest.spider_journal_slot_classifier_v2 import classify_p3_v2_slots
 
 _V2_SCHEMA = "spider_journal_record_v2"
 
@@ -61,48 +64,14 @@ def _decode_wire_row(line: bytes) -> dict[str, object]:
 
 
 def _refs(row: dict[str, object]) -> list[list[object]]:
-    payload = row.get("payload")
-    if type(payload) is not dict:
+    slots = classify_p3_v2_slots(row)
+    if slots is None:
         _raise("ARTIFACT_MISMATCH")
-    payload = cast(dict[str, object], payload)
-    kind = row["record_kind"]
-    if kind == "HISTORICAL_MARKET_RESULT":
-        request = payload.get("request")
-        if type(request) is not dict:
-            _raise("ARTIFACT_MISMATCH")
-        request = cast(dict[str, object], request)
-        working, snapshot = (
-            request.get("working_orders"),
-            payload.get("working_orders_snapshot"),
-        )
-        if type(working) is not list or type(snapshot) is not list:
-            _raise("ARTIFACT_MISMATCH")
-        return [cast(list[object], working), cast(list[object], snapshot)]
-    if kind == "SOURCE_GROUP_RESULT":
-        result = []
-        for side in ("owner_evidence_before", "owner_evidence_after"):
-            evidence = payload.get(side)
-            fact = evidence.get("open_orders_fact") if type(evidence) is dict else None
-            immutable = fact.get("immutable_payload") if type(fact) is dict else None
-            values = immutable.get("rows") if type(immutable) is dict else None
-            if type(values) is not list:
-                _raise("ARTIFACT_MISMATCH")
-            result.append(cast(list[object], values))
-        return result
-    if kind == "SNAPSHOT_FACT":
-        fact = payload.get("fact")
-        if type(fact) is not dict:
-            _raise("ARTIFACT_MISMATCH")
-        if fact.get("snapshot_kind") == "OPEN_ORDERS":
-            immutable = fact.get("immutable_payload")
-            if type(immutable) is not dict:
-                _raise("ARTIFACT_MISMATCH")
-            if immutable.get("outcome") == "SUCCESS":
-                values = immutable.get("rows")
-                if type(values) is not list:
-                    _raise("ARTIFACT_MISMATCH")
-                return [cast(list[object], values)]
-    return []
+    return [
+        cast(list[object], parent[leaf])
+        for _, _, state, parent, leaf in slots
+        if state == SLOT_LIST
+    ]
 
 
 def _projected_len(
