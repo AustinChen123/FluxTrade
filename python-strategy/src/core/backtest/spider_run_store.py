@@ -15,6 +15,8 @@ from src.core.backtest.spider_run_envelope_schema import endpoint as validate_en
 from src.core.backtest.spider_run_errors import ReconciliationProjectionError, SpiderRunStoreError
 from src.core.backtest.spider_run_evidence import _context_chain, build_reconciliation
 from src.core.backtest.spider_run_reconciliation_schema import reconciliation as validate_reconciliation
+from src.core.backtest import spider_artifact_limits as artifact_limits
+from src.core.backtest.spider_journal_reader_v2 import read_p3_v2_journal
 from src.core.backtest.spider_historical_input import (
     ValidatedHistoricalInput,
     _historical_context_for_validated_input,
@@ -120,6 +122,7 @@ class SpiderRunStore:
         self._execution_input: bytes | None = None
         self._floating_exit = False
         self._gross_execution = False
+        self._p3_v2_journal_metadata: dict[str, object] | None = None
 
     def _is_execution(self) -> bool:
         return self._attempt.get("run_contract_id") in (
@@ -636,6 +639,62 @@ class SpiderRunStore:
             raise SpiderRunStoreError("ENDPOINT_RECONCILIATION_FAILED")
         return value, dict(path=name, schema_version=schema, sha256=sha256(raw).hexdigest(), byte_count=len(raw), row_count=len(rows))
 
+    def _reread_artifact(
+        self, name: str, validator: Any, *, attempt: dict[str, Any] | None = None,
+    ) -> tuple[Any, dict[str, Any]]:
+        """Dispatch one artifact read by the registered P3 wire encoding."""
+        p3_v2 = (
+            self._attempt.get("run_contract_id") == _P3_RUN_CONTRACT
+            and self._attempt.get("artifact_encoding") == "artifact_encoding_v2"
+        )
+        if not p3_v2:
+            return self._reread(name, validator)
+        if name == "attempt.json":
+            def validate_p3_v2_attempt(value: object) -> None:
+                if type(value) is not dict or value.get("artifact_encoding") != "artifact_encoding_v2":
+                    raise ValueError("INVALID_ARTIFACT")
+                normalized = value.copy()
+                normalized["artifact_encoding"] = "artifact_encoding_v1"
+                validate_artifact(normalized)
+
+            reread = self._reread(name, validate_p3_v2_attempt)
+            if reread[0] != self._attempt:
+                raise SpiderRunStoreError("ENDPOINT_RECONCILIATION_FAILED")
+            return reread
+        if name != "journal.jsonl":
+            return self._reread(name, validator)
+        if attempt is None or attempt != self._attempt or self._p3_v2_journal_metadata is None:
+            raise SpiderRunStoreError("ENDPOINT_RECONCILIATION_FAILED")
+        if attempt.get("artifact_encoding") != "artifact_encoding_v2":
+            raise SpiderRunStoreError("ENDPOINT_RECONCILIATION_FAILED")
+        journal_path = self._path / name
+        if journal_path.is_symlink() or not journal_path.is_file():
+            raise SpiderRunStoreError("PUBLICATION_FAILED")
+        coverage: dict[str, int] = {}
+        for entry in attempt["planned_coverage"]:
+            kind = entry["record_kind"]
+            coverage[kind] = coverage.get(kind, 0) + 1
+        try:
+            result = read_p3_v2_journal(
+                self._path / name,
+                expected_metadata=self._p3_v2_journal_metadata,
+                contexts=(attempt["configuration_context"], attempt["historical_context"]),
+                budget=artifact_limits.p3_v2_scope_budget(coverage),
+            )
+            validator(result.rows)
+            if any(row["run_id"] != self._run_id for row in result.rows):
+                raise ValueError("INVALID_ARTIFACT")
+        except OSError as error:
+            raise SpiderRunStoreError("PUBLICATION_FAILED") from error
+        except ValueError as error:
+            reason = (
+                "ARTIFACT_LIMIT_EXCEEDED"
+                if error.args == ("ARTIFACT_LIMIT_EXCEEDED",)
+                else "ENDPOINT_RECONCILIATION_FAILED"
+            )
+            raise SpiderRunStoreError(reason) from error
+        return result.rows, dict(path=name, **result.wire_metadata)
+
     def _historical_input_metadata(self, attempt: dict[str, Any]) -> dict[str, Any]:
         path = self._path / "historical_input.json"
         try:
@@ -673,18 +732,28 @@ class SpiderRunStore:
         if any(row["run_id"] != self._run_id for row in report):
             raise ValueError("INVALID_ARTIFACT")
         try:
-            current = [self._reread(name, validator)[0] for name, validator in (
-                ("attempt.json", validate_artifact), ("status.json", validate_artifact), ("journal.jsonl", validate_journal))]
-            _context_chain(current[0], current[1], current[2], endpoint, reconciliation, report)
-            historical_metadata = self._historical_input_metadata(current[0]) if historical else None
+            current_attempt = self._reread_artifact("attempt.json", validate_artifact)[0]
+            current_status = self._reread_artifact("status.json", validate_artifact)[0]
+            current_journal, first_journal_metadata = self._reread_artifact(
+                "journal.jsonl", validate_journal, attempt=current_attempt,
+            )
+            _context_chain(current_attempt, current_status, current_journal, endpoint, reconciliation, report)
+            historical_metadata = self._historical_input_metadata(current_attempt) if historical else None
+            del current_journal
         except ReconciliationProjectionError as error:
             raise SpiderRunStoreError("ENDPOINT_RECONCILIATION_FAILED") from error
         for name, value in [("endpoint.json", endpoint), ("reconciliation.json", reconciliation), ("report.jsonl", report)]:
             rows = value if name.endswith(".jsonl") else [value]
             self._publish(name, b"".join(canonical_bytes(row) + b"\n" for row in rows))
         validators = (validate_artifact, validate_artifact, validate_journal, validate_endpoint, validate_reconciliation)
-        reread = [self._reread(name, validator) for (name, _), validator in zip(_ARTIFACTS[:-1], validators, strict=True)]
-        reread.append(self._reread("report.jsonl", _report_validator(reread[0][0])))
+        reread: list[tuple[Any, dict[str, Any]]] = []
+        for (name, _), validator in zip(_ARTIFACTS[:-1], validators, strict=True):
+            reread.append(
+                self._reread_artifact(
+                    name, validator, attempt=reread[0][0] if name == "journal.jsonl" else None,
+                )
+            )
+        reread.append(self._reread_artifact("report.jsonl", _report_validator(reread[0][0])))
         attempt, status, journal, final, supplied, rows = (value for value, _ in reread)
         try:
             _context_chain(attempt, status, journal, final, supplied, rows)
