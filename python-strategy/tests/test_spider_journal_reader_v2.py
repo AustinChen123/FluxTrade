@@ -188,3 +188,140 @@ def test_metadata_mismatch_rejects_before_any_json_parse(monkeypatch, tmp_path):
             path, expected_metadata=expected, contexts=CONTEXTS, budget=_budget(raw)
         )
     assert called == []
+
+
+def test_reader_uses_one_open_and_reads_file_bytes_once(monkeypatch, tmp_path):
+    raw = _raw(_wire_row(), _wire_row({"result": "second"}))
+    path = tmp_path / "journal.jsonl"
+    path.write_bytes(raw)
+    opens: list[object] = []
+    read_bytes = 0
+    open_fd, read_fd = reader.os.open, reader.os.read
+
+    def observed_open(name, flags):
+        opens.append(name)
+        return open_fd(name, flags)
+
+    def observed_read(fd, size):
+        nonlocal read_bytes
+        chunk = read_fd(fd, size)
+        read_bytes += len(chunk)
+        return chunk
+
+    monkeypatch.setattr(reader.os, "open", observed_open)
+    monkeypatch.setattr(reader.os, "read", observed_read)
+
+    result = _read(path, raw)
+
+    assert len(opens) == 1
+    assert read_bytes == len(raw)
+    assert len(result.rows) == 2
+
+
+def test_both_parse_passes_reuse_the_same_owned_buffer(monkeypatch, tmp_path):
+    raw = _raw(_wire_row())
+    path = tmp_path / "journal.jsonl"
+    path.write_bytes(raw)
+    iterator = reader._iter_owned_lines
+    buffers = []
+
+    def observed(value):
+        buffers.append(id(value))
+        yield from iterator(value)
+
+    monkeypatch.setattr(reader, "_iter_owned_lines", observed)
+    _read(path, raw)
+    assert len(buffers) == 2
+    assert buffers[0] == buffers[1]
+
+
+def test_line_iteration_does_not_copy_or_split_the_whole_owned_buffer(
+    monkeypatch, tmp_path
+):
+    raw = _raw(_wire_row())
+    path = tmp_path / "journal.jsonl"
+    path.write_bytes(raw)
+    capture = reader.journal_buffer.capture_owned_p3_v2_buffer
+
+    class NoWholeBufferCopies(bytearray):
+        def __bytes__(self):
+            raise AssertionError("whole-buffer bytes copy")
+
+        def split(self, *args, **kwargs):
+            raise AssertionError("whole-buffer split copy")
+
+    def owned_copy_guard(*args, **kwargs):
+        captured = capture(*args, **kwargs)
+        return reader.journal_buffer.OwnedP3V2Buffer(
+            NoWholeBufferCopies(captured.data), captured.wire_metadata
+        )
+
+    monkeypatch.setattr(
+        reader.journal_buffer, "capture_owned_p3_v2_buffer", owned_copy_guard
+    )
+    assert len(_read(path, raw).rows) == 1
+
+
+@pytest.mark.parametrize("delta", [-1, 1])
+@pytest.mark.parametrize("with_definitions", [False, True])
+def test_pass_two_projection_length_must_match_the_materialized_row(
+    monkeypatch, tmp_path, delta, with_definitions
+):
+    wire = _wire_row()
+    if with_definitions:
+        wire = _wire_row(
+            {
+                "request": {"working_orders": [0]},
+                "working_orders_snapshot": [0],
+            },
+            "HISTORICAL_MARKET_RESULT",
+        )
+        wire["order_defs"] = [{"order_id": "order-1"}]
+    raw = _raw(wire)
+    path = tmp_path / "journal.jsonl"
+    path.write_bytes(raw)
+    projected_len = reader._projected_len
+    calls = 0
+
+    def drift_only_on_pass_two(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        expected = projected_len(*args, **kwargs)
+        return expected + delta if calls == 2 else expected
+
+    monkeypatch.setattr(reader, "_projected_len", drift_only_on_pass_two)
+    with pytest.raises(ValueError, match="ARTIFACT_MISMATCH"):
+        _read(path, raw)
+    assert calls == 2
+
+
+def test_real_policy_kind_budget_counts_wire_bytes_at_exact_and_plus_one(
+    tmp_path,
+):
+    budget = limits.p3_v2_scope_budget({"HISTORICAL_MARKET_STEP": 1})
+    cap = budget["kind_budgets"]["CALLBACK_RESULT"]
+    v1_row = valid_v1_record("CALLBACK_RESULT")
+    journal_record(v1_row)
+    wire_row = dict(v1_row)
+    wire_row["schema_version"] = "spider_journal_record_v2"
+    wire_row["payload"] = dict(v1_row["payload"])
+    wire_row["payload"]["delivery_id"] = ""
+    base = len(canonical_bytes(wire_row)) + 1
+    wire_row["payload"]["delivery_id"] = "x" * (cap - base)
+    v1_row["payload"]["delivery_id"] = wire_row["payload"]["delivery_id"]
+    journal_record(v1_row)
+    raw = _raw(wire_row)
+    assert len(raw) == cap
+    exact_path = tmp_path / "exact.jsonl"
+    exact_path.write_bytes(raw)
+    result = _read(exact_path, raw, budget=budget)
+    assert result.counters["kind_bytes"]["CALLBACK_RESULT"] == cap
+    assert result.counters["projected_bytes"] > cap
+
+    one_over = dict(budget)
+    one_over["kind_budgets"] = dict(budget["kind_budgets"])
+    one_over["kind_budgets"]["CALLBACK_RESULT"] = cap - 1
+    over_path = tmp_path / "one-over.jsonl"
+    over_path.write_bytes(raw)
+    with pytest.raises(ValueError, match="ARTIFACT_LIMIT_EXCEEDED"):
+        _read(over_path, raw, budget=one_over)
