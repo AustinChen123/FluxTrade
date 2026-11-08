@@ -107,6 +107,27 @@ def _write(path: Path, raw: bytes, append: bool = False) -> None:
         raise SpiderRunStoreError("ARTIFACT_WRITE_FAILED") from error
 
 
+def _read_bounded(path: Path, limit: int) -> bytes:
+    if type(limit) is not int or limit < 0:
+        raise SpiderRunStoreError("INVALID_ARTIFACT")
+    result = bytearray()
+    try:
+        with path.open("rb") as stream:
+            while len(result) <= limit:
+                remaining = limit + 1 - len(result)
+                if remaining <= 0:
+                    break
+                chunk = stream.read(min(65_536, remaining))
+                if not chunk:
+                    break
+                result.extend(chunk)
+    except OSError as error:
+        raise SpiderRunStoreError("PUBLICATION_FAILED") from error
+    if len(result) > limit:
+        raise SpiderRunStoreError("ARTIFACT_LIMIT_EXCEEDED")
+    return bytes(result)
+
+
 class SpiderRunStore:
     def __init__(self, path: Path, run_id: str):
         self._path, self._run_id, self._state = path, run_id, "CREATED"
@@ -612,12 +633,13 @@ class SpiderRunStore:
         self._publish("completion.json", completion_raw)
         return "COMPLETE_PUBLISHED"
 
-    def _reread(self, name: str, validator: Any) -> tuple[Any, dict[str, Any]]:
+    def _reread(self, name: str, validator: Any, *, raw: bytes | None = None) -> tuple[Any, dict[str, Any]]:
         try:
             path = self._path / name
             if path.is_symlink() or not path.is_file():
                 raise OSError("invalid artifact")
-            raw = path.read_bytes()
+            if raw is None:
+                raw = path.read_bytes()
         except OSError as error:
             raise SpiderRunStoreError("PUBLICATION_FAILED") from error
         try:
@@ -657,12 +679,18 @@ class SpiderRunStore:
                 normalized["artifact_encoding"] = "artifact_encoding_v1"
                 validate_artifact(normalized)
 
-            reread = self._reread(name, validate_p3_v2_attempt)
+            reread = self._reread(
+                name, validate_p3_v2_attempt,
+                raw=self._read_p3_v2_artifact(name),
+            )
             if reread[0] != self._attempt:
                 raise SpiderRunStoreError("ENDPOINT_RECONCILIATION_FAILED")
             return reread
         if name != "journal.jsonl":
-            return self._reread(name, validator)
+            return self._reread(
+                name, validator,
+                raw=self._read_p3_v2_artifact(name),
+            )
         if attempt is None or attempt != self._attempt or self._p3_v2_journal_metadata is None:
             raise SpiderRunStoreError("ENDPOINT_RECONCILIATION_FAILED")
         if attempt.get("artifact_encoding") != "artifact_encoding_v2":
@@ -700,7 +728,10 @@ class SpiderRunStore:
         try:
             if path.is_symlink() or not path.is_file():
                 raise OSError("invalid historical input target")
-            raw = path.read_bytes()
+            if attempt.get("artifact_encoding") == "artifact_encoding_v2":
+                raw = _read_bounded(path, self._p3_v2_artifact_limit("historical_input.json"))
+            else:
+                raw = path.read_bytes()
         except OSError as error:
             raise SpiderRunStoreError("PUBLICATION_FAILED") from error
         try:
@@ -709,6 +740,26 @@ class SpiderRunStore:
             raise SpiderRunStoreError("ENDPOINT_RECONCILIATION_FAILED") from error
         return dict(path="historical_input.json", schema_version="spider_historical_research_run_v1",
                     sha256=sha256(raw).hexdigest(), byte_count=len(raw), row_count=1)
+
+    def _p3_v2_artifact_limit(self, name: str) -> int:
+        if name == "endpoint.json" or name == "reconciliation.json":
+            coverage: dict[str, int] = {}
+            for entry in self._attempt["planned_coverage"]:
+                kind = entry["record_kind"]
+                coverage[kind] = coverage.get(kind, 0) + 1
+            budget = artifact_limits.p3_v2_scope_budget(coverage)
+            limit = budget["E2" if name == "endpoint.json" else "X2"]
+        else:
+            limit = artifact_limits.artifact_limit("P3", "v2", name)
+        if type(limit) is not int or limit < 0:
+            raise SpiderRunStoreError("ENDPOINT_RECONCILIATION_FAILED")
+        return limit
+
+    def _read_p3_v2_artifact(self, name: str) -> bytes:
+        path = self._path / name
+        if path.is_symlink() or not path.is_file():
+            raise SpiderRunStoreError("PUBLICATION_FAILED")
+        return _read_bounded(path, self._p3_v2_artifact_limit(name))
 
     def finalize(self, endpoint: dict, reconciliation: dict, report: list) -> str:
         self._allowed("RUNNING")
