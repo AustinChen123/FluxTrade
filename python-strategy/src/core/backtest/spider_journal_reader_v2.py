@@ -301,6 +301,23 @@ def read_p3_v2_journal_from_attempt_bytes_at(
     )
 
 
+def read_p3_v2_journal_for_diagnosis_at(
+    directory_fd: int, name: str, *, retained_attempt_bytes: object,
+    expected_attempt_sha256: object, budget: Mapping[str, object],
+) -> P3V2JournalRead:
+    """Run both reader passes on one owned journal buffer without a manifest."""
+    journal_cap = budget.get("J2")
+    if type(journal_cap) is not int or journal_cap < 0:
+        _raise("INVALID_ARTIFACT")
+    contexts = _contexts_from_retained_attempt_bytes(
+        retained_attempt_bytes, expected_attempt_sha256
+    )
+    captured = journal_buffer.capture_owned_p3_v2_buffer_unmanifested_at(
+        directory_fd, name, journal_cap=journal_cap,
+    )
+    return _read_captured_p3_v2_journal(captured, contexts=contexts, budget=budget)
+
+
 def read_p3_v2_journal_from_attempt_bytes(
     path: str | os.PathLike[str],
     *,

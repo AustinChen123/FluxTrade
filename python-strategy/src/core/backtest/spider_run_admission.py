@@ -33,7 +33,7 @@ from src.core.backtest.spider_run_execution_schema import (
 from src.core.backtest.spider_run_execution_evidence import (
     build_execution_reconciliation as _build_execution_reconciliation,
 )
-from src.core.backtest.spider_journal_reader_v2 import read_p3_v2_journal_from_attempt_bytes_at as _read_p3_v2_journal_at
+from src.core.backtest.spider_journal_reader_v2 import read_p3_v2_journal_from_attempt_bytes_at as _read_p3_v2_journal_at, read_p3_v2_journal_for_diagnosis_at as _read_p3_v2_journal_diagnosis_at
 from src.core.backtest.spider_artifact_limits import (
     DEFAULT_LIMIT as _LIMIT,
     GROSS_REPORT_LIMIT as _GROSS_REPORT_LIMIT,  # noqa: F401 - compatibility policy alias
@@ -148,6 +148,26 @@ def _run_id(value: _Any) -> bool:
 
 def _diagnose(directory: int) -> dict[str, _Any]:
     try:
+        attempt_raw = _capture(
+            directory, "attempt.json",
+            limit=_artifact_limit("P3", "v2", "attempt.json") or _LIMIT,
+        )
+        attempt = _decode(attempt_raw, "attempt.json")
+        if type(attempt) is dict and attempt.get("artifact_encoding") == "artifact_encoding_v2":
+            normalized = dict(attempt)
+            normalized["artifact_encoding"] = "artifact_encoding_v1"
+            _validate(_artifact, normalized)
+            coverage: dict[str, int] = {}
+            for entry in attempt["planned_coverage"]:
+                kind = entry["record_kind"]
+                coverage[kind] = coverage.get(kind, 0) + 1
+            budget = _p3_v2_scope_budget(coverage)
+            if budget["refused"]:
+                return _reject("ARTIFACT_LIMIT_EXCEEDED", _DIAGNOSTIC)
+            return _diagnose_p3_v2(directory, attempt_raw, attempt, budget)
+    except (OSError, _Unsafe, _Oversize, _Invalid, ValueError, TypeError, KeyError):
+        pass
+    try:
         status_raw = _capture(directory, "status.json")
         journal_raw = _capture(directory, "journal.jsonl")
         status = _decode(status_raw, "status.json")
@@ -203,6 +223,45 @@ def _diagnose(directory: int) -> dict[str, _Any]:
                 and (failed_persistence or running_p3_frontier)):
             return _reject("INCOMPLETE_PERSISTENCE", _DIAGNOSTIC)
     except (OSError, _Unsafe, _Oversize, _Invalid):
+        pass
+    return _reject("MISSING_COMPLETE_MANIFEST", _DIAGNOSTIC)
+
+
+def _diagnose_p3_v2(
+    directory: int, attempt_raw: bytes, attempt: dict[str, _Any], budget: dict[str, _Any],
+) -> dict[str, _Any]:
+    try:
+        status_raw = _capture(directory, "status.json")
+        status = _decode(status_raw, "status.json")
+        _validate(_artifact, status)
+        if status.get("schema_version") != "spider_status_v1":
+            raise _Invalid()
+        journal = _read_p3_v2_journal_diagnosis_at(
+            directory, "journal.jsonl", retained_attempt_bytes=attempt_raw,
+            expected_attempt_sha256=_sha256(attempt_raw).hexdigest(), budget=budget,
+        ).rows
+        _validate(_journal, journal)
+        persisted = dict(
+            ordinal=len(journal), journal_seq=len(journal), barrier_id=journal[-1]["barrier_id"],
+        ) if journal else None
+        processed = status["processed_boundary"]
+        advanced = (
+            processed is not None
+            and processed["ordinal"] == processed["journal_seq"] > len(journal)
+            and processed["ordinal"] > (persisted["ordinal"] if persisted is not None else 0)
+        )
+        matching = status["persisted_boundary"] == persisted and all(
+            row["run_id"] == status["run_id"] for row in journal
+        )
+        if matching and _limit_refusal(status):
+            return _reject(_LIMIT_REASON, _DIAGNOSTIC)
+        failed_persistence = (
+            status["state"] == "FAILED" and status["failure_reason"] == "PERSISTENCE_FAILED"
+        )
+        running_p3_frontier = status["state"] == "RUNNING" and "historical_context" in status
+        if matching and advanced and (failed_persistence or running_p3_frontier):
+            return _reject("INCOMPLETE_PERSISTENCE", _DIAGNOSTIC)
+    except (OSError, _Unsafe, _Oversize, _Invalid, ValueError, TypeError, KeyError):
         pass
     return _reject("MISSING_COMPLETE_MANIFEST", _DIAGNOSTIC)
 

@@ -36,7 +36,7 @@ def _check_capture_inputs(
 
 
 def _capture_from_fd(
-    fd: int, *, expected_metadata: Mapping[str, object], journal_cap: int,
+    fd: int, *, expected_metadata: Mapping[str, object] | None, journal_cap: int,
     require_regular: bool,
 ) -> OwnedP3V2Buffer:
     try:
@@ -64,7 +64,9 @@ def _capture_from_fd(
         "byte_count": len(data),
         "row_count": data.count(b"\n"),
     }
-    if any(expected_metadata.get(key) != value for key, value in metadata.items()):
+    if expected_metadata is not None and any(
+        expected_metadata.get(key) != value for key, value in metadata.items()
+    ):
         _fail("ARTIFACT_MISMATCH")
     return OwnedP3V2Buffer(data, metadata)
 
@@ -97,4 +99,18 @@ def capture_owned_p3_v2_buffer_at(
     )
     return _capture_from_fd(
         fd, expected_metadata=expected_metadata, journal_cap=journal_cap, require_regular=True,
+    )
+
+
+def capture_owned_p3_v2_buffer_unmanifested_at(
+    directory_fd: int, name: str, *, journal_cap: int,
+) -> OwnedP3V2Buffer:
+    """Capture a v2 journal for diagnostics that have no completion manifest."""
+    if type(journal_cap) is not int or journal_cap < 0 or journal_cap > limits.P3_V2_JOURNAL_CAP:
+        _fail("INVALID_ARTIFACT")
+    fd = os.open(
+        name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd,
+    )
+    return _capture_from_fd(
+        fd, expected_metadata=None, journal_cap=journal_cap, require_regular=True,
     )

@@ -183,7 +183,7 @@ def test_absent_completion_diagnostic_and_only_needed_opens(tmp_path, persisted,
         return original(path, flags, *args, **kwargs)
     monkeypatch.setattr(admission._os, "open", observe)
     rejected(tmp_path, "INCOMPLETE_PERSISTENCE" if matching else "MISSING_COMPLETE_MANIFEST", DIAGNOSTIC)
-    assert opened == [str(tmp_path), "status.json", "journal.jsonl"]
+    assert opened == [str(tmp_path), "attempt.json", "status.json", "journal.jsonl"]
 
 
 @pytest.mark.parametrize(("shape", "primary", "matched", "expected"), [
@@ -646,3 +646,139 @@ def test_admit_v2_rejects_fifo_journal_without_blocking(tmp_path, p3_v2_admissio
     assert admission.admit_spider_run(run_dir) == {
         "decision": "REJECT", "reason": "UNSAFE_ARTIFACT_PATH", "evidence": ("journal.jsonl",),
     }
+
+
+@pytest.fixture(scope="module")
+def p3_v2_diagnosis_bundle(p3_v2_admission_bundle):
+    return p3_v2_admission_bundle
+
+
+# Independent expected rows from JOURNAL_AB_DESIGN_v3 T1.4/T3.3 and J9's
+# diagnostic classification contract; do not derive these from the reader.
+_V2_DIAGNOSIS_EXPECTED = {
+    "E1-limit": "ARTIFACT_LIMIT_EXCEEDED",
+    "E5-limit": "ARTIFACT_LIMIT_EXCEEDED",
+    "E1-other-primary": "INCOMPLETE_PERSISTENCE",
+    "RUNNING-frontier": "INCOMPLETE_PERSISTENCE",
+    "journal-unmatched": "MISSING_COMPLETE_MANIFEST",
+}
+
+
+def _prepare_v2_diagnosis(source, target, cell):
+    run_dir = _copy_v2_admission_bundle(source, target)
+    (run_dir / "completion.json").unlink()
+    status = admission._decode((run_dir / "status.json").read_bytes(), "status.json")
+    rows = admission._decode((run_dir / "journal.jsonl").read_bytes(), "journal.jsonl")
+    frontier = (
+        dict(ordinal=len(rows), journal_seq=len(rows), barrier_id=rows[-1]["barrier_id"])
+        if rows else None
+    )
+    if cell == "journal-unmatched":
+        rows[-1]["run_id"] = "another-valid-run"
+        (run_dir / "journal.jsonl").write_bytes(framed(rows, "journal.jsonl"))
+    running = cell == "RUNNING-frontier"
+    status.update(
+        state="RUNNING" if running else "FAILED",
+        failure_reason=None if running else "PERSISTENCE_FAILED",
+        primary_failure=(
+            None if running else
+            {"kind": "PERSISTENCE", "reason": "ARTIFACT_LIMIT_EXCEEDED"}
+            if cell in ("E1-limit", "E5-limit") else
+            {"kind": "PERSISTENCE", "reason": "ARTIFACT_WRITE_FAILED"}
+        ),
+        persisted_boundary=frontier,
+        processed_boundary=(
+            dict(ordinal=len(rows) + 1, journal_seq=len(rows) + 1, barrier_id="unpersisted")
+            if cell in ("E1-limit", "E1-other-primary", "RUNNING-frontier") else frontier
+        ),
+    )
+    (run_dir / "status.json").write_bytes(framed(status, "status.json"))
+    return run_dir
+
+
+@pytest.mark.parametrize(
+    "cell", tuple(_V2_DIAGNOSIS_EXPECTED), ids=tuple(_V2_DIAGNOSIS_EXPECTED),
+)
+def test_v2_diagnosis_decision_cells(tmp_path, p3_v2_diagnosis_bundle, cell):
+    run_dir = _prepare_v2_diagnosis(p3_v2_diagnosis_bundle, tmp_path, cell)
+    directory = os.open(run_dir, os.O_RDONLY)
+    try:
+        result = admission._diagnose(directory)
+    finally:
+        os.close(directory)
+    assert result == dict(
+        decision="REJECT", reason=_V2_DIAGNOSIS_EXPECTED[cell], evidence=DIAGNOSTIC,
+    )
+
+
+def test_v2_diagnosis_v1_attempt_uses_existing_path(tmp_path, p3_v2_diagnosis_bundle, monkeypatch):
+    run_dir = _prepare_v2_diagnosis(p3_v2_diagnosis_bundle, tmp_path, "E1-limit")
+    attempt = admission._decode((run_dir / "attempt.json").read_bytes(), "attempt.json")
+    attempt["artifact_encoding"] = "artifact_encoding_v1"
+    (run_dir / "attempt.json").write_bytes(framed(attempt, "attempt.json"))
+    calls = []
+    monkeypatch.setattr(admission, "_diagnose_p3_v2", lambda *args: calls.append(args))
+    directory = os.open(run_dir, os.O_RDONLY)
+    try:
+        result = admission._diagnose(directory)
+    finally:
+        os.close(directory)
+    assert calls == []
+    assert result["reason"] == "MISSING_COMPLETE_MANIFEST"
+
+
+@pytest.mark.parametrize("attempt_kind", ["symlink", "oversize"], ids=["unreadable", "oversize"])
+def test_v2_diagnosis_attempt_capture_failure_uses_existing_result(
+    tmp_path, p3_v2_diagnosis_bundle, attempt_kind,
+):
+    run_dir = _prepare_v2_diagnosis(p3_v2_diagnosis_bundle, tmp_path, "E1-limit")
+    attempt_path = run_dir / "attempt.json"
+    if attempt_kind == "symlink":
+        attempt_path.unlink()
+        attempt_path.symlink_to(tmp_path / "outside-missing-attempt")
+    else:
+        attempt_path.write_bytes(b"x" * (DEFAULT_LIMIT + 1))
+    directory = os.open(run_dir, os.O_RDONLY)
+    try:
+        result = admission._diagnose(directory)
+    finally:
+        os.close(directory)
+    assert result["reason"] == "MISSING_COMPLETE_MANIFEST"
+
+
+def test_v2_diagnosis_never_follows_journal_symlink(tmp_path, p3_v2_diagnosis_bundle):
+    run_dir = _prepare_v2_diagnosis(p3_v2_diagnosis_bundle, tmp_path, "E1-limit")
+    journal = run_dir / "journal.jsonl"
+    outside = tmp_path / "outside-journal.jsonl"
+    outside.write_bytes(journal.read_bytes())
+    journal.unlink()
+    journal.symlink_to(outside)
+    directory = os.open(run_dir, os.O_RDONLY)
+    try:
+        result = admission._diagnose(directory)
+    finally:
+        os.close(directory)
+    assert result == dict(
+        decision="REJECT", reason="MISSING_COMPLETE_MANIFEST", evidence=DIAGNOSTIC,
+    )
+
+
+def test_v2_diagnosis_reader_receives_directory_fd_and_leaf(
+    tmp_path, p3_v2_diagnosis_bundle, monkeypatch,
+):
+    run_dir = _prepare_v2_diagnosis(p3_v2_diagnosis_bundle, tmp_path, "E1-limit")
+    original = admission._read_p3_v2_journal_diagnosis_at
+    calls = []
+
+    def capture_arguments(directory, name, **kwargs):
+        calls.append((directory, name))
+        return original(directory, name, **kwargs)
+
+    monkeypatch.setattr(admission, "_read_p3_v2_journal_diagnosis_at", capture_arguments)
+    directory = os.open(run_dir, os.O_RDONLY)
+    try:
+        result = admission._diagnose(directory)
+    finally:
+        os.close(directory)
+    assert result["reason"] == "ARTIFACT_LIMIT_EXCEEDED"
+    assert calls == [(directory, "journal.jsonl")]
