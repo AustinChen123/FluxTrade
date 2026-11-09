@@ -526,4 +526,32 @@ def test_import_boundary():
         "src.core.backtest.spider_run_envelope_schema", "src.core.backtest.spider_run_evidence",
         "src.core.backtest.spider_run_reconciliation_schema", "src.core.backtest.spider_scenario_plans",
         "src.core.backtest.spider_run_execution_schema", "src.core.backtest.spider_run_execution_evidence",
-        "src.core.backtest.spider_artifact_limits"}
+        "src.core.backtest.spider_artifact_limits", "src.core.backtest.spider_journal_reader_v2"}
+
+
+@pytest.fixture(scope="module")
+def p3_v2_admission_bundle(tmp_path_factory, real_p3_artifacts):
+    from spider_run_store_v2_fixtures import p3_v2_finalize_fixture
+
+    root = tmp_path_factory.mktemp("j10-p3-v2-admission")
+    store, values, reconciliation, _ = p3_v2_finalize_fixture(root, real_p3_artifacts)
+    assert store.finalize(values[3], reconciliation, values[4]) == "COMPLETE_PUBLISHED"
+    return store._path
+
+
+def _copy_v2_admission_bundle(source, target):
+    import shutil
+
+    destination = target / source.name
+    shutil.copytree(source, destination)
+    return destination
+
+
+def test_admit_dispatch_accepts_v2_bundle_with_retained_attempt_bytes(tmp_path, p3_v2_admission_bundle):
+    from src.core.backtest.spider_run_admission import admit_spider_run
+
+    run_dir = _copy_v2_admission_bundle(p3_v2_admission_bundle, tmp_path)
+    result = admit_spider_run(run_dir)
+    assert result["decision"] == "ACCEPT", result
+    assert result["artifacts"]["attempt.json"]["artifact_encoding"] == "artifact_encoding_v2"
+    assert result["artifacts"]["journal.jsonl"]

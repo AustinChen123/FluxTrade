@@ -9,7 +9,7 @@ from typing import Any as _Any
 from typing import cast as _cast
 
 from src.core.backtest.spider_run_artifacts import canonical_bytes as _bytes, configuration_context as _validate_context, decode_canonical as _decode_canonical, decode_jsonl as _decode_jsonl, historical_context as _validate_historical_context, validate_artifact as _artifact
-from src.core.backtest.spider_run_completion_schema import _ARTIFACTS, _P3_ARTIFACTS, completion as _completion, report as _report
+from src.core.backtest.spider_run_completion_schema import _ARTIFACTS, _P3_ARTIFACTS, _P3_V2_ARTIFACTS, completion as _completion, report as _report
 from src.core.backtest.spider_run_envelope_schema import endpoint as _endpoint, journal as _journal
 from src.core.backtest.spider_run_evidence import ReconciliationProjectionError as _ProjectionError, _context_chain, build_reconciliation as _build
 from src.core.backtest.spider_run_reconciliation_schema import reconciliation as _reconciliation
@@ -33,11 +33,13 @@ from src.core.backtest.spider_run_execution_schema import (
 from src.core.backtest.spider_run_execution_evidence import (
     build_execution_reconciliation as _build_execution_reconciliation,
 )
+from src.core.backtest.spider_journal_reader_v2 import read_p3_v2_journal_from_attempt_bytes as _read_p3_v2_journal
 from src.core.backtest.spider_artifact_limits import (
     DEFAULT_LIMIT as _LIMIT,
     GROSS_REPORT_LIMIT as _GROSS_REPORT_LIMIT,  # noqa: F401 - compatibility policy alias
     artifact_limit as _artifact_limit,
     oversize_reason as _oversize_reason,
+    p3_v2_scope_budget as _p3_v2_scope_budget,
 )
 
 _NAMES = tuple(name for name, _ in _ARTIFACTS)
@@ -370,7 +372,201 @@ def _admit_execution(directory: int, manifest: dict[str, _Any], completion_raw: 
     return dict(decision="ACCEPT", artifacts=ordered)
 
 
-def _admit(directory: int) -> dict[str, _Any]:
+
+def _admit_p3_v2(directory: int, directory_path: str, manifest: dict[str, _Any], completion_raw: bytes) -> dict[str, _Any]:
+    """Admit a P3 bundle whose manifest selects the owned-buffer v2 journal reader."""
+    names = _P3_NAMES
+    all_names = _P3_ALL
+    metadata = {entry["path"]: entry for entry in manifest["artifacts"]}
+    unsafe = []
+    for name in names:
+        try:
+            _regular(directory, name)
+        except _Unsafe:
+            unsafe.append(name)
+        except OSError:
+            pass
+    if unsafe:
+        return _reject("UNSAFE_ARTIFACT_PATH", tuple(name for name in names if name in unsafe))
+    captured: dict[str, bytes] = {}
+    bad = []
+    attempt_raw = b""
+    attempt_limit = _artifact_limit("P3", "v2", "attempt.json") or _LIMIT
+    try:
+        attempt_raw = _capture(directory, "attempt.json", limit=attempt_limit)
+    except _Unsafe:
+        return _reject("UNSAFE_ARTIFACT_PATH", ("attempt.json",))
+    except (OSError, _Oversize):
+        return _reject("ARTIFACT_MISMATCH", ("attempt.json",))
+    captured["attempt.json"] = attempt_raw
+    try:
+        attempt = _decode(attempt_raw, "attempt.json")
+        if type(attempt) is not dict:
+            return _reject("UNSUPPORTED_SCHEMA", ("attempt.json",))
+        encoding = attempt.get("artifact_encoding")
+        if encoding == "artifact_encoding_v1":
+            return _reject("ARTIFACT_MISMATCH", ("attempt.json",))
+        if encoding != "artifact_encoding_v2":
+            return _reject("UNSUPPORTED_SCHEMA", ("attempt.json",))
+        normalized_attempt = dict(attempt)
+        normalized_attempt["artifact_encoding"] = "artifact_encoding_v1"
+        _validate(_artifact, normalized_attempt)
+    except _Invalid:
+        return _reject("UNSUPPORTED_SCHEMA", ("attempt.json",))
+    except (_JSONDecodeError, UnicodeDecodeError, ValueError, TypeError, KeyError):
+        return _reject("UNSUPPORTED_SCHEMA", ("attempt.json",))
+    attempt_entry = metadata["attempt.json"]
+    if (len(attempt_raw) != attempt_entry["byte_count"]
+            or _sha256(attempt_raw).hexdigest() != attempt_entry["sha256"]
+            or attempt_entry["row_count"] != 1):
+        return _reject("ARTIFACT_MISMATCH", ("attempt.json",))
+    coverage: dict[str, int] = {}
+    for entry in attempt["planned_coverage"]:
+        kind = entry["record_kind"]
+        coverage[kind] = coverage.get(kind, 0) + 1
+    try:
+        budget = _p3_v2_scope_budget(coverage)
+    except (ValueError, KeyError, TypeError):
+        return _reject("UNSUPPORTED_SCHEMA", ("attempt.json",))
+    if budget["refused"]:
+        return _reject("ARTIFACT_LIMIT_EXCEEDED", ("attempt.json",))
+    for name in names:
+        if name == "attempt.json":
+            continue
+        try:
+            if name == "journal.jsonl":
+                continue
+            if name in ("endpoint.json", "reconciliation.json"):
+                limit = budget["E2" if name == "endpoint.json" else "X2"]
+            else:
+                limit = _artifact_limit("P3", "v2", name)
+            if type(limit) is not int:
+                return _reject("UNSUPPORTED_SCHEMA", (name,))
+            captured[name] = _capture(
+                directory, name, exclusive=name == "historical_input.json", limit=limit,
+            )
+        except _Unsafe:
+            unsafe.append(name)
+        except (OSError, _Oversize):
+            bad.append(name)
+    if unsafe:
+        return _reject("UNSAFE_ARTIFACT_PATH", tuple(name for name in names if name in unsafe))
+    if bad:
+        return _reject("ARTIFACT_MISMATCH", tuple(name for name in names if name in bad))
+    try:
+        journal_result = _read_p3_v2_journal(
+            _os.path.join(directory_path, "journal.jsonl"),
+            expected_metadata=metadata["journal.jsonl"],
+            retained_attempt_bytes=attempt_raw,
+            expected_attempt_sha256=attempt_entry["sha256"],
+            budget=budget,
+        )
+    except (OSError, ValueError, KeyError, TypeError):
+        return _reject("ARTIFACT_MISMATCH", ("journal.jsonl",))
+    values: dict[str, _Any] = {"journal.jsonl": journal_result.rows}
+    for entry in manifest["artifacts"]:
+        name = entry["path"]
+        if name == "journal.jsonl":
+            if (journal_result.wire_metadata != {
+                    key: metadata[name][key] for key in ("schema_version", "sha256", "byte_count", "row_count")
+            }):
+                return _reject("ARTIFACT_MISMATCH", (name,))
+            continue
+        data = captured[name]
+        try:
+            if name == "historical_input.json":
+                value = _decode_canonical(data)
+                if type(value) is not dict:
+                    raise _Invalid()
+                count = 1
+            else:
+                value = _decode(data, name)
+                count = len(value) if name.endswith(".jsonl") else 1
+            if (len(data) != entry["byte_count"] or _sha256(data).hexdigest() != entry["sha256"]
+                    or count != entry["row_count"]):
+                raise _Invalid()
+            digest_field = {"endpoint.json": "endpoint_state_digest", "reconciliation.json": "reconciliation_digest"}.get(name)
+            if digest_field and _sha256(_bytes(value)).hexdigest() != manifest[digest_field]:
+                raise _Invalid()
+            values[name] = value
+        except (_Invalid, _JSONDecodeError, UnicodeDecodeError):
+            bad.append(name)
+        except ValueError as error:
+            if error.args != ("INVALID_ARTIFACT",):
+                raise
+            bad.append(name)
+    if bad:
+        return _reject("ARTIFACT_MISMATCH", tuple(name for name in names if name in bad))
+    values["attempt.json"] = attempt
+    for name, value in values.items():
+        rows = value if name.endswith(".jsonl") else [value]
+        if any(not _run_id(row.get("run_id")) or row["run_id"] != manifest["run_id"] for row in rows):
+            bad.append(name)
+    if bad:
+        return _reject("RUN_ID_MISMATCH", tuple(name for name in names if name in bad))
+    for name, schema in _P3_V2_ARTIFACTS:
+        value = values[name]
+        rows = value if name.endswith(".jsonl") else [value]
+        expected_schema = "spider_journal_record_v1" if name == "journal.jsonl" else schema
+        if any(row.get("schema_version") != expected_schema for row in rows):
+            bad.append(name)
+            continue
+        try:
+            if name == "attempt.json":
+                continue
+            if name == "historical_input.json":
+                _validate_historical_run_link(captured[name], attempt, manifest["run_id"])
+            elif name == "report.jsonl":
+                _report(value, context=_validate_context(attempt.get("configuration_context")),
+                        historical_context=_validate_historical_context(attempt.get("historical_context")))
+            elif name == "journal.jsonl":
+                _journal(value)
+            elif name == "endpoint.json":
+                _endpoint(value)
+            elif name == "reconciliation.json":
+                _reconciliation(value)
+            elif name == "status.json":
+                _artifact(value)
+        except (_Invalid, _HistoricalInputError, ValueError, TypeError, KeyError, IndexError):
+            bad.append(name)
+    if bad:
+        return _reject("UNSUPPORTED_SCHEMA", tuple(name for name in names if name in bad))
+    attempt, status, journal, endpoint, supplied, report = (values[name] for name in _NAMES)
+    try:
+        _context_chain(attempt, status, journal, endpoint, supplied, report, manifest)
+    except _ProjectionError:
+        return _reject("ENDPOINT_RECONCILIATION_FAILED", all_names)
+    coverage_rows = attempt["planned_coverage"]
+    frontier = dict(ordinal=len(journal), journal_seq=len(journal), barrier_id=journal[-1]["barrier_id"]) if journal else None
+    if (not coverage_rows or not journal or manifest["planned_coverage"] != coverage_rows
+            or any(manifest[key] != status[key] or status[key] != frontier
+                   for key in ("processed_boundary", "persisted_boundary"))):
+        return _reject("INCOMPLETE_PERSISTENCE", _FRONTIER)
+    if status["state"] != "COMPLETE" or attempt["registration_state"] != "VALIDATED":
+        return _reject("INCOMPLETE_PERSISTENCE", _FRONTIER)
+    if (attempt["scenario_plan_id"] != "SPIDER_HISTORICAL_RESEARCH_RUN_V1"
+            or attempt["requested_scenario_selector"] != "SPIDER_HISTORICAL_RESEARCH_RUN_V1"
+            or attempt["run_contract_id"] != "SPIDER_HISTORICAL_RESEARCH_RUN_V1"
+            or attempt["terminal_policy"] != "MTM_PRESERVE_OPEN_V1"
+            or manifest["terminal_reason"] != "MTM_PRESERVE_OPEN_V1"):
+        return _reject("ENDPOINT_RECONCILIATION_FAILED", all_names)
+    if (any(entry["sha256"] != attempt[key] for entry, key in zip(
+            attempt["input_contract_hashes"],
+            ("scenario_plan_sha256", "program_sha256", "native_artifact_sha256", "policy_source_sha256"), strict=True))
+            or manifest["input_contract_hashes"] != attempt["input_contract_hashes"]
+            or manifest["terminal_reason"] != endpoint["terminal_reason"]):
+        return _reject("ENDPOINT_RECONCILIATION_FAILED", all_names)
+    try:
+        computed = _build(manifest["run_id"], attempt, status, journal, endpoint, report)
+    except _ProjectionError:
+        return _reject("ENDPOINT_RECONCILIATION_FAILED", all_names)
+    if (computed["result"] != "OK" or any(row["result"] != "OK" for row in computed["checks"])
+            or _bytes(computed) != _bytes(supplied)):
+        return _reject("ENDPOINT_RECONCILIATION_FAILED", all_names)
+    values["completion.json"] = manifest
+    return dict(decision="ACCEPT", artifacts=values)
+
+def _admit(directory: int, directory_path: str | None = None) -> dict[str, _Any]:
     try:
         raw = _capture(directory, "completion.json")
     except FileNotFoundError:
@@ -408,6 +604,15 @@ def _admit(directory: int) -> dict[str, _Any]:
         _validate(_completion, manifest)
     except _Invalid:
         return _reject("INVALID_MANIFEST", ("completion.json",))
+    journal_schema = next(
+        (entry.get("schema_version") for entry in manifest["artifacts"]
+         if entry.get("path") == "journal.jsonl"),
+        None,
+    )
+    if journal_schema == "spider_journal_record_v2":
+        if directory_path is None:
+            return _reject("UNSAFE_ARTIFACT_PATH", ("run-directory",))
+        return _admit_p3_v2(directory, directory_path, manifest, raw)
     historical_manifest = "historical_context" in manifest
     names = _P3_NAMES if historical_manifest else _NAMES
     all_names = _P3_ALL if historical_manifest else _ALL
@@ -605,6 +810,6 @@ def admit_spider_run(path: str | _os.PathLike[str]) -> dict[str, _Any]:
     try:
         if not _stat.S_ISDIR(_os.fstat(directory).st_mode):
             return _reject("UNSAFE_ARTIFACT_PATH", ("run-directory",))
-        return _admit(directory)
+        return _admit(directory, _os.path.abspath(name))
     finally:
         _os.close(directory)
