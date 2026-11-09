@@ -85,6 +85,9 @@ def rejected(root, reason, evidence):
 def test_all_protocols_accept_exact_detached_bytes_without_writes(tmp_path, index, monkeypatch):
     values = bundle(tmp_path, index)
     before = {name: (tmp_path / name).read_bytes() for name in NAMES}
+    v2_dispatch = admission._admit_p3_v2
+    v2_calls = []
+    monkeypatch.setattr(admission, "_admit_p3_v2", lambda *args: v2_calls.append(args))
     original_open = os.open
     opens = []
     def read_only(path, flags, *args, **kwargs):
@@ -95,6 +98,8 @@ def test_all_protocols_accept_exact_detached_bytes_without_writes(tmp_path, inde
     result = admission.admit_spider_run(tmp_path)
     assert result == dict(decision="ACCEPT", artifacts=values)
     assert tuple(result["artifacts"]) == NAMES
+    assert v2_calls == []
+    monkeypatch.setattr(admission, "_admit_p3_v2", v2_dispatch)
     result["artifacts"]["endpoint.json"]["final_owner_evidence"]["inspection"]["cash"] = "999"
     assert admission.admit_spider_run(tmp_path) == dict(decision="ACCEPT", artifacts=values)
     assert {name: (tmp_path / name).read_bytes() for name in NAMES} == before
@@ -555,6 +560,44 @@ def test_admit_dispatch_accepts_v2_bundle_with_retained_attempt_bytes(tmp_path, 
     assert result["decision"] == "ACCEPT", result
     assert result["artifacts"]["attempt.json"]["artifact_encoding"] == "artifact_encoding_v2"
     assert result["artifacts"]["journal.jsonl"]
+
+
+def test_admit_v2_attempt_is_captured_once(tmp_path, p3_v2_admission_bundle, monkeypatch):
+    from src.core.backtest import spider_run_admission as admission
+    run_dir = _copy_v2_admission_bundle(p3_v2_admission_bundle, tmp_path)
+    original = admission._capture
+    attempt_reads = []
+    def count_attempt(directory, name, **kwargs):
+        if name == "attempt.json":
+            attempt_reads.append(name)
+        return original(directory, name, **kwargs)
+
+    monkeypatch.setattr(admission, "_capture", count_attempt)
+    result = admission.admit_spider_run(run_dir)
+    assert result["decision"] == "ACCEPT", result
+    assert attempt_reads == ["attempt.json"]
+
+
+def test_admit_manifest_v2_rejects_v1_attempt_encoding(tmp_path, p3_v2_admission_bundle):
+    from src.core.backtest.spider_run_admission import admit_spider_run
+
+    run_dir = _copy_v2_admission_bundle(p3_v2_admission_bundle, tmp_path)
+    attempt_path = run_dir / "attempt.json"
+    attempt = admission._decode(attempt_path.read_bytes(), "attempt.json")
+    attempt["artifact_encoding"] = "artifact_encoding_v1"
+    attempt_raw = canonical_bytes(attempt) + b"\n"
+    attempt_path.write_bytes(attempt_raw)
+    completion_path = run_dir / "completion.json"
+    manifest = admission._decode(completion_path.read_bytes(), "completion.json")
+    attempt_entry = next(entry for entry in manifest["artifacts"] if entry["path"] == "attempt.json")
+    attempt_entry["sha256"] = sha256(attempt_raw).hexdigest()
+    attempt_entry["byte_count"] = len(attempt_raw)
+    completion_path.write_bytes(canonical_bytes(manifest) + b"\n")
+    result = admit_spider_run(run_dir)
+    assert result == {
+        "decision": "REJECT", "reason": "ARTIFACT_MISMATCH", "evidence": ("attempt.json",),
+    }
+
 
 def test_admit_v2_rejects_journal_symlink(tmp_path, p3_v2_admission_bundle):
     run_dir = _copy_v2_admission_bundle(p3_v2_admission_bundle, tmp_path)
