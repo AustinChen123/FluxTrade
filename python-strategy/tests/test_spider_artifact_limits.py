@@ -252,14 +252,16 @@ def test_registration_preflight_d2_5_exact_limits_and_refusal_twins():
         spider_scenario_run._P3_RUN_CONTRACT,
     )
     attempt["artifact_encoding"] = "artifact_encoding_v2"
-    limits.p3_v2_registration_preflight(attempt, raw)
-    historical = raw + b"x" * (limits.DEFAULT_LIMIT + 1 - len(raw))
+    original = limits.P3_V2_HISTORICAL_INPUT_LIMIT
     try:
-        limits.p3_v2_registration_preflight(attempt, historical)
-    except ValueError as exc:
-        assert exc.args == ("ARTIFACT_LIMIT_EXCEEDED",)
-    else:
-        raise AssertionError("expected D2.5 historical input refusal")
+        limits.P3_V2_HISTORICAL_INPUT_LIMIT = len(raw)
+        limits.p3_v2_registration_preflight(attempt, raw)
+        limits.P3_V2_HISTORICAL_INPUT_LIMIT = len(raw) - 1
+        with pytest.raises(ValueError) as caught:
+            limits.p3_v2_registration_preflight(attempt, raw)
+        assert caught.value.args == ("ARTIFACT_LIMIT_EXCEEDED",)
+    finally:
+        limits.P3_V2_HISTORICAL_INPUT_LIMIT = original
 
 
 def test_registration_preflight_refuses_structural_scope_and_accepts_legal_twin():
@@ -296,8 +298,14 @@ def test_registration_preflight_rejects_when_budget_classifier_marks_scope_refus
         raise AssertionError("scope refusal was not applied")
 
 
-@pytest.mark.parametrize(("field", "value"), [("X2", 16_777_217), ("E2", 16_777_217)])
-def test_registration_preflight_rejects_each_other_artifact_cap(monkeypatch, field, value):
+@pytest.mark.parametrize(
+    ("field", "cap"),
+    (("X2", limits.P3_V2_OTHER_ARTIFACT_LIMITS["X2"]),
+     ("E2", limits.P3_V2_OTHER_ARTIFACT_LIMITS["E2"])),
+)
+def test_registration_preflight_checks_each_other_artifact_cap_inclusively(
+    monkeypatch, field, cap,
+):
     from dataclasses import replace
     from src.core.backtest.spider_historical_input import encode_historical_run_input, historical_planned_coverage
     from test_spider_historical_input import _valid_run
@@ -308,15 +316,44 @@ def test_registration_preflight_rejects_each_other_artifact_cap(monkeypatch, fie
         "artifact_encoding": "artifact_encoding_v2",
         "planned_coverage": historical_planned_coverage(run),
     }
-    budget = {"refused": False, "X2": limits.DEFAULT_LIMIT, "E2": limits.DEFAULT_LIMIT}
-    budget[field] = value
+    raw = encode_historical_run_input(run)
+    budget = {"refused": False, "X2": 0, "E2": 0}
+    budget[field] = cap
     monkeypatch.setattr(limits, "p3_v2_scope_budget", lambda _: budget)
-    try:
-        limits.p3_v2_registration_preflight(attempt, encode_historical_run_input(run))
-    except ValueError as exc:
-        assert exc.args == ("ARTIFACT_LIMIT_EXCEEDED",)
-    else:
-        raise AssertionError(f"{field} other-artifact cap was not enforced")
+    limits.p3_v2_registration_preflight(attempt, raw)
+
+    budget[field] = cap + 1
+    with pytest.raises(ValueError) as caught:
+        limits.p3_v2_registration_preflight(attempt, raw)
+    assert caught.value.args == ("ARTIFACT_LIMIT_EXCEEDED",)
+
+
+def test_reviewer_h360_x2_input_is_accepted():
+    from collections import Counter
+    from dataclasses import replace
+    from pathlib import Path
+    from src.core.backtest import spider_scenario_run
+    from src.core.backtest.spider_historical_input import (
+        decode_historical_run_input, encode_historical_run_input, historical_planned_coverage,
+    )
+    from src.core.backtest.spider_run_artifacts import canonical_bytes
+
+    source = Path("/Volumes/Dev/Scratch/agents/spider_throughput/S4/x/s3-3-after/h360_durable/runs/h360/historical_input.json")
+    run = decode_historical_run_input(source.read_bytes())
+    run = replace(run, policy_source_sha256=spider_scenario_run._P3_POLICY_SOURCE)
+    raw = encode_historical_run_input(run)
+    _, bundle, hashes = spider_scenario_run._historical_configuration(raw, run.run_id)
+    attempt = spider_scenario_run._attempt(
+        run.run_id, spider_scenario_run._P3_SELECTOR, bundle, hashes,
+        spider_scenario_run._P3_RUN_CONTRACT,
+    )
+    attempt["artifact_encoding"] = "artifact_encoding_v2"
+    counts = Counter(row["record_kind"] for row in historical_planned_coverage(run))
+    budget = limits.p3_v2_scope_budget(counts)
+    assert budget["X2"] == 19_048_383
+    assert budget["structural_bytes"] == 61_054_232 and not budget["refused"]
+    assert len(raw) == 1_858_827 and len(canonical_bytes(attempt)) + 65_536 == 622_244
+    limits.p3_v2_registration_preflight(attempt, raw)
 
 
 def test_p3_v2_uses_python_integers_and_scope_budgets_are_monotone():

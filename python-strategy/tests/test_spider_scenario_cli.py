@@ -179,6 +179,38 @@ def test_historical_runner_preflight_refusal_precedes_create(tmp_path, monkeypat
     assert list(tmp_path.iterdir()) == []
 
 
+def test_historical_input_cap_exact_and_plus_one_refuses_before_create(
+    tmp_path, monkeypatch,
+):
+    run_input = replace(
+        _valid_run(), run_id="historical-input-cap", policy_source_sha256=run._P3_POLICY_SOURCE,
+    )
+    raw = encode_historical_run_input(run_input)
+    monkeypatch.setattr(run._artifact_limits, "P3_V2_HISTORICAL_INPUT_LIMIT", len(raw))
+    original = run._attempt
+
+    def v2_attempt(*args, **kwargs):
+        return dict(original(*args, **kwargs), artifact_encoding="artifact_encoding_v2")
+
+    monkeypatch.setattr(run, "_attempt", v2_attempt)
+    original_create = run._Store.create
+
+    def observe_create(*args, **kwargs):
+        pytest.fail("exact-cap preflight rejected before store creation")
+
+    monkeypatch.setattr(run._Store, "create", observe_create)
+    with pytest.raises(pytest.fail.Exception, match="exact-cap preflight"):
+        run._invoke(str(tmp_path), run_input.run_id, run._P3_SELECTOR, None, raw)
+    monkeypatch.setattr(run._Store, "create", original_create)
+    monkeypatch.setattr(run._artifact_limits, "P3_V2_HISTORICAL_INPUT_LIMIT", len(raw) - 1)
+    monkeypatch.setattr(run._Store, "create", lambda *_args, **_kwargs: pytest.fail("create ran"))
+    plus_one = run._invoke(str(tmp_path), run_input.run_id, run._P3_SELECTOR, None, raw)
+    assert plus_one == dict(
+        run_id=run_input.run_id, outcome="FAILED", reason="ARTIFACT_LIMIT_EXCEEDED",
+    )
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_d2_5_attempt_limit_exact_and_minus_one_with_real_attempt(
     tmp_path, monkeypatch, real_p3_artifacts,
 ):

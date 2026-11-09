@@ -5,6 +5,7 @@ import hashlib
 import json
 import linecache
 import pickle
+import subprocess
 import sys
 import traceback
 from pathlib import Path
@@ -298,10 +299,57 @@ def test_durable_publication_guard_and_callback_catch_match_head_structure():
     execute = next(node for node in executor_tree.body if isinstance(node, ast.FunctionDef) and node.name == "_execute_historical")
     persist = next(node for node in ast.walk(execute) if isinstance(node, ast.FunctionDef) and node.name == "persist")
     callback_handler = next(node for node in ast.walk(persist) if isinstance(node, ast.ExceptHandler))
+    handlers = [node for node in ast.walk(invoke) if isinstance(node, ast.ExceptHandler)]
     def digest(value):
         return hashlib.sha256(ast.dump(value, include_attributes=False).encode()).hexdigest()
 
     assert digest(failed) == "d87093802d02b6f30e002a661742edc8f6b1dbf2ed67fd970044d3336a19d690"
+    preflight_try = next(
+        node for node in ast.walk(invoke)
+        if isinstance(node, ast.Try)
+        and any(isinstance(call, ast.Call)
+                and ast.unparse(call.func) == "_artifact_limits.p3_v2_registration_preflight"
+                for call in ast.walk(node))
+    )
+    head_tree = ast.parse(subprocess.run(
+        ["git", "show", "HEAD:python-strategy/src/core/backtest/spider_scenario_run.py"],
+        check=True, capture_output=True, text=True,
+    ).stdout)
+    head_invoke = next(node for node in head_tree.body
+                       if isinstance(node, ast.FunctionDef) and node.name == "_invoke")
+    head_handlers = [node for node in ast.walk(head_invoke) if isinstance(node, ast.ExceptHandler)]
+    head_digest = hashlib.sha256("\n".join(
+        ast.dump(node, include_attributes=False) for node in head_handlers
+    ).encode()).hexdigest()
+    assert head_digest == "50f0d1651b24acf70aa680ddb1d7079ed1ff353ddcbc2cc5ee3e82028ee7ede8"
+    # Preserve every original handler exactly, except the historical-input
+    # ValueError tuple that gained the narrowly scoped preflight refusal.
+    current_handlers = [ast.dump(node, include_attributes=False) for node in handlers]
+    current_nodes = [node for node in handlers]
+    for original in head_handlers:
+        if (isinstance(original.type, ast.Tuple)
+                and [ast.unparse(part) for part in original.type.elts]
+                == ["OSError", "ValueError", "TypeError", "KeyError"]):
+            continue
+        expected = ast.dump(original, include_attributes=False)
+        if (isinstance(original.type, ast.Tuple)
+                and [ast.unparse(part) for part in original.type.elts]
+                == ["OSError", "ValueError", "TypeError", "KeyError", "IndexError"]):
+            # The historical preflight branch keeps the same return body but
+            # moves ValueError to its separately classified limit handler.
+            expected = ast.dump(next(
+                node for node in current_nodes
+                if "IndexError" in ast.unparse(node.type)
+                and "UNSUPPORTED_CONFIGURATION" in ast.unparse(node)
+            ), include_attributes=False
+            )
+        assert expected in current_handlers
+    assert any(
+        isinstance(node.type, ast.Name) and node.type.id == "_StoreError"
+        and node.name == "error"
+        and ast.unparse(node.body[0]) == "return failed(error)"
+        for node in handlers
+    )
     preflight_try = next(
         node for node in ast.walk(invoke)
         if isinstance(node, ast.Try)

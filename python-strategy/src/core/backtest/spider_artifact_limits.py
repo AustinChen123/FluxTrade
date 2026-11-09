@@ -70,6 +70,11 @@ P3_V2_ROW_MIN = 1_591
 P3_V2_RECONCILIATION_FLOOR = DEFAULT_LIMIT
 P3_V2_ENDPOINT_FLOOR = DEFAULT_LIMIT
 P3_V2_ATTEMPT_BYTES_LIMIT = DEFAULT_LIMIT
+P3_V2_OTHER_ARTIFACT_LIMITS = {
+    "X2": 48 * 1_048_576,
+    "E2": 32 * 1_048_576,
+}
+P3_V2_HISTORICAL_INPUT_LIMIT = DEFAULT_LIMIT
 P3_V2_X2_COEFFICIENT = (19_048_383, 6_119)
 P3_V2_E2_COEFFICIENT = (10_790_164, 6_119)
 
@@ -150,7 +155,7 @@ def p3_v2_registration_preflight(attempt: Mapping[str, object], historical_input
         raise ValueError("INVALID_ARTIFACT")
     if attempt.get("artifact_encoding") != "artifact_encoding_v2":
         return
-    if len(historical_input) > DEFAULT_LIMIT:
+    if len(historical_input) > P3_V2_HISTORICAL_INPUT_LIMIT:
         raise ValueError("ARTIFACT_LIMIT_EXCEEDED")
     from src.core.backtest.spider_historical_input import (
         _decode_historical_run_input_validated,
@@ -175,7 +180,7 @@ def p3_v2_registration_preflight(attempt: Mapping[str, object], historical_input
 
     if len(canonical_bytes(dict(attempt))) + 65_536 > P3_V2_ATTEMPT_BYTES_LIMIT:
         raise ValueError("ARTIFACT_LIMIT_EXCEEDED")
-    if budget["X2"] > DEFAULT_LIMIT or budget["E2"] > DEFAULT_LIMIT:
+    if any(budget[field] > P3_V2_OTHER_ARTIFACT_LIMITS[field] for field in ("X2", "E2")):
         raise ValueError("ARTIFACT_LIMIT_EXCEEDED")
 
 

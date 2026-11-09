@@ -321,11 +321,21 @@ def test_register_v2_guard_is_literal_first_statement_and_refuses_before_publish
     function = next(node for node in method.body if isinstance(node, ast.FunctionDef))
     assert isinstance(function.body[0], ast.If)
     assert "p3_v2_registration_preflight" in ast.unparse(function.body[0])
+    assert ast.unparse(function.body[0].body[0].handlers[0].type) == "ValueError"
+    translated = ast.unparse(function.body[0].body[0].handlers[0].body[0])
+    assert translated == "if error.args == ('ARTIFACT_LIMIT_EXCEEDED',):\n    raise SpiderRunStoreError('ARTIFACT_LIMIT_EXCEEDED') from error"
     attempt = decode_jsonl(real_p3_artifacts["attempt.json"])[0]
     attempt["artifact_encoding"] = "artifact_encoding_v2"
     monkeypatch.setattr(module.artifact_limits, "p3_v2_scope_budget", lambda _: {"refused": True})
     store = module.SpiderRunStore.create(str(tmp_path), cast(str, attempt["run_id"]))
-    with pytest.raises(ValueError, match="ARTIFACT_LIMIT_EXCEEDED"):
+    with pytest.raises(module.SpiderRunStoreError) as caught:
         store.register(attempt, historical_input=real_p3_artifacts["historical_input.json"])
+    assert type(caught.value) is module.SpiderRunStoreError
+    assert caught.value.reason == "ARTIFACT_LIMIT_EXCEEDED"
+    assert caught.value.requested_failure_reason is None
+    assert caught.value.primary_failure is None
+    with pytest.raises(module.SpiderRunStoreError) as retry:
+        module.SpiderRunStore.create(str(tmp_path), cast(str, attempt["run_id"]))
+    assert retry.value.reason == "PUBLICATION_FAILED"
     assert store._state == "CREATED"
     assert list(store._path.iterdir()) == []
