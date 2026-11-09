@@ -18,6 +18,21 @@ class SpiderRunStoreError(Exception):
 SpiderRunStoreError.__module__ = "src.core.backtest.spider_run_store"
 
 
+def runner_reason_for(error: SpiderRunStoreError) -> str:
+    """Apply T5.1 rules 1 and 3; rules 2/4 and T5.2(b) registration are identity."""
+    reason = error.reason
+    primary = error.primary_failure
+    if reason == "PUBLICATION_DURABILITY_UNKNOWN":
+        return reason
+    if (reason == "PERSISTENCE_FAILED" and type(primary) is dict
+            and primary.keys() == {"kind", "reason"}
+            and type(primary["kind"]) is str and primary["kind"] == "PERSISTENCE"
+            and type(primary["reason"]) is str
+            and primary["reason"] == "ARTIFACT_LIMIT_EXCEEDED"):
+        return "ARTIFACT_LIMIT_EXCEEDED"
+    return reason
+
+
 class ReconciliationProjectionError(ValueError):
     """Required evidence cannot be represented by the frozen eleven shapes."""
 

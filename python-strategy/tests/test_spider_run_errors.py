@@ -1,6 +1,7 @@
 """HEAD byte and caller-oracle regressions for historical spider errors."""
 
 import ast
+from copy import deepcopy
 import hashlib
 import json
 import linecache
@@ -12,15 +13,57 @@ from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import patch
 
+import pytest
+
 from src.core.backtest import spider_historical_execution as executor
 from src.core.backtest import spider_historical_durable_ports as durable_ports
 from src.core.backtest import spider_run_errors as errors
 from src.core.backtest import spider_run_evidence as evidence
 from src.core.backtest import spider_run_store as store
 from src.core.backtest import spider_scenario_run as scenario
+from src.core.backtest.spider_run_artifacts import _FAILURES as CLOSED_FAILURE_REASONS
 from test_synthetic_scenario_native import _native_error_type
 
 _HEAD_MATRIX_SHA256 = "df9d0f169032c7cfceac06422cd07d4167795f7363060edfa5c387191c4a722b"
+
+_DESIGN_FAILURE_REASONS = (
+    "UNSUPPORTED_CONFIGURATION",
+    "PERSISTENCE_FAILED",
+    "CALLBACK_FAILED",
+    "NATIVE_FAULT",
+    "NATIVE_POISONED",
+    "SCHEDULER_FAILED",
+    "ENDPOINT_RECONCILIATION_FAILED",
+    "ARTIFACT_WRITE_FAILED",
+    "PUBLICATION_FAILED",
+    "PUBLICATION_DURABILITY_UNKNOWN",
+    "UNEXPECTED_EXCEPTION",
+)
+_DESIGN_PRIMARY_VARIANTS = (
+    ("none", None),
+    ("persistence-limit", {"kind": "PERSISTENCE", "reason": "ARTIFACT_LIMIT_EXCEEDED"}),
+    ("persistence-other", {"kind": "PERSISTENCE", "reason": "ARTIFACT_WRITE_FAILED"}),
+    ("other-kind-limit", {"kind": "NATIVE", "reason": "ARTIFACT_LIMIT_EXCEEDED"}),
+)
+
+
+def _runner_reason_expected_from_design(reason, primary):
+    """Independent T5.1 oracle: ordered rules copied from the design contract."""
+    if reason == "PUBLICATION_DURABILITY_UNKNOWN":
+        return reason
+    if reason in ("ARTIFACT_WRITE_FAILED", "PUBLICATION_FAILED"):
+        return reason
+    if (reason == "PERSISTENCE_FAILED"
+            and primary == {"kind": "PERSISTENCE", "reason": "ARTIFACT_LIMIT_EXCEEDED"}):
+        return "ARTIFACT_LIMIT_EXCEEDED"
+    return reason
+
+
+_RUNNER_REASON_MATRIX = tuple(
+    (reason, variant_name, deepcopy(primary))
+    for reason in CLOSED_FAILURE_REASONS
+    for variant_name, primary in _DESIGN_PRIMARY_VARIANTS
+)
 
 
 class StoreChild(store.SpiderRunStoreError):
@@ -286,7 +329,9 @@ def test_classifier_has_one_owner_and_no_writer_capability():
     assert sum((root / name).read_text().count("def classify_historical_failure(") for name in (
         "spider_run_errors.py", "spider_historical_execution.py", "spider_scenario_run.py",
     )) == 1
-    assert {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)} == {"copy", "dataclasses", "typing"}
+    assert {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)} == {
+        "copy", "dataclasses", "typing",
+    }
     assert not any(isinstance(n, (ast.Import, ast.Call)) and (isinstance(n, ast.Import) or getattr(n.func, "id", "") in {"open", "eval", "exec", "__import__"}) for n in ast.walk(tree))
 
 
@@ -363,3 +408,45 @@ def test_durable_publication_guard_and_callback_catch_match_head_structure():
     assert any(isinstance(node, ast.Call) and ast.unparse(node.func) == "output.fail"
                for node in ast.walk(callback_handler))
     assert ast.unparse(persist.body[-2]) == "output.retain(row)"
+
+
+def test_runner_reason_failure_matrix_is_closed_and_nonempty():
+    assert tuple(CLOSED_FAILURE_REASONS) == _DESIGN_FAILURE_REASONS
+    assert len(CLOSED_FAILURE_REASONS) == len(_DESIGN_FAILURE_REASONS) == 11
+    assert len(_RUNNER_REASON_MATRIX) == len(CLOSED_FAILURE_REASONS) * len(_DESIGN_PRIMARY_VARIANTS)
+
+
+@pytest.mark.parametrize(
+    ("reason", "variant_name", "primary"),
+    _RUNNER_REASON_MATRIX,
+    ids=lambda value: value if isinstance(value, str) else None,
+)
+def test_runner_reason_for_precedence_matrix_is_pure(reason, variant_name, primary):
+    del variant_name
+    error = store.SpiderRunStoreError(reason, primary_failure=primary)
+    before = deepcopy(error.__dict__)
+
+    actual = errors.runner_reason_for(error)
+
+    assert actual == _runner_reason_expected_from_design(reason, primary)
+    assert error.__dict__ == before
+
+
+def test_runner_reason_for_registration_limit_without_primary_is_pure():
+    error = store.SpiderRunStoreError("ARTIFACT_LIMIT_EXCEEDED")
+    before = deepcopy(error.__dict__)
+
+    assert errors.runner_reason_for(error) == "ARTIFACT_LIMIT_EXCEEDED"
+    assert error.__dict__ == before
+
+
+def test_runner_reason_for_requires_exact_primary_field_types():
+    class StringChild(str):
+        pass
+
+    primary = {"kind": StringChild("PERSISTENCE"), "reason": "ARTIFACT_LIMIT_EXCEEDED"}
+    error = store.SpiderRunStoreError("PERSISTENCE_FAILED", primary_failure=primary)
+    before = deepcopy(error.__dict__)
+
+    assert errors.runner_reason_for(error) == "PERSISTENCE_FAILED"
+    assert error.__dict__ == before
