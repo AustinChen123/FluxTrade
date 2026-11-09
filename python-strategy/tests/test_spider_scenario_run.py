@@ -66,6 +66,11 @@ def historical_input(name="p3-run", *, partial_fill=False):
     return value, encode_historical_run_input(value)
 
 
+@pytest.fixture(scope="module")
+def t54_historical_input():
+    return historical_input("j9-t54-limit-matrix")
+
+
 def frozen_h03_input(run_id):
     source, value = _oracle_run("H03")
     answer = _case_answer("H03")
@@ -722,6 +727,225 @@ def test_historical_persistence_failure_is_terminal_and_unadmitted(tmp_path, mon
     assert len(calls) == 1
     assert read(tmp_path, value.run_id, "status.json")[0]["failure_reason"] == "PERSISTENCE_FAILED"
     assert not (tmp_path / value.run_id / "completion.json").exists()
+
+
+def test_historical_callback_limit_maps_runner_reason_and_keeps_closed_status(tmp_path, monkeypatch):
+    value, raw = historical_input("historical-limit-result")
+    primary = dict(kind="PERSISTENCE", reason="ARTIFACT_LIMIT_EXCEEDED")
+
+    def fail_append(_store, _row):
+        raise storage.SpiderRunStoreError("PERSISTENCE_FAILED", "PERSISTENCE_FAILED", primary)
+
+    monkeypatch.setattr(storage.SpiderRunStore, "append_journal", fail_append)
+    result = run.run_spider_scenario(str(tmp_path), value.run_id, run._P3_SELECTOR, raw)
+    status = read(tmp_path, value.run_id, "status.json")[0]
+    assert result == dict(run_id=value.run_id, outcome="FAILED", reason="ARTIFACT_LIMIT_EXCEEDED")
+    assert (status["failure_reason"], status["primary_failure"]) == ("PERSISTENCE_FAILED", primary)
+
+
+@pytest.mark.parametrize(("cell", "outcome", "runner_reason", "status_reason", "expected_primary",
+                          "admission_decision", "admission_reason", "evidence", "journal_rows"), [
+    pytest.param("E1-k1", "FAILED", "ARTIFACT_LIMIT_EXCEEDED", "PERSISTENCE_FAILED",
+                 {"kind": "PERSISTENCE", "reason": "ARTIFACT_LIMIT_EXCEEDED"}, "REJECT",
+                 "ARTIFACT_LIMIT_EXCEEDED", ("completion.json", "status.json", "journal.jsonl"), 0,
+                 id="E1-k1"),
+    pytest.param("E1-k2", "FAILED", "ARTIFACT_LIMIT_EXCEEDED", "PERSISTENCE_FAILED",
+                 {"kind": "PERSISTENCE", "reason": "ARTIFACT_LIMIT_EXCEEDED"}, "REJECT",
+                 "ARTIFACT_LIMIT_EXCEEDED", ("completion.json", "status.json", "journal.jsonl"), 1,
+                 id="E1-k2"),
+    pytest.param("E5-publish-ok", "FAILED", "ARTIFACT_LIMIT_EXCEEDED", "PERSISTENCE_FAILED",
+                 {"kind": "PERSISTENCE", "reason": "ARTIFACT_LIMIT_EXCEEDED"}, "REJECT",
+                 "ARTIFACT_LIMIT_EXCEEDED", ("completion.json", "status.json", "journal.jsonl"), None,
+                 id="E5-publish-ok"),
+    pytest.param("E5-fail-before-replace", "FAILED", "PUBLICATION_FAILED", None, None, "REJECT",
+                 "MISSING_COMPLETE_MANIFEST", ("completion.json", "status.json", "journal.jsonl"), None,
+                 id="E5-fail-before-replace"),
+    pytest.param("E5-fail-after-replace", "DURABILITY_UNKNOWN", "PUBLICATION_DURABILITY_UNKNOWN",
+                 "PERSISTENCE_FAILED", {"kind": "PERSISTENCE", "reason": "ARTIFACT_LIMIT_EXCEEDED"},
+                 "REJECT", "ARTIFACT_LIMIT_EXCEEDED",
+                 ("completion.json", "status.json", "journal.jsonl"), None,
+                 id="E5-fail-after-replace"),
+    pytest.param("precedence-durability-unknown-primary-limit", "DURABILITY_UNKNOWN",
+                 "PUBLICATION_DURABILITY_UNKNOWN", "PUBLICATION_DURABILITY_UNKNOWN",
+                 {"kind": "PERSISTENCE", "reason": "ARTIFACT_LIMIT_EXCEEDED"}, "REJECT",
+                 "MISSING_COMPLETE_MANIFEST", ("completion.json", "status.json", "journal.jsonl"), None,
+                 id="precedence-durability-unknown-primary-limit"),
+    pytest.param("precedence-publication-failed-primary-limit", "FAILED", "PUBLICATION_FAILED",
+                 "PUBLICATION_FAILED", {"kind": "PERSISTENCE", "reason": "ARTIFACT_LIMIT_EXCEEDED"},
+                 "REJECT", "MISSING_COMPLETE_MANIFEST", ("completion.json", "status.json", "journal.jsonl"), None,
+                 id="precedence-publication-failed-primary-limit"),
+])
+def test_t54_real_runner_limit_matrix(
+    tmp_path, monkeypatch, t54_historical_input, cell, outcome, runner_reason, status_reason,
+    expected_primary, admission_decision, admission_reason, evidence, journal_rows,
+):
+    """One independently runnable real-entry cell per T5.4 E1/E5/precedence row."""
+    value, raw = t54_historical_input
+    primary = {"kind": "PERSISTENCE", "reason": "ARTIFACT_LIMIT_EXCEEDED"}
+    append = storage.SpiderRunStore.append_journal
+    sync = storage._sync
+    replace_file = storage.os.replace
+    if cell in ("E1-k1", "E1-k2"):
+        fail_at = 1 if cell == "E1-k1" else 2
+
+        def append_with_limit(store, row):
+            if row["journal_seq"] == fail_at:
+                raise storage.SpiderRunStoreError("PERSISTENCE_FAILED", "PERSISTENCE_FAILED", primary)
+            append(store, row)
+
+        monkeypatch.setattr(storage.SpiderRunStore, "append_journal", append_with_limit)
+    else:
+        finalize_reason = {
+            "E5-publish-ok": "PERSISTENCE_FAILED",
+            "E5-fail-before-replace": "PERSISTENCE_FAILED",
+            "E5-fail-after-replace": "PERSISTENCE_FAILED",
+            "precedence-durability-unknown-primary-limit": "PUBLICATION_DURABILITY_UNKNOWN",
+            "precedence-publication-failed-primary-limit": "PUBLICATION_FAILED",
+        }[cell]
+
+        def finalize_with_failure(store, **artifacts):
+            raise storage.SpiderRunStoreError(finalize_reason, None, primary)
+
+        monkeypatch.setattr(storage.SpiderRunStore, "finalize", finalize_with_failure)
+        if cell == "E5-fail-before-replace":
+            def replace_before(source, target):
+                candidate = decode_jsonl(Path(source).read_bytes())[0]
+                if type(candidate) is dict and candidate.get("state") == "FAILED":
+                    raise OSError("injected replace failure before publication")
+                replace_file(source, target)
+            monkeypatch.setattr(storage.os, "replace", replace_before)
+        elif cell == "E5-fail-after-replace":
+            def sync_after(directory):
+                sync(directory)
+                status_path = directory / "status.json"
+                if status_path.exists():
+                    candidate = decode_jsonl(status_path.read_bytes())[0]
+                    if (type(candidate) is dict and candidate.get("state") == "FAILED"
+                            and candidate.get("primary_failure") == primary):
+                        raise storage.SpiderRunStoreError("PUBLICATION_DURABILITY_UNKNOWN")
+            monkeypatch.setattr(storage, "_sync", sync_after)
+
+    result = run.run_spider_scenario(str(tmp_path), value.run_id, run._P3_SELECTOR, raw)
+    status = read(tmp_path, value.run_id, "status.json")[0]
+    admission_result = admit_spider_run(tmp_path / value.run_id)
+    assert (result["outcome"], result["reason"]) == (outcome, runner_reason)
+    assert (status["failure_reason"], status["primary_failure"]) == (status_reason, expected_primary)
+    assert (admission_result["decision"], admission_result["reason"], admission_result["evidence"]) == (
+        admission_decision, admission_reason, evidence,
+    )
+    if journal_rows is not None:
+        assert len(read(tmp_path, value.run_id, "journal.jsonl")) == journal_rows
+
+
+@pytest.mark.parametrize(("cell", "outcome", "reason", "admission", "directory_exists", "store_state"), [
+    pytest.param("REG-preflight", "FAILED", "ARTIFACT_LIMIT_EXCEEDED",
+                 ("REJECT", "UNSAFE_ARTIFACT_PATH", ("run-directory",)), False, None,
+                 id="REG-preflight"),
+    pytest.param("REG-register-guard", "FAILED", "ARTIFACT_LIMIT_EXCEEDED",
+                 ("REJECT", "MISSING_COMPLETE_MANIFEST",
+                  ("completion.json", "status.json", "journal.jsonl")), True, "CREATED",
+                 id="REG-register-guard"),
+])
+def test_t54_registration_refusal_real_runner(
+    tmp_path, monkeypatch, t54_historical_input, cell, outcome, reason, admission,
+    directory_exists, store_state,
+):
+    """T5.2 registration refusal is tested independently for each owner."""
+    from types import SimpleNamespace
+    from src.core.backtest import spider_artifact_limits as limits
+
+    value, raw = t54_historical_input
+    original_attempt = run._attempt
+    def v2_attempt(*args, **kwargs):
+        attempt = original_attempt(*args, **kwargs)
+        attempt["artifact_encoding"] = "artifact_encoding_v2"
+        return attempt
+
+    monkeypatch.setattr(run, "_attempt", v2_attempt)
+    monkeypatch.setattr(limits, "P3_V2_HISTORICAL_INPUT_LIMIT", len(raw) - 1)
+    monkeypatch.setattr(limits, "p3_v2_scope_budget", lambda _coverage: {"refused": False})
+    register_states = []
+    if cell == "REG-register-guard":
+        # Skip only the runner hook so the authoritative register() guard owns refusal.
+        monkeypatch.setattr(run, "_artifact_limits", SimpleNamespace(p3_v2_registration_preflight=lambda *_: None))
+        register = storage.SpiderRunStore.register
+
+        def observe_register(store, *args, **kwargs):
+            try:
+                return register(store, *args, **kwargs)
+            except storage.SpiderRunStoreError:
+                register_states.append(store._state)
+                raise
+
+        monkeypatch.setattr(storage.SpiderRunStore, "register", observe_register)
+
+    root = tmp_path
+    result = run.run_spider_scenario(str(root), value.run_id, run._P3_SELECTOR, raw)
+    run_dir = root / value.run_id
+    assert result == dict(run_id=value.run_id, outcome=outcome, reason=reason)
+    assert run_dir.exists() is directory_exists
+    assert not (run_dir / "status.json").exists()
+    if directory_exists:
+        assert list(run_dir.iterdir()) == []
+    assert register_states == ([] if store_state is None else [store_state])
+    admission_result = admit_spider_run(run_dir)
+    assert (admission_result["decision"], admission_result["reason"], admission_result["evidence"]) == admission
+
+
+@pytest.mark.parametrize(("run_id", "primary_reason", "expected_primary"), [
+    pytest.param("j9-t54-other-persistence", "ARTIFACT_WRITE_FAILED",
+                 {"kind": "PERSISTENCE", "reason": "ARTIFACT_WRITE_FAILED"}, id="other-persistence"),
+    pytest.param("j9-t54-unknown-persistence", "UNRECOGNIZED_STORE_FAILURE",
+                 {"kind": "PERSISTENCE", "reason": "UNRECOGNIZED_STORE_FAILURE"}, id="unknown-persistence"),
+])
+def test_t54_non_limit_persistence_primary_keeps_runner_reason(
+    tmp_path, monkeypatch, t54_historical_input, run_id, primary_reason, expected_primary,
+):
+    value, raw = t54_historical_input
+    value = replace(value, run_id=run_id)
+    raw = encode_historical_run_input(value)
+
+    def fail_append(_store, _row):
+        raise storage.SpiderRunStoreError(
+            "PERSISTENCE_FAILED", "PERSISTENCE_FAILED",
+            {"kind": "PERSISTENCE", "reason": primary_reason},
+        )
+
+    monkeypatch.setattr(storage.SpiderRunStore, "append_journal", fail_append)
+    result = run.run_spider_scenario(str(tmp_path), value.run_id, run._P3_SELECTOR, raw)
+    status = read(tmp_path, value.run_id, "status.json")[0]
+    assert result == dict(run_id=value.run_id, outcome="FAILED", reason="PERSISTENCE_FAILED")
+    assert (status["failure_reason"], status["primary_failure"]) == ("PERSISTENCE_FAILED", expected_primary)
+    admission_result = admit_spider_run(tmp_path / value.run_id)
+    assert (admission_result["decision"], admission_result["reason"], admission_result["evidence"]) == (
+        "REJECT", "INCOMPLETE_PERSISTENCE", ("completion.json", "status.json", "journal.jsonl"),
+    )
+
+
+def test_scenario_store_error_return_maps_limit_but_publishes_closed_reason(tmp_path, monkeypatch):
+    primary = dict(kind="PERSISTENCE", reason="ARTIFACT_LIMIT_EXCEEDED")
+
+    def fail_execute(*_args):
+        raise storage.SpiderRunStoreError("PERSISTENCE_FAILED", None, primary)
+
+    monkeypatch.setattr(run, "_execute", fail_execute)
+    result = invoke(tmp_path, name="scenario-limit-result")
+    status = read(tmp_path, "scenario-limit-result", "status.json")[0]
+    assert result == dict(run_id="scenario-limit-result", outcome="FAILED", reason="ARTIFACT_LIMIT_EXCEEDED")
+    assert (status["failure_reason"], status["primary_failure"]) == ("PERSISTENCE_FAILED", primary)
+
+
+def test_scenario_store_error_return_keeps_non_limit_reason(tmp_path, monkeypatch):
+    primary = dict(kind="PERSISTENCE", reason="ARTIFACT_WRITE_FAILED")
+
+    def fail_execute(*_args):
+        raise storage.SpiderRunStoreError("ARTIFACT_WRITE_FAILED", None, primary)
+
+    monkeypatch.setattr(run, "_execute", fail_execute)
+    result = invoke(tmp_path, name="scenario-write-result")
+    status = read(tmp_path, "scenario-write-result", "status.json")[0]
+    assert result == dict(run_id="scenario-write-result", outcome="FAILED", reason="ARTIFACT_WRITE_FAILED")
+    assert (status["failure_reason"], status["primary_failure"]) == ("ARTIFACT_WRITE_FAILED", primary)
 
 
 def test_historical_processed_marker_publication_failure_stops_before_append(tmp_path, monkeypatch):
