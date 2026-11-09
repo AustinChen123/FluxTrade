@@ -782,3 +782,156 @@ def test_v2_diagnosis_reader_receives_directory_fd_and_leaf(
         os.close(directory)
     assert result["reason"] == "ARTIFACT_LIMIT_EXCEEDED"
     assert calls == [(directory, "journal.jsonl")]
+
+
+@pytest.fixture(scope="module")
+def p3_v2_admission_values(p3_v2_admission_bundle):
+    result = admission.admit_spider_run(p3_v2_admission_bundle)
+    assert result["decision"] == "ACCEPT", result
+    return result["artifacts"]
+
+
+# Independent expected outcomes from JOURNAL_AB_DESIGN_v3 T1.1/T1.4 and the
+# existing S3 manifest-binding contract; expected values are not computed by
+# admission or the reader under test.
+_J10_ITEM3_EXPECTED = {
+    "attempt-swap-retained": ("ACCEPT", None),
+    "mixed-v1-manifest-v2-journal": ("REJECT", "UNSUPPORTED_SCHEMA"),
+    "mixed-v2-manifest-v1-journal": ("REJECT", "ARTIFACT_MISMATCH"),
+    "v2-attempt-no-v2-artifacts": ("REJECT", "UNSUPPORTED_SCHEMA"),
+    "journal-sha256-mismatch": ("REJECT", "ARTIFACT_MISMATCH"),
+    "journal-byte-count-mismatch": ("REJECT", "ARTIFACT_MISMATCH"),
+    "journal-row-count-mismatch": ("REJECT", "ARTIFACT_MISMATCH"),
+    "journal-reader-schema-version-mismatch": ("REJECT", "ARTIFACT_MISMATCH"),
+    "attempt-sha256-mismatch": ("REJECT", "ARTIFACT_MISMATCH"),
+    "endpoint-digest-mismatch": ("REJECT", "ARTIFACT_MISMATCH"),
+    "reconciliation-digest-mismatch": ("REJECT", "ARTIFACT_MISMATCH"),
+}
+
+
+def _rewrite_v2_manifest(run_dir, change):
+    path = run_dir / "completion.json"
+    manifest = admission._decode(path.read_bytes(), "completion.json")
+    change(manifest)
+    path.write_bytes(framed(manifest, "completion.json"))
+    return manifest
+
+
+def _journal_entry(manifest):
+    return next(entry for entry in manifest["artifacts"] if entry["path"] == "journal.jsonl")
+
+
+def _make_j10_item3_cell(run_dir, cell, p3_v2_admission_values):
+    if cell == "attempt-swap-retained":
+        return
+    if cell == "mixed-v1-manifest-v2-journal":
+        attempt_path = run_dir / "attempt.json"
+        attempt = admission._decode(attempt_path.read_bytes(), "attempt.json")
+        attempt["artifact_encoding"] = "artifact_encoding_v1"
+        attempt_raw = framed(attempt, "attempt.json")
+        attempt_path.write_bytes(attempt_raw)
+        def mixed_manifest(manifest):
+            _journal_entry(manifest)["schema_version"] = "spider_journal_record_v1"
+            attempt_entry = next(item for item in manifest["artifacts"] if item["path"] == "attempt.json")
+            attempt_entry.update(sha256=sha256(attempt_raw).hexdigest(), byte_count=len(attempt_raw))
+        _rewrite_v2_manifest(run_dir, mixed_manifest)
+    elif cell in ("mixed-v2-manifest-v1-journal", "v2-attempt-no-v2-artifacts"):
+        if cell == "v2-attempt-no-v2-artifacts":
+            _rewrite_v2_manifest(
+                run_dir, lambda manifest: _journal_entry(manifest).__setitem__(
+                    "schema_version", "spider_journal_record_v1",
+                ),
+            )
+        raw = framed(p3_v2_admission_values["journal.jsonl"], "journal.jsonl")
+        (run_dir / "journal.jsonl").write_bytes(raw)
+        def metadata(manifest):
+            entry = _journal_entry(manifest)
+            entry.update(sha256=sha256(raw).hexdigest(), byte_count=len(raw),
+                         row_count=raw.count(b"\n"))
+        _rewrite_v2_manifest(run_dir, metadata)
+    elif cell in (
+        "journal-sha256-mismatch", "journal-byte-count-mismatch",
+        "journal-row-count-mismatch",
+    ):
+        field = {
+            "journal-sha256-mismatch": "sha256",
+            "journal-byte-count-mismatch": "byte_count",
+            "journal-row-count-mismatch": "row_count",
+        }[cell]
+        def mismatch(manifest):
+            entry = _journal_entry(manifest)
+            entry[field] = "f" * 64 if field == "sha256" else entry[field] + 1
+        _rewrite_v2_manifest(run_dir, mismatch)
+    elif cell == "attempt-sha256-mismatch":
+        def mismatch(manifest):
+            entry = next(item for item in manifest["artifacts"] if item["path"] == "attempt.json")
+            entry["sha256"] = "f" * 64
+        _rewrite_v2_manifest(run_dir, mismatch)
+    elif cell in ("endpoint-digest-mismatch", "reconciliation-digest-mismatch"):
+        field = "endpoint_state_digest" if cell == "endpoint-digest-mismatch" else "reconciliation_digest"
+        _rewrite_v2_manifest(run_dir, lambda manifest: manifest.__setitem__(field, "f" * 64))
+
+
+@pytest.mark.parametrize(
+    "cell", tuple(_J10_ITEM3_EXPECTED), ids=tuple(_J10_ITEM3_EXPECTED),
+)
+def test_j10_item3_real_admission_matrix(
+    tmp_path, p3_v2_admission_bundle, p3_v2_admission_values, cell, monkeypatch,
+):
+    run_dir = _copy_v2_admission_bundle(p3_v2_admission_bundle, tmp_path)
+    _make_j10_item3_cell(run_dir, cell, p3_v2_admission_values)
+    read_attempts = []
+    original_capture = admission._capture
+    def capture_once(directory, name, **kwargs):
+        if name == "attempt.json":
+            read_attempts.append(name)
+        captured = original_capture(directory, name, **kwargs)
+        if cell == "attempt-swap-retained" and name == "attempt.json":
+            replacement = admission._decode(captured, "attempt.json")
+            replacement["artifact_encoding"] = "artifact_encoding_v1"
+            (run_dir / "attempt.json").write_bytes(framed(replacement, "attempt.json"))
+        return captured
+
+    journal_parses = []
+    original_decode = admission._decode
+    def observe_decode(raw, name):
+        if name == "journal.jsonl":
+            journal_parses.append("admission")
+        return original_decode(raw, name)
+    from src.core.backtest import spider_journal_reader_v2 as reader
+    original_wire_decode = reader._decode_wire_row
+    def observe_wire_decode(line):
+        journal_parses.append("v2-reader")
+        return original_wire_decode(line)
+    monkeypatch.setattr(admission, "_capture", capture_once)
+    monkeypatch.setattr(admission, "_decode", observe_decode)
+    monkeypatch.setattr(reader, "_decode_wire_row", observe_wire_decode)
+    if cell == "journal-reader-schema-version-mismatch":
+        from src.core.backtest import spider_journal_buffer_v2 as journal_buffer
+        monkeypatch.setattr(journal_buffer, "_V2_SCHEMA", "spider_journal_record_v1")
+    v2_calls = []
+    original_admit_v2 = admission._admit_p3_v2
+    def observe_v2_dispatch(*args, **kwargs):
+        v2_calls.append(args)
+        return original_admit_v2(*args, **kwargs)
+    monkeypatch.setattr(admission, "_admit_p3_v2", observe_v2_dispatch)
+    result = admission.admit_spider_run(run_dir)
+    expected_decision, expected_reason = _J10_ITEM3_EXPECTED[cell]
+    assert result["decision"] == expected_decision
+    if expected_reason is not None:
+        assert result["reason"] == expected_reason
+    if cell == "attempt-swap-retained":
+        assert result["artifacts"]["attempt.json"]["artifact_encoding"] == "artifact_encoding_v2"
+        assert (run_dir / "attempt.json").read_bytes() != framed(
+            result["artifacts"]["attempt.json"], "attempt.json",
+        )
+        assert read_attempts == ["attempt.json"]
+    if cell in {"mixed-v1-manifest-v2-journal", "v2-attempt-no-v2-artifacts"}:
+        assert v2_calls == []
+    else:
+        assert len(v2_calls) == 1
+    if cell in {
+        "journal-sha256-mismatch", "journal-byte-count-mismatch",
+        "journal-row-count-mismatch", "journal-reader-schema-version-mismatch",
+    }:
+        assert journal_parses == []
