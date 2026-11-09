@@ -9,7 +9,7 @@ from json import JSONDecodeError
 from pathlib import Path
 from typing import Any, cast
 
-from src.core.backtest.spider_run_artifacts import _P3_RUN_CONTRACT, _boundary, _configuration_context, _historical_context, _require, _text, canonical_bytes, configuration_context, decode_jsonl, historical_context, validate_artifact
+from src.core.backtest.spider_run_artifacts import _P3_RUN_CONTRACT, _boundary, _configuration_context, _historical_context, _require, _text, canonical_bytes, configuration_context, decode_jsonl, historical_context, is_v1_attempt_encoding, validate_artifact
 from src.core.backtest.spider_run_completion_schema import (
     _ARTIFACTS, _P3_V2_ARTIFACTS, completion, report as validate_report,
 )
@@ -423,6 +423,10 @@ class SpiderRunStore:
             self._publish("historical_input.json", historical_input)
         self._publish("attempt.json", canonical_bytes(attempt) + b"\n")
         self._attempt = deepcopy(attempt)
+        self._p3_v2_write_enabled = (
+            attempt["run_contract_id"] == _P3_RUN_CONTRACT
+            and attempt["artifact_encoding"] == "artifact_encoding_v2"
+        )
         if attempt["registration_state"] == "REJECTED":
             self.publish_failure("UNSUPPORTED_CONFIGURATION", None)
             return "REGISTRATION_REJECTED"
@@ -764,6 +768,11 @@ class SpiderRunStore:
                 raise ValueError("INVALID_ARTIFACT")
             value = rows if name.endswith(".jsonl") else rows[0]
             validator(value)
+            if (name == "attempt.json"
+                    and not (self._attempt.get("run_contract_id") == _P3_RUN_CONTRACT
+                             and self._attempt.get("artifact_encoding") == "artifact_encoding_v2")
+                    and not is_v1_attempt_encoding(value)):
+                raise ValueError("INVALID_ARTIFACT")
             if any(row["run_id"] != self._run_id for row in rows):
                 raise ValueError("INVALID_ARTIFACT")
         except (JSONDecodeError, UnicodeDecodeError) as error:

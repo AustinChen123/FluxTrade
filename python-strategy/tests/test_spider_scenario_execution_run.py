@@ -47,6 +47,54 @@ def _run(tmp_path: Path, run_id: str, *, mode: str = "flat", **kwargs):
 
 
 @pytest.mark.parametrize(
+    ("encoding", "family"),
+    [(encoding, family) for encoding in ("artifact_encoding_v1", "artifact_encoding_v2")
+     for family in ("paid", "floating", "gross")],
+    ids=[f"{family}-{encoding.removeprefix('artifact_encoding_')}"
+         for encoding in ("artifact_encoding_v1", "artifact_encoding_v2")
+         for family in ("paid", "floating", "gross")],
+)
+def test_p3_encoding_opt_in_does_not_escape_into_paid_families(
+    tmp_path, monkeypatch, encoding, family,
+):
+    from test_spider_floating_exit_formal import _candidate_input
+    from test_spider_gross_formal_runner import _for_run
+    from src.core.backtest.spider_gross_execution_input import encode_spider_gross_execution_input
+    from src.core.backtest.spider_run_artifacts import decode_jsonl
+
+    run_id = f"encoding-{family}-{encoding[-2:]}"
+    if family == "paid":
+        request, raw = _request(run_id)
+        selector = scenario._PAID_SELECTOR
+        kwargs = {"execution_input": raw}
+    elif family == "floating":
+        raw = _candidate_input(run_id, "BAYES_REMAINING_COST_RISK_V1")
+        selector = scenario._FLOATING_SELECTOR
+        kwargs = {"floating_exit_input": raw}
+    else:
+        request = _for_run(run_id)
+        raw = encode_spider_gross_execution_input(request)
+        selector = scenario._GROSS_SELECTOR
+        kwargs = {"gross_execution_input": raw}
+
+    monkeypatch.setattr(scenario, "_P3_ATTEMPT_ARTIFACT_ENCODING", encoding)
+    result = scenario.run_spider_scenario(str(tmp_path), run_id, selector, **kwargs)
+    assert result["outcome"] == "ADMITTED"
+    attempt = decode_jsonl((tmp_path / run_id / "attempt.json").read_bytes())[0]
+    assert attempt["artifact_encoding"] == "artifact_encoding_v1"
+@pytest.mark.parametrize("encoding", ["artifact_encoding_v1", "artifact_encoding_v2"])
+def test_p3_runner_uses_the_selected_attempt_encoding(tmp_path, monkeypatch, encoding):
+    from test_spider_scenario_run import historical_input
+
+    value, raw = historical_input(f"p3-selected-{encoding[-2:]}")
+    monkeypatch.setattr(scenario, "_P3_ATTEMPT_ARTIFACT_ENCODING", encoding)
+    result = scenario.run_spider_scenario(str(tmp_path), value.run_id, scenario._P3_SELECTOR, raw)
+    assert result["outcome"] == "ADMITTED"
+    attempt = scenario._admit(tmp_path / value.run_id)["artifacts"]["attempt.json"]
+    assert attempt["artifact_encoding"] == encoding
+
+
+@pytest.mark.parametrize(
     ("mode", "status"),
     [
         ("flat", "PAID_FLAT"),

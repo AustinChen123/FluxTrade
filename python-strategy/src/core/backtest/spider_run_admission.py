@@ -8,7 +8,7 @@ from json import JSONDecodeError as _JSONDecodeError
 from typing import Any as _Any
 from typing import cast as _cast
 
-from src.core.backtest.spider_run_artifacts import canonical_bytes as _bytes, configuration_context as _validate_context, decode_canonical as _decode_canonical, decode_jsonl as _decode_jsonl, historical_context as _validate_historical_context, validate_artifact as _artifact
+from src.core.backtest.spider_run_artifacts import canonical_bytes as _bytes, configuration_context as _validate_context, decode_canonical as _decode_canonical, decode_jsonl as _decode_jsonl, historical_context as _validate_historical_context, is_v1_attempt_encoding as _is_v1_attempt_encoding, validate_artifact as _artifact
 from src.core.backtest.spider_run_completion_schema import _ARTIFACTS, _P3_ARTIFACTS, _P3_V2_ARTIFACTS, completion as _completion, report as _report
 from src.core.backtest.spider_run_envelope_schema import endpoint as _endpoint, journal as _journal
 from src.core.backtest.spider_run_evidence import ReconciliationProjectionError as _ProjectionError, _context_chain, build_reconciliation as _build
@@ -781,6 +781,8 @@ def _admit(directory: int) -> dict[str, _Any]:
                     raise _Invalid() from error
             else:
                 _validate(validator, value)
+                if name == "attempt.json" and not _is_v1_attempt_encoding(value):
+                    raise _Invalid()
         except _Invalid:
             bad.append(name)
     if bad:

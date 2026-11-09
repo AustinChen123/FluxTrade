@@ -302,14 +302,19 @@ def test_v2_reread_rejects_foreign_run_id_without_trusting_valid_wire_metadata(t
     assert (store._path / "journal.jsonl").read_bytes() == foreign
 
 
-def test_public_register_does_not_select_p3_v2(tmp_path, real_p3_artifacts):
+@pytest.mark.parametrize(
+    ("encoding", "expected_v2_writer"),
+    [("artifact_encoding_v1", False), ("artifact_encoding_v2", True)],
+    ids=("p3-v1-keeps-v1-writer", "p3-v2-selects-v2-writer"),
+)
+def test_register_selects_writer_only_from_validated_p3_encoding(
+    tmp_path, real_p3_artifacts, encoding, expected_v2_writer,
+):
     attempt = decode_jsonl(real_p3_artifacts["attempt.json"])[0]
-    attempt["artifact_encoding"] = "artifact_encoding_v2"
+    attempt["artifact_encoding"] = encoding
     store = module.SpiderRunStore.create(str(tmp_path), cast(str, attempt["run_id"]))
-    with pytest.raises(ValueError, match="INVALID_ARTIFACT"):
-        store.register(attempt, historical_input=real_p3_artifacts["historical_input.json"])
-    assert store._state == "CREATED"
-    assert list(store._path.iterdir()) == []
+    store.register(attempt, historical_input=real_p3_artifacts["historical_input.json"])
+    assert store._p3_v2_write_enabled is expected_v2_writer
 
 
 def test_register_v2_guard_is_literal_first_statement_and_refuses_before_publish(tmp_path, real_p3_artifacts, monkeypatch):

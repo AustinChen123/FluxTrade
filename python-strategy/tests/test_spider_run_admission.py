@@ -836,6 +836,93 @@ _J10_ITEM3_EXPECTED = {
 }
 
 
+# Independent HEAD 451f641e oracle for each v1-only consumer of the relaxed
+# attempt validator. Encodings are actual values written into valid P3 attempts.
+_V1_ATTEMPT_ROUTE_EXPECTED = {
+    ("admit-v1-manifest", "artifact_encoding_v1"): ("ACCEPT", None),
+    ("admit-v1-manifest", "artifact_encoding_v2"): ("REJECT", "UNSUPPORTED_SCHEMA"),
+    ("store-v1-reread", "artifact_encoding_v1"): ("ACCEPT", None),
+    ("store-v1-reread", "artifact_encoding_v2"): ("REJECT", "ENDPOINT_RECONCILIATION_FAILED"),
+    ("paid-schema", "artifact_encoding_v1"): ("REJECT", "INVALID_ARTIFACT"),
+    ("paid-schema", "artifact_encoding_v2"): ("REJECT", "INVALID_ARTIFACT"),
+    ("floating-schema", "artifact_encoding_v1"): ("REJECT", "INVALID_ARTIFACT"),
+    ("floating-schema", "artifact_encoding_v2"): ("REJECT", "INVALID_ARTIFACT"),
+    ("gross-schema", "artifact_encoding_v1"): ("REJECT", "INVALID_ARTIFACT"),
+    ("gross-schema", "artifact_encoding_v2"): ("REJECT", "INVALID_ARTIFACT"),
+}
+
+
+@pytest.fixture(scope="module")
+def v1_route_execution_contexts():
+    from test_spider_run_execution_schema import _contexts
+    from test_spider_floating_exit_run import _floating_registration_fixture
+    from test_spider_gross_artifact_schema import _context as gross_context
+
+    _, _, paid, _, _ = _contexts()
+    floating = _floating_registration_fixture()[3]["execution_context"]
+    gross = gross_context()[2]
+    return {"paid-schema": paid, "floating-schema": floating, "gross-schema": gross}
+
+
+@pytest.mark.parametrize(
+    ("route", "encoding", "expected"),
+    [(route, encoding, expected) for (route, encoding), expected in _V1_ATTEMPT_ROUTE_EXPECTED.items()],
+    ids=[f"{route}-{encoding}" for route, encoding in _V1_ATTEMPT_ROUTE_EXPECTED],
+)
+def test_p3_attempt_encoding_compatibility_on_v1_only_routes(
+    tmp_path, real_p3_artifacts, p3_v2_admission_bundle, p3_v2_admission_values,
+    v1_route_execution_contexts, route, encoding, expected,
+):
+    from copy import deepcopy
+    from src.core.backtest import spider_run_execution_schema
+    from src.core.backtest.spider_run_store import SpiderRunStore, SpiderRunStoreError
+
+    attempt = admission._decode(real_p3_artifacts["attempt.json"], "attempt.json")
+    attempt["artifact_encoding"] = encoding
+    expected_decision, expected_value = expected
+    if route == "admit-v1-manifest":
+        run_dir = _copy_v2_admission_bundle(p3_v2_admission_bundle, tmp_path)
+        manifest = admission._decode((run_dir / "completion.json").read_bytes(), "completion.json")
+        wire_attempt = deepcopy(p3_v2_admission_values["attempt.json"])
+        wire_attempt["artifact_encoding"] = encoding
+        attempt_raw = framed(wire_attempt, "attempt.json")
+        (run_dir / "attempt.json").write_bytes(attempt_raw)
+        journal_raw = framed(p3_v2_admission_values["journal.jsonl"], "journal.jsonl")
+        (run_dir / "journal.jsonl").write_bytes(journal_raw)
+        for entry in manifest["artifacts"]:
+            if entry["path"] == "attempt.json":
+                entry.update(sha256=sha256(attempt_raw).hexdigest(), byte_count=len(attempt_raw))
+            elif entry["path"] == "journal.jsonl":
+                entry.update(schema_version="spider_journal_record_v1",
+                             sha256=sha256(journal_raw).hexdigest(), byte_count=len(journal_raw),
+                             row_count=len(p3_v2_admission_values["journal.jsonl"]))
+        (run_dir / "completion.json").write_bytes(framed(manifest, "completion.json"))
+        result = admission.admit_spider_run(run_dir)
+        assert result["decision"] == expected_decision
+        assert result.get("reason") == expected_value
+        return
+    if route == "store-v1-reread":
+        store_attempt = admission._decode(real_p3_artifacts["attempt.json"], "attempt.json")
+        store = SpiderRunStore.create(str(tmp_path), store_attempt["run_id"])
+        store.register(store_attempt, historical_input=real_p3_artifacts["historical_input.json"])
+        store_attempt["artifact_encoding"] = encoding
+        (store._path / "attempt.json").write_bytes(framed(store_attempt, "attempt.json"))
+        if expected_decision == "ACCEPT":
+            assert store._reread_artifact("attempt.json", admission._artifact)[0] == store_attempt
+        else:
+            with pytest.raises(SpiderRunStoreError) as caught:
+                store._reread_artifact("attempt.json", admission._artifact)
+            assert caught.value.reason == expected_value
+        return
+    raw = framed(attempt, "attempt.json")
+    with pytest.raises(ValueError) as caught:
+        spider_run_execution_schema.validate_execution_artifact(
+            "attempt.json", raw,
+            execution_context=v1_route_execution_contexts[route],
+        )
+    assert caught.value.args == (expected_value,)
+
+
 def _rewrite_v2_manifest(run_dir, change):
     path = run_dir / "completion.json"
     manifest = admission._decode(path.read_bytes(), "completion.json")

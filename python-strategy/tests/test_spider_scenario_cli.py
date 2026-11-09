@@ -302,6 +302,20 @@ def test_historical_cli_preserves_invalid_invocation_precedence(tmp_path, capsys
     assert list(tmp_path.iterdir()) == []
 
 
+def test_runner_p3_attempt_encoding_default_is_v1():
+    from dataclasses import replace
+    from src.core.backtest.spider_historical_input import encode_historical_run_input
+    from test_spider_historical_input import _valid_run
+
+    value = replace(_valid_run(), run_id="runner-default-encoding",
+                    policy_source_sha256=run._P3_POLICY_SOURCE)
+    raw = encode_historical_run_input(value)
+    _, bundle, hashes = run._historical_configuration(raw, value.run_id)
+    attempt = run._attempt(value.run_id, run._P3_SELECTOR, bundle, hashes, run._P3_RUN_CONTRACT)
+    assert run._P3_ATTEMPT_ARTIFACT_ENCODING == "artifact_encoding_v1"
+    assert attempt["artifact_encoding"] == run._P3_ATTEMPT_ARTIFACT_ENCODING
+
+
 def normalize(value: Any) -> Any:
     if isinstance(value, dict):
         return {key: {"first": "normalized", "second": "normalized"}[item] if key == "run_id" else normalize(item) for key, item in value.items()}

@@ -72,6 +72,7 @@ _P2_PLAN_SHA256 = "8235c952a5d199825a2a77842b03f49e213ef707c0f30b24d8bf623fde53c
 _P2_CONFIG_SHA256 = "807054044bdd182274509535ecf8bbc4598f00b6a92b598c6228129a6ff11b70"
 _P2_RUN_CONTRACT = "SPIDER_SYNTHETIC_P2_CONFIGURED_RUN_V1"
 _P3_RUN_CONTRACT = "SPIDER_HISTORICAL_RESEARCH_RUN_V1"
+_P3_ATTEMPT_ARTIFACT_ENCODING = "artifact_encoding_v1"
 _P3_PROGRAM = (*_PROGRAM, "python-strategy/src/core/backtest/spider_historical_input.py",
                "python-strategy/src/core/backtest/spider_historical_replay.py",
                "python-strategy/src/core/backtest/spider_historical_ports.py",
@@ -258,6 +259,7 @@ def _paid_configuration(raw: bytes, run_id: str):
         input_contract_hashes=[dict(name=name, sha256=value) for name, value in zip(_HASH_NAMES, hashes, strict=True)],
         schema_version="spider_execution_attempt_v1",
         run_contract_id=_PAID_RUN_CONTRACT,
+        artifact_encoding="artifact_encoding_v1",
         requested_scenario_selector=_PAID_SELECTOR,
         scenario_plan_id=_PAID_SELECTOR,
         terminal_policy="PAID_CLOSE_RESEARCH_V1",
@@ -347,7 +349,8 @@ def _attempt(run_id, selector, bundle=None, hashes=(), rejected_contract="SPIDER
                                       "SYNTHETIC_P1_NO_FUNDING_INPUT_OR_CLAIM"),
                    terminal_policy=plan["terminal_policy"],
                    planned_coverage=([dict(ordinal=item["ordinal"], barrier_id=item["barrier_id"], record_kind=item["record_kind"]) for item in plan["planned_barriers"]]
-                                     if configured else plan["planned_coverage"]), artifact_encoding="artifact_encoding_v1",
+                                     if configured else plan["planned_coverage"]),
+                   artifact_encoding=(_P3_ATTEMPT_ARTIFACT_ENCODING if historical else "artifact_encoding_v1"),
                    **dict(zip(_HASHES, hashes, strict=True)))
         if configured:
             row["run_contract_id"] = _P2_RUN_CONTRACT

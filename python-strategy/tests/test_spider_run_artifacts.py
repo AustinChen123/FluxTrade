@@ -439,6 +439,78 @@ def test_attempt_p1_p2_validated_and_rejected_matrix():
         a.validate_artifact({**p1, "run_contract_id": "SPIDER_SYNTHETIC_P2_CONFIGURED_RUN_V1"})
 
 
+@pytest.fixture(scope="module")
+def encoding_contract_attempts():
+    from test_spider_run_execution_schema import _attempt as paid_attempt, _contexts
+    from test_spider_floating_exit_run import _floating_registration_fixture
+    from test_spider_gross_artifact_schema import _context as gross_context
+    from src.core.backtest.spider_historical_input import historical_context_for_input
+
+    request, _, paid_execution, configured, history = _contexts()
+    paid = paid_attempt(request, paid_execution, configured, history)
+    floating = _floating_registration_fixture()[3]
+    gross_request, _, gross_execution = gross_context()
+    history_input = gross_request.execution_input.historical_input
+    from src.core.backtest.spider_run_artifacts import decode_canonical
+    config_row = decode_canonical(history_input.configuration_bytes)
+    gross_config = a.configuration_context({
+        "schema_version": "spider_configuration_context_v1",
+        "config_id": config_row["config_id"],
+        "configuration_sha256": history_input.configuration_sha256,
+        "products": list(history_input.ordered_products),
+    })
+    gross_history = historical_context_for_input(history_input)
+    gross = paid_attempt(gross_request.execution_input, gross_execution, gross_config, gross_history)
+    gross.update(
+        schema_version="spider_gross_execution_attempt_v1",
+        run_contract_id="SPIDER_GROSS_PROTECTED_RESEARCH_RUN_V1",
+        requested_scenario_selector="SPIDER_GROSS_PROTECTED_RESEARCH_RUN_V1",
+        scenario_plan_id="SPIDER_GROSS_PROTECTED_RESEARCH_RUN_V1",
+        profile_id=gross_execution["native_profile_id"],
+    )
+    return {
+        "P1": attempt(), "P2": configured_attempt(), "P3": historical_attempt(),
+        "paid": paid, "floating": floating, "gross": gross,
+    }
+
+
+ENCODING_ORACLE = {
+    ("P1", "artifact_encoding_v1"): True, ("P1", "artifact_encoding_v2"): False,
+    ("P1", "future_encoding"): False, ("P1", 7): False,
+    ("P2", "artifact_encoding_v1"): True, ("P2", "artifact_encoding_v2"): False,
+    ("P2", "future_encoding"): False, ("P2", 7): False,
+    ("P3", "artifact_encoding_v1"): True, ("P3", "artifact_encoding_v2"): True,
+    ("P3", "future_encoding"): False, ("P3", 7): False,
+    ("paid", "artifact_encoding_v1"): True, ("paid", "artifact_encoding_v2"): False,
+    ("paid", "future_encoding"): False, ("paid", 7): False,
+    ("floating", "artifact_encoding_v1"): True, ("floating", "artifact_encoding_v2"): False,
+    ("floating", "future_encoding"): False, ("floating", 7): False,
+    ("gross", "artifact_encoding_v1"): True, ("gross", "artifact_encoding_v2"): False,
+    ("gross", "future_encoding"): False, ("gross", 7): False,
+}
+
+
+@pytest.mark.parametrize(
+    ("contract", "encoding", "accepted"),
+    [(contract, encoding, expected)
+     for (contract, encoding), expected in ENCODING_ORACLE.items()],
+    ids=[f"{contract}-{encoding}" for contract, encoding in ENCODING_ORACLE],
+)
+def test_attempt_encoding_is_closed_per_contract(encoding_contract_attempts, contract, encoding, accepted):
+    row = deepcopy(encoding_contract_attempts[contract])
+    row["artifact_encoding"] = encoding
+    flags = {
+        "paid": {"paid_execution": True},
+        "floating": {"floating_exit": True},
+        "gross": {"gross_execution": True},
+    }.get(contract, {})
+    if accepted:
+        a._attempt(row, **flags)
+    else:
+        with pytest.raises(ValueError):
+            a._attempt(row, **flags)
+
+
 def test_historical_validated_attempt_roundtrips_and_detaches_contexts():
     row = historical_attempt()
     row["historical_context"] = a.historical_context(row["historical_context"])
