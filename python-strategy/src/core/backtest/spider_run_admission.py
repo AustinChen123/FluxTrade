@@ -165,7 +165,7 @@ def _diagnose(directory: int) -> dict[str, _Any]:
             if budget["refused"]:
                 return _reject("ARTIFACT_LIMIT_EXCEEDED", _DIAGNOSTIC)
             return _diagnose_p3_v2(directory, attempt_raw, attempt, budget)
-    except (OSError, _Unsafe, _Oversize, _Invalid, ValueError, TypeError, KeyError):
+    except (OSError, _Unsafe, _Oversize, _Invalid, ValueError, TypeError, KeyError, RecursionError):
         pass
     try:
         status_raw = _capture(directory, "status.json")
@@ -472,7 +472,7 @@ def _admit_p3_v2(directory: int, manifest: dict[str, _Any], completion_raw: byte
         _validate(_artifact, normalized_attempt)
     except _Invalid:
         return _reject("UNSUPPORTED_SCHEMA", ("attempt.json",))
-    except (_JSONDecodeError, UnicodeDecodeError, ValueError, TypeError, KeyError):
+    except (_JSONDecodeError, UnicodeDecodeError, ValueError, TypeError, KeyError, RecursionError):
         return _reject("UNSUPPORTED_SCHEMA", ("attempt.json",))
     attempt_entry = metadata["attempt.json"]
     if (len(attempt_raw) != attempt_entry["byte_count"]

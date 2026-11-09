@@ -186,6 +186,21 @@ def test_absent_completion_diagnostic_and_only_needed_opens(tmp_path, persisted,
     assert opened == [str(tmp_path), "attempt.json", "status.json", "journal.jsonl"]
 
 
+def test_absent_completion_deep_attempt_preserves_legacy_diagnosis(tmp_path):
+    bundle(tmp_path)
+    (tmp_path / "completion.json").unlink()
+    (tmp_path / "attempt.json").write_bytes(
+        b'{"nested":' + b"[" * 2000 + b"0" + b"]" * 2000 + b"}\n",
+    )
+    directory = os.open(tmp_path, os.O_RDONLY)
+    try:
+        assert admission._diagnose(directory) == dict(
+            decision="REJECT", reason="MISSING_COMPLETE_MANIFEST", evidence=DIAGNOSTIC,
+        )
+    finally:
+        os.close(directory)
+
+
 @pytest.mark.parametrize(("shape", "primary", "matched", "expected"), [
     ("E1", {"kind": "PERSISTENCE", "reason": "ARTIFACT_LIMIT_EXCEEDED"}, True, "ARTIFACT_LIMIT_EXCEEDED"),
     ("E5", {"kind": "PERSISTENCE", "reason": "ARTIFACT_LIMIT_EXCEEDED"}, True, "ARTIFACT_LIMIT_EXCEEDED"),
@@ -744,6 +759,18 @@ def test_v2_diagnosis_attempt_capture_failure_uses_existing_result(
     finally:
         os.close(directory)
     assert result["reason"] == "MISSING_COMPLETE_MANIFEST"
+
+
+def test_v2_admission_deep_attempt_uses_decode_failure_rejection(
+    tmp_path, p3_v2_admission_bundle,
+):
+    run_dir = _copy_v2_admission_bundle(p3_v2_admission_bundle, tmp_path)
+    (run_dir / "attempt.json").write_bytes(
+        b'{"nested":' + b"[" * 2000 + b"0" + b"]" * 2000 + b"}\n",
+    )
+    assert admission.admit_spider_run(run_dir) == {
+        "decision": "REJECT", "reason": "UNSUPPORTED_SCHEMA", "evidence": ("attempt.json",),
+    }
 
 
 def test_v2_diagnosis_never_follows_journal_symlink(tmp_path, p3_v2_diagnosis_bundle):
