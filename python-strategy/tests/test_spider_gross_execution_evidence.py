@@ -5,6 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import replace
 from decimal import Decimal
+import os
 from typing import Any, cast
 
 import pytest
@@ -235,6 +236,11 @@ def _actual_gross_bundle(
     return artifacts, dict(run_id=run_id, request=request, endpoint=paid_endpoint,
                            report=report, journal=rows, attempt=attempt, raw_input=raw_input,
                            composition=composition)
+
+
+@pytest.fixture(scope="module")
+def t54_gross_artifacts():
+    return _actual_gross_bundle()[0]
 
 
 def _native_terminal_request(cash: str) -> Any:
@@ -874,6 +880,56 @@ def test_actual_native_gross_store_failure_prefix_is_diagnosed_fail_closed(tmp_p
     diagnostic = admit_spider_run(tmp_path / facts["run_id"])
     assert diagnostic["decision"] == "REJECT"
     assert diagnostic["reason"] == "INCOMPLETE_PERSISTENCE"
+
+
+@pytest.mark.parametrize(("shape", "primary_reason", "matching", "expected"), [
+    pytest.param("E1", "ARTIFACT_LIMIT_EXCEEDED", True, "ARTIFACT_LIMIT_EXCEEDED", id="gross-E1-limit"),
+    pytest.param("E5", "ARTIFACT_LIMIT_EXCEEDED", True, "ARTIFACT_LIMIT_EXCEEDED", id="gross-E5-limit"),
+    pytest.param("E1", "ARTIFACT_WRITE_FAILED", True, "INCOMPLETE_PERSISTENCE", id="gross-E1-other-primary"),
+    pytest.param("E5", "ARTIFACT_WRITE_FAILED", True, "MISSING_COMPLETE_MANIFEST", id="gross-E5-other-primary"),
+    pytest.param("RUNNING_LIMIT_PRIMARY", "ARTIFACT_LIMIT_EXCEEDED", True,
+                 "MISSING_COMPLETE_MANIFEST", id="gross-RUNNING-limit-primary"),
+    pytest.param("E1", "ARTIFACT_LIMIT_EXCEEDED", False,
+                 "MISSING_COMPLETE_MANIFEST", id="gross-E1-unmatched"),
+])
+def test_diagnose_routes_matching_gross_limit_primary(
+    tmp_path: Any, t54_gross_artifacts, shape, primary_reason, matching, expected,
+):
+    artifacts = t54_gross_artifacts
+    status_path = tmp_path / "status.json"
+    journal_path = tmp_path / "journal.jsonl"
+    status = decode_jsonl(artifacts["status.json"])[0]
+    rows = decode_jsonl(artifacts["journal.jsonl"])
+    status["state"] = "FAILED"
+    status["failure_reason"] = "PERSISTENCE_FAILED"
+    status["primary_failure"] = {"kind": "PERSISTENCE", "reason": "ARTIFACT_LIMIT_EXCEEDED"}
+    persisted = dict(ordinal=len(rows), journal_seq=len(rows), barrier_id=rows[-1]["barrier_id"])
+    from src.core.backtest import spider_run_admission as admission
+    assert len(artifacts["status.json"]) < admission._LIMIT
+    assert len(artifacts["journal.jsonl"]) < admission._LIMIT
+
+    candidate = deepcopy(status)
+    candidate["state"] = "RUNNING" if shape.startswith("RUNNING") else "FAILED"
+    candidate["failure_reason"] = None if shape.startswith("RUNNING") else "PERSISTENCE_FAILED"
+    candidate["primary_failure"] = None if shape == "RUNNING" else {
+        "kind": "PERSISTENCE", "reason": primary_reason,
+    }
+    candidate["persisted_boundary"] = persisted if matching else None
+    candidate["processed_boundary"] = (
+        dict(ordinal=len(rows) + 1, journal_seq=len(rows) + 1, barrier_id="processed")
+        if shape == "E1" else persisted
+    )
+    status_path.write_bytes(encode_jsonl([candidate]))
+    journal_path.write_bytes(artifacts["journal.jsonl"])
+    directory = os.open(tmp_path, os.O_RDONLY)
+    try:
+        result = admission._diagnose(directory)
+    finally:
+        os.close(directory)
+    assert result == dict(
+        decision="REJECT", reason=expected,
+        evidence=("completion.json", "status.json", "journal.jsonl"),
+    )
 
 
 def test_actual_gross_initial_owner_failure_is_null_observation_prefix(tmp_path: Any):

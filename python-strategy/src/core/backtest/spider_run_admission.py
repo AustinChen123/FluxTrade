@@ -55,6 +55,7 @@ _FLOATING_NAMES = tuple(name for name, _, _ in _FLOATING_COMPLETION_ARTIFACTS)
 _FLOATING_ALL = (*_FLOATING_NAMES, "completion.json")
 _GROSS_NAMES = tuple(name for name, _, _ in _GROSS_COMPLETION_ARTIFACTS)
 _GROSS_ALL = (*_GROSS_NAMES, "completion.json")
+_LIMIT_REASON = _oversize_reason("P3", "v1", "journal.jsonl")
 
 
 class _Unsafe(Exception):
@@ -71,6 +72,23 @@ class _Invalid(Exception):
 
 def _reject(reason: str, evidence: tuple[str, ...]) -> dict[str, _Any]:
     return dict(decision="REJECT", reason=reason, evidence=evidence)
+
+
+def _limit_refusal(status: _Any) -> bool:
+    primary = status.get("primary_failure") if type(status) is dict else None
+    return (
+        type(status) is dict
+        and type(status.get("state")) is str
+        and status["state"] == "FAILED"
+        and type(status.get("failure_reason")) is str
+        and status["failure_reason"] == "PERSISTENCE_FAILED"
+        and type(primary) is dict
+        and set(primary) == {"kind", "reason"}
+        and type(primary.get("kind")) is str
+        and primary["kind"] == "PERSISTENCE"
+        and type(primary.get("reason")) is str
+        and primary["reason"] == _LIMIT_REASON
+    )
 
 
 def _regular(directory: int, name: str) -> None:
@@ -157,6 +175,8 @@ def _diagnose(directory: int) -> dict[str, _Any]:
                 matching = status["persisted_boundary"] == persisted and all(
                     row["run_id"] == status["run_id"] for row in journal
                 )
+                if matching and _limit_refusal(status):
+                    return _reject(_LIMIT_REASON, _DIAGNOSTIC)
                 failed_persistence = (status["state"] == "FAILED"
                                       and status["failure_reason"] == "PERSISTENCE_FAILED")
                 if matching and advanced and (failed_persistence or status["state"] == "RUNNING"):
@@ -173,6 +193,8 @@ def _diagnose(directory: int) -> dict[str, _Any]:
         matching_journal = status["persisted_boundary"] == persisted and all(
             row["run_id"] == status["run_id"] for row in journal
         )
+        if matching_journal and _limit_refusal(status):
+            return _reject(_LIMIT_REASON, _DIAGNOSTIC)
         failed_persistence = (status["state"] == "FAILED" and status["failure_reason"] == "PERSISTENCE_FAILED")
         running_p3_frontier = status["state"] == "RUNNING" and "historical_context" in status
         if (status["schema_version"] == "spider_status_v1" and matching_journal and advanced

@@ -181,6 +181,54 @@ def test_absent_completion_diagnostic_and_only_needed_opens(tmp_path, persisted,
     assert opened == [str(tmp_path), "status.json", "journal.jsonl"]
 
 
+@pytest.mark.parametrize(("shape", "primary", "matched", "expected"), [
+    ("E1", {"kind": "PERSISTENCE", "reason": "ARTIFACT_LIMIT_EXCEEDED"}, True, "ARTIFACT_LIMIT_EXCEEDED"),
+    ("E5", {"kind": "PERSISTENCE", "reason": "ARTIFACT_LIMIT_EXCEEDED"}, True, "ARTIFACT_LIMIT_EXCEEDED"),
+    ("E1", {"kind": "PERSISTENCE", "reason": "ARTIFACT_WRITE_FAILED"}, True, "INCOMPLETE_PERSISTENCE"),
+    ("E5", {"kind": "PERSISTENCE", "reason": "ARTIFACT_WRITE_FAILED"}, True, "MISSING_COMPLETE_MANIFEST"),
+    ("E1", {"kind": "PERSISTENCE", "reason": "ARTIFACT_LIMIT_EXCEEDED"}, False, "MISSING_COMPLETE_MANIFEST"),
+    ("RUNNING_LIMIT_PRIMARY", {"kind": "PERSISTENCE", "reason": "ARTIFACT_LIMIT_EXCEEDED"}, True, "MISSING_COMPLETE_MANIFEST"),
+], ids=["legacy-E1-limit", "legacy-E5-limit", "legacy-E1-other-primary",
+       "legacy-E5-other-primary", "legacy-E1-unmatched", "legacy-RUNNING-limit-primary"])
+def test_diagnose_routes_matching_legacy_limit_primary(tmp_path, shape, primary, matched, expected):
+    values = bundle(tmp_path)
+    status = values["status.json"]
+    rows = values["journal.jsonl"]
+    frontier = (dict(ordinal=len(rows), journal_seq=len(rows), barrier_id=rows[-1]["barrier_id"])
+                if rows else None)
+    status.update(
+        state="RUNNING" if shape.startswith("RUNNING") else "FAILED",
+        failure_reason=None if shape.startswith("RUNNING") else "PERSISTENCE_FAILED",
+        primary_failure=None if shape == "RUNNING" else primary,
+        processed_boundary=(dict(ordinal=len(rows) + 1, journal_seq=len(rows) + 1, barrier_id="processed")
+                            if shape == "E1" else frontier),
+        persisted_boundary=frontier,
+    )
+    if not matched and rows:
+        rows[-1]["run_id"] = "other-run"
+    (tmp_path / "status.json").write_bytes(framed(status, "status.json"))
+    (tmp_path / "journal.jsonl").write_bytes(framed(rows, "journal.jsonl"))
+    (tmp_path / "completion.json").unlink()
+    assert (tmp_path / "status.json").stat().st_size < DEFAULT_LIMIT
+    assert (tmp_path / "journal.jsonl").stat().st_size < DEFAULT_LIMIT
+    directory = os.open(tmp_path, os.O_RDONLY)
+    try:
+        result = admission._diagnose(directory)
+    finally:
+        os.close(directory)
+    assert result == dict(decision="REJECT", reason=expected, evidence=DIAGNOSTIC)
+
+
+def test_limit_refusal_requires_failed_state_and_exact_primary():
+    base = dict(state="FAILED", failure_reason="PERSISTENCE_FAILED",
+                primary_failure={"kind": "PERSISTENCE", "reason": "ARTIFACT_LIMIT_EXCEEDED"})
+    assert admission._limit_refusal(base)
+    assert not admission._limit_refusal({**base, "state": "RUNNING"})
+    assert not admission._limit_refusal({**base, "primary_failure": {
+        "kind": "PERSISTENCE", "reason": "ARTIFACT_LIMIT_EXCEEDED", "extra": 1,
+    }})
+
+
 @pytest.mark.parametrize("mutation", ["bytes", "sha256", "byte_count", "row_count", "semantic_digest", "oversize", "oversize_journal"])
 def test_actual_file_metadata_is_not_trusted(tmp_path, mutation):
     values = bundle(tmp_path)
