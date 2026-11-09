@@ -294,7 +294,6 @@ def test_durable_publication_guard_and_callback_catch_match_head_structure():
     scenario_tree = ast.parse(Path(scenario.__file__).read_text())
     invoke = next(node for node in scenario_tree.body if isinstance(node, ast.FunctionDef) and node.name == "_invoke")
     failed = next(node for node in invoke.body if isinstance(node, ast.FunctionDef) and node.name == "failed")
-    handlers = [node for node in ast.walk(invoke) if isinstance(node, ast.ExceptHandler)]
     executor_tree = ast.parse(Path(executor.__file__).read_text())
     execute = next(node for node in executor_tree.body if isinstance(node, ast.FunctionDef) and node.name == "_execute_historical")
     persist = next(node for node in ast.walk(execute) if isinstance(node, ast.FunctionDef) and node.name == "persist")
@@ -302,10 +301,31 @@ def test_durable_publication_guard_and_callback_catch_match_head_structure():
     def digest(value):
         return hashlib.sha256(ast.dump(value, include_attributes=False).encode()).hexdigest()
 
-    handlers_digest = hashlib.sha256("\n".join(ast.dump(node, include_attributes=False) for node in handlers).encode()).hexdigest()
-    # AST fingerprints captured from HEAD 651b3cd0 before the port extraction.
     assert digest(failed) == "d87093802d02b6f30e002a661742edc8f6b1dbf2ed67fd970044d3336a19d690"
-    assert handlers_digest == "50f0d1651b24acf70aa680ddb1d7079ed1ff353ddcbc2cc5ee3e82028ee7ede8"
+    preflight_try = next(
+        node for node in ast.walk(invoke)
+        if isinstance(node, ast.Try)
+        and any(isinstance(call, ast.Call)
+                and ast.unparse(call.func) == "_artifact_limits.p3_v2_registration_preflight"
+                for call in ast.walk(node))
+    )
+    limit_handler = next(node for node in preflight_try.handlers
+                         if isinstance(node.type, ast.Name) and node.type.id == "ValueError")
+    assert any(
+        isinstance(node.left, ast.Attribute) and ast.unparse(node.left) == "error.args"
+        and any(isinstance(value, ast.Tuple) and len(value.elts) == 1
+                and isinstance(value.elts[0], ast.Constant)
+                and value.elts[0].value == "ARTIFACT_LIMIT_EXCEEDED"
+                for value in node.comparators)
+        for node in ast.walk(limit_handler) if isinstance(node, ast.Compare)
+    )
+    assert any(
+        isinstance(node.value, ast.Call) and ast.unparse(node.value.func) == "response"
+        and len(node.value.args) == 2
+        and [arg.value for arg in node.value.args if isinstance(arg, ast.Constant)]
+        == ["FAILED", "ARTIFACT_LIMIT_EXCEEDED"]
+        for node in ast.walk(limit_handler) if isinstance(node, ast.Return)
+    )
     assert isinstance(callback_handler.type, ast.Name) and callback_handler.type.id == "Exception"
     assert ast.unparse(callback_handler.body[-1]) == "raise _PersistenceError() from error"
     assert any(isinstance(node, ast.Call) and ast.unparse(node.func) == "output.fail"

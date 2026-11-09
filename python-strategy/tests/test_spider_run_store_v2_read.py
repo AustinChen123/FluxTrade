@@ -310,3 +310,22 @@ def test_public_register_does_not_select_p3_v2(tmp_path, real_p3_artifacts):
         store.register(attempt, historical_input=real_p3_artifacts["historical_input.json"])
     assert store._state == "CREATED"
     assert list(store._path.iterdir()) == []
+
+
+def test_register_v2_guard_is_literal_first_statement_and_refuses_before_publish(tmp_path, real_p3_artifacts, monkeypatch):
+    import ast
+    import inspect
+    import textwrap
+
+    method = ast.parse(textwrap.dedent(inspect.getsource(module.SpiderRunStore.register)))
+    function = next(node for node in method.body if isinstance(node, ast.FunctionDef))
+    assert isinstance(function.body[0], ast.If)
+    assert "p3_v2_registration_preflight" in ast.unparse(function.body[0])
+    attempt = decode_jsonl(real_p3_artifacts["attempt.json"])[0]
+    attempt["artifact_encoding"] = "artifact_encoding_v2"
+    monkeypatch.setattr(module.artifact_limits, "p3_v2_scope_budget", lambda _: {"refused": True})
+    store = module.SpiderRunStore.create(str(tmp_path), cast(str, attempt["run_id"]))
+    with pytest.raises(ValueError, match="ARTIFACT_LIMIT_EXCEEDED"):
+        store.register(attempt, historical_input=real_p3_artifacts["historical_input.json"])
+    assert store._state == "CREATED"
+    assert list(store._path.iterdir()) == []

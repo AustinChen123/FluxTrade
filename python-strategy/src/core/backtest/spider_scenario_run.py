@@ -48,6 +48,7 @@ from src.core.backtest.spider_historical_input import (
     encode_historical_run_input as _encode_historical_input,
 )
 from src.core.backtest.spider_run_artifacts import decode_canonical as _decode  # noqa: F401 -- private test compatibility
+from src.core.backtest import spider_artifact_limits as _artifact_limits
 from src.core.backtest.spider_historical_execution import (
     _execute_historical, _normalized, _owner_requests, _terminal,
 )
@@ -967,7 +968,13 @@ def _invoke(
                 historical_input, run_id, _tokenized=True,
             )
             historical_attempt = _attempt(run_id, selector, bundle, hashes, _P3_RUN_CONTRACT)
-        except (OSError, ValueError, TypeError, KeyError):
+            if historical_attempt.get("artifact_encoding") == "artifact_encoding_v2":
+                _artifact_limits.p3_v2_registration_preflight(historical_attempt, historical_input)
+        except ValueError as error:
+            if error.args == ("ARTIFACT_LIMIT_EXCEEDED",):
+                return response("FAILED", "ARTIFACT_LIMIT_EXCEEDED")
+            return response("REJECTED", "UNSUPPORTED_CONFIGURATION")
+        except (OSError, TypeError, KeyError):
             return response("REJECTED", "UNSUPPORTED_CONFIGURATION")
     try:
         store = _Store.create(output_root, run_id)

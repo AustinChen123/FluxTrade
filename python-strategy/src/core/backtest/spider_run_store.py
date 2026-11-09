@@ -355,6 +355,10 @@ class SpiderRunStore:
         execution_input: bytes | None = None, floating_exit_input: bytes | None = None,
         gross_execution_input: bytes | None = None,
     ) -> str:
+        # Authoritative v2 guard is deliberately the first statement.
+        if (type(attempt) is dict and attempt.get("artifact_encoding") == "artifact_encoding_v2"
+                and historical_input is not None):
+            artifact_limits.p3_v2_registration_preflight(attempt, historical_input)
         self._allowed("CREATED")
         floating_exit = floating_exit_input is not None
         gross_execution = gross_execution_input is not None

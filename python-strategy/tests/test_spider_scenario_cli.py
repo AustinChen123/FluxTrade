@@ -155,6 +155,113 @@ def test_historical_cli_missing_input_rejects_without_run_directory(tmp_path, ca
     assert list(tmp_path.iterdir()) == []
 
 
+def test_historical_runner_preflight_refusal_precedes_create(tmp_path, monkeypatch):
+    run_input = _valid_run()
+    run_input = replace(run_input, run_id="limit-preflight", policy_source_sha256=run._P3_POLICY_SOURCE)
+    raw = encode_historical_run_input(run_input)
+    original = run._attempt
+
+    def v2_attempt(*args, **kwargs):
+        attempt = original(*args, **kwargs)
+        attempt["artifact_encoding"] = "artifact_encoding_v2"
+        return attempt
+
+    def forbidden_create(*args, **kwargs):
+        raise AssertionError("create called before preflight refusal")
+
+    monkeypatch.setattr(run, "_attempt", v2_attempt)
+    monkeypatch.setattr(run._artifact_limits, "p3_v2_scope_budget", lambda _: {"refused": True})
+    monkeypatch.setattr(run._Store, "create", forbidden_create)
+    result = run._invoke(str(tmp_path), "limit-preflight", run._P3_SELECTOR, None, raw)
+    assert result == dict(
+        run_id="limit-preflight", outcome="FAILED", reason="ARTIFACT_LIMIT_EXCEEDED",
+    )
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_d2_5_attempt_limit_exact_and_minus_one_with_real_attempt(
+    tmp_path, monkeypatch, real_p3_artifacts,
+):
+    attempt = decode_jsonl(real_p3_artifacts["attempt.json"])[0]
+    attempt["artifact_encoding"] = "artifact_encoding_v2"
+    raw = real_p3_artifacts["historical_input.json"]
+    attempt_bytes = len(canonical_bytes(attempt))
+    exact_cap = attempt_bytes + 65_536
+    monkeypatch.setattr(run._artifact_limits, "P3_V2_ATTEMPT_BYTES_LIMIT", exact_cap)
+    run._artifact_limits.p3_v2_registration_preflight(attempt, raw)
+
+    monkeypatch.setattr(run._artifact_limits, "P3_V2_ATTEMPT_BYTES_LIMIT", exact_cap - 1)
+    monkeypatch.setattr(run, "_attempt", lambda *args, **kwargs: attempt)
+
+    def forbidden_create(*args, **kwargs):
+        raise AssertionError("runner created a store after the D2.5 refusal")
+
+    monkeypatch.setattr(run._Store, "create", forbidden_create)
+    result = run._invoke(
+        str(tmp_path), attempt["run_id"], run._P3_SELECTOR, None, raw,
+    )
+    assert result == dict(
+        run_id=attempt["run_id"], outcome="FAILED", reason="ARTIFACT_LIMIT_EXCEEDED",
+    )
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_attempt_bytes_grow_with_schema_valid_planned_coverage():
+    from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_canonical
+    from src.core.backtest.spider_historical_input import encode_historical_run_input
+    from test_spider_historical_input import _rehashed_run
+    from test_spider_scenario_run import historical_input
+
+    base, _ = historical_input("coverage-growth")
+    longer_end = base.range_end_ms + base.bar_duration_ms
+    longer = _rehashed_run(
+        base,
+        trade_rows=base.trade_bars + tuple(
+            replace(max((row for row in base.trade_bars if row.product_id == product),
+                        key=lambda row: row.bar_open_ms),
+                    bar_open_ms=max(row.bar_open_ms for row in base.trade_bars if row.product_id == product)
+                    + base.bar_duration_ms,
+                    source_sequence=max(row.source_sequence for row in base.trade_bars if row.product_id == product) + 1)
+            for product in base.ordered_products
+        ),
+        mark_rows=base.mark_bars + tuple(
+            replace(max((row for row in base.mark_bars if row.product_id == product),
+                        key=lambda row: row.bar_open_ms),
+                    bar_open_ms=max(row.bar_open_ms for row in base.mark_bars if row.product_id == product)
+                    + base.bar_duration_ms,
+                    source_sequence=max(row.source_sequence for row in base.mark_bars if row.product_id == product) + 1)
+            for product in base.ordered_products
+        ),
+    )
+    configuration = decode_canonical(base.configuration_bytes)
+    for product in configuration["products"]:
+        product["marks"][0]["valid_to"] = longer_end
+    configuration_bytes = canonical_bytes(configuration)
+    longer = replace(
+        longer, range_end_ms=longer_end, configuration_bytes=configuration_bytes,
+        configuration_sha256=sha256(configuration_bytes).hexdigest(),
+        trade_manifest=replace(longer.trade_manifest, source_row_count=len(longer.trade_bars),
+                               normalized_row_count=len(longer.trade_bars),
+                               last_source_timestamp_ms=max(row.bar_open_ms for row in longer.trade_bars)),
+        mark_manifest=replace(longer.mark_manifest, source_row_count=len(longer.mark_bars),
+                              normalized_row_count=len(longer.mark_bars),
+                              last_source_timestamp_ms=max(row.bar_open_ms for row in longer.mark_bars)),
+        spec_after=tuple(replace(spec, effective_at_ms=longer_end) for spec in base.spec_after),
+    )
+
+    def make_attempt(value):
+        raw = encode_historical_run_input(value)
+        _, bundle, hashes = run._historical_configuration(raw, value.run_id)
+        result = run._attempt(value.run_id, run._P3_SELECTOR, bundle, hashes, run._P3_RUN_CONTRACT)
+        result["artifact_encoding"] = "artifact_encoding_v2"
+        return result
+
+    small = make_attempt(base)
+    large = make_attempt(longer)
+    assert len(large["planned_coverage"]) > len(small["planned_coverage"])
+    assert len(canonical_bytes(large)) > len(canonical_bytes(small))
+
+
 def test_historical_cli_preserves_invalid_invocation_precedence(tmp_path, capsys):
     code = cli.main(args(tmp_path, name="../invalid", selector="SPIDER_HISTORICAL_RESEARCH_RUN_V1")
                     + ["--historical-input", str(tmp_path / "missing.json")])
