@@ -952,13 +952,36 @@ def _malformed_floating_reconciliation_inputs(raw: bytes) -> list[tuple[str, byt
     return cases
 
 
-def test_floating_reconciliation_invalid_exception_chains_match_head():
-    from src.core.backtest import spider_execution_input as execution_input_module
-    from src.core.backtest.spider_floating_exit_input import decode_spider_floating_exit_input
-    from src.core.backtest.spider_run_artifacts import decode_canonical as decode_json
+@pytest.fixture(scope="module")
+def floating_reconciliation_invalid_exception_cases():
     from test_spider_floating_exit_run import _floating_registration_fixture
 
     run, _request, raw, _attempt = _floating_registration_fixture()
+    cases = _malformed_floating_reconciliation_inputs(raw)
+    assert len(cases) == 106
+    return run.run_id, tuple(cases)
+
+
+def _assert_exception_chain_matches(label, encoded, expected_decoder, actual_builder):
+    with pytest.raises(Exception) as expected:
+        expected_decoder(encoded)
+    with pytest.raises(Exception) as actual:
+        actual_builder()
+    assert _exception_tree(actual.value) == _exception_tree(expected.value), (
+        f"exception chain mismatch: {label}"
+    )
+
+
+@pytest.mark.parametrize("case_index", range(106), ids=lambda index: f"malformed-{index:03d}")
+def test_floating_reconciliation_invalid_exception_chains_match_head(
+    floating_reconciliation_invalid_exception_cases, case_index,
+):
+    from src.core.backtest import spider_execution_input as execution_input_module
+    from src.core.backtest.spider_floating_exit_input import decode_spider_floating_exit_input
+    from src.core.backtest.spider_run_artifacts import decode_canonical as decode_json
+
+    run_id, cases = floating_reconciliation_invalid_exception_cases
+    label, encoded = cases[case_index]
     artifacts = {
         name: b""
         for name in (
@@ -966,21 +989,58 @@ def test_floating_reconciliation_invalid_exception_chains_match_head():
             "paid_endpoint.json", "report.jsonl",
         )
     }
-    cases = _malformed_floating_reconciliation_inputs(raw)
-    assert len(cases) == 106
-    for label, encoded in cases:
-        changed = dict(artifacts, **{"execution_input.json": encoded})
-        if label in ("empty-bytes", "non-utf8"):
-            expected_decoder = decode_json
-        elif label in ("outer-missing-schema_version", "outer-wrong-schema_version"):
-            expected_decoder = execution_input_module.decode_spider_execution_input
-        else:
-            expected_decoder = decode_spider_floating_exit_input
-        with pytest.raises(BaseException) as expected:
-            expected_decoder(encoded)
-        with pytest.raises(BaseException) as actual:
-            evidence.build_execution_reconciliation(run.run_id, changed)
-        assert _exception_tree(actual.value) == _exception_tree(expected.value), label
+    changed = dict(artifacts, **{"execution_input.json": encoded})
+    if label in ("empty-bytes", "non-utf8"):
+        expected_decoder = decode_json
+    elif label in ("outer-missing-schema_version", "outer-wrong-schema_version"):
+        expected_decoder = execution_input_module.decode_spider_execution_input
+    else:
+        expected_decoder = decode_spider_floating_exit_input
+    _assert_exception_chain_matches(
+        label, encoded, expected_decoder,
+        lambda: evidence.build_execution_reconciliation(run_id, changed),
+    )
+
+
+def test_floating_exception_chain_mutant_reports_clear_mismatch(
+    floating_reconciliation_invalid_exception_cases, monkeypatch,
+):
+    from src.core.backtest.spider_floating_exit_input import decode_spider_floating_exit_input
+
+    run_id, cases = floating_reconciliation_invalid_exception_cases
+    label, encoded = cases[0]
+    artifacts = {name: b"" for name in (
+        "attempt.json", "status.json", "journal.jsonl", "execution_input.json",
+        "paid_endpoint.json", "report.jsonl",
+    )}
+    artifacts["execution_input.json"] = encoded
+    original = evidence.build_execution_reconciliation
+
+    def different_product_exception(*args, **kwargs):
+        try:
+            return original(*args, **kwargs)
+        except Exception as error:
+            raise RuntimeError("mutated product exception") from error
+
+    monkeypatch.setattr(evidence, "build_execution_reconciliation", different_product_exception)
+    with pytest.raises(AssertionError, match=f"exception chain mismatch: {label}"):
+        _assert_exception_chain_matches(
+            label, encoded, decode_spider_floating_exit_input,
+            lambda: evidence.build_execution_reconciliation(run_id, artifacts),
+        )
+
+
+def test_floating_exception_chain_timeout_propagates_as_timeout():
+    import signal
+
+    def timeout_from_sigalrm():
+        signal.raise_signal(signal.SIGALRM)
+
+    with pytest.raises(pytest.fail.Exception, match="Timeout \\(>300\\.0s\\) from pytest-timeout"):
+        _assert_exception_chain_matches(
+            "simulated-timeout", b"unused", lambda _raw: (_ for _ in ()).throw(ValueError("expected")),
+            timeout_from_sigalrm,
+        )
 
 
 def test_reconciliation_projection_helpers_reject_foreign_historical_tokens():
