@@ -34,7 +34,11 @@ class DurableHistoricalOutputAdapter(EvidenceSink):
     def fail(self, classification: str, reason: str, primary: dict[str, Any] | None,
              last_processed_boundary: dict[str, Any] | None,
              last_fully_recorded_row_ordinal: int | None) -> None:
-        self._store.publish_failure(reason, primary)
+        if reason == "ARTIFACT_LIMIT_EXCEEDED":
+            self.failure_result = reason
+            self._store.publish_failure("PERSISTENCE_FAILED", primary)
+        else:
+            self._store.publish_failure(reason, primary)
 
     def finish(self, initial_owner_evidence: dict[str, Any], final_owner_evidence: dict[str, Any],
                final_scheduler_observation: dict[str, Any], terminal: str,

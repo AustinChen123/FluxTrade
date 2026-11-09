@@ -13,7 +13,7 @@ from src.core.backtest.spider_run_envelope_schema import endpoint as _endpoint, 
 from src.core.backtest.spider_run_evidence import ReconciliationProjectionError as _ProjectionError, build_endpoint_artifacts as _build
 from src.core.backtest.spider_run_admission import admit_spider_run as _admit
 from src.core.backtest.spider_run_store import SpiderRunStore as _Store, SpiderRunStoreError as _StoreError
-from src.core.backtest.spider_run_errors import classify_historical_failure as _classify_historical_failure
+from src.core.backtest.spider_run_errors import classify_historical_failure as _classify_historical_failure, runner_reason_for as _runner_reason_for
 from src.core.backtest.synthetic_scenario_replay import _ReplayComposition, ReplayPersistenceError as _PersistenceError, _ScheduleError
 from src.core.backtest.spider_paid_endpoint import _classify_paid_endpoint_result as _classify_paid, _error as _paid_error
 from src.core.backtest.spider_run_execution_schema import canonical_paid_bytes as _paid_bytes, execution_context_from_input as _execution_context_from_input, validate_execution_artifact as _validate_execution_artifact
@@ -925,7 +925,7 @@ def _invoke(
             except _StoreError as newer:
                 error = newer
         return response("DURABILITY_UNKNOWN" if error.reason == "PUBLICATION_DURABILITY_UNKNOWN" else "FAILED",
-                        error.reason)
+                        _runner_reason_for(error))
     historical_run = None
     historical_attempt = None
     historical_token = None

@@ -71,13 +71,18 @@ def classify_historical_failure(
         )
         if isinstance(error, SpiderRunStoreError) and error.reason == "PUBLICATION_DURABILITY_UNKNOWN":
             return HistoricalFailure("PERSISTENCE_FAILED", error.reason, primary, True, True, True)
-        return HistoricalFailure("PERSISTENCE_FAILED", "PERSISTENCE_FAILED", primary, True, True, False)
+        reason = (
+            runner_reason_for(error)
+            if isinstance(error, SpiderRunStoreError) and error.reason == "PERSISTENCE_FAILED"
+            else "PERSISTENCE_FAILED"
+        )
+        return HistoricalFailure("PERSISTENCE_FAILED", reason, primary, True, True, False)
     if phase == "OUTER_INVOCATION":
         if native_failure is not None:
             return HistoricalFailure("NATIVE_FAULT", "NATIVE_FAULT", dict(kind="NATIVE", reason=native_failure["reason"]), closed, True, False)
         if isinstance(error, SpiderRunStoreError):
             classification = "DURABILITY_UNKNOWN" if error.reason == "PUBLICATION_DURABILITY_UNKNOWN" else "PERSISTENCE_FAILED"
-            return HistoricalFailure(classification, error.reason, error.primary_failure, closed, True, False)
+            return HistoricalFailure(classification, runner_reason_for(error), error.primary_failure, closed, True, False)
         if isinstance(error, ReconciliationProjectionError):
             return HistoricalFailure("ENDPOINT_RECONCILIATION_FAILED", "ENDPOINT_RECONCILIATION_FAILED", None, closed, True, False)
         return HistoricalFailure("UNEXPECTED_EXCEPTION", "UNEXPECTED_EXCEPTION", None, closed, False, False)

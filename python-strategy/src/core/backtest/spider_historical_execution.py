@@ -11,7 +11,11 @@ from src.core.backtest.spider_historical_input import (
     HistoricalRunInput as _HistoricalRunInput,
     ValidatedHistoricalInput as _ValidatedHistoricalInput,
 )
-from src.core.backtest.spider_run_errors import classify_historical_failure as _classify_failure
+from src.core.backtest.spider_run_errors import (
+    SpiderRunStoreError as _StoreError,
+    classify_historical_failure as _classify_failure,
+    runner_reason_for as _runner_reason_for,
+)
 from src.core.backtest.spider_historical_ports import EvidenceSink
 
 
@@ -126,8 +130,10 @@ def _execute_historical(
         reason, primary = _terminal(result, closed)
         if not closed:
             returned = output.fail(result["classification"], reason, primary, last_boundary, last_recorded_ordinal)
-            return reason if returned is None else returned
-        return output.failure_result if output.failure_result is not None else reason
+            return _runner_reason_for(_StoreError(reason, primary_failure=primary)) if returned is None else returned
+        return output.failure_result if output.failure_result is not None else _runner_reason_for(
+            _StoreError(reason, primary_failure=primary),
+        )
     final_capture = capture(cutoff, "FINAL", include_scheduler=True)
     return output.finish(
         initial, final_capture["owner_evidence"], final_capture["scheduler_observation"],

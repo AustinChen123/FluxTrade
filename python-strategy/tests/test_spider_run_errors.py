@@ -347,7 +347,7 @@ def test_durable_publication_guard_and_callback_catch_match_head_structure():
     def digest(value):
         return hashlib.sha256(ast.dump(value, include_attributes=False).encode()).hexdigest()
 
-    assert digest(failed) == "d87093802d02b6f30e002a661742edc8f6b1dbf2ed67fd970044d3336a19d690"
+    assert digest(failed) == "b777bf77378b6c572bf97773ec7ef726c99a393d2edc9dc08b2c443a9981b01d"
     preflight_try = next(
         node for node in ast.walk(invoke)
         if isinstance(node, ast.Try)
@@ -450,3 +450,90 @@ def test_runner_reason_for_requires_exact_primary_field_types():
 
     assert errors.runner_reason_for(error) == "PERSISTENCE_FAILED"
     assert error.__dict__ == before
+
+
+def test_outer_classifier_wires_limit_reason_but_keeps_status_classification():
+    primary = {"kind": "PERSISTENCE", "reason": "ARTIFACT_LIMIT_EXCEEDED"}
+    decision = errors.classify_historical_failure(
+        store.SpiderRunStoreError("PERSISTENCE_FAILED", primary_failure=primary),
+        "OUTER_INVOCATION", None, False,
+    )
+    assert (decision.classification, decision.reason, decision.primary_failure) == (
+        "PERSISTENCE_FAILED", "ARTIFACT_LIMIT_EXCEEDED", primary,
+    )
+
+
+def test_outer_classifier_keeps_non_limit_persistence_reason():
+    primary = {"kind": "PERSISTENCE", "reason": "ARTIFACT_WRITE_FAILED"}
+    decision = errors.classify_historical_failure(
+        store.SpiderRunStoreError("PERSISTENCE_FAILED", primary_failure=primary),
+        "OUTER_INVOCATION", None, False,
+    )
+    assert (decision.classification, decision.reason, decision.primary_failure) == (
+        "PERSISTENCE_FAILED", "PERSISTENCE_FAILED", primary,
+    )
+
+
+def test_callback_persistence_classifier_wires_limit_reason_and_preserves_primary():
+    primary = {"kind": "PERSISTENCE", "reason": "ARTIFACT_LIMIT_EXCEEDED"}
+    error = store.SpiderRunStoreError("PERSISTENCE_FAILED", primary_failure=primary)
+    decision = errors.classify_historical_failure(error, "CALLBACK_PERSIST", None, False)
+    assert (decision.classification, decision.reason, decision.primary_failure) == (
+        "PERSISTENCE_FAILED", "ARTIFACT_LIMIT_EXCEEDED", primary,
+    )
+
+
+def test_callback_persistence_classifier_keeps_non_limit_persistence_reason():
+    primary = {"kind": "PERSISTENCE", "reason": "ARTIFACT_WRITE_FAILED"}
+    error = store.SpiderRunStoreError("PERSISTENCE_FAILED", primary_failure=primary)
+    decision = errors.classify_historical_failure(error, "CALLBACK_PERSIST", None, False)
+    assert (decision.classification, decision.reason, decision.primary_failure) == (
+        "PERSISTENCE_FAILED", "PERSISTENCE_FAILED", primary,
+    )
+
+
+_DURABLE_FAIL_EXPECTED = {
+    "ARTIFACT_LIMIT_EXCEEDED": ("PERSISTENCE_FAILED", "ARTIFACT_LIMIT_EXCEEDED"),
+    "PERSISTENCE_FAILED": ("PERSISTENCE_FAILED", None),
+    "PUBLICATION_FAILED": ("PUBLICATION_FAILED", None),
+    "PUBLICATION_DURABILITY_UNKNOWN": ("PUBLICATION_DURABILITY_UNKNOWN", None),
+    "NATIVE_FAULT": ("NATIVE_FAULT", None),
+}
+_DURABLE_FAIL_PRIMARY_VARIANTS = (
+    ("none", None),
+    ("limit", {"kind": "PERSISTENCE", "reason": "ARTIFACT_LIMIT_EXCEEDED"}),
+    ("other", {"kind": "PERSISTENCE", "reason": "ARTIFACT_WRITE_FAILED"}),
+)
+
+
+def test_durable_fail_reason_primary_matrix_is_closed_and_nonempty():
+    assert tuple(_DURABLE_FAIL_EXPECTED) == (
+        "ARTIFACT_LIMIT_EXCEEDED", "PERSISTENCE_FAILED", "PUBLICATION_FAILED",
+        "PUBLICATION_DURABILITY_UNKNOWN", "NATIVE_FAULT",
+    )
+    assert tuple(name for name, _ in _DURABLE_FAIL_PRIMARY_VARIANTS) == ("none", "limit", "other")
+    assert len(_DURABLE_FAIL_EXPECTED) * len(_DURABLE_FAIL_PRIMARY_VARIANTS) == 15
+
+
+@pytest.mark.parametrize(
+    ("reason", "primary_name", "primary"),
+    tuple(
+        (reason, primary_name, deepcopy(primary))
+        for reason in _DURABLE_FAIL_EXPECTED
+        for primary_name, primary in _DURABLE_FAIL_PRIMARY_VARIANTS
+    ),
+    ids=lambda value: value if isinstance(value, str) else None,
+)
+def test_durable_fail_publishes_expected_reason_and_runner_result(reason, primary_name, primary):
+    del primary_name
+    published = []
+    adapter = durable_ports.DurableHistoricalOutputAdapter.__new__(
+        durable_ports.DurableHistoricalOutputAdapter,
+    )
+    adapter.failure_result = None
+    adapter._store = SimpleNamespace(
+        publish_failure=lambda status_reason, failure: published.append((status_reason, failure)),
+    )
+    adapter.fail("PERSISTENCE_FAILED", reason, primary, None, None)
+    expected_status, expected_result = _DURABLE_FAIL_EXPECTED[reason]
+    assert (published, adapter.failure_result) == ([(expected_status, primary)], expected_result)
