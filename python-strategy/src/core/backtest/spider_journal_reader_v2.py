@@ -212,6 +212,20 @@ def _pass_two(
     return result
 
 
+def _read_captured_p3_v2_journal(
+    captured: journal_buffer.OwnedP3V2Buffer,
+    *,
+    contexts: tuple[object, object], budget: Mapping[str, object],
+) -> P3V2JournalRead:
+    owned, metadata = captured.data, captured.wire_metadata
+    row_count = cast(int, metadata["row_count"])
+    first = _pass_one(owned, contexts=contexts, budget=budget)
+    if first["rows"] != row_count:
+        _raise("ARTIFACT_MISMATCH")
+    result = _pass_two(owned, contexts=contexts)
+    return P3V2JournalRead(result, metadata, first)
+
+
 def read_p3_v2_journal(
     path: str | os.PathLike[str],
     *,
@@ -225,14 +239,25 @@ def read_p3_v2_journal(
     captured = journal_buffer.capture_owned_p3_v2_buffer(
         path, expected_metadata=expected_metadata, journal_cap=journal_cap
     )
-    owned, metadata = captured.data, captured.wire_metadata
-    row_count = cast(int, metadata["row_count"])
-    first = _pass_one(owned, contexts=contexts, budget=budget)
-    if first["rows"] != row_count:
-        _raise("ARTIFACT_MISMATCH")
+    return _read_captured_p3_v2_journal(captured, contexts=contexts, budget=budget)
 
-    result = _pass_two(owned, contexts=contexts)
-    return P3V2JournalRead(result, metadata, first)
+
+def read_p3_v2_journal_at(
+    directory_fd: int,
+    name: str,
+    *,
+    expected_metadata: Mapping[str, object],
+    contexts: tuple[object, object],
+    budget: Mapping[str, object],
+) -> P3V2JournalRead:
+    """Read a v2 journal leaf relative to a previously validated directory fd."""
+    journal_cap = budget.get("J2")
+    if type(journal_cap) is not int or journal_cap < 0:
+        _raise("INVALID_ARTIFACT")
+    captured = journal_buffer.capture_owned_p3_v2_buffer_at(
+        directory_fd, name, expected_metadata=expected_metadata, journal_cap=journal_cap,
+    )
+    return _read_captured_p3_v2_journal(captured, contexts=contexts, budget=budget)
 
 
 def _contexts_from_retained_attempt_bytes(
@@ -256,6 +281,24 @@ def _contexts_from_retained_attempt_bytes(
     if type(configuration) is not dict or type(historical) is not dict:
         _raise("INVALID_ARTIFACT")
     return cast(dict[str, object], configuration), cast(dict[str, object], historical)
+
+
+def read_p3_v2_journal_from_attempt_bytes_at(
+    directory_fd: int,
+    name: str,
+    *,
+    expected_metadata: Mapping[str, object],
+    retained_attempt_bytes: object,
+    expected_attempt_sha256: object,
+    budget: Mapping[str, object],
+) -> P3V2JournalRead:
+    contexts = _contexts_from_retained_attempt_bytes(
+        retained_attempt_bytes, expected_attempt_sha256
+    )
+    return read_p3_v2_journal_at(
+        directory_fd, name, expected_metadata=expected_metadata,
+        contexts=contexts, budget=budget,
+    )
 
 
 def read_p3_v2_journal_from_attempt_bytes(

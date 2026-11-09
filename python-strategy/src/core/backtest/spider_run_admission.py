@@ -33,7 +33,7 @@ from src.core.backtest.spider_run_execution_schema import (
 from src.core.backtest.spider_run_execution_evidence import (
     build_execution_reconciliation as _build_execution_reconciliation,
 )
-from src.core.backtest.spider_journal_reader_v2 import read_p3_v2_journal_from_attempt_bytes as _read_p3_v2_journal
+from src.core.backtest.spider_journal_reader_v2 import read_p3_v2_journal_from_attempt_bytes_at as _read_p3_v2_journal_at
 from src.core.backtest.spider_artifact_limits import (
     DEFAULT_LIMIT as _LIMIT,
     GROSS_REPORT_LIMIT as _GROSS_REPORT_LIMIT,  # noqa: F401 - compatibility policy alias
@@ -373,7 +373,7 @@ def _admit_execution(directory: int, manifest: dict[str, _Any], completion_raw: 
 
 
 
-def _admit_p3_v2(directory: int, directory_path: str, manifest: dict[str, _Any], completion_raw: bytes) -> dict[str, _Any]:
+def _admit_p3_v2(directory: int, manifest: dict[str, _Any], completion_raw: bytes) -> dict[str, _Any]:
     """Admit a P3 bundle whose manifest selects the owned-buffer v2 journal reader."""
     names = _P3_NAMES
     all_names = _P3_ALL
@@ -454,8 +454,8 @@ def _admit_p3_v2(directory: int, directory_path: str, manifest: dict[str, _Any],
     if bad:
         return _reject("ARTIFACT_MISMATCH", tuple(name for name in names if name in bad))
     try:
-        journal_result = _read_p3_v2_journal(
-            _os.path.join(directory_path, "journal.jsonl"),
+        journal_result = _read_p3_v2_journal_at(
+            directory, "journal.jsonl",
             expected_metadata=metadata["journal.jsonl"],
             retained_attempt_bytes=attempt_raw,
             expected_attempt_sha256=attempt_entry["sha256"],
@@ -566,7 +566,7 @@ def _admit_p3_v2(directory: int, directory_path: str, manifest: dict[str, _Any],
     values["completion.json"] = manifest
     return dict(decision="ACCEPT", artifacts=values)
 
-def _admit(directory: int, directory_path: str | None = None) -> dict[str, _Any]:
+def _admit(directory: int) -> dict[str, _Any]:
     try:
         raw = _capture(directory, "completion.json")
     except FileNotFoundError:
@@ -610,9 +610,7 @@ def _admit(directory: int, directory_path: str | None = None) -> dict[str, _Any]
         None,
     )
     if journal_schema == "spider_journal_record_v2":
-        if directory_path is None:
-            return _reject("UNSAFE_ARTIFACT_PATH", ("run-directory",))
-        return _admit_p3_v2(directory, directory_path, manifest, raw)
+        return _admit_p3_v2(directory, manifest, raw)
     historical_manifest = "historical_context" in manifest
     names = _P3_NAMES if historical_manifest else _NAMES
     all_names = _P3_ALL if historical_manifest else _ALL
@@ -810,6 +808,6 @@ def admit_spider_run(path: str | _os.PathLike[str]) -> dict[str, _Any]:
     try:
         if not _stat.S_ISDIR(_os.fstat(directory).st_mode):
             return _reject("UNSAFE_ARTIFACT_PATH", ("run-directory",))
-        return _admit(directory, _os.path.abspath(name))
+        return _admit(directory)
     finally:
         _os.close(directory)

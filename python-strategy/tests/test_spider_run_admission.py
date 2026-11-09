@@ -555,3 +555,51 @@ def test_admit_dispatch_accepts_v2_bundle_with_retained_attempt_bytes(tmp_path, 
     assert result["decision"] == "ACCEPT", result
     assert result["artifacts"]["attempt.json"]["artifact_encoding"] == "artifact_encoding_v2"
     assert result["artifacts"]["journal.jsonl"]
+
+def test_admit_v2_rejects_journal_symlink(tmp_path, p3_v2_admission_bundle):
+    run_dir = _copy_v2_admission_bundle(p3_v2_admission_bundle, tmp_path)
+    journal = run_dir / "journal.jsonl"
+    outside = tmp_path / "outside-journal.jsonl"
+    outside.write_bytes(journal.read_bytes())
+    journal.unlink()
+    journal.symlink_to(outside)
+    assert admission.admit_spider_run(run_dir) == {
+        "decision": "REJECT", "reason": "UNSAFE_ARTIFACT_PATH", "evidence": ("journal.jsonl",),
+    }
+
+
+def test_admit_v2_rejects_symlink_swapped_after_regular_check(
+    tmp_path, p3_v2_admission_bundle, monkeypatch,
+):
+    run_dir = _copy_v2_admission_bundle(p3_v2_admission_bundle, tmp_path)
+    journal = run_dir / "journal.jsonl"
+    outside = tmp_path / "outside-journal.jsonl"
+    outside.write_bytes(journal.read_bytes())
+    original_regular = admission._regular
+    swapped = []
+
+    def regular_then_swap(directory, name):
+        original_regular(directory, name)
+        if name == "journal.jsonl" and not swapped:
+            journal.unlink()
+            journal.symlink_to(outside)
+            swapped.append(name)
+
+    monkeypatch.setattr(admission, "_regular", regular_then_swap)
+    result = admission.admit_spider_run(run_dir)
+    assert swapped == ["journal.jsonl"]
+    assert result["decision"] == "REJECT"
+    assert (result["reason"], result["evidence"]) in {
+        ("UNSAFE_ARTIFACT_PATH", ("journal.jsonl",)),
+        ("ARTIFACT_MISMATCH", ("journal.jsonl",)),
+    }
+
+
+def test_admit_v2_rejects_fifo_journal_without_blocking(tmp_path, p3_v2_admission_bundle):
+    run_dir = _copy_v2_admission_bundle(p3_v2_admission_bundle, tmp_path)
+    journal = run_dir / "journal.jsonl"
+    journal.unlink()
+    os.mkfifo(journal)
+    assert admission.admit_spider_run(run_dir) == {
+        "decision": "REJECT", "reason": "UNSAFE_ARTIFACT_PATH", "evidence": ("journal.jsonl",),
+    }
