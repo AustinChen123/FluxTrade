@@ -278,6 +278,31 @@ def test_registration_preflight_refuses_structural_scope_and_accepts_legal_twin(
     limits.p3_v2_registration_preflight(attempt, raw)
 
 
+def test_registration_preflight_rejects_attempt_coverage_mismatch():
+    from dataclasses import replace
+    from src.core.backtest import spider_scenario_run
+    from src.core.backtest.spider_historical_input import (
+        encode_historical_run_input, historical_planned_coverage,
+    )
+    from test_spider_historical_input import _valid_run
+
+    run = replace(_valid_run(), run_id="coverage-mismatch",
+                  policy_source_sha256=spider_scenario_run._P3_POLICY_SOURCE)
+    raw = encode_historical_run_input(run)
+    _, bundle, hashes = spider_scenario_run._historical_configuration(raw, run.run_id)
+    attempt = spider_scenario_run._attempt(
+        run.run_id, spider_scenario_run._P3_SELECTOR, bundle, hashes,
+        spider_scenario_run._P3_RUN_CONTRACT,
+    )
+    attempt["artifact_encoding"] = "artifact_encoding_v2"
+    attempt["planned_coverage"] = historical_planned_coverage(run)
+    attempt["planned_coverage"][0]["record_kind"] = "HISTORICAL_TIMER"
+
+    with pytest.raises(ValueError) as caught:
+        limits.p3_v2_registration_preflight(attempt, raw)
+    assert caught.value.args == ("INVALID_ARTIFACT",)
+
+
 def test_registration_preflight_rejects_when_budget_classifier_marks_scope_refused(monkeypatch):
     from dataclasses import replace
     from src.core.backtest.spider_historical_input import encode_historical_run_input, historical_planned_coverage
@@ -331,16 +356,48 @@ def test_registration_preflight_checks_each_other_artifact_cap_inclusively(
 def test_reviewer_h360_x2_input_is_accepted():
     from collections import Counter
     from dataclasses import replace
-    from pathlib import Path
+    from hashlib import sha256
     from src.core.backtest import spider_scenario_run
     from src.core.backtest.spider_historical_input import (
-        decode_historical_run_input, encode_historical_run_input, historical_planned_coverage,
+        BAR_DURATION_MS, encode_historical_run_input, historical_planned_coverage,
     )
     from src.core.backtest.spider_run_artifacts import canonical_bytes
+    from test_spider_historical_input import _manifest, _p2_configuration, _rows, _valid_run
 
-    source = Path("/Volumes/Dev/Scratch/agents/spider_throughput/S4/x/s3-3-after/h360_durable/runs/h360/historical_input.json")
-    run = decode_historical_run_input(source.read_bytes())
-    run = replace(run, policy_source_sha256=spider_scenario_run._P3_POLICY_SOURCE)
+    base = _valid_run()
+    end = base.range_start_ms + 360 * BAR_DURATION_MS
+    minutes = (end - base.warmup_start_ms) // BAR_DURATION_MS - 1
+    trade_rows = tuple(sorted(
+        _rows("A-USDT-SWAP", base.warmup_start_ms, trade=True,
+              minutes=minutes)
+        + _rows("B-USDT-SWAP", base.warmup_start_ms, trade=True,
+                minutes=minutes),
+        key=lambda row: (row.bar_open_ms, 0 if row.product_id.startswith("A-") else 1),
+    ))
+    mark_rows = tuple(sorted(
+        _rows("A-USDT-SWAP", base.warmup_start_ms, trade=False,
+              minutes=minutes)
+        + _rows("B-USDT-SWAP", base.warmup_start_ms, trade=False,
+                minutes=minutes),
+        key=lambda row: (row.bar_open_ms, 0 if row.product_id.startswith("A-") else 1),
+    ))
+    configuration = _p2_configuration()
+    for product in configuration["products"]:
+        product["marks"][0]["valid_to"] = end
+    configuration_bytes = canonical_bytes(configuration)
+    run = replace(
+        base,
+        run_id="reviewer-h360-generated",
+        policy_source_sha256=spider_scenario_run._P3_POLICY_SOURCE,
+        range_end_ms=end,
+        configuration_bytes=configuration_bytes,
+        configuration_sha256=sha256(configuration_bytes).hexdigest(),
+        trade_bars=trade_rows,
+        mark_bars=mark_rows,
+        trade_manifest=_manifest("P3_ORACLE_TRADE_V1", trade_rows, trade=True),
+        mark_manifest=_manifest("P3_ORACLE_MARK_V1", mark_rows, trade=False),
+        spec_after=tuple(replace(spec, effective_at_ms=end) for spec in base.spec_after),
+    )
     raw = encode_historical_run_input(run)
     _, bundle, hashes = spider_scenario_run._historical_configuration(raw, run.run_id)
     attempt = spider_scenario_run._attempt(
@@ -352,7 +409,7 @@ def test_reviewer_h360_x2_input_is_accepted():
     budget = limits.p3_v2_scope_budget(counts)
     assert budget["X2"] == 19_048_383
     assert budget["structural_bytes"] == 61_054_232 and not budget["refused"]
-    assert len(raw) == 1_858_827 and len(canonical_bytes(attempt)) + 65_536 == 622_244
+    assert len(canonical_bytes(attempt)) + 65_536 <= limits.P3_V2_ATTEMPT_BYTES_LIMIT
     limits.p3_v2_registration_preflight(attempt, raw)
 
 

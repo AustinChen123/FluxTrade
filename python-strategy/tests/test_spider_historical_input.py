@@ -46,9 +46,13 @@ ANSWERS_SHA256 = "30f412b0c1ddd1ae6ac779cb6c821efbef96f410f751781add33bc02991b1d
 P2_CONFIGURATION_SHA256 = "807054044bdd182274509535ecf8bbc4598f00b6a92b598c6228129a6ff11b70"
 
 
-def _rows(product: str, start: int, *, trade: bool) -> tuple[HistoricalBar, ...]:
+def _rows(
+    product: str, start: int, *, trade: bool, minutes: int = 1440,
+) -> tuple[HistoricalBar, ...]:
     result = []
-    for sequence, timestamp in enumerate(range(start, start + 1441 * BAR_DURATION_MS, BAR_DURATION_MS)):
+    for sequence, timestamp in enumerate(
+        range(start, start + (minutes + 1) * BAR_DURATION_MS, BAR_DURATION_MS)
+    ):
         row = HistoricalBar(
             product, timestamp, Decimal("100"), Decimal("100"), Decimal("100"),
             Decimal("100"), 1, sequence, Decimal("4") if trade else None,
