@@ -3,6 +3,8 @@
 import ast
 from pathlib import Path
 
+import pytest
+
 from src.core.backtest import spider_artifact_limits as limits
 
 
@@ -233,6 +235,88 @@ def test_p3_v2_coverage_rejects_empty_malformed_and_unknown_inputs():
             assert exc.args == ("INVALID_ARTIFACT",)
         else:
             raise AssertionError((structural, minimum))
+
+
+def test_registration_preflight_d2_5_exact_limits_and_refusal_twins():
+    from dataclasses import replace
+    from src.core.backtest.spider_historical_input import encode_historical_run_input
+    from src.core.backtest import spider_scenario_run
+    from test_spider_historical_input import _valid_run
+
+    run = replace(_valid_run(), run_id="preflight-test",
+                  policy_source_sha256=spider_scenario_run._P3_POLICY_SOURCE)
+    raw = encode_historical_run_input(run)
+    _, bundle, hashes = spider_scenario_run._historical_configuration(raw, run.run_id)
+    attempt = spider_scenario_run._attempt(
+        run.run_id, spider_scenario_run._P3_SELECTOR, bundle, hashes,
+        spider_scenario_run._P3_RUN_CONTRACT,
+    )
+    attempt["artifact_encoding"] = "artifact_encoding_v2"
+    limits.p3_v2_registration_preflight(attempt, raw)
+    historical = raw + b"x" * (limits.DEFAULT_LIMIT + 1 - len(raw))
+    try:
+        limits.p3_v2_registration_preflight(attempt, historical)
+    except ValueError as exc:
+        assert exc.args == ("ARTIFACT_LIMIT_EXCEEDED",)
+    else:
+        raise AssertionError("expected D2.5 historical input refusal")
+
+
+def test_registration_preflight_refuses_structural_scope_and_accepts_legal_twin():
+    from dataclasses import replace
+    from src.core.backtest.spider_historical_input import encode_historical_run_input, historical_planned_coverage
+    from test_spider_historical_input import _valid_run
+
+    run = replace(_valid_run(), run_id="preflight-test")
+    raw = encode_historical_run_input(run)
+    attempt = {"run_contract_id": "SPIDER_HISTORICAL_RESEARCH_RUN_V1", "artifact_encoding": "artifact_encoding_v2",
+               "planned_coverage": historical_planned_coverage(run)}
+    limits.p3_v2_registration_preflight(attempt, raw)
+    assert attempt["planned_coverage"]
+    limits.p3_v2_registration_preflight(attempt, raw)
+
+
+def test_registration_preflight_rejects_when_budget_classifier_marks_scope_refused(monkeypatch):
+    from dataclasses import replace
+    from src.core.backtest.spider_historical_input import encode_historical_run_input, historical_planned_coverage
+    from test_spider_historical_input import _valid_run
+
+    run = replace(_valid_run(), run_id="preflight-test")
+    attempt = {
+        "run_contract_id": "SPIDER_HISTORICAL_RESEARCH_RUN_V1",
+        "artifact_encoding": "artifact_encoding_v2",
+        "planned_coverage": historical_planned_coverage(run),
+    }
+    monkeypatch.setattr(limits, "p3_v2_scope_budget", lambda _: {"refused": True})
+    try:
+        limits.p3_v2_registration_preflight(attempt, encode_historical_run_input(run))
+    except ValueError as exc:
+        assert exc.args == ("ARTIFACT_LIMIT_EXCEEDED",)
+    else:
+        raise AssertionError("scope refusal was not applied")
+
+
+@pytest.mark.parametrize(("field", "value"), [("X2", 16_777_217), ("E2", 16_777_217)])
+def test_registration_preflight_rejects_each_other_artifact_cap(monkeypatch, field, value):
+    from dataclasses import replace
+    from src.core.backtest.spider_historical_input import encode_historical_run_input, historical_planned_coverage
+    from test_spider_historical_input import _valid_run
+
+    run = replace(_valid_run(), run_id="preflight-artifact-cap")
+    attempt = {
+        "run_contract_id": "SPIDER_HISTORICAL_RESEARCH_RUN_V1",
+        "artifact_encoding": "artifact_encoding_v2",
+        "planned_coverage": historical_planned_coverage(run),
+    }
+    budget = {"refused": False, "X2": limits.DEFAULT_LIMIT, "E2": limits.DEFAULT_LIMIT}
+    budget[field] = value
+    monkeypatch.setattr(limits, "p3_v2_scope_budget", lambda _: budget)
+    try:
+        limits.p3_v2_registration_preflight(attempt, encode_historical_run_input(run))
+    except ValueError as exc:
+        assert exc.args == ("ARTIFACT_LIMIT_EXCEEDED",)
+    else:
+        raise AssertionError(f"{field} other-artifact cap was not enforced")
 
 
 def test_p3_v2_uses_python_integers_and_scope_budgets_are_monotone():

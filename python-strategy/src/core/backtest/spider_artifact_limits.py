@@ -69,6 +69,7 @@ P3_V2_JOURNAL_CAP = min(P3_V2_WIRE_CEILING, P3_V2_MATERIAL_CEILING // P3_V2_EXP_
 P3_V2_ROW_MIN = 1_591
 P3_V2_RECONCILIATION_FLOOR = DEFAULT_LIMIT
 P3_V2_ENDPOINT_FLOOR = DEFAULT_LIMIT
+P3_V2_ATTEMPT_BYTES_LIMIT = DEFAULT_LIMIT
 P3_V2_X2_COEFFICIENT = (19_048_383, 6_119)
 P3_V2_E2_COEFFICIENT = (10_790_164, 6_119)
 
@@ -139,6 +140,43 @@ def p3_v2_scope_budget(coverage: Mapping[str, int]) -> dict[str, object]:
         "E2": e2,
         "refused": refused,
     }
+
+
+def p3_v2_registration_preflight(attempt: Mapping[str, object], historical_input: bytes) -> None:
+    """Reject a P3-v2 registration before store creation or publication."""
+    if not isinstance(attempt, Mapping) or type(historical_input) is not bytes:
+        raise ValueError("INVALID_ARTIFACT")
+    if attempt.get("run_contract_id") != "SPIDER_HISTORICAL_RESEARCH_RUN_V1":
+        raise ValueError("INVALID_ARTIFACT")
+    if attempt.get("artifact_encoding") != "artifact_encoding_v2":
+        return
+    if len(historical_input) > DEFAULT_LIMIT:
+        raise ValueError("ARTIFACT_LIMIT_EXCEEDED")
+    from src.core.backtest.spider_historical_input import (
+        _decode_historical_run_input_validated,
+        _historical_planned_coverage_for_input,
+    )
+
+    token = _decode_historical_run_input_validated(historical_input)
+    planned = _historical_planned_coverage_for_input(token)
+    counts = {kind: 0 for kind in P3_V2_COVERAGE_KINDS}
+    for row in planned:
+        kind = row["record_kind"]
+        if kind not in counts:
+            raise ValueError("INVALID_ARTIFACT")
+        counts[kind] += 1
+    if attempt.get("planned_coverage") != planned:
+        raise ValueError("INVALID_ARTIFACT")
+    coverage = counts
+    budget = p3_v2_scope_budget(coverage)
+    if budget["refused"]:
+        raise ValueError("ARTIFACT_LIMIT_EXCEEDED")
+    from src.core.backtest.spider_run_artifacts import canonical_bytes
+
+    if len(canonical_bytes(dict(attempt))) + 65_536 > P3_V2_ATTEMPT_BYTES_LIMIT:
+        raise ValueError("ARTIFACT_LIMIT_EXCEEDED")
+    if budget["X2"] > DEFAULT_LIMIT or budget["E2"] > DEFAULT_LIMIT:
+        raise ValueError("ARTIFACT_LIMIT_EXCEEDED")
 
 
 def artifact_limit(family: str, encoding: str, artifact: str) -> int | None:
