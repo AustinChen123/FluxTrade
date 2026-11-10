@@ -82,16 +82,26 @@ def test_p3_encoding_opt_in_does_not_escape_into_paid_families(
     assert result["outcome"] == "ADMITTED"
     attempt = decode_jsonl((tmp_path / run_id / "attempt.json").read_bytes())[0]
     assert attempt["artifact_encoding"] == "artifact_encoding_v1"
-@pytest.mark.parametrize("encoding", ["artifact_encoding_v1", "artifact_encoding_v2"])
-def test_p3_runner_uses_the_selected_attempt_encoding(tmp_path, monkeypatch, encoding):
+@pytest.mark.parametrize(
+    ("selected_encoding", "expected_encoding"),
+    [(None, "artifact_encoding_v2"),
+     ("artifact_encoding_v1", "artifact_encoding_v1"),
+     ("artifact_encoding_v2", "artifact_encoding_v2")],
+    ids=["runner-default-v2", "explicit-v1-compatibility", "explicit-v2"],
+)
+def test_p3_runner_uses_the_selected_attempt_encoding(
+    tmp_path, monkeypatch, selected_encoding, expected_encoding,
+):
     from test_spider_scenario_run import historical_input
 
-    value, raw = historical_input(f"p3-selected-{encoding[-2:]}")
-    monkeypatch.setattr(scenario, "_P3_ATTEMPT_ARTIFACT_ENCODING", encoding)
+    run_id = f"p3-selected-{expected_encoding[-2:]}-{selected_encoding or 'default'}"
+    value, raw = historical_input(run_id)
+    if selected_encoding is not None:
+        monkeypatch.setattr(scenario, "_P3_ATTEMPT_ARTIFACT_ENCODING", selected_encoding)
     result = scenario.run_spider_scenario(str(tmp_path), value.run_id, scenario._P3_SELECTOR, raw)
     assert result["outcome"] == "ADMITTED"
     attempt = scenario._admit(tmp_path / value.run_id)["artifacts"]["attempt.json"]
-    assert attempt["artifact_encoding"] == encoding
+    assert attempt["artifact_encoding"] == expected_encoding
 
 
 @pytest.mark.parametrize(

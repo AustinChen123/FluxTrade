@@ -256,6 +256,8 @@ def test_historical_report_bytes_match_head_e872b973(tmp_path):
 
 
 def test_historical_projection_error_occurs_after_final_captures_like_head(tmp_path, monkeypatch):
+    # This is a frozen legacy-v1 journal/status byte-fingerprint oracle.
+    monkeypatch.setattr(run, "_P3_ATTEMPT_ARTIFACT_ENCODING", "artifact_encoding_v1")
     value, raw = historical_input("report-error-head")
     captured = []
     capture = wire.ScenarioCodec.capture_snapshot
@@ -342,7 +344,9 @@ def test_durable_ports_preserve_callback_order_and_five_finish_inputs(tmp_path, 
     assert run.run_spider_scenario(str(tmp_path), value.run_id, run._P3_SELECTOR, raw) == (
         dict(run_id=value.run_id, outcome="ADMITTED", reason=None)
     )
-    rows = read(tmp_path, value.run_id, "journal.jsonl")
+    admitted = admit_spider_run(tmp_path / value.run_id)
+    assert admitted["decision"] == "ACCEPT"
+    rows = admitted["artifacts"]["journal.jsonl"]
     assert len(calls) == 3 * len(rows) and calls[-1][0] == "retain"
     for index, row in enumerate(rows):
         checkpoint_call, persist_call, retain_call = calls[index * 3:index * 3 + 3]
@@ -536,7 +540,7 @@ def test_h06_frozen_policy_limits_run_through_public_admission(
         ]
 
 
-def test_h06_policy_market_orders_cross_scheduler_native_and_notice_path(tmp_path):
+def test_h06_policy_market_orders_cross_scheduler_native_and_notice_path(tmp_path, monkeypatch):
     _, value = _oracle_run("H06", h06_variant="A")
     endpoint = value.range_start_ms + 5_022
     value = replace(
@@ -555,6 +559,7 @@ def test_h06_policy_market_orders_cross_scheduler_native_and_notice_path(tmp_pat
     assert result == dict(run_id=value.run_id, outcome="ADMITTED", reason=None)
     admitted = admit_spider_run(tmp_path / value.run_id)
     assert admitted["decision"] == "ACCEPT"
+    assert admitted["artifacts"]["attempt.json"]["artifact_encoding"] == "artifact_encoding_v2"
     journal = admitted["artifacts"]["journal.jsonl"]
     market_events = [
         event
@@ -1234,7 +1239,25 @@ def test_historical_filled_market_append_failure_keeps_native_mutation_and_unper
     result = row["payload"]["result"]
     fills = [fill for product in result["products"] for fill in product["fills"]]
     directory = tmp_path / value.run_id
-    journal = read(tmp_path, value.run_id, "journal.jsonl")
+    attempt_bytes = (directory / "attempt.json").read_bytes()
+    attempt = cast(dict[str, Any], decode_jsonl(attempt_bytes)[0])
+    coverage: dict[str, int] = {}
+    for item in attempt["planned_coverage"]:
+        kind = item["record_kind"]
+        coverage[kind] = coverage.get(kind, 0) + 1
+    from src.core.backtest import spider_artifact_limits, spider_journal_reader_v2
+
+    directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        journal = cast(list[dict[str, Any]], spider_journal_reader_v2.read_p3_v2_journal_for_diagnosis_at(
+            directory_fd,
+            "journal.jsonl",
+            retained_attempt_bytes=attempt_bytes,
+            expected_attempt_sha256=sha256(attempt_bytes).hexdigest(),
+            budget=spider_artifact_limits.p3_v2_scope_budget(coverage),
+        ).rows)
+    finally:
+        os.close(directory_fd)
     source_order = next(
         order
         for entry in journal

@@ -2,6 +2,7 @@
 
 import ast
 from collections.abc import Mapping
+from fractions import Fraction
 from pathlib import Path
 from typing import cast
 
@@ -90,7 +91,7 @@ def test_p3_v2_policy_constants_are_golden():
         limits.P3_V2_DEFCAP,
         limits.P3_V2_ROW_MAX,
         limits.P3_V2_ROW_MIN,
-    ) == (5, 425, 1_048_576, 1591)
+    ) == (7, 425, 1_048_576, 1591)
     assert (limits.P3_V2_HEADER_BYTES, limits.P3_V2_MAX_DEFINITION_BYTES) == (0, 4096)
     assert (
         limits.P3_V2_WIRE_CEILING,
@@ -112,8 +113,10 @@ def test_p3_v2_closed_record_kinds_match_common_schema():
     assert schema_kinds - {"DELIVERY_ATTEMPT"} == limits.P3_V2_RECORD_KINDS
 
 
-# Captured with the v2 D5.2 closed slots and D5.3 canonical bytes. H01-H10
-# came from the real research executor; F-IN/H60/H360 from stored replay rows.
+# Captured v2 wire metrics for every durable fixture family. H07 is omitted:
+# its oracle test exercises ScenarioCodec directly and creates no P3 attempt or journal.
+# endpoint-flat/partial: test_spider_historical_replay._historical_endpoint_case
+# (second policy row inactive), measured independently by the 3b r2 reviewer.
 P3_V2_FIXTURES = (
     ("F-IN", (287, 96, 24), (459303, 1177725, 616274, 346894), 80, 30894),
     ("H01", (23, 8, 2), (38460, 95284, 65035, 279066), 17, 6385),
@@ -123,9 +126,17 @@ P3_V2_FIXTURES = (
     ("H05", (4, 2, 0), (9395, 15004, 7869, 0), 2, 503),
     ("H06-A", (1, 1, 0), (4431, 5480, 5612, 0), 0, 0),
     ("H06-B", (1, 1, 0), (4431, 5363, 4292, 0), 0, 0),
+    ("H06-hold-boundary", (1, 1, 0), (4443, 5411, 2776, 0), 0, 0),
+    ("H06-elapsed-boundary", (1, 1, 0), (4446, 5423, 2788, 0), 0, 0),
+    ("H06-market-vertical", (1, 1, 0), (4445, 5536, 5150, 55221), 6, 2190),
     ("H08", (11, 4, 1), (18302, 46125, 23968, 0), 2, 491),
     ("H09", (11, 4, 1), (18823, 45525, 24109, 0), 4, 962),
     ("H10", (0, 1, 0), (5284, 0, 0, 0), 2, 530),
+    ("endpoint-flat", (11, 4, 1), (18964, 42869, 24620, 34061), 8, 3060),
+    ("endpoint-partial", (11, 4, 1), (19881, 43774, 25286, 34061), 10, 3852),
+    ("input-builder-flat", (11, 4, 1), (20659, 43177, 26260, 68253), 16, 6120),
+    ("input-builder-partial", (11, 4, 1), (21590, 44188, 27037, 68277), 18, 6912),
+    ("frozen-H03-order", (20, 7, 1), (31858, 79126, 39967, 8715), 2, 761),
     ("H60", (719, 240, 60), (1194812, 3004779, 1985534, 9492559), 482, 184479),
     ("H360", (4319, 1440, 360), (6891086, 18364493, 9853802, 15081552), 724, 276840),
 )
@@ -138,6 +149,18 @@ def test_p3_v2_fixture_calibration_admits_all_executable_scopes():
         "CALLBACK_RESULT",
         "SOURCE_GROUP_RESULT",
     )
+    max_definitions_per_market_step = max(
+        Fraction(definitions, market)
+        for _, (_, market, _), _, definitions, _ in P3_V2_FIXTURES
+    )
+    expected_defs_per_market = (
+        11 * max_definitions_per_market_step.numerator
+        + 10 * max_definitions_per_market_step.denominator - 1
+    ) // (10 * max_definitions_per_market_step.denominator)
+    assert max_definitions_per_market_step == Fraction(6, 1)
+    assert limits.P3_V2_DEFS_PER_MARKET == expected_defs_per_market == 7
+
+    b_sg_headroom = {}
     for name, (timers, market, cache), actual, definitions, def_bytes in P3_V2_FIXTURES:
         budget = limits.p3_v2_scope_budget(
             dict(zip(limits.P3_V2_COVERAGE_KINDS, (market, cache, timers), strict=True))
@@ -166,11 +189,14 @@ def test_p3_v2_fixture_calibration_admits_all_executable_scopes():
             name
         )
         assert actual_by_kind["SOURCE_GROUP_RESULT"] <= budget["B_SG"], name
+        b_sg_headroom[name] = budget["B_SG"] - actual_by_kind["SOURCE_GROUP_RESULT"]
         assert (
             definitions <= budget["table_max"]
             and def_bytes <= budget["table_bytes_max"]
         ), name
         assert def_bytes <= definitions * limits.P3_V2_DEFCAP, name
+    assert b_sg_headroom["H60"] == 69_611_414
+    assert b_sg_headroom["H360"] == 12_118_701
 
 
 def test_p3_v2_bounds_are_inclusive_and_refuse_only_above_limit():
@@ -201,10 +227,10 @@ def test_p3_v2_h360_derived_budget_matches_fixed_arithmetic():
         "SNAPSHOT_FACT": 14686,
         "CALLBACK_RESULT": 16522,
     }
-    assert (budget["table_max"], budget["table_bytes_max"]) == (7200, 3_060_000)
+    assert (budget["table_max"], budget["table_bytes_max"]) == (10_080, 4_284_000)
     assert (budget["structural_bytes"], budget["B_SG"], budget["L_wire"]) == (
-        61_054_232,
-        28_424_253,
+        62_278_232,
+        27_200_253,
         2_291_040,
     )
     assert (budget["U_wire"], budget["J2"], budget["X2"], budget["E2"]) == (
@@ -412,7 +438,7 @@ def test_reviewer_h360_x2_input_is_accepted():
     )
     budget = limits.p3_v2_scope_budget(counts)
     assert budget["X2"] == 19_048_383
-    assert budget["structural_bytes"] == 61_054_232 and not budget["refused"]
+    assert budget["structural_bytes"] == 62_278_232 and not budget["refused"]
     assert len(canonical_bytes(attempt)) + 65_536 <= limits.P3_V2_ATTEMPT_BYTES_LIMIT
     limits.p3_v2_registration_preflight(attempt, raw)
 

@@ -13,13 +13,19 @@ from src.core.backtest.spider_run_envelope_schema import journal as validate_jou
 
 def build_real_p3_artifacts(tmp_path_factory):
     from test_spider_scenario_run import historical_input as make_historical_input
-    from src.core.backtest.spider_scenario_run import run_spider_scenario
+    from src.core.backtest import spider_scenario_run as scenario
 
     root = tmp_path_factory.mktemp("j6-real-p3-finalize")
     run, raw = make_historical_input("j6-real-p3-finalize")
-    assert run_spider_scenario(str(root), run.run_id, "SPIDER_HISTORICAL_RESEARCH_RUN_V1", raw) == {
-        "run_id": run.run_id, "outcome": "ADMITTED", "reason": None,
-    }
+    # This fixture is legacy-v1 source material for v2 writer/reader conversion tests.
+    original_encoding = scenario._P3_ATTEMPT_ARTIFACT_ENCODING
+    scenario._P3_ATTEMPT_ARTIFACT_ENCODING = "artifact_encoding_v1"
+    try:
+        assert scenario.run_spider_scenario(
+            str(root), run.run_id, "SPIDER_HISTORICAL_RESEARCH_RUN_V1", raw,
+        ) == {"run_id": run.run_id, "outcome": "ADMITTED", "reason": None}
+    finally:
+        scenario._P3_ATTEMPT_ARTIFACT_ENCODING = original_encoding
     return {
         name: (root / run.run_id / name).read_bytes()
         for name in ("attempt.json", "status.json", "journal.jsonl", "endpoint.json",

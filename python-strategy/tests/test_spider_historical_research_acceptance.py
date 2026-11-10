@@ -189,6 +189,8 @@ def _install_observer(monkeypatch: pytest.MonkeyPatch):
 def test_full_fixture_durable_research_parity_and_independent_recompute(
     tmp_path, monkeypatch, run_id
 ):
+    # This compares persisted S0 legacy-v1 bundles against their frozen bytes.
+    monkeypatch.setattr(scenario, "_P3_ATTEMPT_ARTIFACT_ENCODING", "artifact_encoding_v1")
     baseline, raw = _fixture_input(run_id)
     run = historical_input.decode_historical_run_input(raw)
     expected_outcome = next(row[2] for row in _FIXTURES if row[0] == run_id)

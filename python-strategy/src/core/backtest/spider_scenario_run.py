@@ -72,7 +72,7 @@ _P2_PLAN_SHA256 = "8235c952a5d199825a2a77842b03f49e213ef707c0f30b24d8bf623fde53c
 _P2_CONFIG_SHA256 = "807054044bdd182274509535ecf8bbc4598f00b6a92b598c6228129a6ff11b70"
 _P2_RUN_CONTRACT = "SPIDER_SYNTHETIC_P2_CONFIGURED_RUN_V1"
 _P3_RUN_CONTRACT = "SPIDER_HISTORICAL_RESEARCH_RUN_V1"
-_P3_ATTEMPT_ARTIFACT_ENCODING = "artifact_encoding_v1"
+_P3_ATTEMPT_ARTIFACT_ENCODING = "artifact_encoding_v2"
 _P3_PROGRAM = (*_PROGRAM, "python-strategy/src/core/backtest/spider_historical_input.py",
                "python-strategy/src/core/backtest/spider_historical_replay.py",
                "python-strategy/src/core/backtest/spider_historical_ports.py",

@@ -884,7 +884,9 @@ def test_research_entry_executes_real_fixture_and_matches_durable_order(tmp_path
     assert validated_preparations["durable"] == 1
     durable_endpoint = read(tmp_path, value.run_id, "endpoint.json")[0]
     durable_report = read(tmp_path, value.run_id, "report.jsonl")
-    durable_journal = read(tmp_path, value.run_id, "journal.jsonl")
+    admitted = admission.admit_spider_run(tmp_path / value.run_id)
+    assert admitted["decision"] == "ACCEPT"
+    durable_journal = admitted["artifacts"]["journal.jsonl"]
     mode[0] = "research"
     research_before = validation_calls[0]
     result = entry.run_historical_research(raw)

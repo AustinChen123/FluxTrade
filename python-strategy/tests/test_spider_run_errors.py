@@ -1,6 +1,7 @@
 """HEAD byte and caller-oracle regressions for historical spider errors."""
 
 import ast
+from builtins import BaseExceptionGroup
 from copy import deepcopy
 import hashlib
 import json
@@ -232,6 +233,8 @@ def test_real_store_failure_outcomes_and_artifact_bytes_match_head(tmp_path, mon
                        if isinstance(n, ast.Call) and ast.unparse(n.func) == "self._journal.append")
     matrix = {}
     for case in cases:
+        # This matrix fingerprints legacy-v1 durable bytes captured from HEAD.
+        monkeypatch.setattr(scenario, "_P3_ATTEMPT_ARTIFACT_ENCODING", "artifact_encoding_v1")
         case_root = tmp_path / case
         case_root.mkdir()
         _, raw = historical_input("probe")
