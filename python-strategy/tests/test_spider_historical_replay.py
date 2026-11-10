@@ -11,6 +11,8 @@ from typing import Any, Literal, Protocol, TypedDict, cast, overload
 import pytest
 
 from src.core.backtest import synthetic_scenario_codec as wire
+from src.core.backtest import synthetic_scenario_replay as replay_module
+from src.core.backtest import spider_historical_input as historical_input_module
 from src.core.backtest.spider_run_admission import admit_spider_run
 from src.core.backtest.spider_policy import DEFAULTS
 from src.core.backtest.spider_historical_input import (
@@ -235,6 +237,35 @@ def _node(run: HistoricalRunInput, open_ms: int, step: int) -> wire.HistoricalNo
 def _composition(run: HistoricalRunInput, evidence_callback=None) -> _ReplayComposition:
     composition = _ReplayComposition._from_historical_run(run)
     composition._evidence_callback = evidence_callback
+    return composition
+
+
+def _admit_timer(raw_at: int, sequence: int, stable_id: str | None = None):
+    return dict(kind="HISTORICAL_TIMER", schedule_sequence=sequence,
+                stable_id=stable_id or f"P3_TIMER_{raw_at}", raw_at=raw_at), None
+
+
+def _admit_historical_group(sequence: int, account: wire.Account, *, at: int = 1_000):
+    return dict(kind="SOURCE_GROUP", schedule_sequence=sequence, group=dict(
+        schema_version="scenario_group_v1", group_id=f"group-{sequence}", account_key=deepcopy(account),
+        ordering_contract_id="HISTORICAL_ORDER_V1", group_effective_at=at, declared_member_count=1,
+        members=[dict(kind="CANCEL_EFFECT", stamp=dict(
+            event_id=f"event-{sequence}", effective_at=at, source_sequence=sequence, causal_parent_ids=["parent"],
+            ordering_contract_id="HISTORICAL_ORDER_V1", scenario_ordinal=50,
+        ), payload=dict(effects=[dict(detecting_event_id="detect", target_order_id=f"order-{sequence}",
+                                     reason="EXPLICIT_SCENARIO")]))],
+    )), None
+
+
+def _admit_composition() -> _ReplayComposition:
+    composition = _composition(_valid_run())
+    composition._queue, composition._records = [], {}
+    composition._admit_prefix3_counts = {}
+    composition._admit_class0_by_at = {}
+    composition._admit_indexed_record_count = 0
+    composition._admit_index_unsafe = False
+    composition._historical_poll_range = (5_000, 1_000_000)
+    composition._current_time = 0
     return composition
 
 
@@ -1590,13 +1621,34 @@ def test_historical_endpoint_and_reconciliation_project_authoritative_market_evi
 
 
 @pytest.mark.parametrize("partial_fill", [False, True])
-def test_historical_store_finalize_and_admission_accept_real_native_bundle(tmp_path, partial_fill):
+def test_historical_store_finalize_and_admission_accept_real_native_bundle(tmp_path, partial_fill, monkeypatch):
     run, attempt, status, journal, artifacts, _, store = _historical_endpoint_case(
         tmp_path, partial_fill=partial_fill, return_store=True,
     )
+    original_full_validator = historical_input_module.validate_historical_input
+    validation_calls = 0
+    def count_validation(value):
+        nonlocal validation_calls
+        validation_calls += 1
+        return original_full_validator(value)
+    monkeypatch.setattr(historical_input_module, "validate_historical_input", count_validation)
+    original_validate = historical_input_module._validate_historical_input_once
+    tokens = []
+    def capture_token(run):
+        token = original_validate(run)
+        tokens.append(token)
+        return token
+    monkeypatch.setattr(historical_input_module, "_validate_historical_input_once", capture_token)
     assert store.finalize(artifacts["endpoint"], artifacts["reconciliation"], artifacts["report"]) == "COMPLETE_PUBLISHED"
+    assert len(tokens) == validation_calls == 1
+    finalize_token = tokens[0]
+    for name, rows in (("endpoint.json", [artifacts["endpoint"]]),
+                       ("reconciliation.json", [artifacts["reconciliation"]]),
+                       ("report.jsonl", artifacts["report"])):
+        assert (store._path / name).read_bytes() == b"".join(canonical_bytes(row) + b"\n" for row in rows)
     raw_input = (store._path / "historical_input.json").read_bytes()
     assert raw_input == encode_historical_run_input(run)
+    before_admission = validation_calls
     manifest = cast(dict[str, Any], decode_canonical((store._path / "completion.json").read_bytes().rstrip(b"\n")))
     input_metadata = manifest["artifacts"][-1]
     assert input_metadata == dict(
@@ -1604,9 +1656,41 @@ def test_historical_store_finalize_and_admission_accept_real_native_bundle(tmp_p
         sha256=sha256(raw_input).hexdigest(), byte_count=len(raw_input), row_count=1,
     )
     admitted = admit_spider_run(store._path)
+    assert len(tokens) == 2 and validation_calls == before_admission + 1
+    assert tokens[1] is not finalize_token
     assert admitted["decision"] == "ACCEPT", admitted
     assert admitted["artifacts"]["historical_input.json"]["run_id"] == run.run_id
     assert admitted["artifacts"]["journal.jsonl"] == journal
+    assert status["state"] == "RUNNING"
+
+
+def test_legacy_v1_admits_a_legal_journal_row_over_one_mib(tmp_path):
+    _, _, _, journal, artifacts, _, store = _historical_endpoint_case(
+        tmp_path, partial_fill=False, return_store=True,
+    )
+    journal[0]["causal_parent_ids"] = ["legacy-parent-" + "x" * (1_048_576 + 32)]
+    raw_journal = b"".join(canonical_bytes(row) + b"\n" for row in journal)
+    assert len(canonical_bytes(journal[0])) + 1 > 1_048_576
+    assert len(raw_journal) <= 33_554_432
+    (store._path / "journal.jsonl").write_bytes(raw_journal)
+    assert store.finalize(
+        artifacts["endpoint"], artifacts["reconciliation"], artifacts["report"],
+    ) == "COMPLETE_PUBLISHED"
+    admitted = admit_spider_run(store._path)
+    assert admitted["decision"] == "ACCEPT", admitted
+    assert admitted["artifacts"]["journal.jsonl"] == journal
+
+
+def test_real_store_recomputes_report_and_rejects_corrupted_supplied_projection(tmp_path):
+    run, _, _, _, artifacts, _, store = _historical_endpoint_case(
+        tmp_path, partial_fill=True, return_store=True,
+    )
+    corrupted = deepcopy(artifacts["report"])
+    corrupted[0]["account_cash"] = "999999"
+    with pytest.raises(SpiderRunStoreError):
+        store.finalize(artifacts["endpoint"], artifacts["reconciliation"], corrupted)
+    assert (store._path / "status.json").exists()
+    status = cast(dict[str, Any], decode_canonical((store._path / "status.json").read_bytes().rstrip(b"\n")))
     assert status["state"] == "RUNNING"
 
 
@@ -2513,3 +2597,352 @@ def test_historical_timer_preserves_poll_start_terminal_and_stops_queue(monkeypa
     later_raw = first_raw + 5_000
     assert (later_raw * 16 + 9, 5, 1, f"P3_TIMER_{later_raw}") in composition._queue
     assert composition._records[(5, f"P3_TIMER_{later_raw}")]["result"]["classification"] == "PENDING"
+
+
+def _admit_variant(method_name, items, monkeypatch, *, commit=True, fail_push=None,
+                   push_then_fail=False, fail_final_copy=False, seed=False):
+    composition = _admit_composition()
+    if seed:
+        composition._admit_set_original(items)
+    pushes, original_push, original_copy, copy_count = [], replay_module.heapq.heappush, replay_module.deepcopy, 0
+
+    def heappush(queue, key):
+        pushes.append(key)
+        if fail_push == len(pushes) and not push_then_fail:
+            raise RuntimeError("INJECTED_HEAPPUSH_FAILURE")
+        original_push(queue, key)
+        if fail_push == len(pushes) and push_then_fail:
+            raise RuntimeError("INJECTED_HEAPPUSH_FAILURE")
+
+    def copied(value):
+        nonlocal copy_count
+        copy_count += 1
+        if fail_final_copy and copy_count == 2:
+            raise RuntimeError("INJECTED_POST_COMMIT_DEEPCOPY_FAILURE")
+        return original_copy(value)
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(replay_module.heapq, "heappush", heappush)
+        patcher.setattr(replay_module, "deepcopy", copied)
+        try:
+            outcome = ("return", getattr(composition, method_name)(items, commit=commit))
+        except Exception as error:
+            outcome = ("raise", type(error), error.args)
+    return outcome, composition._records, composition._queue, pushes
+
+@pytest.mark.parametrize(
+    ("fail_push", "push_then_fail", "fail_final_copy"),
+    [(2, False, False), (2, True, False), (None, False, True)],
+)
+def test_admit_set_contract_a_matches_original_partial_commit_and_post_commit_errors(monkeypatch, fail_push, push_then_fail, fail_final_copy):
+    items = [_admit_timer(5_000, 1)] if fail_final_copy else [_admit_timer(5_000, 1), _admit_timer(10_000, 2)]
+    kwargs = dict(fail_push=fail_push, push_then_fail=push_then_fail, fail_final_copy=fail_final_copy)
+    original = _admit_variant("_admit_set_original", items, monkeypatch, **kwargs)
+    optimized = _admit_variant("_admit_set", items, monkeypatch, **kwargs)
+    assert optimized == original
+    error = "INJECTED_POST_COMMIT_DEEPCOPY_FAILURE" if fail_final_copy else "INJECTED_HEAPPUSH_FAILURE"
+    assert optimized[0] == ("raise", RuntimeError, (error,))
+
+@pytest.mark.parametrize("case", ["commit_false", "duplicate_only"])
+def test_admit_set_contract_a_matches_original_non_mutating_and_duplicate_calls(monkeypatch, case):
+    items = [_admit_timer(5_000, 1)]
+    kwargs = {"commit": False} if case == "commit_false" else {"seed": True}
+    assert _admit_variant("_admit_set", items, monkeypatch, **kwargs) == _admit_variant(
+        "_admit_set_original", items, monkeypatch, **kwargs,
+    )
+
+def test_admit_set_contract_a_preserves_historical_same_time_class_zero_buckets(monkeypatch):
+    composition = _admit_composition()
+    items = [_admit_historical_group(seq, composition._account) for seq in (1, 2)]
+    optimized = _admit_variant("_admit_set", items, monkeypatch)
+    assert optimized == _admit_variant("_admit_set_original", items, monkeypatch)
+    assert [key[2] for key in optimized[2]] == [1, 2]
+
+
+def test_admit_set_same_call_duplicate_identity_uses_overlay_without_fallback(monkeypatch):
+    items = [_admit_timer(5_000, 1), _admit_timer(5_000, 1)]
+    optimized = _admit_variant("_admit_set", items, monkeypatch)
+    original = _admit_variant("_admit_set_original", items, monkeypatch)
+    assert optimized == original
+    assert len(optimized[1]) == len(optimized[2]) == 1
+
+def test_admit_set_contract_a_validation_failure_has_no_partial_state(monkeypatch):
+    items = [_admit_timer(5_000, 1), _admit_timer(5_000, 2)]
+    optimized = _admit_variant("_admit_set", items, monkeypatch)
+    assert optimized == _admit_variant("_admit_set_original", items, monkeypatch)
+    assert optimized[0] == ("raise", _ScheduleError, ("INVALID_SCHEMA",))
+    assert optimized[1] == {} and optimized[2] == [] and optimized[3] == []
+
+
+def test_admit_set_native_builder_failure_calls_once_and_matches_original_store(monkeypatch):
+    base = _valid_run()
+    trade = tuple(
+        replace(row, high=D("103"), low=D("98"), volume=D("1"))
+        if row.product_id == "A-USDT-SWAP" else row
+        for row in base.trade_bars
+    )
+    run = _rehashed_run(base, trade_rows=trade)
+
+    def exercise(method_name):
+        composition = _composition(run)
+        composition._policy.rows[1]["active"] = "false"
+        start = run.range_start_ms
+        composition._dispatch_due((start + 5_020) * 16 + 6)
+        composition._dispatch_due((start + 5_021) * 16 + 3)
+        for row in composition._policy.rows:
+            row["active"] = "false"
+        composition._dispatch_due(run.range_end_ms * 16 + 6)
+        delivery = deepcopy(next(
+            record["item"]["delivery"] for record in composition._records.values()
+            if record["item"]["kind"] == "DELIVERY"
+            and record["item"]["delivery"]["payload_kind"] == "EXECUTION_FACT"
+        ))
+        delivery["occurrence_index"] += 100_000
+        item = {"kind": "DELIVERY", "delivery": delivery}
+        calls = []
+        builder_type = type(composition._codec)
+        original_builder = builder_type.build_delivery
+        projection = []
+
+        def counted_builder(codec, value):
+            if codec is composition._codec:
+                projection.append(deepcopy(value))
+                calls.append(True)
+            return original_builder(codec, value)
+
+        with monkeypatch.context() as patcher:
+            patcher.setattr(builder_type, "build_delivery", counted_builder)
+            try:
+                getattr(composition, method_name)([(item, None)])
+                outcome = ("return",)
+            except Exception as error:
+                outcome = ("raise", type(error), error.args)
+            admission_calls = len(calls)
+            assert admission_calls == 1 and len(projection) == 1
+            changed = deepcopy(projection[0])
+            changed["visible_at"] += 16
+            try:
+                original_builder(composition._codec, changed)
+                store_probe = ("return",)
+            except Exception as error:
+                store_probe = ("raise", type(error), error.args)
+        return outcome, admission_calls, composition._records, composition._queue, store_probe
+
+    optimized = exercise("_admit_set")
+    original = exercise("_admit_set_original")
+    assert optimized == original
+    assert optimized[0] == ("raise", _ScheduleError, ("INVALID_SCHEMA",))
+    assert optimized[1] == 1
+    assert optimized[4][0] == "raise" and optimized[4][2] == ("DELIVERY_ID_CONFLICT",)
+
+def test_admit_set_contract_a_unsafe_iterator_and_hook_use_original_before_consumption(monkeypatch):
+    fallback_calls = []
+    original = _ReplayComposition._admit_set_original
+
+    class OneShot:
+        calls = 0
+        def __iter__(self):
+            self.calls += 1
+            return iter([_admit_timer(5_000, 1)])
+
+    class HookDict(dict):
+        hook_calls = 0
+        def get(self, key, default=None):
+            self.hook_calls += 1
+            return super().get(key, default)
+
+    def fallback_spy(self, items, commit=True):
+        fallback_calls.append(True)
+        assert not isinstance(items, OneShot) or items.calls == 0
+        assert not (type(items) is list and items and type(items[0][0]) is HookDict) or items[0][0].hook_calls == 0
+        return original(self, items, commit)
+
+    monkeypatch.setattr(_ReplayComposition, "_admit_set_original", fallback_spy)
+    iterator = OneShot()
+    _admit_composition()._admit_set(iterator, commit=False)
+    hooked_item = HookDict(_admit_timer(5_000, 1)[0])
+    _admit_composition()._admit_set([(hooked_item, None)], commit=False)
+    assert (iterator.calls, hooked_item.hook_calls, len(fallback_calls)) == (1, 1, 2)
+
+def test_admit_set_contract_a_valid_call_has_zero_fallbacks(monkeypatch):
+    fallback_calls = []
+    original = _ReplayComposition._admit_set_original
+
+    def fallback_spy(self, items, commit=True):
+        fallback_calls.append(True)
+        return original(self, items, commit)
+
+    monkeypatch.setattr(_ReplayComposition, "_admit_set_original", fallback_spy)
+    assert _admit_composition()._admit_set([_admit_timer(5_000, 1)]) == [
+        {"kind": "HISTORICAL_TIMER", "stable_id": "P3_TIMER_5000", "classification": "PENDING"}
+    ]
+    assert fallback_calls == []
+
+
+def test_admit_set_index_is_updated_at_commit(monkeypatch):
+    composition = _admit_composition()
+    composition._admit_set([_admit_timer(5_000, 1)])
+    record = composition._records[(5, "P3_TIMER_5000")]
+    assert composition._admit_indexed_record_count == len(composition._records) == 1
+    assert composition._admit_prefix3_counts[record["key"][:3]] == 1
+    assert composition._admit_class0_by_at == {}
+
+
+def test_admit_set_original_commit_updates_index_and_next_safe_call_stays_fast(monkeypatch):
+    composition = _admit_composition()
+    fallbacks = []
+    original = _ReplayComposition._admit_set_original
+
+    def fallback(self, items, commit=True):
+        fallbacks.append(True)
+        return original(self, items, commit)
+
+    monkeypatch.setattr(_ReplayComposition, "_admit_set_original", fallback)
+    composition._admit_set(iter([_admit_historical_group(1, composition._account)]))
+    record = next(iter(composition._records.values()))
+    assert composition._admit_indexed_record_count == len(composition._records) == 1
+    assert composition._admit_prefix3_counts[record["key"][:3]] == 1
+    assert composition._admit_class0_by_at[record["key"][0]] == [record]
+    assert composition._admit_index_unsafe is False
+    assert composition._admit_set([_admit_historical_group(2, composition._account)])
+    assert fallbacks == [True]
+
+
+def test_admit_set_depth_700_input_matches_original(monkeypatch):
+    nested = []
+    for _ in range(700):
+        nested = [nested]
+    cases = [
+        [(_admit_timer(5_000, 1)[0], {"ignored": nested})],
+        [({**_admit_timer(5_000, 1)[0], "ignored": nested}, None)],
+    ]
+    for items in cases:
+        optimized = _admit_variant("_admit_set", items, monkeypatch)
+        original = _admit_variant("_admit_set_original", items, monkeypatch)
+        assert optimized == original
+        assert optimized[0][0] == "return" or optimized[0][1] is _ScheduleError
+
+
+def test_admit_set_custom_metaclass_equality_successful_commit_matches_original(monkeypatch):
+    equality_calls = []
+
+    class Meta(type):
+        __hash__ = type.__hash__
+
+        def __eq__(cls, other):
+            equality_calls.append((cls, other))
+            raise RuntimeError("CUSTOM_TYPE_EQUALITY")
+
+    class HookDict(dict, metaclass=Meta):
+        pass
+
+    item = HookDict(_admit_timer(5_000, 1)[0])
+    items = [(item, None)]
+
+    def execute(method_name):
+        composition = _admit_composition()
+        pushes = []
+        real_heappush = replay_module.heapq.heappush
+
+        def counted_heappush(queue, key):
+            pushes.append(key)
+            real_heappush(queue, key)
+
+        with monkeypatch.context() as patcher:
+            patcher.setattr(replay_module.heapq, "heappush", counted_heappush)
+            try:
+                outcome = ("return", getattr(composition, method_name)(items))
+            except Exception as error:
+                outcome = ("raise", type(error), error.args)
+        hook_calls = len(equality_calls)
+        record_rows = [
+            (key, record["key"], record["content"], dict(record["item"]), record["result"],
+             type(record["item"]) is HookDict)
+            for key, record in composition._records.items()
+        ]
+        state = (
+            outcome,
+            record_rows,
+            composition._queue,
+            pushes,
+            composition._admit_index_unsafe,
+            composition._admit_indexed_record_count,
+        )
+        return state, hook_calls
+
+    optimized, optimized_hook_calls = execute("_admit_set")
+    equality_calls.clear()
+    original, original_hook_calls = execute("_admit_set_original")
+    assert optimized_hook_calls == original_hook_calls == 0
+    expected_key = (80_009, 5, 1, "P3_TIMER_5000")
+    expected_result = [{"kind": "HISTORICAL_TIMER", "stable_id": "P3_TIMER_5000", "classification": "PENDING"}]
+    for state in (optimized, original):
+        assert state[0] == ("return", expected_result)
+        assert len(state[1]) == len(state[2]) == len(state[3]) == 1
+        assert state[2] == state[3] == [expected_key]
+        assert state[1][0][:2] == ((5, "P3_TIMER_5000"), expected_key)
+        assert state[1][0][3] == dict(item)
+        assert state[1][0][4] == expected_result[0]
+        assert state[1][0][5] is True
+        assert state[4:] == (True, 0)
+    assert optimized == original
+
+
+def test_admit_set_stale_index_falls_back_after_direct_records_write(monkeypatch):
+    composition = _admit_composition()
+    item, plan = _admit_timer(5_000, 1)
+    composition._records[(5, "DIRECT_WRITE")] = composition._queue_record(item, plan)
+    fallback_calls = []
+    original = _ReplayComposition._admit_set_original
+
+    def fallback(self, items, commit=True):
+        fallback_calls.append(True)
+        return original(self, items, commit)
+
+    monkeypatch.setattr(_ReplayComposition, "_admit_set_original", fallback)
+    with pytest.raises(_ScheduleError, match="INVALID_SCHEMA"):
+        composition._admit_set([(item, plan)], commit=False)
+    assert fallback_calls == [True]
+
+
+def test_admit_set_per_call_work_is_independent_of_committed_record_count(monkeypatch):
+    composition = _admit_composition()
+    composition._historical_poll_range = (5_000, 10_000_000)
+    items = [_admit_timer(5_000 + i * 5_000, i) for i in range(1_200)]
+    composition._admit_set(items)
+
+    class TouchedRecords:
+        def __init__(self, rows):
+            self.rows = dict(rows)
+            self.gets = self.scans = 0
+        def __len__(self):
+            return len(self.rows)
+        def get(self, key, default=None):
+            self.gets += 1
+            return self.rows.get(key, default)
+        def __iter__(self):
+            self.scans += 1
+            raise AssertionError("record map iterated")
+
+    class TouchedIndex(dict):
+        def __init__(self, rows):
+            super().__init__(rows)
+            self.gets = 0
+        def get(self, key, default=None):
+            self.gets += 1
+            return super().get(key, default)
+
+    records = TouchedRecords(composition._records)
+    composition._records = cast(Any, records)
+    prefixes = composition._admit_prefix3_counts = TouchedIndex(composition._admit_prefix3_counts)
+    fallback_calls = []
+    original = _ReplayComposition._admit_set_original
+
+    def fallback(self, values, commit=True):
+        fallback_calls.append(True)
+        return original(self, values, commit)
+
+    monkeypatch.setattr(_ReplayComposition, "_admit_set_original", fallback)
+    result = composition._admit_set([_admit_timer(6_005_000, 2_000)], commit=False)
+    assert result[0]["classification"] == "PENDING"
+    assert (records.gets, records.scans, prefixes.gets, fallback_calls) == (1, 0, 1, [])

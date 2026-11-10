@@ -1,9 +1,12 @@
 """The single pure reconciliation projection/predicate owner; never admission."""
 
 from copy import deepcopy as _copy
+from enum import Enum as _Enum
 from hashlib import sha256 as _sha256
 from struct import pack as _pack
 from typing import Any as _Any
+from typing import Final as _Final
+from typing import Literal as _Literal
 from typing import cast as _cast
 
 from src.core.backtest.spider_policy_protocol import (
@@ -19,6 +22,10 @@ from src.core.backtest.spider_run_artifacts import (
     _historical_context,
     canonical_bytes as _bytes,
 )
+from src.core.backtest.spider_historical_report_projection import (
+    FinalOwnerEvidenceValues as _FinalOwnerEvidenceValues,
+    project_historical_report as _project_historical_report,
+)
 from src.core.backtest.spider_run_completion_schema import report as _validate_report
 from src.core.backtest.spider_run_envelope_schema import (
     endpoint as _validate_endpoint, journal_record as _validate_journal_record,
@@ -26,6 +33,7 @@ from src.core.backtest.spider_run_envelope_schema import (
 from src.core.backtest.spider_run_reconciliation_schema import _CHECKS, reconciliation as _validate
 from src.core.backtest.spider_configured_scale_input import _configured_scale_projection_oracle
 from src.core.backtest.spider_scenario_plans import plan_bundle as _plan_bundle
+from src.core.backtest.spider_run_errors import ReconciliationProjectionError
 
 _INITIAL = "artifact:endpoint.json#/initial_owner_evidence"
 _FINAL = "artifact:endpoint.json#/final_owner_evidence"
@@ -35,13 +43,8 @@ _P2_SELECTOR = "SPIDER_P2_CONFIGURED_SCALE_V1"
 _P2_PLAN_SHA256 = "8235c952a5d199825a2a77842b03f49e213ef707c0f30b24d8bf623fde53c2b3"
 
 
-class ReconciliationProjectionError(ValueError):
-    """Required evidence cannot be represented by the frozen eleven shapes."""
-
-    reason = "ENDPOINT_RECONCILIATION_FAILED"
-
-    def __init__(self) -> None:
-        super().__init__(self.reason)
+class _IndexFallback(Exception):
+    """Internal signal to discard a guarded index and use the original scan."""
 
 
 def _historical_snapshot_matches(owner: dict[str, _Any], cutoff: int,
@@ -307,7 +310,7 @@ def _historical_native_notice_mode_compatible(
         return False
 
 
-def _historical_polls_endpoint_mode_compatible(
+def _historical_polls_endpoint_mode_compatible_original(
     observation: dict[str, _Any], cutoff: int, mode: _HistoricalSequenceMode,
     paid_prefix: str | None = None, allow_terminal_delivery: bool = False,
 ) -> bool:
@@ -438,6 +441,304 @@ def _historical_polls_endpoint_mode_compatible(
     return True
 
 
+class _HistoricalFastPathFallback(_Enum):
+    FALLBACK = "fallback"
+
+
+_HISTORICAL_FAST_PATH_FALLBACK: _Final[_HistoricalFastPathFallback] = (
+    _HistoricalFastPathFallback.FALLBACK
+)
+
+
+def _historical_polls_endpoint_mode_compatible(
+    observation: dict[str, _Any], cutoff: int, mode: _HistoricalSequenceMode,
+    paid_prefix: str | None = None, allow_terminal_delivery: bool = False,
+) -> bool:
+    """Run the indexed path, delegating every exception to the verbatim original."""
+    try:
+        result = _historical_polls_endpoint_mode_compatible_fast(
+            observation, cutoff, mode, paid_prefix, allow_terminal_delivery,
+        )
+    except Exception:
+        return _historical_polls_endpoint_mode_compatible_original(
+            observation, cutoff, mode, paid_prefix, allow_terminal_delivery,
+        )
+    if result is _HISTORICAL_FAST_PATH_FALLBACK:
+        return _historical_polls_endpoint_mode_compatible_original(
+            observation, cutoff, mode, paid_prefix, allow_terminal_delivery,
+        )
+    return result
+
+
+def _historical_polls_endpoint_mode_compatible_fast(
+    observation: dict[str, _Any], cutoff: int, mode: _HistoricalSequenceMode,
+    paid_prefix: str | None = None, allow_terminal_delivery: bool = False,
+) -> bool | _Literal[_HistoricalFastPathFallback.FALLBACK]:
+    """Indexed fast path with a whole-call fallback to the historical checker."""
+    if (mode is not _HistoricalSequenceMode.LEGACY_SHARED_SEQUENCE_V1
+            and mode is not _HistoricalSequenceMode.HISTORICAL_DISJOINT_SEQUENCE_V1):
+        return _HISTORICAL_FAST_PATH_FALLBACK
+    if not _historical_poll_fast_path_inputs_safe(
+        observation, cutoff, paid_prefix, allow_terminal_delivery,
+    ):
+        return _HISTORICAL_FAST_PATH_FALLBACK
+    records = observation["records"]
+    timers: dict[str, list[dict[str, _Any]]] = {}
+    captures: dict[str, list[dict[str, _Any]]] = {}
+    deliveries: dict[tuple[int, int], list[dict[str, _Any]]] = {}
+    for record in records:
+        if type(record) is not dict or "kind" not in record or type(record["kind"]) is not str:
+            return _HISTORICAL_FAST_PATH_FALLBACK
+        kind = record["kind"]
+        if kind == "HISTORICAL_TIMER":
+            if ("stable_id" not in record or type(record["stable_id"]) is not str
+                    or "key" not in record or type(record["key"]) is not dict
+                    or "schedule_sequence" not in record["key"]
+                    or type(record["key"]["schedule_sequence"]) is not int):
+                return _HISTORICAL_FAST_PATH_FALLBACK
+            timers.setdefault(record["stable_id"], []).append(record)
+        elif kind == "SNAPSHOT_CAPTURE":
+            if ("stable_id" not in record or type(record["stable_id"]) is not str
+                    or "key" not in record or type(record["key"]) is not dict
+                    or any(key not in record["key"] for key in
+                           ("queue_class", "stable_id", "schedule_sequence", "visible_at"))
+                    or type(record["key"]["queue_class"]) is not str
+                    or type(record["key"]["stable_id"]) is not str
+                    or type(record["key"]["schedule_sequence"]) is not int
+                    or type(record["key"]["visible_at"]) is not int
+                    or "classification" not in record or type(record["classification"]) is not str):
+                return _HISTORICAL_FAST_PATH_FALLBACK
+            captures.setdefault(record["stable_id"], []).append(record)
+        elif kind == "DELIVERY":
+            if ("key" not in record or type(record["key"]) is not dict
+                    or any(key not in record["key"] for key in
+                           ("schedule_sequence", "visible_at", "queue_class"))
+                    or type(record["key"]["schedule_sequence"]) is not int
+                    or type(record["key"]["visible_at"]) is not int
+                    or type(record["key"]["queue_class"]) is not str
+                    or "classification" not in record or type(record["classification"]) is not str):
+                return _HISTORICAL_FAST_PATH_FALLBACK
+            delivery_key = (record["key"]["schedule_sequence"], record["key"]["visible_at"])
+            deliveries.setdefault(delivery_key, []).append(record)
+
+    if not _historical_pending_matches(observation, cutoff, allow_same_time=allow_terminal_delivery):
+        return False
+
+    # Keep the original poll, stage, and capture-before-delivery loops and their
+    # query-read points. Only the three records scans are replaced by buckets.
+    return _historical_polls_endpoint_mode_compatible_indexed(
+        observation, cutoff, mode, paid_prefix, allow_terminal_delivery,
+        timers, captures, deliveries,
+    )
+
+
+def _historical_polls_endpoint_mode_compatible_indexed(
+    observation: dict[str, _Any], cutoff: int, mode: _HistoricalSequenceMode,
+    paid_prefix: str | None, allow_terminal_delivery: bool,
+    timers_by_id: dict[str, list[dict[str, _Any]]],
+    captures_by_id: dict[str, list[dict[str, _Any]]],
+    deliveries_by_schedule: dict[tuple[int, int], list[dict[str, _Any]]],
+) -> bool:
+    """Run the original classifier loops with only record scans indexed."""
+    pending_keys = observation["pending_keys"]
+    stage_layouts = {
+        True: (("EARN", 0, 1, 5), ("TRADING", 1, 6, 10),
+               ("POSITIONS", 2, 11, 15), ("OPEN_ORDERS", 3, 16, 20)),
+        False: (("TRADING", 0, 1, 5), ("POSITIONS", 1, 6, 10),
+                ("OPEN_ORDERS", 2, 11, 15)),
+    }
+    for poll in observation["polls"]:
+        paused = poll["status"] == "PAUSED" and poll["awaiting"] is None
+        if paused and paid_prefix is not None:
+            continue
+        completed = poll["status"] == "COMPLETED" and poll["awaiting"] is None
+        failed_prefix = paid_prefix is not None and poll["status"] == "CALLBACK_FAILED" and poll["awaiting"] is None
+        if not completed and not failed_prefix and poll["status"] != "IN_PROGRESS":
+            return False
+        marker = "_POLL_"
+        prefix, separator, raw_text = poll["poll_id"].partition(marker)
+        expected_prefixes = {"P3"} if paid_prefix is None else {paid_prefix}
+        if (prefix not in expected_prefixes or not separator or not raw_text.isascii()
+                or not raw_text.isdigit()):
+            return False
+        raw_at = int(raw_text)
+        if poll["continuation_id"] != f"{prefix}_CONT_{raw_at}":
+            return False
+        timer_id = f"{prefix}_TIMER_{raw_at}"
+        timer_rows = timers_by_id.get(timer_id, [])
+        if len(timer_rows) != 1:
+            return False
+        has_earn = bool(captures_by_id.get(f"{poll['poll_id']}_EARN", []))
+        layout = stage_layouts[has_earn]
+        if has_earn and not any(item[0] == "EARN" for item in layout):
+            return False
+        awaiting = "EARN" if poll["awaiting"] == "EARN_IF_DUE" else poll["awaiting"]
+        if not completed and not failed_prefix and awaiting not in ("EARN", "TRADING", "POSITIONS", "OPEN_ORDERS"):
+            return False
+        observed_stages = []
+        stage_classifications: dict[str, tuple[str, str | None]] = {}
+        for stage in layout:
+            name, stage_index, capture_offset, delivery_offset = stage
+            snapshot_id = f"{poll['poll_id']}_{name}"
+            capture_rows = captures_by_id.get(snapshot_id, [])
+            if not capture_rows:
+                continue
+            if len(capture_rows) != 1:
+                return False
+            capture = capture_rows[0]
+            capture_key = capture["key"]
+            capture_sequence = timer_rows[0]["key"]["schedule_sequence"] * 4 + stage_index
+            expected_capture_at = (raw_at + capture_offset) * 16 + 5
+            if (capture_key["queue_class"] != "SNAPSHOT_CAPTURE"
+                    or capture_key["stable_id"] != snapshot_id
+                    or capture_key["schedule_sequence"] != capture_sequence
+                    or capture_key["visible_at"] != expected_capture_at):
+                return False
+            if capture["classification"] == "PENDING":
+                if completed or name != awaiting or expected_capture_at <= cutoff or capture_key not in pending_keys:
+                    return False
+                delivery_at = (raw_at + delivery_offset) * 16 + 6
+                delivery_sequence = _historical_delivery_sequence(
+                    mode, _HistoricalDeliveryKind.POLL, capture_sequence,
+                )
+                if not deliveries_by_schedule:
+                    delivery_present = False
+                else:
+                    delivery_present = bool(deliveries_by_schedule.get((delivery_sequence, delivery_at), []))
+                if delivery_present:
+                    return False
+                observed_stages.append(name)
+                stage_classifications[name] = ("PENDING_CAPTURE", None)
+                continue
+            if capture["classification"] != "SUCCESS" or expected_capture_at > cutoff:
+                return False
+            delivery_at = (raw_at + delivery_offset) * 16 + 6
+            delivery_sequence = _historical_delivery_sequence(
+                mode, _HistoricalDeliveryKind.POLL, capture_sequence,
+            )
+            if not deliveries_by_schedule:
+                delivery_rows = []
+            else:
+                delivery_rows = deliveries_by_schedule.get((delivery_sequence, delivery_at), [])
+            if len(delivery_rows) != 1:
+                return False
+            delivery = delivery_rows[0]
+            if delivery["key"]["queue_class"] != "DELIVERY":
+                return False
+            if delivery["classification"] == "PENDING":
+                if delivery_at <= cutoff or delivery["key"] not in pending_keys:
+                    return False
+            elif delivery["classification"] not in ("SUCCESS", "TERMINAL"):
+                return False
+            if completed and delivery["classification"] != "SUCCESS":
+                return False
+            observed_stages.append(name)
+            stage_classifications[name] = ("CAPTURED", delivery["classification"])
+        if completed:
+            if observed_stages != [item[0] for item in layout]:
+                return False
+        elif failed_prefix:
+            if observed_stages != [item[0] for item in layout[:len(observed_stages)]]:
+                return False
+            if observed_stages and any(
+                stage_classifications.get(name) != ("CAPTURED", "SUCCESS")
+                for name in observed_stages[:-1]
+            ):
+                return False
+        else:
+            if awaiting not in observed_stages:
+                return False
+            awaiting_index = next(index for index, item in enumerate(layout) if item[0] == awaiting)
+            if observed_stages != [item[0] for item in layout[:awaiting_index + 1]]:
+                return False
+            for name, _, _, _ in layout[:awaiting_index]:
+                if stage_classifications.get(name) != ("CAPTURED", "SUCCESS"):
+                    return False
+            awaiting_state = stage_classifications.get(awaiting)
+            allowed_awaiting = [("PENDING_CAPTURE", None), ("CAPTURED", "PENDING")]
+            if allow_terminal_delivery:
+                allowed_awaiting.append(("CAPTURED", "TERMINAL"))
+            if awaiting_state not in allowed_awaiting:
+                return False
+    return True
+
+
+def _exact_json_builtin_graph(*values: _Any) -> bool:
+    """Accept only recursively exact JSON builtin values without invoking hooks."""
+    stack = list(values)
+    visited: set[int] = set()
+    while stack:
+        value = stack.pop()
+        value_type = type(value)
+        if (value_type is str or value_type is int or value_type is float
+                or value_type is bool or value_type is type(None)):
+            continue
+        if value_type is list or value_type is tuple:
+            identity = id(value)
+            if identity in visited:
+                continue
+            visited.add(identity)
+            stack.extend(value)
+            continue
+        if value_type is dict:
+            identity = id(value)
+            if identity in visited:
+                continue
+            visited.add(identity)
+            for key, item in value.items():
+                if type(key) is not str:
+                    return False
+                stack.append(item)
+            continue
+        return False
+    return True
+
+
+def _historical_poll_fast_path_inputs_safe(
+    observation: _Any, cutoff: _Any, paid_prefix: _Any, allow_terminal_delivery: _Any,
+) -> bool:
+    """Validate the complete JSON-like input graph before any indexed-path reads."""
+    if not _exact_json_builtin_graph(observation, cutoff, paid_prefix, allow_terminal_delivery):
+        return False
+    if type(cutoff) is not int or (paid_prefix is not None and type(paid_prefix) is not str):
+        return False
+    if type(allow_terminal_delivery) is not bool:
+        return False
+    if type(observation) is not dict:
+        return False
+    for name in ("records", "polls", "pending_keys"):
+        if name not in observation or type(observation[name]) is not list:
+            return False
+    # Required indexed fields still fail closed when absent.
+    for row in observation["records"]:
+        if type(row) is not dict or "kind" not in row:
+            return False
+        if row["kind"] == "HISTORICAL_TIMER" and (
+            "stable_id" not in row or "key" not in row
+            or type(row["key"]) is not dict or "schedule_sequence" not in row["key"]
+        ):
+            return False
+        if row["kind"] == "SNAPSHOT_CAPTURE" and (
+            "stable_id" not in row or "classification" not in row or "key" not in row
+            or type(row["key"]) is not dict
+            or any(name not in row["key"] for name in ("queue_class", "stable_id", "schedule_sequence", "visible_at"))
+        ):
+            return False
+        if row["kind"] == "DELIVERY" and (
+            "classification" not in row or "key" not in row or type(row["key"]) is not dict
+            or any(name not in row["key"] for name in ("queue_class", "schedule_sequence", "visible_at"))
+        ):
+            return False
+    if any(type(key) is not dict for key in observation["pending_keys"]):
+        return False
+    for poll in observation["polls"]:
+        if type(poll) is not dict or any(
+            name not in poll for name in ("status", "awaiting", "poll_id", "continuation_id")
+        ):
+            return False
+    return True
+
+
 def _historical_coverage_records_compatible(coverage: list[dict[str, _Any]],
                                             observation: dict[str, _Any], cutoff: int) -> bool:
     """Require every frozen planned identity, accepting only exact future pending keys."""
@@ -525,7 +826,7 @@ def _digests(sites: list[tuple]) -> list[dict[str, _Any]]:
             for stage, _, owner, first in sites]
 
 
-def _actions(journal: list[dict[str, _Any]], actions: list[dict[str, _Any]]) -> list[dict[str, _Any]]:
+def _actions_original(journal: list[dict[str, _Any]], actions: list[dict[str, _Any]]) -> list[dict[str, _Any]]:
     projected = []
     for action in actions:
         matches = [row for row in journal if row["record_kind"] == "SOURCE_GROUP_RESULT"
@@ -538,7 +839,54 @@ def _actions(journal: list[dict[str, _Any]], actions: list[dict[str, _Any]]) -> 
     return projected
 
 
-def _historical_deferred_actions_compatible(
+def _actions(journal: list[dict[str, _Any]], actions: list[dict[str, _Any]]) -> list[dict[str, _Any]]:
+    """Project actions with a guarded, per-call source-result index."""
+    try:
+        if not _exact_json_builtin_graph(journal, actions):
+            raise _IndexFallback()
+        sources: dict[str, list[dict[str, _Any]]] = {}
+        source_count = 0
+        for row in journal:
+            if type(row) is not dict or "record_kind" not in row:
+                raise _IndexFallback()
+            kind = row["record_kind"]
+            if type(kind) is not str:
+                raise _IndexFallback()
+            if kind != "SOURCE_GROUP_RESULT":
+                continue
+            if "payload" not in row or type(row["payload"]) is not dict:
+                raise _IndexFallback()
+            payload = row["payload"]
+            if "result" not in payload or type(payload["result"]) is not dict:
+                raise _IndexFallback()
+            result = payload["result"]
+            if "group_id" not in result or type(result["group_id"]) is not str:
+                raise _IndexFallback()
+            sources.setdefault(result["group_id"], []).append(row)
+            source_count += 1
+
+        projected = []
+        for action in actions:
+            matches = []
+            if action["status"] == "SUBMITTED" and source_count:
+                group_id = action["group_id"]
+                if type(group_id) is not str:
+                    raise _IndexFallback()
+                for row in sources.get(group_id, []):
+                    if _equal(row["payload"]["result"], action["group_result"]):
+                        matches.append(row)
+            projected.append(dict(delivery_id=action["delivery_id"], event_index=action["event_index"], action_index=action["action_index"],
+                                  group_id=action["group_id"], status=action["status"], cancel_effect_ref=None,
+                                  group_result_ref=f"journal:{matches[0]['journal_seq']}" if len(matches) == 1 else None,
+                                  **({"effective_at": action["effective_at"]} if "effective_at" in action else {})))
+        return projected
+    except _IndexFallback:
+        return _actions_original(journal, actions)
+    except Exception:
+        return _actions_original(journal, actions)
+
+
+def _historical_deferred_actions_compatible_original(
     journal: list[dict[str, _Any]], observation: dict[str, _Any], cutoff: int,
 ) -> bool:
     records = observation["records"]
@@ -623,6 +971,135 @@ def _historical_deferred_actions_compatible(
     return True
 
 
+def _historical_deferred_actions_compatible(
+    journal: list[dict[str, _Any]], observation: dict[str, _Any], cutoff: int,
+) -> bool:
+    """Validate deferred actions with guarded per-call lookup indexes."""
+    try:
+        if not _exact_json_builtin_graph(journal, observation, cutoff):
+            raise _IndexFallback()
+        records = observation["records"]
+        callback_actions_observed = observation["callback_actions"]
+        pending_keys = observation["pending_keys"]
+        if (type(records) is not list or type(callback_actions_observed) is not list
+                or type(pending_keys) is not list):
+            raise _IndexFallback()
+
+        parents_by_id: dict[str, list[dict[str, _Any]]] = {}
+        groups_by_id: dict[str, list[dict[str, _Any]]] = {}
+        for record in records:
+            if type(record) is not dict or "kind" not in record or type(record["kind"]) is not str:
+                raise _IndexFallback()
+            if record["kind"] == "DELIVERY":
+                if "stable_id" not in record or type(record["stable_id"]) is not str:
+                    raise _IndexFallback()
+                parents_by_id.setdefault(record["stable_id"], []).append(record)
+            elif record["kind"] == "SOURCE_GROUP":
+                if "stable_id" not in record or type(record["stable_id"]) is not str:
+                    raise _IndexFallback()
+                groups_by_id.setdefault(record["stable_id"], []).append(record)
+        pending_by_group: dict[str, list[dict[str, _Any]]] = {}
+        for key in pending_keys:
+            if type(key) is not dict or "queue_class" not in key or type(key["queue_class"]) is not str:
+                raise _IndexFallback()
+            if key["queue_class"] == "SOURCE_GROUP":
+                if "stable_id" not in key or type(key["stable_id"]) is not str:
+                    raise _IndexFallback()
+                pending_by_group.setdefault(key["stable_id"], []).append(key)
+
+        observed_actions = {}
+        for action in callback_actions_observed:
+            identity = (action["delivery_id"], action["event_index"], action["action_index"])
+            if identity in observed_actions:
+                return False
+            observed_actions[identity] = action
+
+        callback_actions = {}
+        callback_rows = {}
+        source_results_by_group: dict[str, list[dict[str, _Any]]] = {}
+        for row in journal:
+            if type(row) is not dict or "record_kind" not in row or type(row["record_kind"]) is not str:
+                raise _IndexFallback()
+            if row["record_kind"] == "SOURCE_GROUP_RESULT":
+                payload = row["payload"]
+                result = payload["result"]
+                if type(result["group_id"]) is not str:
+                    raise _IndexFallback()
+                source_results_by_group.setdefault(result["group_id"], []).append(row)
+            if row["record_kind"] != "CALLBACK_RESULT":
+                continue
+            callback = row["payload"]
+            for item in callback["actions"]:
+                identity = (callback["delivery_id"], item["event_index"], item["action_index"])
+                if identity in callback_actions:
+                    return False
+                callback_actions[identity] = item
+                callback_rows[identity] = row
+        if observed_actions.keys() != callback_actions.keys():
+            return False
+
+        for identity, action in observed_actions.items():
+            callback_action, callback = callback_actions[identity], callback_rows[identity]
+            if (callback["payload"]["outcome"] != "SUCCESS"
+                    or callback["payload"]["delivery_id"] != identity[0]
+                    or callback_action["status"] != "UNSUBMITTED"
+                    or callback_action["group_id"] != action["group_id"]
+                    or callback_action.get("group_result") is not None
+                    or callback_action.get("native_failure") is not None
+                    or action.get("native_failure") is not None):
+                return False
+            delivery_id = action["delivery_id"]
+            parents = parents_by_id.get(delivery_id, []) if type(delivery_id) is str else []
+            if type(delivery_id) is not str and any(record["kind"] == "DELIVERY" for record in records):
+                raise _IndexFallback()
+            if len(parents) != 1 or parents[0]["classification"] != "SUCCESS":
+                return False
+            parent_key = parents[0]["key"]
+            if callback["scheduler_key"] != parent_key:
+                return False
+            visible_at = parent_key["visible_at"]
+            if visible_at > cutoff or visible_at < 6 or visible_at % 16 != 6:
+                return False
+
+            group_id = action["group_id"]
+            if action["status"] == "SUBMITTED":
+                if "effective_at" in action or group_id is None or action.get("group_result") is None:
+                    return False
+                if type(group_id) is not str and source_results_by_group:
+                    raise _IndexFallback()
+                matches = source_results_by_group.get(group_id, []) if type(group_id) is str else []
+                if (len(matches) != 1
+                        or not _equal(matches[0]["payload"]["result"], action["group_result"])):
+                    return False
+                continue
+
+            if action["status"] != "UNSUBMITTED" or action.get("group_result") is not None:
+                return False
+            if group_id is not None:
+                if "effective_at" in action:
+                    return False
+                if type(group_id) is not str and (groups_by_id or pending_by_group):
+                    raise _IndexFallback()
+                group_records = groups_by_id.get(group_id, []) if type(group_id) is str else []
+                group_keys = pending_by_group.get(group_id, []) if type(group_id) is str else []
+                if (len(group_records) != 1 or group_records[0]["classification"] != "PENDING"
+                        or len(group_keys) != 1 or group_records[0]["key"] != group_keys[0]
+                        or group_keys[0]["visible_at"] <= cutoff):
+                    return False
+                continue
+
+            if "effective_at" not in action:
+                return False
+            expected_effective_at = (((visible_at - 6) // 16) + 1) * 16 + 3
+            if action["effective_at"] != expected_effective_at or expected_effective_at <= cutoff:
+                return False
+        return True
+    except _IndexFallback:
+        return _historical_deferred_actions_compatible_original(journal, observation, cutoff)
+    except Exception:
+        return _historical_deferred_actions_compatible_original(journal, observation, cutoff)
+
+
 def _terminal(policy: str, endpoint: dict[str, _Any]) -> dict[str, _Any]:
     observation = endpoint["scheduler_observation"]
     inspection = endpoint["final_owner_evidence"]["inspection"]
@@ -643,10 +1120,15 @@ def _historical_report(run_id: str, attempt: dict[str, _Any], journal: list[dict
     trading = final["trading_fact"]["immutable_payload"]
     positions = _required(final["positions_fact"]["immutable_payload"], "rows")
     orders = _required(final["open_orders_fact"]["immutable_payload"], "rows")
-    rows = []
+    products_by_id = {}
+    fills_by_product = []
+    refs_by_product = []
+    account_values = None
+    configuration_context = None
+    historical_context = None
     for product in context.products:
         position = next((row for row in positions if row["product_id"] == product), None)
-        relevant_refs: list[str] = []
+        refs: list[str] = []
         fills: list[str] = []
         for row in journal:
             payload = row["payload"]
@@ -656,30 +1138,42 @@ def _historical_report(run_id: str, attempt: dict[str, _Any], journal: list[dict
                                        if item["product_id"] == product), None)
                 if result_product is not None:
                     related = True
-                    fills.extend("SOURCE:" + fill["source_event_id"] for fill in result_product["fills"])
+                    fills.extend(fill["source_event_id"] for fill in result_product["fills"])
             elif row["record_kind"] == "SOURCE_GROUP_RESULT":
                 related = any(member.get("payload", {}).get("product_id") == product
                               for member in payload["request"]["members"])
             if related:
-                relevant_refs.append(f"journal:{row['journal_seq']}")
-        relevant_refs.append(_FINAL)
-        rows.append(dict(
-            schema_version="spider_product_report_v1", run_id=run_id, product_id=product,
-            terminal_reason=attempt["terminal_policy"],
+                refs.append(f"journal:{row['journal_seq']}")
+        products_by_id[product] = dict(
             position_contracts=_required(position, "position_contracts") if position is not None else "0",
             mark_price=_required(position, "last_price") if position is not None else None,
             notional_usd=_required(position, "notional_usd") if position is not None else "0",
-            open_orders=[row for row in orders if row["product_id"] == product],
-            committed_execution_refs=fills, source_evidence_refs=relevant_refs,
-            account_cash=_required(inspection, "cash"),
-            account_equity=_required(trading, "equity"),
-            account_available_equity=_required(trading, "available_equity"),
-            account_gross_realized=_required(inspection, "gross_realized"),
-            account_total_fees=_required(inspection, "total_fees"),
-            configuration_context=_configuration_context(context),
-            historical_context=_historical_context(historical),
-        ))
-    return rows
+            open_orders=tuple(row for row in orders if row["product_id"] == product),
+        )
+        fills_by_product.append(tuple(fills))
+        refs_by_product.append(tuple(refs))
+        if account_values is None:
+            account_values = (
+                _required(inspection, "cash"), _required(trading, "equity"),
+                _required(trading, "available_equity"), _required(inspection, "gross_realized"),
+                _required(inspection, "total_fees"),
+            )
+            configuration_context = _configuration_context(context)
+            historical_context = _historical_context(historical)
+    assert account_values is not None and configuration_context is not None and historical_context is not None
+    final_owner_values = _cast(_FinalOwnerEvidenceValues, dict(
+        account_cash=account_values[0], account_equity=account_values[1],
+        account_available_equity=account_values[2], account_gross_realized=account_values[3],
+        account_total_fees=account_values[4], products_by_id=products_by_id,
+    ))
+    return list(_project_historical_report(
+        run_id=run_id, product_order=context.products, terminal_reason=attempt["terminal_policy"],
+        fill_source_event_ids_by_product=tuple(fills_by_product),
+        journal_evidence_refs_by_product=tuple(refs_by_product),
+        final_owner_evidence=final_owner_values,
+        configuration_context=configuration_context,
+        historical_context=historical_context,
+    ))
 
 
 def _historical_endpoint(run_id: str, attempt: dict[str, _Any], status: dict[str, _Any],

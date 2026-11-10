@@ -1,6 +1,267 @@
 use super::super::super::tests::{d, fixture};
 use super::*;
 use inspection::receipt_vectors::Raw;
+use std::collections::BTreeMap;
+
+fn owned_batch_rows(owner: &ScenarioAccount) -> BTreeMap<(Kind, String), Stored<BatchResult>> {
+    owner
+        .cancel_facts
+        .batches
+        .iter()
+        .map(|(key, row)| (key.clone(), row.clone()))
+        .collect()
+}
+
+fn assert_owned_batch_rows(
+    owner: &ScenarioAccount,
+    expected: &BTreeMap<(Kind, String), Stored<BatchResult>>,
+) {
+    assert_eq!(owned_batch_rows(owner), *expected);
+}
+
+fn owner_with_nonempty_batches() -> ScenarioAccount {
+    let (mut seed, config, marks) = fixture();
+    let mut second = seed.orders[0].clone();
+    second.intent_id = "I2".into();
+    second.order_id = "O2".into();
+    second.client_id = "C2".into();
+    seed.orders.push(second);
+    let mut owner = ScenarioAccount::from_seed(&seed, &config, &marks).unwrap();
+    owner
+        .request_cancel(&RequestInput {
+            stamp: source::stamp("existing-request", 501, 40),
+            targets: vec![("O1".into(), Reason::ExplicitScenario)],
+        })
+        .unwrap();
+    owner
+}
+
+fn request(event_id: &str, target: &str) -> RequestInput {
+    RequestInput {
+        stamp: source::stamp(event_id, 502, 40),
+        targets: vec![(target.into(), Reason::ExplicitScenario)],
+    }
+}
+
+#[test]
+fn nonempty_batch_publication_duplicates_and_before_swap_rollback_match_owned_rows() {
+    let original = owner_with_nonempty_batches();
+    let original_rows = owned_batch_rows(&original);
+    assert_eq!(original_rows.len(), 1);
+
+    let input = request("new-request", "O2");
+    let actions = identity::requests(&original, &input).unwrap();
+    let digest = identity::batch_digest(&original.key, &input.stamp, Kind::Request, &actions);
+    let mut actual = original.clone();
+    let published = actual.request_cancel(&input).unwrap();
+    let mut expected_rows = original_rows.clone();
+    expected_rows.insert(
+        (Kind::Request, input.stamp.event_id.clone()),
+        Stored {
+            digest,
+            value: published.clone(),
+        },
+    );
+    assert_eq!(expected_rows.len(), original_rows.len() + 1);
+    assert_owned_batch_rows(&actual, &expected_rows);
+
+    let saved_after_success = owned_batch_rows(&actual);
+    assert_eq!(actual.request_cancel(&input), Ok(published));
+    assert_owned_batch_rows(&actual, &saved_after_success);
+    let conflict = request("new-request", "O1");
+    assert_eq!(actual.request_cancel(&conflict), Err("EVENT_ID_CONFLICT"));
+    assert_owned_batch_rows(&actual, &saved_after_success);
+
+    for (suffix, stage) in [
+        ("prepared", Stage::Prepared),
+        ("action-drafted", Stage::ActionDrafted(0)),
+        ("before-swap", Stage::BeforeSwap(0)),
+    ] {
+        for panic in [false, true] {
+            let mut owner = original.clone();
+            let before = owned_batch_rows(&owner);
+            let input = request(&format!("request-{suffix}-{panic}"), "O2");
+            let result = owner.request_cancel_checked(&input, |observed| {
+                if observed == stage {
+                    if panic {
+                        panic!("injected request hook panic");
+                    }
+                    Err("REQUEST_HOOK_INJECTED")
+                } else {
+                    Ok(())
+                }
+            });
+            assert_eq!(
+                result,
+                Err(if panic {
+                    "CANCEL_PANIC"
+                } else {
+                    "REQUEST_HOOK_INJECTED"
+                })
+            );
+            assert_owned_batch_rows(&owner, &before);
+        }
+    }
+
+    // An enclosing historical/group-style draft that fails before publishing is
+    // dropped as a unit; its nested batch draft cannot leak into the owner.
+    let mut outer_draft = original.clone();
+    let outer_before = owned_batch_rows(&outer_draft);
+    assert_eq!(
+        outer_draft.request_cancel_checked(&request("nested-failure", "O2"), |stage| {
+            if stage == Stage::BeforeSwap(0) {
+                Err("NESTED_FAILURE")
+            } else {
+                Ok(())
+            }
+        }),
+        Err("NESTED_FAILURE")
+    );
+    assert_owned_batch_rows(&outer_draft, &outer_before);
+    drop(outer_draft);
+    assert_owned_batch_rows(&original, &original_rows);
+}
+
+#[test]
+fn nonempty_effect_batch_pre_swap_hook_matrix_matches_publication_boundary() {
+    let mut base = owner_with_nonempty_batches();
+    base.request_cancel(&request("second-existing", "O2"))
+        .unwrap();
+    let input = EffectInput {
+        stamp: source::stamp("effect-hook-matrix", 503, 50),
+        effects: vec![(
+            "second-existing".into(),
+            "O2".into(),
+            Reason::ExplicitScenario,
+        )],
+    };
+
+    for stage in [
+        Stage::Prepared,
+        Stage::ActionDrafted(0),
+        Stage::BeforeSwap(0),
+    ] {
+        for panic in [false, true] {
+            let mut owner = base.clone();
+            let before = owned_batch_rows(&owner);
+            let outcome = owner.effect_cancel_checked(&input, |observed| {
+                if observed == stage {
+                    if panic {
+                        panic!("injected effect hook panic");
+                    }
+                    Err("EFFECT_HOOK_INJECTED")
+                } else {
+                    Ok(())
+                }
+            });
+
+            if stage == Stage::Prepared {
+                assert_eq!(
+                    outcome,
+                    Err(if panic {
+                        "CANCEL_PANIC"
+                    } else {
+                        "EFFECT_HOOK_INJECTED"
+                    })
+                );
+                assert_owned_batch_rows(&owner, &before);
+            } else {
+                let batch = outcome.unwrap();
+                assert_eq!(batch.receipts.len(), 0);
+                assert_eq!(
+                    batch.failure,
+                    Some(if panic {
+                        "CANCEL_PANIC"
+                    } else {
+                        "EFFECT_HOOK_INJECTED"
+                    })
+                );
+                let actions = identity::effects(&base, &input).unwrap();
+                let digest =
+                    identity::batch_digest(&base.key, &input.stamp, Kind::Effect, &actions);
+                let mut expected = before;
+                expected.insert(
+                    (Kind::Effect, input.stamp.event_id.clone()),
+                    Stored {
+                        digest,
+                        value: batch,
+                    },
+                );
+                assert_owned_batch_rows(&owner, &expected);
+            }
+        }
+    }
+}
+
+#[test]
+fn nonempty_batch_after_swap_failure_and_real_apply_group_match_owned_rows() {
+    let (mut seed, config, marks) = fixture();
+    let mut second = seed.orders[0].clone();
+    second.intent_id = "I2".into();
+    second.order_id = "O2".into();
+    second.client_id = "C2".into();
+    seed.orders.push(second);
+    let mut base = ScenarioAccount::from_seed(&seed, &config, &marks).unwrap();
+    for (event_id, target, at) in [("R1", "O1", 502), ("R2", "O2", 503)] {
+        let mut input = request(event_id, target);
+        input.stamp.effective_at = at;
+        base.request_cancel(&input).unwrap();
+    }
+
+    let mut effect_owner = base.clone();
+    let before_effect = owned_batch_rows(&effect_owner);
+    let effect = EffectInput {
+        stamp: source::stamp("E-multi", 504, 50),
+        effects: vec![
+            ("R1".into(), "O1".into(), Reason::ExplicitScenario),
+            ("R2".into(), "O2".into(), Reason::ExplicitScenario),
+        ],
+    };
+    let result = effect_owner
+        .effect_cancel_checked(&effect, |stage| {
+            if stage == Stage::BeforeSwap(1) {
+                Err("SECOND_EFFECT_BEFORE_SWAP")
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+    assert_eq!(result.receipts.len(), 1);
+    assert_eq!(result.failure, Some("SECOND_EFFECT_BEFORE_SWAP"));
+    let actions = identity::effects(&base, &effect).unwrap();
+    let digest = identity::batch_digest(&base.key, &effect.stamp, Kind::Effect, &actions);
+    let mut expected_effect = before_effect;
+    expected_effect.insert(
+        (Kind::Effect, effect.stamp.event_id.clone()),
+        Stored {
+            digest,
+            value: result,
+        },
+    );
+    assert_owned_batch_rows(&effect_owner, &expected_effect);
+
+    use super::super::super::group::{Group, Input as GroupInput, Member};
+    let mut grouped = owner_with_nonempty_batches();
+    let group_request = request("grouped-request", "O2");
+    let before_group = owned_batch_rows(&grouped);
+    let mut expected_group = grouped.clone();
+    expected_group.request_cancel(&group_request).unwrap();
+    let expected_group_rows = owned_batch_rows(&expected_group);
+    let group = Group {
+        group_id: "batch-history-group".into(),
+        account_key: grouped.key.clone(),
+        ordering_contract_id: "S_order_v1".into(),
+        group_effective_at: group_request.stamp.effective_at,
+        declared_member_count: 1,
+        members: vec![Member {
+            stamp: group_request.stamp.clone(),
+            input: GroupInput::Request(group_request),
+        }],
+    };
+    grouped.apply_group(&group).unwrap();
+    assert_eq!(expected_group_rows.len(), before_group.len() + 1);
+    assert_owned_batch_rows(&grouped, &expected_group_rows);
+}
 fn owner() -> ScenarioAccount {
     let (seed, config, marks) = fixture();
     let mut a = ScenarioAccount::from_seed(&seed, &config, &marks).unwrap();

@@ -282,7 +282,7 @@ impl ScenarioAccount {
             seed_orders: seed.orders.iter().map(|o| o.order_id.clone()).collect(),
             seed_executions: BTreeSet::new(),
             commit_sequence: 0,
-            intent_results: BTreeMap::new(),
+            intent_results: super::history_map::HistoryMap::new(),
             execution_receipts: BTreeMap::new(),
             pending_actions: Vec::new(),
             cancel_facts: Default::default(),

@@ -1,6 +1,6 @@
 use super::super::super::tests::{d, fixture};
 use super::*;
-use context::tests::{activation, mark_rows};
+use context::tests::{activation, mark_rows, mark_rows_vec};
 
 // Consume the existing complete source draft at its pre-continuation boundary.
 // Production still publishes that same draft and takes the 4C-2 sentinel.
@@ -428,7 +428,7 @@ fn pending_cancel_and_invalid_preparation_inputs_fail_without_a_step() {
         valid_to: 3000,
     });
     let mut pending = ScenarioAccount::from_seed(&seed, &config, &marks).unwrap();
-    let input = activation(&pending, 600, mark_rows(&marks, 600));
+    let input = activation(&pending, 600, mark_rows_vec(&marks, 600));
     pending.activate_context(&input).unwrap();
     assert_eq!(
         pending.transition.lifecycle,
@@ -446,7 +446,13 @@ fn pending_cancel_and_invalid_preparation_inputs_fail_without_a_step() {
         &anchor(Side::Long, "1001", "50000", "3000", 500, "49900"),
         501,
     );
-    for field in 0..7 {
+    let (_, marks) = owner.btc_context().unwrap();
+    let duplicate = marks.to_vec_for_test();
+    assert_eq!(
+        crate::binding::matcher::replay_transition::synthetic_risk::scenario_account::mark_history::MarkHistory::try_from_vec([duplicate.clone(), duplicate[2..].to_vec()].concat()).map(|_| ()),
+        Err("OVERLAPPING_MARKS")
+    );
+    for field in [0, 1, 2, 3, 5, 6] {
         let mut bad = owner.clone();
         let expected = match field {
             0 => {
@@ -473,28 +479,39 @@ fn pending_cancel_and_invalid_preparation_inputs_fail_without_a_step() {
                 else {
                     unreachable!()
                 };
-                match field {
-                    3 => {
-                        marks.remove(2);
+                if field == 6 {
+                    scenario
+                        .tiers
+                        .retain(|t| !(t.product == Product::Btc && t.version == "tier-v1"));
+                } else {
+                    let mut rows = marks.to_vec_for_test();
+                    match field {
+                        3 => rows.retain(|row| {
+                            !(row.product == Product::Btc
+                                && row.valid_from <= 501
+                                && 501 < row.valid_to)
+                        }),
+                        5 => {
+                            let row = rows
+                                .iter_mut()
+                                .find(|row| {
+                                    row.product == Product::Btc
+                                        && row.valid_from <= 501
+                                        && 501 < row.valid_to
+                                })
+                                .unwrap();
+                            row.price = d("49900.01");
+                        }
+                        _ => unreachable!(),
                     }
-                    4 => {
-                        marks.push(marks[2].clone());
+                    let updated = crate::binding::matcher::replay_transition::synthetic_risk::scenario_account::mark_history::MarkHistory::try_from_vec(rows).unwrap();
+                    if field == 5 {
+                        bad.valuation_context_id = context_id(scenario, &updated, 501).unwrap();
                     }
-                    5 => {
-                        marks[2].price = d("49900.01");
-                    }
-                    _ => {
-                        scenario
-                            .tiers
-                            .retain(|t| !(t.product == Product::Btc && t.version == "tier-v1"));
-                    }
-                }
-                if field == 5 {
-                    bad.valuation_context_id = context_id(scenario, marks, 501).unwrap();
+                    *marks = updated;
                 }
                 match field {
                     3 | 6 => "UNSUPPORTED_CONTEXT_TRANSITION",
-                    4 => "OVERLAPPING_MARKS",
                     _ => "INVALID_HYPOTHETICAL_EXECUTION",
                 }
             }

@@ -13,6 +13,7 @@ from src.core.backtest import spider_policy_protocol as policy_protocol
 from src.core.backtest.spider_historical_input import (
     HistoricalBar,
     POLL_OPEN_ORDERS_FAILURE_PROFILE,
+    ValidatedHistoricalInput,
     historical_market_step_clock,
     historical_market_step_in_range,
 )
@@ -31,6 +32,84 @@ def _historical_order_ordinal(kind: object) -> int | None:
     if type(kind) is not str:
         return None
     return {"INTENT": 60, "CANCEL_REQUEST": 40, "CANCEL_EFFECT": 50}.get(kind)
+
+
+def _admit_value_is_safe(value: object) -> bool:
+    """Accept inert built-ins and the closed market DTOs without recursion or hooks."""
+    from src.core.backtest.spider_historical_replay import _ClosedMarketSnapshot, _MarketRow
+
+    active: set[int] = set()
+    pending: list[tuple[object, bool]] = [(value, False)]
+    while pending:
+        current, exiting = pending.pop()
+        if exiting:
+            active.remove(cast(int, current))
+            continue
+        current_type = type(current)
+        if (current is None or current_type is bool or current_type is int or current_type is str
+                or current_type is bytes or current_type is D):
+            continue
+        if current_type is _ClosedMarketSnapshot:
+            snapshot = cast(_ClosedMarketSnapshot, current)
+            if type(snapshot.close_ms) is not int or type(snapshot.markets) is not tuple:
+                return False
+            for row in snapshot.markets:
+                if (type(row) is not _MarketRow or type(row.product_id) is not str
+                        or type(row.instrument_code) is not int
+                        or type(row.price) is not D or type(row.contract_value) is not D
+                        or type(row.lot_size) is not D or type(row.minimum_size) is not D
+                        or type(row.price_increment) is not D or type(row.high_low_ratio) is not D):
+                    return False
+            continue
+        if current_type is list or current_type is tuple or current_type is dict:
+            identity = id(current)
+            if identity in active:
+                return False
+            active.add(identity)
+            pending.append((identity, True))
+            if current_type is dict:
+                for key, child in cast(dict[object, object], current).items():
+                    pending.append((key, False))
+                    pending.append((child, False))
+            else:
+                pending.extend((child, False) for child in cast(list[object] | tuple[object, ...], current))
+            continue
+        return False
+    return True
+
+
+def _admit_inputs_are_safe(items: object) -> bool:
+    """Reject custom containers/hooks before iterating or reading candidate fields."""
+    if type(items) is not list:
+        return False
+    for pair in cast(list[object], items):
+        if type(pair) is not tuple or len(pair) != 2:
+            return False
+        item, plan = cast(tuple[object, object], pair)
+        if type(item) is not dict or not _admit_value_is_safe(item):
+            return False
+        if plan is not None and (type(plan) is not dict or not _admit_value_is_safe(plan)):
+            return False
+    return True
+
+
+def _admit_index_record_is_safe(record: object) -> bool:
+    if type(record) is not dict:
+        return False
+    key = cast(dict[str, Any], record).get("key")
+    return (
+        type(key) is tuple and len(key) == 4
+        and type(key[0]) is int and type(key[1]) is int
+        and type(key[2]) is int and type(key[3]) is str
+        and _admit_content_is_safe(cast(dict[str, Any], record).get("content"))
+        and _admit_value_is_safe(cast(dict[str, Any], record).get("item"))
+    )
+
+
+def _admit_content_is_safe(content: object) -> bool:
+    return type(content) is bytes or (
+        type(content) is tuple and all(type(part) is bytes for part in cast(tuple[object, ...], content))
+    )
 
 
 def _pair_financial(item, digest, operation, order, account, previous, configured_product_ids=None):
@@ -334,6 +413,10 @@ class _ReplayComposition:
         self._callback_plans = deepcopy(callback_plans if callback_plans is not None else {})
         self._queue: list[tuple] = []
         self._records: dict[tuple, dict[str, Any]] = {}
+        self._admit_prefix3_counts: dict[tuple[int, int, int], int] = {}
+        self._admit_class0_by_at: dict[int, list[dict[str, Any]]] = {}
+        self._admit_indexed_record_count = 0
+        self._admit_index_unsafe = False
         self._current_time, self._last_popped = 500, None
         self._terminal: dict[str, Any] | None = None
         self._audit: dict[str, list] = {}
@@ -422,12 +505,17 @@ class _ReplayComposition:
         from src.core.backtest.spider_historical_replay import (
             _historical_market_item,
             _prepare_historical_replay,
+            _prepare_historical_replay_validated,
             _restore_initial_policy,
         )
         from src.core.backtest.spider_historical_input import HistoricalRunInput
 
-        historical_run = cast(HistoricalRunInput, run)
-        prepared = _prepare_historical_replay(historical_run)
+        if type(run) is ValidatedHistoricalInput:
+            historical_run = run.run
+            prepared = _prepare_historical_replay_validated(run)
+        else:
+            historical_run = cast(HistoricalRunInput, run)
+            prepared = _prepare_historical_replay(historical_run)
         configuration = deepcopy(prepared.configuration)
         configuration["seed_effective_at"] = cast(int, configuration["seed_effective_at"]) * 16
         for product in cast(list[dict[str, Any]], configuration["products"]):
@@ -504,6 +592,18 @@ class _ReplayComposition:
                 raise ValueError("INVALID_SCHEMA")
         return composition
 
+    @classmethod
+    def _from_validated_historical_input(
+        cls, token: ValidatedHistoricalInput, *, paid_endpoint: PaidEndpoint | None = None,
+        gross_response: bool = False,
+    ) -> "_ReplayComposition":
+        """Private same-run construction seam; raw callers retain their guard."""
+        if type(token) is not ValidatedHistoricalInput:
+            raise TypeError("validated historical input token required")
+        return cls._from_historical_run(
+            token, paid_endpoint=paid_endpoint, gross_response=gross_response,
+        )
+
     def _historical_node_item(
         self, bar_open_ms: int, step_index: int, sequence: int,
         working_orders: list[wire.HistoricalWorkingOrder],
@@ -574,8 +674,8 @@ class _ReplayComposition:
                            polls=sorted(polls, key=lambda row: (row["poll_id"], row["continuation_id"])), callback_actions=actions)
         return deepcopy(observation)
 
-    def capture_owner_evidence(self, cutoff, trading_request, positions_request, open_orders_request):
-        """Observe the owner and scheduler without dispatching or emitting a barrier."""
+    def _capture_owner_evidence_core(self, cutoff, trading_request, positions_request, open_orders_request):
+        """Observe owner state without dispatching or rendering scheduler history."""
         _poll_check(type(cutoff) is int and 0 <= cutoff < 2**63)
         requests = deepcopy((trading_request, positions_request, open_orders_request))
         for kind, request in zip(("TRADING", "POSITIONS", "OPEN_ORDERS"), requests, strict=True):
@@ -586,6 +686,13 @@ class _ReplayComposition:
         for kind, request in zip(("trading", "positions", "open_orders"), requests, strict=True):
             owner[kind + "_request"] = request
             owner[kind + "_fact"] = self._codec.capture_snapshot(deepcopy(request))
+        return owner
+
+    def capture_owner_evidence(self, cutoff, trading_request, positions_request, open_orders_request):
+        """Observe the owner and scheduler without dispatching or emitting a barrier."""
+        owner = self._capture_owner_evidence_core(
+            cutoff, trading_request, positions_request, open_orders_request,
+        )
         observation = self._public_scheduler_observation()
         return deepcopy(dict(owner_evidence=owner, scheduler_observation=observation))
 
@@ -853,7 +960,115 @@ class _ReplayComposition:
                 raise _ScheduleError("INVALID_SCHEMA") from exc
             raise
 
-    def _admit_set(self, items, commit=True):
+    def _admit_set(self, items: Any, commit: bool = True) -> Any:
+        if self._admit_index_unsafe:
+            return self._admit_set_original(items, commit)
+        try:
+            stale = len(self._records) != self._admit_indexed_record_count
+        except Exception:
+            stale = True
+        if stale:
+            self._admit_index_unsafe = True
+            return self._admit_set_original(items, commit)
+        try:
+            safe_inputs = _admit_inputs_are_safe(items)
+        except Exception:
+            safe_inputs = False
+        if not safe_inputs:
+            return self._admit_set_original(items, commit)
+        _overlay, added, results = self._admit_set_fast_validation(items)
+        if commit:
+            self._commit_admit_records(added)
+        return deepcopy(results)
+
+    def _prepare_admit_index_entries(
+        self, records: list[dict[str, Any]],
+    ) -> list[tuple[tuple[int, int, int], int | None, dict[str, Any]]] | None:
+        if (self._admit_index_unsafe or type(self._admit_prefix3_counts) is not dict
+                or type(self._admit_class0_by_at) is not dict):
+            self._admit_index_unsafe = True
+            return None
+        entries: list[tuple[tuple[int, int, int], int | None, dict[str, Any]]] = []
+        try:
+            for record in records:
+                if not _admit_index_record_is_safe(record):
+                    self._admit_index_unsafe = True
+                    return None
+                key = record["key"]
+                at = key[0] if key[1] == 0 else None
+                bucket = self._admit_class0_by_at.get(at) if at is not None else None
+                if bucket is not None and type(bucket) is not list:
+                    self._admit_index_unsafe = True
+                    return None
+                entries.append((key[:3], at, record))
+        except Exception:
+            self._admit_index_unsafe = True
+            return None
+        return entries
+
+    def _commit_admit_records(self, records: list[dict[str, Any]]) -> None:
+        entries = self._prepare_admit_index_entries(records)
+        # Preflight completes before the first records mutation. From here to the final
+        # push, exact built-in containers and exact int/string tuple keys prevent user hooks.
+        for index, record in enumerate(records):
+            key = record["key"]
+            self._records[(key[1], key[3])] = record
+            if entries is not None:
+                prefix, at, indexed_record = entries[index]
+                self._admit_prefix3_counts[prefix] = self._admit_prefix3_counts.get(prefix, 0) + 1
+                if at is not None:
+                    self._admit_class0_by_at.setdefault(at, []).append(indexed_record)
+                self._admit_indexed_record_count += 1
+            heapq.heappush(self._queue, key)
+
+    def _admit_set_fast_validation(
+        self, items: list[tuple[dict[str, Any], Any]],
+    ) -> tuple[dict[tuple, dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+        overlay, overlay_prefix_counts, overlay_class0, added, results = {}, {}, {}, [], []
+        for item, plan in items:
+            record = self._queue_record(item, plan)
+            at, cls, sequence, stable = key = record["key"]
+            identity = (cls, stable)
+            old = overlay.get(identity)
+            if old is None:
+                old = self._records.get(identity)
+            if old is not None:
+                if old["content"] != record["content"]:
+                    raise _ScheduleError("DELIVERY_ID_CONFLICT" if cls == 2 else "INVALID_SCHEMA")
+                results.append(old["result"])
+                continue
+            if at < self._current_time or (self._last_popped is not None and key <= self._last_popped):
+                raise _ScheduleError("INVALID_SCHEMA")
+            prefix = key[:3]
+            if self._admit_prefix3_counts.get(prefix, 0) + overlay_prefix_counts.get(prefix, 0):
+                raise _ScheduleError("INVALID_SCHEMA")
+            if cls == 0:
+                same_tick = self._admit_class0_by_at.get(at, ())
+                for other in (*same_tick, *overlay_class0.get(at, ())):
+                    other_key = other["key"]
+                    historical_same_tick = (
+                        item.get("kind") == other["item"].get("kind") == "SOURCE_GROUP"
+                        and item["group"]["ordering_contract_id"]
+                        == other["item"]["group"]["ordering_contract_id"] == "HISTORICAL_ORDER_V1"
+                        and sequence != other_key[2]
+                    )
+                    if not historical_same_tick:
+                        raise _ScheduleError("INVALID_SCHEMA")
+            if cls == 1:
+                request, projection = item["request"], item["delivery_projection"]
+                if projection["visible_at"] < at or projection["reference"] != dict(namespace="SNAPSHOT", fact_id=request["snapshot_id"]):
+                    raise _ScheduleError("INVALID_SCHEMA")
+            if cls == 2 and plan is not None and plan["delivery_id"] != stable:
+                raise _ScheduleError("INVALID_SCHEMA")
+            overlay[identity] = record
+            overlay_prefix_counts[prefix] = overlay_prefix_counts.get(prefix, 0) + 1
+            if cls == 0:
+                overlay_class0.setdefault(at, []).append(record)
+            added.append(record)
+            results.append(record["result"])
+        return overlay, added, results
+
+    def _admit_set_original(self, items, commit=True):
         prospective, added, results = dict(self._records), [], []
         for item, plan in items:
             record = self._queue_record(item, plan)
@@ -887,10 +1102,7 @@ class _ReplayComposition:
             added.append(record)
             results.append(record["result"])
         if commit:
-            for record in added:
-                key = record["key"]
-                self._records[(key[1], key[3])] = record
-                heapq.heappush(self._queue, key)
+            self._commit_admit_records(added)
         return deepcopy(results)
 
     def _enqueue(self, item, plan=None):

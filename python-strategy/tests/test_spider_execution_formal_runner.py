@@ -63,6 +63,7 @@ def _expected_projection(artifacts: dict[str, object]) -> dict[str, object]:
     "model_id",
     ["OHLC4_OPEN_HIGH_LOW_CLOSE_V1", "OHLC4_OPEN_LOW_HIGH_CLOSE_V1"],
 )
+@pytest.mark.slow
 def test_three_paid_entrances_produce_identical_projection_and_detached_rows(
     tmp_path, capsys, model_id,
 ):

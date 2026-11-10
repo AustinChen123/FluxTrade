@@ -117,12 +117,14 @@ def test_python_dispatcher_owner_restarts_in_a_fresh_os_process(tmp_path: Path) 
 
     # A process crash can lose an in-flight and a queued optional diagnostic.
     # It does not replay committed rows; a fresh process owns a new dispatcher.
+    crash_result = context.Queue()
     crashing = context.Process(
         target=_block_dispatcher_process,
-        args=(db_path, result),
+        args=(db_path, crash_result),
     )
     crashing.start()
-    crash_state = result.get(timeout=30)
+    # A killed child must not share a queue whose feeder lock it may hold.
+    crash_state = crash_result.get(timeout=30)
     assert crash_state["accepted"] == 2
     assert crash_state["queued"] == 1
     crashing.terminate()

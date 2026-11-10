@@ -230,14 +230,8 @@ impl ScenarioAccount {
                     fee_policy,
                 )?;
             }
-            let old_mark = marks
-                .iter()
-                .find(|m| m.product == product && m.valid_from <= old_at && old_at < m.valid_to)
-                .ok_or("MARK_COVERAGE_MISSING")?;
-            let mark = marks
-                .iter()
-                .find(|m| m.product == product && m.valid_from <= at && at < m.valid_to)
-                .ok_or("MARK_COVERAGE_MISSING")?;
+            let old_mark = marks.mark_at(&product, old_at)?;
+            let mark = marks.mark_at(&product, at)?;
             rows_before.push((old_spec.clone(), old_tier.clone(), old_mark.clone()));
             rows_after.push((spec.clone(), tier.clone(), mark.clone()));
             match &input.rows {

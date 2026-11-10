@@ -181,6 +181,59 @@ fn assert_market_failure_preserves_financial_state(
     assert_eq!(owner.reservation().unwrap(), before.reservation().unwrap());
 }
 
+fn legacy_mark_candidate(
+    rows: &[Mark],
+    at: i64,
+    steps: &[(Product, Decimal)],
+) -> Result<Vec<Mark>, Fault> {
+    let mut candidate = rows.to_vec();
+    for (product, price) in steps {
+        for mark in candidate
+            .iter_mut()
+            .filter(|mark| mark.product == *product && mark.valid_from < at && at < mark.valid_to)
+        {
+            mark.valid_to = at;
+        }
+        candidate.retain(|mark| !(mark.product == *product && mark.valid_from == at));
+        candidate.push(Mark {
+            product: product.clone(),
+            price: *price,
+            valid_from: at,
+            valid_to: i64::MAX,
+        });
+    }
+    super::super::super::validate_marks(&candidate)?;
+    Ok(candidate)
+}
+
+fn legacy_historical_marks(
+    rows: &[Mark],
+    old_at: i64,
+    at: i64,
+    steps: &[(Product, Decimal)],
+) -> Result<Vec<Mark>, Fault> {
+    if at < old_at {
+        return Err("UNSUPPORTED_CONTEXT_TRANSITION");
+    }
+    if at == old_at
+        && steps.iter().any(|(product, price)| {
+            rows.iter()
+                .find(|mark| {
+                    mark.product == *product && mark.valid_from <= at && at < mark.valid_to
+                })
+                .map_or(true, |mark| mark.price != *price)
+        })
+    {
+        return Err("UNSUPPORTED_CONTEXT_TRANSITION");
+    }
+    let candidate = legacy_mark_candidate(rows, at, steps)?;
+    if at == old_at {
+        Ok(rows.to_vec())
+    } else {
+        Ok(candidate)
+    }
+}
+
 #[test]
 fn configured_historical_market_order_keeps_kind_and_settles_only_on_later_capacity() {
     for (id, side, expected_fill) in [
@@ -326,6 +379,146 @@ fn configured_historical_market_order_keeps_kind_and_settles_only_on_later_capac
         assert_eq!(owner.orders[&order_id].facts.status, "FILLED");
         assert_eq!(owner.orders[&order_id].facts.filled, d("0.5"));
     }
+}
+
+#[test]
+fn historical_same_time_same_price_validates_then_discards_candidate() {
+    let at = 336_008;
+    let (mut seed, mut products) = configured_ab();
+    seed.effective_at = at;
+    for product in &mut products {
+        for mark in &mut product.marks {
+            mark.valid_to = at + 1_000;
+        }
+    }
+    let mut owner = ScenarioAccount::from_configured(&seed, d("10"), products).unwrap();
+    let input = node_input(
+        &owner,
+        NodeBar {
+            model: "OHLC4_OPEN_HIGH_LOW_CLOSE_V1",
+            bar_open_ms: 1_000,
+            step_index: 1,
+            a_ohlc: [d("100"), d("110"), d("90"), d("105")],
+            a_volume: "0",
+            a_mark: [d("105"), d("105"), d("105"), d("105")],
+        },
+        &[],
+    );
+    let before = owner.clone();
+    let backwards = node_input(
+        &owner,
+        NodeBar {
+            model: "OHLC4_OPEN_HIGH_LOW_CLOSE_V1",
+            bar_open_ms: 1_000,
+            step_index: 0,
+            a_ohlc: [d("100"), d("110"), d("90"), d("105")],
+            a_volume: "0",
+            a_mark: [d("105"); 4],
+        },
+        &[],
+    );
+    assert_eq!(
+        owner.historical_market_step(&backwards),
+        Err("UNSUPPORTED_CONTEXT_TRANSITION")
+    );
+    assert_eq!(owner, before);
+    let marks_before = owner.btc_context().unwrap().1.to_vec_for_test();
+    let same_time_steps = [
+        (Product("A-USDT-SWAP".into()), d("105")),
+        (Product("B-USDT-SWAP".into()), d("100")),
+    ];
+    let expected_candidate = legacy_mark_candidate(&marks_before, at, &same_time_steps).unwrap();
+    let expected_same_time = legacy_historical_marks(&marks_before, at, at, &same_time_steps);
+    assert_eq!(expected_same_time, Ok(marks_before.clone()));
+    assert_ne!(expected_candidate, marks_before);
+    assert_eq!(
+        expected_candidate,
+        vec![
+            Mark {
+                product: Product("A-USDT-SWAP".into()),
+                price: d("105"),
+                valid_from: 0,
+                valid_to: at
+            },
+            Mark {
+                product: Product("B-USDT-SWAP".into()),
+                price: d("100"),
+                valid_from: 0,
+                valid_to: at
+            },
+            Mark {
+                product: Product("A-USDT-SWAP".into()),
+                price: d("105"),
+                valid_from: at,
+                valid_to: i64::MAX
+            },
+            Mark {
+                product: Product("B-USDT-SWAP".into()),
+                price: d("100"),
+                valid_from: at,
+                valid_to: i64::MAX
+            },
+        ]
+    );
+    owner.historical_market_step(&input).unwrap();
+    assert_eq!(owner, before);
+    assert_eq!(
+        owner.btc_context().unwrap().1.to_vec_for_test(),
+        expected_same_time.unwrap()
+    );
+
+    let before_changed_price = owner.clone();
+    let mut changed_price = input;
+    changed_price.bars[0].mark_ohlc = [d("106"); 4];
+    assert_eq!(
+        owner.historical_market_step(&changed_price),
+        Err("UNSUPPORTED_CONTEXT_TRANSITION")
+    );
+    assert_eq!(owner, before_changed_price);
+}
+
+#[test]
+fn historical_same_time_future_seed_collision_rejects_without_owner_changes() {
+    let at = 336_008;
+    let (mut seed, mut products) = configured_ab();
+    seed.effective_at = at;
+    let a = &mut products[0].marks;
+    a[0].valid_to = at + 1_000;
+    a.push(Mark {
+        product: Product("A-USDT-SWAP".into()),
+        price: d("106"),
+        valid_from: at + 1_000,
+        valid_to: at + 2_000,
+    });
+    for mark in &mut products[1].marks {
+        mark.valid_to = at + 1_000;
+    }
+    let mut owner = ScenarioAccount::from_configured(&seed, d("10"), products).unwrap();
+    let input = node_input(
+        &owner,
+        NodeBar {
+            model: "OHLC4_OPEN_HIGH_LOW_CLOSE_V1",
+            bar_open_ms: 1_000,
+            step_index: 1,
+            a_ohlc: [d("100"), d("110"), d("90"), d("105")],
+            a_volume: "0",
+            a_mark: [d("105"); 4],
+        },
+        &[],
+    );
+    let before = owner.clone();
+    let marks = owner.btc_context().unwrap().1.to_vec_for_test();
+    let same_time_steps = [
+        (Product("A-USDT-SWAP".into()), d("105")),
+        (Product("B-USDT-SWAP".into()), d("100")),
+    ];
+    let oracle = legacy_historical_marks(&marks, at, at, &same_time_steps);
+    assert_eq!(oracle, Err("OVERLAPPING_MARKS"));
+    assert_eq!(
+        owner.historical_market_step(&input).map(|_| ()),
+        oracle.map(|_| ())
+    );
+    assert_eq!(owner, before);
 }
 
 #[test]
@@ -476,6 +669,92 @@ fn historical_step_commits_through_the_existing_execution_owner() {
     assert_eq!(result.products[0].fills[0].quantity, d("1"));
     assert_eq!(owner.orders["O1"].facts.status, "FILLED");
     assert_eq!(owner.execution_receipts.len(), 1);
+}
+
+#[test]
+fn historical_downstream_context_failure_discards_staged_mark_candidate() {
+    let (mut seed, products) = configured_ab();
+    seed.orders.push(SeedOrder {
+        intent_id: "ROLLBACK-INTENT".into(),
+        order_id: "ROLLBACK-ORDER".into(),
+        client_id: "ROLLBACK-CLIENT".into(),
+        strategy_id: "ROLLBACK-STRATEGY".into(),
+        product: ProfileProduct::BtcEth(products[0].product.clone()),
+        side: Side::Short,
+        price: d("109"),
+        reduce_only: false,
+        original: d("1"),
+        filled: Decimal::ZERO,
+        canceled: Decimal::ZERO,
+        remaining: d("1"),
+        status: "OPEN".into(),
+    });
+    let mut owner = ScenarioAccount::from_configured(&seed, d("10"), products).unwrap();
+    let initial = node_input(
+        &owner,
+        NodeBar {
+            model: "OHLC4_OPEN_HIGH_LOW_CLOSE_V1",
+            bar_open_ms: 1_000,
+            step_index: 0,
+            a_ohlc: [d("100"), d("105"), d("95"), d("100")],
+            a_volume: "8",
+            a_mark: [d("100"), d("105"), d("95"), d("100")],
+        },
+        &[("ROLLBACK-ORDER", 1)],
+    );
+    owner.historical_market_step(&initial).unwrap();
+    owner
+        .request_cancel(&risk_transition::cancel::RequestInput {
+            stamp: source::stamp("ROLLBACK-CANCEL", 16_007, 40),
+            targets: vec![(
+                "ROLLBACK-ORDER".into(),
+                risk_transition::cancel::Reason::ExplicitScenario,
+            )],
+        })
+        .unwrap();
+    let saved_batches: std::collections::BTreeMap<_, _> = owner
+        .cancel_facts
+        .batch_rows_snapshot()
+        .into_iter()
+        .collect();
+    assert!(!saved_batches.is_empty());
+    let saved: std::collections::BTreeMap<_, _> = owner
+        .transition
+        .contexts
+        .iter()
+        .map(|(key, receipt)| (key.clone(), receipt.clone()))
+        .collect();
+    assert!(!saved.is_empty());
+    owner.state_version = u64::MAX - 1;
+    let input = node_input(
+        &owner,
+        NodeBar {
+            model: "OHLC4_OPEN_HIGH_LOW_CLOSE_V1",
+            bar_open_ms: 1_000,
+            step_index: 1,
+            a_ohlc: [d("100"), d("110"), d("90"), d("105")],
+            a_volume: "8",
+            a_mark: [d("100"), d("110"), d("90"), d("105")],
+        },
+        &[("ROLLBACK-ORDER", 1)],
+    );
+    assert_eq!(
+        owner.historical_market_step(&input),
+        Err("VERSION_OVERFLOW")
+    );
+    let after_batches: std::collections::BTreeMap<_, _> = owner
+        .cancel_facts
+        .batch_rows_snapshot()
+        .into_iter()
+        .collect();
+    assert_eq!(after_batches, saved_batches);
+    let after: std::collections::BTreeMap<_, _> = owner
+        .transition
+        .contexts
+        .iter()
+        .map(|(key, receipt)| (key.clone(), receipt.clone()))
+        .collect();
+    assert_eq!(after, saved);
 }
 
 #[test]

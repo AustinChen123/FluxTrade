@@ -8,6 +8,8 @@ from hashlib import sha256
 import json
 from typing import Any, cast
 
+import pytest
+
 from examples import run_spider_scenario_replay as cli
 from src.core.backtest import spider_formal_runner as formal
 from src.core.backtest.spider_historical_input import (
@@ -116,6 +118,7 @@ def _assert_h09_path(projection: formal.SpiderP02Projection, model_id: str) -> N
     assert endpoint["trading_fact"]["immutable_payload"]["equity"] == "1009.8"
 
 
+@pytest.mark.slow
 def test_frozen_h12_formal_acceptance_matrix(tmp_path, capsys):
     assert sha256(INPUTS.read_bytes()).hexdigest() == _INPUTS_SHA256
     assert sha256(ANSWERS.read_bytes()).hexdigest() == _ANSWERS_SHA256

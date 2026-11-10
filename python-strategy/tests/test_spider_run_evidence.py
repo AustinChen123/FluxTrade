@@ -4,6 +4,8 @@ import ast
 from copy import deepcopy
 from hashlib import sha256
 from pathlib import Path
+import subprocess
+import sys
 from typing import Any, cast
 
 import pytest
@@ -13,6 +15,7 @@ from src.core.backtest import spider_policy_protocol as sequence_protocol
 from src.core.backtest import spider_run_completion_schema as completion
 from src.core.backtest import spider_run_envelope_schema as envelope
 from src.core.backtest import spider_run_evidence as evidence
+from src.core.backtest import spider_historical_report_projection as projection
 from src.core.backtest.spider_run_reconciliation_schema import reconciliation
 from src.core.backtest.spider_scenario_plans import PLAN_IDS, plan_bundle
 from src.core.backtest.spider_historical_input import historical_planned_coverage
@@ -25,6 +28,55 @@ NAMES = ["PLANNED_COVERAGE_COMPLETE", "PROCESSED_EQUALS_PERSISTED", "JOURNAL_CON
          "ENDPOINT_SNAPSHOT_VERSION_MATCH", "NO_UNRESOLVED_QUEUE", "NO_UNRESOLVED_POLL", "NO_UNSUBMITTED_CALLBACK_ACTION", "TERMINAL_POLICY_MATCH", "REPORT_PROJECTION_MATCH"]
 INITIAL = "artifact:endpoint.json#/initial_owner_evidence"
 FINAL = "artifact:endpoint.json#/final_owner_evidence"
+
+
+def test_historical_projection_import_closure_is_pure_and_mutation_sensitive():
+    path = Path(projection.__file__)
+    source = path.read_text()
+    allowed_imports = {"typing": {"Any", "TypedDict"}}
+
+    def assert_allowed_imports(text):
+        tree = ast.parse(text)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    assert alias.name in allowed_imports
+            elif isinstance(node, ast.ImportFrom):
+                assert node.level == 0 and node.module in allowed_imports
+                assert {alias.name for alias in node.names} <= allowed_imports[node.module]
+
+    assert_allowed_imports(source)
+    mutations = (
+        "\nimport pathlib\n",
+        "\nfrom src.core.backtest import spider_run_native_schema\n",
+        "\nfrom . import spider_run_artifacts\n",
+    )
+    for mutation in mutations:
+        with pytest.raises(AssertionError):
+            assert_allowed_imports(source + mutation)
+
+    closure_check = """
+import sys
+import src.core.backtest.spider_historical_report_projection
+allowed_core = {
+    'src.core', 'src.core.backtest',
+    'src.core.backtest.spider_historical_report_projection',
+}
+banned = {
+    'src.core.backtest.spider_run_artifacts', 'src.core.backtest.spider_run_store',
+    'src.core.backtest.spider_run_admission', 'src.core.backtest.spider_run_evidence',
+    'src.core.backtest.spider_run_native_schema',
+}
+loaded_core = {name for name in sys.modules
+               if name == 'src.core' or name.startswith('src.core.')}
+assert not (loaded_core - allowed_core), sorted(loaded_core - allowed_core)
+assert not (loaded_core & banned), sorted(loaded_core & banned)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", closure_check], cwd=Path(__file__).parents[1],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def fixture(index=0):
@@ -253,6 +305,471 @@ def test_h03_mixed_poll_delivery_sequence_modes_are_rejected():
     assert not evidence._historical_polls_endpoint_compatible(observation, cutoff)
 
 
+def _assert_poll_checker_differential(observation, cutoff, mode, paid_prefix=None,
+                                      allow_terminal_delivery=False):
+    args = (observation, cutoff, mode, paid_prefix, allow_terminal_delivery)
+    try:
+        expected = evidence._historical_polls_endpoint_mode_compatible_original(*args)
+    except Exception as error:
+        expected = (type(error), error.args)
+    try:
+        actual = evidence._historical_polls_endpoint_mode_compatible(*args)
+    except Exception as error:
+        actual = (type(error), error.args)
+    assert actual == expected
+
+
+def test_indexed_poll_checker_matches_original_for_delivery_multimap_collisions():
+    _, observation, cutoff = h03_endpoint_observation(100_001)
+    mode = evidence._HistoricalSequenceMode.HISTORICAL_DISJOINT_SEQUENCE_V1
+    _assert_poll_checker_differential(observation, cutoff, mode)
+    poll = next(row for row in observation["polls"] if row["status"] == "COMPLETED")
+    raw_at = int(poll["poll_id"].partition("_POLL_")[2])
+    timer = next(row for row in observation["records"]
+                 if row["kind"] == "HISTORICAL_TIMER"
+                 and row["stable_id"] == f"P3_TIMER_{raw_at}")
+    has_earn = any(row["kind"] == "SNAPSHOT_CAPTURE"
+                   and row["stable_id"] == f"{poll['poll_id']}_EARN"
+                   for row in observation["records"])
+    layout = (("EARN", 0, 1, 5), ("TRADING", 1, 6, 10),
+              ("POSITIONS", 2, 11, 15), ("OPEN_ORDERS", 3, 16, 20)) if has_earn else (
+                  ("TRADING", 0, 1, 5), ("POSITIONS", 1, 6, 10), ("OPEN_ORDERS", 2, 11, 15))
+    target = None
+    for name, stage_index, _, delivery_offset in layout:
+        capture = next(row for row in observation["records"]
+                       if row["kind"] == "SNAPSHOT_CAPTURE"
+                       and row["stable_id"] == f"{poll['poll_id']}_{name}")
+        sequence = timer["key"]["schedule_sequence"] * 4 + stage_index
+        delivery_sequence = sequence_protocol.historical_delivery_sequence(
+            mode, sequence_protocol.HistoricalDeliveryKind.POLL, sequence,
+        )
+        delivery_at = (raw_at + delivery_offset) * 16 + 6
+        target = next((row for row in observation["records"]
+                       if row["kind"] == "DELIVERY"
+                       and row["key"]["schedule_sequence"] == delivery_sequence
+                       and row["key"]["visible_at"] == delivery_at), None)
+        if capture["classification"] == "SUCCESS" and target is not None:
+            break
+        target = None
+    assert target is not None
+    # Same schedule/time, distinct stable identity must retain cardinality=2.
+    duplicate_identity = deepcopy(target)
+    duplicate_identity["key"]["stable_id"] += "-other"
+    observation["records"].append(duplicate_identity)
+    _assert_poll_checker_differential(observation, cutoff, mode)
+    observation["records"].pop()
+    # Same stable identity at another schedule/time must not enter the bucket.
+    duplicate_time = deepcopy(target)
+    duplicate_time["key"]["schedule_sequence"] += 100_000
+    duplicate_time["key"]["visible_at"] += 1
+    observation["records"].append(duplicate_time)
+    _assert_poll_checker_differential(observation, cutoff, mode)
+
+
+@pytest.mark.parametrize("mode", list(evidence._HistoricalSequenceMode))
+def test_indexed_poll_checker_differential_invalid_status_missing_timer_and_legal_timer(mode):
+    _, observation, cutoff = h03_endpoint_observation(100_001)
+    _assert_poll_checker_differential(observation, cutoff, mode)
+    invalid = deepcopy(observation)
+    invalid["polls"][0]["status"] = "INVALID"
+    invalid["records"] = [{}]
+    _assert_poll_checker_differential(invalid, cutoff, mode)
+    assert evidence._historical_polls_endpoint_compatible(invalid, cutoff) is False
+    missing = deepcopy(observation)
+    poll = missing["polls"][-1]
+    poll["status"] = "IN_PROGRESS"
+    timer_id = f"P3_TIMER_{int(poll['poll_id'].partition('_POLL_')[2])}"
+    missing["records"] = [row for row in missing["records"] if row.get("stable_id") != timer_id]
+    _assert_poll_checker_differential(missing, cutoff, mode)
+
+
+def test_indexed_poll_checker_unsafe_relevant_row_uses_whole_call_fallback(monkeypatch):
+    _, observation, cutoff = h03_endpoint_observation(100_001)
+    observation["records"].append({"kind": "HISTORICAL_TIMER", "stable_id": [],
+                                    "classification": "SUCCESS", "key": {}})
+    expected = evidence._historical_polls_endpoint_mode_compatible_original(
+        observation, cutoff, evidence._HistoricalSequenceMode.HISTORICAL_DISJOINT_SEQUENCE_V1,
+    )
+    called = 0
+    original = evidence._historical_polls_endpoint_mode_compatible_original
+
+    def spy(*args):
+        nonlocal called
+        called += 1
+        return original(*args)
+
+    monkeypatch.setattr(evidence, "_historical_polls_endpoint_mode_compatible_original", spy)
+    actual = evidence._historical_polls_endpoint_mode_compatible(
+        observation, cutoff, evidence._HistoricalSequenceMode.HISTORICAL_DISJOINT_SEQUENCE_V1,
+    )
+    assert actual == expected
+    assert called == 1
+
+
+def test_indexed_poll_checker_subclass_sources_fall_back_before_hash_or_mapping_reads(monkeypatch):
+    class UnhashableStr(str):
+        __hash__ = None  # pyright: ignore[reportAssignmentType]
+
+    class DictSubclass(dict):
+        def __contains__(self, key):
+            raise AssertionError("subclass containment must not be called by fast path")
+
+    _, observation, cutoff = h03_endpoint_observation(100_001)
+    observation["polls"] = []
+    observation["records"] = [{
+        "kind": "HISTORICAL_TIMER", "stable_id": UnhashableStr("timer"),
+        "classification": "SUCCESS", "key": {"schedule_sequence": 0},
+    }]
+    original = evidence._historical_polls_endpoint_mode_compatible_original
+    cases = [observation]
+    mapping_case = deepcopy(observation)
+    mapping_case["records"] = [DictSubclass({"kind": "OTHER"})]
+    cases.append(mapping_case)
+    for case in cases:
+        try:
+            expected = original(case, cutoff, evidence._HistoricalSequenceMode.HISTORICAL_DISJOINT_SEQUENCE_V1)
+        except Exception as error:
+            expected = (type(error), error.args)
+        calls = 0
+
+        def spy(*args):
+            nonlocal calls
+            calls += 1
+            return original(*args)
+
+        monkeypatch.setattr(evidence, "_historical_polls_endpoint_mode_compatible_original", original)
+        monkeypatch.setattr(evidence, "_historical_polls_endpoint_mode_compatible_original", spy)
+        try:
+            actual = evidence._historical_polls_endpoint_mode_compatible(
+                case, cutoff, evidence._HistoricalSequenceMode.HISTORICAL_DISJOINT_SEQUENCE_V1,
+            )
+        except Exception as error:
+            actual = (type(error), error.args)
+        assert actual == expected
+        assert calls == 1
+        monkeypatch.setattr(evidence, "_historical_polls_endpoint_mode_compatible_original", original)
+
+
+def test_indexed_poll_checker_stateful_classification_subclass_falls_back(monkeypatch):
+    class Classification(str):
+        def __eq__(self, other):
+            self.calls = getattr(self, "calls", 0) + 1
+            if self.calls > 1:
+                raise RuntimeError("classification compared twice")
+            return super().__eq__(other)
+
+    def make_observation():
+        _, observation, cutoff = h03_endpoint_observation(100_001)
+        observation["polls"] = []
+        observation["pending_keys"] = []
+        observation["records"] = [{
+            "kind": "HISTORICAL_TIMER", "stable_id": "x",
+            "classification": Classification("SUCCESS"),
+            "key": {"schedule_sequence": 0},
+        }]
+        return observation, cutoff
+
+    original = evidence._historical_polls_endpoint_mode_compatible_original
+    observation, cutoff = make_observation()
+    args = (observation, cutoff, evidence._HistoricalSequenceMode.HISTORICAL_DISJOINT_SEQUENCE_V1)
+    try:
+        expected = original(*args)
+    except Exception as error:
+        expected = (type(error), error.args)
+    calls = 0
+
+    def spy(*spy_args):
+        nonlocal calls
+        calls += 1
+        return original(*spy_args)
+
+    monkeypatch.setattr(evidence, "_historical_polls_endpoint_mode_compatible_original", spy)
+    observation, cutoff = make_observation()
+    args = (observation, cutoff, evidence._HistoricalSequenceMode.HISTORICAL_DISJOINT_SEQUENCE_V1)
+    try:
+        actual = evidence._historical_polls_endpoint_mode_compatible(*args)
+    except Exception as error:
+        actual = (type(error), error.args)
+    assert actual == expected is True
+    assert calls == 1
+
+
+def test_indexed_poll_checker_nested_non_json_payload_falls_back(monkeypatch):
+    _, observation, cutoff = h03_endpoint_observation(100_001)
+    observation["records"][0]["payload"] = {"nested": ([object()],)}
+    original = evidence._historical_polls_endpoint_mode_compatible_original
+    calls = 0
+
+    def spy(*args):
+        nonlocal calls
+        calls += 1
+        return original(*args)
+
+    monkeypatch.setattr(evidence, "_historical_polls_endpoint_mode_compatible_original", spy)
+    args = (observation, cutoff, evidence._HistoricalSequenceMode.HISTORICAL_DISJOINT_SEQUENCE_V1)
+    actual = evidence._historical_polls_endpoint_mode_compatible(*args)
+    expected = original(*args)
+    assert actual == expected
+    assert calls == 1
+
+
+def test_indexed_poll_checker_tuple_float_payload_stays_on_fast_path(monkeypatch):
+    _, observation, cutoff = h03_endpoint_observation(100_001)
+    observation["records"][0]["payload"] = ("allowed", [1.25, None, True])
+    original = evidence._historical_polls_endpoint_mode_compatible_original
+    calls = 0
+
+    def spy(*args):
+        nonlocal calls
+        calls += 1
+        return original(*args)
+
+    monkeypatch.setattr(evidence, "_historical_polls_endpoint_mode_compatible_original", spy)
+    args = (observation, cutoff, evidence._HistoricalSequenceMode.HISTORICAL_DISJOINT_SEQUENCE_V1)
+    expected = original(*args)
+    actual = evidence._historical_polls_endpoint_mode_compatible(*args)
+    assert actual == expected
+    assert calls == 0
+
+
+
+
+def test_indexed_poll_checker_contract_a_fallback_parity_and_input_purity(monkeypatch):
+    _, base, cutoff = h03_endpoint_observation(100_001)
+    mode = evidence._HistoricalSequenceMode.HISTORICAL_DISJOINT_SEQUENCE_V1
+    invalid_poll_id = {
+        "records": [], "pending_keys": [],
+        "polls": [{"status": "COMPLETED", "awaiting": None, "poll_id": 7, "continuation_id": "x"}],
+    }
+    paused = deepcopy(invalid_poll_id)
+    paused["polls"][0].update(status="PAUSED")
+    completed_keyerror = deepcopy(invalid_poll_id)
+    completed_keyerror["polls"][0].update(status="COMPLETED")
+    completed_keyerror["records"] = [{"kind": "OTHER"}]
+    huge_id = deepcopy(invalid_poll_id)
+    huge_id["polls"][0].update(poll_id="P3_POLL_" + "1" * 5000)
+    invalid_integer_id = {
+        "records": [], "pending_keys": [],
+        "polls": [{"status": "INVALID", "awaiting": None, "poll_id": 0, "continuation_id": "x"}],
+    }
+    invalid_huge_id = deepcopy(invalid_integer_id)
+    invalid_huge_id["polls"][0].update(poll_id="P3_POLL_" + "1" * 5000)
+    negative_sequence = deepcopy(base)
+    poll = next(row for row in negative_sequence["polls"] if row["status"] == "COMPLETED")
+    poll_id = poll["poll_id"]
+    raw_at = int(poll_id.partition("_POLL_")[2])
+    timer = next(row for row in negative_sequence["records"]
+                 if row["kind"] == "HISTORICAL_TIMER" and row["stable_id"] == f"P3_TIMER_{raw_at}")
+    timer["key"]["schedule_sequence"] = -1
+    capture = next(row for row in negative_sequence["records"]
+                   if row["kind"] == "SNAPSHOT_CAPTURE" and row["stable_id"] == f"{poll_id}_TRADING")
+    capture["key"]["schedule_sequence"] = 0
+    helper_exception = deepcopy(base)
+    helper_poll = next(row for row in helper_exception["polls"] if row["status"] == "COMPLETED")
+    helper_poll_id = helper_poll["poll_id"]
+    helper_raw_at = int(helper_poll_id.partition("_POLL_")[2])
+    helper_timer = next(row for row in helper_exception["records"]
+                        if row["kind"] == "HISTORICAL_TIMER"
+                        and row["stable_id"] == f"P3_TIMER_{helper_raw_at}")
+    helper_timer["key"]["schedule_sequence"] = -1
+    helper_capture = next(row for row in helper_exception["records"]
+                          if row["kind"] == "SNAPSHOT_CAPTURE"
+                          and row["stable_id"] == f"{helper_poll_id}_TRADING")
+    helper_capture["key"]["schedule_sequence"] = -4
+    cases = [
+        (invalid_poll_id, None), (paused, "PAID_x"),
+        (completed_keyerror, None), (huge_id, None),
+        (invalid_integer_id, None), (invalid_huge_id, None),
+        (negative_sequence, None), (helper_exception, None),
+    ]
+
+    actual_original = evidence._historical_polls_endpoint_mode_compatible_original
+    calls = 0
+
+    def fallback_spy(*args):
+        nonlocal calls
+        calls += 1
+        return actual_original(*args)
+
+    monkeypatch.setattr(evidence, "_historical_polls_endpoint_mode_compatible_original", fallback_spy)
+    for observation, paid_prefix in cases:
+        pristine = deepcopy(observation)
+        args = (observation, cutoff, mode, paid_prefix)
+        try:
+            expected = actual_original(*args)
+        except Exception as error:
+            expected = (type(error), error.args)
+        before = calls
+        try:
+            actual = evidence._historical_polls_endpoint_mode_compatible(*args)
+        except Exception as error:
+            actual = (type(error), error.args)
+        assert actual == expected
+        if observation in (invalid_integer_id, invalid_huge_id):
+            assert actual is False
+        if isinstance(expected, tuple) and len(expected) == 2 and isinstance(expected[0], type):
+            assert calls == before + 1
+        else:
+            assert calls in (before, before + 1)
+        assert observation == pristine
+
+    _, normal, normal_cutoff = h03_endpoint_observation(100_001)
+    pristine = deepcopy(normal)
+    before = calls
+    expected = actual_original(normal, normal_cutoff, mode)
+    actual = evidence._historical_polls_endpoint_mode_compatible(normal, normal_cutoff, mode)
+    assert actual == expected
+    assert calls == before
+    assert normal == pristine
+
+
+def test_indexed_poll_checker_real_sequence_negative_schedule_falls_back(monkeypatch):
+    _, observation, cutoff = h03_endpoint_observation(100_001)
+    poll = next(row for row in observation["polls"] if row["status"] == "COMPLETED")
+    raw_at = int(poll["poll_id"].partition("_POLL_")[2])
+    timer = next(row for row in observation["records"]
+                 if row["kind"] == "HISTORICAL_TIMER" and row["stable_id"] == f"P3_TIMER_{raw_at}")
+    timer["key"]["schedule_sequence"] = -1
+    capture = next(row for row in observation["records"]
+                   if row["kind"] == "SNAPSHOT_CAPTURE" and row["stable_id"] == f"{poll['poll_id']}_TRADING")
+    capture["key"]["schedule_sequence"] = 0
+    mode = evidence._HistoricalSequenceMode.HISTORICAL_DISJOINT_SEQUENCE_V1
+    original = evidence._historical_polls_endpoint_mode_compatible_original
+    calls = 0
+
+    def spy(*args):
+        nonlocal calls
+        calls += 1
+        return original(*args)
+
+    monkeypatch.setattr(evidence, "_historical_polls_endpoint_mode_compatible_original", spy)
+    expected = original(observation, cutoff, mode)
+    actual = evidence._historical_polls_endpoint_mode_compatible(observation, cutoff, mode)
+    assert actual == expected is False
+    assert calls == 0
+
+
+def test_indexed_poll_checker_metaclass_equality_is_never_called_by_guard(monkeypatch):
+    class Meta(type):
+        def __eq__(cls, other):
+            raise RuntimeError("metaclass equality called")
+
+    class Unknown(metaclass=Meta):
+        pass
+
+    _, observation, cutoff = h03_endpoint_observation(100_001)
+    observation["records"][0]["payload"] = {"deep": (Unknown(),)}
+    mode = evidence._HistoricalSequenceMode.HISTORICAL_DISJOINT_SEQUENCE_V1
+    original = evidence._historical_polls_endpoint_mode_compatible_original
+    try:
+        expected = original(observation, cutoff, mode)
+    except Exception as error:
+        expected = (type(error), error.args)
+    calls = 0
+
+    def fallback_spy(*args):
+        nonlocal calls
+        calls += 1
+        return original(*args)
+
+    monkeypatch.setattr(evidence, "_historical_polls_endpoint_mode_compatible_original", fallback_spy)
+    try:
+        actual = evidence._historical_polls_endpoint_mode_compatible(observation, cutoff, mode)
+    except Exception as error:
+        actual = (type(error), error.args)
+    assert actual == expected
+    assert calls == 1
+
+
+def test_indexed_poll_checker_unhashable_delivery_query_key_falls_back(monkeypatch):
+    _, observation, cutoff = h03_endpoint_observation(100_001)
+    monkeypatch.setattr(evidence, "_historical_delivery_sequence", lambda *_args: [])
+    expected = evidence._historical_polls_endpoint_mode_compatible_original(
+        observation, cutoff, evidence._HistoricalSequenceMode.HISTORICAL_DISJOINT_SEQUENCE_V1,
+    )
+    called = 0
+    original = evidence._historical_polls_endpoint_mode_compatible_original
+
+    def spy(*args):
+        nonlocal called
+        called += 1
+        return original(*args)
+
+    monkeypatch.setattr(evidence, "_historical_polls_endpoint_mode_compatible_original", spy)
+    actual = evidence._historical_polls_endpoint_mode_compatible(
+        observation, cutoff, evidence._HistoricalSequenceMode.HISTORICAL_DISJOINT_SEQUENCE_V1,
+    )
+    assert actual == expected
+    assert called == 1
+
+
+@pytest.mark.parametrize("pending_capture", [False, True])
+def test_indexed_poll_checker_empty_delivery_source_uses_empty_result(pending_capture, monkeypatch):
+    _, observation, cutoff = h03_endpoint_observation(100_001)
+    if pending_capture:
+        poll = next(row for row in observation["polls"] if row["status"] == "IN_PROGRESS")
+    else:
+        poll = next(row for row in observation["polls"] if row["status"] == "COMPLETED")
+    timer_id = f"P3_TIMER_{int(poll['poll_id'].partition('_POLL_')[2])}"
+    observation["polls"] = [poll]
+    observation["records"] = [
+        row for row in observation["records"]
+        if row.get("stable_id") == timer_id
+        or (row.get("kind") == "SNAPSHOT_CAPTURE" and
+            type(row.get("stable_id")) is str and row["stable_id"].startswith(poll["poll_id"] + "_"))
+    ]
+    observation["pending_keys"] = [
+        deepcopy(row["key"]) for row in observation["records"]
+        if row.get("classification") == "PENDING"
+    ]
+    monkeypatch.setattr(evidence, "_historical_delivery_sequence", lambda *_args: [])
+    for mode in evidence._HistoricalSequenceMode:
+        _assert_poll_checker_differential(observation, cutoff, mode)
+
+
+def test_missing_capture_stable_id_without_timer_returns_false_and_falls_back(monkeypatch):
+    _, observation, cutoff = h03_endpoint_observation(100_001)
+    poll = observation["polls"][-1]
+    poll["status"] = "IN_PROGRESS"
+    observation["polls"] = [poll]
+    raw_at = int(poll["poll_id"].partition("_POLL_")[2])
+    timer_id = f"P3_TIMER_{raw_at}"
+    missing_capture_id = f"{poll['poll_id']}_{poll['awaiting']}"
+    observation["records"] = [
+        row for row in observation["records"]
+        if row.get("stable_id") != timer_id
+    ]
+    capture = next(row for row in observation["records"]
+                   if row["kind"] == "SNAPSHOT_CAPTURE" and row["stable_id"] == missing_capture_id)
+    del capture["stable_id"]
+    original = evidence._historical_polls_endpoint_mode_compatible_original
+    calls = 0
+
+    def spy(*args):
+        nonlocal calls
+        calls += 1
+        return original(*args)
+
+    monkeypatch.setattr(evidence, "_historical_polls_endpoint_mode_compatible_original", spy)
+    for mode in evidence._HistoricalSequenceMode:
+        _assert_poll_checker_differential(observation, cutoff, mode)
+        assert evidence._historical_polls_endpoint_mode_compatible(observation, cutoff, mode) is False
+    assert calls == len(evidence._HistoricalSequenceMode) * 3
+
+
+def test_invalid_poll_status_short_circuits_malformed_records_differential(monkeypatch):
+    _, observation, cutoff = h03_endpoint_observation(100_001)
+    observation["polls"][0]["status"] = "INVALID"
+    observation["records"] = [{}]
+    actual = evidence._historical_polls_endpoint_compatible(observation, cutoff)
+    monkeypatch.setattr(
+        evidence, "_historical_polls_endpoint_mode_compatible",
+        evidence._historical_polls_endpoint_mode_compatible_original,
+    )
+    expected = evidence._historical_polls_endpoint_compatible(observation, cutoff)
+    assert actual is expected is False
+
+
 def expected_checks(values):
     attempt, status, journal, endpoint, report = values
     coverage = attempt["planned_coverage"]
@@ -450,6 +967,212 @@ def test_callback_matching_complete_result_unique_whole_row(matches):
     assert action["cancel_effect_ref"] is None
     assert actual["checks"][8]["result"] == "FAILED"
     reconciliation(actual)
+
+
+def test_actions_index_matches_ordered_scan_and_uses_fast_path(monkeypatch):
+    first = dict(record_kind="SOURCE_GROUP_RESULT", journal_seq=4,
+                 payload=dict(result=dict(group_id="g", value=1)))
+    second = dict(record_kind="SOURCE_GROUP_RESULT", journal_seq=7,
+                  payload=dict(result=dict(group_id="g", value=2)))
+    actions = [dict(delivery_id="d1", event_index=0, action_index=0, group_id="g", status="SUBMITTED",
+                    group_result=dict(group_id="g", value=2)),
+               dict(delivery_id="d2", event_index=1, action_index=1, group_id="g", status="SUBMITTED",
+                    group_result=dict(group_id="g", value=1))]
+    fallbacks = 0
+    original = evidence._actions_original
+
+    def count_fallback(journal, observed):
+        nonlocal fallbacks
+        fallbacks += 1
+        return original(journal, observed)
+
+    monkeypatch.setattr(evidence, "_actions_original", count_fallback)
+    assert evidence._actions([first, second], actions) == original([first, second], actions)
+    assert [row["group_result_ref"] for row in evidence._actions([first, second], actions)] == ["journal:7", "journal:4"]
+    assert fallbacks == 0
+
+
+@pytest.mark.parametrize("journal,actions", [
+    ([dict(record_kind="SOURCE_GROUP_RESULT", journal_seq=1, payload=dict(result=dict(group_id="g", value=1)))],
+     [dict(delivery_id="d", event_index=0, action_index=0, group_id=[], status="SUBMITTED", group_result={})]),
+    ([], [dict(delivery_id="d", event_index=0, action_index=0, status="SUBMITTED")]),
+    ([{}], []),
+])
+def test_actions_index_malformed_inputs_match_verbatim_oracle(journal, actions):
+    def outcome(call):
+        try:
+            return ("return", call())
+        except Exception as error:
+            return ("raise", type(error), error.args)
+
+    assert outcome(lambda: evidence._actions(journal, actions)) == outcome(
+        lambda: evidence._actions_original(journal, actions))
+
+
+def test_actions_exception_fallback_discards_partial_index(monkeypatch):
+    journal = [dict(record_kind="SOURCE_GROUP_RESULT", journal_seq=1,
+                    payload=dict(result=dict(group_id="g", value="x")))]
+    actions = [dict(delivery_id="d", event_index=0, action_index=0, group_id="g", status="SUBMITTED",
+                    group_result=dict(group_id="g", value="x"))]
+    expected = evidence._actions_original(journal, actions)
+    original_equal = evidence._equal
+    calls = 0
+
+    def fail_once(left, right):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("fast-path-only")
+        return original_equal(left, right)
+
+    monkeypatch.setattr(evidence, "_equal", fail_once)
+    assert evidence._actions(journal, actions) == expected
+    assert calls == 2
+
+
+def test_actions_missing_group_result_precedes_later_malformed_source_result(monkeypatch):
+    journal = [dict(record_kind="SOURCE_GROUP_RESULT", journal_seq=1,
+                    payload=dict(result=dict(group_id="g", value="x"))),
+               dict(record_kind="SOURCE_GROUP_RESULT", journal_seq=2)]
+    actions = [dict(delivery_id="d", event_index=0, action_index=0, group_id="g", status="SUBMITTED")]
+    original = evidence._actions_original
+    fallback_calls = 0
+
+    def fallback(journal_rows, observed):
+        nonlocal fallback_calls
+        fallback_calls += 1
+        return original(journal_rows, observed)
+
+    monkeypatch.setattr(evidence, "_actions_original", fallback)
+    with pytest.raises(KeyError) as error:
+        evidence._actions(journal, actions)
+    assert error.value.args == ("group_result",)
+    assert fallback_calls == 1
+
+
+def test_deferred_action_index_differential_duplicates_and_fallback(monkeypatch):
+    key = dict(queue_class="DELIVERY", stable_id="d", schedule_sequence=1, visible_at=6)
+    callback = dict(record_kind="CALLBACK_RESULT", scheduler_key=key, payload=dict(
+        outcome="SUCCESS", delivery_id="d",
+        actions=[dict(event_index=0, action_index=0, status="UNSUBMITTED",
+        group_id=None, group_result=None, native_failure=None)]))
+    observation = dict(records=[dict(kind="DELIVERY", stable_id="d", classification="SUCCESS", key=key)],
+                       callback_actions=[dict(delivery_id="d", event_index=0, action_index=0, group_id=None,
+                       status="UNSUBMITTED", group_result=None, effective_at=19)], pending_keys=[])
+    original = evidence._historical_deferred_actions_compatible_original
+    fallbacks = 0
+
+    def count_fallback(journal, observed, cutoff):
+        nonlocal fallbacks
+        fallbacks += 1
+        return original(journal, observed, cutoff)
+
+    def outcome(call):
+        try:
+            return ("return", call())
+        except Exception as error:
+            return ("raise", type(error), error.args)
+
+    monkeypatch.setattr(evidence, "_historical_deferred_actions_compatible_original", count_fallback)
+    assert evidence._historical_deferred_actions_compatible([callback], observation, 6) is True
+    assert fallbacks == 0
+    duplicated = dict(observation, records=[*observation["records"], observation["records"][0]])
+    assert evidence._historical_deferred_actions_compatible([callback], duplicated, 6) == original([callback], duplicated, 6)
+    assert fallbacks == 0
+    malformed = dict(observation, records=[{}])
+    assert outcome(lambda: evidence._historical_deferred_actions_compatible([callback], malformed, 6)) == outcome(
+        lambda: original([callback], malformed, 6))
+    assert fallbacks == 1
+
+
+def test_action_fast_paths_leave_inputs_unchanged_on_success_and_fallback():
+    journal = [dict(record_kind="SOURCE_GROUP_RESULT", journal_seq=1,
+                    payload=dict(result=dict(group_id="g", value="x")))]
+    actions = [dict(delivery_id="d", event_index=0, action_index=0, group_id="g", status="SUBMITTED",
+                    group_result=dict(group_id="g", value="x"))]
+    before = deepcopy((journal, actions))
+    evidence._actions(journal, actions)
+    assert (journal, actions) == before
+
+    key = dict(queue_class="DELIVERY", stable_id="d", schedule_sequence=1, visible_at=6)
+    callback = dict(record_kind="CALLBACK_RESULT", scheduler_key=key, payload=dict(
+        outcome="SUCCESS", delivery_id="d", actions=[dict(event_index=0, action_index=0,
+        status="UNSUBMITTED", group_id=None, group_result=None, native_failure=None)]))
+    observation = dict(records=[dict(kind="DELIVERY", stable_id="d", classification="SUCCESS", key=key)],
+                       callback_actions=[dict(delivery_id="d", event_index=0, action_index=0, group_id=None,
+                       status="UNSUBMITTED", group_result=None, effective_at=19)], pending_keys=[])
+    before = deepcopy(([callback], observation))
+    evidence._historical_deferred_actions_compatible([callback], observation, 6)
+    assert ([callback], observation) == before
+    malformed_observation = dict(observation, records=[{}])
+    before = deepcopy(([callback], malformed_observation))
+    with pytest.raises(KeyError, match="kind"):
+        evidence._historical_deferred_actions_compatible([callback], malformed_observation, 6)
+    assert ([callback], malformed_observation) == before
+
+
+def test_actions_payload_dict_subclass_falls_back_without_fast_path_access(monkeypatch):
+    class Payload(dict):
+        touched = False
+
+        def __getitem__(self, key):
+            type(self).touched = True
+            raise AssertionError("fast path touched custom payload")
+
+    payload = Payload(result={"group_id": "g"})
+    journal = [{"record_kind": "SOURCE_GROUP_RESULT", "payload": payload}]
+    actions = []
+    original = evidence._actions_original
+    calls = []
+
+    def fallback(*args):
+        calls.append(args)
+        return original(*args)
+
+    monkeypatch.setattr(evidence, "_actions_original", fallback)
+    before = dict(payload)
+    def outcome(call):
+        try:
+            return ("value", call())
+        except Exception as exc:
+            return ("exception", type(exc), exc.args)
+    assert outcome(lambda: evidence._actions(journal, actions)) == outcome(lambda: original(journal, actions))
+    assert calls == [(journal, actions)]
+    assert Payload.touched is False
+    assert dict(payload) == before
+
+
+def test_deferred_payload_dict_subclass_falls_back_without_fast_path_access(monkeypatch):
+    class Payload(dict):
+        touched = False
+
+        def __getitem__(self, key):
+            type(self).touched = True
+            raise AssertionError("fast path touched custom payload")
+
+    payload = Payload(result={"group_id": "g"})
+    journal = [{"record_kind": "SOURCE_GROUP_RESULT", "payload": payload}]
+    observation = {"records": [], "callback_actions": [], "pending_keys": []}
+    original = evidence._historical_deferred_actions_compatible_original
+    calls = []
+
+    def fallback(*args):
+        calls.append(args)
+        return original(*args)
+
+    monkeypatch.setattr(evidence, "_historical_deferred_actions_compatible_original", fallback)
+    before = dict(payload)
+    def outcome(call):
+        try:
+            return ("value", call())
+        except Exception as exc:
+            return ("exception", type(exc), exc.args)
+    assert outcome(lambda: evidence._historical_deferred_actions_compatible(journal, observation, 0)) == outcome(
+        lambda: original(journal, observation, 0)
+    )
+    assert calls == [(journal, observation, 0)]
+    assert Payload.touched is False
+    assert dict(payload) == before
 
 
 @pytest.mark.parametrize("status", ["SUBMITTED", "UNSUBMITTED"])
@@ -806,7 +1529,9 @@ def test_no_reconciliation_authority_and_public_import_boundary():
     tree = ast.parse(Path(evidence.__file__).read_text())
     assert not any(isinstance(node, ast.Import) for node in ast.walk(tree))
     assert {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)} <= {
-            "copy", "hashlib", "struct", "typing", "src.core.backtest.spider_run_artifacts", "src.core.backtest.spider_run_completion_schema",
+            "copy", "enum", "hashlib", "struct", "typing", "src.core.backtest.spider_run_artifacts", "src.core.backtest.spider_run_completion_schema",
         "src.core.backtest.spider_run_reconciliation_schema", "src.core.backtest.spider_scenario_plans", "src.core.backtest.spider_run_envelope_schema",
-        "src.core.backtest.spider_configured_scale_input", "src.core.backtest.spider_policy_protocol"}
+        "src.core.backtest.spider_configured_scale_input", "src.core.backtest.spider_policy_protocol",
+        "src.core.backtest.spider_historical_report_projection",
+        "src.core.backtest.spider_run_errors"}
     assert not any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in {"open", "eval", "exec", "__import__"} for node in ast.walk(tree))

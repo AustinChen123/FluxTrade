@@ -3,14 +3,18 @@
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
+import sys
 from typing import Any, cast
 
 import pytest
 
+from src.core.backtest import spider_historical_input as historical_input_module
+from src.core.backtest import spider_execution_input as execution_input_module
 from src.core.backtest import spider_run_store as module
-from src.core.backtest.spider_run_artifacts import decode_jsonl
+from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_jsonl
 from src.core.backtest.spider_run_execution_evidence import build_execution_reconciliation
 from test_spider_run_execution_evidence import _bundle, _initial_capture_failure_bundle, _liquidation_request
+from test_spider_historical_input import _immutable_subclass
 from test_spider_paid_endpoint_native import _seeded_two_product_run
 
 
@@ -50,11 +54,131 @@ def test_actual_native_paid_bundle_publishes_closed_family_and_completion(tmp_pa
         "paid_endpoint.json", "report.jsonl", "reconciliation.json", "completion.json",
     }
     assert (store._path / "execution_input.json").read_bytes() == artifacts["execution_input.json"]
+    assert (store._path / "paid_endpoint.json").read_bytes() == artifacts["paid_endpoint.json"]
+    assert (store._path / "report.jsonl").read_bytes() == artifacts["report.jsonl"]
+    assert (store._path / "reconciliation.json").read_bytes() == canonical_bytes(reconciliation) + b"\n"
     assert not (store._path / "historical_input.json").exists()
     completion = cast(dict[str, Any], decode_jsonl((store._path / "completion.json").read_bytes())[0])
     assert completion["endpoint_status"] == "PAID_FLAT"
     assert completion["evidence_scope"] == "COMPLETE_RUN"
     assert [item["row_count"] for item in completion["artifacts"]][2] == len(rows)
+
+
+def test_paid_registration_validates_once_and_rejects_stale_token(tmp_path, monkeypatch):
+    artifacts, _ = _bundle()
+    attempt = cast(dict[str, Any], decode_jsonl(artifacts["attempt.json"])[0])
+    original_validator = historical_input_module.validate_historical_input
+    original_factory = historical_input_module._validate_historical_input_once
+    validator_calls = 0
+    all_calls = 0
+    tokens = []
+
+    def validate(run):
+        nonlocal validator_calls
+        validator_calls += 1
+        return original_validator(run)
+
+    def make_token(run):
+        token = original_factory(run)
+        tokens.append(token)
+        return token
+
+    def count_all_aliases(frame, event, _arg):
+        nonlocal all_calls
+        if event == "call" and frame.f_code is original_validator.__code__:
+            all_calls += 1
+
+    monkeypatch.setattr(historical_input_module, "validate_historical_input", validate)
+    monkeypatch.setattr(historical_input_module, "_validate_historical_input_once", make_token)
+    monkeypatch.setattr(execution_input_module, "_validate_historical_input_once", make_token)
+    store = module.SpiderRunStore.create(str(tmp_path), attempt["run_id"])
+    raw = artifacts["execution_input.json"]
+    sys.setprofile(count_all_aliases)
+    try:
+        assert store.register(attempt, execution_input=raw) == "NATIVE_CONSTRUCTION_ALLOWED"
+    finally:
+        sys.setprofile(None)
+    assert validator_calls == len(tokens) == all_calls == 1
+    assert (store._path / "execution_input.json").read_bytes() == raw
+
+    current = execution_input_module.decode_spider_execution_input(raw)
+    changed = replace(current, historical_input=replace(
+        current.historical_input, run_id="fresh-paid-registration",
+    ))
+    changed_attempt = deepcopy(attempt)
+    changed_attempt["run_id"] = changed.historical_input.run_id
+    changed_raw = execution_input_module.encode_spider_execution_input(changed)
+    changed_hash = execution_input_module.validate_spider_execution_input(changed)
+    changed_store = module.SpiderRunStore.create(str(tmp_path), changed.historical_input.run_id)
+    monkeypatch.setattr(
+        module, "_decode_spider_execution_input_validated",
+        lambda _: (changed, tokens[0], changed_hash),
+    )
+    with pytest.raises(ValueError, match="INVALID_ARTIFACT"):
+        changed_store.register(changed_attempt, execution_input=changed_raw)
+    assert changed_store._state == "CREATED" and list(changed_store._path.iterdir()) == []
+
+
+def test_paid_registration_falls_back_for_unapproved_historical_tree(tmp_path, monkeypatch):
+    artifacts, _ = _bundle()
+    attempt = cast(dict[str, Any], decode_jsonl(artifacts["attempt.json"])[0])
+    original_validator = historical_input_module.validate_historical_input
+    alias_calls = 0
+    all_calls = 0
+    def count_validation(run):
+        nonlocal alias_calls
+        alias_calls += 1
+        return original_validator(run)
+
+    def count_all_aliases(frame, event, _arg):
+        nonlocal all_calls
+        if event == "call" and frame.f_code is original_validator.__code__:
+            all_calls += 1
+
+    monkeypatch.setattr(historical_input_module, "validate_historical_input", count_validation)
+    def reject_tree(*_args):
+        return False
+
+    monkeypatch.setattr(execution_input_module, "_is_approved_historical_input_tree", reject_tree)
+    monkeypatch.setattr(historical_input_module, "_is_approved_historical_input_tree", reject_tree)
+    store = module.SpiderRunStore.create(str(tmp_path), attempt["run_id"])
+    raw = artifacts["execution_input.json"]
+    sys.setprofile(count_all_aliases)
+    try:
+        assert store.register(attempt, execution_input=raw) == "NATIVE_CONSTRUCTION_ALLOWED"
+    finally:
+        sys.setprofile(None)
+    assert all_calls == 14
+    assert alias_calls == 8
+    assert (store._path / "execution_input.json").read_bytes() == raw
+
+
+def test_non_exact_manifest_fallback_preserves_head_exception_chain(monkeypatch):
+    artifacts, _ = _bundle()
+    original_decoder = historical_input_module._decode_manifest
+
+    def non_exact_manifest(value):
+        return _immutable_subclass(original_decoder(value))
+
+    def error_chain(error):
+        if error is None:
+            return None
+        return (
+            type(error).__module__, type(error).__qualname__, error.args,
+            error_chain(error.__cause__), error_chain(error.__context__),
+            error.__suppress_context__,
+        )
+
+    monkeypatch.setattr(historical_input_module, "_decode_manifest", non_exact_manifest)
+    with pytest.raises(Exception) as head_error:
+        execution_input_module.decode_spider_execution_input(artifacts["execution_input.json"])
+    monkeypatch.setattr(execution_input_module, "_is_approved_historical_input_tree", lambda _value: True)
+    with pytest.raises(Exception) as validated_error:
+        execution_input_module._decode_spider_execution_input_validated(
+            artifacts["execution_input.json"],
+        )
+    assert error_chain(validated_error.value) == error_chain(head_error.value)
+    assert validated_error.value.__context__ is None
 
 
 @pytest.mark.parametrize("offset_ms", [30_000, 59_000])

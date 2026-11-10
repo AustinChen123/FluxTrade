@@ -19,6 +19,9 @@ from decimal import Decimal
 from typing import Any, Optional, Dict, List, cast
 from unittest.mock import MagicMock
 
+from spider_run_store_v2_fixtures import build_real_p3_artifacts
+
+
 from sqlalchemy import create_engine, event
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.compiler import compiles
@@ -57,6 +60,11 @@ from src.core.interfaces.verified_net_reduction import (
 # Core modules
 from src.core.risk_manager import AccountService
 from src.core.clock import Clock
+
+
+@pytest.fixture(scope="module")
+def real_p3_artifacts(tmp_path_factory):
+    return build_real_p3_artifacts(tmp_path_factory)
 
 
 @compiles(JSONB, "sqlite")

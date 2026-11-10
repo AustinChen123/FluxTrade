@@ -9,6 +9,12 @@ from typing import cast
 from src.core.backtest.spider_historical_input import (
     HistoricalInputError,
     HistoricalRunInput,
+    ValidatedHistoricalInput,
+    _UnapprovedHistoricalInputTree,
+    _decode_historical_run_input_candidate,
+    _encode_historical_run_input_validated_run,
+    _is_approved_historical_input_tree,
+    _validate_historical_input_once,
     decode_historical_run_input,
     encode_historical_run_input,
     validate_historical_input,
@@ -67,8 +73,9 @@ def _admit_initial_ownership(run: HistoricalRunInput) -> None:
                 raise HistoricalInputError("initial position lot ownership mismatch")
 
 
-def validate_spider_execution_input(value: SpiderExecutionInput) -> str:
-    """Validate the exact closed host contract and return its semantic SHA-256."""
+def _validate_spider_execution_input(
+    value: SpiderExecutionInput, token: ValidatedHistoricalInput | None = None,
+) -> str:
     if type(value) is not SpiderExecutionInput:
         raise HistoricalInputError("invalid Spider execution input DTO")
     if (value.schema_version != SCHEMA_VERSION or value.policy_id != POLICY_ID
@@ -77,7 +84,9 @@ def validate_spider_execution_input(value: SpiderExecutionInput) -> str:
     if type(value.policy_end_ms) is not int or type(value.generation) is not int or value.generation != 0:
         raise HistoricalInputError("invalid policy cutoff or generation")
     run = value.historical_input
-    base_hash = validate_historical_input(run)
+    if token is not None and token.run is not run:
+        raise HistoricalInputError("validated historical input token mismatch")
+    base_hash = validate_historical_input(run) if token is None else token.semantic_hash
     if (run.policy_id != BASE_POLICY_ID or run.policy_version != BASE_POLICY_VERSION
             or run.policy_source_sha256 != BASE_POLICY_SOURCE_SHA256):
         raise HistoricalInputError("unsupported original P3 policy identity")
@@ -95,6 +104,25 @@ def validate_spider_execution_input(value: SpiderExecutionInput) -> str:
     return sha256(canonical_bytes(projection)).hexdigest()
 
 
+def validate_spider_execution_input(value: SpiderExecutionInput) -> str:
+    """Validate the exact closed host contract and return its semantic SHA-256."""
+    return _validate_spider_execution_input(value)
+
+
+def _encode_spider_execution_input_validated(
+    value: SpiderExecutionInput, token: ValidatedHistoricalInput,
+) -> bytes:
+    base = decode_canonical(_encode_historical_run_input_validated_run(token.run))
+    return canonical_bytes({
+        "schema_version": value.schema_version,
+        "policy_id": value.policy_id,
+        "endpoint_policy_id": value.endpoint_policy_id,
+        "historical_input": base,
+        "policy_end_ms": value.policy_end_ms,
+        "generation": value.generation,
+    })
+
+
 def encode_spider_execution_input(value: SpiderExecutionInput) -> bytes:
     """Encode the wrapper with the existing P3 canonical object embedded."""
     validate_spider_execution_input(value)
@@ -109,8 +137,9 @@ def encode_spider_execution_input(value: SpiderExecutionInput) -> bytes:
     })
 
 
-def decode_spider_execution_input(raw: bytes) -> SpiderExecutionInput:
-    """Decode exact wrapper JSON, reuse the immutable P3 decoder, and recheck bytes."""
+def _decode_spider_execution_input(
+    raw: bytes, *, validated: bool,
+) -> SpiderExecutionInput | tuple[SpiderExecutionInput, ValidatedHistoricalInput | None, str]:
     try:
         decoded = decode_canonical(raw)
         row = _object(decoded, "Spider execution input")
@@ -120,7 +149,22 @@ def decode_spider_execution_input(raw: bytes) -> SpiderExecutionInput:
         nested = row["historical_input"]
         if type(nested) is not dict:
             raise HistoricalInputError("historical_input must be a P3 JSON object")
-        run = decode_historical_run_input(canonical_bytes(nested))
+        if validated:
+            nested_raw = canonical_bytes(nested)
+            candidate = None
+            try:
+                candidate = _decode_historical_run_input_candidate(nested_raw)
+            except Exception:
+                pass
+            if candidate is not None and _is_approved_historical_input_tree(candidate):
+                token = _validate_historical_input_once(candidate)
+                run = token.run
+            else:
+                token = None
+                run = decode_historical_run_input(nested_raw)
+        else:
+            token = None
+            run = decode_historical_run_input(canonical_bytes(nested))
         cutoff = row["policy_end_ms"]
         generation = row["generation"]
         if type(cutoff) is not int or type(generation) is not int:
@@ -129,11 +173,46 @@ def decode_spider_execution_input(raw: bytes) -> SpiderExecutionInput:
             cast(str, row["schema_version"]), cast(str, row["policy_id"]),
             cast(str, row["endpoint_policy_id"]), run, cutoff, generation,
         )
-        validate_spider_execution_input(value)
-        if encode_spider_execution_input(value) != raw:
+        wrapper_hash = (
+            _validate_spider_execution_input(value, token)
+            if token is not None else validate_spider_execution_input(value)
+        )
+        encoded = (
+            _encode_spider_execution_input_validated(value, token)
+            if token is not None else encode_spider_execution_input(value)
+        )
+        if encoded != raw:
             raise HistoricalInputError("noncanonical Spider execution input encoding")
-        return value
+        return (value, token, wrapper_hash) if validated else value
     except HistoricalInputError:
+        raise
+    except _UnapprovedHistoricalInputTree:
         raise
     except (TypeError, ValueError, UnicodeError) as error:
         raise HistoricalInputError("invalid Spider execution input encoding") from error
+
+
+def decode_spider_execution_input(raw: bytes) -> SpiderExecutionInput:
+    """Decode exact wrapper JSON, reuse the immutable P3 decoder, and recheck bytes."""
+    decoded = _decode_spider_execution_input(raw, validated=True)
+    return cast(tuple[SpiderExecutionInput, ValidatedHistoricalInput | None, str], decoded)[0]
+
+
+def _decode_spider_execution_input_validated(
+    raw: bytes,
+) -> tuple[SpiderExecutionInput, ValidatedHistoricalInput | None, str]:
+    fallback = False
+    try:
+        value, token, wrapper_hash = cast(
+            tuple[SpiderExecutionInput, ValidatedHistoricalInput | None, str],
+            _decode_spider_execution_input(raw, validated=True),
+        )
+        if token is None:
+            wrapper_hash = validate_spider_execution_input(value)
+        return value, token, wrapper_hash
+    except _UnapprovedHistoricalInputTree:
+        fallback = True
+    if fallback:
+        value = cast(SpiderExecutionInput, _decode_spider_execution_input(raw, validated=False))
+        return value, None, validate_spider_execution_input(value)
+    raise AssertionError("unreachable validated Spider execution decode state")

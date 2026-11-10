@@ -134,6 +134,7 @@ def paths(value, path=()):
             yield from paths(item, path + (index,))
 
 
+@pytest.mark.slow
 def test_every_nested_field_mutation_and_omission(monkeypatch):
     original = o03.detached_bundle()
     for path in paths(original):

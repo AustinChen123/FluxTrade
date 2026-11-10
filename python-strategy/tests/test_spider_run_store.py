@@ -1,7 +1,9 @@
 """Causal filesystem durability gates using independent detached fixtures."""
 
 import ast
+import importlib.util
 import os
+from dataclasses import replace
 from copy import deepcopy
 from hashlib import sha256
 from pathlib import Path
@@ -10,9 +12,11 @@ from typing import Any, Protocol, cast
 import pytest
 
 from src.core.backtest import spider_run_store as module
+from src.core.backtest import spider_historical_input as historical_input_module
 from src.core.backtest.spider_run_admission import admit_spider_run
 from src.core.backtest.spider_run_artifacts import (
     canonical_bytes,
+    decode_canonical,
     decode_jsonl,
     validate_artifact,
 )
@@ -381,6 +385,79 @@ def test_historical_registration_persists_input_and_dynamic_journal_frontier(tmp
     assert not any((store._path / name).exists() for name in ("endpoint.json", "reconciliation.json", "report.jsonl", "completion.json"))
 
 
+def test_historical_registration_validates_once_and_link_rejects_a_stale_token(tmp_path, monkeypatch):
+    run, raw, attempt = historical_registration()
+    original_full_validator = historical_input_module.validate_historical_input
+    validation_calls = 0
+    def count_validation(value):
+        nonlocal validation_calls
+        validation_calls += 1
+        return original_full_validator(value)
+    monkeypatch.setattr(historical_input_module, "validate_historical_input", count_validation)
+    original = historical_input_module._validate_historical_input_once
+    tokens = []
+    def capture(value):
+        token = original(value)
+        tokens.append(token)
+        return token
+    monkeypatch.setattr(historical_input_module, "_validate_historical_input_once", capture)
+    store = module.SpiderRunStore.create(str(tmp_path), run.run_id)
+    assert store.register(attempt, historical_input=raw) == "NATIVE_CONSTRUCTION_ALLOWED"
+    assert len(tokens) == validation_calls == 1 and tokens[0].run == run
+
+    changed = replace(run, run_id="fresh-recompute")
+    changed_attempt = deepcopy(attempt)
+    changed_attempt["run_id"] = changed.run_id
+    changed_raw = encode_historical_run_input(changed)
+    before_recompute = validation_calls
+    assert historical_input_module._validate_historical_run_link(
+        changed_raw, changed_attempt, changed.run_id
+    ) == changed
+    assert len(tokens) == 2 and validation_calls == before_recompute + 1
+    assert tokens[1] is not tokens[0]
+    monkeypatch.setattr(
+        historical_input_module, "_decode_historical_run_input_validated",
+        lambda _: tokens[0],
+    )
+    with pytest.raises(ValueError):
+        historical_input_module._validate_historical_run_link(
+            changed_raw, changed_attempt, changed.run_id
+        )
+    assert validation_calls == before_recompute + 1
+
+
+@pytest.mark.parametrize("field", ["schema_version", "run_id", "timer_period_ms", "funding_mode"])
+@pytest.mark.parametrize("boundary_name", ["registration", "finalize_metadata"])
+def test_p3_invalid_fields_keep_head_error_taxonomy(tmp_path, field, boundary_name):
+    run, raw, attempt = historical_registration()
+    invalid = cast(dict[str, Any], decode_canonical(raw))
+    invalid[field] = []
+    invalid_raw = canonical_bytes(invalid)
+    with pytest.raises(historical_input_module.HistoricalInputError) as legacy_error:
+        historical_input_module.decode_historical_run_input(invalid_raw)
+
+    store = module.SpiderRunStore.create(str(tmp_path), run.run_id)
+    if boundary_name == "registration":
+        with pytest.raises(ValueError, match="INVALID_ARTIFACT") as caught:
+            store.register(attempt, historical_input=invalid_raw)
+        assert caught.value.__cause__ is not None
+        assert type(caught.value.__cause__) is type(legacy_error.value)
+        assert caught.value.__cause__.args == legacy_error.value.args
+        assert store._state == "CREATED"
+        assert list(store._path.iterdir()) == []
+    else:
+        assert store.register(attempt, historical_input=raw) == "NATIVE_CONSTRUCTION_ALLOWED"
+        persisted = store._path / "historical_input.json"
+        persisted.write_bytes(invalid_raw)
+        with pytest.raises(module.SpiderRunStoreError) as caught:
+            store._historical_input_metadata(attempt)
+        assert caught.value.reason == "ENDPOINT_RECONCILIATION_FAILED"
+        assert caught.value.__cause__ is not None
+        assert type(caught.value.__cause__) is type(legacy_error.value)
+        assert caught.value.__cause__.args == legacy_error.value.args
+        assert store._state == "RUNNING"
+
+
 @pytest.mark.parametrize("case", ["missing_input", "bad_input_bytes", "wrong_context", "wrong_coverage", "wrong_run_id"])
 def test_historical_registration_rejects_input_or_attempt_mismatch_before_attempt_publish(tmp_path, case):
     run, raw, attempt = historical_registration()
@@ -592,6 +669,37 @@ def test_finalize_rereads_and_completion_visibility_freezes(tmp_path, monkeypatc
             store.publish_failure("PUBLICATION_FAILED", None)
 
 
+_STORE_IMPORT_FORBIDDEN_WORDS = ("plans", "codec", "scheduler", "policy", "admission")
+# JOURNAL_AB_DESIGN_v3 T7 S7 assigns append encoding to this persistence store;
+# this store-owned codec is allowed while strategy/scenario codecs stay forbidden.
+_STORE_IMPORT_ALLOWED = frozenset({"src.core.backtest.spider_journal_codec_v2"})
+
+
+def _store_forbidden_imports(source: str) -> set[str]:
+    tree = ast.parse(source)
+    imports: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imports.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                relative = "." * node.level + (node.module or "")
+                base = importlib.util.resolve_name(relative, "src.core.backtest")
+            else:
+                base = node.module or ""
+            if base:
+                imports.add(base)
+                # Symbols imported from this exact allowed module remain in its boundary.
+                if base not in _STORE_IMPORT_ALLOWED:
+                    imports.update(f"{base}.{alias.name}" for alias in node.names)
+    forbidden = {
+        name for name in imports
+        if any(word in name for word in _STORE_IMPORT_FORBIDDEN_WORDS)
+        or name.rsplit(".", 1)[-1].startswith("spider_scenario_plan")
+    } - _STORE_IMPORT_ALLOWED
+    return forbidden
+
+
 def test_programming_error_and_import_boundary(tmp_path, monkeypatch):
     store, values, recon = prepared(tmp_path)
     ready(store, values)
@@ -600,6 +708,18 @@ def test_programming_error_and_import_boundary(tmp_path, monkeypatch):
     monkeypatch.setattr(module, "build_reconciliation", broken)
     with pytest.raises(RuntimeError, match="programming"):
         store.finalize(values[3], recon, values[4])
-    tree = ast.parse(Path(module.__file__).read_text())
-    imports = {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)}
-    assert not any(any(word in (name or "") for word in ("plans", "codec", "scheduler", "policy", "admission")) for name in imports)
+    source = Path(module.__file__).read_text()
+    assert not _store_forbidden_imports(source)
+
+
+@pytest.mark.parametrize("forbidden_import", [
+    "import src.core.backtest.synthetic_scenario_codec as scenario_codec",
+    "from src.core.backtest import spider_scenario_plan_o03 as plan_module",
+    "import src.core.backtest.spider_policy as policy_module",
+    "from src.core.backtest import spider_run_admission as admission_module",
+    "from src.core.spider_management.source_checkpoint_codec import *",
+])
+def test_store_import_boundary_resolves_aliases_and_rejects_forbidden_modules(forbidden_import):
+    source = Path(module.__file__).read_text()
+    with pytest.raises(AssertionError):
+        assert not _store_forbidden_imports(f"{source}\n{forbidden_import}\n")
