@@ -869,6 +869,7 @@ def v1_route_execution_contexts():
     [(route, encoding, expected) for (route, encoding), expected in _V1_ATTEMPT_ROUTE_EXPECTED.items()],
     ids=[f"{route}-{encoding}" for route, encoding in _V1_ATTEMPT_ROUTE_EXPECTED],
 )
+@pytest.mark.slow
 def test_p3_attempt_encoding_compatibility_on_v1_only_routes(
     tmp_path, real_p3_artifacts, p3_v2_admission_bundle, p3_v2_admission_values,
     v1_route_execution_contexts, route, encoding, expected,

@@ -496,6 +496,7 @@ ENCODING_ORACLE = {
      for (contract, encoding), expected in ENCODING_ORACLE.items()],
     ids=[f"{contract}-{encoding}" for contract, encoding in ENCODING_ORACLE],
 )
+@pytest.mark.slow
 def test_attempt_encoding_is_closed_per_contract(encoding_contract_attempts, contract, encoding, accepted):
     row = deepcopy(encoding_contract_attempts[contract])
     row["artifact_encoding"] = encoding

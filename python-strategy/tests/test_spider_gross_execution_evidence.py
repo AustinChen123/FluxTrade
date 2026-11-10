@@ -1052,6 +1052,7 @@ def _gross_reconciliation_invalid_inputs(raw: bytes) -> list[tuple[str, bytes]]:
     return cases
 
 
+@pytest.mark.slow
 def test_gross_reconciliation_invalid_exception_chains_match_head():
     from src.core.backtest.spider_execution_input import decode_spider_execution_input
     from src.core.backtest.spider_gross_execution_input import decode_spider_gross_execution_input

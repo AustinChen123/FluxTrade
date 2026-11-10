@@ -223,6 +223,7 @@ def test_real_callers_match_head_error_matrix():
     assert len(matrix) == 40 and hashlib.sha256(json.dumps(matrix, sort_keys=True, separators=(",", ":")).encode()).hexdigest() == _HEAD_MATRIX_SHA256  # Selected HEAD rows from S4/c3/review/scratch/base-probe.json
 
 
+@pytest.mark.slow
 def test_real_store_failure_outcomes_and_artifact_bytes_match_head(tmp_path, monkeypatch):
     # HEAD 334401c9 real-store oracle: S4/c3/review2/scratch/durable-base/results.json.
     expected = "a6f646d346089156c18a18962264c5c45d1ae965b029568977180b38e7c55ab6"

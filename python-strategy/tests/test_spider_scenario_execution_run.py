@@ -54,6 +54,7 @@ def _run(tmp_path: Path, run_id: str, *, mode: str = "flat", **kwargs):
          for encoding in ("artifact_encoding_v1", "artifact_encoding_v2")
          for family in ("paid", "floating", "gross")],
 )
+@pytest.mark.slow
 def test_p3_encoding_opt_in_does_not_escape_into_paid_families(
     tmp_path, monkeypatch, encoding, family,
 ):

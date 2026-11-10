@@ -71,6 +71,7 @@ def _floating_registration_fixture():
     return run, request, raw, attempt
 
 
+@pytest.mark.slow
 def test_floating_registration_token_counts_fallback_bytes_and_stale_token(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
@@ -167,6 +168,7 @@ def test_floating_registration_token_counts_fallback_bytes_and_stale_token(
     assert stale_store._state == "CREATED" and list(stale_store._path.iterdir()) == []
 
 
+@pytest.mark.slow
 def test_floating_non_exact_manifest_fallback_preserves_error_chain(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
@@ -205,6 +207,7 @@ def test_floating_non_exact_manifest_fallback_preserves_error_chain(
     pytest.param(lambda row: row.pop("execution_input"), id="missing-execution-input"),
     pytest.param(lambda row: row.update(execution_input=None), id="wrong-execution-input"),
 ])
+@pytest.mark.slow
 def test_malformed_floating_registration_preserves_legacy_exception_chain(
     tmp_path: Path, mutate,
 ):

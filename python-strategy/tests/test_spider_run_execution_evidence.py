@@ -839,6 +839,7 @@ def _malformed_paid_reconciliation_inputs(raw: bytes) -> list[tuple[str, bytes]]
     return cases
 
 
+@pytest.mark.slow
 def test_paid_reconciliation_invalid_input_exception_chains_match_head():
     from src.core.backtest import spider_execution_input as execution_input_module
     from src.core.backtest.spider_run_artifacts import decode_canonical as decode_json
@@ -973,6 +974,7 @@ def _assert_exception_chain_matches(label, encoded, expected_decoder, actual_bui
 
 
 @pytest.mark.parametrize("case_index", range(106), ids=lambda index: f"malformed-{index:03d}")
+@pytest.mark.slow
 def test_floating_reconciliation_invalid_exception_chains_match_head(
     floating_reconciliation_invalid_exception_cases, case_index,
 ):
@@ -1043,6 +1045,7 @@ def test_floating_exception_chain_timeout_propagates_as_timeout():
         )
 
 
+@pytest.mark.slow
 def test_reconciliation_projection_helpers_reject_foreign_historical_tokens():
     from src.core.backtest.spider_historical_input import _validate_historical_input_once
     from test_spider_floating_exit_run import _floating_registration_fixture
@@ -1095,6 +1098,7 @@ def _stop_after_floating_context(monkeypatch, captured):
     return ContextReady
 
 
+@pytest.mark.slow
 def test_valid_floating_reconciliation_uses_fresh_token_and_correct_hash_fields(
     _floating_reconciliation_input, monkeypatch,
 ):
@@ -1158,6 +1162,7 @@ def test_valid_floating_reconciliation_uses_fresh_token_and_correct_hash_fields(
     assert contexts[0]["base_execution_input_sha256"] == expected_base_hash
 
 
+@pytest.mark.slow
 def test_ineligible_floating_reconciliation_uses_legacy_decoder_and_context(
     _floating_reconciliation_input, monkeypatch,
 ):
