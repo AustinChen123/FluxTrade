@@ -215,6 +215,8 @@ def run(
     process = subprocess.Popen(
         child_command,
         cwd=Path(__file__).resolve().parents[1],
+        # The native extension may live only in src/ (CI layout); children need it on the path.
+        env={**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, (str(Path(__file__).resolve().parents[1] / "src"), os.environ.get("PYTHONPATH"))))},
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
