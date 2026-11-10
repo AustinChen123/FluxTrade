@@ -326,8 +326,10 @@ def test_register_v2_guard_is_literal_first_statement_and_refuses_before_publish
     function = next(node for node in method.body if isinstance(node, ast.FunctionDef))
     assert isinstance(function.body[0], ast.If)
     assert "p3_v2_registration_preflight" in ast.unparse(function.body[0])
-    assert ast.unparse(function.body[0].body[0].handlers[0].type) == "ValueError"
-    translated = ast.unparse(function.body[0].body[0].handlers[0].body[0])
+    try_statement = cast(ast.Try, function.body[0].body[0])
+    handler = cast(ast.ExceptHandler, try_statement.handlers[0])
+    assert ast.unparse(cast(ast.AST, handler.type)) == "ValueError"
+    translated = ast.unparse(cast(ast.AST, handler.body[0]))
     assert translated == "if error.args == ('ARTIFACT_LIMIT_EXCEEDED',):\n    raise SpiderRunStoreError('ARTIFACT_LIMIT_EXCEEDED') from error"
     attempt = decode_jsonl(real_p3_artifacts["attempt.json"])[0]
     attempt["artifact_encoding"] = "artifact_encoding_v2"

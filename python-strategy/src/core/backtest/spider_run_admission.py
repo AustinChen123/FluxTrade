@@ -6,6 +6,7 @@ import stat as _stat
 from hashlib import sha256 as _sha256
 from json import JSONDecodeError as _JSONDecodeError
 from typing import Any as _Any
+from typing import Mapping as _Mapping
 from typing import cast as _cast
 
 from src.core.backtest.spider_run_artifacts import canonical_bytes as _bytes, configuration_context as _validate_context, decode_canonical as _decode_canonical, decode_jsonl as _decode_jsonl, historical_context as _validate_historical_context, is_v1_attempt_encoding as _is_v1_attempt_encoding, validate_artifact as _artifact
@@ -228,7 +229,7 @@ def _diagnose(directory: int) -> dict[str, _Any]:
 
 
 def _diagnose_p3_v2(
-    directory: int, attempt_raw: bytes, attempt: dict[str, _Any], budget: dict[str, _Any],
+    directory: int, attempt_raw: bytes, attempt: dict[str, _Any], budget: _Mapping[str, object],
 ) -> dict[str, _Any]:
     try:
         status_raw = _capture(directory, "status.json")

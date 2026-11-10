@@ -265,7 +265,7 @@ def test_attempt_bytes_grow_with_schema_valid_planned_coverage():
             for product in base.ordered_products
         ),
     )
-    configuration = decode_canonical(base.configuration_bytes)
+    configuration = cast(dict[str, Any], decode_canonical(base.configuration_bytes))
     for product in configuration["products"]:
         product["marks"][0]["valid_to"] = longer_end
     configuration_bytes = canonical_bytes(configuration)
@@ -290,7 +290,9 @@ def test_attempt_bytes_grow_with_schema_valid_planned_coverage():
 
     small = make_attempt(base)
     large = make_attempt(longer)
-    assert len(large["planned_coverage"]) > len(small["planned_coverage"])
+    assert len(cast(list[object], large["planned_coverage"])) > len(
+        cast(list[object], small["planned_coverage"])
+    )
     assert len(canonical_bytes(large)) > len(canonical_bytes(small))
 
 

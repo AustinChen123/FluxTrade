@@ -452,7 +452,7 @@ def encoding_contract_attempts():
     gross_request, _, gross_execution = gross_context()
     history_input = gross_request.execution_input.historical_input
     from src.core.backtest.spider_run_artifacts import decode_canonical
-    config_row = decode_canonical(history_input.configuration_bytes)
+    config_row = cast(dict[str, object], decode_canonical(history_input.configuration_bytes))
     gross_config = a.configuration_context({
         "schema_version": "spider_configuration_context_v1",
         "config_id": config_row["config_id"],
@@ -466,8 +466,8 @@ def encoding_contract_attempts():
         run_contract_id="SPIDER_GROSS_PROTECTED_RESEARCH_RUN_V1",
         requested_scenario_selector="SPIDER_GROSS_PROTECTED_RESEARCH_RUN_V1",
         scenario_plan_id="SPIDER_GROSS_PROTECTED_RESEARCH_RUN_V1",
-        profile_id=gross_execution["native_profile_id"],
     )
+    gross["profile_id"] = cast(str, gross_execution["native_profile_id"])
     return {
         "P1": attempt(), "P2": configured_attempt(), "P3": historical_attempt(),
         "paid": paid, "floating": floating, "gross": gross,

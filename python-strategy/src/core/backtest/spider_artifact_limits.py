@@ -1,6 +1,7 @@
 """Single source of truth for versioned Spider artifact byte limits."""
 
 from collections.abc import Mapping
+from typing import TypedDict, cast
 
 DEFAULT_LIMIT = 16_777_216
 LEG32 = 33_554_432
@@ -79,6 +80,21 @@ P3_V2_X2_COEFFICIENT = (19_048_383, 6_119)
 P3_V2_E2_COEFFICIENT = (10_790_164, 6_119)
 
 
+class P3V2ScopeBudget(TypedDict):
+    row_counts: dict[str, int]
+    kind_budgets: dict[str, int]
+    table_max: int
+    table_bytes_max: int
+    structural_bytes: int
+    B_SG: int
+    L_wire: int
+    U_wire: int | None
+    J2: int | None
+    X2: int
+    E2: int
+    refused: bool
+
+
 def _ceil_div(numerator: int, denominator: int) -> int:
     return (numerator + denominator - 1) // denominator
 
@@ -94,7 +110,7 @@ def p3_v2_scope_refused(structural_bytes: int, l_wire: int) -> bool:
     return structural_bytes > P3_V2_JOURNAL_CAP or l_wire > P3_V2_JOURNAL_CAP
 
 
-def p3_v2_scope_budget(coverage: Mapping[str, int]) -> dict[str, object]:
+def p3_v2_scope_budget(coverage: Mapping[str, int]) -> P3V2ScopeBudget:
     """Return the pure P3-v2 registration and runtime budgets for valid coverage."""
     if not isinstance(coverage, Mapping) or any(
         kind not in P3_V2_COVERAGE_KINDS for kind in coverage
@@ -166,7 +182,7 @@ def p3_v2_registration_preflight(attempt: Mapping[str, object], historical_input
     planned = _historical_planned_coverage_for_input(token)
     counts = {kind: 0 for kind in P3_V2_COVERAGE_KINDS}
     for row in planned:
-        kind = row["record_kind"]
+        kind = cast(str, row["record_kind"])
         if kind not in counts:
             raise ValueError("INVALID_ARTIFACT")
         counts[kind] += 1

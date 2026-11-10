@@ -3,7 +3,7 @@ import hashlib
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import NoReturn, cast
+from typing import NoReturn, TypedDict, cast
 
 from src.core.backtest import spider_artifact_limits as limits
 from src.core.backtest import spider_journal_buffer_v2 as journal_buffer
@@ -24,11 +24,20 @@ from src.core.backtest.spider_journal_slot_classifier_v2 import classify_p3_v2_s
 _V2_SCHEMA = "spider_journal_record_v2"
 
 
+class _JournalCounters(TypedDict):
+    rows: int
+    projected_bytes: int
+    kind_bytes: dict[str, int]
+    kind_rows: dict[str, int]
+    definition_count: int
+    definition_bytes: int
+
+
 @dataclass(frozen=True, slots=True)
 class P3V2JournalRead:
     rows: list[dict[str, object]]
     wire_metadata: dict[str, int | str]
-    counters: dict[str, object]
+    counters: _JournalCounters
 
 
 def _raise(code: str) -> NoReturn:
@@ -100,7 +109,7 @@ def _pass_one(
     *,
     contexts: tuple[object, object],
     budget: Mapping[str, object],
-) -> dict[str, object]:
+) -> _JournalCounters:
     journal_cap = budget.get("J2")
     if type(journal_cap) is not int or journal_cap < 0:
         _raise("INVALID_ARTIFACT")

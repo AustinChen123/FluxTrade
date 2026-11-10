@@ -531,9 +531,9 @@ def test_durable_fail_publishes_expected_reason_and_runner_result(reason, primar
         durable_ports.DurableHistoricalOutputAdapter,
     )
     adapter.failure_result = None
-    adapter._store = SimpleNamespace(
+    adapter._store = cast(Any, SimpleNamespace(
         publish_failure=lambda status_reason, failure: published.append((status_reason, failure)),
-    )
+    ))
     adapter.fail("PERSISTENCE_FAILED", reason, primary, None, None)
     expected_status, expected_result = _DURABLE_FAIL_EXPECTED[reason]
     assert (published, adapter.failure_result) == ([(expected_status, primary)], expected_result)

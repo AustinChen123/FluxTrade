@@ -1,7 +1,9 @@
 """Golden policy and v1 classification matrix for Spider artifact limits."""
 
 import ast
+from collections.abc import Mapping
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -223,14 +225,14 @@ def test_p3_v2_coverage_rejects_empty_malformed_and_unknown_inputs():
         {"HISTORICAL_TIMER": 1.0},
     ):
         try:
-            limits.p3_v2_scope_budget(value)
+            limits.p3_v2_scope_budget(cast(Mapping[str, int], value))
         except ValueError as exc:
             assert exc.args == ("INVALID_ARTIFACT",)
         else:
             raise AssertionError(value)
     for structural, minimum in ((True, 0), (-1, 0), (0, -1), (0.0, 0)):
         try:
-            limits.p3_v2_scope_refused(structural, minimum)
+            limits.p3_v2_scope_refused(cast(int, structural), minimum)
         except ValueError as exc:
             assert exc.args == ("INVALID_ARTIFACT",)
         else:
@@ -405,7 +407,9 @@ def test_reviewer_h360_x2_input_is_accepted():
         spider_scenario_run._P3_RUN_CONTRACT,
     )
     attempt["artifact_encoding"] = "artifact_encoding_v2"
-    counts = Counter(row["record_kind"] for row in historical_planned_coverage(run))
+    counts: Counter[str] = Counter(
+        cast(str, row["record_kind"]) for row in historical_planned_coverage(run)
+    )
     budget = limits.p3_v2_scope_budget(counts)
     assert budget["X2"] == 19_048_383
     assert budget["structural_bytes"] == 61_054_232 and not budget["refused"]

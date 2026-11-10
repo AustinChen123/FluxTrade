@@ -2,6 +2,7 @@
 
 import hashlib
 import os
+from typing import cast
 
 import pytest
 
@@ -232,9 +233,9 @@ def test_per_kind_row_and_wire_byte_budget_boundaries_are_exact(tmp_path):
     wire_bytes = len(raw)
     assert projected > wire_bytes
     budget = _budget(raw)
-    caps = dict(budget["kind_budgets"])
+    caps = cast(dict[str, int], dict(cast(dict[str, object], budget["kind_budgets"])))
     caps["CALLBACK_RESULT"] = wire_bytes
-    row_caps = dict(budget["row_counts"])
+    row_caps = cast(dict[str, int], dict(cast(dict[str, object], budget["row_counts"])))
     row_caps["CALLBACK_RESULT"] = 1
     budget.update(kind_budgets=caps, row_counts=row_caps)
     result = _read(path, raw, budget)
@@ -261,7 +262,7 @@ def test_definition_table_count_bytes_and_definition_size_boundaries(tmp_path):
     with pytest.raises(ValueError, match="ARTIFACT_LIMIT_EXCEEDED"):
         _read(path, raw, budget)
     budget["table_max"] = 1
-    budget["table_bytes_max"] -= 1
+    budget["table_bytes_max"] = cast(int, budget["table_bytes_max"]) - 1
     with pytest.raises(ValueError, match="ARTIFACT_LIMIT_EXCEEDED"):
         _read(path, raw, budget)
 
@@ -319,6 +320,6 @@ def test_source_group_remainder_budget_is_enforced_inclusive(tmp_path):
     result = _read(path, raw, budget)
     assert len(result.rows) == 1
     assert result.counters["kind_bytes"]["SOURCE_GROUP_RESULT"] == wire_bytes
-    budget["B_SG"] -= 1
+    budget["B_SG"] = cast(int, budget["B_SG"]) - 1
     with pytest.raises(ValueError, match="ARTIFACT_LIMIT_EXCEEDED"):
         _read(path, raw, budget)
