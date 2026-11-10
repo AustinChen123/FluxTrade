@@ -1545,7 +1545,7 @@ def test_runtime_pathlib_writer_mutation_is_rejected(tmp_path, monkeypatch):
     assert not (tmp_path / "unexpected.txt").exists()
 
 
-def test_research_import_closure_and_forbidden_import_mutation():
+def test_research_import_closure_and_forbidden_import_mutation(tmp_path):
     graph = _local_modules()
     assert _FORBIDDEN_MODULES.isdisjoint(graph)
     _assert_runtime_static_allowlist(graph)
@@ -1561,11 +1561,14 @@ def test_research_import_closure_and_forbidden_import_mutation():
         with pytest.raises(AssertionError, match="forbidden research import"):
             _local_modules({_ENTRY: mutated})
     allowed = sorted(_ALLOWED_CORE | {"src.core", "src.core.backtest"})
-    run_input = "/Volumes/Dev/Scratch/agents/spider_throughput/S0/fin-a/fin/historical_input.json"
+    _, raw = frozen_h03_input("import-closure")
+    run_input = str(tmp_path / "historical_input.json")
+    Path(run_input).write_bytes(raw)
     script = f"import sys; from pathlib import Path; from src.core.backtest import spider_historical_research_entry as entry; result=entry.run_historical_research(Path({run_input!r}).read_bytes().rstrip(b'\\n')); assert result.outcome == 'COMPLETE'; allowed={allowed!r}; loaded={{name for name in sys.modules if name.startswith('src.core.')}}; assert loaded <= set(allowed), sorted(loaded - set(allowed))"
     process = subprocess.run(
         [sys.executable, "-c", script],
         cwd=_BASE.parents[2],
+        env={**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, (str(_BASE.parents[1]), os.environ.get("PYTHONPATH"))))},
         capture_output=True,
         text=True,
         check=False,
