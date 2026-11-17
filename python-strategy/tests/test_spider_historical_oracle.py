@@ -784,8 +784,6 @@ def _duplicate_execution_occurrence(composition, original_record):
 
 
 def _enqueue_policy_order(composition, visible_raw, event_kind, order):
-    # The frozen case has a direct accepted source action; use the existing
-    # private historical child builder and native SOURCE_GROUP scheduler.
     record = {
         "item": {
             "delivery": {
@@ -1581,8 +1579,6 @@ def test_frozen_h04_fill_then_cancel_request_effect_ack_and_later_exclusion():
         D("0"),
     )
     unrealized = trading["equity"] - owner["cash"]
-    # Native snapshots omit basis and maintenance margin; derive these from
-    # committed fills, the native position snapshot, and the admitted tier.
     configured_tier = json.loads(run.configuration_bytes)["products"][0]["tiers"][0][
         "rows"
     ][0]
@@ -1927,7 +1923,6 @@ def test_h07_native_spec_migration_precedes_boundary_bar_and_rejects_raw_intent(
     boundary = EPOCH + 60_000
     assert (close["raw_time_ms"], close["effective_at"]) == (boundary, boundary * 16 + 4)
     assert all(not product["fills"] for product in close["products"])
-    # One spec migration at phase 0, then the mark context at the phase-4 close.
     assert close["owner_evidence"]["account_version"] == 5
     assert codec.historical_working_orders() == []
 

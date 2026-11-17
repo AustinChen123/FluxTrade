@@ -584,11 +584,8 @@ class BacktestRunner:
         for candle in candles:
             if dataset_evidence is not None:
                 dataset_evidence.observe(candle)
-            # Update Clock
             self.clock.set_time(candle.timestamp / 1000)
 
-            # Fine-grained source candles drive matching first. Strategies only
-            # see completed derived candles, matching the live Rust pipeline.
             if aggregator is None:
                 engine.on_market_data(candle)
             else:
@@ -630,7 +627,6 @@ class BacktestRunner:
                     decision_candle,
                 )
 
-            # Check Circuit Breaker
             if mock_account.adapter is None:
                 current_equity = mock_account.get_balance()
             elif not isinstance(mock_account.adapter, SimulatedAdapter):
@@ -761,7 +757,6 @@ class BacktestRunner:
 
     def run(self):
         self.completed_outcome = None
-        # 0. Registration Check
         with self._db_session_factory() as db_session:
             self._ensure_strategies_registered(db_session)
 
@@ -769,7 +764,6 @@ class BacktestRunner:
             logger.warning("No strategies added. Exiting.")
             return
 
-        # 1. Setup Backtest Session
         primary_strategy_id = (
             self._primary_runtime_id or self._strategies_buffer[0].strategy_id
         )
@@ -786,10 +780,8 @@ class BacktestRunner:
             summary_id = summary.id
         logger.info("Backtest Session Created: ID %s", summary_id)
 
-        # 2. Create journal for structured event recording
         journal = StrategyJournal(primary_strategy_id)
 
-        # 3. Create Rust-backed adapter with fee config
         funding_timeline = build_external_funding_timeline(
             self.external_funding_events,
             account_id=self.external_funding_account_id,
@@ -908,7 +900,6 @@ class BacktestRunner:
             decision_snapshots.append(canonical_decision_snapshot(decision_context))
             return decision_context
 
-        # 4. Setup repo (trade recording only) and account service
         repo = BacktestOrderRepository(
             None,
             summary_id,
@@ -916,7 +907,6 @@ class BacktestRunner:
         )
         mock_account = BacktestAccountService(adapter=adapter)
 
-        # 5. Setup Engine with pre-created adapter and journal
         self.engine = StrategyEngine(
             None,
             self.clock,
@@ -930,7 +920,6 @@ class BacktestRunner:
             strategy_context_loader=strategy_context_loader,
         )
 
-        # Inject journal and account service into strategies
         portfolio_sleeve_ids = {
             sleeve.strategy.strategy_id
             for portfolio in self._portfolios_buffer
@@ -1011,7 +1000,6 @@ class BacktestRunner:
             else None
         )
 
-        # Calculate Final PnL
         final_balance = mock_account.get_balance()
         total_pnl = (
             flow_neutral_performance.net_pnl
@@ -1031,7 +1019,6 @@ class BacktestRunner:
                 .filter_by(id=summary_id)
                 .first(),
             )
-            # Metrics (with advanced calculations)
             trades = (
                 db_session.query(BacktestTradeLog)
                 .filter_by(session_id=summary_id)
@@ -1067,10 +1054,8 @@ class BacktestRunner:
                     metrics["total_pnl"] = flow_neutral_performance.net_pnl
                     metrics["mark_to_market_pnl"] = flow_neutral_performance.net_pnl
 
-            # Per-strategy metrics
             per_strategy = self._compute_per_strategy_metrics(trades)
 
-            # Serialize metrics (exclude non-serializable closed_trades)
             metrics_for_json = {
                 k: v for k, v in metrics.items() if k != "closed_trades"
             }
@@ -1099,7 +1084,6 @@ class BacktestRunner:
             ),
         )
 
-        # Export reports
         report_dir = self._export_reports(
             metrics,
             journal,

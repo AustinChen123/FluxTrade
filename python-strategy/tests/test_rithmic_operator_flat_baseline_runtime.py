@@ -958,7 +958,6 @@ def test_startup_restore_requires_matching_authoritative_account_scope(
         callbacks=_runtime_callbacks(),
         logger=MagicMock(),
     )
-    # The baseline writer is intentionally absent; wrong account scope cannot clear Redis.
     reconciler = adapter.create_owned_order_reconciler(
         OwnedOrderReconciliationContext(
             list_recoverable_client_orders=lambda: [],

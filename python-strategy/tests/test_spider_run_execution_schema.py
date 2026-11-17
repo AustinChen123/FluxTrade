@@ -201,8 +201,6 @@ def test_paid_result_roundtrips_native_flat_and_all_five_status_tags_as_closed_s
         configuration=configured,
     ) == result
     for status in ("PAID_FLAT", "INCOMPLETE", "LIQUIDATED_FLAT", "LIQUIDATED_INSOLVENT"):
-        # Schema validation is deliberately structural; economic status truth is
-        # compared by the later shared evidence predicate, not duplicated here.
         changed = deepcopy(result)
         changed["status"] = status
         schema.validate_paid_endpoint(changed, execution, configured)

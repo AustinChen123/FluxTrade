@@ -104,7 +104,6 @@ def test_source_time_storage_constraints_and_each_disposition_downgrade_guard(
     owner, scope, _operation_id, order_manager, *_ = _install_owner(
         engine, admitted_run=_run_with_initial_order_count(11)
     )
-    # These SOURCE_TIME rows are storage-only seeds, not actual time ingress.
     assert "SOURCE_TIME" in str(
         SpiderRuntimeDelivery.__table__.c.kind.type
     ) or any(
@@ -151,7 +150,6 @@ def test_source_time_storage_constraints_and_each_disposition_downgrade_guard(
     with Session(engine) as session, session.begin():
         session.execute(SpiderRuntimeDelivery.__table__.insert(), values)
 
-    # Use existing FK-valid identities so failures are from the kind-reference CHECK.
     with Session(engine) as session:
         action_id = session.execute(
             select(SpiderRuntimeAction.action_id).where(

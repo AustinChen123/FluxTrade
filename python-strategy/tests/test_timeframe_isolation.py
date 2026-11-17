@@ -16,9 +16,6 @@ from src.core.strategy_context import StrategyContext
 from src.strategies.base import BaseStrategy, StrategyRequirements
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 
 class FakeStrategy(BaseStrategy):
@@ -88,9 +85,6 @@ def engine_with_strategy():
         yield engine, _add
 
 
-# ---------------------------------------------------------------------------
-# build_stream_channels()
-# ---------------------------------------------------------------------------
 
 
 class TestBuildStreamChannels:
@@ -140,9 +134,6 @@ class TestBuildStreamChannels:
         assert channels == ["stream:market:binance:btcusdt:15m"]
 
 
-# ---------------------------------------------------------------------------
-# Timeframe guard in on_market_data()
-# ---------------------------------------------------------------------------
 
 
 class TestTimeframeGuard:

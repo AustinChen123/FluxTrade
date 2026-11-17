@@ -187,8 +187,6 @@ def _bundle(request=None, *, failure_mode: str | None = None, monkeypatch=None) 
                 if rows else None)
     status = dict(
         schema_version="spider_execution_status_v1", run_id=run_id,
-        # Store finalization succeeded for this bundle. A FAILED endpoint is
-        # still a durable, reconciled FAILED_PREFIX rather than a store fault.
         state="COMPLETE",
         processed_boundary=frontier, persisted_boundary=frontier,
         failure_reason=None,

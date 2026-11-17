@@ -2095,8 +2095,6 @@ def test_portfolio_execute_ignores_other_sleeve_basket_after_target_terminal(
     )
     engine.submit_verified_net_reduction = MagicMock(return_value="exit-order")
     engine.record_verified_net_reduction = MagicMock()
-    # Isolate the post-cancel basket identity gate: owned reconciliation can
-    # independently block on unrelated account-wide observations.
     engine.reconcile_owned_orders = MagicMock(return_value={"auto_resume_safe": True})
     with patch(
         "src.core.adapters.rithmic_portfolio_exit.load_rithmic_recovery_snapshot",

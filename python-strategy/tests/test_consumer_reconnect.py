@@ -77,7 +77,6 @@ class TestReconnectionBackoff:
             call_count += 1
             if call_count <= 3:
                 raise RedisConnectionError("connection refused")
-            # Stop after 3 failures
             consumer.running = False
 
         consumer._ensure_consumer_groups = MagicMock()
@@ -113,7 +112,6 @@ class TestReconnectionBackoff:
             with pytest.raises(RedisConnectionError):
                 consumer.start()
 
-        # All backoffs should be <= MAX_BACKOFF
         for b in backoffs:
             assert b <= MAX_BACKOFF
 
@@ -143,7 +141,6 @@ class TestReconnectionBackoff:
             call_count += 1
             if call_count == 1:
                 raise RedisConnectionError("refused")
-            # Second call: succeed then stop
             consumer.running = False
 
         consumer._ensure_consumer_groups = MagicMock()
@@ -156,7 +153,6 @@ class TestReconnectionBackoff:
         ):
             consumer.start()
 
-        # Only one backoff sleep (from the first failure)
         assert len(backoffs) == 1
         assert backoffs[0] == INITIAL_BACKOFF
 
@@ -180,7 +176,6 @@ class TestReconnectionBackoff:
         consumer._consume_loop = MagicMock(side_effect=stop_loop)
 
         consumer.start()
-        # Should exit without error
         assert consumer.running is False
 
     def test_startup_shutdown_request_is_sticky(self, consumer):

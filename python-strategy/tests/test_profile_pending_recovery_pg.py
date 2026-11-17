@@ -132,12 +132,11 @@ def test_real_pending_rewind_or_ack_rebuild(
             if armed[0]:
                 armed[0] = False
                 assert terminal_counts(self, start) == (1, 1, 1)
-                assert len(original.trace) == 5  # Callback already changed memory.
+                assert len(original.trace) == 5
                 if fault_phase == "before_commit":
                     commit_proof.append("rolled_back")
                     raise failure
                 super().commit()
-                # Independent fresh connection proves commit preceded ACK loss.
                 with Session(engine) as observed:
                     assert terminal_counts(observed, start) == (1, 1, 1)
                 commit_proof.append("committed")
@@ -200,7 +199,6 @@ def test_real_pending_rewind_or_ack_rebuild(
     assert applications == (
         [original, recovered] if fault_phase == "before_commit" else [original]
     )
-    # Literal fixture oracle, independent of Reader/plan outputs.
     profile_id = "5766b5d445bededce8aae025da6629f16784fd3c8463672452c7e0fb70dfd3a4"
     expected_trace = [
         [
@@ -253,7 +251,7 @@ def test_real_pending_rewind_or_ack_rebuild(
     assert recovered.state() == expected and digest(recovered.state()) == digest(
         expected
     )
-    assert original.state() == dirty_state  # Discarded instance was never replayed.
+    assert original.state() == dirty_state
     replay.replay(candle, apply_new=apply_new)
     repeated = registry.get("s")
     assert isinstance(repeated, Consumer) and repeated is not recovered

@@ -25,11 +25,9 @@ def test_order_has_migration5_columns() -> None:
     missing = expected - set(cols.keys())
     assert not missing, f"Order missing migration 5 columns: {missing}"
 
-    # All five new columns must be nullable (historical rows have no data).
     for name in expected:
         assert cols[name].nullable, f"Order.{name} should be nullable"
 
-    # intent_payload should map to JSONB.
     assert isinstance(cols["intent_payload"].type, JSONB)
 
 
@@ -44,12 +42,10 @@ def test_signal_audit_has_migration5_columns_and_jsonb() -> None:
     missing = expected - set(cols.keys())
     assert not missing, f"SignalAudit missing migration 5 columns: {missing}"
 
-    # details_json was upgraded TEXT -> JSONB in this migration.
     assert isinstance(
         cols["details_json"].type, JSONB
     ), "SignalAudit.details_json should be JSONB after migration 5"
 
-    # JSONB payload columns should also be JSONB.
     for name in ("intent_payload", "outcome_payload"):
         assert isinstance(cols[name].type, JSONB), f"{name} should be JSONB"
 
@@ -69,12 +65,10 @@ def test_system_event_class_exists_with_required_columns() -> None:
     missing = expected - set(cols.keys())
     assert not missing, f"SystemEvent missing columns: {missing}"
 
-    # NOT NULL columns.
     assert not cols["event_type"].nullable
     assert not cols["payload"].nullable
     assert not cols["created_at"].nullable
 
-    # Nullable columns.
     for name in (
         "event_subtype",
         "related_strategy_id",
@@ -83,7 +77,6 @@ def test_system_event_class_exists_with_required_columns() -> None:
     ):
         assert cols[name].nullable, f"SystemEvent.{name} should be nullable"
 
-    # payload must be JSONB.
     assert isinstance(cols["payload"].type, JSONB)
 
 
@@ -108,5 +101,4 @@ def test_system_event_related_order_id_is_string_fk() -> None:
     fks = list(col.foreign_keys)
     assert len(fks) == 1
     assert fks[0].column.table.name == "order"
-    # Python type should be ``str``.
     assert col.type.python_type is str

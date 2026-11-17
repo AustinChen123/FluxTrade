@@ -1139,6 +1139,6 @@ def test_terminalize_valid_but_wrong_returning_record(change):
         | dict(status="CONSUMED", terminal_at=NOW, terminal_reason="DONE")
         | change
     )
-    _hydrate(data, request().request_id)  # Valid row, but not the requested mutation.
+    _hydrate(data, request().request_id)
     with pytest.raises(Integrity):
         terminalize(terminal_harness(second=[data]))

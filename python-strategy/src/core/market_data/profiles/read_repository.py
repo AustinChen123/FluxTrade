@@ -202,7 +202,6 @@ class ProfileReadRepository:
             header = session.execute(select(*_header_projection()).where(_SNAPSHOT.c.id == snapshot_id)).mappings().one_or_none()
             if header is None or header["quality"] != "VERIFIED":
                 return None
-            # Queries are outside reconstruction catches: DBAPI errors retain their identity.
             sizes = _header_sizes(header, snapshot_id)
             bins_probe = select(*((func.octet_length(sql_cast(_BIN.c[name], Text)) > MAX_NUMERIC_TEXT_BYTES).label(name + "_oversized")
                                   for name in ("base_volume", "quote_volume"))).where(_BIN.c.snapshot_id == snapshot_id).limit(MAX_BINS + 1).subquery()
@@ -240,7 +239,6 @@ class ProfileReadRepository:
         with self._transaction() as session:
             headers = _indexed(session.execute(select(*_header_projection()).where(_SNAPSHOT.c.id.in_(ids))
                                .limit(len(ids) + 1)).mappings().all(), ids)
-            # Absence/quality precedes other header corruption, but never hides foreign/duplicate IDs.
             if len(headers) != len(ids) or any(row.get("quality") != "VERIFIED" for row in headers.values()):
                 return None
             sizes = {identifier: _header_shape(headers[identifier], identifier) for identifier in ids}
@@ -258,7 +256,6 @@ class ProfileReadRepository:
             except (ValueError, TypeError, KeyError):
                 raise ProfileIntegrityError("profile integrity check failed") from None
             requested = select(_SNAPSHOT.c.id).where(_SNAPSHOT.c.id.in_(ids)).limit(len(ids)).subquery("requested")
-            # Correlated bounded probes materialize only counts/flags, including zero for empty days.
             probe = select(*((func.octet_length(sql_cast(_BIN.c[name], Text)) > MAX_NUMERIC_TEXT_BYTES).label(name)
                              for name in ("base_volume", "quote_volume"))).where(_BIN.c.snapshot_id == requested.c.id)
             probe = probe.correlate(requested).limit(MAX_BINS + 1).subquery()
@@ -277,7 +274,6 @@ class ProfileReadRepository:
                 events_per_day[identifier] = _count_shape(summary.get("event_count"))
                 if type(summary.get("oversized")) is not bool:
                     raise ProfileIntegrityError("profile integrity check failed")
-            # Whole-batch integrity precedes resource classification, independent of row order.
             for identifier in ids:
                 _header_sizes(headers[identifier], identifier)
                 _bounded_count(bins_per_day[identifier], MAX_BINS)

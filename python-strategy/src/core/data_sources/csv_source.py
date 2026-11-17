@@ -7,7 +7,6 @@ import pandas as pd
 from src.core.interfaces.data_source import IDataSource
 from src.core.models import Candlestick
 
-# Column name aliases for auto-detection
 _COLUMN_ALIASES = {
     "timestamp": ["timestamp", "time", "ts", "date", "datetime"],
     "open": ["open", "Open", "o"],
@@ -39,15 +38,12 @@ def _parse_timestamp(df: pd.DataFrame) -> pd.DataFrame:
 
     sample = df["timestamp"].iloc[0]
 
-    # Already numeric (epoch ms or seconds)
     if pd.api.types.is_numeric_dtype(df["timestamp"]):
-        # If value looks like seconds (< 1e12), convert to ms
         if float(sample) < 1e12:
             df["timestamp"] = (df["timestamp"] * 1000).astype(int)
         else:
             df["timestamp"] = df["timestamp"].astype(int)
     else:
-        # Parse date string → epoch ms
         df["timestamp"] = (
             pd.to_datetime(df["timestamp"], utc=True)
             .dt.as_unit("ms")

@@ -39,9 +39,6 @@ def _executed_sql_strings(conn: MagicMock) -> list[str]:
     return [str(call.args[0]) for call in conn.execute.call_args_list]
 
 
-# ---------------------------------------------------------------------------
-# _validate_identifier
-# ---------------------------------------------------------------------------
 
 
 class TestValidateIdentifier:
@@ -54,14 +51,14 @@ class TestValidateIdentifier:
     @pytest.mark.parametrize(
         "bad",
         [
-            "signal_audit; DROP TABLE foo",  # statement injection
-            "details_json --comment",        # SQL comment
-            'col"; --',                      # quote injection
-            "1leading_digit",                # digit start
-            "with space",                    # whitespace
-            "schema.table",                  # qualified name
-            "",                              # empty
-            "col\nname",                     # newline
+            "signal_audit; DROP TABLE foo",
+            "details_json --comment",
+            'col"; --',
+            "1leading_digit",
+            "with space",
+            "schema.table",
+            "",
+            "col\nname",
         ],
     )
     def test_rejects_injection_attempts(self, bad: str) -> None:
@@ -73,9 +70,6 @@ class TestValidateIdentifier:
             _validate_identifier("table", 123)  # type: ignore[arg-type]
 
 
-# ---------------------------------------------------------------------------
-# null_invalid_json_in_text_column
-# ---------------------------------------------------------------------------
 
 
 class TestNullInvalidJsonInTextColumn:
@@ -116,7 +110,6 @@ class TestNullInvalidJsonInTextColumn:
         assert affected == 42
 
     def test_returns_zero_when_rowcount_is_negative(self) -> None:
-        # SQLAlchemy/DB-API return -1 when rowcount is unknown; we coerce to 0.
         conn = _make_mock_connection(rowcount=-1)
 
         affected = null_invalid_json_in_text_column(
@@ -144,7 +137,6 @@ class TestNullInvalidJsonInTextColumn:
             null_invalid_json_in_text_column(
                 conn, "signal_audit; DROP TABLE strategy", "details_json"
             )
-        # Must short-circuit before issuing any SQL.
         conn.execute.assert_not_called()
 
     def test_rejects_injection_in_column_name(self) -> None:
@@ -159,8 +151,6 @@ class TestNullInvalidJsonInTextColumn:
     def test_rejects_qualified_table_name(self) -> None:
         conn = _make_mock_connection()
 
-        # Schema-qualified names are rejected; callers must use search_path
-        # instead. This keeps the identifier whitelist minimal.
         with pytest.raises(ValueError, match="Invalid table"):
             null_invalid_json_in_text_column(
                 conn, "public.signal_audit", "details_json"

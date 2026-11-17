@@ -423,7 +423,6 @@ def test_lost_result_commit_response_is_proved_by_original_group_readback(
             transport,
         )
         assert fault["fired"] is True
-        # The marker and result writes commit, followed by one proof reader.
         assert commit_count == 3
         assert offline.calls == 1
         assert result.disposition == "RECORDED"
@@ -1622,8 +1621,6 @@ def test_normal_tx_b_after_execution_fill_before_rest_ack_derives_local_intents_
                 fee_asset="USDT",
                 last_fill_exchange_trade_id="normal-fill-40-at-49",
             ))["action"] == "applied"
-            # Exact duplicate has no new financial receipt and cannot invoke
-            # the source full callback a second time.
             duplicate = execution.process_exchange_order_event(ExchangeOrderEvent(
                 status="filled",
                 product_id=order.product_id,
@@ -1741,8 +1738,6 @@ def test_normal_tx_b_after_execution_fill_before_rest_ack_derives_local_intents_
         )
         assert full_key_count == 1
 
-    # The ordinary query exposes only explicitly bound PLACE actions. CANCEL
-    # remains an immutable intent and cannot fabricate a local Order/binding.
     from test_spider_order_query_pg import _query_service
 
     query_status, query_body = _query_service(engine, scope).orders(
@@ -1968,8 +1963,6 @@ def test_normal_tx_b_rollback_or_lost_commit_replays_once_from_cold_owner(
     else:
         assert consumed_before_replay == received_before_replay
 
-    # Reconstructing the owner exercises checkpoint/decision/action proofs with
-    # no process-local callbacks. Any committed decision keeps its full key once.
     cold = _transport_enabled_owner(owner, scope)
     cold.restore_owned_runtimes()
     cold_readback = cold.readback(scope, operation_id)
@@ -2997,8 +2990,6 @@ def test_normal_cancel_owner_result_ack_and_cold_proof(
         engine, mock_clock, mock_exchange_adapter
     )
 
-    # A persisted PLACE result proves only transport acceptance.  Establish the
-    # target provider identity through the ordinary Execution/TXA ACK path.
     with Session(engine) as session:
         full_delivery = session.execute(
             select(SpiderRuntimeDelivery).where(
@@ -4074,8 +4065,6 @@ def test_projection_sql_failure_rolls_back_order_state_receipt_and_projection_tx
             ]
             assert len(dirty_actions) == 1
             assert plan in session.dirty
-            # Force only the actual projection rows through SQL in this caller TX,
-            # then fail before repository commit to prove whole-TX rollback.
             session.flush([plan, *dirty_actions])
             assert session.scalar(
                 select(SpiderRuntimeAction.outcome_state).where(
@@ -4571,7 +4560,6 @@ def test_manual_member_resubmission_uses_saved_request_and_normal_place_consumer
             )
             assert runtime is not None
             assert runtime.last_received_sequence == runtime.last_consumed_sequence
-        # The saved request and version remain valid after the unrelated row is consumed.
         result = _dispatch(enabled, command)
         assert result.success is True
     if result_kind == "stopped":
@@ -4674,7 +4662,6 @@ def test_manual_member_resubmission_uses_saved_request_and_normal_place_consumer
     ) == readback
     action_id = cast(str, readback["resubmission_action_id"])
 
-    # A different key cannot open a second frontier while this child is pending.
     with Session(engine) as session:
         runtime = session.execute(select(SpiderRuntimeScope).where(
             SpiderRuntimeScope.environment == scope.environment,
@@ -4892,10 +4879,6 @@ def test_manual_member_resubmission_uses_saved_request_and_normal_place_consumer
                 for item in callback_candidates
                 if item.get("operation") == "CANCEL" and item.get("disposition") == "PLANNED"
             }
-            # The resubmitted fill keeps its original GRID coordinate. The
-            # source Policy.order_filled cancellation neighborhood for a buy
-            # fill is [index + n + 1, index - n, index + 1]; it cancels the
-            # existing order at the matching coordinate, not the filled child.
             filled_action = session.get(SpiderRuntimeAction, action_id)
             assert filled_action is not None
             filled_binding = session.get(SpiderRuntimeBinding, action_id)

@@ -84,7 +84,7 @@ def test_actual_gross_native_projection_has_closed_gross_report_shape():
     ))
     paid = endpoint.result(composition)
     paid["schema_version"] = "spider_gross_paid_endpoint_result_v1"
-    paid.pop("gross_response")  # E3b's paid DTO transport strips the private result field.
+    paid.pop("gross_response")
     schema.validate_gross_paid_endpoint(
         decode_canonical(canonical_bytes(paid)), context, configured,
     )
@@ -106,9 +106,6 @@ def test_actual_gross_native_projection_has_closed_gross_report_shape():
     with pytest.raises(ValueError):
         gross_observation(dict(root, unexpected=None))
 
-    # These are structural acceptance examples only. They preserve the exact
-    # nullable/no-action, partial, rejection and terminal shapes without
-    # claiming that those economic outcomes occurred in this replay.
     example_round = deepcopy(root)
     round_row = example_round["episodes"][0]["rounds"][0]
     round_row.update(sequence=None, action_ids=[], completion_key=None,

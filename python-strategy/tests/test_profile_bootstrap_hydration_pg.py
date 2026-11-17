@@ -70,7 +70,6 @@ def test_real_persistence_detached_stateful_warmup(
         )
     finally:
         event.remove(engine, "before_cursor_execute", forbidden)
-    # Independent literal recurrence: 12 → 142 → 1454 → 14593; skipped close=40 never contributes.
     assert strategy.accumulator == Decimal(14593)
     assert [row[0] for row in strategy.trace] == [
         DAY,
@@ -128,7 +127,7 @@ def test_real_persistence_detached_stateful_warmup(
         ],
     }
     assert digest(strategy.state()) == digest(expected)
-    assert not forbidden.mock_calls  # Includes cache child methods, clocks, and reads.
+    assert not forbidden.mock_calls
     assert not execution.mock_calls
     account.get_position.assert_called_once_with("s", PRODUCT)
 
@@ -141,4 +140,4 @@ def test_prepare_failures_never_start_callback(profile_repository_pg, damage):
     with pytest.raises((ValueError, RuntimeError)):
         reader.prepare(strategy, CUTOVER + 3 * MINUTE)
     assert strategy.trace == [] and strategy.accumulator == 0 and not active
-    assert not forbidden.mock_calls  # Includes cache child methods, clocks, and reads.
+    assert not forbidden.mock_calls

@@ -490,9 +490,6 @@ class StrategyLoader:
         except Exception:
             snapshot.cleanup()
             raise
-        # A running instance may still lazy-import from an older generation.
-        # Retain each small snapshot until process exit; add reference tracking
-        # only if hot-reload volume makes this measurable.
         StrategyLoader._catalog_snapshots[package_name] = snapshot
         return snapshot_root, package_name
 

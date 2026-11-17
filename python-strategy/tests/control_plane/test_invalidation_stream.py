@@ -514,9 +514,6 @@ def test_slow_socket_overflow_releases_blocked_writer_within_write_timeout(
 
         blocked_write_observed = False
         for revision in range(1, 2_000):
-            # Advance only after the preceding frame write completes. This
-            # prevents the hub queue from overflowing before TCP backpressure
-            # has actually stalled the handler's writer.
             frame_write_started.clear()
             frame_write_finished.clear()
             app.invalidation_hub.publish(_record(identity="x" * 128, revision=revision))

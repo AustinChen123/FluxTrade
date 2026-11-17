@@ -120,8 +120,6 @@ def create_or_link(
                     getattr(linked, key) != value for key, value in identity.items()
                 ):
                     raise ExitPersistenceError("handoff link has no matching target attempt")
-                # A retry replays the durable association even after completion.
-                # It cannot create a replacement intent or authorize replay.
                 return str(linked.attempt_id)
             by_intent = cast(Any, session.execute(
                 select(RithmicExitAttempt).where(RithmicExitAttempt.intent_key == intent_key).with_for_update()
@@ -194,8 +192,6 @@ def claim_prepared(
         raise ExitPersistenceError("invalid attempt claim")
     try:
         with session.begin():
-            # Read only to discover the authority key; the row is re-read and
-            # validated after acquiring locks in authority -> attempt order.
             target_key = session.execute(
                 select(
                     RithmicExitAttempt.account_id,

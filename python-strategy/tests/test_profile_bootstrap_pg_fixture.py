@@ -174,7 +174,7 @@ def build(engine, referenced, damage=None):
         pinned = MarketDataDecisionInput(
             key, value.requirements, start + MINUTE, evidence(index)
         )
-        inputs.pin(pinned)  # Null-reference SKIPPED deliberately leaves an orphan.
+        inputs.pin(pinned)
         skipped = index == 3
         outcome = MarketDataDecisionOutcome(
             key,
@@ -204,7 +204,6 @@ def build(engine, referenced, damage=None):
                 rebuild_applied=lambda _: pytest.fail("rebuild"),
             )
         else:
-            # Deliberate incomplete history: canonical candle exists, receipt does not.
             with factory.begin() as db:
                 db.add(
                     CandleRow(

@@ -131,9 +131,6 @@ from src.core.rithmic_publisher_liveness_gate import (
 from src.strategies.base import StrategyContextCapability, StrategyRequirements
 
 
-# =============================================================================
-# Helpers
-# =============================================================================
 
 
 def test_engine_has_no_concrete_rithmic_runtime_composition_dependency() -> None:
@@ -484,9 +481,6 @@ class _RecordingRiskManager:
         self._events.append("risk_resolver")
 
 
-# =============================================================================
-# Initialization
-# =============================================================================
 
 
 class TestEngineInit:
@@ -2413,9 +2407,6 @@ class TestEngineInit:
         assert kwargs["is_strategy_loaded"]("dynamic") is True
 
 
-# =============================================================================
-# add_strategy (legacy)
-# =============================================================================
 
 
 class TestAddStrategy:
@@ -2768,9 +2759,6 @@ class TestAddStrategy:
             )
 
 
-# =============================================================================
-# build_stream_channels
-# =============================================================================
 
 
 class TestBuildStreamChannels:
@@ -2852,9 +2840,6 @@ class TestBuildStreamChannels:
             engine.build_stream_channels()
 
 
-# =============================================================================
-# on_market_data
-# =============================================================================
 
 
 class TestOnMarketData:
@@ -2873,7 +2858,7 @@ class TestOnMarketData:
         engine.add_strategy(strategy_instance)
         strategy_instance.on_candle = MagicMock()
 
-        candle = _make_candle(timeframe="5m")  # strategy requires "1m"
+        candle = _make_candle(timeframe="5m")
         engine.on_market_data(candle)
 
         strategy_instance.on_candle.assert_not_called()
@@ -2910,7 +2895,6 @@ class TestOnMarketData:
     def test_no_signal_not_forwarded(self, engine, strategy_instance):
         """NO_SIGNAL should not trigger process_signal."""
         engine.add_strategy(strategy_instance)
-        # Default behavior returns NO_SIGNAL
         engine.process_signal = MagicMock()
 
         candle = _make_candle()
@@ -2955,7 +2939,6 @@ class TestOnMarketData:
         candle = _make_candle(product_id="BINANCE:XYZUSDT-PERP")
         engine.execution_engine.process_market_data = MagicMock()
 
-        # Should not raise
         engine.on_market_data(candle)
 
     def test_split_backtest_routes_fill_before_completed_decision(self, engine):
@@ -3115,9 +3098,6 @@ class TestOnMarketData:
         assert result.quantities == {"sleeve_a": Decimal("1.5")}
 
 
-# =============================================================================
-# process_signal
-# =============================================================================
 
 
 class TestProcessSignal:
@@ -3579,9 +3559,6 @@ class TestProcessSignal:
         mock_db_session.commit.assert_called_once()
 
 
-# =============================================================================
-# _handle_command
-# =============================================================================
 
 
 def test_command_idempotency_facades_resolve_current_engine_dependencies(engine):
@@ -4309,13 +4286,9 @@ class TestHandleCommand:
         """Exceptions in command handlers should be caught."""
         engine.scan_strategies = MagicMock(side_effect=RuntimeError("scan fail"))
 
-        # Should not raise
         engine._handle_command({"command": "SCAN"})
 
 
-# =============================================================================
-# heartbeat recording
-# =============================================================================
 
 
 class TestHeartbeatRecording:
@@ -5542,9 +5515,6 @@ class TestHeartbeatRecording:
         mock_db.commit.assert_called_once()
 
 
-# =============================================================================
-# shutdown
-# =============================================================================
 
 
 class TestScanStrategies:
@@ -6326,7 +6296,6 @@ class TestStopStrategy:
         engine._strategy_state_manager._db_session_factory = engine._db_session_factory
 
         engine.stop_strategy("nonexistent")
-        # Should complete without error
 
     def test_stop_reconciles_active_state_when_runtime_is_missing(self, engine):
         state = MagicMock(status=StrategyStatus.ACTIVE, version=3)
@@ -6463,7 +6432,6 @@ class TestTestRunStrategy:
     def test_test_run_unloaded_returns_early(self, engine):
         """test_run on unloaded strategy should return."""
         engine.test_run_strategy("nonexistent", 1)
-        # No crash
 
     @pytest.mark.parametrize(
         ("config", "error_type", "message"),
@@ -7097,9 +7065,6 @@ class TestStrategyWarmup:
         engine._strategy_state_manager.transition_to_error.assert_called_once()
         assert "position_state_sync_unsupported" in state.performance_json
 
-    # test_activate_strategy_replays_recent_candles_without_orders (line ~1011) already
-    # covers the flat/no-position happy path: account_service returns None, position_side
-    # is None, set_position_state returns True → activation succeeds.  No duplicate needed.
 
     def test_warm_up_precedes_register_during_activation(self, engine):
         """warm-up must complete before the instance is registered as live.
@@ -7171,9 +7136,6 @@ class TestStrategyWarmup:
         engine._strategy_state_manager.transition_to_running.assert_called_once()
 
 
-# =============================================================================
-# Restore active strategies — matrix tests
-# =============================================================================
 
 
 class TestRestoreActiveStrategiesMatrix:
@@ -7212,7 +7174,6 @@ class TestRestoreActiveStrategiesMatrix:
         state_b = self._make_state("test.py::StratB")
         engine._db_session_factory = self._db_ctx([state_a, state_b])
 
-        # Both classes are loaded; A's activation raises, B's does not.
         engine.loaded_classes["test.py::StratA"] = MagicMock()
         engine.loaded_classes["test.py::StratB"] = MagicMock()
 
@@ -7228,13 +7189,11 @@ class TestRestoreActiveStrategiesMatrix:
 
         engine._restore_active_strategies_on_startup()
 
-        # A → transitioned to error
         engine._strategy_state_manager.transition_to_error.assert_called_once()
         error_args = engine._strategy_state_manager.transition_to_error.call_args
         assert error_args[0][0] == "test.py::StratA"
         assert "startup_restore_failed" in error_args[0][1]
 
-        # B → activate_strategy was reached
         assert "test.py::StratB" in activate_calls
 
 
@@ -7595,9 +7554,6 @@ class TestRuntimeReconciliationThread:
             "_initialize_strategy_state_cache_on_startup",
             "_start_strategy_state_subscriber_on_startup",
             "_reconcile_recoverable_orders_on_startup",
-            # Must be mocked: otherwise live startup leaks a real order-event
-            # daemon thread that spins on the MagicMock adapter's poll and hangs
-            # later tests in the same process.
             "_start_exchange_order_event_stream",
             "_start_heartbeat",
             "_start_command_listener",
@@ -7639,9 +7595,6 @@ class TestRuntimeReconciliationThread:
             "_initialize_strategy_state_cache_on_startup",
             "_start_strategy_state_subscriber_on_startup",
             "_reconcile_recoverable_orders_on_startup",
-            # Must be mocked: otherwise live startup leaks a real order-event
-            # daemon thread that spins on the MagicMock adapter's poll and hangs
-            # later tests in the same process.
             "_start_exchange_order_event_stream",
             "_start_heartbeat",
             "_start_command_listener",
@@ -9116,9 +9069,6 @@ class TestExchangeOrderEventThread:
         engine.execution_engine.resume_after_reconcile.assert_called_once_with()
 
 
-# =============================================================================
-# shutdown
-# =============================================================================
 
 
 class TestShutdown:
@@ -9160,7 +9110,6 @@ class TestShutdown:
     def test_redis_close_error_handled(self, engine):
         """Redis close error should not propagate."""
         engine.redis_client.close.side_effect = Exception("close fail")
-        # Should not raise
         engine.shutdown(timeout=0.1)
 
 
@@ -11511,8 +11460,6 @@ def test_reconnect_reconcile_failure_keeps_gate_and_retries(engine):
     assert engine._reconcile_owned_orders_on_reconnect() is False
 
     engine.execution_engine.halt_for_reconcile.assert_called_once_with(timeout=30.0)
-    # Fail-safe: never resume against an unreconciled book, and do not advance
-    # the generation so the next tick retries.
     engine.execution_engine.resume_after_reconcile.assert_not_called()
     assert reconnect.last_generation == 1
     assert reconnect.pending_generation == 2

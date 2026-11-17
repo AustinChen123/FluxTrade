@@ -38,11 +38,11 @@ def _normalize_initial_balance(value: object) -> Decimal:
 class ClosedTrade:
     """A completed round-trip trade with entry/exit details."""
 
-    entry_time: int  # unix ms
-    exit_time: int  # unix ms
+    entry_time: int
+    exit_time: int
     entry_price: Decimal
     exit_price: Decimal
-    side: PositionSide  # "LONG" or "SHORT"
+    side: PositionSide
     quantity: Decimal
     pnl: Decimal
     fee: Decimal = Decimal("0")
@@ -418,7 +418,6 @@ def calculate_metrics(
         spot_quote_asset=spot_quote_asset,
     )
 
-    # --- Basic metrics (backward-compatible) ---
     wins = sum(1 for p in trade_pnls if p > 0)
     losses = sum(1 for p in trade_pnls if p < 0)
     total_trades = wins + losses
@@ -433,13 +432,11 @@ def calculate_metrics(
     )
     avg_trade = float(total_pnl / total_trades) if total_trades > 0 else 0.0
 
-    # Max Drawdown
     equity_series = pd.Series(equity_curve)
     rolling_max = equity_series.cummax()
     drawdown = equity_series - rolling_max
     max_drawdown = drawdown.min()
 
-    # Trade-based Sharpe Ratio
     trade_sharpe = 0.0
     if len(trade_pnls) > 1:
         returns = np.array(trade_pnls)
@@ -447,9 +444,7 @@ def calculate_metrics(
         if std_dev != 0:
             trade_sharpe = np.mean(returns) / std_dev
 
-    # --- Advanced metrics ---
 
-    # Sortino Ratio (downside deviation only)
     sortino_ratio = 0.0
     if len(trade_pnls) > 1:
         returns_arr = np.array(trade_pnls)
@@ -458,7 +453,6 @@ def calculate_metrics(
         if downside_std != 0:
             sortino_ratio = float(np.mean(returns_arr) / downside_std)
 
-    # Calmar Ratio (annualized return / max drawdown)
     calmar_ratio = 0.0
     if closed_trades and max_drawdown < 0:
         first_ts = closed_trades[0].entry_time
@@ -476,7 +470,6 @@ def calculate_metrics(
             abs(Decimal(str(max_drawdown))) / initial_balance_decimal
         )
 
-    # Monthly returns
     monthly_returns: Dict[str, Decimal] = {}
     if closed_trades:
         for ct in closed_trades:
@@ -486,7 +479,6 @@ def calculate_metrics(
                 ct.pnl,
             )
 
-    # Max drawdown duration (in days)
     max_drawdown_days = 0.0
     if closed_trades:
         eq = np.array(equity_curve)
@@ -512,7 +504,6 @@ def calculate_metrics(
                 ms_per_bar = (last_ts - first_ts) / total_bars
                 max_drawdown_days = float((longest * ms_per_bar) / (1000 * 86400))
 
-    # Trade frequency (per day)
     trade_frequency_per_day = 0.0
     if closed_trades:
         first_ts = closed_trades[0].entry_time
@@ -521,14 +512,12 @@ def calculate_metrics(
         if duration_days > 0:
             trade_frequency_per_day = float(len(closed_trades) / duration_days)
 
-    # Average hold time (hours)
     avg_hold_time_hours = 0.0
     if closed_trades:
         hold_times = [(ct.exit_time - ct.entry_time) for ct in closed_trades]
         avg_hold_ms = sum(hold_times) / len(hold_times)
         avg_hold_time_hours = float(avg_hold_ms / (1000 * 3600))
 
-    # Max consecutive wins / losses
     max_consecutive_wins = 0
     max_consecutive_losses = 0
     max_consecutive_win_amount = Decimal("0")
@@ -580,7 +569,6 @@ def calculate_metrics(
         max_drawdown if equity_samples is not None else Decimal(f"{max_drawdown:.2f}")
     )
     return {
-        # Basic (backward-compatible) - all numeric values as Decimal for precision
         "total_pnl": Decimal(f"{total_pnl:.2f}"),
         "mark_to_market_pnl": mark_to_market_pnl,
         "max_drawdown": reported_max_drawdown,
@@ -590,7 +578,6 @@ def calculate_metrics(
         "avg_trade": Decimal(f"{avg_trade:.2f}"),
         "total_trades": total_trades,
         "closed_trade_count": len(closed_trades),
-        # Advanced
         "sortino_ratio": Decimal(f"{sortino_ratio:.4f}"),
         "calmar_ratio": Decimal(f"{calmar_ratio:.4f}"),
         "monthly_returns": monthly_returns,

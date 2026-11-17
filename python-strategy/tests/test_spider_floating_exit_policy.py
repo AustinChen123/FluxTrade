@@ -256,7 +256,7 @@ def test_cost_u_uses_only_remaining_position_and_estimated_close_fee():
     assert full_row.return_ratio == half_row.return_ratio == Decimal("0.0994")
     assert full_row.unrealized != Decimal(
         "1"
-    )  # Includes estimated close fee, not realized PnL.
+    )
 
 
 def test_posterior_normalizes_once_and_decision_batch_is_detached_immutable_and_repeatable():

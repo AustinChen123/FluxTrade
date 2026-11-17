@@ -110,7 +110,6 @@ class ProfileSnapshotCache:
             return tuple(retained)
 
     def _entry(self, request: ProfileQueryRequest) -> _Entry:
-        # Only called under the lock. Validation precedes hashing caller input.
         if (
             type(request) is not ProfileQueryRequest
             or request.purpose != "LIVE_QUERY"
@@ -217,7 +216,6 @@ class ProfileSnapshotCache:
         return self._finalize(request, state, decision_time_ms, current_monotonic_ms)
 
     def _plan(self, requests: tuple[ProfileQueryRequest, ...]) -> tuple[_Entry, ...]:
-        # Under the lock: validate the entire plan before any fetch or replacement.
         if type(requests) is not tuple:
             raise ProfileQueryError("INTEGRITY") from None
         entries = tuple(self._entry(request) for request in requests)

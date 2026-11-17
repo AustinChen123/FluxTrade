@@ -43,7 +43,6 @@ def _key(observation: dict[str, Any]) -> dict[str, Any] | None:
             return None
     native_key = observation.get("scheduler_key")
     if isinstance(native_key, dict):
-        # Older native observation facts omit queue_class. Do not invent it.
         if set(native_key) == {"visible_at", "queue_class", "schedule_sequence", "stable_id"}:
             return deepcopy(native_key)
     if observation.get("cause") == "START_READINESS":

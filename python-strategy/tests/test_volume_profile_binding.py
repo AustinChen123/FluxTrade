@@ -9,7 +9,6 @@ from typing import Callable, Never, cast
 
 DAY = 86400000
 CALLBACK_LOG: list[str] = []
-# Deliberately ill-typed boundary inputs must reach the actual extension decoder.
 merge = cast(
     Callable[..., fluxtrade_core.VolumeProfileMergeResult],
     fluxtrade_core.merge_volume_profiles,

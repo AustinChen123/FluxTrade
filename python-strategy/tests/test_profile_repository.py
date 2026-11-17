@@ -124,7 +124,6 @@ def test_bin_order_rejection_is_not_masked_by_digest_or_expected_mismatch(duplic
     cast(dict[str, Any], row).update(id=digest, content_sha256=digest)
     session = MagicMock()
     session.execute.return_value.mappings.return_value.all.return_value = bins
-    # Totals/counts and digest match these malformed-order rows; expected is deliberately absent.
     for action in (lambda: repository._verify_rows(row, bins), lambda: repository._verify(session, row)):
         with pytest.raises(ProfileIntegrityError):
             action()

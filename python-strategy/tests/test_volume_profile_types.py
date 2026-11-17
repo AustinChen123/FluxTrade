@@ -183,7 +183,6 @@ def test_exact_totals_must_fit_rust_domain_at_construction(
         context.prec = precision
         for signal in context.traps:
             context.traps[signal] = traps
-        # Every individual bin is valid; only the chosen aggregate can overflow.
         bins = tuple(replace(ProfileBin(index, Decimal(1), Decimal(1), 1),
                              **{field: Decimal(raw)}) for index, raw in enumerate(parts))
         if valid:
@@ -191,6 +190,5 @@ def test_exact_totals_must_fit_rust_domain_at_construction(
             assert getattr(content, field) == Decimal("79228162514264337593543950335")
             assert getattr(content, "quote_volume" if field == "base_volume" else "base_volume") == Decimal(len(parts))
         else:
-            # No content escapes construction for publication or any Session call.
             with pytest.raises(ValueError, match="Rust coefficient/scale domain"):
                 replace(profile(), bins=bins)

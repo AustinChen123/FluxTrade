@@ -299,7 +299,6 @@ class TestThreadSafety:
                 errors.append(sid)
 
         threads = []
-        # 10 strategies each requesting 15000 — only ~6 can fit
         for i in range(10):
             t = threading.Thread(
                 target=allocate_strategy,
@@ -312,12 +311,10 @@ class TestThreadSafety:
         for t in threads:
             t.join()
 
-        # Sum of allocations + unallocated must equal total
         total_allocated = sum(
             allocator.get_allocation(f"strat_{i}") for i in range(10)
         )
         assert total_allocated + allocator.get_unallocated() == Decimal("100000")
-        # At least some should have been rejected
         assert len(errors) > 0
 
     def test_concurrent_usage_recording(self):
@@ -332,7 +329,6 @@ class TestThreadSafety:
                 errors.append(True)
 
         threads = []
-        # 20 threads each trying to record 10000 — only 10 should succeed
         for _ in range(20):
             t = threading.Thread(target=record, args=(Decimal("10000"),))
             threads.append(t)
@@ -345,7 +341,6 @@ class TestThreadSafety:
         available = allocator.get_available("strat_a")
         assert available >= Decimal("0")
         assert available + Decimal(str(len(errors))) * Decimal("0") <= Decimal("100000")
-        # Total used must be consistent
         used = Decimal("100000") - available
         successful = 20 - len(errors)
         assert used == Decimal(str(successful)) * Decimal("10000")
@@ -385,6 +380,5 @@ class TestEdgeCases:
 
     def test_total_balance_property_is_readonly(self):
         allocator = CapitalAllocator(Decimal("100000"))
-        # total_balance is a property, cannot be set directly
         with pytest.raises(AttributeError):
             allocator.total_balance = Decimal("50000")  # type: ignore[misc]

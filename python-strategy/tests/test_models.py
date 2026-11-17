@@ -178,11 +178,9 @@ class TestCandlestickModel:
             low=Decimal("90"),
             close=Decimal("105")
         )
-        # high >= max(open, close, low)
         assert candle.high >= candle.open
         assert candle.high >= candle.close
         assert candle.high >= candle.low
-        # low <= min(open, close, high)
         assert candle.low <= candle.open
         assert candle.low <= candle.close
 
@@ -382,7 +380,6 @@ class TestModelSerialization:
         data = trade.model_dump()
         assert data["id"] == "trade_1"
         assert data["product_id"] == "BINANCE:BTCUSDT-PERP"
-        # Decimals are preserved in model_dump
         assert data["price"] == Decimal("42000.50")
 
     def test_trade_from_dict(self):

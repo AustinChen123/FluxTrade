@@ -81,8 +81,6 @@ class MarketExitHandoffInput:
             or self.cause_generation is not None and self.cause_generation < 0
         ):
             raise DecisionBatchIntegrityError()
-        # Own the accepted bytes. The public input may be mutated by its caller,
-        # but neither that alias nor a row dict can alter the durable evidence.
         object.__setattr__(self, "signal_payload", json.loads(canonical))
         object.__setattr__(self, "_canonical_payload", canonical)
 

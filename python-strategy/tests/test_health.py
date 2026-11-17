@@ -141,7 +141,6 @@ class TestHealthReportSerialization:
         assert "uptime_seconds" in d
         assert "timestamp" in d
 
-        # Nested structure
         assert d["redis"]["status"] == "healthy"
         assert "latency_ms" in d["redis"]
         assert "message" in d["redis"]
@@ -154,6 +153,5 @@ class TestHealthReportSerialization:
         report = checker.get_status()
         d = report.to_dict()
 
-        # Should not raise
         serialized = json.dumps(d)
         assert isinstance(serialized, str)

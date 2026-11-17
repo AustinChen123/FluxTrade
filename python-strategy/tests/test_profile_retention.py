@@ -97,7 +97,7 @@ def test_binding_retention_availability_and_exact_types() -> None:
     with pytest.raises(ValueError):
         _validate_publication_binding(None, parsed.publication)  # type: ignore[arg-type]
     recon = parsed.publication.reconciliation.thaw()
-    recon["official_constituent_trade_count"] = 99  # Not aggregate count (2).
+    recon["official_constituent_trade_count"] = 99
     _validate_publication_binding(parsed.spec, replace(parsed.publication, reconciliation=CanonicalJsonObject(recon)))
 
 
@@ -185,7 +185,7 @@ def test_retention_database_and_commit_failures_propagate() -> None:
             session.execute.side_effect = error
         with pytest.raises(DBAPIError) as caught:
             store.mark_raw_deleted(parsed.spec, snapshot["id"])
-        assert caught.value is error  # Recording fake does not prove database rollback.
+        assert caught.value is error
 
 
 @pytest.mark.parametrize("damage", ["cas_missing", "revision", "metadata", "job"])

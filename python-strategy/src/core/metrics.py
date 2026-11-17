@@ -12,7 +12,6 @@ from prometheus_client import Counter, Gauge, Histogram, start_http_server
 
 logger = logging.getLogger(__name__)
 
-# ── Metric definitions ────────────────────────────────────────────
 
 SIGNALS_TOTAL = Counter(
     "fluxtrade_signals_total",
@@ -47,7 +46,6 @@ ACTIVE_STRATEGIES = Gauge(
     "Number of currently active strategies",
 )
 
-# ── Configuration ─────────────────────────────────────────────────
 
 _enabled = False
 

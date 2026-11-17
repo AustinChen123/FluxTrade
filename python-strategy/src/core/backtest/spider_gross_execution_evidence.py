@@ -129,9 +129,6 @@ def gross_report_projection(
                 return False
 
         settlement_key = {"visible_at": scheduler["current_time"]}
-        # The persisted observation has a closed public ``key`` field; the
-        # pure metric helpers consume the original native key spelling. Adapt
-        # that same fact without adding or inferring any scheduler identity.
         metric_rows = []
         for row in native_observations:
             metric_row = dict(row)

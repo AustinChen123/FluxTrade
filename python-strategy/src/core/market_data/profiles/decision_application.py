@@ -17,11 +17,10 @@ from .publication import _canonical
 MAX_DECISION_BATCH_PARTICIPANTS = 256
 MAX_DECISION_BATCH_BYTES = 1024 * 1024
 MAX_DECISION_BATCH_NODES = 65536
-MAX_DECISION_BATCH_DEPTH = 16  # Shared detached JSON helper's fixed depth domain.
+MAX_DECISION_BATCH_DEPTH = 16
 
 
 def _batch_bytes(value: dict[str, Any]) -> bytes:
-    # Detached bounded JSON only; this is not the HTTP profile wire decoder.
     return _canonical(
         value, max_bytes=MAX_DECISION_BATCH_BYTES, max_nodes=MAX_DECISION_BATCH_NODES
     ).encode("utf-8")

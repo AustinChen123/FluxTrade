@@ -304,7 +304,6 @@ class OpsSafetyService:
             "drain_timeout": False,
         }
 
-        # Drain in-flight order submissions before snapshotting state.
         halt_and_drain = getattr(self._execution_engine, "halt_and_drain", None)
         drained = not callable(halt_and_drain) or halt_and_drain(self._drain_timeout)
         if not drained:
@@ -605,9 +604,6 @@ class OpsSafetyService:
             )
 
         if local_error is not None:
-            # No adapter enumeration method and local fetch failed: we cannot
-            # determine exposure, so re-raise to let kill_switch record the
-            # failure rather than falsely reporting already_flat.
             raise local_error
 
         return local_positions, None

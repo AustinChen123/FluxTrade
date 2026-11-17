@@ -235,9 +235,6 @@ def test_populated_predecessor_transport_migration_backfill_and_downgrade(
                     ),
                     {"id": strategy_id},
                 )
-        # These go through the existing owner, financial receiver, and STOP
-        # path: the predecessor contains actual INSTALL, receipt, and control
-        # rows rather than schema-only or hand-authored financial fixtures.
         seeded = [
             _seed_install_receipt_stop(engine, strategy_id, mock_exchange_adapter)
             for strategy_id in ("spider-main", "spider-secondary")
@@ -253,8 +250,6 @@ def test_populated_predecessor_transport_migration_backfill_and_downgrade(
         _upgrade(fresh_pg_db, "c3f8d1a904b7")
         assert _legacy_snapshot(engine) == predecessor
 
-        # The ORM and owner checks below use the current head's schema; keep
-        # those operability checks separate from the c3 migration proof above.
         _upgrade(fresh_pg_db, "head")
         factory = sessionmaker(engine)
         with factory() as session:

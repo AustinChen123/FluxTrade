@@ -79,8 +79,6 @@ def seq_id(value):
 def seq_order(i, j, price, volume, step):
     p, v, r = num(price), num(volume), num(step)
     a = (1 + D("0.5") * r) / (1 + r)
-    # Algebraic cancellation avoids subtracting a rounded reciprocal of a.
-    # This is mathematical equivalence, not JavaScript Number parity.
     quantity = v * (1 - a) / a**i if j == -1 else v * (1 - a) * a ** (i - 1)
     return p * (1 + r) ** (i * j), quantity
 
@@ -100,7 +98,7 @@ class Policy:
         self.ws_open = False
         self.now_ms = now_ms
         self.shared_ms = now_ms - 12000
-        self.last_capital = None  # Source closure captures undefined at load time.
+        self.last_capital = None
         self.last_market_ms = 0
         self.last_earn_ms = now_ms - 61000
         self.reset_ms = {}
@@ -128,7 +126,7 @@ class Policy:
         if self.now_ms - self.last_market_ms < 2000:
             return
         self.last_market_ms = self.now_ms
-        self.emit("request_market")  # Caller may deliver a later market snapshot.
+        self.emit("request_market")
 
     def apply_market(self, markets):
         self.markets = deepcopy(markets)
@@ -372,7 +370,7 @@ class Policy:
                 reason="non_grid_fill_enters_orderFilled",
                 order=od,
             )
-            return  # Source continues with NaN; not silently treated as a valid grid.
+            return
         n = int(r["單數"])
         targets = (
             [index + n + 1, index - n, index + 1]
@@ -388,7 +386,7 @@ class Policy:
                 and seq_id(x["clOrdId"]) in targets
             ]
         )
-        price = num(od["px"])  # Original order limit, not fillPx or avgPx.
+        price = num(od["px"])
         volume = self.a("total") * num(r["leverage"]) * D("0.5") / price
         ods = []
         for j in [-1, 1]:
@@ -429,7 +427,7 @@ class Policy:
             fmt(num(od["sz"]) * ct),
             fmt(num(od["accFillSz"]) * ct),
         )
-        row["cTime"] = od.get("cTime")  # Display formatting is not a decision input.
+        row["cTime"] = od.get("cTime")
         if row.get("state") in ["canceled", "mmp_canceled"]:
             del self.replies[key]
         elif row.get("state") == "filled":
@@ -488,7 +486,6 @@ class Policy:
         if ratio > self.p("hlLimit") and active_reply:
             self.cancel_all(r["name"])
             self.emit("alert", reason="high_low_limit", name=r["name"])
-        # The source's restart-in-range branch is commented out.
         hold = num(r["hold"]) / self.a("total")
         if (
             hold > num(r["hold上限"]) or hold < num(r["hold下限"])
@@ -520,7 +517,6 @@ class Policy:
                 self.shared_ms = self.now_ms
                 for r in self.rows:
                     self.start_strategy(r["name"])
-        # checkFinance is not invoked by the source.
 
     @decimal_scope
     def timer_action(

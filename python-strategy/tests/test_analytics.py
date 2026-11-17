@@ -16,7 +16,6 @@ from src.core.decimal_math import (
 from src.core.models import OrderSide, PositionSide, Trade
 
 
-# ── Helpers ──────────────────────────────────────────────────────
 
 
 def _make_trade(side: str, price: float, qty: float, ts: int) -> Trade:
@@ -76,7 +75,6 @@ def _round_trip(
         ]
 
 
-# ── Empty / edge cases ──────────────────────────────────────────
 
 
 class TestEmptyAndEdge:
@@ -92,7 +90,6 @@ class TestEmptyAndEdge:
         assert result["total_pnl"] == Decimal("0.00")
 
 
-# ── Basic metrics (backward compatibility) ───────────────────────
 
 
 class TestBasicMetrics:
@@ -105,7 +102,7 @@ class TestBasicMetrics:
     def test_single_winning_trade(self):
         trades = _round_trip(100.0, 110.0)
         result = calculate_metrics(trades)
-        assert result["total_pnl"] == Decimal("1.00")  # 10 * 0.1
+        assert result["total_pnl"] == Decimal("1.00")
         assert result["win_rate"] == 1.0
         assert result["total_trades"] == 1
         assert result["profit_factor"] == 999.0
@@ -156,11 +153,9 @@ class TestBasicMetrics:
             100.0, 95.0, entry_ts=3000, exit_ts=4000
         )
         result = calculate_metrics(trades)
-        # gross_profit=2.0, gross_loss=0.5
         assert result["profit_factor"] == pytest.approx(4.0, abs=0.01)
 
     def test_max_drawdown(self):
-        # Win then lose: equity goes 0 → +2 → +1.5
         trades = _round_trip(100.0, 120.0, entry_ts=1000, exit_ts=2000) + _round_trip(
             100.0, 95.0, entry_ts=3000, exit_ts=4000
         )
@@ -261,12 +256,9 @@ class TestBasicMetrics:
             100.0, 110.0, entry_ts=3000, exit_ts=4000
         )
         result = calculate_metrics(trades)
-        # All wins → sharpe is mean/std, but std=0 for identical PnLs
-        # std(1.0, 1.0) = 0 → sharpe = 0
         assert result["trade_sharpe"] == 0.0
 
 
-# ── ClosedTrade pairing ─────────────────────────────────────────
 
 
 class TestClosedTrades:
@@ -541,7 +533,6 @@ class TestClosedTrades:
             _build_closed_trades(trades)
 
 
-# ── Advanced metrics ─────────────────────────────────────────────
 
 
 class TestSortinoRatio:
@@ -550,7 +541,6 @@ class TestSortinoRatio:
             100.0, 120.0, entry_ts=3000, exit_ts=4000
         )
         result = calculate_metrics(trades)
-        # No downside → downside_std=0 → sortino=0
         assert result["sortino_ratio"] == 0.0
 
     def test_mixed_returns(self):
@@ -558,13 +548,11 @@ class TestSortinoRatio:
             100.0, 80.0, entry_ts=3000, exit_ts=4000
         )
         result = calculate_metrics(trades)
-        # Has both positive and negative → sortino should be nonzero
         assert isinstance(result["sortino_ratio"], Decimal)
 
 
 class TestCalmarRatio:
     def test_calmar_with_drawdown(self):
-        # Create trades with drawdown
         trades = _round_trip(
             100.0, 120.0, entry_ts=86_400_000, exit_ts=86_400_000 * 2
         ) + _round_trip(100.0, 80.0, entry_ts=86_400_000 * 3, exit_ts=86_400_000 * 4)
@@ -579,9 +567,8 @@ class TestCalmarRatio:
 
 class TestMonthlyReturns:
     def test_monthly_bucketing(self):
-        # Jan trade + Feb trade
-        jan_ts = 1704067200000  # 2024-01-01
-        feb_ts = 1706745600000  # 2024-02-01
+        jan_ts = 1704067200000
+        feb_ts = 1706745600000
         trades = _round_trip(
             100.0, 110.0, entry_ts=jan_ts, exit_ts=jan_ts + 60000
         ) + _round_trip(100.0, 90.0, entry_ts=feb_ts, exit_ts=feb_ts + 60000)
@@ -829,7 +816,6 @@ class TestTradeFrequency:
             + _round_trip(100.0, 110.0, entry_ts=day_ms * 3, exit_ts=day_ms * 3 + 60000)
         )
         result = calculate_metrics(trades)
-        # 3 trades over ~2 days = ~1.5/day
         assert result["trade_frequency_per_day"] > 0
 
 

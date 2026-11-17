@@ -82,8 +82,6 @@ class SpiderConfigurationHttpService:
         except SpiderConfigurationRequestError as error:
             return self._error(422, str(error))
         except Exception:
-            # A failed COMMIT may have succeeded. Resolve once using the exact
-            # same immutable request; never retry the write or mint a new key.
             return self._readback_response(request)
         return self._readback_response(request)
 

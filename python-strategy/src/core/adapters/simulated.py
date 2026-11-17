@@ -33,7 +33,6 @@ from src.core.strategy_context import (
     StrategyContext,
 )
 
-# Rust PyO3 matching engine
 from fluxtrade_core import (
     PyMatchingEngine,
     Order as RustOrder,
@@ -50,7 +49,6 @@ if TYPE_CHECKING:
     from src.core.backtest.external_funding import ExternalFundingTimeline
     from src.core.capital_allocator import CapitalAllocator
 
-# Detect if Rust engine supports strategy_id parameter
 _RUST_HAS_STRATEGY_ID = "strategy_id" in str(inspect.signature(RustOrder))
 logger = logging.getLogger(__name__)
 _INVALID_MARKET_SLIPPAGE_BPS = (
@@ -230,7 +228,6 @@ class SimulatedAdapter(IExchangeAdapter):
                 str(precision_codec.spec.price_tick),
                 str(precision_codec.spec.quantity_step),
             )
-        # Map order ID → ORM Order so we can return it in fills
         self._order_map: Dict[str, Order] = {}
         self._pending_rejections: List[Dict] = []
         self._rust_supports_strategy_id = _RUST_HAS_STRATEGY_ID
@@ -252,7 +249,6 @@ class SimulatedAdapter(IExchangeAdapter):
             return None
         return self._instrument_spec
 
-    # ── IExchangeAdapter interface ───────────────────────────────
 
     def place_order(self, order: Order) -> str:
         self.validate_order(order)
@@ -340,10 +336,6 @@ class SimulatedAdapter(IExchangeAdapter):
         *,
         order_type: Optional[str] = None,
     ) -> bool:
-        # order_type is only needed by venues with a separate conditional-order
-        # id namespace; the simulated matcher has a single namespace.
-        # order_id here is the exchange_order_id; we stored ORM id in Rust
-        # Try to find the internal id for this exchange_order_id
         for oid, orm_order in self._order_map.items():
             if orm_order.exchange_order_id == order_id:
                 cancelled = self._engine.cancel_order(oid)
@@ -474,15 +466,11 @@ class SimulatedAdapter(IExchangeAdapter):
 
         rust_pos = None
         if strategy_id:
-            # Composite key: "strategy_id:product_id" (Rust engine uses this)
             composite_key = f"{strategy_id}:{product_id}"
             rust_pos = rust_positions.get(composite_key)
-            # Fallback to product_id-only key for backward compat with older Rust engine
             if rust_pos is None:
                 rust_pos = rust_positions.get(product_id)
         else:
-            # No strategy_id specified: try product_id-only key first, then
-            # scan composite keys ending with the product_id (return first match)
             rust_pos = rust_positions.get(product_id)
             if rust_pos is None:
                 suffix = f":{product_id}"
@@ -629,7 +617,6 @@ class SimulatedAdapter(IExchangeAdapter):
             capital=_capital_snapshot(capital_allocator, strategy_id),
         )
 
-    # ── Backtest simulation hook ─────────────────────────────────
 
     def on_market_data(self, candle: Candlestick) -> List[Dict]:
         """Process a candle through the Rust matching engine.
@@ -761,7 +748,6 @@ class SimulatedAdapter(IExchangeAdapter):
                 }
             )
 
-        # Sync _order_map: remove orders cancelled by Rust (e.g. OCO)
         if fills:
             live_ids = {o.id for o in self._engine.open_orders}
             stale = [oid for oid in self._order_map if oid not in live_ids]
@@ -773,7 +759,6 @@ class SimulatedAdapter(IExchangeAdapter):
 
         return fills
 
-    # ── Conversion helpers ───────────────────────────────────────
 
     @staticmethod
     def _side_to_rust(side: str) -> str:
@@ -783,7 +768,6 @@ class SimulatedAdapter(IExchangeAdapter):
             return PositionSide.LONG
         if s == "sell":
             return PositionSide.SHORT
-        # Already LONG/SHORT
         return side.upper()
 
     @staticmethod
@@ -795,10 +779,6 @@ class SimulatedAdapter(IExchangeAdapter):
         side = self._side_to_rust(order.side)
         order_type = self._order_type_to_rust(order.type)
 
-        # For conditional orders (SL/TP/Trailing), Rust expects 'side' to be the
-        # position side being protected — not the trade direction.
-        # ORM: side="sell" means "sell to close long" → Rust side="LONG"
-        # ORM: side="buy" means "buy to close short" → Rust side="SHORT"
         if order_type in ("STOP_LOSS", "TAKE_PROFIT", "TRAILING_STOP"):
             side = (
                 PositionSide.LONG if side == PositionSide.SHORT else PositionSide.SHORT
@@ -839,7 +819,6 @@ class SimulatedAdapter(IExchangeAdapter):
             trailing_distance=trailing_distance,
             linked_order_id=linked_order_id,
         )
-        # Pass strategy_id if the Rust engine supports it
         if self._rust_supports_strategy_id:
             kwargs["strategy_id"] = order.strategy_id or ""
 

@@ -115,8 +115,6 @@ def test_python_dispatcher_owner_restarts_in_a_fresh_os_process(tmp_path: Path) 
         assert child.exitcode == 0
         assert result.get(timeout=30) == label
 
-    # A process crash can lose an in-flight and a queued optional diagnostic.
-    # It does not replay committed rows; a fresh process owns a new dispatcher.
     crashing = context.Process(
         target=_block_dispatcher_process,
         args=(db_path, result),
@@ -241,8 +239,6 @@ def test_real_stream_restart_and_drift_safety_survive_blocked_dispatcher(
 
     start_terminal_stream()
     assert open_entered.wait(30)
-    # ORDER stream restart reuses the same process dispatcher while its DB
-    # session factory is still blocked on the first diagnostic.
     start_terminal_stream()
     drift.detect(
         "rithmic_external_order_detected: account_id=ACCOUNT_SECRET "

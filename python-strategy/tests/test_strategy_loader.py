@@ -1008,7 +1008,6 @@ class TestIgnoreNonStrategies:
         """Files without BaseStrategy subclass should be ignored."""
         (tmp_path / "util.py").write_text("def helper(): return 42\n")
         result = StrategyLoader.scan_directory(str(tmp_path))
-        # No strategy keys, only possibly debug log
         strategy_keys = [k for k in result if "LoadError" not in k]
         assert strategy_keys == []
 
@@ -1036,7 +1035,6 @@ class ConcreteStrat(BaseStrategy):
         (tmp_path / "strat.py").write_text(code)
         result = StrategyLoader.scan_directory(str(tmp_path))
 
-        # Only the concrete subclass should appear
         keys = list(result.keys())
         assert len(keys) == 1
         assert "ConcreteStrat" in keys[0]

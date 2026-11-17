@@ -126,7 +126,6 @@ class TestFaultInjection:
         result2 = engine.execute_signal(sig2)
         assert result2 is None
 
-        # First order still intact in adapter
         assert len(adapter.open_orders) == 1
 
     def test_duplicate_signal_creates_multiple_orders(self, clock, order_repo, journal):
@@ -162,8 +161,6 @@ class TestFaultInjection:
         sig = _make_signal(stop_loss=Decimal("49000"))
         order_id = engine.execute_signal(sig)
 
-        # Market order should succeed even if SL conditional fails
         assert order_id is not None
-        # Only the market order should be in open_orders (SL failed to place)
         assert len(adapter.open_orders) == 1
         assert adapter.open_orders[0].type == "market"

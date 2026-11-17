@@ -238,7 +238,7 @@ def test_authoritative_revocation_survives_pending_recovery(
     assert isinstance(recovered, Consumer) and recovered is not original
     assert recovered.accumulator == Decimal(
         145998
-    )  # 14593 * 10 + close60 + volume7 + FRESH1.
+    )
     assert recovered.trace[-1] == [
         86700000,
         86760000,

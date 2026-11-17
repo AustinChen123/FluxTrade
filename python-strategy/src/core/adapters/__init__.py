@@ -140,7 +140,6 @@ def create_adapter(
         default_product_ids=instrument_product_ids,
     )
 
-    # Use Binance-specific adapter if WS requested and exchange is binance
     adapter = None
     try:
         guard()
