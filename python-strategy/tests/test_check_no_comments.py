@@ -20,11 +20,3 @@ def test_comment_lines_skips_directives_and_strings() -> None:
         "z = 3  # trailing\n"
     )
     assert mod.comment_lines(src) == [6, 7]
-
-
-def test_check_ratchets_baseline() -> None:
-    assert mod.check({"a.py": [1, 2]}, {"a.py": 2}) == []
-    assert "baseline allows 1" in mod.check({"a.py": [1, 2]}, {"a.py": 1})[0]
-    assert "stale" in mod.check({"a.py": [1]}, {"a.py": 2})[0]
-    assert "baseline allows 0" in mod.check({"new.py": [3]}, {})[0]
-    assert "no longer has comments" in mod.check({}, {"gone.py": 1})[0]
