@@ -212,6 +212,9 @@ jobs:
       - name: Lint with Ruff
         run: uv run ruff check .
 
+      - name: Forbid Python comments
+        run: uv run python scripts/check_no_comments.py
+
       - name: Run invariant tests
         run: uv run pytest tests/test_invariant_*.py -v
 
