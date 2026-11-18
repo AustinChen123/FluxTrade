@@ -454,7 +454,7 @@ jobs:
         run: npm exec playwright install --with-deps chromium
 
       - name: Audit dependencies
-        run: npm audit --audit-level=high
+        run: node ../.github/scripts/npm-audit-gate.mjs
 
       - name: Check production types
         run: npm run lint
