@@ -5,9 +5,10 @@ This module deliberately has no network, provider, or financial-owner imports.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields, is_dataclass
 from datetime import datetime
 from decimal import Decimal
+from functools import lru_cache
 from hashlib import sha256
 import json
 import re
@@ -91,6 +92,12 @@ def historical_planned_coverage(run: HistoricalRunInput) -> list[dict[str, objec
 def _canonical_decimal(value: Decimal) -> str:
     if type(value) is not Decimal or not value.is_finite():
         raise HistoricalInputError("financial and numeric values must be finite Decimal")
+    return _decimal_text(value)
+
+
+@lru_cache(maxsize=1 << 16)
+def _decimal_text(value: Decimal) -> str:
+    """Equal Decimals share a cache entry; their canonical text is identical by construction."""
     text = format(value, "f")
     if "." in text:
         text = text.rstrip("0").rstrip(".")
@@ -712,7 +719,7 @@ def validate_historical_input(run: HistoricalRunInput) -> str:
                 )
             ):
                 raise HistoricalInputError("endpoint configured spec differs from run evidence")
-    return _digest(_semantic_input_projection(run))
+    return _semantic_input_digest(run)
 
 
 def _validate_configured_spec_timeline(
@@ -765,13 +772,55 @@ def _validate_configured_spec_timeline(
     return active
 
 
-def _semantic_input_projection(run: HistoricalRunInput, *, model_id: str | None = None) -> dict[str, object]:
-    projection = asdict(run)
-    projection.pop("run_id")
+_FIELD_NAMES: dict[type, tuple[str, ...]] = {}
+
+
+def _canonical_plain(value: object) -> object:
+    """_canonical's conversion of asdict(value), in one read-only pass without deep copies."""
+    kind = type(value)
+    if type(value) is Decimal:
+        return _canonical_decimal(value)
+    if kind in (str, int, bool) or value is None:
+        return value
+    if type(value) is HistoricalBar:
+        bar = value
+        return {
+            "product_id": _canonical_plain(bar.product_id),
+            "bar_open_ms": _canonical_plain(bar.bar_open_ms),
+            "open": _canonical_plain(bar.open), "high": _canonical_plain(bar.high),
+            "low": _canonical_plain(bar.low), "close": _canonical_plain(bar.close),
+            "confirm": _canonical_plain(bar.confirm),
+            "source_sequence": _canonical_plain(bar.source_sequence),
+            "volume": _canonical_plain(bar.volume),
+            "source_row_hash": _canonical_plain(bar.source_row_hash),
+        }
+    if is_dataclass(value) and not isinstance(value, type):
+        names = _FIELD_NAMES.get(kind)
+        if names is None:
+            names = _FIELD_NAMES[kind] = tuple(field.name for field in fields(value))
+        return {name: _canonical_plain(getattr(value, name)) for name in names}
+    if isinstance(value, (tuple, list)):
+        return [_canonical_plain(element) for element in value]
+    if type(value) is bytes:
+        return {"$canonical_bytes": cast(bytes, value).hex()}
+    if isinstance(value, frozenset):
+        return sorted((_canonical_plain(element) for element in value), key=str)
+    if isinstance(value, dict):
+        return {str(key): _canonical_plain(element) for key, element in value.items()}
+    raise HistoricalInputError("unsupported canonical value")
+
+
+def _semantic_input_digest(run: HistoricalRunInput, *, model_id: str | None = None) -> str:
+    """Same digest as _digest of the asdict projection without run_id."""
+    names = _FIELD_NAMES.get(HistoricalRunInput)
+    if names is None:
+        names = _FIELD_NAMES[HistoricalRunInput] = tuple(field.name for field in fields(run))
+    projection: dict[str, object] = {name: getattr(run, name) for name in names if name != "run_id"}
     projection["parameters"] = _parameter_projection(run.parameters)
     if model_id is not None:
         projection["model_id"] = model_id
-    return projection
+    encoded = json.dumps(_canonical_plain(projection), sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return sha256(encoded.encode("ascii")).hexdigest()
 
 
 def historical_context_for_input(run: HistoricalRunInput) -> dict[str, object]:
@@ -811,7 +860,7 @@ def historical_context_for_input(run: HistoricalRunInput) -> dict[str, object]:
         "trade": _manifest_coverage(run.trade_manifest),
         "mark": _manifest_coverage(run.mark_manifest),
     })
-    path_pair_hash = _digest(_semantic_input_projection(run, model_id="OHLC4_PATH_PAIR_V1"))
+    path_pair_hash = _semantic_input_digest(run, model_id="OHLC4_PATH_PAIR_V1")
     return historical_context({
         "schema_version": "spider_historical_context_v1",
         "research_classification": "RESEARCH_ONLY",
