@@ -19,7 +19,6 @@ class RandomStrategy(BaseStrategy):
         candle: Candlestick,
         context: StrategyContext | None = None,
     ) -> Signal:
-        # Only process relevant product
         if candle.product_id != self.product_id:
             return Signal(
                 strategy_id=self.strategy_id,
@@ -29,7 +28,6 @@ class RandomStrategy(BaseStrategy):
                 type=SignalType.NO_SIGNAL,
             )
 
-        # Simple logic: 10% chance to generate a signal
         roll = random.random()
         signal_type = SignalType.NO_SIGNAL
 

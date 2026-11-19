@@ -135,7 +135,6 @@ def test_all_graph_branches_are_closed_and_do_not_mutate(check, fixture):
             mutated = deepcopy(fixture)
             at(mutated, path)[field] = None
             if field == "limit_price":
-                # This required field is intentionally nullable for historical MARKET.
                 check(mutated)
             else:
                 with pytest.raises(ValueError):

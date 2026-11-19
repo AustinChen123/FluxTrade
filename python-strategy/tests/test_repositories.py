@@ -116,7 +116,6 @@ class TestBacktestPositionDelegation:
         """update_position should be no-op (Rust engine handles positions)."""
         repo = BacktestOrderRepository(mock_db_session, session_id=1)
 
-        # Should not raise and should not change balance
         repo.update_position(
             "test",
             "BINANCE:BTCUSDT-PERP",
@@ -264,9 +263,6 @@ class TestBacktestTradeLogging:
         assert order.exchange_order_id == "SIM-abc123"
 
 
-# =============================================================================
-# LiveOrderRepository
-# =============================================================================
 
 
 class TestLiveOrderRepositoryBasics:
@@ -1382,7 +1378,6 @@ class TestLiveOrderRepositoryPositionUpdate:
             position_side="LONG",
         )
 
-        # New avg entry: (0.5*40000 + 0.5*44000) / 1.0 = 42000
         with sqlite_order_session_factory() as session:
             position = session.get(
                 Position,

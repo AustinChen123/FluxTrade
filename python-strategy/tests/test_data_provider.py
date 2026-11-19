@@ -16,9 +16,6 @@ import pytest
 from src.core.data_provider import timeframe_to_ms, check_data_availability
 
 
-# =============================================================================
-# timeframe_to_ms
-# =============================================================================
 
 
 class TestTimeframeToMs:
@@ -70,9 +67,6 @@ class TestTimeframeToMsErrors:
             timeframe_to_ms("m")
 
 
-# =============================================================================
-# check_data_availability
-# =============================================================================
 
 
 class TestCheckDataAvailabilitySufficient:
@@ -201,5 +195,4 @@ class TestBackfillCommand:
             mock_db, "NOFORMAT", "1m", lookback=100
         )
 
-        # Should not crash; uses fallback
         assert "backfill" in cmd

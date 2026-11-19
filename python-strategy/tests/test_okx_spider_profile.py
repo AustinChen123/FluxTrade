@@ -169,9 +169,9 @@ def _mutated_request(
 def test_exact_demo_profile_and_inclusive_freshness_admit_place() -> None:
     check = _prerequisite()
     assert check(_request(), NOW)
-    assert check(_request(), NOW - 0)  # receipt is exactly 10 seconds old
-    assert not check(_request(), NOW + 1)  # one millisecond beyond the budget
-    assert not check(_request(), NOW - 10_001)  # future receipt
+    assert check(_request(), NOW - 0)
+    assert not check(_request(), NOW + 1)
+    assert not check(_request(), NOW - 10_001)
 
 
 @pytest.mark.parametrize(

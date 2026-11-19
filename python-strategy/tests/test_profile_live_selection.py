@@ -276,7 +276,6 @@ def test_availability_uses_only_selected_versions_across_days(
             ("e", 4, {"revoked": True}),
         )
     )
-    # Revision 2 wins day one; its older revision, modeled and revoked rows cannot inflate max.
     winner = replace(
         extras[0],
         source_available_at=epoch + timedelta(days=2, milliseconds=first_offset),

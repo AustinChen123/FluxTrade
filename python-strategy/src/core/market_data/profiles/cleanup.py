@@ -60,13 +60,13 @@ class ProfileRawCleanupProcess:
         expected = encode_handoff(spec, publication)
         digest = hashlib.sha256(expected).hexdigest()
         hours = publication.source_manifest.thaw()["hours"]
-        assert type(hours) is list  # encode_handoff validates every hour and page count.
+        assert type(hours) is list
         pages = sum(hour["page_count"] for hour in hours)
         args = ["--staging-root", staging_root, "--job-id", spec.id, "--start-ms", str(spec.window_start_ms)]
         try:
             assembled = _assemble([self._assembler, *args], self._policy)
         except AssemblyFailure:
-            pass  # Raw may already be deleted; Rust still verifies the full DB-derived SHA.
+            pass
         else:
             if assembled != expected:
                 raise CleanupIntegrityError("cleanup evidence verification failed")

@@ -19,9 +19,6 @@ pytestmark = pytest.mark.rust
 PRODUCT = "BINANCE:BTCUSDT-PERP"
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 def make_engine(balance: str = "10000", maker: str = "0.0002", taker: str = "0.0006"):
     return PyMatchingEngine(balance, maker, taker)
 
@@ -90,9 +87,6 @@ def make_1m_candle(
     )
 
 
-# ===========================================================================
-# Candle aggregation
-# ===========================================================================
 class TestCandleAggregation:
     @pytest.mark.parametrize(
         ("source_timeframe", "target_timeframe", "expected"),
@@ -229,9 +223,6 @@ class TestCandleAggregation:
             CandleAggregator().add_candle(candle, target_timeframe)
 
 
-# ===========================================================================
-# Basic API
-# ===========================================================================
 class TestBasicAPI:
     def test_engine_initial_balance(self):
         engine = make_engine("10000")
@@ -260,9 +251,6 @@ class TestBasicAPI:
         assert len(engine.get_positions()) == 0
 
 
-# ===========================================================================
-# Market order fills
-# ===========================================================================
 class TestMarketOrders:
     def test_long_market_fills_on_candle(self):
         engine = make_engine("10000", "0", "0")
@@ -272,7 +260,6 @@ class TestMarketOrders:
         assert len(fills) == 1
         assert fills[0].order_id == "M-LONG"
         assert Decimal(fills[0].quantity) == Decimal("0.1")
-        # After fill, should have a position
         positions = engine.get_positions()
         assert len(positions) == 1
 
@@ -287,18 +274,14 @@ class TestMarketOrders:
 
     def test_market_fill_deducts_fee_from_balance(self):
         """Perp trading: balance only changes by fee (no notional deduction)."""
-        engine = make_engine("100000", "0", "0.001")  # 0.1% taker fee
+        engine = make_engine("100000", "0", "0.001")
         engine.submit_order(make_order(side="LONG", order_type="MARKET", price="50000", quantity="1"))
         engine.on_candle(make_candle(open="50000"))
 
-        # Balance should decrease by taker fee: 50000 * 1 * 0.001 = 50
         balance = Decimal(engine.balance)
         assert balance == Decimal("100000") - Decimal("50")
 
 
-# ===========================================================================
-# Fee model
-# ===========================================================================
 class TestFeeModel:
     def test_market_order_pays_taker_fee(self):
         engine = make_engine("100000", maker="0", taker="0.001")
@@ -308,7 +291,6 @@ class TestFeeModel:
         assert len(fills) == 1
         fee = Decimal(fills[0].fee)
         assert fee > Decimal("0")
-        # taker fee on 1 * 50000 = 50
         assert fee == Decimal("50")
 
     def test_limit_order_pays_maker_fee(self):
@@ -316,7 +298,6 @@ class TestFeeModel:
         engine.submit_order(make_order(
             side="LONG", order_type="LIMIT", price="49900", quantity="1",
         ))
-        # Candle goes down to 49900 → limit fills
         fills = engine.on_candle(make_candle(open="50000", low="49800", close="49850"))
 
         assert len(fills) == 1
@@ -324,20 +305,15 @@ class TestFeeModel:
         assert fee > Decimal("0")
 
 
-# ===========================================================================
-# Limit orders
-# ===========================================================================
 class TestLimitOrders:
     def test_long_limit_fills_when_price_drops(self):
         engine = make_engine("100000", "0", "0")
         engine.submit_order(make_order(
             side="LONG", order_type="LIMIT", price="49500", quantity="0.1",
         ))
-        # Candle doesn't reach limit
         fills = engine.on_candle(make_candle(open="50000", low="49600", close="49800"))
         assert len(fills) == 0
 
-        # Candle reaches limit
         fills = engine.on_candle(make_candle(open="49800", low="49400", close="49600", ts=1_700_001_800_000))
         assert len(fills) == 1
 
@@ -350,30 +326,23 @@ class TestLimitOrders:
         assert len(fills) == 1
 
 
-# ===========================================================================
-# Stop Loss / Take Profit
-# ===========================================================================
 class TestSLTP:
     def test_long_stop_loss_triggers(self):
         """SL for long triggers when candle.low <= trigger_price.
         Note: Rust convention — SL side matches position side (LONG SL has side=LONG).
         """
         engine = make_engine("100000", "0", "0")
-        # Open long position first
         engine.submit_order(make_order(side="LONG", order_type="MARKET", quantity="0.1"))
         engine.on_candle(make_candle(open="50000", close="50000"))
 
-        # Place SL (side=LONG per Rust convention)
         engine.submit_order(make_order(
             side="LONG", order_type="STOP_LOSS", price="0",
             quantity="0.1", trigger_price="49000", order_id="SL-1",
         ))
-        # Candle doesn't trigger SL (low=49100 > 49000)
         fills = engine.on_candle(make_candle(open="50000", low="49100", close="49500", ts=1_700_001_800_000))
         sl_fills = [f for f in fills if f.order_id == "SL-1"]
         assert len(sl_fills) == 0
 
-        # Candle triggers SL (low=48900 <= 49000)
         fills = engine.on_candle(make_candle(open="49500", low="48900", close="49100", ts=1_700_002_700_000))
         sl_fills = [f for f in fills if f.order_id == "SL-1"]
         assert len(sl_fills) == 1
@@ -395,9 +364,6 @@ class TestSLTP:
         assert len(tp_fills) == 1
 
 
-# ===========================================================================
-# OCO (One Cancels Other)
-# ===========================================================================
 class TestOCO:
     def test_sl_cancels_tp(self):
         """When SL fills, linked TP should be auto-cancelled."""
@@ -405,7 +371,6 @@ class TestOCO:
         engine.submit_order(make_order(side="LONG", order_type="MARKET", quantity="0.1"))
         engine.on_candle(make_candle(open="50000", close="50000"))
 
-        # SL linked to TP (side=LONG per Rust convention)
         engine.submit_order(make_order(
             side="LONG", order_type="STOP_LOSS", price="0",
             quantity="0.1", trigger_price="49000", order_id="SL-OCO",
@@ -418,18 +383,13 @@ class TestOCO:
         ))
         assert len(engine.open_orders) == 2
 
-        # Trigger SL (low=48900 <= 49000)
         engine.on_candle(make_candle(open="49500", low="48900", close="49000", ts=1_700_001_800_000))
 
-        # TP should be cancelled
         remaining_ids = [o.id for o in engine.open_orders]
         assert "TP-OCO" not in remaining_ids
         assert "SL-OCO" not in remaining_ids
 
 
-# ===========================================================================
-# Trailing Stop
-# ===========================================================================
 class TestTrailingStop:
     def test_trailing_stop_updates_and_triggers(self):
         """Trailing stop should update trigger as price moves favorably, then trigger on reversal.
@@ -439,18 +399,15 @@ class TestTrailingStop:
         engine.submit_order(make_order(side="LONG", order_type="MARKET", quantity="0.1"))
         engine.on_candle(make_candle(open="50000", close="50000"))
 
-        # Trailing stop: side=LONG, initial trigger=49000, distance=1000
         engine.submit_order(make_order(
             side="LONG", order_type="TRAILING_STOP", price="0",
             quantity="0.1", trigger_price="49000",
             trailing_distance="1000", order_id="TS-1",
         ))
 
-        # Candle 1: high=52000 → trigger updates to 52000-1000=51000, low=51200 > 51000 → no trigger
         fills1 = engine.on_candle(make_candle(open="51500", high="52000", low="51200", close="51800", ts=1_700_001_800_000))
         assert len([f for f in fills1 if f.order_id == "TS-1"]) == 0
 
-        # Candle 2: low=50500 <= 51000 → triggers
         fills2 = engine.on_candle(make_candle(open="51200", high="51500", low="50500", close="50800", ts=1_700_002_700_000))
         ts_fills = [f for f in fills2 if f.order_id == "TS-1"]
         assert len(ts_fills) == 1

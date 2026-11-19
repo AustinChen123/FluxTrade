@@ -62,7 +62,6 @@ class LiveBinanceAdapter(CcxtExchangeAdapter):
             resolve_client_order_id=self._canonical_client_order_id,
         )
 
-        # Optional WebSocket fast path
         self.ws_connector: BinanceWebSocketOrderConnector | None = None
         if enable_ws:
             guard = operation_guard or (lambda: None)
@@ -195,7 +194,6 @@ class LiveBinanceAdapter(CcxtExchangeAdapter):
             isinstance(intent_payload, dict)
             and intent_payload.get("reduce_only") is True
         )
-        # Try WS fast path for market orders
         if (
             not reduce_only
             and self.ws_connector
@@ -249,7 +247,6 @@ class LiveBinanceAdapter(CcxtExchangeAdapter):
                         else:
                             return ack.exchange_order_id
 
-        # REST fallback (parent class)
         return super().place_order(order)
 
 

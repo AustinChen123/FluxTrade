@@ -173,7 +173,6 @@ def test_composite_poc_requires_unique_volume_maximum():
     assert wire.decode_live_profile_response(request, raw).validated == evidence
     body = json.loads(raw)
     assert body["profile_kind"] == "COMPOSITE"
-    # Valid edges and existing index isolate winner selection, not daily digest/edge checks.
     body["poc"] = {"bin_index": -1, "low": "-10", "high_exclusive": "0"}
     with pytest.raises(wire.ProfileWireError, match="^PROFILE_WIRE_INVALID_PROFILE$"):
         wire.decode_live_profile_response(request, json.dumps(body).encode())

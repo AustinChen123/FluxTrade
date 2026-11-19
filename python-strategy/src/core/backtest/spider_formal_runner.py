@@ -322,7 +322,6 @@ def _projection_value(artifacts: dict[str, Any]) -> dict[str, object]:
         if type(item) is not dict:
             raise SpiderProjectionIntegrityError
         entry = cast(dict[str, object], item)
-        # These captured-file metadata values are run-ID-sensitive by contract.
         entry.pop("sha256", None)
         entry.pop("byte_count", None)
     normalized_completion["endpoint_state_digest"] = normalized_endpoint

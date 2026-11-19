@@ -116,7 +116,6 @@ def test_loser_missing_and_valid_conflict():
     store, _, state, _, _ = harness()
     state["loser"] = True
     assert store.pin(sample()).already_present
-    # Use an empty valid envelope to vary content without changing its key.
     different = replace(
         sample(), requirements=(), context=replace(sample().context, profiles=())
     )

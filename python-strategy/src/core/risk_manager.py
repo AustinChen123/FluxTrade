@@ -58,7 +58,7 @@ class AccountService:
         self._authoritative_balance_max_age_seconds: float | None = None
         try:
             redis_client = cast(_SyncRedis, create_redis_client())
-            redis_client.ping()  # Check connection
+            redis_client.ping()
             self.redis = redis_client
         except Exception as e:
             logger.warning("AccountService: Redis connection failed: %s", e)
@@ -136,7 +136,6 @@ class AccountService:
         if not self.redis:
             return Decimal("0")
         
-        # Assuming single account 'main' for now as per Lua script usage
         balance = self.redis.hget("state:balance:main", "free")
         return Decimal(balance) if balance else Decimal("0")
 
@@ -211,7 +210,6 @@ class AccountService:
         if qty == 0:
             return None
 
-        # Determine Side & Abs Quantity
         if qty > 0:
             side = PositionSide.LONG
             abs_qty = qty
@@ -219,10 +217,8 @@ class AccountService:
             side = PositionSide.SHORT
             abs_qty = abs(qty)
 
-        # Entry Price (tracked by Lua or external updater)
         entry_price = Decimal(data.get("entry_price", "0"))
         
-        # Unrealized PnL (Not strictly tracked in Redis Hash yet, placeholder)
         unrealized_pnl = Decimal("0")
 
         return Position(
@@ -408,17 +404,13 @@ class RiskManager:
                     daily_start_nav, current_nav = nav_context
                     balance = current_nav
 
-        # Rule 1: Balance / Capital check. Risk-reducing signals must not depend
-        # on account-balance availability.
         if self.capital_allocator is not None:
-            # Per-strategy capital check
             available = self.capital_allocator.get_available(signal.strategy_id)
             if is_entry and available <= Decimal("0"):
                 msg = f"REJECT: No available capital for strategy {signal.strategy_id} (available={available})"
                 logger.warning("RISK_REJECTED: %s signal_type=%s", msg, signal.type)
                 return False, msg
         else:
-            # Global balance check (backward-compatible)
             if is_entry and balance is None:
                 balance = self.account_service.get_balance()
             if balance is not None and balance <= 0:
@@ -426,7 +418,6 @@ class RiskManager:
                 logger.warning("RISK_REJECTED: %s signal_type=%s", msg, signal.type)
                 return False, msg
 
-        # Rule 2: Single-order notional check.
         if is_entry:
             nav = balance if balance is not None else self.account_service.get_balance()
             rule_status, rule_reason = self.single_order_rule.evaluate(
@@ -439,7 +430,6 @@ class RiskManager:
                 logger.warning("RISK_REJECTED: %s", msg)
                 return False, msg
 
-        # Rule 3: Daily loss circuit breaker when NAV context is available.
         if is_entry and (daily_start_nav is not None or current_nav is not None):
             if daily_start_nav is None and current_nav is not None and self.daily_nav_service is not None:
                 daily_start_nav = self.daily_nav_service.get_start_nav(
@@ -465,7 +455,6 @@ class RiskManager:
                 logger.warning("RISK_REJECTED: %s", msg)
                 return False, msg
 
-        # Rule 4: Price sanity check when market-depth context is available.
         if is_entry and (best_bid is not None or best_ask is not None):
             rule_status, rule_reason = self.price_sanity_rule.evaluate(
                 signal,
@@ -477,7 +466,6 @@ class RiskManager:
                 logger.warning("RISK_REJECTED: %s", msg)
                 return False, msg
 
-        # Rule 5: Max Exposure Check (uses current market price)
         position = self.account_service.get_position(signal.strategy_id, signal.product_id)
         if position:
             price_for_exposure = current_price if current_price is not None else position.entry_price
@@ -521,7 +509,6 @@ class RiskManager:
                         logger.warning("RISK_REJECTED: %s", msg)
                         return False, msg
 
-            # Per-strategy exposure limit (only when capital_allocator present)
             if self.capital_allocator is not None and is_entry:
                 current_exposure = calculate_notional_exposure(
                     position.quantity,
@@ -536,7 +523,6 @@ class RiskManager:
                     logger.warning("RISK_REJECTED: %s", msg)
                     return False, msg
 
-        # Rule 6: Order rate limit. This records only after prior checks pass.
         if is_entry and self.order_rate_limit_rule is not None:
             rule_status, rule_reason = self.order_rate_limit_rule.try_record_order(
                 signal.strategy_id,
@@ -587,6 +573,4 @@ class RiskManager:
 
         size = risk_amount / price_diff
         
-        # Optional: Add rounding logic here based on exchange precision if known
-        # For now, return raw Decimal
         return round(size, 4)

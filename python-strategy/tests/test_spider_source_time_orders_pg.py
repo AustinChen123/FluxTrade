@@ -108,7 +108,6 @@ def _partial_fixture(engine: Engine, mock_clock: Any, mock_exchange_adapter: Any
             "cumulative_contracts": format(partial.normalize(), "f"),
             "created_at_ms": timestamp,
         }
-        # Use the canonical source decimal text already persisted by the order.
         snapshot_row["price"] = source_price
     return owner, scope, factory, prepared, runtime, snapshot_row, execution, product_id, client_order_id, price, quantity
 
@@ -148,7 +147,6 @@ def test_complete_partial_working_set_is_proved_at_cutoff_and_not_rewritten_by_l
     first_time = _time_rows(factory, scope)[-1]
     assert first_time.disposition == "CONSUMED"
 
-    # Later state must not change the earlier time decision's working set.
     assert execution.process_exchange_order_event(ExchangeOrderEvent(
         status="open", product_id=product_id, client_order_id=client_id,
         exchange_order_id="time-cutoff-provider-id",
@@ -335,7 +333,6 @@ def test_active_resubmitted_child_replaces_terminal_ancestor_in_working_set(
     assert accepted.data["delivery_disposition"] == "CONSUMED"
     assert transport_owner.readback(scope, cast(str, accepted.data["operation_id"])) is not None
 
-    # A contradictory late active ancestor must not disappear behind the child frontier.
     assert execution.process_exchange_order_event(ExchangeOrderEvent(
         status="open", product_id=ancestor_product, client_order_id=ancestor_client,
         exchange_order_id="late-active-ancestor",

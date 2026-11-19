@@ -347,9 +347,6 @@ def _journal_check(run_id: str, attempt: dict[str, Any], status: dict[str, Any],
         and not scheduler["polls"] and not scheduler["callback_actions"]
     )
     if initial_capture_failure:
-        # At construction, the first market step, snapshots, timers and paid
-        # drain are queued; later market steps are causally enqueued by earlier
-        # steps and therefore are not yet observable at this zero-event prefix.
         market_steps = [key for key in expected_records if key[0] == "HISTORICAL_MARKET_STEP"]
         initial_identities = {
             key for key in expected_records
@@ -634,9 +631,6 @@ def _action_bindings_for_mode(attempt: dict[str, Any], journal: list[dict[str, A
             if action["action_id"] != expected_id:
                 return False
     if gross_execution:
-        # Actions retain source-group registration order; future cancel effects
-        # may be registered before requests effective sooner. Legacy paid ordering
-        # remains unchanged; financial journal order is verified independently.
         action_schedule_sequences = [key[2] for key in action_admission_keys]
         if action_schedule_sequences != sorted(action_schedule_sequences):
             return False
@@ -743,10 +737,6 @@ def _action_bindings_for_mode(attempt: dict[str, Any], journal: list[dict[str, A
     live_deliveries = {canonical_bytes(key) for key in scheduler["pending_keys"] if key["queue_class"] == "DELIVERY"}
     if not pending_delivery <= live_deliveries:
         return False
-    # Rebuild paid delivery obligations from native fills and committed cancel
-    # effects, then bind each one to the scheduler's actual stable key and its
-    # pending, consumed, or terminal public outcome. Observation arrays alone
-    # cannot make an omitted notice look settled.
     expected_deliveries = _paid_delivery_origins(journal, request, role_rows, actions_by_group, mode)
     scheduler_deliveries = [row for row in scheduler["records"] if row["kind"] == "DELIVERY"]
     observation_deliveries = observation["pending_paid_deliveries"]

@@ -110,7 +110,6 @@ def _h01_run(record: dict[str, str]) -> HistoricalRunInput:
     )
     run = _extend_one_minute(run)
 
-    # The input record is the only source of the changed market path.
     bars: dict[tuple[str, int], tuple[D, D, D, D, D]] = {}
     product = None
     product_ids: dict[str, str] = dict(zip(("A", "B"), products, strict=True))
@@ -563,8 +562,6 @@ def test_configured_spec_exact_run_end_boundary_is_valid_and_uses_run_cache(monk
                                  "valid_to": None})
         product["marks"][0]["valid_to"] = 200_000_000
     run = _run_with_configuration(run, configuration)
-    # Historical timers now perform real Policy polling; keep this cache test
-    # isolated from intentional grid-order acceptance.
     run = replace(run, initial_policy_cache=_policy_cache(running=False))
     owner_calls = _count_native_session_constructions(monkeypatch)
     composition = _composition(run)
@@ -691,8 +688,6 @@ def test_initial_and_closed_market_cache_use_raw_ratio_for_policy_gate(high, exp
     )
     run = _rehashed_run(base, trade_rows=altered)
 
-    # The admitted initial cache is the same pre-window source history consumed
-    # by the first strategy timer; keep its raw units without projecting future bars.
     state = cast(dict[str, object], decode_canonical(run.initial_policy_cache))
     markets = cast(list[dict[str, object]], state["markets"])
     initial_history = tuple(
@@ -900,7 +895,6 @@ def test_frozen_h01_runs_policy_poll_native_fill_notice_and_endpoint_oracle():
     start = run.range_start_ms
     endpoint = start + 60_002
 
-    # The market opens at E before the first poll can create any owner orders.
     first_open = next(record for record in composition._records.values()
                       if record["item"]["kind"] == "HISTORICAL_MARKET_STEP"
                       and record["item"]["node"]["bar_open_ms"] == start
@@ -910,7 +904,6 @@ def test_frozen_h01_runs_policy_poll_native_fill_notice_and_endpoint_oracle():
     assert all(not product["fills"] for product in first_result["products"])
     assert composition._codec.historical_working_orders() == []
 
-    # The frozen input's initial ordered poll is visible at E+5020.
     poll_visible = start + 5_020
     assert composition._dispatch_due(poll_visible * 16 + 6)["classification"] == "SUCCESS"
     sends = [event for event in composition._policy.events
@@ -944,7 +937,6 @@ def test_frozen_h01_runs_policy_poll_native_fill_notice_and_endpoint_oracle():
     ]
     accept_snapshot = _capture_snapshot(composition, "TRADING", "H01_ACCEPT_TRADING", accepted_at)
 
-    # Every intervening completed poll sees the same four native orders and emits no repair.
     for offset in range(10_000, 60_000, 5_000):
         visible = start + offset + 20
         assert composition._dispatch_due(visible * 16 + 6)["classification"] == "SUCCESS"
@@ -955,7 +947,6 @@ def test_frozen_h01_runs_policy_poll_native_fill_notice_and_endpoint_oracle():
                 if record["item"]["kind"] == "SOURCE_GROUP"
                 and record["item"]["group"].get("ordering_contract_id") == "HISTORICAL_ORDER_V1"]) == 4
 
-    # The next bar opens at 45. Only A LONG fills; execution notice is separate and delayed.
     fill_time = start + 60_000
     assert composition._dispatch_due(fill_time * 16 + 9)["classification"] == "SUCCESS"
     market_steps = [record for record in composition._records.values()
@@ -1010,7 +1001,6 @@ def test_frozen_h01_runs_policy_poll_native_fill_notice_and_endpoint_oracle():
     assert [row["ordId"] for row in notice_actions[0]["orders"]] == [initial_a_short]
     assert [row["instId"] for row in notice_actions[0]["orders"]] == ["A-USDT-SWAP"]
 
-    # At the frozen H01 observation endpoint, only the original A-short and B grid remain.
     assert composition._dispatch_due(endpoint * 16 + 6)["classification"] == "SUCCESS"
     pending_poll = composition._polls[f"P3_POLL_{fill_time}"]
     assert pending_poll.observation.status == "IN_PROGRESS"
@@ -1032,7 +1022,6 @@ def test_frozen_h01_runs_policy_poll_native_fill_notice_and_endpoint_oracle():
         ("B-USDT-SWAP", "SHORT", D("1"), D("200")),
     }
 
-    # Read the answer record only after runtime behavior is complete; it is never input to replay.
     answer = _frozen_h01_answer()
     expected_source = []
     for product_row in answer["source_orders"].split(";"):
@@ -1088,8 +1077,6 @@ def test_seed_limit_projection_is_ranked_and_fills_only_after_seed_effective_at(
     start = run.range_start_ms
     config = json.loads(run.configuration_bytes)
     config["seed_effective_at"] = start
-    # Reverse configuration order intentionally: native seed ordering is the
-    # owner_order_id lexical rank, not input-array order.
     seed_orders = [
         {
             "intent_id": "SEED-INTENT-2",
@@ -1183,8 +1170,6 @@ def test_seed_limit_projection_is_ranked_and_fills_only_after_seed_effective_at(
     ]
     assert min(record["key"][0] for record in market_steps) > seed_effective_at
 
-    # The first queued market segment is phase 7, after seed phase 0. Both
-    # orders have the same trigger; one segment lot proves rank 1 is first.
     assert composition._dispatch_due(start * 16 + 7)["classification"] == "SUCCESS"
     first = next(
         record["result"]["historical_result"]
@@ -2462,9 +2447,9 @@ def _complete_poll_through_native_deliveries(
 
 
 @pytest.mark.parametrize("issued_at,expected_day_ago", [
-    (129_540_000, False),  # 11:59 UTC
-    (129_600_000, True),   # 12:00 UTC
-    (129_660_000, False),  # 12:01 UTC
+    (129_540_000, False),
+    (129_600_000, True),
+    (129_660_000, False),
 ])
 def test_historical_poll_completion_updates_day_ago_only_in_utc_noon_minute(issued_at, expected_day_ago):
     composition = _composition(_valid_run())
@@ -2497,8 +2482,6 @@ def test_historical_timer_preserves_poll_start_terminal_and_stops_queue(monkeypa
 
     def invalid_plan(raw_at, sequence):
         plan = original_plan(raw_at, sequence)
-        # A due EARN delivery is visible after this capture; force trading capture
-        # to precede that visible boundary so the real poll validator rejects it.
         plan["trading"]["snapshot_request"]["captured_at"] = raw_at
         return plan
 

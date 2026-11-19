@@ -122,7 +122,6 @@ def test_mvp_grid_rejection_even_with_a_matching_content_digest(change: dict[str
     wire["content_sha256"] = content.content_sha256
     with pytest.raises(ValueError, match="^invalid profile handoff$"):
         parse_handoff(encode(wire))
-    # Unit is fixed to USDT by the MVP identity, never a caller-selected field.
     wire = json.loads(RAW)
     wire["content"]["unit"] = "USDC"
     with pytest.raises(ValueError):

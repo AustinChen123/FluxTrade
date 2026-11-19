@@ -8,7 +8,6 @@ from typing import Any
 import structlog
 from sqlalchemy.orm import Session
 
-# Add project root to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.core.consumer import (

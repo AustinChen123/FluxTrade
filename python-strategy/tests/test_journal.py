@@ -10,9 +10,6 @@ from src.core.execution import ExecutionEngine
 from src.core.strategy_context import StrategyContext
 
 
-# =============================================================================
-# StrategyJournal Unit Tests
-# =============================================================================
 
 
 class TestJournalBasicLogging:
@@ -177,9 +174,6 @@ class TestJournalClear:
         assert j.entries() == []
 
 
-# =============================================================================
-# BaseStrategy Journal Integration
-# =============================================================================
 
 
 class DummyStrategy(BaseStrategy):
@@ -238,9 +232,6 @@ class TestBaseStrategyJournal:
         assert len(s.journal) == 1
 
 
-# =============================================================================
-# ExecutionEngine Journal Integration
-# =============================================================================
 
 
 class TestExecutionEngineJournal:
@@ -310,7 +301,6 @@ class TestExecutionEngineJournal:
     def test_fill_logs_to_journal(self, engine_with_journal):
         engine, journal = engine_with_journal
 
-        # Simulate a fill via on_market_data
         candle = Candlestick(
             product_id="BINANCE:BTCUSDT-PERP",
             timeframe="1m",
@@ -322,7 +312,6 @@ class TestExecutionEngineJournal:
             volume=Decimal("100"),
         )
 
-        # Place a signal first to get an order in the adapter
         signal = Signal(
             strategy_id="test_strat",
             product_id="BINANCE:BTCUSDT-PERP",
@@ -332,7 +321,7 @@ class TestExecutionEngineJournal:
             quantity=Decimal("0.1"),
         )
         engine.execute_signal(signal)
-        journal.clear()  # clear entry log to isolate fill test
+        journal.clear()
 
         engine.process_market_data(candle)
 
@@ -362,9 +351,6 @@ class TestExecutionEngineJournal:
         assert order_id is not None
 
 
-# =============================================================================
-# JournalEntry dataclass
-# =============================================================================
 
 
 class TestJournalEntry:

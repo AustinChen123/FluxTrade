@@ -444,8 +444,6 @@ def _decode_scalar(value: object) -> object:
         text = row.get("value")
         _require(set(row) == {"tag", "value"} and type(text) is str)
         decimal_text = cast(str, text)
-        # The encoder always emits fixed-point text; reject exponent forms before
-        # rendering so a tiny payload cannot request an unbounded expansion.
         _require("e" not in decimal_text.lower())
         try:
             number = Decimal(decimal_text)

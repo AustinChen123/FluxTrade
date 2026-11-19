@@ -77,7 +77,6 @@ class GeneRole(str, Enum):
 class BaseFluxModel(BaseModel):
     """Base model with common configuration"""
     model_config = ConfigDict(
-        # Allow population by alias/name
         populate_by_name=True
     )
 
@@ -95,7 +94,7 @@ class Trade(BaseFluxModel):
     price: Decimal
     quantity: Decimal
     side: OrderSide
-    timestamp: int  # Unix timestamp in milliseconds
+    timestamp: int
 
     @field_validator('product_id')
     @classmethod
@@ -105,7 +104,7 @@ class Trade(BaseFluxModel):
 class Candlestick(BaseFluxModel):
     product_id: str
     timeframe: str
-    timestamp: int  # Unix timestamp in milliseconds
+    timestamp: int
     open: Decimal
     high: Decimal
     low: Decimal
@@ -121,7 +120,7 @@ class Signal(BaseFluxModel):
     strategy_id: str
     product_id: str
     timeframe: str
-    timestamp: int  # Unix timestamp in milliseconds
+    timestamp: int
     type: SignalType
     value: Optional[Decimal] = None
     quantity: Optional[Decimal] = None
@@ -146,7 +145,7 @@ class Signal(BaseFluxModel):
 class Position(BaseFluxModel):
     strategy_id: str
     product_id: str
-    side: PositionSide  # "LONG" or "SHORT"
+    side: PositionSide
     quantity: Decimal
     entry_price: Decimal
     unrealized_pnl: Decimal

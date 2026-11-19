@@ -132,7 +132,6 @@ def test_golden_cross_strategy_rejects_invalid_parameters():
     [
         (None, True, False, False),
         ("LONG", True, False, True),
-        # SHORT must be rejected: return False and must NOT mutate _in_position.
         ("SHORT", False, True, True),
     ],
     ids=["flat-none", "long-accepted", "short-rejected"],

@@ -40,9 +40,6 @@ def _install_redis_client(consumer: DataConsumer, client: "_BehaviorRedis") -> N
     object.__setattr__(consumer, "redis_client", client)
 
 
-# =============================================================================
-# Fixtures
-# =============================================================================
 
 
 @pytest.fixture
@@ -56,7 +53,7 @@ def mock_redis():
     client.smembers.return_value = set()
     client.sadd.return_value = 1
     client.xgroup_destroy.return_value = 1
-    client.time.return_value = (1704067200, 0)  # (seconds, microseconds)
+    client.time.return_value = (1704067200, 0)
     client.xack.return_value = 1
 
     def eval_script(script, *args):
@@ -340,9 +337,6 @@ def test_ephemeral_cleanup_includes_initialized_unregistered_streams(mock_redis)
     assert consumer._initialized_channels == set()
 
 
-# =============================================================================
-# Consumer group creation
-# =============================================================================
 
 
 class TestEnsureConsumerGroups:
@@ -1394,9 +1388,6 @@ class TestDeliverySemantics:
         assert consumer._consume_loop.call_count == 1
 
 
-# =============================================================================
-# Message parsing
-# =============================================================================
 
 
 class TestParseMessage:
@@ -1484,8 +1475,6 @@ class TestParseMessage:
 
         result = consumer._parse_message("stream:key", data)
 
-        # 'unknown' is not a canonical product ID, so validation fails.
-        # _parse_message catches the exception and returns None
         assert result is None
 
     def test_parse_unrecognized_data_returns_none(self, consumer):
@@ -1505,9 +1494,6 @@ class TestParseMessage:
         assert result is None
 
 
-# =============================================================================
-# Stop
-# =============================================================================
 
 
 class TestConsumerStop:

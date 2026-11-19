@@ -50,10 +50,6 @@ class _SpiderOkxClient(ccxt.okx):
         requestHeaders: object,
         requestBody: object,
     ) -> None:
-        # CCXT's OKX override throws for envelope code!=0 before returning the
-        # low-level endpoint result. This client is Spider-only: preserve that
-        # exact body so the durable owner can classify every batch member.
-        # HTTP status/network/timeout errors are still raised by CCXT's fetch.
         del httpCode, reason, url, method, headers, body, response
         del requestHeaders, requestBody
 

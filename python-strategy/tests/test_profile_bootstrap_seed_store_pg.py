@@ -181,7 +181,6 @@ def test_constraints_and_append_only(profile_repository_pg):
                 with conn.begin_nested():
                     conn.execute(insert(SeedRow).values(**values))
     assert BootstrapSeedStore(sessionmaker(engine)).confirm(value) is not None
-    # Independently prove PK and full durable-key uniqueness (C is not in key).
     for change in ({"strategy_id": "pk_other"}, {"seed_id": "f" * 64, "cutover_ms": 0}):
         with engine.begin() as conn:
             with pytest.raises(DBAPIError) as caught:

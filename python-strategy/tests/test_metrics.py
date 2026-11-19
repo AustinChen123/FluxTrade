@@ -41,7 +41,6 @@ class TestConfigureMetrics:
 
     def test_disabled_does_not_start_server(self):
         configure_metrics(enabled=False)
-        # No exception — HTTP server NOT started
         assert not is_enabled()
 
     def test_is_enabled_returns_bool(self):

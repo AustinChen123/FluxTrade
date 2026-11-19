@@ -144,7 +144,6 @@ class BinanceWebSocketOrderConnector:
                 backoff = min(backoff * 2, MAX_BACKOFF)
 
     async def _authenticate(self, ws: Any) -> None:
-        # The existing connection performs no separate authentication handshake.
         return None
 
     def _handle_message(self, msg: str | bytes) -> None:

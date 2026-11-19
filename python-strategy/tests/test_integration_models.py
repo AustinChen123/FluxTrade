@@ -6,7 +6,6 @@ from src.core.models import OrderSide, Trade
 
 
 def test_product_id_validation():
-    # Valid
     Trade(
         id="1",
         product_id="BINANCE:BTC-PERP",
@@ -16,7 +15,6 @@ def test_product_id_validation():
         timestamp=1000,
     )
 
-    # Invalid (missing exchange)
     with pytest.raises(ValueError):
         Trade(
             id="1",
@@ -27,7 +25,6 @@ def test_product_id_validation():
             timestamp=1000,
         )
 
-    # Invalid (missing -PERP)
     with pytest.raises(ValueError):
         Trade(
             id="1",
@@ -40,7 +37,6 @@ def test_product_id_validation():
 
 
 def test_model_decimal_parsing():
-    # Test string to decimal
     trade = Trade.model_validate(
         {
             "id": "1",

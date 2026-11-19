@@ -960,9 +960,6 @@ def test_on_candle_syncs_strategy_only_when_authoritative_side_changes() -> None
     assert len(strategy.candles_received) == 3
 
 
-# ---------------------------------------------------------------------------
-# Parametrized decision-table for set_position_state
-# ---------------------------------------------------------------------------
 
 _SENTINEL = sentinel.untouched
 
@@ -1019,7 +1016,6 @@ class _HookNoneFullStrategy(BaseStrategy):
         self.position = 99
         self._in_position = _SENTINEL
 
-    # sync_position_state NOT overridden → BaseStrategy.sync_position_state → None
 
     @property
     def requirements(self) -> StrategyRequirements:
@@ -1040,7 +1036,6 @@ class _InPositionOnlyStrategy(BaseStrategy):
         super().__init__("in_pos_only", "BINANCE:BTCUSDT-PERP")
         self._in_position = _SENTINEL
 
-    # sync_position_state NOT overridden → None
 
     @property
     def requirements(self) -> StrategyRequirements:
@@ -1075,23 +1070,20 @@ class _NoAttrsStrategy(BaseStrategy):
 @pytest.mark.parametrize(
     "strategy_factory, side, expected_result, checks",
     [
-        # hook returns True → result True, fallback attrs untouched
         pytest.param(
             _HookTrueStrategy,
             "LONG",
             True,
-            {"_in_position": _SENTINEL},  # fallback must NOT have run
+            {"_in_position": _SENTINEL},
             id="hook_returns_true",
         ),
-        # hook returns False → result False, fallback attrs untouched (P1 regression)
         pytest.param(
             _HookFalseStrategy,
             "LONG",
             False,
-            {"_in_position": _SENTINEL},  # fallback must NOT have run
+            {"_in_position": _SENTINEL},
             id="hook_returns_false_attrs_untouched",
         ),
-        # hook returns None (base default) + both attrs + LONG → True, position=1
         pytest.param(
             _HookNoneFullStrategy,
             "LONG",
@@ -1099,7 +1091,6 @@ class _NoAttrsStrategy(BaseStrategy):
             {"position": 1, "_in_position": True},
             id="hook_none_full_attrs_LONG",
         ),
-        # hook returns None + both attrs + SHORT → True, position=-1
         pytest.param(
             _HookNoneFullStrategy,
             "SHORT",
@@ -1107,7 +1098,6 @@ class _NoAttrsStrategy(BaseStrategy):
             {"position": -1, "_in_position": True},
             id="hook_none_full_attrs_SHORT",
         ),
-        # hook returns None + both attrs + None → True, position=0
         pytest.param(
             _HookNoneFullStrategy,
             None,
@@ -1115,7 +1105,6 @@ class _NoAttrsStrategy(BaseStrategy):
             {"position": 0, "_in_position": False},
             id="hook_none_full_attrs_flat",
         ),
-        # hook returns None + _in_position only + LONG → False, attr untouched (direction-safety)
         pytest.param(
             _InPositionOnlyStrategy,
             "LONG",
@@ -1123,7 +1112,6 @@ class _NoAttrsStrategy(BaseStrategy):
             {"_in_position": _SENTINEL},
             id="in_position_only_LONG_direction_safety",
         ),
-        # hook returns None + _in_position only + None → True, _in_position=False
         pytest.param(
             _InPositionOnlyStrategy,
             None,
@@ -1131,7 +1119,6 @@ class _NoAttrsStrategy(BaseStrategy):
             {"_in_position": False},
             id="in_position_only_flat",
         ),
-        # hook returns None + no attrs at all + LONG → False
         pytest.param(
             _NoAttrsStrategy,
             "LONG",

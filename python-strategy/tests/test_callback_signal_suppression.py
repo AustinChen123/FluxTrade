@@ -46,7 +46,7 @@ def test_builder_suppresses_before_idempotency_portfolio_and_handler(
     runner.portfolio_coordinator = portfolio
     candle = make_candle()
     runner.on_candle(candle, decision_scope=lambda *_: scope)
-    assert strategy.candles_received == [candle]  # Callback state survives suppression.
+    assert strategy.candles_received == [candle]
     assert identities.call_count == handler.call_count == (0 if suppressed else 1)
     assert len(portfolio.coordinate_candle_decisions.call_args.args[1][0][1]) == (
         0 if suppressed else 1
@@ -74,13 +74,13 @@ def test_applied_scope_is_one_shot_even_after_failure(failure):
     with pytest.raises(DecisionBatchBuildError):
         scope.__exit__(None, None, None)
     with pytest.raises(DecisionBatchBuildError):
-        owner.build()  # Exit before enter cannot manufacture APPLIED.
+        owner.build()
     assert scope.__enter__() == "context"
     with pytest.raises(DecisionBatchBuildError):
         scope.__enter__()
     assert scope.__exit__(type(failure) if failure else None, failure, None) is False
     with pytest.raises(DecisionBatchBuildError):
-        scope.__exit__(None, None, None)  # Failure cannot be rewritten as success.
+        scope.__exit__(None, None, None)
     with pytest.raises(DecisionBatchBuildError):
         scope.__enter__()
     if failure is not None:

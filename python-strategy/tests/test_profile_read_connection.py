@@ -94,7 +94,6 @@ class Text(str):
     ("query", {"sslmode": "require"}), ("query", {"host": "other"}),
 ])
 def test_reject_invalid_exact_url_fields_without_input_in_error(field: str, value: Any) -> None:
-    # _replace preserves deliberately malformed runtime types; URL.create coerces ports.
     invalid = url()._replace(**{field: value})
     with pytest.raises(ConfigError, match="^invalid profile read connection configuration$"):
         Config(invalid)
@@ -265,7 +264,7 @@ def test_session_failure_releases_active_and_preserves_exception(phase: str, mon
     assert caught.value is error and create.call_count == constructor.call_count == 1
     if phase == "body":
         assert session.__exit__.call_args.args[1] is error
-    owner.close()  # No active-count leak, including failed construction/entry.
+    owner.close()
     engine.dispose.assert_called_once()
 
 

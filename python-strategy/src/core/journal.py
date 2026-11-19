@@ -17,8 +17,8 @@ from typing import Any, Dict, List, Optional
 class JournalEntry:
     """Single journal event."""
 
-    timestamp: int  # unix ms
-    tag: str  # e.g. "entry", "sl_hit", "skip", "structure"
+    timestamp: int
+    tag: str
     data: Dict[str, Any]
     trade_id: Optional[str] = None
 
@@ -36,7 +36,6 @@ class StrategyJournal:
         self.strategy_id = strategy_id
         self._entries: List[JournalEntry] = []
 
-    # ── Recording ────────────────────────────────────────────────
 
     def log(
         self,
@@ -56,7 +55,6 @@ class StrategyJournal:
             )
         )
 
-    # ── Querying ─────────────────────────────────────────────────
 
     def entries(
         self,
@@ -86,7 +84,6 @@ class StrategyJournal:
     def __len__(self) -> int:
         return len(self._entries)
 
-    # ── Export ────────────────────────────────────────────────────
 
     def to_jsonl(self) -> str:
         """Export all entries as JSON-lines string."""

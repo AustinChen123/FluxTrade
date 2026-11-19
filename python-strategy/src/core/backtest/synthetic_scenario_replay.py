@@ -1246,7 +1246,6 @@ class _ReplayComposition:
             action["order_id"] = resolved
             self._paid_cancel_attempted_orders.add(resolved)
             self._paid_cancel_pending_orders.add(resolved)
-        # Both causal records are admitted from this exact resolved value.
         targets[0]["target_order_id"] = resolved
         spec["target_order_id"] = resolved
 

@@ -81,22 +81,15 @@ class GoldenCrossStrategy(BaseStrategy):
         """
         df = df.copy()
 
-        # Calculate SMAs
         df["sma_short"] = df["close"].rolling(window=self.short_window).mean()
         df["sma_long"] = df["close"].rolling(window=self.long_window).mean()
 
-        # Identify Bullish condition
         df["bullish"] = df["sma_short"] > df["sma_long"]
 
-        # Identify Crossovers
-        # True if Bullish now AND Not Bullish previously
         df["crossover"] = df["bullish"] & (~df["bullish"].shift(1).fillna(False))
 
-        # Identify Crossunders (Death Cross)
-        # True if Not Bullish now AND Bullish previously
         df["crossunder"] = (~df["bullish"]) & (df["bullish"].shift(1).fillna(False))
 
-        # Generate Signals
         df["signal"] = 0
         df.loc[df["crossover"], "signal"] = 1
         df.loc[df["crossunder"], "signal"] = -1

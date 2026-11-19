@@ -75,14 +75,12 @@ def test_upgrade_creates_both_indexes_with_partial_predicate(
     one must carry the ``WHERE strategy_id IS NOT NULL`` partial predicate."""
     src = migration_source.lower()
 
-    # Candlestick composite index.
     assert "create index if not exists idx_candlestick_product_tf_ts" in src
     assert re.search(
         r"on\s+candlestick\s*\(\s*product_id\s*,\s*timeframe\s*,\s*\"timestamp\"\s+desc\s*\)",
         src,
     )
 
-    # backtest_trade_log partial index.
     assert "create index if not exists idx_backtest_trade_log_strategy" in src
     assert re.search(
         r"on\s+backtest_trade_log\s*\(\s*strategy_id\s*,\s*\"timestamp\"\s+desc\s*\)",
@@ -116,6 +114,4 @@ def test_orm_columns_referenced_by_migration_exist() -> None:
         f"BacktestTradeLog missing expected columns: {btl_cols}"
     )
 
-    # The partial-index predicate ``WHERE strategy_id IS NOT NULL`` only
-    # makes sense if strategy_id is nullable.
     assert BacktestTradeLog.__table__.c.strategy_id.nullable is True

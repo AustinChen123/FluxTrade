@@ -15,9 +15,6 @@ from src.core.jsonb_helpers import (
 )
 
 
-# ---------------------------------------------------------------------------
-# decimal_to_jsonb_str
-# ---------------------------------------------------------------------------
 
 
 def test_decimal_to_jsonb_str_positive():
@@ -25,8 +22,6 @@ def test_decimal_to_jsonb_str_positive():
 
 
 def test_decimal_to_jsonb_str_negative():
-    # Decimal.__str__ may use scientific notation for very small/large values;
-    # what matters is lossless round-trip, not the textual form.
     original = Decimal("-0.00000001")
     serialized = decimal_to_jsonb_str(original)
     assert Decimal(serialized) == original
@@ -38,13 +33,11 @@ def test_decimal_to_jsonb_str_zero():
 
 
 def test_decimal_to_jsonb_str_high_precision():
-    # 28-digit precision, default Decimal context
     high = Decimal("1.2345678901234567890123456789")
     assert decimal_to_jsonb_str(high) == "1.2345678901234567890123456789"
 
 
 def test_decimal_to_jsonb_str_scientific_input():
-    # Decimal preserves whatever notation it's constructed with
     assert decimal_to_jsonb_str(Decimal("1E+10")) == "1E+10"
 
 
@@ -58,9 +51,6 @@ def test_decimal_to_jsonb_str_rejects_float():
         decimal_to_jsonb_str(123.456)  # type: ignore[arg-type]
 
 
-# ---------------------------------------------------------------------------
-# jsonb_to_decimal
-# ---------------------------------------------------------------------------
 
 
 def test_jsonb_to_decimal_none():
@@ -90,9 +80,6 @@ def test_jsonb_to_decimal_rejects_non_string():
         jsonb_to_decimal(123)  # type: ignore[arg-type]
 
 
-# ---------------------------------------------------------------------------
-# serialize_payload_with_decimals
-# ---------------------------------------------------------------------------
 
 
 def test_serialize_flat_dict():
@@ -127,7 +114,7 @@ def test_serialize_preserves_non_decimal_types():
     payload = {
         "active": True,
         "count": 7,
-        "ratio": 0.5,  # float allowed in non-monetary context
+        "ratio": 0.5,
         "name": "alpha",
         "missing": None,
         "amount": Decimal("9.99"),
@@ -153,9 +140,6 @@ def test_serialize_rejects_non_dict():
         serialize_payload_with_decimals([Decimal("1")])  # type: ignore[arg-type]
 
 
-# ---------------------------------------------------------------------------
-# deserialize_payload_with_decimals
-# ---------------------------------------------------------------------------
 
 
 def test_deserialize_targeted_keys():
@@ -168,7 +152,7 @@ def test_deserialize_skips_unspecified_keys():
     payload = {"price": "100.5", "note": "1.23"}
     result = deserialize_payload_with_decimals(payload, {"price"})
     assert result["price"] == Decimal("100.5")
-    assert result["note"] == "1.23"  # untouched, still str
+    assert result["note"] == "1.23"
 
 
 def test_deserialize_nested_keys():
@@ -196,9 +180,6 @@ def test_deserialize_rejects_non_dict():
         deserialize_payload_with_decimals(["100"], {"price"})  # type: ignore[arg-type]
 
 
-# ---------------------------------------------------------------------------
-# Round-trip
-# ---------------------------------------------------------------------------
 
 
 def test_round_trip_preserves_high_precision():
@@ -214,5 +195,4 @@ def test_round_trip_preserves_high_precision():
     assert restored["price"] == original["price"]
     assert restored["fees"]["maker"] == original["fees"]["maker"]
     assert restored["fees"]["taker"] == original["fees"]["taker"]
-    # history not in decimal_keys → remains strings
     assert restored["history"] == ["1", "2.5"]

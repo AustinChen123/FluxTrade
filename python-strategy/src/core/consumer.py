@@ -19,7 +19,6 @@ from src.core.redis_factory import create_redis_client
 from src.core.metrics import CONSUMER_LAG_MS
 from src.core.runtime_environment import RuntimeEnvironment
 
-# Load env
 load_dotenv(os.path.join(os.path.dirname(__file__), '../../../.env'))
 
 logger = logging.getLogger(__name__)
@@ -340,7 +339,6 @@ class DataConsumer:
             try:
                 self._assert_ownership()
                 self._consume_loop()
-                # _consume_loop exits cleanly when self.running is False
                 break
             except KeyboardInterrupt:
                 self.request_stop()
@@ -349,9 +347,6 @@ class DataConsumer:
                 logger.critical("Market stream ownership lost: %s", e)
                 raise
             except MarketStreamPendingError as e:
-                # Keep the process alive but stop reading newer entries. An
-                # operator/recovery workflow may resolve the pending delivery;
-                # the next loop rechecks the group before consumption resumes.
                 self._initialized_channels.clear()
                 stage = getattr(e, "_diagnostic_stage", "pending_delivery")
                 if stage not in {
@@ -756,9 +751,6 @@ class DataConsumer:
             self._assert_ownership()
             self._ensure_no_quarantined_delivery()
             self._load_durable_stream_gate()
-            # A stream remains a global submission gate even if the dynamic
-            # strategy set no longer subscribes to it. Resolve every delivery
-            # with an uncertain outcome before reading any newer market data.
             if self._blocked_streams:
                 self._ensure_no_abandoned_pending(sorted(self._blocked_streams))
             channels = self._current_channels()
@@ -766,18 +758,12 @@ class DataConsumer:
                 time.sleep(0.1)
                 continue
             self._ensure_consumer_groups(channels)
-            # Redis applies COUNT per stream. Poll exactly one stream so this
-            # process can never claim a second delivery before the first one
-            # reaches an ACK-safe outcome.
             stream_key = channels[self._next_channel_index % len(channels)]
             self._next_channel_index = (self._next_channel_index + 1) % len(channels)
             self._register_stream_before_read(stream_key)
             try:
                 response = self._read_next_owned_message(stream_key)
             except (ConnectionError, OSError, RedisError):
-                # The server may have claimed a delivery even if its response
-                # never reached this process. The next loop must inspect this
-                # stream's PEL before any other stream can advance.
                 self._blocked_streams.add(stream_key)
                 raise
 
@@ -790,7 +776,6 @@ class DataConsumer:
                     continue
                 self._blocked_streams.add(stream_key)
 
-                # Record delivery lag without changing ordered delivery.
                 last_msg_id, _ = messages[-1]
                 last_msg_ts = int(last_msg_id.split('-')[0])
                 t = cast(tuple[int, int], self.redis_client.time())
@@ -813,8 +798,6 @@ class DataConsumer:
                         setattr(pending_error, "_diagnostic_stage", "market_delivery")
                         raise pending_error from exc
                     self._assert_ownership()
-                    # Remember callback completion across a Redis reconnect.
-                    # This process may retry only the ACK, never the callback.
                     self._completed_pending.add((stream_key, message_id))
                     self._ack_message(stream_key, message_id)
                     self._completed_pending.discard((stream_key, message_id))
@@ -860,8 +843,6 @@ class DataConsumer:
                     "repeat_count": repeat_count,
                 }
 
-            # The JSON is part of the message so it survives the production
-            # ProcessorFormatter, which does not add arbitrary LogRecord extras.
             logger.error(
                 "consumer_callback_failure %s",
                 json.dumps(
@@ -878,8 +859,6 @@ class DataConsumer:
                 ),
             )
         except Exception:
-            # Diagnostics are observational only; callback and ACK semantics
-            # remain authoritative even if time, formatting, or logging fails.
             return
 
     def _reset_callback_failure_diagnostic(self) -> None:

@@ -344,7 +344,6 @@ class StrategyEngine:
             self._db_session_factory,
         )
 
-        # Initialize Services
         self.account_service = account_service if account_service else AccountService()
         self.risk_manager = RiskManager(
             self.account_service,
@@ -355,8 +354,6 @@ class StrategyEngine:
             ),
         )
 
-        # Live adapters are composed by the service entrypoint. Keep the local
-        # simulated default for library and backtest callers.
         effective_adapter_config = adapter_config or {"mode": "simulated"}
         configured_balance_asset = effective_adapter_config.get("balance_asset")
         if configured_balance_asset is not None and (
@@ -690,7 +687,6 @@ class StrategyEngine:
             ),
         )
 
-        # System State & Heartbeat
         self._health_monitor.redis_client = self.redis_client
         self.running = True
         self._kill_switch_halted = False
@@ -889,8 +885,6 @@ class StrategyEngine:
             return result
 
         self.notification_dispatcher.start()
-        # Start fail-closed so the command listener can accept a manual clear
-        # while startup waits on a persisted LOCKDOWN state.
         run_phase(self._halt_for_kill_switch)
         run_phase(self._start_command_listener)
 
@@ -953,7 +947,6 @@ class StrategyEngine:
         if self._runtime_reconciliation_enabled:
             run_phase(self._start_runtime_reconciliation)
 
-        # Initial scan to discover strategies
         run_phase(self.scan_strategies)
         run_phase(self._restore_active_strategies_on_startup)
 

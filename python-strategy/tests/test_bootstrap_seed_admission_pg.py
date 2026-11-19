@@ -48,7 +48,6 @@ def test_distinct_backends_lineage_pool_hold_and_second_connection_pin(
         with store.initial_admission(value.key):
             holder_pid = locks[-1]
             checkpoint = len(checkins)
-            # Explicitly reserve the competing physical backend through release.
             with engine.connect() as competitor_connection:
                 contender = BootstrapSeedStore(sessionmaker(competitor_connection))
                 earlier = replace(seed(count=1), key=value.key, max_seed_candles=10)
@@ -72,8 +71,6 @@ def test_distinct_backends_lineage_pool_hold_and_second_connection_pin(
                     assert locks[-1] == competitor_pid
                     assert holder_pid not in checkins[checkpoint:]
 
-                # Pin is deliberately a non-admission writer. The lock does not
-                # block raw writers; future startup callers must cooperate.
                 result = store.pin_confirmed(value)
                 assert result.status is BootstrapSeedPinStatus.CONFIRMED
                 assert result.record is not None
@@ -114,8 +111,6 @@ def test_release_allows_other_reserved_backend_after_every_body_exit(
 
     event.listen(engine, "after_cursor_execute", capture)
     try:
-        # Reserve one connection before holder acquisition so pool reuse cannot
-        # make the release assertion pass via reentrant locking on the holder.
         with engine.connect() as other_connection:
             contender = BootstrapSeedStore(sessionmaker(other_connection))
             error = error_type("body failure") if error_type is not None else None

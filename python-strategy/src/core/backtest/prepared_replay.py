@@ -28,7 +28,6 @@ from src.core.precision import PrecisionCodec, PrecisionSpec
 from src.core.product_registry import validate_product_id
 
 
-# Bump whenever the artifact layout or Rust aggregation semantics change.
 _CONTRACT_VERSION = 1
 _EXECUTION_WIDTH = 6
 _DECISION_WIDTH = 7
@@ -562,8 +561,6 @@ def _decision_candle(
     spec: PreparedReplaySpec,
     codec: PrecisionCodec,
 ) -> Candlestick:
-    # The artifact contract already validates product, timeframe, timestamps,
-    # precision, and OHLCV invariants before any event can be iterated.
     return Candlestick.model_construct(
         product_id=spec.product_id,
         timeframe=spec.decision_timeframe,

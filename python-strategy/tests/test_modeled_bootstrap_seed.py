@@ -167,7 +167,6 @@ def test_full_preflight_including_late_invalid_has_zero_provider_calls(damage):
 def test_exact_lookback_domain_before_resolve(lookback):
     data = setup()
     requirements = replace(data[2], lookback_window=lookback)
-    # True equals len=1: only exact-integer validation may reject this valid window.
     with pytest.raises(ModeledProfileInputError):
         build(data, requirements=requirements, candles=data[3][-1:])
     data[5].context_for.assert_not_called()

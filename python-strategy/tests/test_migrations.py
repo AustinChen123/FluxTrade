@@ -58,8 +58,6 @@ from src.core.market_data.profiles.read_repository import ProfileReadRepository,
 from src.core.market_data.profiles.read_types import DailyProfileRef, OrderedProfileManifest
 from src.core.market_data.profiles.types import ProfileBin, VolumeProfileContent
 
-# Alembic is imported lazily inside tests so that import-time failures do not
-# break collection on environments where alembic is missing.
 ALEMBIC_INI = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "..", "database", "alembic.ini")
 )
@@ -74,13 +72,9 @@ if os.getenv("FLUXTRADE_RUN_POSTGRES_MIGRATION_TESTS") != "1":
     )
 
 
-# --------------------------------------------------------------------------- #
-# Connection helpers
-# --------------------------------------------------------------------------- #
 
 
 def _admin_url() -> str:
-    # Connect to the maintenance ``postgres`` database for CREATE/DROP DATABASE.
     return _target_url("postgres")
 
 
@@ -106,9 +100,6 @@ def _pg_reachable() -> bool:
         return False
 
 
-# --------------------------------------------------------------------------- #
-# Explicitly enabled connectivity gate
-# --------------------------------------------------------------------------- #
 
 
 if not _pg_reachable():  # pragma: no cover - environment dependent
@@ -117,9 +108,6 @@ if not _pg_reachable():  # pragma: no cover - environment dependent
     )
 
 
-# --------------------------------------------------------------------------- #
-# Fixtures
-# --------------------------------------------------------------------------- #
 
 
 @pytest.fixture()
@@ -139,7 +127,6 @@ def fresh_pg_db() -> Iterator[str]:
     finally:
         admin = sa.create_engine(_admin_url(), isolation_level="AUTOCOMMIT")
         with admin.connect() as conn:
-            # Terminate any lingering connections from alembic before dropping.
             conn.execute(
                 text(
                     "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
@@ -156,8 +143,6 @@ def _alembic_config(db_name: str):
     from alembic.config import Config
 
     cfg = Config(ALEMBIC_INI)
-    # ``script_location`` in alembic.ini uses %(here)s, which Alembic resolves
-    # against the .ini file's directory — no extra fix-up needed.
     cfg.set_main_option("sqlalchemy.url", _target_url(db_name).replace("%", "%%"))
     cfg.attributes["expected_isolated_database"] = db_name
     return cfg
@@ -461,7 +446,6 @@ def test_profile_reader_pg_guarded_header_stops_before_payload(profile_repositor
             conn.execute(text("UPDATE volume_profile_snapshot SET source_manifest=CAST(:value AS jsonb) WHERE id=:id"),
                          {"id": result.snapshot_id, "value": json.dumps({"large": "x" * 131072})})
         else:
-            # Current snapshot schema permits these timestamps; the reader must guard driver conversion.
             assert damage in ("computed_at", "published_at", "source_available_at")
             conn.execute(text(f"UPDATE volume_profile_snapshot SET {damage}='10000-01-01 00:00:00+00'::timestamptz WHERE id=:id"),
                          {"id": result.snapshot_id})
@@ -498,7 +482,6 @@ def test_profile_reader_pg_repeatable_read_excludes_mid_read_invalidation(
         with cursor.connection.cursor() as probe:
             probe.execute("SELECT current_setting('transaction_isolation'),current_setting('transaction_read_only'),current_setting('TimeZone')")
             settings.append(probe.fetchone())
-        # Independent writer commit completes synchronously before the reader fetches its payload.
         with profile_repository_pg.begin() as writer:
             writer.execute(text("INSERT INTO market_data_invalidation(event_id,snapshot_id,reason_code,source) "
                                 "VALUES ('mid_read',:id,'BAD_DATA','acceptance')"), {"id": target})
@@ -540,7 +523,6 @@ def test_profile_reader_pg_connection_settings_read_only_and_new_call_recovery(p
                     "current_setting('TimeZone'),current_setting('lock_timeout'),current_setting('statement_timeout')")).one()
                 assert settings == ("repeatable read", "on", "UTC", "250ms", "1500ms")
                 driver: Any = session.connection().connection.driver_connection
-                # Inspect only the timeout field; never retain or print the complete DSN.
                 assert driver.get_dsn_parameters()["connect_timeout"] == "2"
                 session.execute(text("INSERT INTO market_data_invalidation(event_id,snapshot_id,reason_code,source) "
                                      "VALUES ('readonly_probe',:id,'BAD_DATA','acceptance')"), {"id": published.snapshot_id})
@@ -550,7 +532,6 @@ def test_profile_reader_pg_connection_settings_read_only_and_new_call_recovery(p
 
 
 def test_profile_reader_pg_pool_saturation_and_fresh_session_recovery(profile_repository_pg: Engine, fresh_pg_db: str) -> None:
-    # The migrated fixture owns the isolated database; the tested pool is independent.
     assert profile_repository_pg is not None
     owner = ProfileReadConnection(ProfileReadConnectionConfig(make_url(_target_url(fresh_pg_db))))
     try:
@@ -563,7 +544,7 @@ def test_profile_reader_pg_pool_saturation_and_fresh_session_recovery(profile_re
                 with owner.sessions() as third:
                     third.execute(text("SELECT pg_backend_pid()"))
             assert type(caught.value) is PoolTimeoutError
-            assert 0.15 <= time.monotonic() - started < 5  # Pool wait only, not an E2E SLA.
+            assert 0.15 <= time.monotonic() - started < 5
         with owner.sessions() as fresh:
             assert fresh.execute(text("SELECT pg_backend_pid()")).scalar_one() in (first_pid, second_pid)
     finally:
@@ -596,7 +577,7 @@ def test_profile_reader_pg_lock_timeout_no_retry_then_new_public_call(profile_re
                     holder.rollback()
         finally:
             event.remove(engine, "before_cursor_execute", capture)
-        recovered = reader.get_verified(published.snapshot_id)  # Explicit new call, not automatic retry.
+        recovered = reader.get_verified(published.snapshot_id)
         assert recovered is not None and recovered.publication == value
 
 
@@ -604,14 +585,14 @@ def test_profile_reader_pg_statement_timeout_then_new_public_call(profile_reposi
     value = _publication_pg()
     published = profile_repository.ProfileRepository(sessionmaker(profile_repository_pg)).publish(value)
     with _profile_reader_pg(fresh_pg_db) as (reader, _):
-        started: float | None = None  # Duration measurement only; no financial arithmetic.
+        started: float | None = None
         with pytest.raises(DBAPIError) as caught:
             with reader._transaction() as session:
                 started = time.monotonic()
                 session.execute(text("SELECT pg_sleep(2)"))
         assert getattr(caught.value.orig, "pgcode", None) == "57014"
         assert started is not None
-        assert 1.2 <= time.monotonic() - started < 5  # Statement cancellation, not an E2E SLA.
+        assert 1.2 <= time.monotonic() - started < 5
         recovered = reader.get_verified(published.snapshot_id)
         assert recovered is not None and recovered.publication == value
 
@@ -657,7 +638,6 @@ def test_profile_repository_isolation_override_and_concurrent_convergence(
     def inspect_isolation(conn: sa.Connection, cursor: Any, statement: str,
                           parameters: Any, context: Any, executemany: bool) -> None:
         if "pg_advisory_xact_lock" in statement:
-            # Same DBAPI connection and current transaction, before lock execution.
             with cursor.connection.cursor() as probe:
                 probe.execute("SHOW transaction_isolation")
                 observed.append(probe.fetchone()[0])
@@ -913,7 +893,6 @@ def test_completed_job_restart_recovery_rejects_invalid_evidence(profile_reposit
             elif damage == "bin":
                 conn.execute(text("UPDATE volume_profile_bin SET base_volume=base_volume+1 WHERE bin_index=-2"))
             elif damage == "missing":
-                # Schema permits staging-only DONE; publication recovery requires a snapshot.
                 conn.execute(text("UPDATE volume_profile_ingest_job SET completed_snapshot_id=NULL"))
             else:
                 conn.execute(text("UPDATE volume_profile_snapshot SET quality='PARTIAL', published_at=NULL"))
@@ -1282,7 +1261,7 @@ def test_retention_cas_exact_readback_idempotency_and_commit_recovery(profile_re
     def lost_ack() -> Iterator[Session]:
         with Session(engine) as session:
             yield session
-            raise failure  # Inner transaction already committed.
+            raise failure
 
     if ack_unknown:
         with pytest.raises(DBAPIError) as caught:
@@ -1319,7 +1298,6 @@ def test_retention_rejects_corruption_without_mutating(profile_repository_pg: En
                 if damage == "non_done_without_snapshot":
                     conn.execute(text("DELETE FROM volume_profile_snapshot"))
             elif damage == "done_null_snapshot":
-                # Schema permits NULL for staged DONE jobs; this recovery requires a published snapshot.
                 conn.execute(text("UPDATE volume_profile_ingest_job SET completed_snapshot_id=NULL"))
             elif damage == "done_zero_attempt":
                 conn.execute(text("UPDATE volume_profile_ingest_job SET attempt=0"))
@@ -1459,7 +1437,6 @@ def test_atomic_profile_commit_ack_unknown_recovers_exact_committed_result(profi
     def ack_unknown() -> Iterator[Session]:
         with Session(engine) as session:
             yield session
-            # The owner's inner session.begin() has already committed successfully.
             raise failure
 
     with pytest.raises(DBAPIError) as caught:
@@ -1589,9 +1566,6 @@ def _downgrade(db_name: str, target: str = "base") -> None:
     command.downgrade(_alembic_config(db_name), target)
 
 
-# --------------------------------------------------------------------------- #
-# Schema introspection helpers
-# --------------------------------------------------------------------------- #
 
 
 def _table_names(engine: Engine) -> set[str]:
@@ -1713,9 +1687,6 @@ def _schema_fingerprint(engine: Engine) -> tuple:
     return tuple(fp)
 
 
-# --------------------------------------------------------------------------- #
-# Tests
-# --------------------------------------------------------------------------- #
 
 
 def _activation_request_row(engine: Engine):
@@ -1777,7 +1748,6 @@ def test_profile_activation_request_lifecycle_pg(
         {"status": "PENDING"},
         {"status": terminal, "terminal_at": stamp, "terminal_reason": "DONE"},
     ]
-    # Every immutable field is challenged during an otherwise valid transition.
     for name, changed in {
         "request_id": "f" * 64,
         "environment": "other",
@@ -1902,7 +1872,6 @@ def test_profile_activation_request_constraints_pg(
     with pytest.raises(DBAPIError) as caught, engine.begin() as conn:
         conn.execute(table.insert().values(**{**row, "strategy_id": "absent"}))
     assert cast(Any, caught.value.orig).pgcode == "23503"
-    # Exact byte/version/reason boundaries remain accepted (rolled back per case).
     for changes in (
         {"canonical_payload": b"x" * 65536, "expected_state_version": 2147483647},
         {**terminal, "terminal_reason": "A" * 128},
@@ -2252,7 +2221,6 @@ def test_terminal_schema_contract_and_guards(profile_repository_pg: Engine) -> N
                          ("recorded_at", sa.cast("infinity", sa.DateTime(timezone=True)))):
         with pytest.raises(DBAPIError), engine.begin() as conn:
             conn.execute(header.insert().values(**{**base, field: value}))
-    # SQL resource boundaries are independent of codec completeness: later helper validates payload claims.
     for changes in ({"participant_count": 256}, {"canonical_payload": empty.canonical_bytes + b" " * (1048576 - len(empty.canonical_bytes))}):
         with engine.connect() as conn:
             tx = conn.begin()
@@ -2440,7 +2408,6 @@ def test_live_application_terminal_atomic_pg(profile_repository_pg: Engine, monk
     failure = RuntimeError("injected before final commit")
     def append(db, value):
         result = original(db, value)
-        # A different connection cannot see any member before caller commit.
         with engine.connect() as probe:
             for table in ("market_data_application", "market_data_decision_batch", "market_data_decision_outcome"):
                 assert probe.execute(text(f"SELECT count(*) FROM {table}")).scalar_one() == 0
@@ -2470,8 +2437,6 @@ def test_live_application_terminal_atomic_pg(profile_repository_pg: Engine, monk
             assert conn.execute(text(f"SELECT count(*) FROM {table}")).scalar_one() == int(not fail)
 
 
-# Selected non-legacy tables that must exist at HEAD and be gone
-# after a full downgrade to ``base``.
 HEAD_ONLY_TABLES = {
     "strategy_profile_activation_request",
     "market_data_bootstrap_seed",
@@ -2490,7 +2455,6 @@ HEAD_ONLY_TABLES = {
     "spider_control_receipt",
 }
 
-# Pre-existing tables (created by revs 1–4) that must remain at every stage.
 LEGACY_TABLES = {
     "exchange",
     "product",
@@ -2517,7 +2481,6 @@ def test_full_upgrade_to_head(fresh_pg_db: str) -> None:
             "barrier_sequence", "outcome",
         } <= _column_names(engine, "spider_control_receipt")
 
-        # ``order`` must carry idempotency, audit, and account identity columns.
         order_cols = _column_names(engine, "order")
         for col in (
             "client_order_id",
@@ -2530,7 +2493,6 @@ def test_full_upgrade_to_head(fresh_pg_db: str) -> None:
         ):
             assert col in order_cols, f"order.{col} missing after upgrade"
 
-        # ``signal_audit`` must carry the 4 new payload/relation columns.
         sa_cols = _column_names(engine, "signal_audit")
         for col in (
             "client_order_id",
@@ -2540,7 +2502,6 @@ def test_full_upgrade_to_head(fresh_pg_db: str) -> None:
         ):
             assert col in sa_cols, f"signal_audit.{col} missing after upgrade"
 
-        # ``strategy_state`` must gain the 5 new error/version columns.
         ss_cols = _column_names(engine, "strategy_state")
         for col in (
             "last_error_message",
@@ -2551,7 +2512,6 @@ def test_full_upgrade_to_head(fresh_pg_db: str) -> None:
         ):
             assert col in ss_cols, f"strategy_state.{col} missing after upgrade"
 
-        # Account-scoped and legacy partial unique order indexes.
         order_idx = _index_names(engine, "order")
         assert {
             "uq_order_identified_client_order_id",
@@ -2563,11 +2523,9 @@ def test_full_upgrade_to_head(fresh_pg_db: str) -> None:
         assert "idx_order_client_order_id" in order_idx
         assert "idx_order_strategy_status" in order_idx
 
-        # Partial unique champion-per-strategy index.
         gene_idx = _index_names(engine, "gene_records")
         assert "uq_one_champion_per_strategy" in gene_idx
 
-        # CHECK constraints landed by revs 5–7.
         assert "chk_system_events_type" in _check_constraint_names(
             engine, "system_events"
         )
@@ -2592,7 +2550,6 @@ def test_sample_data_insertion_after_upgrade(fresh_pg_db: str) -> None:
     engine = sa.create_engine(_target_url(fresh_pg_db))
     try:
         with engine.begin() as conn:
-            # FK pre-requisites.
             conn.execute(
                 text("INSERT INTO exchange (id, name) VALUES ('binance', 'Binance')")
             )
@@ -2652,7 +2609,6 @@ def test_sample_data_insertion_after_upgrade(fresh_pg_db: str) -> None:
                 )
             )
 
-            # Positive system_events insert.
             conn.execute(
                 text(
                     "INSERT INTO system_events (event_type, payload) "
@@ -2660,7 +2616,6 @@ def test_sample_data_insertion_after_upgrade(fresh_pg_db: str) -> None:
                 )
             )
 
-        # Negative CHECK: invalid event_type must be rejected.
         with pytest.raises(IntegrityError):
             with engine.begin() as conn:
                 conn.execute(
@@ -2724,7 +2679,6 @@ def test_sample_data_insertion_after_upgrade(fresh_pg_db: str) -> None:
                     )
                 )
 
-        # Negative CHECK: daily_nav_snapshots.source must be in whitelist.
         with pytest.raises(IntegrityError):
             with engine.begin() as conn:
                 conn.execute(
@@ -2735,7 +2689,6 @@ def test_sample_data_insertion_after_upgrade(fresh_pg_db: str) -> None:
                     )
                 )
 
-        # Positive nav snapshot insert (default source = 'eod_snapshot').
         with engine.begin() as conn:
             conn.execute(
                 text(
@@ -2745,7 +2698,6 @@ def test_sample_data_insertion_after_upgrade(fresh_pg_db: str) -> None:
                 )
             )
 
-        # Evolution epoch + gene records (champion uniqueness).
         with engine.begin() as conn:
             conn.execute(
                 text(
@@ -2771,7 +2723,6 @@ def test_sample_data_insertion_after_upgrade(fresh_pg_db: str) -> None:
                 )
             )
 
-        # Negative CHECK: invalid gene role.
         with pytest.raises(IntegrityError):
             with engine.begin() as conn:
                 conn.execute(
@@ -2787,7 +2738,6 @@ def test_sample_data_insertion_after_upgrade(fresh_pg_db: str) -> None:
                     )
                 )
 
-        # Partial unique: a second champion for the same strategy must fail.
         with pytest.raises(IntegrityError):
             with engine.begin() as conn:
                 conn.execute(
@@ -2803,7 +2753,6 @@ def test_sample_data_insertion_after_upgrade(fresh_pg_db: str) -> None:
                     )
                 )
 
-        # ...but a challenger alongside the champion is allowed.
         with engine.begin() as conn:
             conn.execute(
                 text(
@@ -2817,7 +2766,6 @@ def test_sample_data_insertion_after_upgrade(fresh_pg_db: str) -> None:
                 )
             )
 
-        # Read-back sanity: rows are visible.
         with engine.begin() as conn:
             n_events = conn.execute(
                 text("SELECT COUNT(*) FROM system_events")
@@ -2839,11 +2787,7 @@ def test_full_downgrade_to_base(fresh_pg_db: str) -> None:
     engine = sa.create_engine(_target_url(fresh_pg_db))
     try:
         tables = _table_names(engine)
-        # All selected non-legacy tables are gone.
         assert HEAD_ONLY_TABLES.isdisjoint(tables), "HEAD tables remain after downgrade"
-        # And the original revs 1–4 tables are also gone (full downgrade).
-        # alembic_version may or may not remain depending on Alembic version;
-        # exclude it from comparison.
         residual = tables - {"alembic_version"}
         assert residual == set(), (
             f"Unexpected residual tables after full downgrade: {residual}"

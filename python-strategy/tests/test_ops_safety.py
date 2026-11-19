@@ -40,9 +40,6 @@ from src.core.orm_models import Exchange, Order, Product, Strategy
 from src.core.repositories import LiveOrderRepository
 
 
-# =============================================================================
-# Helpers / fakes
-# =============================================================================
 
 PRODUCT_ID = "BINANCE:BTCUSDT-PERP"
 STRATEGY_ID = "strat_alpha"
@@ -155,7 +152,6 @@ class _FakeOrderManager:
         self._orders_by_status = orders_by_status
         self.failed_orders: list[tuple[Order, str]] = []
 
-        # Build flat orders list for repo.list_orders_by_statuses
         all_orders: list[Order] = []
         for orders in orders_by_status.values():
             all_orders.extend(orders)
@@ -247,9 +243,6 @@ class FailingEnumerationScopedPositionAdapter(FakeExchangePositionAdapter):
         return self._scoped_result
 
 
-# =============================================================================
-# A. OpsSafetyService.kill_switch tests
-# =============================================================================
 
 
 class TestKillSwitchIdempotency:
@@ -504,7 +497,6 @@ class TestKillSwitchCancelScope:
 
         service.kill_switch(actor="ops")
 
-        # fail_order must be called, cancel_order must NOT be called for NEW
         failed_ids = [o.id for o, _ in engine.order_manager.failed_orders]
         assert "o-new" in failed_ids
         assert all(c != ("cancel_order", "o-new") for c in engine.calls)
@@ -710,7 +702,6 @@ class TestKillSwitchCancelFailureIsolation:
         service, engine, _ = _make_service(orders=[order], positions=[pos])
         engine.cancel_order = lambda oid: (_ for _ in ()).throw(RuntimeError("boom"))  # type: ignore[assignment]
 
-        # Monkeypatch so cancel raises but flatten is a proper recording
         flatten_calls: list = []
         engine.flatten_position = (
             lambda sid, pid, side, qty: flatten_calls.append((sid, pid)) or "flat-id"
@@ -946,9 +937,6 @@ class TestKillSwitchFlattenPositions:
         )
 
 
-# =============================================================================
-# B. ExecutionEngine.flatten_position tests
-# =============================================================================
 
 
 class TestFlattenPosition:
@@ -969,16 +957,13 @@ class TestFlattenPosition:
         """LONG position → BUY order on adapter (sell direction), type=market."""
         result = eng.flatten_position(STRATEGY_ID, PRODUCT_ID, "LONG", Decimal("2.5"))
 
-        # Must return an order id (non-None)
         assert result is not None
 
-        # Adapter must have received exactly one order
         placed = (
             mock_exchange_adapter.filled_orders or mock_exchange_adapter.open_orders
         )
         assert len(placed) >= 1
 
-        # The placed order must be a market SELL (flatten LONG = sell)
         placed_order = (
             mock_exchange_adapter.open_orders + mock_exchange_adapter.filled_orders
         )[-1]
@@ -989,7 +974,6 @@ class TestFlattenPosition:
         )
         assert order_obj is not None
         assert order_obj.type == "market"
-        # Side convention: flatten LONG → place SELL (buy/sell convention from adapter boundary)
         assert order_obj.side.lower() in ("sell", "short")
 
     def test_short_position_places_buy_market_order(self, eng, mock_exchange_adapter):
@@ -1375,9 +1359,6 @@ class TestKillSwitchHalting:
         engine.execution_engine.execute_signal.assert_not_called()
 
 
-# =============================================================================
-# C. StrategyEngine._handle_command — KILL_SWITCH routing
-# =============================================================================
 
 
 class TestEngineKillSwitchCommand:
@@ -1522,9 +1503,6 @@ class TestEngineKillSwitchCommand:
         engine._command_router.handle.assert_called_once_with(data)
 
 
-# =============================================================================
-# D. Fix 1 — _positions() local fetch failure isolation
-# =============================================================================
 
 
 class FakeFailingAccountService:
@@ -1662,14 +1640,9 @@ class TestLocalFetchFailureIsolation:
 @pytest.mark.parametrize(
     "local_ok, adapter_has_enum, expected_flattened, expect_local_error_entry",
     [
-        # local ok + adapter has get_all_positions → attributed flatten, no local error entry
         (True, True, 1, False),
-        # local ok + no adapter → uses local positions, no local error entry
         (True, False, 1, False),
-        # local error + adapter has get_all_positions → adapter flatten, local_error entry
         (False, True, 1, True),
-        # local error + no adapter → no flatten, failure recorded, no "local_positions_unavailable" entry
-        #   (the re-raised exc is caught as a generic enumeration failure)
         (False, False, 0, False),
     ],
     ids=["ok/enum", "ok/none", "error/enum", "error/none"],
@@ -1687,7 +1660,6 @@ def test_positions_fetch_matrix(
     if adapter_has_enum:
         adapter: object = FakeExchangePositionAdapter(positions=[exchange_pos])
     else:
-        # No adapter attached — positions come from local only (or fail entirely)
         adapter = None
 
     if local_ok:
@@ -1731,9 +1703,6 @@ def test_positions_fetch_matrix(
         )
 
 
-# =============================================================================
-# E. Fix 2 — Submission drain gate
-# =============================================================================
 
 
 class BlockingAdapter:
@@ -2168,7 +2137,6 @@ class TestSubmissionDrainGate:
         repo = repo_eng.order_manager.repo
         assert isinstance(repo, MockOrderRepository)
 
-        # Pre-populate repo with a submitted order as if a previous execute_signal ran.
         submitted_order = _make_order("submitted-001", OrderStatus.SUBMITTED.value)
         repo.orders[submitted_order.id] = submitted_order
 
@@ -2177,7 +2145,6 @@ class TestSubmissionDrainGate:
             repo_eng, fake_account, _make_null_db_session_factory(), drain_timeout=5.0
         )
 
-        # Patch cancel_order on the engine (it's called by kill_switch for SUBMITTED orders).
         cancelled: list[str] = []
 
         def fake_cancel(order_id: str) -> bool:

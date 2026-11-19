@@ -16,7 +16,6 @@ from test_profile_decision_context import item, DAY
 
 
 def test_merge_identity_propagates_without_changing_legacy_evidence(monkeypatch):
-    # Identity propagation only; this does not implement or validate a v2 merge.
     decision = item()
     assert decision.profile is not None
     collection = StrategyMarketDataContext(DAY + 3, (decision,))
@@ -115,7 +114,7 @@ def test_nested_change_affects_snapshot_and_hash_without_context_time_restrictio
     second = replace(first, observed_at_ms=DAY + 3)
     a = replace(context(), market_data=StrategyMarketDataContext(DAY + 3, (first,)))
     b = replace(a, market_data=StrategyMarketDataContext(DAY + 3, (second,)))
-    assert a.timestamp == 1  # Collection time need not equal the account context time.
+    assert a.timestamp == 1
     left, right = canonical_decision_snapshot(a), canonical_decision_snapshot(b)
     assert left != right
     assert configuration_sha256(left) != configuration_sha256(right)

@@ -19,7 +19,6 @@ from src.core.models import Candlestick, Signal, SignalType
 from src.core.strategy_context import StrategyContext
 from integration.conftest import PRODUCT_ID, TIMEFRAME, make_candle, make_candle_series
 
-# Skip if Rust .so is not available
 try:
     import fluxtrade_core  # noqa: F401
 
@@ -33,9 +32,6 @@ pytestmark = [
 ]
 
 
-# ---------------------------------------------------------------------------
-# Test strategy that generates predictable signals
-# ---------------------------------------------------------------------------
 class AlwaysLongStrategy(BaseStrategy):
     """Opens a LONG on every 10th candle, exits on every 20th."""
 
@@ -165,9 +161,6 @@ class ContextDrivenRoundTripStrategy(BaseStrategy):
         )
 
 
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
 @pytest.fixture
 def candle_data():
     """200 candles with mild uptrend."""
@@ -181,9 +174,6 @@ def memory_source(candle_data):
     return ds
 
 
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
 class TestBacktestE2E:
     @patch("src.core.backtest_runner.SessionLocal")
     def test_full_and_research_runners_share_context_driven_state_machine(
@@ -359,7 +349,6 @@ class TestBacktestE2E:
         runner.add_strategy(strategy)
         result = runner.run()
 
-        # Journal captures execution events even with mock DB
         assert result is not None
         assert result["journal_count"] > 0
 
@@ -502,7 +491,7 @@ class TestBacktestE2E:
             product_id=PRODUCT_ID,
             timeframe=TIMEFRAME,
             initial_balance=10000.0,
-            max_drawdown_limit=0.001,  # Very tight: stop at 0.1% drawdown
+            max_drawdown_limit=0.001,
             data_source=memory_source,
             fee_config={"maker": 0.001, "taker": 0.002},
             report_config={

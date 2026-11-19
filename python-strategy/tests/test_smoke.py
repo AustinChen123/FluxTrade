@@ -38,7 +38,6 @@ class TestTradingPipeline:
         engine, adapter, repo = self._build_engine(mock_db_session, mock_clock)
         initial_balance = adapter.get_balance()
 
-        # 1. Execute LONG signal
         signal = signal_factory(
             signal_type=SignalType.LONG,
             price=Decimal("40000"),
@@ -48,20 +47,17 @@ class TestTradingPipeline:
         assert order_id is not None
         assert len(adapter._engine.open_orders) == 1
 
-        # 2. Market data triggers fill (low touches limit price)
         candle = candlestick_factory(
             low=Decimal("39500"), high=Decimal("41000"), close=Decimal("40500")
         )
         engine.process_market_data(candle)
         assert len(adapter._engine.open_orders) == 0
 
-        # 3. Position should exist
         pos = adapter.get_position(signal.product_id)
         assert pos is not None
         assert pos.side == "LONG"
         assert pos.quantity == Decimal("1.0")
 
-        # 4. Exit with profit
         exit_signal = signal_factory(
             signal_type=SignalType.EXIT_LONG,
             price=Decimal("42000"),
@@ -75,7 +71,6 @@ class TestTradingPipeline:
         )
         engine.process_market_data(exit_candle)
 
-        # 5. Verify PnL realized via adapter (Rust engine tracks balance)
         expected_pnl = (Decimal("42000") - Decimal("40000")) * Decimal("1.0")
         assert adapter.get_balance() == initial_balance + expected_pnl
 
@@ -86,7 +81,6 @@ class TestTradingPipeline:
         engine, adapter, repo = self._build_engine(mock_db_session, mock_clock)
         initial_balance = adapter.get_balance()
 
-        # 1. SHORT entry
         signal = signal_factory(
             signal_type=SignalType.SHORT,
             price=Decimal("44000"),
@@ -103,7 +97,6 @@ class TestTradingPipeline:
         assert pos is not None
         assert pos.side == "SHORT"
 
-        # 2. EXIT_SHORT at lower price (profit)
         exit_signal = signal_factory(
             signal_type=SignalType.EXIT_SHORT,
             price=Decimal("42000"),
@@ -213,7 +206,6 @@ class TestSimulatedAdapterPipeline:
         """Multiple buys should accumulate, sell should reduce position."""
         adapter = SimulatedAdapter()
 
-        # Two buy fills
         for _ in range(2):
             order = order_factory(order_type="market", side="buy", quantity=Decimal("0.5"))
             adapter.place_order(order)
@@ -224,7 +216,6 @@ class TestSimulatedAdapterPipeline:
         assert pos.quantity == Decimal("1.0")
         assert pos.side == "LONG"
 
-        # Partial sell
         sell = order_factory(order_type="market", side="sell", quantity=Decimal("0.3"))
         adapter.place_order(sell)
         adapter.on_market_data(candlestick_factory(close=Decimal("43000")))
@@ -243,7 +234,6 @@ class TestBacktestRepositoryPipeline:
         """Open -> close should calculate correct PnL via adapter."""
         adapter = SimulatedAdapter(initial_balance=Decimal("10000"))
 
-        # Buy 1.0 BTC at 40000 (limit)
         buy = order_factory(order_type="limit", side="buy",
                             product_id="BINANCE:BTCUSDT-PERP",
                             price=Decimal("40000"), quantity=Decimal("1.0"))
@@ -251,7 +241,6 @@ class TestBacktestRepositoryPipeline:
         adapter.on_market_data(candlestick_factory(
             low=Decimal("39500"), high=Decimal("41000"), close=Decimal("40500")))
 
-        # Sell 1.0 BTC at 42000 (limit)
         sell = order_factory(order_type="limit", side="sell",
                              product_id="BINANCE:BTCUSDT-PERP",
                              price=Decimal("42000"), quantity=Decimal("1.0"))

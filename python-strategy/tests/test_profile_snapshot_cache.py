@@ -408,10 +408,10 @@ def test_served_only_change_cannot_renew_expiry():
 @pytest.mark.parametrize("revoked", [False, True])
 def test_validation_high_water_rejects_server_clock_rollback(revoked):
     request, snapshot, client, _, mono, cache = setup()
-    cache.refresh(request)  # A
+    cache.refresh(request)
     newer = newer_evidence(snapshot.evidence)
     client.fetch.return_value = newer
-    assert cache.refresh(request).applied  # B
+    assert cache.refresh(request).applied
     if revoked:
         client.fetch.return_value = LiveProfileQueryUnavailable(
             request, "SNAPSHOT_REVOKED"
@@ -422,7 +422,7 @@ def test_validation_high_water_rejects_server_clock_rollback(revoked):
     assert before.reason == ("SNAPSHOT_REVOKED" if revoked else "VALIDATION_EXPIRED")
     client.fetch.return_value = (
         snapshot.evidence
-    )  # Server validation clock rolled back.
+    )
     assert cache.refresh(request) == ProfileRefreshResult(False, "SUCCESS")
     assert read(cache, request, current_monotonic_ms=mono.return_value) == before
     client.fetch.return_value = replace(newer, served_at_ms=DAY + 12)

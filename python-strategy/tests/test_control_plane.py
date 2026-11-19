@@ -2354,19 +2354,6 @@ def test_control_plane_runs_csv_signal_backtest_job(tmp_path):
     assert audit_count == 2
 
 
-# =============================================================================
-# L6 kill-switch endpoint — POST /ops/kill-switch
-# =============================================================================
-#
-# Matrix:
-#   1. auth-fail: missing key  → 401
-#   2. auth-fail: wrong key    → 401
-#   3. happy-path: valid key   → 202 + publish to Redis with correct shape
-#   4. reason forwarded        → reason appears in published payload params
-#
-# Tests 1 & 2 rely on the existing auth middleware (trivially green once the
-# route exists and auth is enforced).  Tests 3 & 4 are RED until the stub is
-# implemented.
 
 
 def _kill_switch_app(*, api_key: str = "secret", redis_client=None) -> ControlPlaneApp:

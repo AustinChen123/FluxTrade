@@ -191,8 +191,6 @@ class SpiderOperationRequestStore:
 
         head = self._head(session, request)
         if head is not None:
-            # A concurrent exact retry may have committed while this caller
-            # waited for the operation-head row lock.
             existing = self._record_existing(session, request)
             if existing is not None:
                 return existing

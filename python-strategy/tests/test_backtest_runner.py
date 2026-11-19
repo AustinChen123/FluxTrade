@@ -29,9 +29,6 @@ from src.core.strategy_context import StrategyContext
 from src.strategies.base import BaseStrategy, StrategyRequirements
 
 
-# =============================================================================
-# Helpers
-# =============================================================================
 
 
 def _make_closed_trade() -> ClosedTrade:
@@ -46,9 +43,6 @@ def _make_closed_trade() -> ClosedTrade:
     )
 
 
-# =============================================================================
-# _write_csv_trades
-# =============================================================================
 
 
 class TestWriteCsvTrades:
@@ -78,7 +72,7 @@ class TestWriteCsvTrades:
         _write_csv_trades([_make_closed_trade()], path)
 
         lines = path.read_text().strip().split("\n")
-        assert len(lines) == 2  # header + 1 data row
+        assert len(lines) == 2
         assert "42000" in lines[1]
 
     def test_csv_empty_trades(self, tmp_path):
@@ -87,12 +81,9 @@ class TestWriteCsvTrades:
         _write_csv_trades([], path)
 
         lines = path.read_text().strip().split("\n")
-        assert len(lines) == 1  # header only
+        assert len(lines) == 1
 
 
-# =============================================================================
-# _write_equity_curve
-# =============================================================================
 
 
 class TestWriteEquityCurve:
@@ -111,12 +102,9 @@ class TestWriteEquityCurve:
 
         lines = path.read_text().strip().split("\n")
         assert lines[0] == "bar,equity"
-        assert len(lines) == 4  # header + 3 data rows
+        assert len(lines) == 4
 
 
-# =============================================================================
-# _write_journal
-# =============================================================================
 
 
 class TestWriteJournal:
@@ -134,9 +122,6 @@ class TestWriteJournal:
         assert "LONG" in content
 
 
-# =============================================================================
-# _write_markdown_report
-# =============================================================================
 
 
 class TestWriteMarkdownReport:
@@ -222,9 +207,6 @@ class TestWriteMarkdownReport:
         assert "2024-01" in content
 
 
-# =============================================================================
-# BacktestRunner defaults
-# =============================================================================
 
 
 class TestBacktestRunnerInit:
@@ -273,9 +255,7 @@ class TestBacktestRunnerInit:
             report_config={"csv_trades": False},
         )
 
-        # Custom overrides default
         assert runner.report_config["csv_trades"] is False
-        # Other defaults preserved
         assert runner.report_config["markdown_report"] is True
 
     @patch("src.core.backtest_runner.SessionLocal")
@@ -487,9 +467,6 @@ def test_add_portfolio_rejects_runner_identity_mismatch():
         runner.add_portfolio(definition)
 
 
-# =============================================================================
-# _export_reports
-# =============================================================================
 
 
 class TestExportReports:

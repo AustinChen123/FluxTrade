@@ -12,7 +12,6 @@ import pandas_market_calendars as market_calendars
 
 
 _CME_EQUITY = market_calendars.get_calendar("CME_Equity")
-# https://www.cmegroup.com/notices/electronic-trading/2021/06/20210621.html
 _CME_DAILY_PAUSE_REMOVED = date(2021, 6, 28)
 
 
