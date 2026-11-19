@@ -104,6 +104,7 @@ def test_python_dispatcher_owner_restarts_in_a_fresh_os_process(tmp_path: Path) 
     db_engine.dispose()
     context = multiprocessing.get_context("spawn")
     result = context.Queue()
+    queue_owned_by_terminated_process = context.Queue()
     for label in ("first", "restarted"):
         child = context.Process(
             target=_write_from_fresh_dispatcher_process,
@@ -117,10 +118,10 @@ def test_python_dispatcher_owner_restarts_in_a_fresh_os_process(tmp_path: Path) 
 
     crashing = context.Process(
         target=_block_dispatcher_process,
-        args=(db_path, result),
+        args=(db_path, queue_owned_by_terminated_process),
     )
     crashing.start()
-    crash_state = result.get(timeout=30)
+    crash_state = queue_owned_by_terminated_process.get(timeout=30)
     assert crash_state["accepted"] == 2
     assert crash_state["queued"] == 1
     crashing.terminate()
