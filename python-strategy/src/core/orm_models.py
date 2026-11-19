@@ -276,7 +276,6 @@ class Order(Base):
     )
     filled_price: Mapped[Decimal | None] = mapped_column(Numeric, nullable=True)
 
-    # Migration 5 — idempotency / lifecycle columns.
     client_order_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     intent_payload: Mapped[dict[str, object] | None] = mapped_column(
         JSONB,
@@ -422,19 +421,17 @@ class SignalAudit(Base):
 
     signal_type: Mapped[str] = mapped_column(String, nullable=False)
 
-    risk_status: Mapped[str] = mapped_column(String, nullable=False)  # PASS, REJECT
+    risk_status: Mapped[str] = mapped_column(String, nullable=False)
 
     risk_message: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     order_id: Mapped[str | None] = mapped_column(String, nullable=True)
 
-    # Migration 5 — TEXT upgraded to JSONB.
     details_json: Mapped[dict[str, object] | None] = mapped_column(
         JSONB,
         nullable=True,
     )
 
-    # Migration 5 — Path B audit linkage + multi-signal batch correlation.
     client_order_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
     intent_payload: Mapped[dict[str, object] | None] = mapped_column(
@@ -466,7 +463,6 @@ class SystemEvent(Base):
     event_subtype = Column(String(64), nullable=True)
     related_strategy_id = Column(String, ForeignKey("strategy.id"), nullable=True)
     related_order_id = Column(String, ForeignKey("order.id"), nullable=True)
-    # No FK — gene_records lands in migration 7.
     related_gene_id = Column(BigInteger, nullable=True)
     payload = Column(JSONB, nullable=False)
     created_at = Column(
@@ -552,7 +548,6 @@ class BacktestResultSummary(Base):
     start_time: Mapped[int] = mapped_column(BigInteger, nullable=False)
     end_time: Mapped[int] = mapped_column(BigInteger, nullable=False)
     total_pnl: Mapped[Decimal] = mapped_column(Numeric, nullable=False)
-    # Text is used for JSONB compatibility in the generic ORM.
     metrics_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     job_id: Mapped[str | None] = mapped_column(String, nullable=True)
     dataset_id: Mapped[str | None] = mapped_column(
@@ -747,7 +742,6 @@ class StrategyState(Base):
     last_heartbeat: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     uptime_start: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
-    # Migration 6 — audit / lifecycle metadata + optimistic-lock version.
     last_error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     entered_error_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
@@ -882,7 +876,6 @@ class EvolutionEpoch(Base):
     pop_size: Mapped[int] = mapped_column(Integer, nullable=False)
     max_generations: Mapped[int] = mapped_column(Integer, nullable=False)
     generations_run: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    # Numeric (Decimal) — float forbidden for monetary / ratio values.
     best_score: Mapped[Decimal | None] = mapped_column(
         Numeric(18, 8),
         nullable=True,
@@ -943,7 +936,6 @@ class GeneRecord(Base):
         JSONB,
         nullable=False,
     )
-    # Positive loss magnitude normalized at the parameter-search boundary.
     max_drawdown: Mapped[Decimal] = mapped_column(
         Numeric(18, 8),
         nullable=False,

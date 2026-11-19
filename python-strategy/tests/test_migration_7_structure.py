@@ -12,9 +12,6 @@ from src.core.models import GeneRole
 from src.core.orm_models import EvolutionEpoch, GeneRecord
 
 
-# ---------------------------------------------------------------------------
-# EvolutionEpoch
-# ---------------------------------------------------------------------------
 
 def test_evolution_epoch_has_all_eval_columns() -> None:
     """Critical fix I4: the four eval_* columns must exist so that
@@ -35,7 +32,6 @@ def test_evolution_epoch_best_score_is_numeric_not_float() -> None:
     assert isinstance(col.type, Numeric), (
         f"EvolutionEpoch.best_score must be Numeric, got {type(col.type).__name__}"
     )
-    # Numeric(18, 8) per spec.
     assert col.type.precision == 18
     assert col.type.scale == 8
 
@@ -46,9 +42,6 @@ def test_evolution_epoch_check_constraint_exists() -> None:
     assert "chk_epoch_status" in constraints
 
 
-# ---------------------------------------------------------------------------
-# GeneRecord
-# ---------------------------------------------------------------------------
 
 def test_gene_record_has_role_column() -> None:
     cols = GeneRecord.__table__.columns
@@ -86,9 +79,6 @@ def test_gene_record_check_constraint_exists() -> None:
     assert "chk_gene_role" in constraints
 
 
-# ---------------------------------------------------------------------------
-# GeneRole enum
-# ---------------------------------------------------------------------------
 
 def test_gene_role_enum_values_are_lowercase() -> None:
     """Values must be lower-case to match the DB CHECK constraint
@@ -97,6 +87,5 @@ def test_gene_role_enum_values_are_lowercase() -> None:
     assert GeneRole.CHAMPION.value == "champion"
     assert GeneRole.RETIRED.value == "retired"
 
-    # Sanity: exactly three roles, no extras.
     all_values = {member.value for member in GeneRole}
     assert all_values == {"challenger", "champion", "retired"}

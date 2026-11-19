@@ -55,8 +55,6 @@ def _classify_status(
             fully_filled,
         )
 
-    # ExchangeOrderNotification FILL carries cumulative progress; its raw status
-    # is not authoritative. The native decoder uses the same quantity boundary.
     if notification == "FILL":
         if filled_quantity <= 0:
             return _StatusInterpretation(None, None)
@@ -64,8 +62,6 @@ def _classify_status(
             "filled" if fully_filled else "partially_filled", fully_filled
         )
 
-    # The official sample treats COMPLETE as order completion, not proof of a
-    # full fill. Preserve terminal evidence without inventing economic progress.
     if notification == "COMPLETE":
         if normalized in _CANCEL_ALIASES and incomplete:
             return _StatusInterpretation("cancelled", True)

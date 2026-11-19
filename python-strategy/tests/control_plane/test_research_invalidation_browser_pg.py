@@ -376,8 +376,6 @@ def test_real_https_browser_reconnect_refreshes_missed_pg_epoch(
         first_epoch_id = first_evolution.get("epoch_id")
         assert isinstance(first_epoch_id, str) and first_epoch_id
 
-        # Establish a known prior champion through the existing authenticated
-        # lifecycle route, using a gene produced by the real native worker.
         with sessions() as session:
             first_genes = list(
                 session.scalars(

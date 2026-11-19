@@ -64,7 +64,7 @@ def test_append_order_parameters_header_only_and_idempotency() -> None:
     calls.clear()
     again = store.append_confirmed(REQUEST)
     assert again == InvalidationAppendResult(result.event, True)
-    assert len(calls) == 3  # Replay never revalidates reference headers.
+    assert len(calls) == 3
     with pytest.raises(FrozenInstanceError):
         setattr(again, "already_present", False)
 
@@ -210,4 +210,3 @@ def test_db_and_commit_ack_unknown_propagate_without_retry() -> None:
         if commit:
             session.begin.return_value.__exit__.side_effect = None
             assert state["event"] is not None and store.append_confirmed(REQUEST).already_present
-            # Fake models ACK loss, not evidence of actual commit or rollback.

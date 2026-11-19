@@ -344,9 +344,6 @@ def test_policy_failure_is_a_nonretryable_pending_prefix_then_stop_proves_it_col
         elapsed_ms=61_001,
         predecessor=_observation_id("failed-timer-anchor"),
     )
-    # Negative earn offsets the positive trading equity to zero total.  The
-    # original Policy emits its normal prefix, then fails at its real zero-total
-    # risk division; this avoids an injected exception or absent-cache shortcut.
     timer_value = cast(dict[str, Any], decode_canonical(timer))
     snapshots = cast(dict[str, Any], timer_value["snapshots"])
     snapshots["earn"] = "-100"
@@ -667,7 +664,6 @@ def test_timer_candidate_transaction_rolls_back_or_proves_same_delivery_commit(
     candidates_after = tuple(action for action in after_duplicate_state[6] if action[1] == timer_id)
     assert candidates_after
     assert len(stage_calls) == (2 if fault == "rollback" else 1)
-    # A second notification proves neither branch replays a committed callback.
     repeated = owner.receive_source_time(timer)
     assert repeated.success and repeated.data is not None
     assert repeated.data["disposition"] == "DUPLICATE"

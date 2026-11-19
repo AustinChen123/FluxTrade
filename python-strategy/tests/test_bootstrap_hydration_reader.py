@@ -290,7 +290,7 @@ def test_declared_participant_missing_outcome_is_not_a_stop_gap():
     batch = replace(record.batch, outcomes=(outcome,))
     db, state, _ = store_harness()
     store.append_decision_batch(db, batch)
-    state["outcomes"] = []  # Header still declares this participant.
+    state["outcomes"] = []
 
     def read(**kwargs):
         return candle, store.read_decision_batch(db, **store._identity(batch))

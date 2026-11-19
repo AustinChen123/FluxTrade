@@ -59,8 +59,6 @@ class OpsDiagnosticDispatcher:
         self._worker: _Worker | None = None
         self._accepted = 0
         self._dropped = 0
-        # next(count) is a bounded, nonblocking increment on CPython. Producers
-        # use this when the admission lock is contended.
         self._drop_sequence = count(1)
         self._contended_drops = 0
         self._committed = 0
@@ -88,8 +86,6 @@ class OpsDiagnosticDispatcher:
             health_worker.start()
             self._health_worker = health_worker
         except Exception:
-            # Reporting is optional. The writer remains the terminal process
-            # owner and is never replaced because its reporter failed.
             self._health_stop.set()
         else:
             self._health_reporter_available = True
@@ -191,9 +187,6 @@ class OpsDiagnosticDispatcher:
                 with self._lock:
                     self._dropped += 1
                     if not isinstance(error, Exception):
-                        # A fatal exit terminates this fixed owner. The
-                        # in-flight and queued accepted items have no owner
-                        # that can complete them after this thread exits.
                         self._available = False
                         self._stopped = True
                         self._discard_queued_locked()
@@ -228,9 +221,6 @@ class OpsDiagnosticDispatcher:
     def _persist(self, diagnostic: SafeDiagnostic) -> None:
         with self._session_factory() as session:
             try:
-                # PostgreSQL bounds the item statement after a worker-owned
-                # connection has been acquired. Pool/connect deadlines remain
-                # those configured by the injected application session factory.
                 if session.get_bind().dialect.name == "postgresql":
                     session.execute(text("SET LOCAL statement_timeout = '2000ms'"))
                 session.add(

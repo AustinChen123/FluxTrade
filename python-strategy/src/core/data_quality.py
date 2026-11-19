@@ -11,7 +11,6 @@ from src.core.models import Candlestick
 from src.core.session_calendar import SessionCalendar
 
 
-# Timeframe durations in milliseconds
 _TF_MS = {
     "1m": 60_000,
     "3m": 180_000,
@@ -33,10 +32,10 @@ _TF_MS = {
 class QualityIssue:
     """A single data quality issue."""
 
-    severity: str  # "error" | "warning"
-    category: str  # "gap" | "ohlc" | "outlier" | "general"
-    index: int  # position in candle list (-1 for general)
-    timestamp: int  # unix ms
+    severity: str
+    category: str
+    index: int
+    timestamp: int
     message: str
 
 

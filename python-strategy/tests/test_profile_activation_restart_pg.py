@@ -231,7 +231,7 @@ def test_consumed_active_restart_rehydrates_without_durable_mutation(
         )
         application.apply(candle, apply_new=lambda _: batch, rebuild_applied=forbidden)
         reader._max_recorded = (
-            4  # Actual participants, not the elapsed wall-clock slots.
+            4
         )
         before = durable_state()
         assert before[0] == ("ACTIVE", 3) and len(before[1]) == 3

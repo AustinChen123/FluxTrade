@@ -47,7 +47,6 @@ class OrderManager:
         self.redis_client = None
         self.update_position_script = None
 
-        # Detect Backtest Mode: explicit flag > repository type heuristic
         if is_backtest is not None:
             self.is_backtest = is_backtest
         else:
@@ -55,7 +54,6 @@ class OrderManager:
 
         if not self.is_backtest:
             self.redis_client = create_redis_client()
-            # Load Lua Script
             lua_path = os.path.join(
                 os.path.dirname(__file__), "../lua/update_position.lua"
             )
@@ -191,7 +189,6 @@ class OrderManager:
     def fail_order(self, order: Order, reason: str):
         """Marks an order as FAILED due to execution errors."""
         order.status = "failed"
-        # We could verify if there's a specific field for error msg, but for now just status
         logger.error(
             "ORDER_FAILED: Order %s marked as FAILED. Reason: %s", order.id, reason
         )

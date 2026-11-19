@@ -69,9 +69,6 @@ def test_supported_raw_aliases_use_one_quantity_aware_interpretation(
 def test_exchange_notifications_override_raw_status_only_when_defined(
     status, notification, filled, expected
 ):
-    # Synthetic application-contract cases, not provider-valid captures.
-    # Enum names are from the official schema; fill progress follows the
-    # owned native decoder's cumulative-quantity rule.
     result = _classify_status(
         status, Decimal(filled), Decimal("2"), notification_type=notification
     )
@@ -95,8 +92,6 @@ def test_exchange_notifications_override_raw_status_only_when_defined(
 def test_complete_notification_is_terminal_but_not_fill_evidence(
     status, filled, expected_status
 ):
-    # The licensed SampleOrder.py treats COMPLETE as order completion; it does
-    # not establish a full execution without consistent raw status/fill data.
     result = _classify_status(
         status, Decimal(filled), Decimal("2"), notification_type="COMPLETE"
     )

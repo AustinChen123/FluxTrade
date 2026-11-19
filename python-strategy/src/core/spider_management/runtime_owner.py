@@ -817,7 +817,6 @@ class SpiderRuntimeOwner:
                 raise ModelTimeUnavailable("SPIDER_SOURCE_TIME_ORDER_SNAPSHOT_UNAVAILABLE")
             selected.append((action, binding, order))
 
-        # A resubmission relation replaces its root at its own causal tape ordinal.
         by_root = {action.action_id: (action, binding, order) for action, binding, order in selected}
         relations = session.execute(select(SpiderMemberResubmission).where(
             SpiderMemberResubmission.environment == scope.environment,
@@ -1008,7 +1007,6 @@ class SpiderRuntimeOwner:
                     if outcome[0] == "REJECTED":
                         continue
                 else:
-                    # An accepted send without a financial state is not a proved working state.
                     raise ModelTimeUnavailable("SPIDER_SOURCE_TIME_ORDER_SNAPSHOT_UNAVAILABLE")
                 raise ModelTimeUnavailable("SPIDER_SOURCE_TIME_ORDER_SNAPSHOT_UNAVAILABLE")
             if state in {"filled", "canceled", "failed", "economic_terminal"}:
@@ -1379,7 +1377,6 @@ class SpiderRuntimeOwner:
             elif response_failure is None:
                 response_failure = "RESPONSE_INVALID"
         except Exception:
-            # The committed marker remains the only evidence after any call error.
             response_payload = None
             response_failure = "TRANSPORT_UNKNOWN"
 
@@ -1470,8 +1467,6 @@ class SpiderRuntimeOwner:
             )
         proved = self._transmission_readback(scope, group_id, request_payload)
         if proved is not None and proved.disposition == "RECORDED":
-            # A lost close response can prove the committed result without having
-            # reached the normal post-commit drain below the transaction helper.
             self._drain_stopped_scope(scope)
             self._drain_source_market_scope(scope)
             proved = self._transmission_readback(scope, group_id, request_payload)
@@ -2207,8 +2202,6 @@ class SpiderRuntimeOwner:
                         ) is None:
                             raise RuntimeError("SPIDER_INITIAL_PLAN_PROJECTION_UNAVAILABLE")
                         session.flush()
-                    # Returning from `session.begin()` proves this invocation's
-                    # marker commit; any exception above forbids the call.
                 return group_id, True
 
     def _record_transmission_result(
@@ -2646,7 +2639,6 @@ class SpiderRuntimeOwner:
                                 delivery.suppression_reason = "STOP_CONTROL"
                                 runtime.last_consumed_sequence = sequence
                     except Exception:
-                        # Commit/close uncertainty is resolved only by fresh proof below.
                         pass
                 proved = self.readback(scope, operation_id)
                 consumed_after = None if proved is None else proved.get("consumed_sequence")
@@ -2865,7 +2857,6 @@ class SpiderRuntimeOwner:
                     if source_input is None:
                         return "UNAVAILABLE"
                     if delivery.decision_payload is not None:
-                        # A saved policy failure is observable but not a retry token.
                         return "BLOCKED"
                     decision_full_key = full_key
                     if (
@@ -3285,10 +3276,6 @@ class SpiderRuntimeOwner:
                     ).scalar_one_or_none()
                     if superseded_before_ack is not None:
                         continue
-                    # REST is an acknowledgement, never a status authority. Once the
-                    # local order has reached an economic terminal state, or its
-                    # source full callback has been claimed, a delayed response must
-                    # not move the saved Policy cache backwards to sent/live.
                     local_order = session.execute(
                         select(Order).where(Order.id == action.local_order_id)
                     ).scalar_one_or_none()
@@ -4324,7 +4311,6 @@ class SpiderRuntimeOwner:
                     if identity_rows is None or not self._validate_initial_install_source(session, scope, runtime, plan, identity_rows):
                         return "UNAVAILABLE"
                     if delivery.decision_payload is not None:
-                        # A persisted policy failure cannot be retried as a new callback.
                         return "BLOCKED"
                     products, evidence_sha256, source_sha256 = self._source_market_basis(plan)
                     before = bytes(runtime.source_checkpoint)
@@ -4468,7 +4454,6 @@ class SpiderRuntimeOwner:
                         ).with_for_update()
                     ).scalar_one_or_none()
                     if delivery is None or delivery.kind != "SOURCE_MARKET":
-                        # A financial fact is never skipped by this source-only consumer.
                         return "BLOCKED"
                     if (
                         delivery.disposition != "PENDING"
@@ -4994,7 +4979,6 @@ class SpiderRuntimeOwner:
                                     session, scope, runtime, plan, persist=True
                                 ) is None:
                                     raise RuntimeError("SPIDER_MEMBER_RESUBMISSION_PROJECTION_UNAVAILABLE")
-                            # The commit boundary has passed; independent cold proof below.
             proof = self._member_resubmission_readback(scope, request)
             if proof is None:
                 return self._member_resubmission_result(
@@ -5236,7 +5220,6 @@ class SpiderRuntimeOwner:
                     initial_member_id = root.action_id
                     runtime_operation_id = plan.operation_id
             if relation is not None:
-                # Committed action evidence stays on the shared cold-proof path.
                 return self._member_resubmission_readback(scope, request)
             runtime = (
                 None if runtime_operation_id is None
@@ -5702,11 +5685,9 @@ class SpiderRuntimeOwner:
                         return self._result(scope, "REJECTED", operation_id, "SPIDER_INSTALL_UNAVAILABLE")
                     self._write_install(session, head, request, prepared, expected_version)
                     session.flush()
-                # `session.begin()` has committed. Return a separate fresh read.
         except _ExistingInstallReadback:
             pass
         except Exception:
-            # A transaction/commit exception is not evidence that the write failed.
             unknown_commit = True
         if operation_id is None:
             return self._result(scope, "UNKNOWN", None, "SPIDER_OPERATION_SELECTION_UNKNOWN")
@@ -5998,8 +5979,6 @@ class SpiderRuntimeOwner:
             plan_status="INCOMPLETE",
             missing_members=missing_payload,
         ))
-        # These records share one transaction, but the explicit flush order also
-        # respects the immediate composite foreign keys on each child row.
         session.flush()
         session.add_all(action_rows)
         session.flush()

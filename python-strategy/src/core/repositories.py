@@ -394,9 +394,6 @@ class LiveOrderRepository(IOrderRepository):
                 db.add(order)
                 db.add(trade)
             else:
-                # Product registration uses Session.execute, so keep it and
-                # attachment from autoflushing a caller's dirty Order before
-                # the participant captures the scalar prewrite projection.
                 with db.no_autoflush:
                     ensure_product_registered(db, str(trade.product_id))
                     db.add(order)
@@ -424,7 +421,6 @@ class LiveOrderRepository(IOrderRepository):
         fill_price: Decimal,
         position_side: str,
     ) -> None:
-        # Use with_for_update for locking
         with self._db_session_factory() as db:
             ensure_product_registered(db, product_id)
             position = (
@@ -497,13 +493,12 @@ class BacktestOrderRepository(IOrderRepository):
             lambda: _provided_session(db_session)
         )
         self.session_id = session_id
-        self.balance = initial_balance  # kept for backward compatibility
+        self.balance = initial_balance
         self._order_strategy_map: dict[str, str] = {}
         self._next_fill_sequence = 0
         self._trade_write_lock = Lock()
 
     def add_order(self, order: Order) -> None:
-        # Track order → strategy_id for BacktestTradeLog
         if order.strategy_id:
             self._order_strategy_map[order.id] = order.strategy_id
 
@@ -617,7 +612,6 @@ class BacktestOrderRepository(IOrderRepository):
         fill_price: Decimal,
         position_side: str,
     ) -> None:
-        # No-op: position and balance are tracked by Rust PyMatchingEngine
         pass
 
     def get_position(
@@ -626,7 +620,6 @@ class BacktestOrderRepository(IOrderRepository):
         product_id: str,
         side: str | None = None,
     ) -> Optional[Position]:
-        # Position state lives in Rust engine; accessed via BacktestAccountService
         return None
 
     def update_order_exchange_id(self, order: Order, exchange_order_id: str) -> None:

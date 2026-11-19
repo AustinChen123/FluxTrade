@@ -483,7 +483,6 @@ class TestRiskManagerExposureChecks:
         """Entry should be rejected when max exposure is already reached."""
         mock_account_service.set_balance(Decimal("100000"))
 
-        # Set position with high exposure (quantity * current_price > configured max)
         large_position = position_factory(
             quantity=Decimal("3"), entry_price=Decimal("40000")
         )
@@ -495,7 +494,6 @@ class TestRiskManagerExposureChecks:
         )
         signal = signal_factory(signal_type=SignalType.LONG, value=None)
 
-        # current_price=40000 -> 3 * 40000 = 120000 > default 100000
         is_allowed, reason = risk_manager.check_risk(
             signal, current_price=Decimal("40000")
         )
@@ -601,7 +599,7 @@ class TestRiskManagerExposureChecks:
         mock_account_service.set_position(position)
         risk_manager = RiskManager(
             mock_account_service
-        )  # no existing_position_entry_rule arg
+        )
         signal = signal_factory(
             signal_type=SignalType.LONG,
             price=Decimal("50000"),
@@ -621,7 +619,6 @@ class TestRiskManagerExposureChecks:
         """Exposure should be calculated with current market price, not entry price."""
         mock_account_service.set_balance(Decimal("100000"))
 
-        # Entry at $100, but current price moved; exposure uses current price.
         position = position_factory(
             quantity=Decimal("1000"), entry_price=Decimal("100")
         )
@@ -633,14 +630,12 @@ class TestRiskManagerExposureChecks:
         )
         signal = signal_factory(signal_type=SignalType.LONG, value=None)
 
-        # current 90 -> exposure 90000 < 100000: allowed
         is_allowed, reason = risk_manager.check_risk(
             signal, current_price=Decimal("90")
         )
         assert is_allowed is True
         assert reason == "PASS"
 
-        # current 120 -> exposure 120000 > 100000: rejected by exposure
         is_allowed, reason = risk_manager.check_risk(
             signal, current_price=Decimal("120")
         )
@@ -655,7 +650,7 @@ class TestRiskManagerExposureChecks:
 
         large_position = position_factory(
             quantity=Decimal("3"),
-            entry_price=Decimal("40000"),  # 3 * 40000 = 120000 > 100000
+            entry_price=Decimal("40000"),
         )
         mock_account_service.set_position(large_position)
 
@@ -800,9 +795,6 @@ class TestPositionSizeCalculation:
         mock_account_service.set_balance(Decimal("10000"))
         risk_manager = RiskManager(mock_account_service)
 
-        # Entry at 42000, SL at 41000 (1000 point risk)
-        # 2% of 10000 = 200 USDT risk
-        # Size = 200 / 1000 = 0.2
         size = risk_manager.calculate_position_size(
             entry_price=Decimal("42000"),
             stop_loss_price=Decimal("41000"),
@@ -816,8 +808,6 @@ class TestPositionSizeCalculation:
         mock_account_service.set_balance(Decimal("10000"))
         risk_manager = RiskManager(mock_account_service)
 
-        # 1% risk = 100 USDT
-        # Size = 100 / 1000 = 0.1
         size = risk_manager.calculate_position_size(
             entry_price=Decimal("42000"),
             stop_loss_price=Decimal("41000"),
@@ -844,7 +834,7 @@ class TestPositionSizeCalculation:
 
         size = risk_manager.calculate_position_size(
             entry_price=Decimal("42000"),
-            stop_loss_price=Decimal("42000"),  # Same as entry
+            stop_loss_price=Decimal("42000"),
         )
 
         assert size == Decimal("0")
@@ -854,8 +844,6 @@ class TestPositionSizeCalculation:
         mock_account_service.set_balance(Decimal("10000"))
         risk_manager = RiskManager(mock_account_service)
 
-        # Short entry at 42000, SL at 43000 (above entry)
-        # Distance is still 1000
         size = risk_manager.calculate_position_size(
             entry_price=Decimal("42000"),
             stop_loss_price=Decimal("43000"),
@@ -876,12 +864,11 @@ class TestRiskManagerEdgeCases:
         signal = signal_factory(signal_type=SignalType.LONG, value=None)
         is_allowed, reason = risk_manager.check_risk(signal)
 
-        # Should be allowed (balance > 0)
         assert is_allowed is True
 
     def test_very_large_balance(self, mock_account_service, signal_factory):
         """Risk check should work with very large balance."""
-        mock_account_service.set_balance(Decimal("1000000000"))  # 1 billion
+        mock_account_service.set_balance(Decimal("1000000000"))
         risk_manager = RiskManager(mock_account_service)
 
         signal = signal_factory(signal_type=SignalType.LONG, value=None)
@@ -892,7 +879,6 @@ class TestRiskManagerEdgeCases:
     def test_no_existing_position(self, mock_account_service, signal_factory):
         """Entry should be allowed when no position exists."""
         mock_account_service.set_balance(Decimal("10000"))
-        # No position set
         risk_manager = RiskManager(mock_account_service)
 
         signal = signal_factory(signal_type=SignalType.LONG, value=None)
@@ -906,10 +892,9 @@ class TestRiskManagerEdgeCases:
         """Entry at exactly max exposure should be allowed."""
         mock_account_service.set_balance(Decimal("100000"))
 
-        # Position at exactly max exposure (100000)
         position = position_factory(
             quantity=Decimal("2.5"),
-            entry_price=Decimal("40000"),  # 2.5 * 40000 = 100000
+            entry_price=Decimal("40000"),
         )
         mock_account_service.set_position(position)
 
@@ -941,14 +926,12 @@ class TestRiskManagerEdgeCases:
         mock_account_service.set_balance(Decimal("10000"))
         risk_manager = RiskManager(mock_account_service)
 
-        # 2% risk with 10-point SL on 42000 entry
         size = risk_manager.calculate_position_size(
             entry_price=Decimal("42000"),
             stop_loss_price=Decimal("41990"),
             risk_percent=Decimal("0.02"),
         )
 
-        # 200 / 10 = 20 BTC — very large because SL is tight
         assert size == Decimal("20")
 
     def test_zero_risk_percent_returns_zero(self, mock_account_service):
@@ -975,7 +958,6 @@ class TestRiskManagerEdgeCases:
             risk_percent=Decimal("0.02"),
         )
 
-        # Verify result has at most 4 decimal places
         assert abs(size - round(size, 4)) == 0
 
 
@@ -1470,7 +1452,7 @@ class TestAccountService:
             "src.core.risk_manager.create_redis_client", side_effect=Exception("fail")
         ):
             service = AccountService()
-        service.close()  # Should not raise
+        service.close()
 
 
 class TestRiskManagerWithCapitalAllocator:
@@ -1483,7 +1465,6 @@ class TestRiskManagerWithCapitalAllocator:
         from src.core.capital_allocator import CapitalAllocator
 
         allocator = CapitalAllocator(Decimal("100000"))
-        # No allocation for test_strategy
         risk_manager = RiskManager(mock_account_service, capital_allocator=allocator)
 
         signal = signal_factory(signal_type=SignalType.LONG)
@@ -1547,8 +1528,6 @@ class TestRiskManagerWithCapitalAllocator:
         allocator = CapitalAllocator(Decimal("100000"))
         allocator.allocate("test_strategy", Decimal("50000"))
 
-        # Set position with exposure below configured max position notional
-        # but above per-strategy limit (20000)
         position = position_factory(
             quantity=Decimal("0.5"), entry_price=Decimal("45000")
         )

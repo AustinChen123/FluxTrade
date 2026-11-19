@@ -300,8 +300,6 @@ def test_execution_ack_fills_duplicate_and_cancel_share_actual_receipt_chain(
     assert partial_readback is not None
     assert partial_readback["trading_ready"] is False
 
-    # This input is already normalized at the ExchangeOrderEvent boundary; it
-    # proves the financial consumer path, not OKX provider-wire translation.
     execution.process_exchange_order_event(ExchangeOrderEvent(
         status="open",
         product_id=first_order.product_id,
@@ -934,9 +932,6 @@ def test_broken_and_missing_receipt_proofs_never_restore_as_valid(
     assert accepted is not None
 
     with factory() as session:
-        # The ACK path persists the provider ID and then the SUBMITTED status
-        # as two ORDER_STATE receipts. Corrupt the tail edge so the valid ACK
-        # prefix remains present but cannot chain to the saved Order state.
         delivery = session.scalars(
             select(SpiderRuntimeDelivery).where(
                 SpiderRuntimeDelivery.environment == scope.environment,
@@ -960,8 +955,6 @@ def test_broken_and_missing_receipt_proofs_never_restore_as_valid(
             .values(source_payload=b"{}")
         )
     assert owner.readback(scope, operation_id) is None
-    # Invalid evidence cannot become an accepted restore; the identity remains
-    # owned so generic ACTIVE restoration cannot take over the strategy.
     assert owner.restore_owned_runtimes() == frozenset({scope.strategy_id})
     assert owner.readback(scope, operation_id) is None
     with factory.begin() as session:
@@ -1096,7 +1089,6 @@ def test_main_real_engine_restores_then_receives_fill_through_injected_participa
     from src.core.spider_management import runtime_owner as owner_module
 
     owner_logger = logging.getLogger("src.core.spider_management.runtime_owner")
-    # Alembic fileConfig disables loggers imported before its migration fixture.
     monkeypatch.setattr(owner_logger, "disabled", False)
     if caplog.handler not in owner_logger.handlers:
         monkeypatch.setattr(
@@ -1213,8 +1205,6 @@ def test_main_real_engine_restores_then_receives_fill_through_injected_participa
                         SpiderRuntimeDelivery.sequence == 1,
                     )
                 ) == "CONSUMED"
-            # Malformed STOP envelopes carrying an owned identity must be
-            # rejected by the owner and never reach generic StrategyState stop.
             owner = owners[0]
             malformed_owned_stops = [
                 {"command": "STOP", "id": scope.strategy_id},
@@ -1316,8 +1306,6 @@ def test_main_real_engine_restores_then_receives_fill_through_injected_participa
 
     monkeypatch.setattr(main_module, "DataConsumer", ConsumerProbe)
 
-    # Keep the real Engine startup ordering and repository construction while
-    # replacing only external listeners, Redis work, and periodic workers.
     original_init = StrategyEngine.__init__
     original_owned_restore = StrategyEngine._restore_owned_runtimes_on_startup
     original_generic_restore = StrategyEngine._restore_active_strategies_on_startup
@@ -1432,8 +1420,6 @@ def test_main_real_engine_restores_then_receives_fill_through_injected_participa
                 SpiderRuntimeScope.strategy_id == scope.strategy_id
             )
         ) == 1
-    # Create a real pending suffix for the cross-scope proof regression while
-    # suppressing only the post-commit wake, as with a missed notification.
     execution._owned_order_event_observer = None
     execution.process_exchange_order_event(ExchangeOrderEvent(
         status="open",
@@ -1442,8 +1428,6 @@ def test_main_real_engine_restores_then_receives_fill_through_injected_participa
         exchange_order_id=provider_order_id,
     ))
 
-    # Establish a second legitimate stopped scope using the same admitted
-    # model/venue facts; its receipt must never prove scope A.
     with engine_db.begin() as connection:
         connection.execute(
             text(
@@ -1561,8 +1545,6 @@ def test_main_real_engine_restores_then_receives_fill_through_injected_participa
             )
         )
     assert owners[0].readback(scope, operation_id) is not None
-    # Restoring A's exact row proof permits consumption of only A's original
-    # pending suffix; the valid B receipt remains outside this cursor.
     assert owners[0].restore_owned_runtimes() == frozenset({scope.strategy_id})
     execution._owned_order_event_observer = observer
     with factory() as session:
@@ -1619,8 +1601,6 @@ def test_main_real_engine_restores_then_receives_fill_through_injected_participa
                 fail_flush["hit_staged_writes"] = True
                 raise RuntimeError("injected TX B rollback after staged writes")
 
-    # Commit TX A but hold its notification, then prove corrupted binding and
-    # receipt facts leave the same pending suffix untouched.
     execution._owned_order_event_observer = None
     assert execution.process_exchange_order_event(late_full)["action"] == "applied"
     execution._owned_order_event_observer = observer
@@ -1738,8 +1718,6 @@ def test_main_real_engine_restores_then_receives_fill_through_injected_participa
             )
         ) == 3
 
-    # Commit/close uncertainty on a second-product terminal-cancel receipt resolves
-    # through independent readback of the original sequence, without a write retry.
     other_order_id = None
     with factory() as session:
         other_order_id = session.scalar(
@@ -1870,8 +1848,6 @@ def test_main_real_engine_restores_then_receives_fill_through_injected_participa
         )
         assert decoded_cancel_facts[1]["after"]["status"] == "CANCELLED"
 
-    # A broken suppression proof is unavailable; restoring the exact saved
-    # value reuses the same readback predicate and restores the proved view.
     caplog.clear()
     with factory.begin() as session:
         session.execute(
@@ -1924,8 +1900,6 @@ def test_main_real_engine_restores_then_receives_fill_through_injected_participa
         )
     assert owners[0].readback(scope, operation_id) is not None
 
-    # A missing current STOP proof blocks the next pending fact. Restoring the
-    # exact committed proof lets the same owner resume that finite frontier.
     with factory() as session:
         third_order_id = session.scalar(
             select(Order.id)
@@ -1991,7 +1965,6 @@ def test_main_real_engine_restores_then_receives_fill_through_injected_participa
             )
         ) == "SUPPRESSED"
 
-    # DRAIN remains held: a real post-DRAIN TX A fact stays pending.
     with factory() as session:
         fourth_order_id = session.scalar(
             select(Order.id)
@@ -2042,8 +2015,6 @@ def test_main_real_engine_restores_then_receives_fill_through_injected_participa
             )
         ) == 7
 
-    # Observer failure must not rewrite the already-applied duplicate event or
-    # latch the global order-event stream. No duplicate receipt/Trade is made.
     execution._owned_order_event_observer = lambda _order_id: (_ for _ in ()).throw(
         RuntimeError("injected observer failure")
     )
@@ -2059,9 +2030,6 @@ def test_main_real_engine_restores_then_receives_fill_through_injected_participa
             )
         ) == 7
 
-    # A second authorized STOP advances the lifecycle version after the real
-    # late fill advanced the receiver barrier. Retrying the original key must
-    # prove A without regressing B's current projection.
     def dispatch_stop(key: str, expected_version: int) -> CommandResult:
         results: list[CommandResult | None] = []
         _owned_dispatch(owners[0], results).dispatch({
@@ -2395,7 +2363,6 @@ def test_initial_place_rejection_then_bound_financial_fact_updates_same_projecti
         for action_id in untransmitted_ids
     )
 
-    # The same saved operation/group is read back; it does not resend the batch.
     repeated = transport_owner.transmit_initial_place_group(
         scope,
         source_group,
@@ -2418,8 +2385,6 @@ def test_initial_place_rejection_then_bound_financial_fact_updates_same_projecti
         repository_transaction_participant=transport_owner.participate_in_order_transaction,
         is_backtest=True,
     )
-    # This is already-normalized SOFTWARE evidence through the existing financial
-    # consumer, not OKX wire/WSS or provider-admission evidence.
     assert execution.process_exchange_order_event(ExchangeOrderEvent(
         status="open",
         product_id=first_order.product_id,

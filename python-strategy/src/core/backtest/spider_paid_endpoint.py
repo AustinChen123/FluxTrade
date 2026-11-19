@@ -471,8 +471,6 @@ class PaidEndpoint:
             return
         if self.has_unbound_cancel():
             return
-        # A send accepted after the cutoff remains a native obligation. Wait for
-        # its original effective event and binding rather than dropping it.
         if any(dep["state"] == "PENDING"
                and dep["product_id"] not in self.exit_products
                for dep in composition._historical_send_dependencies.values()):

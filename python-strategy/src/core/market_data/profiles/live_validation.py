@@ -217,7 +217,7 @@ def finalize_live_profile_decision(
                 reason = "PROFILE_EXPIRED"
             elif (
                 request.end_ms > expected_end
-            ):  # Defensive; valid ordered clocks preclude this.
+            ):
                 reason = "PROFILE_NOT_READY"
         if reason is None:
             return ProfileDecisionContext(

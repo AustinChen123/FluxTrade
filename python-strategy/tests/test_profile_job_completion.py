@@ -222,7 +222,6 @@ def test_final_done_update_loses_lease_after_snapshot_verification() -> None:
     assert "ORDER BY volume_profile_bin.bin_index" in events[-2]
     assert events[-1].startswith("UPDATE")
     assert session.begin.return_value.__exit__.call_args.args[0] is LeaseLost
-    # Recording fake mutation is not evidence of PostgreSQL rollback.
 
 
 def test_completion_commit_failure_never_returns_done_result() -> None:
@@ -233,7 +232,6 @@ def test_completion_commit_failure_never_returns_done_result() -> None:
         store.complete(claim, snapshot["id"])
     assert caught.value is failure
     assert session.begin.return_value.__exit__.call_args.args == (None, None, None)
-    # This tests exception propagation only; real rollback needs the PG lane.
 
 
 def atomic():
@@ -270,7 +268,6 @@ def test_atomic_lock_order_result_and_exact_existing_content() -> None:
     for changes in ({"profile": object()}, {"job": object()}, {"recovered_after_commit": 1}):
         with pytest.raises(ValueError):
             replace(result, **changes)
-    # Model a separate RUNNING job state with a preexisting exact snapshot.
     job.update(status="RUNNING", completed_snapshot_id=None, lease_owner=claim.worker_id,
                lease_expires_at=claim.lease_expires_at)
     events.clear()
@@ -324,7 +321,6 @@ def test_visible_commit_ack_unknown_recovers_exact_result_without_mutation() -> 
     with pytest.raises(DBAPIError) as caught:
         store.publish_and_complete(claim, publication())
     assert caught.value is failure
-    # Model a new session observing the committed rows after an unknown ACK.
     session.in_transaction.return_value = False
     session.begin.return_value.__exit__.side_effect = lambda *_: setattr(session.in_transaction, "return_value", False)
     events.clear()
@@ -364,7 +360,6 @@ def test_running_job_rejects_existing_digest_with_different_metadata() -> None:
     store, session, job, events, claim = atomic()
     original = publication()
     store.publish_and_complete(claim, original)
-    # Keep the snapshot but model a valid RUNNING job with the same live claim.
     job.update(status="RUNNING", completed_snapshot_id=None, lease_owner=claim.worker_id,
                lease_expires_at=claim.lease_expires_at)
     changed = replace(original, source_manifest=CanonicalJsonObject({"changed": True}),

@@ -7,7 +7,6 @@ comprehensive testing without external dependencies (Redis, PostgreSQL, Exchange
 
 import os
 
-# Tests must never inherit a shell configured for the live namespace.
 os.environ["FLUXTRADE_ENVIRONMENT"] = "test"
 
 import pytest
@@ -24,7 +23,6 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import sessionmaker
 
-# Models
 from src.core.models import (
     Signal,
     SignalType,
@@ -45,7 +43,6 @@ from src.core.orm_models import (
     Trade as ORMTrade,
 )
 
-# Interfaces
 from src.core.interfaces import IOrderRepository, IExchangeAdapter
 from src.core.interfaces.exchange import ExchangeOrderSnapshot
 from src.core.interfaces.order_cancellation import OrderCancellationSnapshot
@@ -54,7 +51,6 @@ from src.core.interfaces.verified_net_reduction import (
     VerifiedNetReductionOrderSnapshot,
 )
 
-# Core modules
 from src.core.risk_manager import AccountService
 from src.core.clock import Clock
 
@@ -64,9 +60,6 @@ def _compile_jsonb_as_json(_type, _compiler, **_kwargs):
     return "JSON"
 
 
-# =============================================================================
-# Constants
-# =============================================================================
 
 DEFAULT_PRODUCT_ID = "BINANCE:BTCUSDT-PERP"
 DEFAULT_STRATEGY_ID = "test_strategy"
@@ -104,9 +97,6 @@ def sqlite_order_session_factory():
     engine.dispose()
 
 
-# =============================================================================
-# Mock Services
-# =============================================================================
 
 
 class MockAccountService(AccountService):
@@ -159,7 +149,7 @@ class MockAccountService(AccountService):
 class MockClock(Clock):
     """Mock clock for deterministic time in tests."""
 
-    def __init__(self, initial_time: float = 1704067200.0):  # 2024-01-01 00:00:00 UTC
+    def __init__(self, initial_time: float = 1704067200.0):
         self._current_time = initial_time
 
     def now(self) -> float:
@@ -374,7 +364,6 @@ class MockOrderRepository(IOrderRepository):
             )
             self.positions[key] = pos
         else:
-            # Simple update logic
             if side.lower() == "buy":
                 total_cost = (pos.quantity * pos.entry_price) + (
                     fill_quantity * fill_price
@@ -416,7 +405,6 @@ class MockExchangeAdapter(IExchangeAdapter):
 
             raise ExchangeError(self._fail_reason)
 
-        # Fail on specific order types (for testing SL/TP/Trailing error paths)
         if order.type in self._fail_on_order_types:
             from src.core.interfaces import ExchangeError
 
@@ -501,7 +489,6 @@ class MockExchangeAdapter(IExchangeAdapter):
         self.filled_orders.extend(fills)
         return fills
 
-    # Test helpers
     def set_next_fill_price(self, price: Decimal):
         self._next_fill_price = price
 
@@ -561,7 +548,6 @@ class RealisticMockAdapter(MockExchangeAdapter):
                 continue
 
             base_price = self._next_fill_price or candle.close
-            # Apply slippage
             slippage_factor = Decimal(str(self.slippage_bps)) / Decimal("10000")
             if order.side.lower() == "buy":
                 fill_price = base_price * (Decimal("1") + slippage_factor)
@@ -581,7 +567,6 @@ class RealisticMockAdapter(MockExchangeAdapter):
                 }
             )
 
-            # Partial fill: keep remainder as open order
             unfilled = order.quantity - fill_qty
             if unfilled > Decimal("0"):
                 order.quantity = unfilled
@@ -592,9 +577,6 @@ class RealisticMockAdapter(MockExchangeAdapter):
         return fills
 
 
-# =============================================================================
-# Fixture Factories
-# =============================================================================
 
 
 @pytest.fixture
@@ -661,9 +643,6 @@ def mock_db_session():
     return session
 
 
-# =============================================================================
-# Data Fixtures - Candlesticks
-# =============================================================================
 
 
 @pytest.fixture
@@ -672,7 +651,7 @@ def sample_candlestick():
     return Candlestick(
         product_id=DEFAULT_PRODUCT_ID,
         timeframe=DEFAULT_TIMEFRAME,
-        timestamp=1704067200000,  # 2024-01-01 00:00:00 UTC
+        timestamp=1704067200000,
         open=Decimal("42000.00"),
         high=Decimal("42500.00"),
         low=Decimal("41500.00"),
@@ -756,9 +735,6 @@ def candlestick_series_factory():
     return _create
 
 
-# =============================================================================
-# Data Fixtures - Signals
-# =============================================================================
 
 
 @pytest.fixture
@@ -853,9 +829,6 @@ def signal_factory():
     return _create
 
 
-# =============================================================================
-# Data Fixtures - Orders
-# =============================================================================
 
 
 @pytest.fixture
@@ -924,9 +897,6 @@ def order_factory():
     return _create
 
 
-# =============================================================================
-# Data Fixtures - Positions
-# =============================================================================
 
 
 @pytest.fixture
@@ -979,9 +949,6 @@ def position_factory():
     return _create
 
 
-# =============================================================================
-# Data Fixtures - Trades
-# =============================================================================
 
 
 @pytest.fixture
@@ -1021,9 +988,6 @@ def trade_factory():
     return _create
 
 
-# =============================================================================
-# Integration Fixtures
-# =============================================================================
 
 
 @pytest.fixture

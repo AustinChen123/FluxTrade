@@ -136,7 +136,7 @@ def callback_failure_run(trace):
     replay = _ReplayComposition("SYNTHETIC_GOLDEN_CANCEL_V1", ACCOUNT,
                                 {emission["delivery_id"]: emission, tail_plan["delivery_id"]: tail_plan})
     native = replay._codec.inspect_state()
-    del replay._policy.capital["total"]  # Real source missing-cache exception after request_market.
+    del replay._policy.capital["total"]
     assert replay._enqueue(replay._capture_item(item))["classification"] == "PENDING"
     assert replay._enqueue(replay._capture_item(tail))["classification"] == "PENDING"
     failure = replay._dispatch_due(600)

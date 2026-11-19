@@ -53,7 +53,6 @@ def fixture(present=True) -> dict[str, Any]:
 
 
 def oracle(present):
-    # Literal protocol reconstruction: no production encoder or fixture traversal.
     def optional(raw):
         return b"\x01" + raw if present else b"\x00"
     account = seq("V", "E", "雪") + optional(text("S"))

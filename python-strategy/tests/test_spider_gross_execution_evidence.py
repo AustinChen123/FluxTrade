@@ -819,9 +819,6 @@ def test_actual_native_source_group_failure_is_stored_and_admitted(tmp_path: Any
     floating_context = floating_exit_context(floating_exit_context_from_input(
         encode_spider_floating_exit_input(floating_request),
     ))
-    # Shape-only dispatch check: validate the existing closed DTO against a
-    # valid candidate context after normalizing context-dependent fields; this
-    # is not a replay or admission claim.
     paid_artifacts, paid_facts = _paid_bundle()
     old_paid = decode_jsonl(paid_artifacts["paid_endpoint.json"])[0]
     old_paid["reasons"] = [*cast(list[str], old_paid["reasons"]), "GROSS_RESPONSE_PENDING"]

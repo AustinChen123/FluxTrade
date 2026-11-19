@@ -4801,7 +4801,6 @@ class TestExecutionErrorHandling:
 
         assert order_id is None
 
-        # Order should be in repo with failed status
         failed_orders = [
             o for o in mock_order_repo.orders.values() if o.status == "failed"
         ]
@@ -5240,7 +5239,6 @@ class TestEntryCandleFreshness:
         )
         candle = self.candle(signal)
 
-        # Orders are durable; only the audit session is mocked in this test.
         with patch.object(
             execution_module,
             "write_signal_audit_intent",
@@ -9126,9 +9124,6 @@ class TestAuditedExecution:
         assert after_sl - before_sl == 1.0
         assert after_tp - before_tp == 1.0
 
-    # ---------------------------------------------------------------------------
-    # Protective terminal without fill — protection gap detection
-    # ---------------------------------------------------------------------------
 
     def _setup_engine_with_filled_entry(
         self,
@@ -9623,7 +9618,6 @@ class TestAuditedExecution:
             mock_order_repo,
             signal_factory,
         )
-        # SL fills — this cancels TP locally
         engine.process_exchange_order_event(
             ExchangeOrderEvent(
                 status="filled",
@@ -9636,7 +9630,6 @@ class TestAuditedExecution:
         assert stop_loss.status == OrderStatus.FILLED.value
         assert take_profit.status == OrderStatus.CANCELLED.value
 
-        # Exchange confirms the TP cancel we requested
         result = engine.process_exchange_order_event(
             ExchangeOrderEvent(
                 status="canceled",
@@ -9663,7 +9656,6 @@ class TestAuditedExecution:
             mock_order_repo,
             signal_factory,
         )
-        # Manually clear entry fill to simulate unfilled entry
         entry = next(o for o in mock_order_repo.orders.values() if o.type == "limit")
         entry.filled_quantity = Decimal("0")
         mock_order_repo.update_order(entry)
@@ -9697,7 +9689,6 @@ class TestAuditedExecution:
             )
         )
         entry = mock_order_repo.orders[order_id]
-        # Fill the entry via event so SL/TP are placed (SUBMITTED)
         engine.process_exchange_order_event(
             ExchangeOrderEvent(
                 status="filled",
@@ -9731,7 +9722,6 @@ class TestAuditedExecution:
                     filled_quantity=order.quantity,
                     average_price=order.price,
                 )
-            # Protective orders come back as canceled with zero fill
             return ExchangeOrderSnapshot(
                 client_order_id=client_order_id,
                 exchange_order_id=order.exchange_order_id,
@@ -9776,10 +9766,7 @@ class TestAuditedExecution:
             if order.type == "limit":
                 raise NetworkError("Connection timeout")
             if order.type == "stop_loss":
-                # mark_submitted(order, ex_id) called by engine after this return
                 return "MOCK-SL-1"
-            # take_profit branch: never reached in this scenario (TP excluded
-            # from placement_candidates because lookup raises below)
             raise ExchangeError("tp placement failed")
 
         mock_exchange_adapter.place_order = MagicMock(
@@ -9788,7 +9775,6 @@ class TestAuditedExecution:
 
         def lookup(client_order_id, product_id, *, order_type=None):
             if order_type == "limit":
-                # Entry was filled on the exchange
                 return ExchangeOrderSnapshot(
                     client_order_id=client_order_id,
                     exchange_order_id="EX-ENTRY-FILLED",
@@ -9799,11 +9785,7 @@ class TestAuditedExecution:
                     fee_asset="USDC",
                 )
             if order_type == "take_profit":
-                # Pre-submit adoption lookup for TP fails → TP stays NEW,
-                # excluded from placement_candidates; failures list non-empty
-                # → event returns unresolved → helper is called
                 raise ExchangeError("boom")
-            # stop_loss pre-submit lookup: no existing exchange order
             return None
 
         mock_exchange_adapter.get_order_by_client_id = MagicMock(side_effect=lookup)
@@ -9815,7 +9797,7 @@ class TestAuditedExecution:
             order_repository=mock_order_repo,
             db_session_factory=lambda: _session_context(audit_session),
             audit_external_orders=True,
-            is_backtest=True,  # fill recording uses repo.update_position, not Redis
+            is_backtest=True,
         )
         narrow_snapshots = []
         broad_snapshots = []
@@ -9863,13 +9845,10 @@ class TestAuditedExecution:
         sl_order = next(o for o in orders if o.type == "stop_loss")
         tp_order = next(o for o in orders if o.type == "take_profit")
 
-        # SL was placed on the exchange; the helper must leave it untouched
         assert sl_order.status == OrderStatus.SUBMITTED.value
         assert sl_order.exchange_order_id == "MOCK-SL-1"
         assert sl_order.intent_payload.get("linked_order_id") == str(tp_order.id)
 
-        # TP was never submitted (pre-submit lookup failed); the helper merges
-        # pending_reason into the existing payload without destroying linked_order_id
         assert tp_order.status == OrderStatus.NEW.value
         assert tp_order.exchange_order_id is None
         assert tp_order.intent_payload.get("linked_order_id") == str(sl_order.id)
@@ -9940,17 +9919,12 @@ class TestAuditedExecution:
         for order in conditional_orders:
             assert order.status == OrderStatus.NEW.value
             assert order.exchange_order_id is None
-            # linked_order_id must survive (merge, not replace)
             assert order.intent_payload.get("linked_order_id") is not None
-            # pending_reason must be added alongside the original keys
             assert (
                 order.intent_payload.get("pending_reason")
                 == "entry_submit_outcome_uncertain"
             )
 
-    # ------------------------------------------------------------------
-    # OCO sibling cancellation during startup reconciliation (P1 fix)
-    # ------------------------------------------------------------------
 
     def test_reconcile_offline_protective_fill_cancels_sibling(
         self,
@@ -9983,7 +9957,6 @@ class TestAuditedExecution:
             )
         )
         entry = mock_order_repo.orders[order_id]
-        # Bring entry to FILLED via live event (SL/TP become SUBMITTED)
         engine.process_exchange_order_event(
             ExchangeOrderEvent(
                 status="filled",
@@ -10000,7 +9973,6 @@ class TestAuditedExecution:
             o for o in mock_order_repo.orders.values() if o.type == "take_profit"
         )
 
-        # Simulate offline fill: exchange reports SL filled, TP still open
         def lookup(client_order_id, product_id, *, order_type=None):
             if client_order_id == entry.client_order_id:
                 return ExchangeOrderSnapshot(
@@ -10034,10 +10006,8 @@ class TestAuditedExecution:
 
         payload = engine.reconcile_recoverable_client_orders()
 
-        # SL must be recorded as filled; TP must be cancelled (stale OCO leg)
         assert stop_loss.status == OrderStatus.FILLED.value
         assert take_profit.status == OrderStatus.CANCELLED.value
-        # At least one result should reflect the SL fill reconciliation
         repair_actions = [r["repair_action"] for r in payload["results"]]
         assert "filled_from_exchange_snapshot" in repair_actions
 
@@ -10072,7 +10042,6 @@ class TestAuditedExecution:
             )
         )
         entry = mock_order_repo.orders[order_id]
-        # Bring entry to FILLED via live event (SL/TP become SUBMITTED)
         engine.process_exchange_order_event(
             ExchangeOrderEvent(
                 status="filled",
@@ -10089,17 +10058,13 @@ class TestAuditedExecution:
             o for o in mock_order_repo.orders.values() if o.type == "take_profit"
         )
 
-        # Simulate crash window: SL was recorded as FILLED but sibling cancel
-        # never happened.  Manually set SL to FILLED in the repo.
         stop_loss.status = OrderStatus.FILLED.value
         stop_loss.filled_quantity = stop_loss.quantity
         mock_order_repo.update_order(stop_loss)
-        # Remove SL from open_orders (exchange already executed it)
         mock_exchange_adapter.open_orders = [
             o for o in mock_exchange_adapter.open_orders if o.id != stop_loss.id
         ]
 
-        # Exchange still shows TP open; entry is terminal (not in scan)
         def lookup(client_order_id, product_id, *, order_type=None):
             if client_order_id == take_profit.client_order_id:
                 return ExchangeOrderSnapshot(
@@ -10115,7 +10080,6 @@ class TestAuditedExecution:
 
         payload = engine.reconcile_recoverable_client_orders()
 
-        # TP must be cancelled — NOT restored as an active tracking order
         assert take_profit.status == OrderStatus.CANCELLED.value
         repair_actions = [r["repair_action"] for r in payload["results"]]
         assert "cancelled_stale_protective_leg" in repair_actions
@@ -10196,7 +10160,6 @@ class TestAuditedExecution:
             return None
 
         mock_exchange_adapter.get_order_by_client_id = MagicMock(side_effect=lookup)
-        # Force cancel to always fail so the sibling cancel returns failure
         mock_exchange_adapter.cancel_order = MagicMock(return_value=False)
         mock_exchange_adapter.cancel_order_by_client_id = MagicMock(return_value=False)
 
@@ -10542,13 +10505,11 @@ class TestMarketDataProcessing:
         candle = candlestick_factory(close=Decimal("42100"))
         engine.process_market_data(candle)
 
-        # Order should be filled
         assert len(mock_exchange_adapter.open_orders) == 0
 
     def test_no_orders_no_fills(self, execution_engine, candlestick_factory):
         """No fills when no pending orders."""
         candle = candlestick_factory()
-        # Should not raise
         execution_engine.process_market_data(candle)
 
     def test_spot_gap_rejection_marks_order_failed_and_preserves_cash(
@@ -10730,9 +10691,7 @@ class TestConditionalOrderErrorHandling:
         )
         order_id = execution_engine.execute_signal(signal)
 
-        # Main order should succeed
         assert order_id is not None
-        # Entry order placed, SL order failed
         assert len(mock_exchange_adapter.open_orders) == 1
         assert "Failed to place SL order" in caplog.text
 
@@ -10748,9 +10707,7 @@ class TestConditionalOrderErrorHandling:
         )
         order_id = execution_engine.execute_signal(signal)
 
-        # Main order should succeed
         assert order_id is not None
-        # Entry order placed, TP order failed
         assert len(mock_exchange_adapter.open_orders) == 1
         assert "Failed to place TP order" in caplog.text
 
@@ -10767,7 +10724,6 @@ class TestConditionalOrderErrorHandling:
         )
         order_id = execution_engine.execute_signal(signal)
 
-        # Main order should succeed
         assert order_id is not None
         assert "Failed to place trailing stop order" in caplog.text
 
@@ -10787,10 +10743,8 @@ class TestConditionalOrderErrorHandling:
         )
         order_id = execution_engine.execute_signal(signal)
 
-        # Main order should still succeed
         assert order_id is not None
         assert len(mock_exchange_adapter.open_orders) == 1
-        # All conditional order errors logged
         assert "Failed to place SL order" in caplog.text
         assert "Failed to place TP order" in caplog.text
         assert "Failed to place trailing stop order" in caplog.text
@@ -10804,18 +10758,15 @@ def test_reconcile_gate_is_independent_of_kill_switch(execution_engine):
     lift an in-progress reconcile gate. Submissions are blocked while either is
     raised.
     """
-    # Both gates raised.
     execution_engine.halt_and_drain(timeout=0)
     execution_engine.halt_for_reconcile(timeout=0)
     assert execution_engine._submissions_halted is True
     assert execution_engine._reconcile_halt is True
 
-    # Resuming after reconcile clears ONLY the reconcile gate; kill switch stays.
     execution_engine.resume_after_reconcile()
     assert execution_engine._reconcile_halt is False
     assert execution_engine._submissions_halted is True
 
-    # And vice versa: clearing the kill switch leaves an active reconcile gate.
     execution_engine.halt_for_reconcile(timeout=0)
     execution_engine.resume_submissions()
     assert execution_engine._submissions_halted is False

@@ -435,8 +435,6 @@ def test_recovery_candidates_preserve_base_56ae1da7_order_and_full_payload(
 
     result = capability.reconcile()
 
-    # Base 56ae1da7 preserved callback order through restoration, snapshot
-    # acquisition, real planning, event application, and the decision payload.
     expected_order = [later, earlier]
     assert restored_rows == expected_order
     assert snapshot_rows == expected_order

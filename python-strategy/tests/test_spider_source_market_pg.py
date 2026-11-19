@@ -790,8 +790,6 @@ def test_market_source_cold_readback_rejects_coherent_chain_tampering(
             rows[0].content_sha256 = sha256(rows[0].source_payload).hexdigest()
         else:
             assert len(tape_rows) == 2
-            # Rotate the referenced receipt order via a temporary ordinal so
-            # both immediate uniqueness and delivery foreign keys remain valid.
             tape_rows[0].ordinal = 3
             session.flush()
             tape_rows[1].ordinal = 1

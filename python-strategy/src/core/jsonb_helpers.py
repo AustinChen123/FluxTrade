@@ -58,9 +58,6 @@ def deserialize_payload_with_decimals(
     return _convert_for_deserialization(payload, decimal_keys)  # type: ignore[return-value]
 
 
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
 
 
 def _convert_for_serialization(node: Any) -> Any:
@@ -80,8 +77,6 @@ def _convert_for_deserialization(node: Any, decimal_keys: set[str], parent_key: 
             for k, v in node.items()
         }
     if isinstance(node, list):
-        # List items inherit the parent key context so that e.g. a list of
-        # Decimal strings under a tracked key still gets converted.
         return [
             _convert_for_deserialization(item, decimal_keys, parent_key=parent_key)
             for item in node

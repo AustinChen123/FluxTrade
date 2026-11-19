@@ -52,7 +52,6 @@ class BacktestAccountService(AccountService):
             try:
                 pos = self.adapter.get_position(product_id, strategy_id=strategy_id)
             except TypeError:
-                # Adapter doesn't support strategy_id kwarg (e.g., live adapters)
                 pos = self.adapter.get_position(product_id)
                 if pos:
                     pos.strategy_id = strategy_id

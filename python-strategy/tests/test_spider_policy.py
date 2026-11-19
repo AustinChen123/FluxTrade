@@ -325,8 +325,6 @@ class Tests(unittest.TestCase):
         self.assertEqual(len(sent(p)), 2)
         self.assertEqual(p.markets["C0"]["price"], D(99))
         self.assertEqual([r["hold"] for r in p.rows], ["0", "0"])
-        # The original 100/1.01 buy limit is rounded down to 99.00 first.
-        # Refill anchors to that order limit: 99/1.01^2 and 99*1.01.
         self.assertEqual([o["px"] for o in sent(p)], ["97.04", "99.99"])
         p.events.clear()
         p.orders(report(original))

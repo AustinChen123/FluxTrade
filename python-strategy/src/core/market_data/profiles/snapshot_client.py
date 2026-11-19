@@ -17,7 +17,7 @@ from .wire import ProfileWireError, ProfileWireEvidence, decode_live_profile_res
 _PATH = "/api/v1/market-data/volume-profiles"
 _MAX_BODY = 2 * 1024 * 1024
 _ERROR_BODY = 1024
-_MAX_AUTH_TOKEN_BYTES = 4096  # ASCII credentials: character and byte counts agree.
+_MAX_AUTH_TOKEN_BYTES = 4096
 _OUTCOMES = {
     (404, "PROFILE_NOT_READY"): "NOT_READY",
     (404, "PROFILE_EXPIRED"): "PROFILE_EXPIRED",

@@ -25,10 +25,6 @@ import re
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
 
-# Identifiers we accept must be plain ASCII names. This blocks obvious SQL
-# injection vectors (semicolons, comments, quotes, whitespace) without trying
-# to fully parse PostgreSQL identifier grammar — migrations are authored by
-# trusted code, but defence-in-depth is cheap.
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -77,9 +73,6 @@ def null_invalid_json_in_text_column(
     safe_table = _validate_identifier("table", table_name)
     safe_column = _validate_identifier("column", column_name)
 
-    # 1. Define a session-local validator. ``pg_temp`` is automatically
-    #    dropped at session end, so no cleanup is required and the function
-    #    cannot leak across migrations.
     create_validator_sql = text(
         """
         CREATE OR REPLACE FUNCTION pg_temp.is_valid_json(value text)
@@ -98,8 +91,6 @@ def null_invalid_json_in_text_column(
     )
     connection.execute(create_validator_sql)
 
-    # 2. Single-statement cleanup. Identifiers are validated above, so
-    #    f-string interpolation is safe here.
     update_sql = text(
         f'UPDATE "{safe_table}" '
         f'SET "{safe_column}" = NULL '
@@ -107,7 +98,5 @@ def null_invalid_json_in_text_column(
         f'AND NOT pg_temp.is_valid_json("{safe_column}")'
     )
     result = connection.execute(update_sql)
-    # rowcount is documented to return -1 when unknown; coerce to 0 so
-    # callers can rely on a non-negative integer.
     rowcount = result.rowcount
     return rowcount if rowcount and rowcount > 0 else 0

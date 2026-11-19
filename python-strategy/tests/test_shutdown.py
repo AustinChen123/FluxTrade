@@ -115,7 +115,6 @@ class TestEngineShutdown:
         redis_client = MagicMock()
         redis_client.close.side_effect = Exception("already closed")
         engine.redis_client = redis_client
-        # Should not raise
         engine.shutdown()
         assert engine.running is False
 

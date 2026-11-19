@@ -210,7 +210,7 @@ class BootstrapSeed:
                     for item in candle.context.profiles
                 ):
                     raise ValueError
-            self.canonical_bytes  # Incremental admission before a whole-seed allocation.
+            self.canonical_bytes
         except (ValueError, TypeError, OverflowError):
             raise BootstrapSeedError() from None
 
@@ -234,7 +234,6 @@ class BootstrapSeed:
                 for item in candle.context.profiles
             ):
                 raise BootstrapSeedError()
-            # Bootstrap evidence deliberately has no decision key or input identity.
             modeled = _canonical(
                 {
                     "schema_version": 1,
@@ -458,7 +457,6 @@ def classify_bootstrap(
                 raise ValueError
             previous = start
             if outcome.disposition == "SKIPPED" and outcome.input_id is None:
-                # An orphan pin does not override terminal evidence that callback was skipped.
                 if pinned is not None and type(pinned) is not MarketDataDecisionInput:
                     raise ValueError
             elif (

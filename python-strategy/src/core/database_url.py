@@ -29,7 +29,6 @@ def select_migration_url(
         try:
             url = make_url(configured_url)
         except (ArgumentError, TypeError, ValueError):
-            # SQLAlchemy URL parsing can raise ArgumentError with the raw input.
             raise ValueError("invalid configured migration URL") from None
     else:
         url = build_postgres_url(settings)

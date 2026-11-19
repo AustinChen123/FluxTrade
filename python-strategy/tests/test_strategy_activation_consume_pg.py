@@ -84,9 +84,8 @@ def test_consume_caller_transaction_and_fresh_reentry(profile_repository_pg, pha
             assert confirmed.terminal_at == admitted.requested_at
             assert confirmed.terminal_reason == "ACTIVATION_COMMITTED"
         updates = sum(statement.startswith("UPDATE") for statement in sql)
-        assert updates == 1  # Request update; state SQL is not in this scoped log.
+        assert updates == 1
         if phase == "ack_lost":
-            # A new manager/session cannot rely on the first call's in-memory state.
             fresh_manager = StrategyStateManager(MagicMock(), MagicMock())
             with Session(engine) as second, second.begin():
                 assert second is not first

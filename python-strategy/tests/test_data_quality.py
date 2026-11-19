@@ -15,7 +15,6 @@ from src.core.models import Candlestick
 from src.core.session_calendar import CmeEquityIndexCalendar, SessionClosure
 
 
-# ── Helpers ──────────────────────────────────────────────────────
 
 def _timestamp_ms(value: str) -> int:
     return int(datetime.fromisoformat(value).replace(tzinfo=UTC).timestamp() * 1000)
@@ -46,7 +45,6 @@ def _series(count: int = 10, start: int = 0, interval: int = 60_000) -> list[Can
     return [_candle(start + i * interval) for i in range(count)]
 
 
-# ── Gap detection ────────────────────────────────────────────────
 
 class TestCheckGaps:
     def test_no_gaps(self):
@@ -58,7 +56,7 @@ class TestCheckGaps:
         candles = [
             _candle(0),
             _candle(60_000),
-            _candle(240_000),  # 3-minute gap
+            _candle(240_000),
         ]
         issues = check_gaps(candles, "1m")
         assert len(issues) == 1
@@ -76,14 +74,13 @@ class TestCheckGaps:
     def test_multiple_gaps(self):
         candles = [
             _candle(0),
-            _candle(180_000),  # gap
-            _candle(360_000),  # gap
+            _candle(180_000),
+            _candle(360_000),
         ]
         issues = check_gaps(candles, "1m")
         assert len(issues) == 2
 
     def test_tolerance(self):
-        # 1.5x tolerance means 90_000ms is still OK for 1m candles
         candles = [_candle(0), _candle(80_000)]
         issues = check_gaps(candles, "1m")
         assert len(issues) == 0
@@ -277,7 +274,6 @@ class TestCheckGaps:
         assert issues == []
 
 
-# ── OHLC validation ─────────────────────────────────────────────
 
 class TestCheckOhlc:
     def test_valid_ohlc(self):
@@ -322,7 +318,6 @@ class TestCheckOhlc:
         assert check_ohlc([]) == []
 
 
-# ── Outlier detection ────────────────────────────────────────────
 
 class TestCheckOutliers:
     def test_no_outliers(self):
@@ -332,7 +327,6 @@ class TestCheckOutliers:
 
     def test_spike_detected(self):
         candles = _series(20)
-        # Inject extreme spike
         candles[10] = _candle(
             candles[10].timestamp,
             o=100, h=500, lo=95, c=500,
@@ -357,7 +351,6 @@ class TestCheckOutliers:
         assert len(issues) == 0
 
 
-# ── Aggregate validate() ────────────────────────────────────────
 
 class TestValidate:
     def test_clean_data(self):
@@ -371,8 +364,8 @@ class TestValidate:
     def test_mixed_issues(self):
         candles = [
             _candle(0),
-            _candle(180_000),  # gap
-            _candle(240_000, o=100, h=90, lo=95, c=92),  # OHLC violation
+            _candle(180_000),
+            _candle(240_000, o=100, h=90, lo=95, c=92),
         ]
         report = validate(candles, "1m")
         assert not report.is_clean

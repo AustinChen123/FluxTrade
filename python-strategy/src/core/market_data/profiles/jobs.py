@@ -64,7 +64,6 @@ def _utc(value: object) -> datetime:
 
 
 def _duration(value: timedelta, zero: bool = False) -> None:
-    # All lease/retry intervals are bounded to one day; no float conversion.
     if type(value) is not timedelta or not timedelta(0) <= value <= timedelta(days=1) or (not zero and not value):
         raise ValueError("invalid job duration")
 
@@ -454,7 +453,6 @@ class ProfileIngestJobStore:
             row = session.execute(select(_JOB).where(_JOB.c.id == claim.spec.id).with_for_update()).mappings().one_or_none()
             state = None if row is None else _state(row)
             if state is not None and state.status == "DONE":
-                # DONE retains attempt/spec, not worker identity. Exact readback is mandatory.
                 if state.spec != claim.spec or state.attempt != claim.attempt:
                     raise JobCompletionError("job publication recovery mismatch")
                 return self._recover_completed(session, state, claim.spec, publication)

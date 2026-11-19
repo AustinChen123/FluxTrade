@@ -376,8 +376,6 @@ class SpiderRunStore:
             valid_kind = record_kind in (
                 "SOURCE_GROUP_RESULT", "SNAPSHOT_FACT", "CALLBACK_RESULT", "HISTORICAL_MARKET_RESULT",
             )
-            # Barrier identity is assigned by the actual journal producer, not
-            # by the scheduler's planned-coverage row.
             invalid = (not valid_kind or boundary["ordinal"] != ordinal
                        or boundary["journal_seq"] != ordinal
                        or boundary["barrier_id"] in self._historical_barrier_ids)

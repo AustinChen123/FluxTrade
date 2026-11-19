@@ -31,9 +31,6 @@ pytestmark = [
 ]
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 def make_rust_order(
     order_id: str,
     side: str,
@@ -118,9 +115,6 @@ def make_orm_order(
     )
 
 
-# ---------------------------------------------------------------------------
-# Test strategy classes for BacktestRunner integration
-# ---------------------------------------------------------------------------
 class StrategyA(BaseStrategy):
     """Goes LONG on candle 5, exits on candle 10."""
 
@@ -223,9 +217,6 @@ class StrategyB(BaseStrategy):
         )
 
 
-# ===========================================================================
-# Test 1: Two strategies, same product, independent positions
-# ===========================================================================
 class TestIndependentPositions:
     """Verify that two strategies can hold opposite positions on the same product."""
 
@@ -233,11 +224,9 @@ class TestIndependentPositions:
         """Directly exercise PyMatchingEngine: strategy A LONG, strategy B SHORT."""
         engine = PyMatchingEngine("10000", "0", "0")
 
-        # Strategy A goes LONG
         order_a = make_rust_order("a1", "LONG", strategy_id="strategy_a")
         engine.submit_order(order_a)
 
-        # Strategy B goes SHORT
         order_b = make_rust_order("b1", "SHORT", strategy_id="strategy_b")
         engine.submit_order(order_b)
 
@@ -248,7 +237,6 @@ class TestIndependentPositions:
         assert fills[0].strategy_id == "strategy_a"
         assert fills[1].strategy_id == "strategy_b"
 
-        # Verify independent positions via composite keys
         positions = engine.positions
         key_a = "strategy_a:" + PRODUCT_ID
         key_b = "strategy_b:" + PRODUCT_ID
@@ -267,15 +255,12 @@ class TestIndependentPositions:
         """Via SimulatedAdapter: strategy A LONG, strategy B SHORT on same product."""
         adapter = make_adapter("100000")
 
-        # Strategy A places a BUY (LONG)
         order_a = make_orm_order("ORD-A1", "strategy_a", side="buy", quantity=Decimal("0.1"))
         adapter.place_order(order_a)
 
-        # Strategy B places a SELL (SHORT)
         order_b = make_orm_order("ORD-B1", "strategy_b", side="sell", quantity=Decimal("0.05"))
         adapter.place_order(order_b)
 
-        # Feed candle to trigger fills
         candle = Candlestick(
             product_id=PRODUCT_ID,
             timeframe=TIMEFRAME,
@@ -289,7 +274,6 @@ class TestIndependentPositions:
         fills = adapter.on_market_data(candle)
         assert len(fills) == 2
 
-        # Check positions via adapter.get_position
         pos_a = adapter.get_position(PRODUCT_ID, strategy_id="strategy_a")
         assert pos_a is not None
         assert pos_a.side == "LONG"
@@ -301,9 +285,6 @@ class TestIndependentPositions:
         assert pos_b.quantity == Decimal("0.05")
 
 
-# ===========================================================================
-# Test 2: Closing one strategy's position doesn't affect the other
-# ===========================================================================
 class TestPositionIsolation:
     """Closing one strategy's position must not impact another strategy."""
 
@@ -311,7 +292,6 @@ class TestPositionIsolation:
         """Close strategy A via opposite market order; strategy B remains unchanged."""
         engine = PyMatchingEngine("100000", "0", "0")
 
-        # Both strategies open LONG positions
         engine.submit_order(make_rust_order("a1", "LONG", quantity="1", strategy_id="strategy_a"))
         engine.submit_order(make_rust_order("b1", "LONG", quantity="2", strategy_id="strategy_b"))
 
@@ -323,7 +303,6 @@ class TestPositionIsolation:
         assert key_a in engine.positions
         assert key_b in engine.positions
 
-        # Strategy A closes with a SHORT market order (quantity matches)
         engine.submit_order(make_rust_order(
             "a_close", "SHORT", quantity="1", strategy_id="strategy_a",
         ))
@@ -337,10 +316,8 @@ class TestPositionIsolation:
         assert fills[0].order_id == "a_close"
         assert fills[0].strategy_id == "strategy_a"
 
-        # Strategy A position is closed
         assert key_a not in engine.positions
 
-        # Strategy B position is untouched
         pos_b = engine.positions[key_b]
         assert pos_b.side == "LONG"
         assert Decimal(pos_b.quantity) == Decimal("2")
@@ -350,21 +327,18 @@ class TestPositionIsolation:
         """Close strategy A via SL; strategy B remains unchanged."""
         engine = PyMatchingEngine("100000", "0", "0")
 
-        # Open positions
         engine.submit_order(make_rust_order("a1", "LONG", quantity="1", strategy_id="strategy_a"))
         engine.submit_order(make_rust_order("b1", "LONG", quantity="1", strategy_id="strategy_b"))
 
         c1 = make_rust_candle(open_="50000", high="50100", low="49900", close="50050")
         engine.on_candle(c1)
 
-        # Strategy A places SL
         sl = make_rust_order(
             "a_sl", "LONG", order_type="STOP_LOSS", quantity="1",
             strategy_id="strategy_a", trigger_price="49000",
         )
         engine.submit_order(sl)
 
-        # Candle triggers SL
         c2 = make_rust_candle(
             open_="49500", high="49600", low="48500", close="48800",
             ts=1_700_001_800_000,
@@ -384,19 +358,15 @@ class TestPositionIsolation:
         assert Decimal(pos_b.quantity) == Decimal("1")
 
 
-# ===========================================================================
-# Test 3: Shared balance — both strategies deduct from the same pool
-# ===========================================================================
 class TestSharedBalance:
     """Verify that all strategies share one balance pool."""
 
     def test_both_strategies_deduct_fees_from_shared_balance(self):
         """Opening positions from two strategies deducts fees from the same balance."""
-        engine = PyMatchingEngine("10000", "0", "0.001")  # 0.1% taker
+        engine = PyMatchingEngine("10000", "0", "0.001")
 
         initial = Decimal("10000")
 
-        # Strategy A opens
         engine.submit_order(make_rust_order(
             "a1", "LONG", quantity="0.1", strategy_id="strategy_a",
         ))
@@ -409,7 +379,6 @@ class TestSharedBalance:
         assert fee_a == Decimal("50000") * Decimal("0.1") * Decimal("0.001")
         assert balance_after_a == initial - fee_a
 
-        # Strategy B opens
         engine.submit_order(make_rust_order(
             "b1", "SHORT", quantity="0.2", strategy_id="strategy_b",
         ))
@@ -424,16 +393,13 @@ class TestSharedBalance:
         fee_b = Decimal(fills_b[0].fee)
         assert fee_b == Decimal("50100") * Decimal("0.2") * Decimal("0.001")
 
-        # Total balance deduction = fee_a + fee_b from the SAME pool
         assert balance_after_b == initial - fee_a - fee_b
 
     def test_pnl_from_both_strategies_affects_shared_balance(self):
         """Realized PnL from closing both strategies hits the same balance."""
         engine = PyMatchingEngine("100000", "0", "0")
 
-        # Strategy A: LONG 1 BTC @ 50000
         engine.submit_order(make_rust_order("a1", "LONG", quantity="1", strategy_id="strategy_a"))
-        # Strategy B: SHORT 1 BTC @ 50000
         engine.submit_order(make_rust_order("b1", "SHORT", quantity="1", strategy_id="strategy_b"))
 
         c1 = make_rust_candle(open_="50000", high="50100", low="49900", close="50050")
@@ -442,7 +408,6 @@ class TestSharedBalance:
         initial_balance = Decimal(engine.balance)
         assert initial_balance == Decimal("100000")
 
-        # Close A via opposite order at 52000 -> PnL +2000
         engine.submit_order(make_rust_order(
             "a_close", "SHORT", quantity="1", strategy_id="strategy_a",
         ))
@@ -452,11 +417,9 @@ class TestSharedBalance:
         )
         engine.on_candle(c2)
 
-        # A closed at 52000, entry 50000 -> +2000
         balance_after_a_close = Decimal(engine.balance)
         assert balance_after_a_close == Decimal("102000")
 
-        # Close B via opposite order at 52000 -> PnL -2000 (short, price went up)
         engine.submit_order(make_rust_order(
             "b_close", "LONG", quantity="1", strategy_id="strategy_b",
         ))
@@ -466,14 +429,10 @@ class TestSharedBalance:
         )
         engine.on_candle(c3)
 
-        # B closed at 52000, entry 50000 -> -2000
         final_balance = Decimal(engine.balance)
-        assert final_balance == Decimal("100000")  # net zero
+        assert final_balance == Decimal("100000")
 
 
-# ===========================================================================
-# Test 4: CapitalAllocator integration
-# ===========================================================================
 class TestCapitalAllocator:
     """Test CapitalAllocator with per-strategy allocation and usage tracking."""
 
@@ -531,9 +490,6 @@ class TestCapitalAllocator:
         assert allocator.get_unallocated() == Decimal("10000")
 
 
-# ===========================================================================
-# Test 5: Full pipeline — BacktestRunner with two strategies
-# ===========================================================================
 class TestBacktestMultiStrategy:
     """End-to-end backtest with two strategies and the real Rust engine."""
 
@@ -605,7 +561,6 @@ class TestBacktestMultiStrategy:
         assert result is not None
         assert "total_pnl" in result
         assert "journal_count" in result
-        # Journal should have events from both strategies
         assert result["journal_count"] > 0
 
     @patch("src.core.backtest_runner.SessionLocal")
@@ -644,15 +599,10 @@ class TestBacktestMultiStrategy:
 
         assert result is not None
         journal_entries = result.get("journal", [])
-        # With 50 candles: StrategyA enters@5, exits@10; StrategyB enters@7, exits@14
-        # That means at least 4 entry events + fill events
         entry_events = [e for e in journal_entries if e.get("tag") == "entry"]
         assert len(entry_events) >= 2, f"Expected >=2 entry events, got {len(entry_events)}"
 
 
-# ===========================================================================
-# Test 6: strategy_id propagation through FillEvent
-# ===========================================================================
 class TestStrategyIdPropagation:
     """Verify strategy_id is correctly propagated in FillEvent from Rust."""
 
@@ -702,13 +652,9 @@ class TestStrategyIdPropagation:
         assert Decimal(pos_y.quantity) == Decimal("0.3")
         assert pos_y.strategy_id == "strat_y"
 
-        # Non-existent strategy returns None
         assert engine.get_position("nonexistent", PRODUCT_ID) is None
 
 
-# ===========================================================================
-# Test 7: SimulatedAdapter strategy-aware position lookup
-# ===========================================================================
 class TestSimulatedAdapterStrategyAware:
     """Verify SimulatedAdapter correctly passes strategy_id to/from Rust."""
 
@@ -716,11 +662,9 @@ class TestSimulatedAdapterStrategyAware:
         """get_position(product_id, strategy_id=...) returns correct position."""
         adapter = make_adapter("100000")
 
-        # Strategy A buys
         order_a = make_orm_order("ORD-A", "strat_1", side="buy", quantity=Decimal("1"))
         adapter.place_order(order_a)
 
-        # Strategy B sells
         order_b = make_orm_order("ORD-B", "strat_2", side="sell", quantity=Decimal("0.5"))
         adapter.place_order(order_b)
 

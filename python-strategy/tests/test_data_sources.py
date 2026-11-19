@@ -45,9 +45,6 @@ def _make_candles(
     return [_make_candle(start_ts + i * 60000, **kwargs) for i in range(count)]
 
 
-# =============================================================================
-# MemoryDataSource
-# =============================================================================
 
 
 class TestMemoryDataSourceBasics:
@@ -98,7 +95,6 @@ class TestMemoryDataSourceBasics:
 
     def test_get_candles_order_ascending(self):
         candles = _make_candles(5)
-        # Shuffle before passing
         ds = MemoryDataSource(list(reversed(candles)))
         result = list(ds.get_candles(PRODUCT, TF, 0, 9999999999999))
         timestamps = [c.timestamp for c in result]
@@ -166,9 +162,6 @@ class TestMemoryDataSourceAddCandles:
         assert timestamps == sorted(timestamps)
 
 
-# =============================================================================
-# CsvDataSource
-# =============================================================================
 
 
 class TestCsvDataSourceStandard:
@@ -310,7 +303,6 @@ class TestCsvDataSourceYahoo:
         ds = CsvDataSource(yahoo_csv, product_id=PRODUCT, timeframe="1d")
         result = list(ds.get_candles(PRODUCT, "1d", 0, 9999999999999))
         assert len(result) == 5
-        # Timestamps should have been parsed from date strings
         assert all(isinstance(c.timestamp, int) for c in result)
 
 
@@ -320,7 +312,7 @@ class TestCsvDataSourceEpochSeconds:
         """CSV with timestamps in epoch seconds (not ms)."""
         path = tmp_path / "epoch_s.csv"
         lines = ["timestamp,open,high,low,close,volume"]
-        base_ts = 1704067200  # seconds
+        base_ts = 1704067200
         for i in range(5):
             ts = base_ts + i * 60
             lines.append(f"{ts},42000,42100,41900,42050,500")
@@ -331,7 +323,6 @@ class TestCsvDataSourceEpochSeconds:
         ds = CsvDataSource(epoch_s_csv, product_id=PRODUCT, timeframe=TF)
         result = list(ds.get_candles(PRODUCT, TF, 0, 9999999999999))
         assert len(result) == 5
-        # Should be in milliseconds
         assert result[0].timestamp >= 1e12
 
 
@@ -362,14 +353,11 @@ class TestCsvDataSourceLazyLoad:
         path.write_text("\n".join(lines))
 
         ds = CsvDataSource(str(path), product_id=PRODUCT, timeframe=TF)
-        assert ds._df is None  # Not loaded yet
+        assert ds._df is None
         list(ds.get_candles(PRODUCT, TF, 0, 9999999999999))
-        assert ds._df is not None  # Now loaded
+        assert ds._df is not None
 
 
-# =============================================================================
-# DatabaseDataSource
-# =============================================================================
 
 
 class TestDatabaseDataSource:
@@ -457,7 +445,6 @@ class TestDatabaseDataSource:
         from src.core.data_sources.database import DatabaseDataSource
 
         mock_session = MagicMock()
-        # First call returns min, second returns max
         mock_session.query.return_value.filter.return_value.scalar.side_effect = [
             1704067200000,
             1704153600000,
@@ -503,9 +490,6 @@ class TestDatabaseDataSource:
         assert ds.validate() is False
 
 
-# =============================================================================
-# YahooFinanceDataSource
-# =============================================================================
 
 
 class TestYahooFinanceDataSource:

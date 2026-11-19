@@ -150,8 +150,6 @@ def test_authority_held_through_factory_pin_and_explicit_retry(profile_repositor
         with engine.connect() as db:
             assert db.scalar(select(func.count()).select_from(SeedRow)) == 1
 
-        # Request the original durable identity. A changed version/config shares
-        # the lock, but must not reuse another durable key's seed after release.
         resolver.return_value = identity
         checkpoint = len(sql)
         retry = contender.prepare_initial_seed_under_admission(

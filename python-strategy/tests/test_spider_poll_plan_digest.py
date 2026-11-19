@@ -28,7 +28,6 @@ def fixture(present=True) -> dict[str, Any]:
 
 
 def oracle(present):
-    # Independent literal reconstruction; no production segment encoders or fixture traversal.
     account = raw("V", "E", "雪") + b"\x01" + raw("S")
     def stage(i, name, kind, payload):
         return (raw(i, "snapshot_request_v1") + account + raw(name, kind, "FROZEN_POLL_FIXTURE")

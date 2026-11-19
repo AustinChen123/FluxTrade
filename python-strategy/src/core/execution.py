@@ -864,8 +864,6 @@ class ExecutionEngine:
         elif entry_filled == 0:
             exposure = ExposureEvidence.FLAT
         elif self._position_loader is None:
-            # Without a position authority, retain the prior OCO completion
-            # interpretation; otherwise the filled parent is open evidence.
             exposure = (
                 ExposureEvidence.FLAT
                 if sibling is not None
@@ -1494,8 +1492,6 @@ class ExecutionEngine:
         Also places SL/TP/Trailing orders when specified in the signal.
         Returns the Order ID (Internal) if successful.
         """
-        # Gate: reject if the submission gate has been halted by a kill switch
-        # or while owned-order reconciliation runs after a reconnect.
         admission_rejection = self._submission_gate_owner.try_begin_submission()
         if admission_rejection is not None:
             cause = (
@@ -1556,7 +1552,6 @@ class ExecutionEngine:
         if not side:
             return None
 
-        # Determine Quantity
         qty = self._quantity_for_signal(signal, exit_decision=exit_decision)
 
         resolved_intent = self._resolve_order_intent_or_reject(signal, candle)
@@ -1565,7 +1560,6 @@ class ExecutionEngine:
         order_type = resolved_intent.order_type
         limit_price = resolved_intent.limit_price
 
-        # 1. Create Entry Order in DB
         intent_payload = self._signal_order_intent(signal, resolved_intent) or {}
         intent_payload.update(self._entry_protection_snapshot(signal))
         order = self.order_manager.create_order(
@@ -1593,7 +1587,6 @@ class ExecutionEngine:
             )
             return None
 
-        # 2. Execute via Adapter
         try:
             self.logger.info("Sending Order %s via Adapter...", order.id)
             t0 = _time.monotonic()
@@ -1638,10 +1631,8 @@ class ExecutionEngine:
             )
             return None
 
-        # 3. Journal: record entry
         self._journal_entry(signal, order, side, order_type)
 
-        # 4. Place conditional orders (SL/TP/Trailing)
         if conditional_orders and not atomic_group:
             self._place_conditional_orders(conditional_orders)
 
@@ -2163,8 +2154,6 @@ class ExecutionEngine:
         audit=None,
     ) -> None:
         for order in [entry_order, *conditional_orders]:
-            # These records were created by this invocation and the wire seam
-            # raised before its submit-attempt callback.
             order.submitted_at = None
             self.order_manager.fail_order(order, error.reason)
 

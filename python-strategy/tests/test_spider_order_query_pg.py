@@ -385,7 +385,6 @@ def test_actual_receipt_orders_and_trades_reach_browser_unchanged(
 
     from http.server import ThreadingHTTPServer
 
-    # Use the same configured-scope composition as the service entrypoint.
     auth = BrowserSessionAuth(
         allowed_origin="https://127.0.0.1",
         operator_capability="unused-read-only-capability",
@@ -403,7 +402,6 @@ def test_actual_receipt_orders_and_trades_reach_browser_unchanged(
         spider_execution_scope_id=scope.execution_scope_id,
         readiness_probe=lambda: None,
     )
-    # Bind an ephemeral loopback TLS listener and serve the already-built UI.
     frontend_dist = Path(__file__).resolve().parents[2] / "frontend" / "dist"
     assert (frontend_dist / "index.html").is_file()
     with tempfile.TemporaryDirectory(prefix="spider-order-browser-") as tmp:
@@ -813,7 +811,6 @@ def test_statement_timeout_returns_unavailable_and_closes_transaction(
     assert response == {"error": "spider_order_query_unavailable"}
     assert _facts_snapshot(engine, scope.strategy_id) == before_financial
     assert _runtime_snapshot(engine, scope) == before_runtime
-    # A fresh request after the cancelled READ ONLY transaction must still work.
     retry_status, retry = service.orders(f"strategy_id={quote(scope.strategy_id)}")
     assert retry_status == 200 and retry["orders"]
 
@@ -899,15 +896,11 @@ def test_actual_execution_changes_hidden_content_and_null_evidence_conflicts(
     assert saved_trade["provider_trade_id_status"] == "NOT_RECORDED"
     assert saved_trade["price"] == canonical_decimal_text(order.price)
     assert saved_trade["quantity"] == canonical_decimal_text(quantity)
-    # The normal ExecutionEngine event producer records absent fee input as
-    # zero in the existing accounting path; this test preserves that behavior.
     assert saved_trade["fee"] == "0"
     assert saved_trade["fee_asset"] == "USDT"
     assert saved_trade["fee_evidence"] == "RECORDED"
     assert row["trade_count"] == 1
 
-    # Nullable fee projection is a separate saved-DB read fixture, not a claim
-    # that the normal execution producer emits unknown fees.
     with Session(engine) as session, session.begin():
         session.execute(
             update(Trade)

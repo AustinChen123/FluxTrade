@@ -136,7 +136,6 @@ class HealthChecker:
         db_result = self.check_database()
         exchange_result = self.check_exchange()
 
-        # Aggregate: worst component wins
         component_statuses = [redis_result.status, db_result.status, exchange_result.status]
         if ComponentStatus.UNHEALTHY in component_statuses:
             overall = ComponentStatus.UNHEALTHY

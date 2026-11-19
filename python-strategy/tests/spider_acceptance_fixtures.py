@@ -72,7 +72,6 @@ def empty_plan(fact, kind) -> dict[str, Any]:
 
 
 def record_native(monkeypatch, log):
-    # Call-through only: retain every actual native result, never patch its value.
     for name in ("apply_group", "capture_snapshot", "build_delivery", "inspect_state"):
         original = getattr(wire.ScenarioCodec, name)
         def record(self, *args, _name=name, _original=original):

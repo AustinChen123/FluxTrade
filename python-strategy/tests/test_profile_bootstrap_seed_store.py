@@ -107,7 +107,6 @@ def test_loser_missing_and_valid_conflict():
     store, _, state, _, _ = harness()
     state["loser"] = True
     assert store.pin(sample()).already_present
-    # Use an empty valid envelope to vary content without changing its key.
     different = replace(sample(), dataset_digest="d" * 64, max_seed_candles=10)
     for method in (store.pin, store.confirm):
         with pytest.raises(BootstrapSeedConflict, match="^BOOTSTRAP_SEED_CONFLICT$"):

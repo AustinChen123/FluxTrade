@@ -211,7 +211,6 @@ def build_modeled_bootstrap_seed(
             _integer(candle.timestamp)
             if candle.timestamp != start + index * duration:
                 raise ValueError
-            # Empty context is a temporary validation carrier, never returned or pinned.
             prepared.append(
                 BootstrapCandle(
                     candle.timestamp,

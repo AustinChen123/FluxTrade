@@ -31,14 +31,11 @@ from src.core.risk_manager import AccountService, RiskManager
 from src.core.runtime_reconcile import PositionAuthorityState, RuntimeReconciliationJob
 
 
-# =============================================================================
-# Helpers / fakes
-# =============================================================================
 
 PRODUCT_ID = "BINANCE:BTCUSDT-PERP"
 STRATEGY_ID = "strat_alpha"
 
-SMALL = Decimal("0.001")  # below any threshold used in tests
+SMALL = Decimal("0.001")
 THRESHOLD_QTY = Decimal("0.01")
 THRESHOLD_BAL = Decimal("1.00")
 
@@ -179,9 +176,6 @@ def _make_job(
     return job, account, adapter
 
 
-# =============================================================================
-# Matrix tests
-# =============================================================================
 
 
 class TestRunOnceResultShape:
@@ -273,7 +267,7 @@ class TestRunOnceNoDrift:
         job, _, _ = _make_job(
             local_positions=[local_pos],
             exchange_positions={PRODUCT_ID: exchange_pos},
-            qty_threshold=THRESHOLD_QTY,  # SMALL < THRESHOLD_QTY
+            qty_threshold=THRESHOLD_QTY,
         )
 
         with patch("src.core.runtime_reconcile.write_system_event") as mock_write:
@@ -288,7 +282,7 @@ class TestRunOnceQuantityDrift:
 
     def test_quantity_drift_above_threshold_reported(self):
         local_qty = Decimal("2.000")
-        exchange_qty = Decimal("1.000")  # diff = 1.0 >> THRESHOLD_QTY
+        exchange_qty = Decimal("1.000")
         local_pos = _make_position(quantity=local_qty)
         exchange_pos = _make_position(quantity=exchange_qty)
         job, _, _ = _make_job(
@@ -324,7 +318,6 @@ class TestRunOnceQuantityDrift:
             job.run_once()
             payload = mock_write.call_args.kwargs["payload"]
 
-        # The event payload must mirror the returned result
         assert "position_drifts" in payload
         assert len(payload["position_drifts"]) >= 1
 
@@ -665,7 +658,7 @@ class TestRunOnceAsymmetricDrift:
         local_pos = _make_position(quantity=Decimal("1.5"))
         job, _, _ = _make_job(
             local_positions=[local_pos],
-            exchange_positions={PRODUCT_ID: None},  # exchange flat
+            exchange_positions={PRODUCT_ID: None},
         )
 
         with patch("src.core.runtime_reconcile.write_system_event") as mock_write:
@@ -679,7 +672,6 @@ class TestRunOnceAsymmetricDrift:
     def test_exchange_has_position_local_flat_is_drift(self):
         """Exchange has position, local is flat → drift reported."""
         exchange_pos = _make_position(quantity=Decimal("2.0"))
-        # local has no position but exchange does — job must check exchange too
         job, _, _ = _make_job(
             local_positions=[],
             exchange_positions={PRODUCT_ID: exchange_pos},
@@ -687,9 +679,6 @@ class TestRunOnceAsymmetricDrift:
 
         with patch("src.core.runtime_reconcile.write_system_event") as mock_write:
             result = job.run_once()
-            # Drift must be detected; the event may or may not fire depending
-            # on whether the job enumerates exchange-side positions.
-            # The spec says "both directions" — an event must fire.
             mock_write.assert_called_once()
 
         assert len(result["position_drifts"]) >= 1
@@ -729,7 +718,7 @@ class TestRunOnceBalanceDrift:
 
     def test_balance_drift_above_threshold_reported(self):
         local_bal = Decimal("10000.00")
-        exchange_bal = Decimal("9000.00")  # diff = 1000 >> THRESHOLD_BAL
+        exchange_bal = Decimal("9000.00")
         job, account, _ = _make_job(
             local_balance=local_bal,
             exchange_balance=exchange_bal,
@@ -949,7 +938,6 @@ class TestRunOnceAdapterError:
             get_position_raises=RuntimeError("exchange timeout"),
         )
 
-        # Must NOT raise
         result = job.run_once()
 
         assert len(result["errors"]) >= 1
@@ -1054,11 +1042,9 @@ class TestRunOnceAdapterError:
         subsequent balance check is still attempted.
         """
         local_pos = _make_position()
-        # Even if positions error, balance comparison must still run
         local_bal = Decimal("10000")
-        exchange_bal = Decimal("5000")  # drift beyond threshold
+        exchange_bal = Decimal("5000")
 
-        # Build a custom job where get_position raises but get_balance works
         account = FakeAccountService(positions=[local_pos], balance=local_bal)
 
         class PartialFailAdapter:
@@ -1080,11 +1066,7 @@ class TestRunOnceAdapterError:
 
         result = job.run_once()
 
-        # Position error recorded
         assert len(result["errors"]) >= 1
-        # Balance drift should still be detected (balance check independent of position check)
-        # OR the job may group them — either way, no exception propagated
-        # At minimum: no exception and errors list non-empty
         assert result is not None
 
 
@@ -1110,7 +1092,7 @@ class TestRunOnceMultipleProducts:
         exchange_drift = _make_position(
             strategy_id="s2",
             product_id="BINANCE:ETHUSDT-PERP",
-            quantity=Decimal("1.0"),  # drifts from 5.0
+            quantity=Decimal("1.0"),
         )
         job, _, _ = _make_job(
             local_positions=[pos_ok, pos_drift],

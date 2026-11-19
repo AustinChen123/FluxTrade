@@ -20,8 +20,6 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
-# Known product mappings with exchange-specific overrides.
-# Only entries that cannot be derived from generic parsing need to be here.
 _KNOWN_PRODUCTS: dict[str, dict] = {
     "BINANCE:BTCUSDT-SPOT": {
         "exchange": "binance",

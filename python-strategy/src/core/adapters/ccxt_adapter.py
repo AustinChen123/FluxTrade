@@ -103,7 +103,6 @@ class CcxtExchangeAdapter(IExchangeAdapter):
             "Connected to %s (%s)", self.exchange_id, "testnet" if testnet else "live"
         )
 
-    # -- IExchangeAdapter ------------------------------------------------
 
     def _exchange_client_order_id(self, client_order_id: str) -> str:
         parse_client_order_id(client_order_id)

@@ -438,9 +438,6 @@ def test_scaled_adapter_market_data_speed_against_decimal_boundary():
 
     assert metrics["count"] == 50_000
     assert metrics["rounds"] == 5
-    # This diagnostic intentionally does not assert scaled is faster. Inline
-    # Decimal->units encoding can be slower than the current string boundary;
-    # the promoted path should pre-encode units during data preparation.
     assert metrics["decimal_avg"] > 0
     assert metrics["scaled_avg"] > 0
 

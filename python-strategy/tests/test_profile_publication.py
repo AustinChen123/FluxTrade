@@ -81,7 +81,6 @@ def test_invalid_roots_keys_cycles_and_float() -> None:
     for bad in [[], MappingProxyType({}), {1: "bad"}, {type("S", (str,), {})("a"): 1}]:
         with pytest.raises(ValueError):
             CanonicalJsonObject(bad)  # type: ignore[arg-type]
-    # JSON float rejection is a type-boundary test, not financial arithmetic.
     with pytest.raises(ValueError):
         CanonicalJsonObject({"value": float("nan")})
     cyclic: dict[str, Any] = {}

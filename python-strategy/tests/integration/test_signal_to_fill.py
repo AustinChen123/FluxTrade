@@ -33,9 +33,6 @@ else:
     )
 
 
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
 @pytest.fixture
 def clock():
     return MockClock(initial_time=1_700_000_000)
@@ -114,9 +111,6 @@ def _make_candle_at(close: Decimal, ts: int = 1_700_000_900_000) -> Candlestick:
     )
 
 
-# ===========================================================================
-# Test: Full Signal → Order → Fill pipeline
-# ===========================================================================
 class TestSignalToFillPipeline:
     """Test the complete signal-to-fill pipeline without external services."""
 
@@ -181,9 +175,6 @@ class TestSignalToFillPipeline:
         assert len(adapter.open_orders) == 0
 
 
-# ===========================================================================
-# Test: Signal with SL/TP creates conditional orders
-# ===========================================================================
 class TestConditionalOrders:
     """Test SL/TP/Trailing conditional order creation via execute_signal."""
 
@@ -196,7 +187,6 @@ class TestConditionalOrders:
         )
         execution_engine.execute_signal(signal)
 
-        # entry + SL + TP = 3 orders
         assert len(adapter.open_orders) == 3
 
     def test_signal_with_sl_only(self, execution_engine, adapter):
@@ -218,9 +208,6 @@ class TestConditionalOrders:
         assert len(adapter.open_orders) == 2
 
 
-# ===========================================================================
-# Test: Risk manager integration
-# ===========================================================================
 class TestRiskManagerIntegration:
     """Test risk manager gates within the signal flow."""
 
@@ -250,7 +237,6 @@ class TestRiskManagerIntegration:
 
     def test_risk_blocks_over_exposure(self, risk_manager, account_service):
         """Signal exceeding max exposure should be rejected."""
-        # Set a large existing position
         account_service.set_position(
             Position(
                 strategy_id="test-strategy",
@@ -267,9 +253,6 @@ class TestRiskManagerIntegration:
         assert passed is False
 
 
-# ===========================================================================
-# Test: Journal records events
-# ===========================================================================
 class TestJournalIntegration:
     """Test that journal captures events through the pipeline."""
 
@@ -291,13 +274,9 @@ class TestJournalIntegration:
         execution_engine.process_market_data(candle)
 
         events = journal.to_dicts()
-        # Should have entry + fill events
         assert len(events) >= 2
 
 
-# ===========================================================================
-# Test: Adapter failure handling
-# ===========================================================================
 class TestAdapterFailure:
     """Test error handling when adapter rejects orders."""
 
