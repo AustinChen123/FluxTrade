@@ -352,13 +352,11 @@ def test_indexed_poll_checker_matches_original_for_delivery_multimap_collisions(
             break
         target = None
     assert target is not None
-    # Same schedule/time, distinct stable identity must retain cardinality=2.
     duplicate_identity = deepcopy(target)
     duplicate_identity["key"]["stable_id"] += "-other"
     observation["records"].append(duplicate_identity)
     _assert_poll_checker_differential(observation, cutoff, mode)
     observation["records"].pop()
-    # Same stable identity at another schedule/time must not enter the bucket.
     duplicate_time = deepcopy(target)
     duplicate_time["key"]["schedule_sequence"] += 100_000
     duplicate_time["key"]["visible_at"] += 1

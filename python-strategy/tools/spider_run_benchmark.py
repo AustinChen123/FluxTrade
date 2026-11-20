@@ -215,7 +215,6 @@ def run(
     process = subprocess.Popen(
         child_command,
         cwd=Path(__file__).resolve().parents[1],
-        # The native extension may live only in src/ (CI layout); children need it on the path.
         env={**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, (str(Path(__file__).resolve().parents[1] / "src"), os.environ.get("PYTHONPATH"))))},
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -311,7 +310,6 @@ def run(
                 admission = {"decision": "ERROR", "reason": str(error)}
         else:
             admission = {"decision": "UNAVAILABLE", "reason": "RUN_DIRECTORY_MISSING"}
-    # The CLI result reports outcome/reason; admission gives the persisted classification independently.
     input_minutes = None
     try:
         from src.core.backtest.spider_historical_input import (

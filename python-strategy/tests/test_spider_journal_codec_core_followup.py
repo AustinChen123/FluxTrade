@@ -67,7 +67,6 @@ def test_state_is_tuple_of_immutable_bytes_and_rejected_calls_do_not_commit():
     with pytest.raises(ValueError, match="CODEC_UNSUPPORTED_ROW"):
         codec.encode_p3_v2_row(_market([{"bad": "shape"}], []), proposed)
 
-    # Simulate a write failure by declining to adopt the proposed state.
     retry_row, retry_state = codec.encode_p3_v2_row(source)
     assert retry_row == encoded
     assert retry_state == before

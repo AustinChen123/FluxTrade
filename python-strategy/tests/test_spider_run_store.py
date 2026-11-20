@@ -670,8 +670,6 @@ def test_finalize_rereads_and_completion_visibility_freezes(tmp_path, monkeypatc
 
 
 _STORE_IMPORT_FORBIDDEN_WORDS = ("plans", "codec", "scheduler", "policy", "admission")
-# JOURNAL_AB_DESIGN_v3 T7 S7 assigns append encoding to this persistence store;
-# this store-owned codec is allowed while strategy/scenario codecs stay forbidden.
 _STORE_IMPORT_ALLOWED = frozenset({"src.core.backtest.spider_journal_codec_v2"})
 
 
@@ -689,7 +687,6 @@ def _store_forbidden_imports(source: str) -> set[str]:
                 base = node.module or ""
             if base:
                 imports.add(base)
-                # Symbols imported from this exact allowed module remain in its boundary.
                 if base not in _STORE_IMPORT_ALLOWED:
                     imports.update(f"{base}.{alias.name}" for alias in node.names)
     forbidden = {

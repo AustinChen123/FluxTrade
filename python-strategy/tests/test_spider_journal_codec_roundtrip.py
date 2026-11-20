@@ -154,8 +154,6 @@ def test_small_real_f_in_row_round_trips_byte_for_byte_through_j3_reader(tmp_pat
         / "fixtures/spider_codec_v2/s0_fin_historical_market_row.json"
     )
     raw_v1 = fixture_path.read_bytes()
-    # Provenance: line 87 of S0/fin-a/fin/journal.jsonl, captured before J4;
-    # SHA-256 covers the canonical row and its JSONL LF.
     assert hashlib.sha256(raw_v1).hexdigest() == (
         "30461a32cc6062f6be2ec7649a3976c05dff10d29582b604781c8577ac1dbf41"
     )

@@ -196,7 +196,6 @@ def _historical_configuration(raw: bytes, run_id: str, *, _tokenized: bool = Fal
     try:
         token = _decode_historical_input_validated(raw) if _tokenized else None
     except _UnapprovedHistoricalInputTree:
-        # Non-exact DTO trees keep the pre-token validation path.
         token = None
     run = token.run if token is not None else _decode_historical_input(raw)
     if run.run_id != run_id:

@@ -31,7 +31,6 @@ _WORKING_FIELDS = frozenset(
 )
 
 
-# Entry = (kind, ordered (path, exact order fields) slots, optional snapshot selector).
 P3_V2_SLOT_TABLE = (
     (
         "HISTORICAL_MARKET_RESULT",

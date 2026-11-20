@@ -25,7 +25,6 @@ from typing import Any
 
 from src.core.backtest.spider_run_completion_schema import _P3_ARTIFACTS
 
-# These paths correspond to the PROGRAM and NATIVE_ARTIFACT entries of input_contract_hashes.
 _REQUIRED_ARTIFACTS = {name for name, _schema in _P3_ARTIFACTS} | {"completion.json"}
 _EXPECTED_DIFFERENCES = {
     "attempt.json": {

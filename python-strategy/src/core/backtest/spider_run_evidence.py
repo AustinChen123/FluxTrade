@@ -524,8 +524,6 @@ def _historical_polls_endpoint_mode_compatible_fast(
     if not _historical_pending_matches(observation, cutoff, allow_same_time=allow_terminal_delivery):
         return False
 
-    # Keep the original poll, stage, and capture-before-delivery loops and their
-    # query-read points. Only the three records scans are replaced by buckets.
     return _historical_polls_endpoint_mode_compatible_indexed(
         observation, cutoff, mode, paid_prefix, allow_terminal_delivery,
         timers, captures, deliveries,
@@ -709,7 +707,6 @@ def _historical_poll_fast_path_inputs_safe(
     for name in ("records", "polls", "pending_keys"):
         if name not in observation or type(observation[name]) is not list:
             return False
-    # Required indexed fields still fail closed when absent.
     for row in observation["records"]:
         if type(row) is not dict or "kind" not in row:
             return False

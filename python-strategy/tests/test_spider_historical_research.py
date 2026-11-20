@@ -256,7 +256,6 @@ _RESEARCH_INTERNAL_MODULES = {
     "src.core.backtest.synthetic_scenario_codec",
 }
 _HEAD_INPUT_EXCEPTION_CASES = (
-    # These expected dispositions are frozen from a0996166 input-matrix-base.json.
     ("OSError", OSError, ("MATRIX_ERROR",), True),
     ("ValueError", ValueError, ("MATRIX_ERROR",), True),
     ("ValueErrorEmpty", ValueError, (), True),
@@ -978,7 +977,6 @@ def test_failure_dto_schema_has_no_economic_fields():
     ],
 )
 def test_head_input_rejections_match_durable_outcomes(tmp_path, monkeypatch, case):
-    # Frozen a0996166: the P3 configuration catch tuple returns REJECTED/UNSUPPORTED_CONFIGURATION.
     value, raw = _small_input("reject-" + (case if isinstance(case, str) else case.__name__))
     if case == "malformed":
         raw = b"{}"

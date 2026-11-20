@@ -8,7 +8,6 @@ LEG32 = 33_554_432
 PAID_JOURNAL_LIMIT = LEG32
 GROSS_REPORT_LIMIT = LEG32
 
-# T1.3. `None` means a separately-derived v2 value; J1 does not activate v2.
 POLICY_TABLE: dict[tuple[str, str, str], int | None] = {
     ("P3", "v1", "journal.jsonl"): LEG32,
     ("P3", "v1", "other"): DEFAULT_LIMIT,
@@ -27,8 +26,6 @@ POLICY_TABLE: dict[tuple[str, str, str], int | None] = {
     ("P2", "v1", "other"): DEFAULT_LIMIT,
 }
 
-# P3-v2 structural policy. Delivery attempts are admitted by the common row
-# schema but are not writable P3-v2 journal rows (the executor skips them).
 P3_V2_COVERAGE_KINDS = (
     "HISTORICAL_MARKET_STEP",
     "HISTORICAL_MARKET_CACHE",
@@ -62,7 +59,7 @@ P3_V2_DEFS_PER_MARKET = 7
 P3_V2_DEFCAP = 425
 P3_V2_ROW_MAX = 1_048_576
 P3_V2_MAX_DEFINITION_BYTES = 4_096
-P3_V2_HEADER_BYTES = 0  # JSONL has no separate file prelude.
+P3_V2_HEADER_BYTES = 0
 P3_V2_WIRE_CEILING = 512 * 1_048_576
 P3_V2_MATERIAL_CEILING = 512 * 1_048_576
 P3_V2_EXP_MAX = 6

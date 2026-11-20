@@ -250,13 +250,11 @@ def test_historical_report_bytes_match_head_e872b973(tmp_path):
     result = run.run_spider_scenario(str(tmp_path), value.run_id, run._P3_SELECTOR, raw)
     assert result == dict(run_id=value.run_id, outcome="ADMITTED", reason=None)
     report_bytes = (tmp_path / value.run_id / "report.jsonl").read_bytes()
-    # Captured by the real durable caller/store on HEAD e872b973 before extraction.
     assert len(report_bytes) == 5926
     assert sha256(report_bytes).hexdigest() == "84d9933d07023f8b07dd46ae6eca10a0d5b513812e9597d1cfbf892a35f2a16a"
 
 
 def test_historical_projection_error_occurs_after_final_captures_like_head(tmp_path, monkeypatch):
-    # This is a frozen legacy-v1 journal/status byte-fingerprint oracle.
     monkeypatch.setattr(run, "_P3_ATTEMPT_ARTIFACT_ENCODING", "artifact_encoding_v1")
     value, raw = historical_input("report-error-head")
     captured = []
@@ -871,7 +869,6 @@ def test_t54_registration_refusal_real_runner(
     monkeypatch.setattr(limits, "p3_v2_scope_budget", lambda _coverage: {"refused": False})
     register_states = []
     if cell == "REG-register-guard":
-        # Skip only the runner hook so the authoritative register() guard owns refusal.
         monkeypatch.setattr(run, "_artifact_limits", SimpleNamespace(p3_v2_registration_preflight=lambda *_: None))
         register = storage.SpiderRunStore.register
 

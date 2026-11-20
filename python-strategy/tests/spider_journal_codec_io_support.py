@@ -22,8 +22,6 @@ from spider_journal_codec_test_support import (
 
 
 def _without_context_members(rows):
-    # Test-only composition of the later B2 step: J4 must not implement the
-    # context gate/removal, while the J3 reader requires the final v2 shape.
     result = copy.deepcopy(rows)
     for row in result:
         row.pop("configuration_context", None)

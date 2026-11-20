@@ -272,8 +272,6 @@ class HistoricalRunInput:
 
 
 _VALIDATED_INPUT_CONSTRUCTION_SEAL = object()
-# The current DTO tree has no enum leaves. A future enum field must add its
-# exact, reviewed enum class here; accepting arbitrary Enum subclasses is not safe.
 _VALIDATED_INPUT_ENUM_TYPES: tuple[type[Enum], ...] = ()
 
 

@@ -17,7 +17,6 @@ def build_real_p3_artifacts(tmp_path_factory):
 
     root = tmp_path_factory.mktemp("j6-real-p3-finalize")
     run, raw = make_historical_input("j6-real-p3-finalize")
-    # This fixture is legacy-v1 source material for v2 writer/reader conversion tests.
     original_encoding = scenario._P3_ATTEMPT_ARTIFACT_ENCODING
     scenario._P3_ATTEMPT_ARTIFACT_ENCODING = "artifact_encoding_v1"
     try:

@@ -20,8 +20,6 @@ SCHEMAS = ("spider_attempt_v1", "spider_status_v1", "spider_journal_record_v1", 
 DIAGNOSTIC = ("completion.json", "status.json", "journal.jsonl")
 FRONTIER = ("attempt.json", "status.json", "journal.jsonl", "completion.json")
 
-# Outcomes were run against a HEAD export at 5ec93e46; J1 changes only the
-# P3 journal over-limit reason in the single oversize-only case.
 _HEAD_FAILURES = {
     **{case: ("MISSING_COMPLETE_MANIFEST", DIAGNOSTIC) for case in (
         "status_oserror", "journal_oserror", "status_oversize", "invalid_journal",
@@ -668,8 +666,6 @@ def p3_v2_diagnosis_bundle(p3_v2_admission_bundle):
     return p3_v2_admission_bundle
 
 
-# Independent expected rows from JOURNAL_AB_DESIGN_v3 T1.4/T3.3 and J9's
-# diagnostic classification contract; do not derive these from the reader.
 _V2_DIAGNOSIS_EXPECTED = {
     "E1-limit": "ARTIFACT_LIMIT_EXCEEDED",
     "E5-limit": "ARTIFACT_LIMIT_EXCEEDED",
@@ -818,9 +814,6 @@ def p3_v2_admission_values(p3_v2_admission_bundle):
     return result["artifacts"]
 
 
-# Independent expected outcomes from JOURNAL_AB_DESIGN_v3 T1.1/T1.4 and the
-# existing S3 manifest-binding contract; expected values are not computed by
-# admission or the reader under test.
 _J10_ITEM3_EXPECTED = {
     "attempt-swap-retained": ("ACCEPT", None),
     "mixed-v1-manifest-v2-journal": ("REJECT", "UNSUPPORTED_SCHEMA"),
@@ -836,8 +829,6 @@ _J10_ITEM3_EXPECTED = {
 }
 
 
-# Independent HEAD 451f641e oracle for each v1-only consumer of the relaxed
-# attempt validator. Encodings are actual values written into valid P3 attempts.
 _V1_ATTEMPT_ROUTE_EXPECTED = {
     ("admit-v1-manifest", "artifact_encoding_v1"): ("ACCEPT", None),
     ("admit-v1-manifest", "artifact_encoding_v2"): ("REJECT", "UNSUPPORTED_SCHEMA"),

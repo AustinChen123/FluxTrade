@@ -1008,8 +1008,6 @@ class _ReplayComposition:
 
     def _commit_admit_records(self, records: list[dict[str, Any]]) -> None:
         entries = self._prepare_admit_index_entries(records)
-        # Preflight completes before the first records mutation. From here to the final
-        # push, exact built-in containers and exact int/string tuple keys prevent user hooks.
         for index, record in enumerate(records):
             key = record["key"]
             self._records[(key[1], key[3])] = record

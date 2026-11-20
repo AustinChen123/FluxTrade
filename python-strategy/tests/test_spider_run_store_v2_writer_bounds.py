@@ -14,7 +14,7 @@ from spider_run_store_v2_fixtures import (
 )
 
 
-ROW_MAX = 1_048_576  # v2 D2.4 inclusive 1 MiB wire-row ceiling.
+ROW_MAX = 1_048_576
 
 
 @pytest.mark.parametrize("delta", [-1, 0, 1])
@@ -32,8 +32,6 @@ def test_v2_wire_row_max_inclusive_with_real_file_io(
         return budget
 
     monkeypatch.setattr(module.artifact_limits, "p3_v2_scope_budget", row_budget)
-    # Isolate the wire ROW_MAX check; expanded-row acceptance is exercised below
-    # with the unmodified shared J6 helper.
     monkeypatch.setattr(module, "projected_jsonl_budget_ok", lambda **kwargs: True)
     row = callback_row(store, values, ROW_MAX + delta)
     expected_v2 = deepcopy(row)

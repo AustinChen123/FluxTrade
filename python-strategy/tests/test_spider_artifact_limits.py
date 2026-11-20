@@ -113,10 +113,6 @@ def test_p3_v2_closed_record_kinds_match_common_schema():
     assert schema_kinds - {"DELIVERY_ATTEMPT"} == limits.P3_V2_RECORD_KINDS
 
 
-# Captured v2 wire metrics for every durable fixture family. H07 is omitted:
-# its oracle test exercises ScenarioCodec directly and creates no P3 attempt or journal.
-# endpoint-flat/partial: test_spider_historical_replay._historical_endpoint_case
-# (second policy row inactive), measured independently by the 3b r2 reviewer.
 P3_V2_FIXTURES = (
     ("F-IN", (287, 96, 24), (459303, 1177725, 616274, 346894), 80, 30894),
     ("H01", (23, 8, 2), (38460, 95284, 65035, 279066), 17, 6385),

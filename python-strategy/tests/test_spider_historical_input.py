@@ -475,7 +475,7 @@ def test_validated_input_token_uses_slots_and_public_decoder_keeps_validation_co
 
     monkeypatch.setattr(historical_input_module, "validate_historical_input", counted)
     assert decode_historical_run_input(raw) == run
-    assert calls == 2  # public decoder keeps its HEAD validator plus canonical-encoder validation
+    assert calls == 2
 
 
 def _mutable_subclass(node):

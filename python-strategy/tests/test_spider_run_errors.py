@@ -90,7 +90,6 @@ def test_moved_classes_preserve_head_bytes_and_alias_identity():
         (store.SpiderRunStoreError, ("PUBLICATION_FAILED",), "src.core.backtest.spider_run_store", "80049596000000000000008c227372632e636f72652e6261636b746573742e7370696465725f72756e5f73746f7265948c1353706964657252756e53746f72654572726f729493948c125055424c49434154494f4e5f4641494c454494859452947d94288c06726561736f6e9468038c187265717565737465645f6661696c7572655f726561736f6e944e8c0f7072696d6172795f6661696c757265944e75622e", "SpiderRunStoreError('PUBLICATION_FAILED')", "PUBLICATION_FAILED", "src.core.backtest.spider_run_store.SpiderRunStoreError: PUBLICATION_FAILED\n"),
         (evidence.ReconciliationProjectionError, (), "src.core.backtest.spider_run_evidence", "80049570000000000000008c257372632e636f72652e6261636b746573742e7370696465725f72756e5f65766964656e6365948c1d5265636f6e63696c696174696f6e50726f6a656374696f6e4572726f729493948c1e454e44504f494e545f5245434f4e43494c494154494f4e5f4641494c454494859452942e", "ReconciliationProjectionError('ENDPOINT_RECONCILIATION_FAILED')", "ENDPOINT_RECONCILIATION_FAILED", "src.core.backtest.spider_run_evidence.ReconciliationProjectionError: ENDPOINT_RECONCILIATION_FAILED\n"),
     )
-    # Values captured from HEAD 334401c906d787a56a86cf866092c87ea4d5fb37 via review/base-probe.json.
     for cls, args, module, raw_hex, expected_repr, expected_str, only_text in expected:
         error = cast(Any, cls)(*args)
         raw = pickle.dumps(error, protocol=4)
@@ -110,7 +109,6 @@ def test_projection_subclass_omitted_reason_matches_head():
     cast(Any, linecache.cache)[filename] = (len(source), None, source.splitlines(keepends=True), filename)
     scope = {"ProjectionReasonChild": ProjectionReasonChild, "traceback": traceback}
     exec(compile(source, filename, "exec"), scope)
-    # Captured by running the same child construction against HEAD 334401c9.
     assert scope["trace"] == (
         "Traceback (most recent call last):\n"
         "  File \"HEAD_projection_reason.py\", line 2, in <module>\n"
@@ -201,9 +199,6 @@ def test_real_callers_match_head_error_matrix():
                 def trace(frame, event, arg):
                     if (event == "return" and frame.f_code.co_filename == executor.__file__
                             and frame.f_code.co_name in ("persist", "_execute_historical")):
-                        # The callback's closed value is a closure cell. If BaseException bypasses
-                        # its Exception handler, CPython may omit the untouched cell from f_locals;
-                        # the enclosing executor initializes that value to False.
                         closed.append((frame.f_code.co_name, frame.f_locals.get("closed", False)))
                     return trace
                 with patch.object(executor, "_ReplayComposition", SimpleNamespace(_from_historical_run=lambda run: composition)):
@@ -220,12 +215,11 @@ def test_real_callers_match_head_error_matrix():
                     finally:
                         sys.settrace(None)
                 matrix[f"callback:{name}:{stage}:newer={newer}"] = dict(outcome=outcome, events=events, closed=closed)
-    assert len(matrix) == 40 and hashlib.sha256(json.dumps(matrix, sort_keys=True, separators=(",", ":")).encode()).hexdigest() == _HEAD_MATRIX_SHA256  # Selected HEAD rows from S4/c3/review/scratch/base-probe.json
+    assert len(matrix) == 40 and hashlib.sha256(json.dumps(matrix, sort_keys=True, separators=(",", ":")).encode()).hexdigest() == _HEAD_MATRIX_SHA256
 
 
 @pytest.mark.slow
 def test_real_store_failure_outcomes_and_artifact_bytes_match_head(tmp_path, monkeypatch):
-    # HEAD 334401c9 real-store oracle: S4/c3/review2/scratch/durable-base/results.json.
     expected = "a6f646d346089156c18a18962264c5c45d1ae965b029568977180b38e7c55ab6"
     from test_spider_scenario_run import historical_input
     from tools.spider_run_compare import _EXPECTED_DIFFERENCES, _canonical
@@ -234,7 +228,6 @@ def test_real_store_failure_outcomes_and_artifact_bytes_match_head(tmp_path, mon
                        if isinstance(n, ast.Call) and ast.unparse(n.func) == "self._journal.append")
     matrix = {}
     for case in cases:
-        # This matrix fingerprints legacy-v1 durable bytes captured from HEAD.
         monkeypatch.setattr(scenario, "_P3_ATTEMPT_ARTIFACT_ENCODING", "artifact_encoding_v1")
         case_root = tmp_path / case
         case_root.mkdir()
@@ -359,9 +352,6 @@ def test_durable_publication_guard_and_callback_catch_match_head_structure():
                 and ast.unparse(call.func) == "_artifact_limits.p3_v2_registration_preflight"
                 for call in ast.walk(node))
     )
-    # Three caller configuration handlers (floating, paid, gross) must each
-    # keep their exact unsupported-configuration response. This is a source
-    # contract, independent of the checkout's Git history.
     config_handlers = [
         node for node in handlers
         if isinstance(node.type, ast.Tuple)

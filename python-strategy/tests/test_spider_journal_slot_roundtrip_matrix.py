@@ -167,16 +167,12 @@ def _no_slot_rows_from_shared_table():
     [
         pytest.param([], id="empty-definitions"),
         pytest.param([{"order_id": "unused"}], id="nonempty-definitions"),
-        # D5.4 definition size boundary is 4,096 canonical bytes; this item
-        # exercises failure precedence before the per-definition size check.
         pytest.param([{"pad": "x" * 4_097}], id="oversized-definition"),
     ],
 )
 def test_reader_rejects_present_order_defs_for_every_no_slot_class(
     tmp_path, kind, snapshot_kind, outcome, payload, definitions
 ):
-    # Snapshot kind/outcome domain is from spider_run_native_schema.py:_KINDS
-    # and snapshot_payload's SUCCESS/FAILURE branches; selector authority is D5.2.
     source = _row(kind, payload)
     encoded, _ = codec.encode_p3_v2_row(source)
     encoded["order_defs"] = definitions
