@@ -131,7 +131,6 @@ def test_failed_refresh_preserves_valid_initial_identity_and_disables_finance(re
     error_at = (method, 2) if refresh_kind.endswith("error") else None
     failed = method if refresh_kind.endswith("transport") else None
     client = _ReadOnlyClient(failed=failed, error_at=error_at)
-    # Fail only the second request for the transport-error cases.
     if failed is not None:
         original = client._response
 

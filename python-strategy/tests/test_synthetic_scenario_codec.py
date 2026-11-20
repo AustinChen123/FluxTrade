@@ -8,7 +8,6 @@ import pytest
 from src.core.backtest import synthetic_scenario_codec as c
 
 KEY: c.Account = {"venue": "okx-scenario", "environment": "test", "account": "A"}
-# Independent protocol field inventory: never derive coverage from codec dispatch.
 MONEY_FIELDS = (
     "mark price open high low close quantity_contracts remaining_quantity_contracts "
     "volume_contracts capacity discarded_volume market_slippage_bps reported_fee limit_price size_contracts fill_price "
@@ -357,7 +356,6 @@ def test_historical_codec_commits_a_then_b_fills_in_configured_order():
         for product, sequence in [("WIRE-Z", 1), ("WIRE-A", 2)]
     ]
     orders[1]["order_id"] = "hist-order"
-    # IDs are owner-scoped, so make the second seed and snapshot distinct.
     cast(dict[str, object], configuration["orders"][1])["order_id"] = "hist-order-b"
     cast(dict[str, object], configuration["orders"][1])["intent_id"] = "hist-intent-b"
     cast(dict[str, object], configuration["orders"][1])["client_order_id"] = "hist-client-b"

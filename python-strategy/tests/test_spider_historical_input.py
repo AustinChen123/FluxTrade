@@ -278,7 +278,7 @@ def test_optional_shared_elapsed_cache_state_rejects_invalid_values(elapsed):
 def test_historical_planned_coverage_uses_half_open_steps_and_closed_endpoint_cache():
     run = _valid_run()
     coverage = historical_planned_coverage(run)
-    assert len(coverage) == 16  # four steps including final-bar close, endpoint cache, eleven timers
+    assert len(coverage) == 16
     assert [row["record_kind"] for row in coverage] == [
         "HISTORICAL_MARKET_STEP", "HISTORICAL_TIMER", "HISTORICAL_TIMER", "HISTORICAL_TIMER",
         "HISTORICAL_MARKET_STEP", "HISTORICAL_TIMER", "HISTORICAL_TIMER", "HISTORICAL_TIMER",

@@ -230,7 +230,6 @@ def test_depth_admission_precedes_typed_reconstruction(monkeypatch):
     nested = None
     for _ in range(17):
         nested = [nested]
-    # Preserve every envelope key; only an existing nested value exceeds depth.
     body["context"]["profiles"][0]["reason"] = nested
     raw = json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
     with pytest.raises(owner.DecisionInputError):

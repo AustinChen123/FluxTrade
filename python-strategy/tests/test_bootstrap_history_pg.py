@@ -135,7 +135,6 @@ def test_real_row_precedence_and_ignored_version_config_boundary(
                     append_decision_batch(db, terminal)
     wanted = replace(sample().key, strategy_version="different", config_hash="f" * 64)
     with store.initial_admission(wanted) as admission:
-        # Even C=0 cannot hide later immutable lineage history.
         proof = admission.read_history(wanted, 0)
     assert proof.state == expected
 

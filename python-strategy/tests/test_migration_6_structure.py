@@ -21,9 +21,6 @@ from src.core.orm_models import (
 )
 
 
-# ---------------------------------------------------------------------------
-# strategy_state ALTER columns + CHECK constraints
-# ---------------------------------------------------------------------------
 
 
 def test_strategy_state_has_migration6_columns() -> None:
@@ -38,17 +35,13 @@ def test_strategy_state_has_migration6_columns() -> None:
     missing = expected - set(cols.keys())
     assert not missing, f"StrategyState missing migration 6 columns: {missing}"
 
-    # Optimistic-lock counter — NOT NULL, integer, default 0.
     version_col = cols["version"]
     assert not version_col.nullable, "version must be NOT NULL"
     assert isinstance(version_col.type, Integer)
-    # server_default is always wrapped in DefaultClause; just check it exists.
     assert version_col.server_default is not None, (
         "version must have a server_default of 0 so existing rows backfill"
     )
 
-    # The four audit timestamps + message column must remain nullable so
-    # existing rows do not violate NOT NULL during ALTER.
     for name in ("last_error_message", "entered_error_at", "recovered_at", "stopped_at"):
         assert cols[name].nullable, f"StrategyState.{name} should be nullable"
 
@@ -68,9 +61,6 @@ def test_strategy_state_has_check_constraints() -> None:
     )
 
 
-# ---------------------------------------------------------------------------
-# strategy_state_transitions
-# ---------------------------------------------------------------------------
 
 
 def test_strategy_state_transition_class_has_required_columns() -> None:
@@ -87,11 +77,9 @@ def test_strategy_state_transition_class_has_required_columns() -> None:
     missing = expected - set(cols.keys())
     assert not missing, f"StrategyStateTransition missing columns: {missing}"
 
-    # NOT NULL columns.
     for name in ("strategy_id", "from_status", "to_status", "transitioned_at"):
         assert not cols[name].nullable, f"{name} should be NOT NULL"
 
-    # Nullable columns.
     for name in ("reason", "actor"):
         assert cols[name].nullable, f"{name} should be nullable"
 
@@ -103,9 +91,6 @@ def test_strategy_state_transition_strategy_id_is_fk_to_strategy() -> None:
     assert fks[0].column.table.name == "strategy"
 
 
-# ---------------------------------------------------------------------------
-# daily_nav_snapshots
-# ---------------------------------------------------------------------------
 
 
 def test_daily_nav_snapshot_class_has_required_columns() -> None:
@@ -140,7 +125,6 @@ def test_daily_nav_snapshot_nav_is_numeric_28_8_not_float() -> None:
     )
     assert not nav_col.nullable, "nav must be NOT NULL"
 
-    # snapshot_date should be a DATE column (not DateTime / BigInt).
     assert isinstance(
         DailyNavSnapshot.__table__.columns["snapshot_date"].type, Date
     )
@@ -154,7 +138,6 @@ def test_daily_nav_snapshot_source_has_default_and_check() -> None:
         "source must have a server_default of 'eod_snapshot'"
     )
 
-    # CHECK constraint on source values.
     constraints = [
         c
         for c in DailyNavSnapshot.__table__.constraints

@@ -177,7 +177,6 @@ def _assert_boundary(source, *, store=False, service=False, binding=False):
         "asyncio",
         "Engine",
     }
-    # SQLAlchemy's engine module is legitimate only for the persistence owner.
     if not store:
         forbidden |= {
             "engine",

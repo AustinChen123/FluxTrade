@@ -114,7 +114,7 @@ def test_terminal_caller_transaction_faults(profile_repository_pg, phase):
                 )
                 if phase == "rollback":
                     raise error
-            raise error  # The real transaction has committed: simulate lost ACK.
+            raise error
     assert caught.value is error
     assert result is not None
     assert sum(statement.startswith("UPDATE") for statement in sql) == 1
@@ -278,7 +278,6 @@ def test_concurrent_admission_real_locks_and_unique_arbitration(
 
     @contextmanager
     def sessions():
-        # Reserve separate physical backends before either admission transaction.
         with engine.connect() as connection:
             pids.append(
                 connection.exec_driver_sql("SELECT pg_backend_pid()").scalar_one()
@@ -452,7 +451,6 @@ def test_admit_confirmed_real_commit_faults(profile_repository_pg, phase, expect
         finally:
             exited.append(session)
         if admission:
-            # The store's transaction has really committed before this ACK loss.
             raise admission_error
 
     event.listen(FaultSession, "before_commit", before_commit)
@@ -473,7 +471,6 @@ def test_admit_confirmed_real_commit_faults(profile_repository_pg, phase, expect
     assert exited == opened and statements and all(s is opened[1] for s in statements)
     assert type(result) is ProfileActivationAdmissionResult
     assert result.status is expected and "SECRET" not in repr(result)
-    # Independent normal session establishes authoritative truth after faults.
     authoritative = Store(sessionmaker(engine)).confirm(value)
     if phase == "before_commit":
         assert authoritative is None and count(engine) == 0

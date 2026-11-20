@@ -184,7 +184,7 @@ def test_lease_algebra_and_daily_bins_digest_not_just_top_level():
     body = json.loads(raw)
     body["validation_expires_at_ms"] = DAY + 300011
     body["validation_remaining_ms"] = 300000
-    reject(body, request)  # Derived elapsed would be negative.
+    reject(body, request)
     body = json.loads(raw)
     body["served_at_ms"] = body["validation_expires_at_ms"]
     body["validation_remaining_ms"] = 0
@@ -194,7 +194,7 @@ def test_lease_algebra_and_daily_bins_digest_not_just_top_level():
     body["quote_volume"] = "25"
     reject(
         body, request
-    )  # Totals still exact, but daily content identity no longer matches.
+    )
 
 
 @pytest.mark.parametrize(

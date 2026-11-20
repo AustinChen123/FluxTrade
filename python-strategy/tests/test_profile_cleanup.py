@@ -75,7 +75,7 @@ def test_maximum_typed_json_plus_lf_roundtrips_without_reducing_rust_domain() ->
     parsed = parse_handoff(framed)
     assert parsed.spec == spec and parsed.publication == publication
     assert encode_handoff(parsed.spec, parsed.publication) == framed
-    hours[0]["page_count"] = 10  # Exactly one more canonical JSON byte.
+    hours[0]["page_count"] = 10
     larger = encode_handoff(spec, replace(publication, source_manifest=CanonicalJsonObject(manifest)))
     assert len(larger) == len(framed) + 1
     assert parse_handoff(larger).publication.source_manifest.thaw() == manifest

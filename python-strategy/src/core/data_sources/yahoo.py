@@ -19,7 +19,6 @@ from src.core.interfaces.data_source import IDataSource
 from src.core.models import Candlestick
 
 
-# yfinance interval strings that map to our timeframe convention.
 _TF_MAP = {
     "1m": "1m",
     "2m": "2m",
@@ -122,7 +121,6 @@ class YahooFinanceDataSource(IDataSource):
                 columns=["timestamp", "open", "high", "low", "close", "volume"]
             )
 
-        # Flatten MultiIndex columns if present (yfinance >= 0.2.31)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
 
@@ -139,7 +137,6 @@ class YahooFinanceDataSource(IDataSource):
         if not isinstance(df.index, pd.DatetimeIndex):
             raise TypeError("Yahoo Finance index must be a DatetimeIndex")
 
-        # Convert index to UTC ms timestamp
         datetime_index = df.index
         utc_index = (
             datetime_index.tz_localize("UTC")
@@ -196,8 +193,6 @@ class YahooFinanceDataSource(IDataSource):
     def get_available_range(
         self, product_id: str, timeframe: str
     ) -> Optional[tuple[int, int]]:
-        # Yahoo Finance doesn't expose range metadata without downloading.
-        # Return None to signal that the caller should specify explicit bounds.
         return None
 
     def validate(self) -> bool:

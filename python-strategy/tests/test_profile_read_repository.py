@@ -95,7 +95,7 @@ def test_revision_filter_custom_policy_and_empty_incomplete_order_preserved() ->
     assert session.execute.call_args_list[1].args[0].compile().params == {"lock_timeout": "10ms", "statement_timeout": "20ms"}
     store, _, _ = harness([row(revision=1), row(id="c" * 64, revision=2)])
     result = store.list_candidates(**{**ARGS, "end_ms": 7 * DAY})
-    assert [item.ref.revision for item in result] == [1, 2]  # Six absent days are not a selection failure.
+    assert [item.ref.revision for item in result] == [1, 2]
 
 
 @pytest.mark.parametrize("field,value", [("product_id", "other"), ("grid_id", "other"), ("algorithm_version", "other"),
@@ -115,7 +115,7 @@ def test_invalid_sql_timestamp_flags_fail_without_constructing_out_of_range_date
         store, _, _ = harness([row(**{name: None, name + "_valid": False})])
         with pytest.raises(ProfileIntegrityError):
             store.list_candidates(**ARGS)
-        assert invalid_database_value  # SQL CASE maps each invalid timestamp to NULL with false flag.
+        assert invalid_database_value
     for stamp in (datetime(1, 1, 1, tzinfo=timezone.utc), datetime.max.replace(tzinfo=timezone.utc)):
         store, _, _ = harness([row(**{name: stamp})])
         assert getattr(store.list_candidates(**ARGS)[0], name) == stamp
@@ -191,7 +191,6 @@ def test_isolated_import_does_not_load_runtime_owners() -> None:
     guard = "assert not any(n in ('src.main','src.core.engine','src.core.db','src.core.database') or 'rithmic' in n.lower() for n in sys.modules)"
     code = "import sys;import src.core.market_data.profiles.read_repository;" + guard
     subprocess.run([sys.executable, "-c", code], check=True, timeout=10)
-    # Import is lazy: this probe never calls get_engine or connects to a database.
     rejected = subprocess.run([sys.executable, "-c", "import sys;import src.core.db;" + guard],
                               capture_output=True, timeout=10)
     assert rejected.returncode != 0 and b"AssertionError" in rejected.stderr
@@ -283,7 +282,6 @@ def test_single_read_all_phases_exact_scope_order_limits_and_sole_verifier(monke
     for name in ("bin_origin", "bin_step", "base_volume", "quote_volume"):
         column = f"volume_profile_snapshot.{name}"
         length = f"octet_length(CAST({column} AS TEXT))"
-        # SQLAlchemy omits ELSE None; SQL CASE's implicit ELSE is NULL.
         assert literal_sql(header_query.selected_columns[name]) == f"CASE WHEN ({length} <= 64) THEN {column} END"
         assert literal_sql(header_query.selected_columns[name + "_oversized"]) == f"{length} > 64"
     bin_sql = literal_sql(phases[1][1])
@@ -333,7 +331,7 @@ def test_exact_preflight_limits_and_canonical_metadata_bound(monkeypatch: pytest
             state["bin_counts"]["count"] = maximum
         else:
             state["event_count"] = maximum
-        with pytest.raises(ProfileIntegrityError):  # Budget passes; deliberately short payload does not.
+        with pytest.raises(ProfileIntegrityError):
             store.get_verified(identifier)
         assert [p for p, _ in phases][-3:] == ["payload", "bins", "events"]
     store, _, _, state, _, identifier = snapshot_harness()
@@ -401,7 +399,6 @@ def test_single_read_validation_db_failure_and_commit_propagation() -> None:
 
 def test_numeric_boundary_and_independent_operation_event_budget(monkeypatch: pytest.MonkeyPatch) -> None:
     store, _, _, state, phases, identifier = snapshot_harness()
-    # PostgreSQL may preserve scale; 64-byte text is allowed without changing exact value.
     for name in ("bin_origin", "bin_step", "base_volume", "quote_volume"):
         text = format(state["header"][name], "f")
         text += "." if "." not in text else ""
@@ -499,14 +496,12 @@ def test_manifest_sql_scope_lateral_bounded_probes_and_payload_limits() -> None:
     assert "volume_profile_bin.snapshot_id = requested.id" in sql
     assert "market_data_invalidation.snapshot_id = requested.id" in sql
     normalized = " ".join(sql.split())
-    # Exact inner FROM excludes a locally materialized requested relation: correlation is required.
     assert "FROM volume_profile_bin WHERE volume_profile_bin.snapshot_id = requested.id LIMIT 100001" in normalized
     assert "FROM market_data_invalidation WHERE market_data_invalidation.snapshot_id = requested.id LIMIT 1001" in normalized
     assert "bool_or(anon_1.base_volume OR anon_1.quote_volume)" in sql
     for name in ("base_volume", "quote_volume"):
         assert f"octet_length(CAST(volume_profile_bin.{name} AS TEXT)) > 64 AS {name}" in sql
     assert "count(*) AS bin_count" in sql and "count(*) AS event_count" in sql
-    # Both APIs must use the exact same guarded header projection (CASE assertions above).
     assert [str(c) for c in phases[0][1].selected_columns] == [str(c) for c in reader._header_projection()]
 
 
@@ -561,7 +556,7 @@ def test_manifest_preflight_resource_limits_without_payload(resource: str) -> No
             row["event_count"] = 1000
     elif resource == "bytes":
         for row in data["summaries"]:
-            row["bin_count"] = 70000  # Each day fits; combined accounting exceeds 32 MiB.
+            row["bin_count"] = 70000
     elif resource == "bin_numeric":
         data["summaries"][0]["oversized"] = True
     else:
@@ -577,7 +572,7 @@ def test_manifest_exact_resource_boundaries_then_payload_consistency(monkeypatch
         store, _, _, data, phases, manifest = manifest_harness(count)
         for summary in data["summaries"]:
             summary[field] = maximum
-        with pytest.raises(ProfileIntegrityError):  # Exact bound passes; short fake payload fails.
+        with pytest.raises(ProfileIntegrityError):
             store.get_manifest(manifest)
         assert [p for p, _ in phases][-3:] == ["payloads", "bins", "events"]
     store, _, _, data, _, manifest = manifest_harness()
@@ -665,12 +660,10 @@ def test_manifest_corrupt_summary_flags_fail_before_payload(field: str, value: o
 
 def test_manifest_event_identity_and_per_day_count_cannot_shift() -> None:
     store, _, _, data, _, manifest = manifest_harness()
-    # IDs remain globally sorted by snapshot; duplicated event ID must still fail.
     data["events"][1]["event_id"] = data["events"][0]["event_id"]
     with pytest.raises(ProfileIntegrityError):
         store.get_manifest(manifest)
     store, _, _, data, _, manifest = manifest_harness()
-    # Global totals stay equal, but one day's claimed count cannot cover another day.
     data["summaries"][0]["bin_count"] += 1
     data["summaries"][1]["bin_count"] -= 1
     with pytest.raises(ProfileIntegrityError):

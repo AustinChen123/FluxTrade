@@ -73,7 +73,6 @@ class InstrumentSpecVersion:
             raise ValueError("instrument product identity mismatch")
         for name in ("exchange", "symbol", "base", "quote"):
             _identity(getattr(self.spec, name))
-        # Replay must not inherit product_registry's optional precision fallback.
         required = {"quantity_step", "price_tick", "min_quantity", "multiplier"}
         numeric = required | {"min_notional", "tick_value", "capital_per_contract"}
         for name in numeric:
@@ -90,7 +89,6 @@ class InstrumentSpecVersion:
             value = getattr(self.spec, name)
             if value is not None and type(value) is not enum_type:
                 raise ValueError("instrument model must be a typed enum")
-        # Detach the frozen payload from the caller's instance.
         object.__setattr__(self, "spec", replace(self.spec))
 
 

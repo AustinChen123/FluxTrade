@@ -19,17 +19,11 @@ def pytest_collection_modifyitems(items):
             item.add_marker(pytest.mark.integration)
 
 
-# ---------------------------------------------------------------------------
-# Shared constants
-# ---------------------------------------------------------------------------
 PRODUCT_ID = "BINANCE:BTCUSDT-PERP"
 TIMEFRAME = "15m"
 INITIAL_BALANCE = Decimal("10000")
 
 
-# ---------------------------------------------------------------------------
-# Candle generation helpers
-# ---------------------------------------------------------------------------
 def make_candle(
     timestamp: int,
     open: Decimal,
@@ -67,14 +61,13 @@ def make_candle_series(
 
     candles = []
     price = float(start_price)
-    interval_ms = 15 * 60 * 1000  # 15m
+    interval_ms = 15 * 60 * 1000
 
     for i in range(count):
         ts = start_timestamp + i * interval_ms
-        # Deterministic wave pattern: uptrend with sine modulation
-        drift = 10.0  # $10 per bar uptrend
+        drift = 10.0
         wave = 200.0 * math.sin(i * 0.15)
-        noise = 50.0 * math.sin(i * 0.73)  # secondary frequency
+        noise = 50.0 * math.sin(i * 0.73)
 
         open_price = price
         close_price = price + drift + (wave - 200.0 * math.sin((i - 1) * 0.15))

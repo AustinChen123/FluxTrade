@@ -20,7 +20,6 @@ from src.core.models import PositionSide
 from src.core.journal import StrategyJournal
 
 
-# ── Helpers ──────────────────────────────────────────────────────
 
 
 def _sample_closed_trades() -> list[ClosedTrade]:
@@ -73,7 +72,6 @@ def _sample_metrics() -> dict:
     }
 
 
-# ── CSV trades ───────────────────────────────────────────────────
 
 
 class TestWriteCsvTrades:
@@ -95,7 +93,7 @@ class TestWriteCsvTrades:
             "fee",
             "pnl",
         ]
-        assert len(rows) == 3  # header + 2 trades
+        assert len(rows) == 3
         assert rows[1][2] == "LONG"
         assert rows[1][6] == "0.100000"
         assert rows[2][2] == "SHORT"
@@ -109,10 +107,9 @@ class TestWriteCsvTrades:
             reader = csv.reader(f)
             rows = list(reader)
 
-        assert len(rows) == 1  # header only
+        assert len(rows) == 1
 
 
-# ── Equity curve ─────────────────────────────────────────────────
 
 
 class TestWriteEquityCurve:
@@ -126,7 +123,7 @@ class TestWriteEquityCurve:
             rows = list(reader)
 
         assert rows[0] == ["bar", "equity"]
-        assert len(rows) == 6  # header + 5 points
+        assert len(rows) == 6
         assert rows[1] == ["0", "0.00"]
         assert rows[4] == ["3", "6.00"]
 
@@ -152,7 +149,6 @@ class TestWriteEquityCurve:
         assert rows[2] == ["2000", "valuation", "", "90", "100", "0.9"]
 
 
-# ── Journal export ───────────────────────────────────────────────
 
 
 class TestWriteJournal:
@@ -178,7 +174,6 @@ class TestWriteJournal:
         assert path.read_text().strip() == ""
 
 
-# ── Markdown report ──────────────────────────────────────────────
 
 
 class TestWriteMarkdownReport:
@@ -288,7 +283,6 @@ class TestWriteMarkdownReport:
         assert "Maker Fee" not in content
 
 
-# ── Default report config ────────────────────────────────────────
 
 
 class TestDefaultReportConfig:

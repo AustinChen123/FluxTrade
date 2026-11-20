@@ -64,9 +64,9 @@ def _valid_source14_run(*, start: int = 86_400_000, minutes: int = 46, products=
     market_rows = cast(list[dict[str, object]], cache["markets"])
     row_values = cast(list[dict[str, object]], cache["rows"])
     for index, market in enumerate(market_rows):
-        market["price"] = str(200 + index)  # Deliberately not the historical anchor.
+        market["price"] = str(200 + index)
     inactive = cast(dict[str, object], next(row for row in row_values if row["product_id"] == products[-1]))
-    inactive["active"] = "false"  # Inactivity does not remove it from observations.
+    inactive["active"] = "false"
     cache_bytes = canonical_bytes(cache)
 
     trades = []
@@ -140,7 +140,7 @@ def test_source14_projection_uses_verified_anchors_all_products_and_complete_clo
     assert projection.model_id == model.MODEL_ID
     assert projection.products == PRODUCTS
     assert projection.anchors == tuple(Decimal(100 + i) for i in range(14))
-    assert projection.anchors[-1] != Decimal("213")  # Cache ticker is not the anchor.
+    assert projection.anchors[-1] != Decimal("213")
     expected_cutoffs = tuple(run.range_start_ms + i * _FIFTEEN_MINUTES for i in range(cut_count))
     assert tuple(sample.cutoff_ms for sample in projection.samples) == expected_cutoffs
     initial, first = projection.samples[:2]
@@ -149,7 +149,7 @@ def test_source14_projection_uses_verified_anchors_all_products_and_complete_clo
     assert initial.observation == Decimal("0")
     assert initial.posterior == model.PRIOR
     assert first.visible_at == cutoff15 * 16 + 6
-    assert first.prices[-1] == Decimal("130")  # Inactive product remains observed.
+    assert first.prices[-1] == Decimal("130")
     assert first.posterior == model.forward_step(model.PRIOR, Decimal("0"), first.observation)
 
     with localcontext(model._model_context()):

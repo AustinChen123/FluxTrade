@@ -106,7 +106,6 @@ def test_incompatible_existing_row_rolls_back_entire_migration(
     direction,
     version,
 ):
-    # Baseline is valid under both domains; only the selected table is damaged.
     monkeypatch.setattr(Consumer, "__fluxtrade_artifact_version__", "v1")
     build(profile_repository_pg, True)
     if direction == "upgrade":

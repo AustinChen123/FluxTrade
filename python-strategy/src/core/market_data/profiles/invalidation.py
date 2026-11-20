@@ -17,7 +17,7 @@ _EVENT = cast(Table, MarketDataInvalidation.__table__)
 _SNAPSHOT = cast(Table, VolumeProfileSnapshot.__table__)
 _FIELDS = ("event_id", "snapshot_id", "reason_code", "replacement_snapshot_id", "source")
 _LOGICAL = ("product_id", "window_start_ms", "window_end_ms", "grid_id", "algorithm_version")
-MAX_INVALIDATION_MEMBERSHIP_IDS = 32 * 90  # Decision-input profiles × manifest days.
+MAX_INVALIDATION_MEMBERSHIP_IDS = 32 * 90
 
 
 class InvalidationConflict(ValueError):

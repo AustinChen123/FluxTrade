@@ -164,7 +164,7 @@ def test_failure_identity_and_abnormal_exit(phase, skip_error):
             events.append(("exit", error))
             if phase == "exit":
                 raise failure
-            return True  # Cannot suppress a callback failure into APPLIED.
+            return True
 
     if phase == "enter" and skip_error:
         processor.on_candle(make_candle(), decision_scope=lambda *_: Scope())

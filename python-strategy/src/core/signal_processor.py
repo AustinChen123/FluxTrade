@@ -265,7 +265,6 @@ class SignalProcessor:
                             invocation_mode=invocation_mode,
                         )
                     except BaseException:
-                        # A scope cannot suppress a started callback failure into success.
                         manager.__exit__(*sys.exc_info())
                         raise
                     else:
@@ -611,9 +610,6 @@ class SignalProcessor:
                     product_id=trade.product_id,
                     event_scope=f"trade:{trade.id}:{trade.side}",
                     event_timestamp=trade.timestamp,
-                    # on_trade() has a singular Signal contract, so the
-                    # per-strategy ordinal is always zero and remains stable
-                    # if unrelated strategies are added or removed.
                     ordinal=0,
                 )
                 if self.signal_handler is not None

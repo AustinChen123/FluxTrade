@@ -63,8 +63,6 @@ class RithmicExternalOrderDriftService:
         )
         if first_detection:
             self._persist_lockdown(safe_reason or "rithmic_unclassified_drift")
-        # Diagnostic projection/admission follows both authoritative writes.
-        # Its dispatcher is best-effort and may be contended or unavailable.
         if self._diagnostic_sink is not None:
             try:
                 self._diagnostic_sink(diagnostic_from_drift_reason(reason))

@@ -173,9 +173,6 @@ class OrderEventApplier:
             "failed",
         }
         if terminal_failure_state and fill_delta["quantity"] == 0:
-            # Keep the parent recoverable until zero-fill child cleanup is
-            # durable. If the process stops between these operations, startup
-            # reconciliation will still query the parent authoritatively.
             self.fail_pending_conditionals_for_terminal_entry(order)
 
         if fill_delta["quantity"] > 0 and fill_delta["price"] is not None:
@@ -249,8 +246,6 @@ class OrderEventApplier:
                         else None
                     )
                 except Exception:
-                    # Preserve the legacy terminal failure path if classification
-                    # evidence cannot be resolved.
                     classified = None
                 if classified is not None:
                     observation, protection_alert = classified
@@ -290,10 +285,6 @@ class OrderEventApplier:
                             "failure": protective_failure,
                         }
 
-        # Post-fill actions key off persisted state, not the event delta:
-        # a replayed event (crash recovery, resync, duplicate stream message)
-        # carries the same cumulative quantity (delta == 0) and must still
-        # retry pending protection placement and sibling cancellation.
         if (order.filled_quantity or Decimal("0")) > 0:
             if not allow_remote_side_effects:
                 if self.remote_follow_up_required(order, event_state):
@@ -377,8 +368,6 @@ class OrderEventApplier:
             try:
                 self.notification_sink.emit(protection_alert)
             except Exception:
-                # Notification delivery is best effort and never changes the
-                # already-applied trading outcome.
                 pass
         return result
 
@@ -586,8 +575,6 @@ class OrderEventApplier:
             order.status = OrderStatus.LIQUIDATED.value
             self.order_manager.repo.update_order(order)
         elif event_state == "modify_rejected":
-            # The existing protection remains active when a modify is explicitly
-            # rejected, so the order's persisted state must not be downgraded.
             return
 
     @staticmethod

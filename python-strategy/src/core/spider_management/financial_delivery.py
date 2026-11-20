@@ -174,9 +174,6 @@ def stage_financial_receipt(
         if type(selection) is not dict:
             raise RuntimeError("spider_financial_selection_unavailable")
 
-        # Lock Order after its owning runtime row. Scalar selection bypasses a
-        # possibly dirty identity-map object, while no_autoflush preserves the
-        # caller's intended write for the later repository flush.
         before_row = session.execute(
             select(
                 Order.id,
@@ -261,10 +258,6 @@ def stage_financial_receipt(
                 if trade in session.new:
                     session.expunge(trade)
                 return False
-            # The caller has already attached this original Trade under
-            # no_autoflush. Flush it only after the runtime and Order locks and
-            # scalar prewrite proof, so the receipt's FK is satisfied without
-            # taking a Trade->Order key lock ahead of the approved lock order.
             session.flush([trade])
 
         payload = {
@@ -321,8 +314,6 @@ def stage_financial_receipt(
             transmission_group_id=None,
         )
         session.add(tape)
-        # Make only the just-staged management proof visible to the same-TX
-        # projection queries; the repository still owns the Order write/flush.
         session.flush([scope_row, delivery, tape])
         return True
 

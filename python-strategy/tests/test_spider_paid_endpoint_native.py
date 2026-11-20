@@ -150,8 +150,6 @@ def test_two_product_seeded_positions_close_through_native_paid_endpoint():
     } == {D("100.1")}
 
     trading = result["owner_evidence"]["trading_fact"]["immutable_payload"]
-    # The fixed fixture uses contract value 1, 0.1% taker fees, 10 bps
-    # slippage, and 1-contract opposing positions opened at 100.
     expected_fees = D("99.9") * D("0.001") + D("100.1") * D("0.001")
     expected_realized = (D("99.9") - D("100")) + (D("100") - D("100.1"))
     assert expected_fees == D("0.2")

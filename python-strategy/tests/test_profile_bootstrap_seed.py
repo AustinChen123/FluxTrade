@@ -238,7 +238,6 @@ def test_seed_canonical_stateful_replay_and_decimal_stability(status):
         is owner.BootstrapDisposition.REPLAY
     )
 
-    # A deterministic stateful consumer gets the same seed inputs, regardless of external latest/clock.
     def state(rows):
         return tuple((row.close, row.context.digest) for row in rows)
 
@@ -331,7 +330,6 @@ def test_same_key_content_drift_conflicts(change):
         )
         other = replace(value, key=key, max_seed_candles=10)
     elif change == "requirements":
-        # Empty-lookback remains a valid admission fixture for another grid intent.
         value = seed(count=0)
         other = replace(
             value,

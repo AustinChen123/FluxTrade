@@ -404,15 +404,11 @@ class GrossResponseEpisode:
                   and not self._unverified_orders_to_cancel(native_state)):
                 self.state, reason = "RESTRICTED", "WAIT_ADMISSION_READINESS"
             elif policy_closed:
-                # Once the ordinary paid drain begins, preserve the live episode
-                # and its evidence but never create another response action.
                 self.state = "RESTRICTED"
                 reason = "WAIT_OBLIGATIONS" if not self._obligations_clear(
                     endpoint, composition, native_state,
                 ) else "POLICY_END"
             elif self.rejected_products:
-                # A rejected row remains part of this proportional episode. Do
-                # not silently redistribute its share into a later round.
                 self.state, reason = "INCOMPLETE", "ACTION_REJECTED"
             else:
                 clear = self._obligations_clear(endpoint, composition, native_state)

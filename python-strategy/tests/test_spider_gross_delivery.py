@@ -145,8 +145,6 @@ def test_actual_gross_reduction_notice_duplicate_is_consumer_deduplicated(source
         for kind, _, item in evidence
     )
     assert duplicate_cut["after"] == duplicate_cut["before"]
-    # The original native fact was consumed; its duplicate must neither replay
-    # it nor erase later same-time native progress in the scheduler.
     assert delivery["source_fact_id"] in duplicate_cut["before"][4]
     assert delivery["source_fact_id"] in duplicate_cut["after"][4]
     same_time_native_notices = [

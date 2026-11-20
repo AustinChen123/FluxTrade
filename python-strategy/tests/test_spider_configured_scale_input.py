@@ -220,8 +220,6 @@ def _account_values(
 
 
 def _expected_decimal_checkpoints() -> dict[int, tuple[Decimal, Decimal, Decimal]]:
-    # Independent section-6 arithmetic: held exposure + fee, then paid fee and
-    # effect-time release. No production calculation or wire encoder is used.
     cash = Decimal("121.2")
     per_order_margin = Decimal("100") / Decimal("10")
     per_order_fee = Decimal("100") * Decimal("0.001")

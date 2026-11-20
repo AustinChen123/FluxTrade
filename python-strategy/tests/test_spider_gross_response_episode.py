@@ -235,7 +235,7 @@ def test_gross_cancel_ack_is_a_reduction_barrier_and_proposal_facts_are_captured
     ack_action = endpoint.cancel_ack_action_by_delivery[ack_id]
     assert ack_action["role"] == "GROSS_CANCEL"
     cancel_actions = [action for action in endpoint.actions if action["role"] == "GROSS_CANCEL"]
-    assert len(cancel_actions) == 2  # one request and its one effect
+    assert len(cancel_actions) == 2
     assert cancel_actions[1]["parent_action_id"] == cancel_actions[0]["action_id"]
     assert ack_action is cancel_actions[1]
     ack_record = next(
@@ -281,7 +281,6 @@ def test_gross_cancel_ack_is_a_reduction_barrier_and_proposal_facts_are_captured
 
     proposal = endpoint.gross_response.rounds[0]["proposal"]
     assert proposal["proposal_context"]["operations"]["pending_delivery_ids"] == []
-    # A later native/account mutation cannot retroactively change this proposal cut.
     endpoint.actions[0]["classification"] = "TEST_ONLY_LATER_MUTATION"
     endpoint.gross_response.active = False
     endpoint.gross_response.rejected_products.add("A-USDT-SWAP")
@@ -425,8 +424,6 @@ def test_gross_rejection_stops_redistribution_but_later_native_recovery_is_allow
     result = endpoint.result(composition)
 
     gross_actions = [action for action in endpoint.actions if action["role"] == "GROSS_REDUCTION"]
-    # The first rejected episode stops at one proportional round. The actual
-    # lower mark recovers it; a later native re-breach starts a distinct round.
     assert len(gross_actions) == 4
     rejected = [action for action in gross_actions if action["classification"] == "REJECTED"]
     committed = [action for action in gross_actions if action["classification"] == "COMMITTED"]

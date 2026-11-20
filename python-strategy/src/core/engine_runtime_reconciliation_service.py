@@ -45,8 +45,6 @@ class EngineRuntimeReconciliationService:
     def _run(self, interval: float, stop_event: threading.Event) -> None:
         self._event_logger.info("Runtime reconciliation service started.")
         venue_owned, run_reconciliation = self._select_reconciliation()
-        # Venue startup already completed reconciliation; avoid an immediate
-        # second operation against the freshly started session.
         if venue_owned and stop_event.wait(interval):
             return
         while self._is_running() and not stop_event.is_set():

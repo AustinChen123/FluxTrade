@@ -113,12 +113,12 @@ def test_bad_reference_list(refs):
 
 def test_valid_vectors_semantic_mismatch_and_immutability():
     for rows in [[report_row()], [report_row("BTC-USDT-SWAP"), report_row("ETH-USDT-SWAP")]]:
-        rows[0]["mark_price"] = "9"  # Flat/projection truth belongs to evidence validation.
+        rows[0]["mark_price"] = "9"
         rows[0]["source_evidence_refs"] = ["journal:9", "journal:1"]
         before = deepcopy(rows)
         schema.report(decode_jsonl(encode_jsonl(cast(list[object], rows))))
         assert rows == before
-    value = manifest()  # Conflicting boundaries and fabricated counts are legal syntax.
+    value = manifest()
     before = deepcopy(value)
     schema.completion(value)
     assert value == before

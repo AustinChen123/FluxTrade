@@ -176,7 +176,6 @@ def _restore_initial_policy(composition: Any, run: HistoricalRunInput, prepared:
     policy.replies = deepcopy(state["replies"])
     policy.last_filled_price = deepcopy(state["last_filled_price"])
     policy.parameters = DEFAULTS | dict(run.parameters)
-    # Replay starts at the admitted source range, never at wall-clock or run identity.
     policy.now_ms = run.range_start_ms
     policy.shared_ms = run.range_start_ms - cast(int, state.get("shared_elapsed_ms", 12_000))
     policy.last_earn_ms = run.range_start_ms - 61_000

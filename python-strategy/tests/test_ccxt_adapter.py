@@ -48,9 +48,6 @@ def _isolate_binance_identity_preflight(monkeypatch) -> None:
 CANONICAL_CLIENT_ORDER_ID = "strategy_1-worker_a-entry-1704067200000000000"
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 
 def _make_order(**overrides) -> Order:
@@ -126,7 +123,6 @@ def adapter(mock_ccxt_client):
             testnet=True,
             enable_ws=False,
         )
-    # Ensure client is our mock
     a.client = mock_ccxt_client
     return a
 
@@ -147,9 +143,6 @@ def generic_adapter(mock_ccxt_client):
     return adapter
 
 
-# ---------------------------------------------------------------------------
-# CcxtExchangeAdapter
-# ---------------------------------------------------------------------------
 
 
 class TestCcxtAdapterInit:
@@ -1945,9 +1938,6 @@ class TestGetPosition:
         ] == [("BACKPACK:SOL_USDC-PERP", "SHORT", Decimal("3"))]
 
 
-# ---------------------------------------------------------------------------
-# create_adapter factory
-# ---------------------------------------------------------------------------
 
 
 class TestCreateAdapter:
@@ -2375,9 +2365,6 @@ class TestCreateAdapter:
             assert isinstance(a, LiveBinanceAdapter)
 
 
-# ---------------------------------------------------------------------------
-# LiveBinanceAdapter
-# ---------------------------------------------------------------------------
 
 
 class TestLiveBinanceWsInit:
@@ -2655,7 +2642,7 @@ class TestLiveBinanceWsOrderPath:
             MockWS.return_value = mock_ws_inst
 
             adapter = LiveBinanceAdapter(api_key="k", secret="s", enable_ws=True)
-            adapter.client = client  # ensure REST uses our mock
+            adapter.client = client
             order = _make_order(type="market")
             result = adapter.place_order(order)
 

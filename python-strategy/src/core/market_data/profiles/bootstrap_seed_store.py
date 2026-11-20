@@ -110,7 +110,6 @@ class BootstrapSeedAdmission:
                 raise ValueError
         except ValueError:
             raise BootstrapSeedAdmissionError() from None
-        # Boundary is evidence identity, never a history time filter.
         try:
             params = {
                 name: getattr(key, name)
@@ -291,7 +290,6 @@ def _hydrate(
 ) -> BootstrapSeedRecord:
     try:
         raw = row["canonical_payload"]
-        # psycopg2 BYTEA is memoryview; normalize only the driver's binary forms.
         if type(raw) is memoryview:
             raw = raw.tobytes()
         value = BootstrapSeed.from_canonical_bytes(

@@ -189,7 +189,7 @@ def test_visible_native_tp_decision_routes_to_existing_reduce_only_exit(decision
     composition = _ReplayComposition._from_floating_exit_run(request)
     host = cast(SpiderFloatingExitHost, composition._floating_exit_host)
     _advance(composition, run.range_start_ms * 16 + 6)
-    assert host.batches == []  # Initial prior is not a decision.
+    assert host.batches == []
 
     _advance(composition, cutoff * 16 + 6)
     assert len(host.batches) == 1
@@ -222,7 +222,7 @@ def test_visible_native_tp_decision_routes_to_existing_reduce_only_exit(decision
         return original_exit_group(composition, product_id, quantity, role=role)
 
     endpoint._exit_group = observe_exit_group
-    composition._policy.paused = True  # Pausing after the request does not cancel its native exit.
+    composition._policy.paused = True
     _advance(composition, run.range_end_ms * 16 + 6)
     result = endpoint.result(composition)
     progress = endpoint.product_exit_progress(composition, PRODUCTS[0])
@@ -398,8 +398,6 @@ def test_two_closed_samples_are_exactly_once_detached_and_prefix_causal():
     cast(list[dict[str, Any]], detached_batches[0]["rows"])[0]["price"] = "0"
     assert host.observation() == original_observation
 
-    # The changed row is strictly after the first 15-minute close; its prefix
-    # decision must equal the same close from the full, unmodified run.
     changed = _reprice_cut(
         run, run.range_start_ms + _FIFTEEN + 2 * _MINUTE,
         ratios={product: D("1.5") for product in PRODUCTS},

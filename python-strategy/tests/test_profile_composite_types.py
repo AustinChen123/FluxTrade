@@ -50,7 +50,7 @@ def test_identity_golden_and_immutability() -> None:
     assert (EMPTY.window_start_ms, EMPTY.window_end_ms) == (0, 86400000)
     assert (
         FULL.composite_id == EMPTY.composite_id
-    )  # Identity is not aggregate validity.
+    )
     assert replace(FULL, base_volume=Decimal(99)).identity_bytes == expected
     for instance in (EMPTY, POC, GRID, MANIFEST, REF, BIN):
         assert not hasattr(instance, "__dict__")
@@ -138,7 +138,6 @@ def test_isolated_import() -> None:
 
 
 def _subclass(value: object) -> object:
-    # Exercise exact-type rejection using valid inherited constructors, not forged state.
     assert is_dataclass(value)
     derived = type("Derived", (type(value),), {})
     return derived(

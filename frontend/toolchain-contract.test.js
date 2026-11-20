@@ -135,7 +135,7 @@ const EXPECTED_DEV_DEPENDENCIES = {
   jsdom: "29.1.1",
   typescript: "7.0.2",
   vite: "8.1.6",
-  vitest: "4.1.11"
+  vitest: "4.1.12"
 };
 const EXPECTED_FIXTURES = {
   browserSession: {

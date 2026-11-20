@@ -131,8 +131,6 @@ def _domain_value(value: object) -> dict[str, object]:
         type(unavailable) is not str or unavailable not in _UNAVAILABLE
     ):
         raise ValueError("invalid OKX Spider financial profile")
-    # Keep the profile construction in this boundary so direct construction
-    # validates the same D5A binding as the factory.
     del profile
     return row
 

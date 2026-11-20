@@ -104,6 +104,7 @@ def test_python_dispatcher_owner_restarts_in_a_fresh_os_process(tmp_path: Path) 
     db_engine.dispose()
     context = multiprocessing.get_context("spawn")
     result = context.Queue()
+    queue_owned_by_terminated_process = context.Queue()
     for label in ("first", "restarted"):
         child = context.Process(
             target=_write_from_fresh_dispatcher_process,
@@ -115,16 +116,12 @@ def test_python_dispatcher_owner_restarts_in_a_fresh_os_process(tmp_path: Path) 
         assert child.exitcode == 0
         assert result.get(timeout=30) == label
 
-    # A process crash can lose an in-flight and a queued optional diagnostic.
-    # It does not replay committed rows; a fresh process owns a new dispatcher.
-    crash_result = context.Queue()
     crashing = context.Process(
         target=_block_dispatcher_process,
-        args=(db_path, crash_result),
+        args=(db_path, queue_owned_by_terminated_process),
     )
     crashing.start()
-    # A killed child must not share a queue whose feeder lock it may hold.
-    crash_state = crash_result.get(timeout=30)
+    crash_state = queue_owned_by_terminated_process.get(timeout=30)
     assert crash_state["accepted"] == 2
     assert crash_state["queued"] == 1
     crashing.terminate()
@@ -243,8 +240,6 @@ def test_real_stream_restart_and_drift_safety_survive_blocked_dispatcher(
 
     start_terminal_stream()
     assert open_entered.wait(30)
-    # ORDER stream restart reuses the same process dispatcher while its DB
-    # session factory is still blocked on the first diagnostic.
     start_terminal_stream()
     drift.detect(
         "rithmic_external_order_detected: account_id=ACCOUNT_SECRET "

@@ -206,8 +206,6 @@ def test_health_thread_start_failure_keeps_single_terminal_writer(monkeypatch) -
             raise RuntimeError("reporter start failure")
 
     monkeypatch.setattr(threading, "Thread", lambda **kwargs: BrokenReporter())
-    # The writer factory remains separately injected; only the optional
-    # reporter uses threading.Thread.
     dispatcher = OpsDiagnosticDispatcher(
         session_factory=MagicMock(), thread_factory=factory
     )

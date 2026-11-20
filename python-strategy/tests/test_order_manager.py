@@ -126,13 +126,13 @@ class TestOrderCreation:
 
     def test_order_timestamp_from_clock(self, mock_order_repo, mock_clock, signal_factory):
         """Order timestamp should come from clock."""
-        mock_clock.set_time(1704153600.0)  # 2024-01-02 00:00:00 UTC
+        mock_clock.set_time(1704153600.0)
         order_manager = OrderManager(mock_order_repo, mock_clock)
         signal = signal_factory()
 
         order = order_manager.create_order(signal, OrderSide.BUY, "market", Decimal("0.1"))
 
-        assert order.timestamp == 1704153600000  # milliseconds
+        assert order.timestamp == 1704153600000
 
     def test_order_extracts_exchange_id(self, mock_order_repo, mock_clock, signal_factory):
         """Order should extract exchange ID from product_id."""
@@ -326,7 +326,6 @@ class TestOrderStatusUpdates:
 
     def test_fill_order_updates_status(self, mock_clock, mock_db_session, signal_factory):
         """Filling an order should update its status to closed."""
-        # Use BacktestOrderRepository to avoid Redis connection
         from src.core.repositories import BacktestOrderRepository
         backtest_repo = BacktestOrderRepository(mock_db_session, session_id=1)
         order_manager = OrderManager(backtest_repo, mock_clock)
@@ -371,8 +370,6 @@ class TestOrderStatusUpdates:
 
         order_manager.fill_order(order, Decimal("42100"), Decimal("0.1"))
 
-        # BacktestOrderRepository adds to db session, verify via mock
-        # The trade is added to DB via mock_db_session.add()
         assert order.status == "closed"
 
 
@@ -661,7 +658,6 @@ class TestBacktestModeDetection:
         """Should detect live mode from non-backtest repository."""
         order_manager = OrderManager(mock_order_repo, mock_clock)
 
-        # MockOrderRepository is not BacktestOrderRepository
         assert order_manager.is_backtest is False
 
 
@@ -678,8 +674,6 @@ class TestPositionUpdates:
         order = order_manager.create_order(signal, OrderSide.BUY, "market", Decimal("0.1"))
         order_manager.fill_order(order, Decimal("42000"), Decimal("0.1"))
 
-        # BacktestOrderRepository delegates position tracking to Rust engine
-        # get_position always returns None in backtest repo
         pos = backtest_repo.get_position(signal.strategy_id, signal.product_id)
         assert pos is None
 
@@ -725,7 +719,6 @@ class TestOrderManagerEdgeCases:
             order = order_manager.create_order(signal, OrderSide.BUY, "market", Decimal("0.1"))
             orders.append(order)
 
-        # All orders should have unique IDs
         order_ids = [o.id for o in orders]
         assert len(order_ids) == len(set(order_ids))
 

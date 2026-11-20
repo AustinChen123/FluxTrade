@@ -48,7 +48,7 @@ def test_s3_ddl_has_exact_receipt_fk_attempt_fields_and_active_index():
         assert field in upgrade
     assert "CREATE UNIQUE INDEX uq_rea_active_target ON rithmic_exit_attempt (account_id, account_profile, product_id) " in upgrade
     assert "WHERE state NOT IN ('COMPLETED','VERIFIED_NOOP','SUPERSEDED_RESIDUAL')" in upgrade
-    assert "CREATE UNIQUE INDEX uq_meh_signal" not in upgrade  # represented as a table constraint
+    assert "CREATE UNIQUE INDEX uq_meh_signal" not in upgrade
     assert "CONSTRAINT uq_meh_signal UNIQUE (environment, product_id, timeframe, timestamp, signal_key)" in upgrade
     assert "CONSTRAINT fk_meh_receipt FOREIGN KEY(environment, product_id, timeframe, timestamp) REFERENCES market_data_application (environment, product_id, timeframe, timestamp)" in upgrade
     assert "CREATE TRIGGER trg_meh_identity_immutable" in upgrade

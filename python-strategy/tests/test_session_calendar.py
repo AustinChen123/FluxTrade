@@ -14,7 +14,7 @@ def _timestamp_ms(value: str) -> int:
 @pytest.mark.parametrize(
     ("utc_timestamp", "expected"),
     [
-        ("2026-01-04T22:59:00", False),  # Sunday before 17:00 CT
+        ("2026-01-04T22:59:00", False),
         ("2026-01-04T23:00:00", True),
         ("2026-01-05T21:59:00", True),
         ("2026-01-05T22:00:00", False),

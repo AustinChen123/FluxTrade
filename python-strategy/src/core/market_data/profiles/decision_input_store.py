@@ -96,7 +96,6 @@ def _hydrate(
 ) -> DecisionInputRecord:
     try:
         raw = row["canonical_payload"]
-        # psycopg2 BYTEA is memoryview; normalize only the driver's binary forms.
         if type(raw) is memoryview:
             raw = raw.tobytes()
         value = MarketDataDecisionInput.from_canonical_bytes(raw)

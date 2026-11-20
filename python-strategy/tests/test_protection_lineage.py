@@ -78,10 +78,10 @@ def test_malformed_present_sibling_link_is_invalid(malformed):
 @pytest.mark.parametrize(
     ("child_side", "linked", "sibling_side"),
     [
-        ("buy", "absent", "buy"),  # child is on entry side
-        ("unknown", "absent", "buy"),  # child side is not recognized
-        ("sell", "child-2", "buy"),  # sibling is on entry side
-        ("sell", "child-2", "unknown"),  # sibling side is not recognized
+        ("buy", "absent", "buy"),
+        ("unknown", "absent", "buy"),
+        ("sell", "child-2", "buy"),
+        ("sell", "child-2", "unknown"),
     ],
 )
 def test_unknown_or_wrong_side_relationship_is_invalid(

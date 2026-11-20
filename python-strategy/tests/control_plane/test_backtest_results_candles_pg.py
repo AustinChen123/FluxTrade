@@ -243,8 +243,6 @@ def test_candles_count_actual_rows_for_10000_bound_and_close_source(
     )
 
     engine, factory = _database(fresh_pg_db)
-    # The source is 1m, but has a candle every 2m: a duration heuristic would
-    # count nearly twice as many intervals as the actual stored rows.
     offsets = [index * 120_000 for index in range(10_001)]
     dataset_id = _sealed_source(factory, tmp_path, "1m", offsets)
     _persist_result(factory, dataset_id)
@@ -333,8 +331,6 @@ def test_candles_missing_linked_source_uses_fixed_backend_failure(
     )
 
     engine, factory = _database(fresh_pg_db)
-    # BacktestResultSummary.dataset_id has an existing FK to research_dataset,
-    # so a truly absent linked source cannot be persisted; use importing state.
     with factory() as session:
         session.add(
             ResearchDataset(

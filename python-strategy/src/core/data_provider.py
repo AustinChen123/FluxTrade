@@ -45,12 +45,9 @@ def check_data_availability(db: Session, product: str, timeframe: str, lookback:
         "start_time": required_start_time
     }).scalar()
     
-    # 10% gap tolerance
     if result is not None and result >= lookback * 0.9:
         return True, ""
     
-    # Generate backfill command
-    # product format: EXCHANGE:SYMBOL-PERP
     try:
         parts = product.split(':')
         exchange = parts[0]

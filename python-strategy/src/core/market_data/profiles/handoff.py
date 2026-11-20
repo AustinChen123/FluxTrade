@@ -20,11 +20,11 @@ from .publication import CanonicalJsonObject, VerifiedProfilePublication, _canon
 
 from .types import BIGINT_MAX, ProfileBin, VolumeProfileContent, _decimal
 
-MAX_HANDOFF_NODES = 65_536  # Full wire only; publication metadata retains 4096 nodes.
+MAX_HANDOFF_NODES = 65_536
 _HOUR = 3_600_000
 _U64_MAX = (1 << 64) - 1
 MAX_HANDOFF_BYTES = 2 * 1024 * 1024
-MAX_FRAMED_HANDOFF_BYTES = MAX_HANDOFF_BYTES + 1  # Canonical JSON plus the CLI's single LF.
+MAX_FRAMED_HANDOFF_BYTES = MAX_HANDOFF_BYTES + 1
 _PRODUCT = "BINANCE:BTCUSDT-SPOT"
 _TOP = "schema_version job_id config_sha256 content content_sha256 hours reconciliation source_available_at_ms availability_basis raw_retention_state"
 _CONTENT = "schema_version product_id window_start_ms window_end_ms period timezone grid_id bin_origin bin_step algorithm_version bins"
@@ -141,7 +141,7 @@ def encode_handoff(spec: JobSpec, publication: VerifiedProfilePublication) -> by
     """Encode bound PRESENT DB evidence; never normalize assembler stdout for comparison."""
     _validate_publication_binding(spec, publication)
     available = publication.source_available_at
-    assert available is not None  # Binding validator requires an exact UTC integer millisecond.
+    assert available is not None
     elapsed = available - datetime(1970, 1, 1, tzinfo=timezone.utc)
     wire = {
         "schema_version": 1, "job_id": spec.id, "config_sha256": spec.config_sha256,
@@ -152,7 +152,6 @@ def encode_handoff(spec: JobSpec, publication: VerifiedProfilePublication) -> by
         "source_available_at_ms": elapsed.days * 86400000 + elapsed.seconds * 1000 + elapsed.microseconds // 1000,
         "availability_basis": publication.availability_basis, "raw_retention_state": publication.raw_retention_state,
     }
-    # Same bounded UTF-8/canonical JSON domain as the wire parser.
     encoded = _canonical(wire, max_nodes=MAX_HANDOFF_NODES, max_bytes=MAX_HANDOFF_BYTES).encode("utf-8")
     return encoded + b"\n"
 

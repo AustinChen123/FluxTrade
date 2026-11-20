@@ -115,7 +115,6 @@ class NotificationDispatcher:
             try:
                 alive = worker.is_alive()
             except Exception:
-                # If liveness cannot be established, the worker may own the fd.
                 alive = True
             with self._lock:
                 self._counters.start_failures += 1
@@ -151,7 +150,7 @@ class NotificationDispatcher:
 
     def stop(self, timeout: float = 0.25) -> bool:
         """Reject new alerts and abandon pending records without joining or closing."""
-        del timeout  # No caller wait, flush, join, or concurrent descriptor close.
+        del timeout
         with self._lock:
             if self._state in {"stopped", "unavailable"}:
                 return True

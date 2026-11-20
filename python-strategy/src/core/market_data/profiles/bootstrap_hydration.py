@@ -155,7 +155,6 @@ class BoundBootstrapHydration:
         ):
             raise BootstrapSeedError()
         self._check_strategy()
-        # Local mutation fingerprint only, never a durable composition identity.
         object.__setattr__(
             self,
             "_configuration_state",

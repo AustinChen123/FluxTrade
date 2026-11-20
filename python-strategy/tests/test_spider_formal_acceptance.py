@@ -81,8 +81,6 @@ def _assert_h02_coverage(projection: formal.SpiderP02Projection) -> None:
         (1_790_640_000_000, [("H02-A-LONG", "1", "100")], "999.9", "0.1"),
         (1_790_640_020_000, [("H02-A-LONG", "1", "100")], "999.8", "0.2"),
     ]
-    # Duplicate-fact idempotency lives in the independent P3 oracle test; the
-    # strict P3 DTO/P02 journal does not persist that test-only injected delivery.
     final_callbacks = [
         row["payload"] for row in journal
         if row["record_kind"] == "CALLBACK_RESULT" and row["payload"]["actions"]

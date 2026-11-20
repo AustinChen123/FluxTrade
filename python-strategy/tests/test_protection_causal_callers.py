@@ -191,7 +191,6 @@ def test_real_rithmic_owned_callback_and_ledger(
     entry.filled_quantity = Decimal("2")
     position.quantity = Decimal("2")
     position.product_id = product
-    # A single submitted child, with its valid OCO sibling already cancelled.
     tp.status = OrderStatus.CANCELLED.value
     adapter = RithmicExchangeAdapter(
         profile="test",
@@ -353,8 +352,6 @@ def test_real_rithmic_owned_runtime_bootstrap_applies_positive_fill(
         cancel_linked_conditional_for_protection_fill=MagicMock(),
         local_positions_loader=lambda: [position],
     )
-    # Keep the real owned reconciler and adapter path while restricting this
-    # recovery snapshot to the entry whose positive fill is under test.
     owned = reconciler._owned_order_reconciler
     assert owned is not None
     remote = remote_order(
@@ -373,8 +370,6 @@ def test_real_rithmic_owned_runtime_bootstrap_applies_positive_fill(
             LedgerPositionFixture(symbol="NQU6", net_quantity=str(remote_filled))
         ],
     )
-    # The context callback is the production list owner; narrow its output to
-    # one real persisted engine order for this causal regression.
     engine.order_manager.repo.list_client_orders_by_statuses = (
         lambda *args, **kwargs: [entry]
     )

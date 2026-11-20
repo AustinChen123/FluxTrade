@@ -238,9 +238,6 @@ class OrderReconciler:
         result_counts: dict[str, int] = {}
         decision_counts: dict[str, int] = {}
 
-        # Decide skips on the scan snapshot up front: repairing an entry can
-        # fail its pending conditionals mid-loop, and a status-based check on
-        # the mutated order would stop skipping them.
         pending_protective_ids = {
             order.id for order in orders if self._is_pending_protective_order(order)
         }
@@ -575,8 +572,6 @@ class OrderReconciler:
                 and snapshot.filled_quantity == 0
                 and (order.filled_quantity or Decimal("0")) == 0
             ):
-                # Route authoritative zero-fill protective terminals through
-                # the shared applier. It owns the one classifier and any alert.
                 applied = self.process_exchange_order_event(
                     exchange_snapshot_to_order_event(order.product_id, snapshot),
                     allow_remote_side_effects=False,

@@ -81,7 +81,7 @@ def test_complete_basis_status_matrix_and_account_preservation(basis, status):
         if field.name != "market_data":
             assert getattr(result, field.name) is getattr(original, field.name)
     assert original.market_data is None
-    assert result.product_id != value.request.product_id  # Auxiliary market is legal.
+    assert result.product_id != value.request.product_id
     repeated = apply(value).market_data
     assert repeated is not None and repeated.digest == result.market_data.digest
 

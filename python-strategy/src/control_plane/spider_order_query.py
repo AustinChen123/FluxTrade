@@ -329,7 +329,6 @@ class SpiderOrderQueryService:
         except _Evidence:
             return 503, {"error": "spider_order_evidence_unavailable"}
         except Exception:
-            # Exception text and row/account data intentionally never leave this boundary.
             return 503, {"error": "spider_order_query_unavailable"}
 
     def _read(self, query: dict[str, Any], route_id: str | None) -> dict[str, Any]:

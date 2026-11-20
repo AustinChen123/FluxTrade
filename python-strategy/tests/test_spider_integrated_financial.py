@@ -29,7 +29,6 @@ def execution(order, name, at, quantity, account_version, order_version, golden=
 
 
 def replacement_plan():
-    # Literal source-policy output fixed before either subject run.
     orders: list[dict[str, Any]] = [dict(instId="P_A", instIdCode=1, tdMode="cross", clOrdId=client,
                    tag="cce88b5c6506BCDE", side=side, ordType="limit", px=price, sz="1")
               for client, side, price in [("0000014998", "buy", "9"), ("0000025001", "sell", "11")]]
@@ -153,8 +152,6 @@ def minimum_run(trace):
     unchanged = checkpoint(replay, trace, "reject502")
     for field in ("cash", "total_fees", "gross_realized", "account_version", "orders_digest", "positions_digest", "reservations_digest"):
         assert unchanged[field] == closed[field]
-    # Independent literal hash_fields reconstruction: BTC/ETH spec-v1/tier-v1,
-    # complete frozen tables, marks 50000@[0,3000) and 101@[503,3000), leverage10.
     context = dict(expected_before=initial["valuation_context_id"],
         expected_after="1ea48d053febc00bb7b39f380dbde9dc5e486607bb92286e345df3408a222195",
         rows=[dict(product_id="BTC-USDT-SWAP", mark=D(50000), valid_from=0, valid_to=3000),

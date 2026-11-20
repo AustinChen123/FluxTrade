@@ -24,7 +24,6 @@ from src.core.interfaces.exchange import ExchangeError
 from src.core.product_registry import InstrumentSpec
 
 
-# ── helpers ──────────────────────────────────────────────────────
 
 PRODUCT = "BINANCE:BTCUSDT-PERP"
 TF = "15m"
@@ -48,9 +47,6 @@ def _approx(a, b, tol=0.01):
     return abs(float(a) - float(b)) < tol
 
 
-# =================================================================
-# Basics
-# =================================================================
 
 
 class TestSimulatedAdapterBasics:
@@ -419,9 +415,6 @@ class TestSimulatedAdapterBasics:
         assert adapter.get_open_orders(product_id) == [order]
 
 
-# =================================================================
-# Market orders
-# =================================================================
 
 
 class TestMarketOrders:
@@ -768,9 +761,6 @@ class TestMarketOrders:
         assert direct_fill["slippage_cost"] == prepared_fill["slippage_cost"]
 
 
-# =================================================================
-# Limit orders
-# =================================================================
 
 
 class TestLimitOrders:
@@ -785,7 +775,6 @@ class TestLimitOrders:
         )
         adapter.place_order(order)
 
-        # low=48900 touches 49000
         fills = adapter.on_market_data(_candle(200, 49500, 49800, 48900, 49200))
         assert len(fills) == 1
         assert fills[0]["price"] == Decimal("49000")
@@ -822,9 +811,6 @@ class TestLimitOrders:
         assert fills[0]["price"] == Decimal("51000")
 
 
-# =================================================================
-# Stop Loss / Take Profit
-# =================================================================
 
 
 class TestConditionalOrders:
@@ -847,7 +833,6 @@ class TestConditionalOrders:
         adapter.place_order(entry)
         adapter.on_market_data(_candle(200, 50000, 50100, 49900, 50050))
 
-    # ── SL for LONG ──────────────────────────────────────────────
 
     def test_sl_long_triggers_on_drop(self, order_factory):
         adapter = SimulatedAdapter(Decimal("10000"))
@@ -862,7 +847,6 @@ class TestConditionalOrders:
         )
         adapter.place_order(sl)
 
-        # low=48900 <= trigger 49000
         fills = adapter.on_market_data(_candle(400, 49500, 49800, 48900, 49200))
         assert len(fills) == 1
         assert fills[0]["fill_type"] == "STOP_LOSS"
@@ -882,11 +866,9 @@ class TestConditionalOrders:
         )
         adapter.place_order(sl)
 
-        # low=49500 > trigger 49000
         fills = adapter.on_market_data(_candle(400, 50000, 51000, 49500, 50800))
         assert len(fills) == 0
 
-    # ── TP for LONG ──────────────────────────────────────────────
 
     def test_tp_long_triggers_on_rise(self, order_factory):
         adapter = SimulatedAdapter(Decimal("10000"))
@@ -901,13 +883,11 @@ class TestConditionalOrders:
         )
         adapter.place_order(tp)
 
-        # high=52500 >= trigger 52000
         fills = adapter.on_market_data(_candle(400, 51000, 52500, 50800, 52200))
         assert len(fills) == 1
         assert fills[0]["fill_type"] == "TAKE_PROFIT"
         assert fills[0]["price"] == Decimal("52000")
 
-    # ── SL for SHORT ─────────────────────────────────────────────
 
     def test_sl_short_triggers_on_rise(self, order_factory):
         adapter = SimulatedAdapter(Decimal("10000"))
@@ -922,14 +902,12 @@ class TestConditionalOrders:
         )
         adapter.place_order(sl)
 
-        # high=51200 >= trigger 51000
         fills = adapter.on_market_data(_candle(400, 50200, 51200, 50100, 51000))
         assert len(fills) == 1
         assert fills[0]["fill_type"] == "STOP_LOSS"
         assert fills[0]["price"] == Decimal("51000")
         assert adapter.get_position(PRODUCT) is None
 
-    # ── TP for SHORT ─────────────────────────────────────────────
 
     def test_tp_short_triggers_on_drop(self, order_factory):
         adapter = SimulatedAdapter(Decimal("10000"))
@@ -944,22 +922,17 @@ class TestConditionalOrders:
         )
         adapter.place_order(tp)
 
-        # low=47800 <= trigger 48000
         fills = adapter.on_market_data(_candle(400, 49000, 49200, 47800, 48000))
         assert len(fills) == 1
         assert fills[0]["fill_type"] == "TAKE_PROFIT"
         assert fills[0]["price"] == Decimal("48000")
 
 
-# =================================================================
-# OCO (one-cancels-other)
-# =================================================================
 
 
 class TestOCO:
     def test_tp_cancels_sl(self, order_factory):
         adapter = SimulatedAdapter(Decimal("10000"))
-        # open long
         entry = order_factory(
             order_type="market", side="buy", product_id=PRODUCT, quantity=Decimal("0.1")
         )
@@ -985,12 +958,10 @@ class TestOCO:
         adapter.place_order(sl)
         adapter.place_order(tp)
 
-        # TP triggers
         fills = adapter.on_market_data(_candle(500, 51000, 52500, 50800, 52200))
         assert len(fills) == 1
         assert fills[0]["order"].id == tp.id
 
-        # SL should have been cancelled — no longer in order map
         assert sl.id not in adapter._order_map
         assert adapter.get_position(PRODUCT) is None
 
@@ -1021,22 +992,17 @@ class TestOCO:
         adapter.place_order(sl)
         adapter.place_order(tp)
 
-        # SL triggers
         fills = adapter.on_market_data(_candle(500, 49500, 49800, 48900, 49200))
         assert len(fills) == 1
         assert fills[0]["order"].id == sl.id
         assert tp.id not in adapter._order_map
 
 
-# =================================================================
-# Trailing Stop
-# =================================================================
 
 
 class TestTrailingStop:
     def test_trailing_moves_up_and_triggers(self, order_factory):
         adapter = SimulatedAdapter(Decimal("10000"))
-        # open long at 50000
         entry = order_factory(
             order_type="market", side="buy", product_id=PRODUCT, quantity=Decimal("0.1")
         )
@@ -1053,11 +1019,9 @@ class TestTrailingStop:
         ts._trailing_distance = Decimal("500")
         adapter.place_order(ts)
 
-        # rally: high=52000, trigger moves to 52000-500=51500
         fills = adapter.on_market_data(_candle(400, 50500, 52000, 51600, 51900))
-        assert len(fills) == 0  # low 51600 > 51500
+        assert len(fills) == 0
 
-        # drop below new trigger
         fills = adapter.on_market_data(_candle(500, 51800, 51900, 51400, 51500))
         assert len(fills) == 1
         assert fills[0]["fill_type"] == "TRAILING_STOP"
@@ -1120,12 +1084,9 @@ class TestTrailingStop:
         ts._trailing_distance = Decimal("500")
         adapter.place_order(ts)
 
-        # drop: low=48000, trigger moves to 48000+500=48500
-        # high must stay below 48500 to avoid triggering on this candle
         fills = adapter.on_market_data(_candle(400, 48400, 48400, 48000, 48200))
         assert len(fills) == 0
 
-        # price rises past new trigger (48500)
         fills = adapter.on_market_data(_candle(500, 48300, 48600, 48200, 48500))
         assert len(fills) == 1
         assert fills[0]["fill_type"] == "TRAILING_STOP"
@@ -1152,20 +1113,15 @@ class TestTrailingStop:
         ts._trailing_distance = Decimal("500")
         adapter.place_order(ts)
 
-        # drop: low=48000, high must stay below new trigger (48500)
         fills = adapter.on_market_data(_candle(400, 49000, 48400, 48000, 48200))
         assert len(fills) == 0
 
-        # price rises past trigger
         fills = adapter.on_market_data(_candle(500, 48300, 48600, 48200, 48500))
         assert len(fills) == 1
         assert fills[0]["fill_type"] == "TRAILING_STOP"
         assert _approx(fills[0]["price"], 48500)
 
 
-# =================================================================
-# Balance & PnL accuracy
-# =================================================================
 
 
 class TestBalanceAccuracy:
@@ -1177,19 +1133,16 @@ class TestBalanceAccuracy:
         adapter.place_order(order)
         adapter.on_market_data(_candle(200, 50000, 50500, 49500, 50200))
 
-        # fee = 50000 * 0.1 * 0.0006 = 3.0
         assert _approx(adapter.get_balance(), 10000 - 3.0)
 
     def test_pnl_after_tp(self, order_factory):
         adapter = SimulatedAdapter(Decimal("10000"), taker_fee=Decimal("0.0006"))
-        # open long at 50000
         entry = order_factory(
             order_type="market", side="buy", product_id=PRODUCT, quantity=Decimal("0.1")
         )
         adapter.place_order(entry)
         adapter.on_market_data(_candle(200, 50000, 50200, 49900, 50100))
 
-        # TP at 52000
         tp = order_factory(
             order_type="take_profit",
             side="sell",
@@ -1200,10 +1153,6 @@ class TestBalanceAccuracy:
         adapter.place_order(tp)
         adapter.on_market_data(_candle(400, 51000, 52500, 50800, 52200))
 
-        # entry fee: 50000*0.1*0.0006 = 3.0
-        # tp fee:    52000*0.1*0.0006 = 3.12
-        # pnl:       (52000-50000)*0.1 = 200
-        # expected:  10000 - 3.0 + 200 - 3.12 = 10193.88
         assert _approx(adapter.get_balance(), 10193.88)
 
     def test_pnl_after_sl_loss(self, order_factory):
@@ -1224,15 +1173,9 @@ class TestBalanceAccuracy:
         adapter.place_order(sl)
         adapter.on_market_data(_candle(400, 49500, 49800, 48900, 49200))
 
-        # entry fee: 3.0,  sl fee: 49000*0.1*0.0006 = 2.94
-        # pnl: (49000-50000)*0.1 = -100
-        # expected: 10000 - 3.0 - 100 - 2.94 = 9894.06
         assert _approx(adapter.get_balance(), 9894.06)
 
 
-# =================================================================
-# Cancellation
-# =================================================================
 
 
 class TestCancellation:
@@ -1295,9 +1238,6 @@ class TestCancellation:
         assert adapter.get_order_by_client_id("missing", PRODUCT) is None
 
 
-# =================================================================
-# Position tracking
-# =================================================================
 
 
 class TestPositionTracking:
@@ -1423,9 +1363,6 @@ class TestPositionTracking:
         assert eth_position.side == "SHORT"
 
 
-# =================================================================
-# Edge cases
-# =================================================================
 
 
 class TestEdgeCases:

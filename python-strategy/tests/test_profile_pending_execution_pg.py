@@ -245,7 +245,7 @@ def test_formal_signal_execution_survives_terminal_fault(
         assert terminal_counts(db, start) == (
             (0, 0, 0) if fault_phase == "before_commit" else (1, 1, 1)
         )
-    current_execution[0] = new_execution()  # No in-memory execution/repository reuse.
+    current_execution[0] = new_execution()
     assert executions[0] is not executions[1]
     replay.replay(candles[0], apply_new=apply_new)
     assert published[-1] is not original and len(published[-1].trace) == 5

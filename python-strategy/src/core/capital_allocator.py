@@ -24,7 +24,6 @@ class CapitalAllocator:
         self._used: Dict[str, Decimal] = {}
         self._lock = threading.Lock()
 
-    # ── Allocation lifecycle ───────────────────────────────────────
 
     def allocate(self, strategy_id: str, amount: Decimal) -> None:
         """Allocate capital to a strategy. Raises if insufficient unallocated balance."""
@@ -65,7 +64,6 @@ class CapitalAllocator:
             logger.info("Deallocated %s from strategy %s", allocation, strategy_id)
             return allocation
 
-    # ── Query methods ──────────────────────────────────────────────
 
     def get_available(self, strategy_id: str) -> Decimal:
         """Get available (allocated - used) capital for a strategy."""
@@ -89,7 +87,6 @@ class CapitalAllocator:
         with self._lock:
             return self._unallocated_unlocked()
 
-    # ── Usage tracking ─────────────────────────────────────────────
 
     def record_usage(self, strategy_id: str, amount: Decimal) -> None:
         """Record capital used (e.g., when opening a position)."""
@@ -142,7 +139,6 @@ class CapitalAllocator:
                 )
             self._used[strategy_id] = new_used
 
-    # ── Balance management ─────────────────────────────────────────
 
     @property
     def total_balance(self) -> Decimal:
@@ -169,7 +165,6 @@ class CapitalAllocator:
                 )
             self._total_balance = new_balance
 
-    # ── Internal helpers ───────────────────────────────────────────
 
     def _unallocated_unlocked(self) -> Decimal:
         """Unallocated balance (caller must hold lock)."""

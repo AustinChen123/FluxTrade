@@ -11,7 +11,7 @@ COMMANDS = [
   'test "$(npm --version)" = "10.9.8"',
   "npm ci",
   "npm exec playwright install --with-deps chromium",
-  "npm audit --audit-level=high",
+  "node ../.github/scripts/npm-audit-gate.mjs",
   "npm run lint",
   "npm exec tsc -- --noEmit -p tsconfig.playwright.json",
   "npm test",
