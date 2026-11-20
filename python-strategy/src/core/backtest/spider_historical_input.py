@@ -913,9 +913,10 @@ def _canonical_plain(value: object) -> object:
 
 def _semantic_input_digest(run: HistoricalRunInput, *, model_id: str | None = None) -> str:
     """Same digest as _digest of the asdict projection without run_id."""
-    names = _FIELD_NAMES.get(HistoricalRunInput)
+    kind = type(run)
+    names = _FIELD_NAMES.get(kind)
     if names is None:
-        names = _FIELD_NAMES[HistoricalRunInput] = tuple(field.name for field in fields(run))
+        names = _FIELD_NAMES[kind] = tuple(field.name for field in fields(run))
     projection: dict[str, object] = {name: getattr(run, name) for name in names if name != "run_id"}
     projection["parameters"] = _parameter_projection(run.parameters)
     if model_id is not None:
