@@ -1,0 +1,348 @@
+"""P3 v2 read-side/finalize tests over real durable files."""
+
+from copy import deepcopy
+from hashlib import sha256
+import signal
+import os
+from typing import cast
+
+import pytest
+
+from src.core.backtest import spider_run_store as module
+from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_jsonl, validate_artifact
+from src.core.backtest.spider_run_envelope_schema import journal as validate_journal
+
+from spider_run_store_v2_fixtures import p3_v2_finalize_fixture
+
+
+def test_v2_read_caps_follow_the_policy_table_and_scope_budget(tmp_path, real_p3_artifacts):
+    store, _, _, _ = p3_v2_finalize_fixture(tmp_path, real_p3_artifacts)
+    coverage = {entry["record_kind"]: 1 for entry in store._attempt["planned_coverage"]}
+    scope = module.artifact_limits.p3_v2_scope_budget(coverage)
+    default_names = (
+        "attempt.json", "status.json", "completion.json", "historical_input.json", "report.jsonl",
+    )
+    for name in default_names:
+        assert store._p3_v2_artifact_limit(name) == module.artifact_limits.DEFAULT_LIMIT
+    assert store._p3_v2_artifact_limit("endpoint.json") == scope["E2"]
+    assert store._p3_v2_artifact_limit("reconciliation.json") == scope["X2"]
+
+
+def test_v2_attempt_reader_accepts_exact_cap_and_refuses_cap_plus_one(tmp_path, real_p3_artifacts):
+    store, _, _, _ = p3_v2_finalize_fixture(tmp_path, real_p3_artifacts)
+    cap = module.artifact_limits.DEFAULT_LIMIT
+
+    def attempt_at_size(size):
+        attempt = deepcopy(store._attempt)
+        planned = attempt["planned_coverage"][0]
+        original = planned["barrier_id"]
+        original_size = len(canonical_bytes(attempt)) + 1
+        planned["barrier_id"] = "x" * (size - original_size + len(original))
+        raw = canonical_bytes(attempt) + b"\n"
+        assert len(raw) == size
+        store._attempt = attempt
+        (store._path / "attempt.json").write_bytes(raw)
+
+    attempt_at_size(cap)
+    _, metadata = store._reread_artifact("attempt.json", validate_artifact)
+    assert metadata["byte_count"] == cap
+
+    attempt_at_size(cap + 1)
+    with pytest.raises(module.SpiderRunStoreError) as caught:
+        store._reread_artifact("attempt.json", validate_artifact)
+    assert caught.value.reason == "ARTIFACT_LIMIT_EXCEEDED"
+
+
+@pytest.mark.parametrize("name", [
+    "attempt.json", "status.json", "completion.json", "historical_input.json", "report.jsonl",
+    "endpoint.json", "reconciliation.json",
+])
+def test_v2_nonjournal_paths_read_at_most_policy_cap_plus_one(tmp_path, real_p3_artifacts, monkeypatch, name):
+    store, _, _, _ = p3_v2_finalize_fixture(tmp_path, real_p3_artifacts)
+    monkeypatch.setattr(store, "_p3_v2_artifact_limit", lambda _: 31)
+    path = store._path / name
+    path.write_bytes(b"x" * 32)
+    with pytest.raises(module.SpiderRunStoreError) as caught:
+        if name == "historical_input.json":
+            store._historical_input_metadata(store._attempt)
+        else:
+            store._reread_artifact(name, validate_artifact)
+    assert caught.value.reason == "ARTIFACT_LIMIT_EXCEEDED"
+    assert path.stat().st_size == 32
+
+
+def test_v1_reread_still_delegates_without_v2_cap(tmp_path, real_p3_artifacts, monkeypatch):
+    store, _, _, _ = p3_v2_finalize_fixture(tmp_path, real_p3_artifacts)
+    store._attempt["artifact_encoding"] = "artifact_encoding_v1"
+    calls = []
+    expected = ({"v1": True}, {"byte_count": 16_777_217})
+
+    def original_reread(name, validator):
+        calls.append((name, validator))
+        return expected
+
+    monkeypatch.setattr(store, "_reread", original_reread)
+    assert store._reread_artifact("attempt.json", validate_artifact) == expected
+    assert calls == [("attempt.json", validate_artifact)]
+
+
+def test_v2_reread_dispatch_returns_projection_and_wire_identity(tmp_path, real_p3_artifacts):
+    store, values, _, raw = p3_v2_finalize_fixture(tmp_path, real_p3_artifacts)
+    attempt, attempt_metadata = store._reread_artifact("attempt.json", validate_artifact)
+    assert attempt == store._attempt
+    rows, metadata = store._reread_artifact("journal.jsonl", validate_journal, attempt=attempt)
+    assert rows == values[2]
+    expected_metadata = cast(dict[str, object], store._p3_v2_journal_metadata)
+    assert metadata == dict(path="journal.jsonl", **expected_metadata)
+    assert metadata["sha256"] == sha256(raw).hexdigest()
+    assert metadata["byte_count"] == len(raw)
+    assert metadata["row_count"] == len(values[2])
+    assert attempt_metadata["schema_version"] == "spider_attempt_v1"
+
+
+def test_journal_real_read_oserror_named_and_fd_closed(tmp_path, real_p3_artifacts, monkeypatch):
+    import os
+
+    store, *_ = p3_v2_finalize_fixture(tmp_path, real_p3_artifacts)
+    before = {path.name: path.read_bytes() for path in store._path.iterdir()}
+    original_read = os.read
+    journal_inode = (store._path / "journal.jsonl").stat().st_ino
+    failed_descriptors = []
+
+    def fail_journal_read(fd, size):
+        if os.fstat(fd).st_ino == journal_inode:
+            failed_descriptors.append(fd)
+            raise OSError("injected journal read error")
+        return original_read(fd, size)
+
+    monkeypatch.setattr(os, "read", fail_journal_read)
+    for _ in range(2):
+        with pytest.raises(module.SpiderRunStoreError) as caught:
+            store._reread_artifact(
+                "journal.jsonl", validate_journal, attempt=store._attempt,
+            )
+        assert caught.value.reason == "PUBLICATION_FAILED"
+        assert {path.name: path.read_bytes() for path in store._path.iterdir()} == before
+        with pytest.raises(OSError):
+            os.fstat(failed_descriptors[-1])
+
+
+def test_v2_attempt_is_normalized_only_for_the_legacy_schema_validator(tmp_path, real_p3_artifacts,
+                                                                       monkeypatch):
+    store, _, _, _ = p3_v2_finalize_fixture(tmp_path, real_p3_artifacts)
+    original_validate = module.validate_artifact
+    observed = []
+
+    def capture_normalized(value):
+        if type(value) is dict and "artifact_encoding" in value:
+            observed.append(value["artifact_encoding"])
+        return original_validate(value)
+
+    monkeypatch.setattr(module, "validate_artifact", capture_normalized)
+    attempt, _ = store._reread_artifact("attempt.json", validate_artifact)
+    assert attempt["artifact_encoding"] == "artifact_encoding_v2"
+    assert observed == ["artifact_encoding_v1"]
+
+
+@pytest.mark.parametrize("encoding", ["artifact_encoding_v1", "unknown_encoding", None])
+def test_v2_attempt_rejects_changed_disk_wire_encoding(tmp_path, real_p3_artifacts, encoding):
+    store, _, _, _ = p3_v2_finalize_fixture(tmp_path, real_p3_artifacts)
+    attempt = deepcopy(store._attempt)
+    if encoding is None:
+        attempt.pop("artifact_encoding")
+    else:
+        attempt["artifact_encoding"] = encoding
+    (store._path / "attempt.json").write_bytes(canonical_bytes(attempt) + b"\n")
+    with pytest.raises(module.SpiderRunStoreError) as caught:
+        store._reread_artifact("attempt.json", validate_artifact)
+    assert caught.value.reason == "ENDPOINT_RECONCILIATION_FAILED"
+
+
+@pytest.mark.parametrize("field", ["schema_version", "sha256", "byte_count", "row_count"])
+def test_v2_reread_rejects_wire_metadata_mismatch_from_real_file(tmp_path, real_p3_artifacts, field):
+    store, _, _, raw = p3_v2_finalize_fixture(tmp_path, real_p3_artifacts)
+    attempt = store._reread_artifact("attempt.json", validate_artifact)[0]
+    metadata = dict(cast(dict[str, object], store._p3_v2_journal_metadata))
+    if field == "schema_version":
+        metadata[field] = "spider_journal_record_v1"
+    else:
+        metadata[field] = "f" * 64 if field == "sha256" else cast(int, metadata[field]) + 1
+    store._p3_v2_journal_metadata = metadata
+    before = (store._path / "journal.jsonl").read_bytes()
+    with pytest.raises(module.SpiderRunStoreError) as caught:
+        store._reread_artifact("journal.jsonl", validate_journal, attempt=attempt)
+    assert caught.value.reason == "ENDPOINT_RECONCILIATION_FAILED"
+    assert (store._path / "journal.jsonl").read_bytes() == before == raw
+
+
+def test_v2_reread_rejects_mixed_version_rows_without_fallback(tmp_path, real_p3_artifacts):
+    store, _, _, _ = p3_v2_finalize_fixture(tmp_path, real_p3_artifacts)
+    attempt = store._reread_artifact("attempt.json", validate_artifact)[0]
+    rows = decode_jsonl((store._path / "journal.jsonl").read_bytes())
+    rows[0]["schema_version"] = "spider_journal_record_v1"
+    mixed = b"".join(canonical_bytes(row) + b"\n" for row in rows)
+    (store._path / "journal.jsonl").write_bytes(mixed)
+    store._p3_v2_journal_metadata = dict(
+        schema_version="spider_journal_record_v2", sha256=sha256(mixed).hexdigest(),
+        byte_count=len(mixed), row_count=len(rows),
+    )
+    with pytest.raises(module.SpiderRunStoreError) as caught:
+        store._reread_artifact("journal.jsonl", validate_journal, attempt=attempt)
+    assert caught.value.reason == "ENDPOINT_RECONCILIATION_FAILED"
+    assert (store._path / "journal.jsonl").read_bytes() == mixed
+    store._attempt["artifact_encoding"] = "artifact_encoding_v1"
+    with pytest.raises(module.SpiderRunStoreError) as reverse:
+        store._reread_artifact("journal.jsonl", validate_journal)
+    assert reverse.value.reason == "ENDPOINT_RECONCILIATION_FAILED"
+
+
+def test_v2_reread_rejects_partial_tail_with_metadata_for_the_partial_bytes(tmp_path, real_p3_artifacts):
+    store, _, _, raw = p3_v2_finalize_fixture(tmp_path, real_p3_artifacts)
+    attempt = store._reread_artifact("attempt.json", validate_artifact)[0]
+    partial = raw[:-1]
+    (store._path / "journal.jsonl").write_bytes(partial)
+    store._p3_v2_journal_metadata = dict(
+        schema_version="spider_journal_record_v2", sha256=sha256(partial).hexdigest(),
+        byte_count=len(partial), row_count=partial.count(b"\n"),
+    )
+    with pytest.raises(module.SpiderRunStoreError) as caught:
+        store._reread_artifact("journal.jsonl", validate_journal, attempt=attempt)
+    assert caught.value.reason == "ENDPOINT_RECONCILIATION_FAILED"
+    assert (store._path / "journal.jsonl").read_bytes() == partial
+
+
+def test_v2_reread_rejects_symlink_journal_target(tmp_path, real_p3_artifacts):
+    store, _, _, _ = p3_v2_finalize_fixture(tmp_path, real_p3_artifacts)
+    journal = store._path / "journal.jsonl"
+    target = store._path / "journal-target.jsonl"
+    journal.rename(target)
+    journal.symlink_to(target.name)
+    attempt = store._reread_artifact("attempt.json", validate_artifact)[0]
+    with pytest.raises(module.SpiderRunStoreError) as caught:
+        store._reread_artifact("journal.jsonl", validate_journal, attempt=attempt)
+    assert caught.value.reason == "PUBLICATION_FAILED"
+
+
+def test_v2_reread_rejects_symlink_before_applying_target_size_cap(tmp_path, real_p3_artifacts):
+    store, _, _, _ = p3_v2_finalize_fixture(tmp_path, real_p3_artifacts)
+    attempt = store._path / "attempt.json"
+    target = store._path / "oversized-target.json"
+    target.write_bytes(b"x" * (module.artifact_limits.DEFAULT_LIMIT + 1))
+    attempt.unlink()
+    attempt.symlink_to(target.name)
+    with pytest.raises(module.SpiderRunStoreError) as caught:
+        store._reread_artifact("attempt.json", validate_artifact)
+    assert caught.value.reason == "PUBLICATION_FAILED"
+
+
+def test_v2_reread_requires_attempt_before_journal(tmp_path, real_p3_artifacts):
+    store, _, _, _ = p3_v2_finalize_fixture(tmp_path, real_p3_artifacts)
+    with pytest.raises(module.SpiderRunStoreError) as caught:
+        store._reread_artifact("journal.jsonl", validate_journal)
+    assert caught.value.reason == "ENDPOINT_RECONCILIATION_FAILED"
+
+
+def test_v2_journal_rejects_unregistered_attempt_identity(tmp_path, real_p3_artifacts):
+    store, _, _, _ = p3_v2_finalize_fixture(tmp_path, real_p3_artifacts)
+    foreign_attempt = deepcopy(store._attempt)
+    foreign_attempt["artifact_encoding"] = "artifact_encoding_v1"
+    with pytest.raises(module.SpiderRunStoreError) as caught:
+        store._reread_artifact("journal.jsonl", validate_journal, attempt=foreign_attempt)
+    assert caught.value.reason == "ENDPOINT_RECONCILIATION_FAILED"
+
+
+def test_v2_reread_rejects_fifo_before_open(tmp_path, real_p3_artifacts):
+    store, _, _, _ = p3_v2_finalize_fixture(tmp_path, real_p3_artifacts)
+    journal = store._path / "journal.jsonl"
+    journal.rename(store._path / "journal.saved")
+    os.mkfifo(journal)
+
+    class OpenBlocked(Exception):
+        pass
+
+    def deadline(*_):
+        raise OpenBlocked("reader blocked opening FIFO")
+
+    previous = signal.signal(signal.SIGALRM, deadline)
+    signal.setitimer(signal.ITIMER_REAL, 0.5)
+    try:
+        with pytest.raises(module.SpiderRunStoreError) as caught:
+            store._reread_artifact("journal.jsonl", validate_journal, attempt=store._attempt)
+        assert caught.value.reason == "PUBLICATION_FAILED"
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def test_v2_reread_rejects_attempt_identity_mismatch(tmp_path, real_p3_artifacts):
+    store, _, _, _ = p3_v2_finalize_fixture(tmp_path, real_p3_artifacts)
+    disk_attempt = deepcopy(store._attempt)
+    disk_attempt["planned_coverage"][0]["barrier_id"] = "different-valid-coverage-id"
+    (store._path / "attempt.json").write_bytes(canonical_bytes(disk_attempt) + b"\n")
+    with pytest.raises(module.SpiderRunStoreError) as caught:
+        store._reread_artifact("attempt.json", validate_artifact)
+    assert caught.value.reason == "ENDPOINT_RECONCILIATION_FAILED"
+
+
+def test_v2_reread_rejects_foreign_run_id_without_trusting_valid_wire_metadata(tmp_path,
+                                                                                real_p3_artifacts):
+    store, _, _, raw = p3_v2_finalize_fixture(tmp_path, real_p3_artifacts)
+    attempt = store._reread_artifact("attempt.json", validate_artifact)[0]
+    rows = decode_jsonl(raw)
+    rows[0]["run_id"] = "foreign-run"
+    foreign = b"".join(canonical_bytes(row) + b"\n" for row in rows)
+    (store._path / "journal.jsonl").write_bytes(foreign)
+    store._p3_v2_journal_metadata = dict(
+        schema_version="spider_journal_record_v2", sha256=sha256(foreign).hexdigest(),
+        byte_count=len(foreign), row_count=len(rows),
+    )
+    with pytest.raises(module.SpiderRunStoreError) as caught:
+        store._reread_artifact("journal.jsonl", validate_journal, attempt=attempt)
+    assert caught.value.reason == "ARTIFACT_MISMATCH"
+    assert (store._path / "journal.jsonl").read_bytes() == foreign
+
+
+@pytest.mark.parametrize(
+    ("encoding", "expected_v2_writer"),
+    [("artifact_encoding_v1", False), ("artifact_encoding_v2", True)],
+    ids=("p3-v1-keeps-v1-writer", "p3-v2-selects-v2-writer"),
+)
+def test_register_selects_writer_only_from_validated_p3_encoding(
+    tmp_path, real_p3_artifacts, encoding, expected_v2_writer,
+):
+    attempt = decode_jsonl(real_p3_artifacts["attempt.json"])[0]
+    attempt["artifact_encoding"] = encoding
+    store = module.SpiderRunStore.create(str(tmp_path), cast(str, attempt["run_id"]))
+    store.register(attempt, historical_input=real_p3_artifacts["historical_input.json"])
+    assert store._p3_v2_write_enabled is expected_v2_writer
+
+
+def test_register_v2_guard_is_literal_first_statement_and_refuses_before_publish(tmp_path, real_p3_artifacts, monkeypatch):
+    import ast
+    import inspect
+    import textwrap
+
+    method = ast.parse(textwrap.dedent(inspect.getsource(module.SpiderRunStore.register)))
+    function = next(node for node in method.body if isinstance(node, ast.FunctionDef))
+    assert isinstance(function.body[0], ast.If)
+    assert "p3_v2_registration_preflight" in ast.unparse(function.body[0])
+    try_statement = cast(ast.Try, function.body[0].body[0])
+    handler = cast(ast.ExceptHandler, try_statement.handlers[0])
+    assert ast.unparse(cast(ast.AST, handler.type)) == "ValueError"
+    translated = ast.unparse(cast(ast.AST, handler.body[0]))
+    assert translated == "if error.args == ('ARTIFACT_LIMIT_EXCEEDED',):\n    raise SpiderRunStoreError('ARTIFACT_LIMIT_EXCEEDED') from error"
+    attempt = decode_jsonl(real_p3_artifacts["attempt.json"])[0]
+    attempt["artifact_encoding"] = "artifact_encoding_v2"
+    monkeypatch.setattr(module.artifact_limits, "p3_v2_scope_budget", lambda _: {"refused": True})
+    store = module.SpiderRunStore.create(str(tmp_path), cast(str, attempt["run_id"]))
+    with pytest.raises(module.SpiderRunStoreError) as caught:
+        store.register(attempt, historical_input=real_p3_artifacts["historical_input.json"])
+    assert type(caught.value) is module.SpiderRunStoreError
+    assert caught.value.reason == "ARTIFACT_LIMIT_EXCEEDED"
+    assert caught.value.requested_failure_reason is None
+    assert caught.value.primary_failure is None
+    with pytest.raises(module.SpiderRunStoreError) as retry:
+        module.SpiderRunStore.create(str(tmp_path), cast(str, attempt["run_id"]))
+    assert retry.value.reason == "PUBLICATION_FAILED"
+    assert store._state == "CREATED"
+    assert list(store._path.iterdir()) == []

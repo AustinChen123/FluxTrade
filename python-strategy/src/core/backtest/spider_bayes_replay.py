@@ -15,6 +15,7 @@ from src.core.backtest.spider_historical_input import (
     HistoricalInputError,
     HistoricalBar,
     HistoricalRunInput,
+    ValidatedHistoricalInput,
     validate_historical_input,
 )
 
@@ -72,6 +73,19 @@ def prepare_closed15m_source14(run: HistoricalRunInput) -> Closed15mProjection:
     if type(run) is not HistoricalRunInput:
         raise HistoricalInputError("invalid historical input DTO")
     validate_historical_input(run)
+    return _prepare_closed15m_source14_run(run)
+
+
+def _prepare_closed15m_source14_validated(
+    token: ValidatedHistoricalInput,
+) -> Closed15mProjection:
+    """Project only from the immutable DTO already validated at this boundary."""
+    if type(token) is not ValidatedHistoricalInput:
+        raise HistoricalInputError("invalid validated historical input token")
+    return _prepare_closed15m_source14_run(token.run)
+
+
+def _prepare_closed15m_source14_run(run: HistoricalRunInput) -> Closed15mProjection:
     if run.ordered_products != PRODUCTS:
         raise HistoricalInputError("unsupported source basket identity or order")
     if run.range_start_ms % _INTERVAL_MS:

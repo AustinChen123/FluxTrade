@@ -299,7 +299,7 @@ fn p1_liquidation_profile_reuses_frozen_owner_transition() {
         "134b24a87d3490abca366cadb5e081d698562474c3285e7b4e1393300c4da94d"
     );
     let mut input =
-        context::tests::activation(&owner, 1501, context::tests::mark_rows(&marks, 1501));
+        context::tests::activation(&owner, 1501, context::tests::mark_rows_vec(&marks, 1501));
     input.stamp.event_id = "S6-L-MARK-1501".into();
     owner.activate_context(&input).unwrap();
     assert_eq!(

@@ -44,18 +44,22 @@ pub(in super::super) fn activation(owner: &ScenarioAccount, at: i64, rows: Rows)
     }
 }
 
-pub(in super::super) fn mark_rows(marks: &[Mark], at: i64) -> Rows {
+pub(in super::super) fn mark_rows(marks: &mark_history::MarkHistory, at: i64) -> Rows {
     Rows::Marks(
         [Product::Btc, Product::Eth]
             .into_iter()
             .map(|p| {
-                let m = marks
-                    .iter()
-                    .find(|m| m.product == p && m.valid_from <= at && at < m.valid_to)
-                    .unwrap();
+                let m = marks.mark_at(&p, at).unwrap();
                 (p, m.valid_from, m.valid_to, m.price)
             })
             .collect(),
+    )
+}
+
+pub(in super::super) fn mark_rows_vec(marks: &[Mark], at: i64) -> Rows {
+    mark_rows(
+        &mark_history::MarkHistory::try_from_vec(marks.to_vec()).unwrap(),
+        at,
     )
 }
 
@@ -66,10 +70,7 @@ fn configured_mark_rows(owner: &ScenarioAccount, at: i64) -> Rows {
             .products()
             .into_iter()
             .map(|product| {
-                let row = marks
-                    .iter()
-                    .find(|m| m.product == product && m.valid_from <= at && at < m.valid_to)
-                    .unwrap();
+                let row = marks.mark_at(&product, at).unwrap();
                 (product, row.valid_from, row.valid_to, row.price)
             })
             .collect(),
@@ -145,6 +146,121 @@ fn configure_spec_change(row: &mut ConfiguredProduct, at: i64, tick: &str) {
             ..old
         },
     ];
+}
+
+fn owned_context_rows(owner: &ScenarioAccount) -> std::collections::BTreeMap<String, Receipt> {
+    owner
+        .transition
+        .contexts
+        .iter()
+        .map(|(key, receipt)| (key.clone(), receipt.clone()))
+        .collect()
+}
+
+#[test]
+fn nonempty_context_history_publication_and_rollback_match_owned_rows() {
+    use super::super::group::{Group, Input as GroupInput, Member};
+
+    let (mut seed, config, marks) = fixture();
+    seed.effective_at = 999;
+    seed.orders.clear();
+    let mut original = ScenarioAccount::from_seed(&seed, &config, &marks).unwrap();
+    let mut first = activation(
+        &original,
+        1000,
+        Rows::Tiers(
+            [Product::Btc, Product::Eth]
+                .into_iter()
+                .map(|product| (product, "tier-v1".into(), "tier-v2".into(), 1000))
+                .collect(),
+        ),
+    );
+    first.stamp.event_id = "prior-context".into();
+    original.activate_context(&first).unwrap();
+    let saved = owned_context_rows(&original);
+    assert_eq!(saved.len(), 1);
+
+    let mut success = original.clone();
+    let mut second = activation(&success, 1001, mark_rows_vec(&marks, 1001));
+    second.stamp.event_id = "published-context".into();
+    let (expected_receipt, _) = success.prepare_context(&second).unwrap();
+    let mut published = saved.clone();
+    published.insert(second.stamp.event_id.clone(), expected_receipt.clone());
+    let receipt = success.activate_context(&second).unwrap();
+    assert_eq!(receipt, expected_receipt);
+    assert_eq!(owned_context_rows(&success), published);
+    assert_eq!(success.activate_context(&second).unwrap(), receipt);
+    assert_eq!(owned_context_rows(&success), published);
+    let mut conflict = second.clone();
+    conflict.expected_after[0] ^= 1;
+    assert_eq!(
+        success.activate_context(&conflict),
+        Err("EVENT_ID_CONFLICT")
+    );
+    assert_eq!(owned_context_rows(&success), published);
+
+    for (event_id, panic) in [("before-error", false), ("before-panic", true)] {
+        let mut owner = original.clone();
+        let mut input = activation(&owner, 1002, mark_rows_vec(&marks, 1002));
+        input.stamp.event_id = event_id.into();
+        let result = owner.activate_context_checked(&input, |stage| {
+            if stage == Stage::BeforeSwap {
+                if panic {
+                    panic!("before-swap injection");
+                }
+                Err("BEFORE_SWAP_INJECTED")
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(
+            result,
+            Err(if panic {
+                "CONTEXT_PANIC"
+            } else {
+                "BEFORE_SWAP_INJECTED"
+            })
+        );
+        assert_eq!(owned_context_rows(&owner), saved);
+    }
+
+    let mut after = original.clone();
+    let mut after_input = activation(&after, 1003, mark_rows_vec(&marks, 1003));
+    after_input.stamp.event_id = "after-swap-error".into();
+    let (after_receipt, _) = after.prepare_context(&after_input).unwrap();
+    assert_eq!(
+        after.activate_context_checked(&after_input, |stage| {
+            if stage == Stage::AfterSwap {
+                Err("AFTER_SWAP_INJECTED")
+            } else {
+                Ok(())
+            }
+        }),
+        Err("AFTER_SWAP_INJECTED")
+    );
+    let mut retained = saved.clone();
+    retained.insert(after_input.stamp.event_id.clone(), after_receipt);
+    assert_eq!(owned_context_rows(&after), retained);
+
+    let mut grouped = original.clone();
+    let mut group_input = activation(&grouped, 1004, mark_rows_vec(&marks, 1004));
+    group_input.stamp.event_id = "group-context".into();
+    let (group_receipt, _) = grouped.prepare_context(&group_input).unwrap();
+    let group = Group {
+        group_id: "nonempty-context-group".into(),
+        account_key: grouped.key.clone(),
+        ordering_contract_id: "S_order_v1".into(),
+        group_effective_at: group_input.stamp.effective_at,
+        declared_member_count: 1,
+        members: vec![Member {
+            stamp: group_input.stamp.clone(),
+            input: GroupInput::Context(group_input.clone()),
+        }],
+    };
+    grouped.apply_group(&group).unwrap();
+    let mut group_rows = saved;
+    group_rows.insert(group_input.stamp.event_id, group_receipt);
+    assert_eq!(owned_context_rows(&grouped), group_rows);
 }
 
 fn configure_tier_change(row: &mut ConfiguredProduct, at: i64, mmr: &str) {
@@ -237,10 +353,7 @@ fn configured_mark_vector_invalid_shapes_fail_without_publishing_context() {
             "stale" => {
                 let (scenario, marks) = owner.btc_context().unwrap();
                 let product = &scenario.products()[0];
-                let old = marks
-                    .iter()
-                    .find(|m| m.product == *product && m.valid_from < 600)
-                    .unwrap();
+                let old = marks.mark_at(product, 599).unwrap();
                 rows[0] = (product.clone(), old.valid_from, old.valid_to, old.price);
             }
             _ => rows[1].3 += Decimal::ONE,
@@ -397,10 +510,7 @@ fn configured_mark_shortfall_commits_source_then_waits_for_cancel_effect_before_
         .products()
         .into_iter()
         .map(|p| {
-            let mark = marks
-                .iter()
-                .find(|m| m.product == p && m.valid_from < 600)
-                .unwrap();
+            let mark = marks.mark_at(&p, 599).unwrap();
             Mark {
                 valid_from: 600,
                 valid_to: 3000,
@@ -409,7 +519,7 @@ fn configured_mark_shortfall_commits_source_then_waits_for_cancel_effect_before_
         })
         .collect::<Vec<_>>();
     let old_counterfactual =
-        reservation::calculate(&projection, &orders, scenario, &old_marks).unwrap();
+        reservation::calculate_vec(&projection, &orders, scenario, &old_marks).unwrap();
     let new_counterfactual = reservation::calculate(&projection, &orders, scenario, marks).unwrap();
     assert_eq!(
         (
@@ -496,8 +606,24 @@ fn exact_mmr_boundary_requests_reducing_order_and_stops_only_after_effect() {
             valid_to: 3000,
         });
         let mut owner = ScenarioAccount::from_seed(&seed, &config, &marks).unwrap();
-        let input = activation(&owner, 600, mark_rows(&marks, 600));
+        let input = activation(&owner, 600, mark_rows_vec(&marks, 600));
         let receipt = owner.activate_context(&input).unwrap();
+        for (index, product) in [Product::Btc, Product::Eth].into_iter().enumerate() {
+            let old = marks
+                .iter()
+                .find(|mark| {
+                    mark.product == product && mark.valid_from <= 599 && 599 < mark.valid_to
+                })
+                .unwrap();
+            let new = marks
+                .iter()
+                .find(|mark| {
+                    mark.product == product && mark.valid_from <= 600 && 600 < mark.valid_to
+                })
+                .unwrap();
+            assert_eq!(&receipt.rows_before[index].2, old);
+            assert_eq!(&receipt.rows_after[index].2, new);
+        }
         assert_eq!(receipt.after.equity, d(equity));
         assert_eq!(receipt.after.maintenance_margin, d("2"));
         assert_eq!(receipt.after.used_margin, d("50.5"));
@@ -701,7 +827,7 @@ fn cross_product_pending_set_is_stable_after_first_effect_restores_margin() {
     );
     let mut owner = ScenarioAccount::from_seed(&seed, &config, &marks).unwrap();
     assert_eq!(owner.reservation().unwrap().used_margin, d("909"));
-    let input = activation(&owner, 600, mark_rows(&marks, 600));
+    let input = activation(&owner, 600, mark_rows_vec(&marks, 600));
     for stage in [
         Stage::RiskActionDrafted(0),
         Stage::RiskActionDrafted(1),
@@ -873,7 +999,7 @@ fn context_and_group_invalid_shape_and_fault_retention_are_atomic() {
     });
     let mut expired = ScenarioAccount::from_seed(&seed, &config, &boundary_marks).unwrap();
     let boundary = activation(&expired, 1000, input.rows.clone());
-    let later_mark = activation(&expired, 1000, mark_rows(&boundary_marks, 1000));
+    let later_mark = activation(&expired, 1000, mark_rows_vec(&boundary_marks, 1000));
     let mut invalid = group.clone();
     invalid.members = vec![
         Member {

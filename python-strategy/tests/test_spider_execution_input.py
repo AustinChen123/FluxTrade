@@ -1,4 +1,4 @@
-from dataclasses import replace
+from dataclasses import fields, replace
 from hashlib import sha256
 from pathlib import Path
 import ast
@@ -9,6 +9,8 @@ import pytest
 
 from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_canonical
 from src.core.backtest.spider_historical_input import HistoricalInputError, encode_historical_run_input
+from src.core.backtest import spider_historical_input as historical_input_module
+from src.core.backtest import spider_execution_input as execution_input_module
 from src.core.backtest.spider_execution_input import (
     ENDPOINT_POLICY_ID,
     POLICY_ID,
@@ -16,6 +18,7 @@ from src.core.backtest.spider_execution_input import (
     BASE_POLICY_SOURCE_SHA256,
     SpiderExecutionInput,
     decode_spider_execution_input,
+    _decode_spider_execution_input,
     encode_spider_execution_input,
     validate_spider_execution_input,
 )
@@ -42,6 +45,64 @@ def test_execution_input_roundtrip_embeds_exact_p3_object_and_preserves_base_byt
     assert decoded == value
     assert encode_historical_run_input(decoded.historical_input) == original
     assert encode_spider_execution_input(decoded) == encoded
+
+
+def test_public_execution_decoder_uses_one_validation_and_matches_legacy_result(monkeypatch):
+    run = _input()
+    raw = encode_spider_execution_input(run)
+    expected = _decode_spider_execution_input(raw, validated=False)
+    calls = 0
+    original = historical_input_module.validate_historical_input
+
+    def counted(value):
+        nonlocal calls
+        calls += 1
+        return original(value)
+
+    monkeypatch.setattr(historical_input_module, "validate_historical_input", counted)
+    actual = decode_spider_execution_input(raw)
+
+    assert type(actual) is SpiderExecutionInput
+    assert actual == expected == run
+    assert calls == 1
+
+
+def test_public_execution_decoder_falls_back_when_approved_tree_gate_is_false(monkeypatch):
+    value = _input()
+    raw = encode_spider_execution_input(value)
+    expected = _decode_spider_execution_input(raw, validated=False)
+    manifest = value.historical_input.trade_manifest
+    non_exact_type = type("NonExactSourceManifest", (type(manifest),), {"__slots__": ()})
+    non_exact_manifest = non_exact_type(
+        **{field.name: getattr(manifest, field.name) for field in fields(manifest)}
+    )
+    candidate = replace(value.historical_input, trade_manifest=non_exact_manifest)
+
+    monkeypatch.setattr(
+        execution_input_module, "_decode_historical_run_input_candidate", lambda _raw: candidate,
+    )
+    monkeypatch.setattr(
+        execution_input_module, "_is_approved_historical_input_tree", lambda _run: False,
+    )
+
+    actual = decode_spider_execution_input(raw)
+
+    assert type(actual) is SpiderExecutionInput
+    assert actual == expected == value
+
+
+def _decode_outcome(call):
+    try:
+        return ("return", call())
+    except BaseException as error:
+        cause = error.__cause__
+        context = error.__context__
+        return (
+            "raise", type(error), error.args,
+            None if cause is None else (type(cause), cause.args),
+            None if context is None else (type(context), context.args),
+            error.__suppress_context__,
+        )
 
 
 @pytest.mark.parametrize("mutation", ["missing", "extra", "nested_type", "schema", "host", "endpoint", "base_policy", "base_version", "base_source", "cutoff_bool", "cutoff_lower", "cutoff_upper", "generation_bool", "generation_nonzero"])
@@ -75,8 +136,15 @@ def test_execution_input_rejects_unknown_identity_or_malformed_contract(mutation
     else:
         wire["generation"] = 1
     expected_message = "unsupported original P3 policy identity" if mutation == "base_source" else None
+    def legacy():
+        return _decode_spider_execution_input(canonical_bytes(wire), validated=False)
+
+    def public():
+        return decode_spider_execution_input(canonical_bytes(wire))
+
+    assert _decode_outcome(public) == _decode_outcome(legacy)
     with pytest.raises(HistoricalInputError, match=expected_message):
-        decode_spider_execution_input(canonical_bytes(wire))
+        public()
 
 
 @pytest.mark.parametrize("mutation", ["duplicate_key", "float"])
@@ -87,6 +155,9 @@ def test_execution_input_rejects_ambiguous_or_float_json(mutation):
     replacement = (b'"generation":0,"generation":0' if mutation == "duplicate_key"
                    else b'"generation":0.0')
     raw = raw.replace(token, replacement, 1)
+    assert _decode_outcome(lambda: decode_spider_execution_input(raw)) == _decode_outcome(
+        lambda: _decode_spider_execution_input(raw, validated=False)
+    )
     with pytest.raises(HistoricalInputError):
         decode_spider_execution_input(raw)
 

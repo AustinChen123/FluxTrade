@@ -162,7 +162,7 @@ fn context_hash(
         .iter()
         .flat_map(|row| row.marks.iter().cloned())
         .collect::<Vec<_>>();
-    context_id(scenario, &marks, seed.effective_at).unwrap()
+    context_id_vec(scenario, &marks, seed.effective_at).unwrap()
 }
 
 fn configured_scenario(leverage: Decimal, products: &[ConfiguredProduct]) -> FrozenScenario {
@@ -483,7 +483,7 @@ fn configured_multi_version_timelines_resolve_boundaries_and_mark_gaps() {
         let (spec, tier) = scenario.resolve(&products[0], at).unwrap();
         assert_eq!((spec.version.as_str(), tier.version.as_str()), expected);
     }
-    assert_eq!(marks[1].price, d("101"));
+    assert_eq!(marks.mark_at(&products[0], 50).unwrap().price, d("101"));
 }
 
 #[test]
@@ -530,7 +530,12 @@ fn configured_multi_version_identity_covers_inactive_timelines_causally() {
         |p| {
             p.marks.remove(0);
         },
-        |p| p.marks.push(p.marks[0].clone()),
+        |p| {
+            let mut inactive = p.marks[0].clone();
+            inactive.valid_from = 210;
+            inactive.valid_to = 220;
+            p.marks.push(inactive);
+        },
         |p| p.specs.reverse(),
         |p| p.tiers.reverse(),
         |p| p.marks.reverse(),
@@ -550,6 +555,20 @@ fn configured_multi_version_identity_covers_inactive_timelines_causally() {
         |p| p.marks[0].price = d("100.0"),
     ];
     assert_timeline_scale_equivalent(&seed, &product, scales);
+}
+
+#[test]
+fn configured_multi_version_identity_rejects_duplicate_mark_history() {
+    let (seed, mut product) = multi_version_input();
+    product.marks.push(product.marks[0].clone());
+    assert_eq!(
+        context_id_vec(
+            &configured_scenario(d("10"), &[product.clone()]),
+            &product.marks,
+            seed.effective_at,
+        ),
+        Err("OVERLAPPING_MARKS")
+    );
 }
 #[test]
 fn configured_multi_version_rejects_invalid_timeline_shapes_before_owner() {
@@ -807,7 +826,7 @@ fn configured_two_product_mark_activation_updates_and_stabilizes_owner_identity(
         .flat_map(|row| row.marks.iter().cloned())
         .collect::<Vec<_>>();
     let activation =
-        context::tests::activation(&owner, 600, context::tests::mark_rows(&marks, 600));
+        context::tests::activation(&owner, 600, context::tests::mark_rows_vec(&marks, 600));
     let receipt = owner.activate_context(&activation).unwrap();
     assert_eq!(owner.valuation_context_id, activation.expected_after);
     assert_ne!(receipt.input.expected_before, receipt.input.expected_after);

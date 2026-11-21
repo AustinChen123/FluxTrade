@@ -1,11 +1,14 @@
 """Actual-native paid scenario orchestration and same-store admission tests."""
 
 from dataclasses import replace
+import ast
 from hashlib import sha256
 import inspect
 import os
 from pathlib import Path
+import subprocess
 import stat
+import sys
 from typing import Any, cast
 
 import pytest
@@ -41,6 +44,65 @@ def _run(tmp_path: Path, run_id: str, *, mode: str = "flat", **kwargs):
         str(tmp_path), run_id, scenario._PAID_SELECTOR, execution_input=raw, **kwargs,
     )
     return request, raw, result
+
+
+@pytest.mark.parametrize(
+    ("encoding", "family"),
+    [(encoding, family) for encoding in ("artifact_encoding_v1", "artifact_encoding_v2")
+     for family in ("paid", "floating", "gross")],
+    ids=[f"{family}-{encoding.removeprefix('artifact_encoding_')}"
+         for encoding in ("artifact_encoding_v1", "artifact_encoding_v2")
+         for family in ("paid", "floating", "gross")],
+)
+@pytest.mark.slow
+def test_p3_encoding_opt_in_does_not_escape_into_paid_families(
+    tmp_path, monkeypatch, encoding, family,
+):
+    from test_spider_floating_exit_formal import _candidate_input
+    from test_spider_gross_formal_runner import _for_run
+    from src.core.backtest.spider_gross_execution_input import encode_spider_gross_execution_input
+    from src.core.backtest.spider_run_artifacts import decode_jsonl
+
+    run_id = f"encoding-{family}-{encoding[-2:]}"
+    if family == "paid":
+        request, raw = _request(run_id)
+        selector = scenario._PAID_SELECTOR
+        kwargs = {"execution_input": raw}
+    elif family == "floating":
+        raw = _candidate_input(run_id, "BAYES_REMAINING_COST_RISK_V1")
+        selector = scenario._FLOATING_SELECTOR
+        kwargs = {"floating_exit_input": raw}
+    else:
+        request = _for_run(run_id)
+        raw = encode_spider_gross_execution_input(request)
+        selector = scenario._GROSS_SELECTOR
+        kwargs = {"gross_execution_input": raw}
+
+    monkeypatch.setattr(scenario, "_P3_ATTEMPT_ARTIFACT_ENCODING", encoding)
+    result = scenario.run_spider_scenario(str(tmp_path), run_id, selector, **kwargs)
+    assert result["outcome"] == "ADMITTED"
+    attempt = decode_jsonl((tmp_path / run_id / "attempt.json").read_bytes())[0]
+    assert attempt["artifact_encoding"] == "artifact_encoding_v1"
+@pytest.mark.parametrize(
+    ("selected_encoding", "expected_encoding"),
+    [(None, "artifact_encoding_v2"),
+     ("artifact_encoding_v1", "artifact_encoding_v1"),
+     ("artifact_encoding_v2", "artifact_encoding_v2")],
+    ids=["runner-default-v2", "explicit-v1-compatibility", "explicit-v2"],
+)
+def test_p3_runner_uses_the_selected_attempt_encoding(
+    tmp_path, monkeypatch, selected_encoding, expected_encoding,
+):
+    from test_spider_scenario_run import historical_input
+
+    run_id = f"p3-selected-{expected_encoding[-2:]}-{selected_encoding or 'default'}"
+    value, raw = historical_input(run_id)
+    if selected_encoding is not None:
+        monkeypatch.setattr(scenario, "_P3_ATTEMPT_ARTIFACT_ENCODING", selected_encoding)
+    result = scenario.run_spider_scenario(str(tmp_path), value.run_id, scenario._P3_SELECTOR, raw)
+    assert result["outcome"] == "ADMITTED"
+    attempt = scenario._admit(tmp_path / value.run_id)["artifacts"]["attempt.json"]
+    assert attempt["artifact_encoding"] == expected_encoding
 
 
 @pytest.mark.parametrize(
@@ -110,6 +172,93 @@ def _program_hash() -> str:
                       + sha256((scenario._ROOT / name).read_bytes()).digest())
     return digest.hexdigest()
 
+
+def test_historical_executor_source_is_in_program_digest(monkeypatch):
+    target = scenario._ROOT / "python-strategy/src/core/backtest/spider_historical_execution.py"
+    assert "python-strategy/src/core/backtest/spider_historical_execution.py" in scenario._P3_PROGRAM
+    before = _program_hash()
+    original_read_bytes = Path.read_bytes
+
+    def mutate_executor_only(path: Path) -> bytes:
+        raw = original_read_bytes(path)
+        return raw + b"\n# digest-only mutation\n" if path == target else raw
+
+    monkeypatch.setattr(Path, "read_bytes", mutate_executor_only)
+    assert _program_hash() != before
+
+
+def test_error_owner_source_is_in_program_digest(monkeypatch):
+    target = scenario._ROOT / "python-strategy/src/core/backtest/spider_run_errors.py"
+    assert "python-strategy/src/core/backtest/spider_run_errors.py" in scenario._P3_PROGRAM
+    before = _program_hash()
+    original_read_bytes = Path.read_bytes
+
+    def mutate_error_owner_only(path: Path) -> bytes:
+        raw = original_read_bytes(path)
+        return raw + b"\n# digest-only mutation\n" if path == target else raw
+
+    monkeypatch.setattr(Path, "read_bytes", mutate_error_owner_only)
+    assert _program_hash() != before
+
+
+def test_historical_projection_source_is_in_program_digest(monkeypatch):
+    target = scenario._ROOT / "python-strategy/src/core/backtest/spider_historical_report_projection.py"
+    assert "python-strategy/src/core/backtest/spider_historical_report_projection.py" in scenario._P3_PROGRAM
+    before = _program_hash()
+    original_read_bytes = Path.read_bytes
+
+    def mutate_projection_only(path: Path) -> bytes:
+        raw = original_read_bytes(path)
+        return raw + b"\n# digest-only mutation\n" if path == target else raw
+
+    monkeypatch.setattr(Path, "read_bytes", mutate_projection_only)
+    assert _program_hash() != before
+
+
+def test_durable_ports_module_import_closure_and_manifest(monkeypatch):
+    module_path = scenario._ROOT / "python-strategy/src/core/backtest/spider_historical_durable_ports.py"
+    source = module_path.read_text()
+    allowed = {
+        "typing": {"Any"},
+        "src.core.backtest.spider_historical_ports": {"EvidenceSink"},
+        "src.core.backtest.spider_run_admission": {"admit_spider_run"},
+        "src.core.backtest.spider_run_evidence": {"build_endpoint_artifacts"},
+        "src.core.backtest.spider_run_store": {"SpiderRunStore"},
+    }
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            assert all(alias.name in allowed for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            assert node.level == 0 and node.module in allowed
+            assert {alias.name for alias in node.names} <= allowed[node.module]
+    assert "python-strategy/src/core/backtest/spider_historical_durable_ports.py" in scenario._P3_PROGRAM
+    before = _program_hash()
+    original_read_bytes = Path.read_bytes
+
+    def mutate_ports_only(path: Path) -> bytes:
+        raw = original_read_bytes(path)
+        return raw + b"\n# digest-only mutation\n" if path == module_path else raw
+
+    monkeypatch.setattr(Path, "read_bytes", mutate_ports_only)
+    assert _program_hash() != before
+    closure = """
+import sys
+import src.core.backtest.spider_historical_durable_ports
+required = {
+    'src.core.backtest.spider_historical_ports',
+    'src.core.backtest.spider_run_admission',
+    'src.core.backtest.spider_run_evidence',
+    'src.core.backtest.spider_run_store',
+        }
+assert required <= set(sys.modules), sorted(required - set(sys.modules))
+assert not any(name.endswith(('spider_historical_research_entry', 'spider_research_evidence_sink'))
+               for name in sys.modules)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", closure], cwd=scenario._ROOT / "python-strategy",
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
 
 @pytest.mark.parametrize(
     "case", ["wrong_selector", "mixed_inputs", "missing_input", "malformed_input", "nested_run_id"],

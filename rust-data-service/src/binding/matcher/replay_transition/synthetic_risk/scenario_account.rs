@@ -21,8 +21,10 @@ mod gross_response;
 mod gross_response_tests;
 mod group;
 mod historical;
+mod history_map;
 mod hypothetical_settlement;
 mod inspection;
+pub(super) mod mark_history;
 mod min_cash;
 mod reservation;
 mod risk_transition;
@@ -37,7 +39,7 @@ mod wire;
 enum ProfileContext {
     BtcEthScenario {
         scenario: FrozenScenario,
-        marks: Vec<Mark>,
+        marks: mark_history::MarkHistory,
         min_cash_profile: bool,
         p1_liquidation_profile: bool,
         gross_admission_profile: bool,
@@ -246,7 +248,7 @@ struct ScenarioAccount {
     seed_orders: BTreeSet<String>,
     seed_executions: BTreeSet<Hash>,
     commit_sequence: u64,
-    intent_results: BTreeMap<String, admission::AdmissionResult>,
+    intent_results: history_map::HistoryMap<String, admission::AdmissionResult>,
     // Only the future execution writer may publish a receipt; seeds have none.
     execution_receipts: BTreeMap<Hash, execution::CommittedExecution>,
     pending_actions: Vec<Infallible>,
@@ -283,13 +285,26 @@ fn product_id(product: &Product) -> &str {
     product.0.as_ref()
 }
 
-fn context_id(scenario: &FrozenScenario, marks: &[Mark], at: i64) -> Result<Hash, Fault> {
+#[cfg(test)]
+fn context_id_vec(scenario: &FrozenScenario, marks: &[Mark], at: i64) -> Result<Hash, Fault> {
+    context_id(
+        scenario,
+        &mark_history::MarkHistory::try_from_vec(marks.to_vec())?,
+        at,
+    )
+}
+
+fn context_id(
+    scenario: &FrozenScenario,
+    marks: &mark_history::MarkHistory,
+    at: i64,
+) -> Result<Hash, Fault> {
     context_id_at(scenario, marks, at, at)
 }
 
 fn owner_context_id(
     scenario: &FrozenScenario,
-    marks: &[Mark],
+    marks: &mark_history::MarkHistory,
     active_at: i64,
     seed_effective_at: i64,
     config_id: &str,
@@ -306,7 +321,7 @@ fn owner_context_id(
 
 fn owner_context_id_with_policy(
     scenario: &FrozenScenario,
-    marks: &[Mark],
+    marks: &mark_history::MarkHistory,
     active_at: i64,
     seed_effective_at: i64,
     config_id: &str,
@@ -331,17 +346,14 @@ fn owner_context_id_with_policy(
 
 fn context_id_at(
     scenario: &FrozenScenario,
-    marks: &[Mark],
+    marks: &mark_history::MarkHistory,
     active_at: i64,
     encoded_at: i64,
 ) -> Result<Hash, Fault> {
     let mut fields = Vec::new();
     for product in scenario.products() {
         let (spec, tier) = scenario.resolve(&product, active_at)?;
-        let mark = marks
-            .iter()
-            .find(|m| m.product == product && m.valid_from <= active_at && active_at < m.valid_to)
-            .ok_or("MARK_COVERAGE_MISSING")?;
+        let mark = marks.mark_at(&product, active_at)?;
         fields.extend([
             Some(product_id(&product).into()),
             Some(spec.version.clone()),
@@ -520,7 +532,7 @@ impl ScenarioAccount {
         Self::from_validated_configuration_profile(seed, scenario, &marks, gross_admission_profile)
     }
 
-    fn btc_context(&self) -> Result<(&FrozenScenario, &[Mark]), Fault> {
+    fn btc_context(&self) -> Result<(&FrozenScenario, &mark_history::MarkHistory), Fault> {
         match &self.profile {
             ProfileContext::BtcEthScenario {
                 scenario, marks, ..
@@ -567,7 +579,6 @@ impl ScenarioAccount {
             scenario.specs.clone(),
             scenario.tiers.clone(),
         )?;
-        validate_marks(marks)?;
         Self::from_validated_configuration(seed, scenario, marks)
     }
 
@@ -585,9 +596,10 @@ impl ScenarioAccount {
         marks: &[Mark],
         gross_admission_profile: bool,
     ) -> Result<Self, Fault> {
+        let marks = mark_history::MarkHistory::try_from_vec(marks.to_vec())?;
         let valuation_context_id = owner_context_id_with_policy(
             &scenario,
-            marks,
+            &marks,
             seed.effective_at,
             seed.effective_at,
             &seed.config_id,
@@ -715,7 +727,7 @@ impl ScenarioAccount {
                 p1_liquidation_profile: false,
                 gross_admission_profile,
                 scenario,
-                marks: marks.to_vec(),
+                marks,
             },
             valuation_context_id,
             seed_effective_at: seed.effective_at,
@@ -730,7 +742,7 @@ impl ScenarioAccount {
             seed_intents,
             seed_executions,
             commit_sequence,
-            intent_results: BTreeMap::new(),
+            intent_results: history_map::HistoryMap::new(),
             execution_receipts: BTreeMap::new(),
             pending_actions: Vec::new(),
             cancel_facts: Default::default(),

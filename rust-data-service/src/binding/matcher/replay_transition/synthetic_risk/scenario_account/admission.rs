@@ -460,7 +460,7 @@ impl ScenarioAccount {
     ) -> Result<(), Fault> {
         use inspection::{number, order_facts};
         number(e, self.intent_results.len())?;
-        for (key, r) in &self.intent_results {
+        for (key, r) in self.intent_results.iter() {
             e.text(key);
             e.text(&r.intent_id);
             e.hash(r.canonical_payload_digest);

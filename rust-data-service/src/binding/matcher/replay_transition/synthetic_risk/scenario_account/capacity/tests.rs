@@ -317,7 +317,7 @@ fn every_context_and_seed_mismatch_fails_without_mutating_inputs() {
     );
     assert_eq!(
         btc.valuation_context_id,
-        context_id(&btc_config, &marks, btc_seed.effective_at).unwrap()
+        context_id_vec(&btc_config, &marks, btc_seed.effective_at).unwrap()
     );
     assert_eq!(config, config_before);
     assert_eq!(seed, seed_before);

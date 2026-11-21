@@ -9,11 +9,18 @@ from typing import cast
 
 from src.core.backtest.spider_execution_input import (
     SpiderExecutionInput,
+    _decode_spider_execution_input_validated,
+    _encode_spider_execution_input_validated,
     decode_spider_execution_input,
     encode_spider_execution_input,
     validate_spider_execution_input,
 )
-from src.core.backtest.spider_historical_input import HistoricalInputError
+from src.core.backtest.spider_historical_input import (
+    HistoricalInputError,
+    ValidatedHistoricalInput,
+    _decode_historical_run_input_candidate,
+    _is_approved_historical_input_tree,
+)
 from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_canonical
 from src.core.decimal_math import canonical_decimal_text
 
@@ -94,6 +101,12 @@ def _parameter_decimal(value: object) -> Decimal:
 
 def validate_spider_gross_execution_input(value: SpiderGrossExecutionInput) -> str:
     """Validate exact gross response identity and return its semantic SHA-256."""
+    return _validate_spider_gross_execution_input(value)
+
+
+def _validate_spider_gross_execution_input(
+    value: SpiderGrossExecutionInput, execution_hash: str | None = None,
+) -> str:
     if type(value) is not SpiderGrossExecutionInput:
         raise HistoricalInputError("invalid gross execution DTO")
     if (
@@ -130,7 +143,8 @@ def validate_spider_gross_execution_input(value: SpiderGrossExecutionInput) -> s
         or any(type(product) is not str or not product for product in scope.ordered_products)
     ):
         raise HistoricalInputError("invalid gross authorization scope")
-    execution_hash = validate_spider_execution_input(value.execution_input)
+    if execution_hash is None:
+        execution_hash = validate_spider_execution_input(value.execution_input)
     history = value.execution_input.historical_input
     if scope.strategy_id != history.strategy_identity or scope.ordered_products != history.ordered_products:
         raise HistoricalInputError("gross authorization scope mismatch")
@@ -150,6 +164,23 @@ def validate_spider_gross_execution_input(value: SpiderGrossExecutionInput) -> s
 def encode_spider_gross_execution_input(value: SpiderGrossExecutionInput) -> bytes:
     validate_spider_gross_execution_input(value)
     nested = decode_canonical(encode_spider_execution_input(value.execution_input))
+    return canonical_bytes({
+        "schema_version": value.schema_version,
+        "policy_id": value.policy_id,
+        "native_profile_id": value.native_profile_id,
+        "admission_policy_id": value.admission_policy_id,
+        "response_policy_id": value.response_policy_id,
+        "response_parameters": _parameters_value(value.response_parameters),
+        "authorization_scope": _scope_value(value.authorization_scope),
+        "model_id": value.model_id,
+        "execution_input": nested,
+    })
+
+
+def _encode_spider_gross_execution_input_validated(
+    value: SpiderGrossExecutionInput, token: ValidatedHistoricalInput,
+) -> bytes:
+    nested = decode_canonical(_encode_spider_execution_input_validated(value.execution_input, token))
     return canonical_bytes({
         "schema_version": value.schema_version,
         "policy_id": value.policy_id,
@@ -209,6 +240,74 @@ def decode_spider_gross_execution_input(raw: bytes) -> SpiderGrossExecutionInput
         raise
     except (TypeError, ValueError, UnicodeError) as error:
         raise HistoricalInputError("invalid gross execution input encoding") from error
+
+
+def _decode_spider_gross_execution_input_validated(
+    raw: bytes,
+) -> tuple[SpiderGrossExecutionInput, ValidatedHistoricalInput | None, str, str | None]:
+    eligible = False
+    nested_raw = b""
+    try:
+        row = _object(decode_canonical(raw))
+        parameter_row = row["response_parameters"]
+        if type(parameter_row) is not dict or set(cast(dict[object, object], parameter_row)) != {
+            "trigger_cap", "target_cap", "allocation", "quantity_rounding",
+        }:
+            raise ValueError("ineligible gross wrapper shape")
+        scope_value = row["authorization_scope"]
+        if type(scope_value) is not dict or set(cast(dict[object, object], scope_value)) != {
+            "kind", "strategy_id", "ordered_products",
+        }:
+            raise ValueError("ineligible gross scope shape")
+        scope = cast(dict[str, object], scope_value)
+        nested = row["execution_input"]
+        if (
+            type(scope["ordered_products"]) is not list
+            or type(nested) is not dict
+            or scope["kind"] != "RUN_STRATEGY_OWNED_LOTS_AND_ORDERS_V1"
+            or row["model_id"] is not None
+        ):
+            raise ValueError("ineligible gross nested input")
+        parameters = cast(dict[str, object], parameter_row)
+        _parameter_decimal(parameters["trigger_cap"])
+        _parameter_decimal(parameters["target_cap"])
+        nested_paid = cast(dict[str, object], nested).get("historical_input")
+        if type(nested_paid) is dict:
+            nested_raw = canonical_bytes(nested)
+            candidate = _decode_historical_run_input_candidate(canonical_bytes(nested_paid))
+            eligible = candidate is not None and _is_approved_historical_input_tree(candidate)
+    except Exception:
+        eligible = False
+    if not eligible:
+        value = decode_spider_gross_execution_input(raw)
+        return value, None, validate_spider_gross_execution_input(value), None
+
+    execution, token, execution_hash = _decode_spider_execution_input_validated(nested_raw)
+    if token is None:
+        value = decode_spider_gross_execution_input(raw)
+        return value, None, validate_spider_gross_execution_input(value), None
+    row = cast(dict[str, object], decode_canonical(raw))
+    parameters = cast(dict[str, object], row["response_parameters"])
+    scope = cast(dict[str, object], row["authorization_scope"])
+    value = SpiderGrossExecutionInput(
+        cast(str, row["schema_version"]), cast(str, row["policy_id"]),
+        cast(str, row["native_profile_id"]), cast(str, row["admission_policy_id"]),
+        cast(str, row["response_policy_id"]),
+        GrossResponseParameters(
+            _parameter_decimal(parameters["trigger_cap"]),
+            _parameter_decimal(parameters["target_cap"]),
+            cast(str, parameters["allocation"]), cast(str, parameters["quantity_rounding"]),
+        ),
+        GrossAuthorizationScope(
+            cast(str, scope["strategy_id"]),
+            tuple(cast(list[str], scope["ordered_products"])),
+        ),
+        None, execution,
+    )
+    wrapper_hash = _validate_spider_gross_execution_input(value, execution_hash)
+    if _encode_spider_gross_execution_input_validated(value, token) != raw:
+        raise HistoricalInputError("noncanonical gross execution input encoding")
+    return value, token, wrapper_hash, execution_hash
 
 
 __all__ = [

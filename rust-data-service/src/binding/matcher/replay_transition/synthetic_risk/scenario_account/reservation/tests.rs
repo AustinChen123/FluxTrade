@@ -263,31 +263,60 @@ fn invalid_reservation_inputs_fail_without_modifying_authoritative_facts() {
         let mut order = seed.orders[0].clone();
         mutate(&mut order);
         let before = order.clone();
-        assert!(calculate(&projection, &[&order], &config, &marks).is_err());
+        assert!(calculate_vec(&projection, &[&order], &config, &marks).is_err());
         assert_eq!(order, before);
     }
-    assert!(calculate(
+    assert!(calculate_vec(
         &projection,
         &[&seed.orders[0], &seed.orders[0]],
         &config,
         &marks
     )
     .is_err());
-    for bad_marks in [
-        Vec::new(),
-        vec![marks[0].clone(), marks[0].clone()],
-        vec![
-            Mark {
-                valid_from: 501,
-                ..marks[0].clone()
-            },
-            marks[1].clone(),
-        ],
-    ] {
-        assert!(calculate(&projection, &[], &config, &bad_marks).is_err());
-    }
+    let empty_history = MarkHistory::try_from_vec(Vec::new()).unwrap();
+    assert_eq!(
+        calculate(&projection, &[], &config, &empty_history),
+        Err("MARK_COVERAGE_MISSING")
+    );
+    assert_eq!(
+        MarkHistory::try_from_vec(vec![marks[0].clone(), marks[0].clone()]).map(|_| ()),
+        Err("OVERLAPPING_MARKS")
+    );
+    let missing_coverage = [
+        Mark {
+            valid_from: 501,
+            ..marks[0].clone()
+        },
+        marks[1].clone(),
+    ];
+    assert!(calculate_vec(&projection, &[], &config, &missing_coverage).is_err());
+
+    let invalid_marks = [Mark {
+        price: d("0"),
+        ..marks[0].clone()
+    }];
+    let invalid_order = order("", Side::Long, "1");
+    assert_eq!(
+        MarkHistory::try_from_vec(invalid_marks.to_vec()).map(|_| ()),
+        Err("INVALID_MARK")
+    );
+    assert_eq!(
+        calculate_vec(&projection, &[&invalid_order], &config, &marks),
+        Err("INVALID_RESERVATION_ORDER")
+    );
+
+    let mut invalid_scenario = config.clone();
+    invalid_scenario.leverage = d("5");
+    assert_eq!(
+        MarkHistory::try_from_vec(invalid_marks.to_vec()).map(|_| ()),
+        Err("INVALID_MARK")
+    );
+    assert_eq!(
+        calculate_vec(&projection, &[], &invalid_scenario, &marks),
+        Err("UNSUPPORTED_SCENARIO_CONFIG")
+    );
     let mut unsupported = config.clone();
     unsupported.leverage = d("5");
-    assert!(calculate(&projection, &[], &unsupported, &marks).is_err());
+    assert!(calculate_vec(&projection, &[], &unsupported, &marks).is_err());
     assert_eq!(owner.projection().unwrap(), projection);
 }

@@ -1,6 +1,7 @@
 use super::super::tests::{d, fixture};
 use super::*;
 use risk_transition::cancel::identity::Encoding;
+use std::collections::BTreeMap;
 pub(in super::super) fn reject_min_cash(owner: &mut ScenarioAccount) {
     let mut intent = fixture_intent(owner, "MIN-NEGATIVE-I", Side::Long, d("1"), d("50000"));
     intent.client_order_id = "MIN-NEGATIVE-C".into();
@@ -87,18 +88,239 @@ fn intent_fields_options_order_overflow_and_exclusions() {
         |r: &mut AdmissionResult| r.accepted_order = None,
     ] {
         let mut altered = owner.clone();
-        change(altered.intent_results.values_mut().next().unwrap());
+        alter_first_result(&mut altered, change);
         assert_ne!(digest(&altered).unwrap(), expected);
     }
     let mut altered = owner.clone();
-    let r = altered.intent_results.values_mut().next().unwrap();
-    r.evaluation = Evaluation::MinCash(d("123"));
-    r.reservation_after = None;
+    alter_first_result(&mut altered, |result| {
+        result.evaluation = Evaluation::MinCash(d("123"));
+        result.reservation_after = None;
+    });
     assert_eq!(digest(&altered).unwrap(), expected);
-    let result = altered.intent_results.values_mut().next().unwrap();
-    result.order_version_after = Some(u64::MAX);
+    alter_first_result(&mut altered, |result| {
+        result.order_version_after = Some(u64::MAX)
+    });
     assert_eq!(digest(&altered), Err("NATIVE_INVARIANT"));
-    let r = owner.intent_results.remove("z").unwrap();
+    let r = owner.intent_results.get("z").unwrap().clone();
+    let original = owner
+        .intent_results
+        .get("execution-fixture")
+        .unwrap()
+        .clone();
+    owner.intent_results.clear();
+    owner
+        .intent_results
+        .insert("execution-fixture".into(), original);
     owner.intent_results.insert("a".into(), r);
     assert_ne!(digest(&owner).unwrap(), expected);
+}
+
+fn alter_first_result(owner: &mut ScenarioAccount, change: impl FnOnce(&mut AdmissionResult)) {
+    let (key, mut result) = owner
+        .intent_results
+        .iter()
+        .next()
+        .map(|(key, result)| (key.clone(), result.clone()))
+        .unwrap();
+    change(&mut result);
+    owner.intent_results.insert(key, result);
+}
+
+fn owned_rows(owner: &ScenarioAccount) -> BTreeMap<String, AdmissionResult> {
+    owner
+        .intent_results
+        .iter()
+        .map(|(key, result)| (key.clone(), result.clone()))
+        .collect()
+}
+
+fn nonempty_owner() -> ScenarioAccount {
+    let (seed, config, marks) = fixture();
+    let mut owner = ScenarioAccount::from_seed(&seed, &config, &marks).unwrap();
+    admit_execution_fixture(&mut owner, Side::Long, d("1"), d("50000"));
+    owner
+}
+
+#[test]
+fn intent_result_publication_duplicate_and_conflict_keep_owned_rows() {
+    let mut owner = nonempty_owner();
+    let mut intent = fixture_intent(&owner, "next-intent", Side::Long, d("1"), d("50000"));
+    intent.client_order_id = "next-client".into();
+    let before = owned_rows(&owner);
+    let (_, published) = fixture_admit(&mut owner, "next-event", 501, &intent).unwrap();
+    let mut expected = before.clone();
+    expected.insert(published.intent_id.clone(), published.clone());
+    assert_eq!(owned_rows(&owner), expected);
+
+    let before_duplicate = owned_rows(&owner);
+    assert_eq!(
+        fixture_admit(&mut owner, "next-event", 501, &intent)
+            .unwrap()
+            .0,
+        "duplicate"
+    );
+    assert_eq!(owned_rows(&owner), before_duplicate);
+    let mut conflict = intent;
+    conflict.client_order_id.push_str("-conflict");
+    assert_eq!(
+        fixture_admit(&mut owner, "next-event", 501, &conflict),
+        Err("IDEMPOTENCY_KEY_CONFLICT")
+    );
+    assert_eq!(owned_rows(&owner), before_duplicate);
+}
+
+#[test]
+fn rejected_admission_publishes_directly_to_nonempty_history() {
+    let mut owner = nonempty_owner();
+    let before = owned_rows(&owner);
+    let intent = fixture_intent(&owner, "rejected-intent", Side::Long, d("1"), d("50000"));
+    let envelope = Envelope {
+        event_id: "negative",
+        effective_at: 502,
+        intent: &intent,
+    };
+    let stamp = source::stamp("negative", 502, 60);
+    let result = owner
+        .admit_stamped_with_restriction(&envelope, &stamp, true, |_| Ok(()))
+        .unwrap()
+        .result;
+    assert_eq!(
+        (result.outcome, result.reason_code),
+        (Outcome::Rejected, Some("GROSS_RESPONSE_PENDING"))
+    );
+    let mut expected = before;
+    expected.insert(result.intent_id.clone(), result);
+    assert_eq!(owned_rows(&owner), expected);
+}
+
+#[test]
+fn result_drafted_error_does_not_publish_intent_result() {
+    let mut owner = nonempty_owner();
+    let before = owned_rows(&owner);
+    let intent = fixture_intent(&owner, "failed-intent", Side::Long, d("1"), d("50000"));
+    let envelope = Envelope {
+        event_id: "failed-event",
+        effective_at: 501,
+        intent: &intent,
+    };
+    assert_eq!(
+        owner.admit_checked(&envelope, |stage| {
+            if stage == PrepareStage::ResultDrafted {
+                Err("INJECTED")
+            } else {
+                Ok(())
+            }
+        }),
+        Err("INJECTED")
+    );
+    assert_eq!(owned_rows(&owner), before);
+}
+
+#[test]
+fn every_pre_swap_admission_exit_preserves_nonempty_intent_rows() {
+    for (index, stage) in [
+        PrepareStage::Validated,
+        PrepareStage::OrderDrafted,
+        PrepareStage::ResultDrafted,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for panic in [false, true] {
+            let mut owner = nonempty_owner();
+            let before = owned_rows(&owner);
+            let id = format!("failed-{index}-{panic}");
+            let intent = fixture_intent(&owner, &id, Side::Long, d("1"), d("50000"));
+            let envelope = Envelope {
+                event_id: &id,
+                effective_at: 501,
+                intent: &intent,
+            };
+            let expected = if panic { "ADMISSION_PANIC" } else { "INJECTED" };
+            assert_eq!(
+                owner.admit_checked(&envelope, |current| {
+                    if current == stage {
+                        if panic {
+                            panic!("injected hook panic");
+                        }
+                        return Err("INJECTED");
+                    }
+                    Ok(())
+                }),
+                Err(expected)
+            );
+            assert_eq!(owned_rows(&owner), before, "stage={stage:?} panic={panic}");
+        }
+    }
+}
+
+#[test]
+fn nested_outer_rollback_and_later_failure_keep_committed_rows() {
+    let mut owner = nonempty_owner();
+    let committed = owned_rows(&owner);
+    let mut outer = owner.clone();
+    let outer_before = owned_rows(&outer);
+    let intent = fixture_intent(&outer, "nested-failure", Side::Long, d("1"), d("50000"));
+    let envelope = Envelope {
+        event_id: "nested-event",
+        effective_at: 501,
+        intent: &intent,
+    };
+    assert_eq!(
+        outer.admit_checked(&envelope, |stage| {
+            if stage == PrepareStage::ResultDrafted {
+                Err("NESTED_FAILURE")
+            } else {
+                Ok(())
+            }
+        }),
+        Err("NESTED_FAILURE")
+    );
+    assert_eq!(owned_rows(&outer), outer_before);
+    drop(outer);
+    assert_eq!(owned_rows(&owner), committed);
+
+    let later = fixture_intent(&owner, "later-failure", Side::Long, d("1"), d("50000"));
+    let envelope = Envelope {
+        event_id: "later-event",
+        effective_at: 501,
+        intent: &later,
+    };
+    assert_eq!(
+        owner.admit_checked(&envelope, |stage| {
+            if stage == PrepareStage::ResultDrafted {
+                Err("LATER_FAILURE")
+            } else {
+                Ok(())
+            }
+        }),
+        Err("LATER_FAILURE")
+    );
+    assert_eq!(owned_rows(&owner), committed);
+}
+
+#[test]
+fn real_apply_group_publishes_intent_against_owned_reference() {
+    let mut owner = nonempty_owner();
+    let before = owned_rows(&owner);
+    let intent = fixture_intent(&owner, "group-intent", Side::Long, d("1"), d("50000"));
+    let stamp = source::stamp("group-event", 501, 60);
+    let group = group::Group {
+        group_id: "group-id".into(),
+        account_key: owner.key.clone(),
+        ordering_contract_id: stamp.ordering_contract_id.clone(),
+        group_effective_at: stamp.effective_at,
+        declared_member_count: 1,
+        members: vec![group::Member {
+            stamp,
+            input: group::Input::Intent(intent.clone()),
+        }],
+    };
+    owner.apply_group(&group).unwrap();
+    let mut expected = before;
+    expected.insert(
+        "group-intent".into(),
+        owner.intent_results["group-intent"].clone(),
+    );
+    assert_eq!(owned_rows(&owner), expected);
 }

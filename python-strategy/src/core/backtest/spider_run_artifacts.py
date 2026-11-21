@@ -527,7 +527,11 @@ def _attempt(row: dict[str, object], *, paid_execution: bool = False,
         else "SYNTHETIC_P2_NO_FUNDING_INPUT_OR_CLAIM"
     )
     _require(row["funding_exclusion"] == expected_funding)
-    _require(row["artifact_encoding"] == "artifact_encoding_v1")
+    allowed_encodings = (
+        ("artifact_encoding_v1", "artifact_encoding_v2")
+        if run_contract == _P3_RUN_CONTRACT else ("artifact_encoding_v1",)
+    )
+    _enum(row["artifact_encoding"], allowed_encodings)
     if run_contract in historical_contracts:
         _require(row["terminal_policy"] == ("MTM_PRESERVE_OPEN_V1" if run_contract == _P3_RUN_CONTRACT else "PAID_CLOSE_RESEARCH_V1"))
         _require(bool(coverage))
@@ -573,6 +577,15 @@ def validate_artifact(value: object) -> None:
     _text(row.get("run_id"), r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
     schema = _enum(row.get("schema_version"), ["spider_attempt_v1", "spider_status_v1"])
     (_attempt if schema == "spider_attempt_v1" else _status)(row)
+
+
+def is_v1_attempt_encoding(value: object) -> bool:
+    """Return whether a validated attempt carries the exact v1 encoding tag."""
+    return (
+        type(value) is dict
+        and type(value.get("artifact_encoding")) is str
+        and value["artifact_encoding"] == "artifact_encoding_v1"
+    )
 
 
 def encode_artifact(value: object) -> bytes:

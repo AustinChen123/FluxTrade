@@ -27,14 +27,7 @@ pub(super) fn project(owner: &ScenarioAccount) -> Result<wire::Json, Fault> {
     let mut products = Vec::with_capacity(configured_products.len());
     for product in configured_products {
         let (spec, tier) = scenario.resolve(&product, effective_at)?;
-        let mark = marks
-            .iter()
-            .find(|row| {
-                row.product == product
-                    && row.valid_from <= effective_at
-                    && effective_at < row.valid_to
-            })
-            .ok_or("MARK_COVERAGE_MISSING")?;
+        let mark = marks.mark_at(&product, effective_at)?;
         let position = positions.get(&product);
         let (signed_contracts, side, lots, position_contracts) = match position {
             Some(position) => {

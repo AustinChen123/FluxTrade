@@ -165,13 +165,8 @@ pub(super) fn current(owner: &ScenarioAccount, kind: Kind) -> Result<Payload, Fa
                     for v in value.products {
                         let p = &positions[&v.product];
                         let mark = marks
-                            .iter()
-                            .find(|m| {
-                                m.product == v.product
-                                    && m.valid_from <= input.effective_at
-                                    && input.effective_at < m.valid_to
-                            })
-                            .ok_or("NATIVE_INVARIANT")?;
+                            .mark_at(&v.product, input.effective_at)
+                            .map_err(|_| "NATIVE_INVARIANT")?;
                         rows.push(PositionRow {
                             product: product_id(&v.product).into(),
                             contracts: if p.side == Side::Long {

@@ -778,6 +778,7 @@ def _assert_grid_native(
 
 
 @pytest.mark.parametrize("model_id", _MODELS)
+@pytest.mark.slow
 def test_original_grid_replenishment_pressure_is_retained_in_gross_formal_bundle(
     tmp_path, model_id, monkeypatch,
 ):

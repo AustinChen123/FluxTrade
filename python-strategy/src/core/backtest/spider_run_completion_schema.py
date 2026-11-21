@@ -21,6 +21,10 @@ _ARTIFACTS = (
     ("report.jsonl", "spider_product_report_v1"),
 )
 _P3_ARTIFACTS = (*_ARTIFACTS, ("historical_input.json", "spider_historical_research_run_v1"))
+_P3_V2_ARTIFACTS = tuple(
+    (name, "spider_journal_record_v2" if name == "journal.jsonl" else schema)
+    for name, schema in _P3_ARTIFACTS
+)
 
 
 def _embedded_context(value: object) -> ConfigurationContext:
@@ -134,7 +138,20 @@ def report(
 def completion(value: object) -> None:
     row = _object(value, "schema_version run_id state terminal_reason input_contract_hashes planned_coverage processed_boundary persisted_boundary endpoint_state_digest reconciliation_digest artifacts", "configuration_context historical_context")
     _, historical = _root_context_pair(row)
-    artifact_specs = _P3_ARTIFACTS if historical is not None else _ARTIFACTS
+    entries = row["artifacts"]
+    p3_v2 = (
+        historical is not None
+        and type(entries) is list
+        and any(
+            type(item) is dict
+            and item.get("path") == "journal.jsonl"
+            and item.get("schema_version") == "spider_journal_record_v2"
+            for item in entries
+        )
+    )
+    artifact_specs = (
+        _P3_V2_ARTIFACTS if p3_v2 else _P3_ARTIFACTS if historical is not None else _ARTIFACTS
+    )
     _header(row, "spider_completion_v1", historical=historical is not None)
     _enum(row["state"], ["COMPLETE"])
     for name in ("endpoint_state_digest", "reconciliation_digest"):

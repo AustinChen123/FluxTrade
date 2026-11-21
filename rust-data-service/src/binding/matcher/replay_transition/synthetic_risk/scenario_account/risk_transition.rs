@@ -31,7 +31,7 @@ pub(super) struct Facts {
     pub episode: Option<Episode>,
     pub context_at: Option<i64>,
     pub accepted_stamp: Option<cancel::Stamp>,
-    pub contexts: BTreeMap<String, context::Receipt>,
+    pub contexts: super::history_map::HistoryMap<String, context::Receipt>,
     pub groups: BTreeMap<(String, String), group::Completion>,
     pub admissions: BTreeMap<(String, String), group::Admission>,
     pub events: BTreeMap<String, (cancel::Stamp, Hash)>,

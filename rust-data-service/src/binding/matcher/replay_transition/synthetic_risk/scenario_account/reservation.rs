@@ -41,7 +41,7 @@ pub(super) fn calculate(
     input: &ValuationInput,
     orders: &[&SeedOrder],
     scenario: &FrozenScenario,
-    marks: &[Mark],
+    marks: &mark_history::MarkHistory,
 ) -> Result<Snapshot, Fault> {
     calculate_with_gross(input, orders, scenario, marks, false)
 }
@@ -50,7 +50,7 @@ pub(super) fn calculate_with_gross(
     input: &ValuationInput,
     orders: &[&SeedOrder],
     scenario: &FrozenScenario,
-    marks: &[Mark],
+    marks: &mark_history::MarkHistory,
     include_gross: bool,
 ) -> Result<Snapshot, Fault> {
     let mut ids = BTreeSet::new();
@@ -65,7 +65,6 @@ pub(super) fn calculate_with_gross(
         }
     }
     scenario.validate()?;
-    validate_marks(marks)?;
     context_id(scenario, marks, input.effective_at)?;
     let valuation = scenario.evaluate(input, marks)?;
     let mut snapshot = Snapshot {
@@ -83,14 +82,7 @@ pub(super) fn calculate_with_gross(
     };
     for product in scenario.products() {
         let (spec, _) = scenario.resolve(&product, input.effective_at)?;
-        let mark = marks
-            .iter()
-            .find(|m| {
-                m.product == product
-                    && m.valid_from <= input.effective_at
-                    && input.effective_at < m.valid_to
-            })
-            .ok_or("MARK_COVERAGE_MISSING")?;
+        let mark = marks.mark_at(&product, input.effective_at)?;
         let value = valuation
             .products
             .iter()
@@ -206,6 +198,21 @@ pub(super) fn calculate_with_gross(
     )?;
     snapshot.available_margin = add(snapshot.equity, -snapshot.used_margin)?;
     Ok(snapshot)
+}
+
+#[cfg(test)]
+pub(super) fn calculate_vec(
+    input: &ValuationInput,
+    orders: &[&SeedOrder],
+    scenario: &FrozenScenario,
+    marks: &[Mark],
+) -> Result<Snapshot, Fault> {
+    calculate(
+        input,
+        orders,
+        scenario,
+        &mark_history::MarkHistory::try_from_vec(marks.to_vec()).expect("valid test marks"),
+    )
 }
 
 #[cfg(test)]

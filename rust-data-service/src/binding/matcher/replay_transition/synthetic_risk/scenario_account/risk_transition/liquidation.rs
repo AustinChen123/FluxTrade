@@ -340,15 +340,7 @@ fn prepare_step(owner: &ScenarioAccount, history: &[Receipt]) -> Result<commit::
     {
         return Err("UNSUPPORTED_CONFIGURED_LIQUIDATION");
     }
-    let mark = marks
-        .iter()
-        .find(|m| {
-            m.product == product
-                && m.valid_from <= before.effective_at
-                && before.effective_at < m.valid_to
-        })
-        .ok_or("MARK_COVERAGE_MISSING")?
-        .price;
+    let mark = marks.mark_at(&product, before.effective_at)?.price;
     let execution_side = match position_before.side {
         Side::Long => Side::Short,
         Side::Short => Side::Long,

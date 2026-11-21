@@ -1,4 +1,4 @@
-use super::super::context::tests::{activation, mark_rows, stamp};
+use super::super::context::tests::{activation, mark_rows_vec as mark_rows, stamp};
 use super::super::tests::{d, fixture};
 use super::*;
 

@@ -1,5 +1,6 @@
 //! Explicit cancel financial transitions on the sole account owner.
 use super::super::execution::FinancialSnapshot;
+use super::super::history_map::HistoryMap;
 use super::super::*;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
@@ -242,13 +243,27 @@ impl BatchResult {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(in super::super) struct Facts {
-    batches: BTreeMap<(Kind, String), Stored<BatchResult>>,
+    batches: HistoryMap<(Kind, String), Stored<BatchResult>>,
     requests: BTreeMap<Hash, Stored<Receipt>>,
     effects: BTreeMap<Hash, Stored<Receipt>>,
     pub actions: BTreeMap<Hash, Action>,
 }
 
 impl Facts {
+    #[cfg(test)]
+    pub(in super::super) fn batch_rows_snapshot(&self) -> Vec<((u8, String), Stored<BatchResult>)> {
+        self.batches
+            .iter()
+            .map(|((kind, event_id), row)| {
+                let kind = match kind {
+                    Kind::Request => 0,
+                    Kind::Effect => 1,
+                };
+                ((kind, event_id.clone()), row.clone())
+            })
+            .collect()
+    }
+
     pub(in super::super) fn historical_effect_receipt(&self, action_id: &Hash) -> Option<&Receipt> {
         self.effects.get(action_id).map(|stored| &stored.value)
     }

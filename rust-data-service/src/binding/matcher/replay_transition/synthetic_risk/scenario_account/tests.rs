@@ -64,7 +64,7 @@ fn shared_constructor_foundation_preserves_p1_order_and_validation_precedence() 
             Err(reason)
         );
         assert_eq!(
-            reservation::calculate(&owner.projection().unwrap(), &[], &invalid, &[]),
+            reservation::calculate_vec(&owner.projection().unwrap(), &[], &invalid, &[]),
             Err(reason)
         );
     }
@@ -337,7 +337,7 @@ fn seed_lots_are_product_net_fifo_not_strategy_positions() {
         (d("0.01"), d("0.02"))
     );
     let value = config
-        .evaluate(&owner.projection().unwrap(), &marks)
+        .evaluate_vec(&owner.projection().unwrap(), &marks)
         .unwrap();
     assert_eq!(
         (value.products[0].unrealized_pnl, value.equity),
@@ -385,7 +385,7 @@ fn two_products_short_lots_and_clone_projection_are_isolated() {
     seed.positions.push(eth);
     let owner = ScenarioAccount::from_seed(&seed, &config, &marks).unwrap();
     let mut projection = owner.projection().unwrap();
-    let value = config.evaluate(&projection, &marks).unwrap();
+    let value = config.evaluate_vec(&projection, &marks).unwrap();
     assert_eq!(
         (
             value.products[1].unrealized_pnl,
@@ -417,7 +417,7 @@ fn two_products_short_lots_and_clone_projection_are_isolated() {
     assert_eq!(owner.orders["O1"].facts.remaining, d("1"));
     assert_eq!(
         config
-            .evaluate(&owner.projection().unwrap(), &marks)
+            .evaluate_vec(&owner.projection().unwrap(), &marks)
             .unwrap(),
         value
     );
@@ -591,7 +591,7 @@ fn fixed_context_boundaries_require_independent_clean_seeds() {
     assert!(ScenarioAccount::from_seed(&seed, &config, &marks).is_ok());
     marks[1].price = d("1901");
     assert_ne!(
-        context_id(&config, &marks, 599).unwrap(),
+        context_id_vec(&config, &marks, 599).unwrap(),
         owner.valuation_context_id
     );
 }

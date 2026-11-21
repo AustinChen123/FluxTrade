@@ -13,6 +13,10 @@ from src.core.backtest.spider_historical_input import (
     HistoricalInputError,
     HistoricalRunInput,
     _spec_value,
+    _encode_historical_run_input_validated_run,
+    _historical_context_for_validated_input,
+    _is_approved_historical_input_tree,
+    _validate_historical_input_once,
     decode_p2_configuration,
     encode_historical_run_input,
     historical_context_for_input,
@@ -20,6 +24,7 @@ from src.core.backtest.spider_historical_input import (
 )
 from src.core.backtest.spider_historical_replay import (
     _prepare_historical_replay,
+    _prepare_historical_replay_validated,
     _restore_initial_policy,
 )
 from src.core.backtest.spider_policy import DEFAULTS
@@ -312,8 +317,19 @@ def prepare_model_bootstrap(
     """Initialize one admitted research owner and capture its exact initial state."""
     selection = _model_scope(runtime_selection)
     try:
-        historical_input_sha256 = validate_historical_input(run)
-        historical_input_artifact_sha256 = _sha(encode_historical_run_input(run))
+        historical_token = (
+            _validate_historical_input_once(run)
+            if _is_approved_historical_input_tree(run)
+            else None
+        )
+        if historical_token is None:
+            historical_input_sha256 = validate_historical_input(run)
+            historical_input_artifact_sha256 = _sha(encode_historical_run_input(run))
+        else:
+            historical_input_sha256 = historical_token.semantic_hash
+            historical_input_artifact_sha256 = _sha(
+                _encode_historical_run_input_validated_run(historical_token.run)
+            )
         if run.account_key != selection["account_id"]:
             raise ModelBootstrapUnavailable("model_source_unavailable")
         _manual_configuration_matches_source(configuration_confirmation, selection, run)
@@ -325,7 +341,11 @@ def prepare_model_bootstrap(
             for item in cast(list[dict[str, object]], configuration["products"])
         ):
             raise ModelBootstrapUnavailable("model_source_unavailable")
-        prepared = _prepare_historical_replay(run)
+        prepared = (
+            _prepare_historical_replay(run)
+            if historical_token is None
+            else _prepare_historical_replay_validated(historical_token)
+        )
         composition = _ReplayComposition(
             "SYNTHETIC_CONFIGURED_MULTI_PRODUCT_V1",
             prepared.account,
@@ -372,7 +392,11 @@ def prepare_model_bootstrap(
         ):
             raise ModelBootstrapUnavailable("model_source_unavailable")
 
-        history = historical_context_for_input(run)
+        history = (
+            historical_context_for_input(run)
+            if historical_token is None
+            else _historical_context_for_validated_input(historical_token)
+        )
         checkpoint_bytes = encode_source_checkpoint(
             composition._policy,
             ordered_products=run.ordered_products,
