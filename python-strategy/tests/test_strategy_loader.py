@@ -227,17 +227,31 @@ class TestRestingOrderProductionSources:
     def test_legacy_scan_directory_skips_resting_module_that_raises_at_import(
         self, tmp_path
     ):
-        (tmp_path / "strategy.py").write_text(STRATEGY_CODE)
-        (tmp_path / "resting.py").write_text(
+        strategy_root = tmp_path / "strategy_pack"
+        resting_root = tmp_path / "resting_pack"
+        strategy_root.mkdir()
+        resting_root.mkdir()
+        (strategy_root / "strategy.py").write_text(STRATEGY_CODE)
+        (resting_root / "resting.py").write_text(
             "raise RuntimeError('resting kind must not be imported')\n"
         )
-        catalog = {
+        strategy_catalog = {
             "schema_version": 3,
             "files": {
-                name: hashlib.sha256((tmp_path / name).read_bytes()).hexdigest()
-                for name in ("strategy.py", "resting.py")
+                "strategy.py": hashlib.sha256(
+                    (strategy_root / "strategy.py").read_bytes()
+                ).hexdigest()
             },
             "strategies": [_strategy_entry()],
+        }
+        resting_catalog = {
+            "schema_version": 3,
+            "files": {
+                "resting.py": hashlib.sha256(
+                    (resting_root / "resting.py").read_bytes()
+                ).hexdigest()
+            },
+            "strategies": [],
             "resting_order_strategies": [
                 {
                     "id": "resting_should_be_skipped_v1",
@@ -249,7 +263,12 @@ class TestRestingOrderProductionSources:
                 }
             ],
         }
-        (tmp_path / StrategyLoader.CATALOG_NAME).write_text(json.dumps(catalog))
+        (strategy_root / StrategyLoader.CATALOG_NAME).write_text(
+            json.dumps(strategy_catalog)
+        )
+        (resting_root / StrategyLoader.CATALOG_NAME).write_text(
+            json.dumps(resting_catalog)
+        )
 
         with _read_only_tree(tmp_path):
             strategies = StrategyLoader.scan_directory(str(tmp_path))
@@ -284,34 +303,91 @@ class TestRestingOrderProductionSources:
         assert not hasattr(cls, "__fluxtrade_system_placed_protection__")
 
     def test_entry_points_import_only_their_declared_kind(self, tmp_path):
-        (tmp_path / "strategy.py").write_text(STRATEGY_CODE)
-        (tmp_path / "resting.py").write_text(RESTING_CODE)
-        (tmp_path / "explode.py").write_text("raise RuntimeError('wrong kind imported')\n")
-        files = {
-            name: hashlib.sha256((tmp_path / name).read_bytes()).hexdigest()
-            for name in ("strategy.py", "resting.py", "explode.py")
+        strategy_root = tmp_path / "strategy_pack"
+        resting_root = tmp_path / "resting_pack"
+        strategy_root.mkdir()
+        resting_root.mkdir()
+        (strategy_root / "strategy.py").write_text(STRATEGY_CODE)
+        (resting_root / "resting.py").write_text(RESTING_CODE)
+        (strategy_root / "explode.py").write_text(
+            "raise RuntimeError('wrong kind imported')\n"
+        )
+        (resting_root / "explode.py").write_text(
+            "raise RuntimeError('wrong kind imported')\n"
+        )
+        strategy_files = {
+            name: hashlib.sha256((strategy_root / name).read_bytes()).hexdigest()
+            for name in ("strategy.py", "explode.py")
         }
-        catalog = {
+        resting_files = {
+            name: hashlib.sha256((resting_root / name).read_bytes()).hexdigest()
+            for name in ("resting.py", "explode.py")
+        }
+        strategy_catalog = {
             "schema_version": 3,
-            "files": files,
-            "strategies": [_strategy_entry("explode.py", "bad_strategy_v1")],
+            "files": strategy_files,
+            "strategies": [_strategy_entry("strategy.py")],
+        }
+        resting_catalog = {
+            "schema_version": 3,
+            "files": resting_files,
+            "strategies": [],
             "resting_order_strategies": [
                 {"id": "toy_resting_v1", "module": "resting.py", "class": "ToyRestingStrategy", "display_name": "Toy", "artifact_version": "1", "readiness": "RESEARCH_FROZEN"},
             ],
         }
-        (tmp_path / StrategyLoader.CATALOG_NAME).write_text(json.dumps(catalog))
+        (strategy_root / StrategyLoader.CATALOG_NAME).write_text(
+            json.dumps(strategy_catalog)
+        )
+        (resting_root / StrategyLoader.CATALOG_NAME).write_text(
+            json.dumps(resting_catalog)
+        )
         with _read_only_tree(tmp_path):
-            resting = StrategyLoader.scan_resting_order_sources(str(tmp_path))
+            resting = StrategyLoader.scan_resting_order_sources(
+                str(resting_root)
+            )
         assert set(resting) == {"toy_resting_v1"}
 
-        catalog["strategies"] = [_strategy_entry()]
-        catalog["resting_order_strategies"] = [
-            {**_strategy_entry("explode.py", "bad_resting_v1"), "class": "Bad"}
-        ]
-        (tmp_path / StrategyLoader.CATALOG_NAME).write_text(json.dumps(catalog))
         with _read_only_tree(tmp_path):
-            strategies = StrategyLoader.scan_production_sources(str(tmp_path))
+            strategies = StrategyLoader.scan_production_sources(
+                str(strategy_root)
+            )
         assert set(strategies) == {"toy_strategy_v1"}
+
+    @pytest.mark.parametrize("other_kind", ["strategies", "portfolios"])
+    def test_schema_three_catalog_rejects_mixed_kinds_before_import(
+        self, tmp_path, other_kind
+    ):
+        (tmp_path / "strategy.py").write_text(
+            "raise RuntimeError('strategy module imported')\n"
+        )
+        catalog = _write_rest_catalog(
+            tmp_path,
+            code="raise RuntimeError('resting module imported')\n",
+        )
+        catalog[other_kind] = [_strategy_entry("strategy.py")]
+        catalog["files"]["strategy.py"] = hashlib.sha256(
+            (tmp_path / "strategy.py").read_bytes()
+        ).hexdigest()
+        (tmp_path / StrategyLoader.CATALOG_NAME).write_text(json.dumps(catalog))
+        message = (
+            "strategy catalog must not mix resting-order strategies with "
+            "strategies or portfolios"
+        )
+
+        with _read_only_tree(tmp_path):
+            strategy_result = StrategyLoader.scan_production_sources(str(tmp_path))
+            resting_result = StrategyLoader.scan_resting_order_sources(str(tmp_path))
+            directory_result = StrategyLoader.scan_directory(str(tmp_path))
+
+        expected_key = "strategy_catalog.json::LoadError"
+        results = (strategy_result, resting_result, directory_result)
+        assert all(set(result) == {expected_key} for result in results)
+        for result in results:
+            trace = result[expected_key]
+            assert isinstance(trace, str)
+            assert message in trace and "strategy module imported" not in trace
+            assert "resting module imported" not in trace
 
     def test_production_scanner_omits_resting_only_catalog(self, tmp_path):
         _write_rest_catalog(tmp_path)
@@ -359,24 +435,24 @@ class TestRestingOrderProductionSources:
         ("override", "extra", "message"),
         [
             ({"system_placed_protection": "NONE"}, {}, "system_placed_protection"),
-            ({"id": "toy_strategy_v1"}, {"strategies": [_strategy_entry()]}, "duplicate strategy id"),
+            ({}, {}, "duplicate strategy id"),
             ({"readiness": "UNKNOWN"}, {}, "unknown strategy readiness"),
             ({"class": "ToyRestingStrategy"}, {"strategies": [], "resting_order_strategies": [], "portfolios": []}, "at least one"),
         ],
     )
     def test_resting_field_contract_rejections(self, tmp_path, override, extra, message):
-        _write_rest_catalog(tmp_path, entry_overrides=override, extra=extra)
+        catalog = _write_rest_catalog(
+            tmp_path,
+            entry_overrides=override,
+            extra=extra,
+        )
         if message == "duplicate strategy id":
-            path = tmp_path / "strategy.py"
-            path.write_text(STRATEGY_CODE)
-            catalog_path = tmp_path / StrategyLoader.CATALOG_NAME
-            catalog = json.loads(catalog_path.read_text())
-            catalog["files"][path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
-            catalog_path.write_text(json.dumps(catalog))
+            catalog["resting_order_strategies"].append(
+                catalog["resting_order_strategies"][0].copy()
+            )
+            (tmp_path / StrategyLoader.CATALOG_NAME).write_text(json.dumps(catalog))
         error = _load_error(StrategyLoader.scan_directory(str(tmp_path)))
         assert message in error
-        if message == "duplicate strategy id":
-            (tmp_path / "strategy.py").unlink()
         _write_rest_catalog(tmp_path)
         assert isinstance(_scan_resting_readonly(tmp_path)["toy_resting_v1"], type)
 
@@ -747,6 +823,8 @@ class MyStrategy(BaseStrategy):
         assert issubclass(strategy_class, BaseStrategy)
 
     def test_finds_hash_pinned_portfolio_factory(self, tmp_path):
+        strategy = tmp_path / "strategy.py"
+        strategy.write_text(STRATEGY_CODE)
         module = tmp_path / "portfolio.py"
         module.write_text(PORTFOLIO_CODE)
         sleeve_a = tmp_path / "sleeve_a.py"
@@ -754,13 +832,15 @@ class MyStrategy(BaseStrategy):
         sleeve_b = tmp_path / "sleeve_b.py"
         sleeve_b.write_text(PORTFOLIO_SLEEVE_B_CODE)
         catalog = {
-            "schema_version": 2,
+            "schema_version": 3,
             "files": {
+                strategy.name: hashlib.sha256(strategy.read_bytes()).hexdigest(),
                 module.name: hashlib.sha256(module.read_bytes()).hexdigest(),
                 sleeve_a.name: hashlib.sha256(sleeve_a.read_bytes()).hexdigest(),
                 sleeve_b.name: hashlib.sha256(sleeve_b.read_bytes()).hexdigest(),
             },
-            "strategies": [],
+            "strategies": [_strategy_entry()],
+            "resting_order_strategies": [],
             "portfolios": [
                 {
                     "id": "portfolio_v1",
@@ -776,6 +856,7 @@ class MyStrategy(BaseStrategy):
 
         result = StrategyLoader.scan_directory(str(tmp_path))
 
+        assert set(result) == {"toy_strategy_v1", "portfolio_v1"}
         factory = _portfolio_factory_class(result["portfolio_v1"])
         assert issubclass(factory, PortfolioFactory)
         assert getattr(factory, "__fluxtrade_readiness__") == "RESEARCH_FROZEN"
@@ -792,7 +873,7 @@ class MyStrategy(BaseStrategy):
 
         relocated = tmp_path / "relocated"
         relocated.mkdir()
-        for source in (module, sleeve_a, sleeve_b):
+        for source in (strategy, module, sleeve_a, sleeve_b):
             (relocated / source.name).write_bytes(source.read_bytes())
         (relocated / StrategyLoader.CATALOG_NAME).write_bytes(
             (tmp_path / StrategyLoader.CATALOG_NAME).read_bytes()

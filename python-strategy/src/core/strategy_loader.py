@@ -22,8 +22,10 @@ from src.strategies.base import BaseStrategy
 
 logger = logging.getLogger(__name__)
 
-LoadedArtifact = Type[BaseStrategy] | Type[PortfolioFactory] | Type[RestingOrderStrategy]
+LoadedArtifact = Type[BaseStrategy] | Type[PortfolioFactory]
+_ScannedArtifact = LoadedArtifact | Type[RestingOrderStrategy]
 LoadResult = LoadedArtifact | str
+_ScanResult = _ScannedArtifact | str
 
 
 class StrategyLoader:
@@ -44,8 +46,11 @@ class StrategyLoader:
         In case of loading errors, the value will be the error traceback string.
         """
         with StrategyLoader._SCAN_LOCK:
-            return StrategyLoader._scan_directory(
-                path, kinds={"strategy", "portfolio"}
+            return cast(
+                Dict[str, LoadResult],
+                StrategyLoader._scan_directory(
+                    path, kinds={"strategy", "portfolio"}
+                ),
             )
 
     @staticmethod
@@ -55,10 +60,13 @@ class StrategyLoader:
         break_glass_path: str | None = None,
     ) -> Dict[str, LoadResult]:
         """Load preflighted catalog-only production artifact sources."""
-        return StrategyLoader._scan_production_sources(
-            primary_path,
-            break_glass_path=break_glass_path,
-            kinds={"strategy", "portfolio"},
+        return cast(
+            Dict[str, LoadResult],
+            StrategyLoader._scan_production_sources(
+                primary_path,
+                break_glass_path=break_glass_path,
+                kinds={"strategy", "portfolio"},
+            ),
         )
 
     @staticmethod
@@ -83,7 +91,7 @@ class StrategyLoader:
         *,
         break_glass_path: str | None,
         kinds: set[str],
-    ) -> Dict[str, LoadResult]:
+    ) -> Dict[str, _ScanResult]:
         with StrategyLoader._SCAN_LOCK:
             try:
                 roots = [Path(primary_path)]
@@ -92,7 +100,7 @@ class StrategyLoader:
                 for root in roots:
                     StrategyLoader._validate_production_source(root)
 
-                combined: Dict[str, LoadResult] = {}
+                combined: Dict[str, _ScanResult] = {}
                 for root in roots:
                     source = StrategyLoader._scan_directory(str(root), kinds=kinds)
                     catalog_error = source.get(
@@ -151,8 +159,8 @@ class StrategyLoader:
         path: str,
         *,
         kinds: set[str],
-    ) -> Dict[str, LoadResult]:
-        strategies: Dict[str, LoadResult] = {}
+    ) -> Dict[str, _ScanResult]:
+        strategies: Dict[str, _ScanResult] = {}
         if not os.path.exists(path):
             logger.warning("Directory %s does not exist.", path)
             return strategies
@@ -255,7 +263,7 @@ class StrategyLoader:
         catalog_path: Path,
         *,
         kinds: set[str],
-    ) -> Dict[str, LoadResult]:
+    ) -> Dict[str, _ScanResult]:
         try:
             catalog_source = catalog_path.read_bytes()
             catalog = json.loads(catalog_source)
@@ -274,7 +282,7 @@ class StrategyLoader:
             catalog_path.parent,
             files,
         )
-        strategies: Dict[str, LoadResult] = {}
+        strategies: Dict[str, _ScanResult] = {}
         StrategyLoader._ensure_catalog_package(package_name, snapshot_root)
         for entry in entries:
             if entry["kind"] not in kinds:
@@ -393,6 +401,11 @@ class StrategyLoader:
         if schema_version < 3 and "resting_order_strategies" in catalog:
             raise ValueError(
                 "strategy catalog resting_order_strategies require schema_version 3"
+            )
+        if resting_entries and (strategy_entries or portfolio_entries):
+            raise ValueError(
+                "strategy catalog must not mix resting-order strategies with "
+                "strategies or portfolios"
             )
         if schema_version == 1 and not strategy_entries:
             raise ValueError(
