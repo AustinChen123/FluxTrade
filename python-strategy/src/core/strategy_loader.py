@@ -17,11 +17,12 @@ from types import ModuleType
 from typing import Dict, Type, cast
 
 from src.core.portfolio_runtime import PortfolioFactory
+from src.core.resting_order_strategy import RestingOrderStrategy
 from src.strategies.base import BaseStrategy
 
 logger = logging.getLogger(__name__)
 
-LoadedArtifact = Type[BaseStrategy] | Type[PortfolioFactory]
+LoadedArtifact = Type[BaseStrategy] | Type[PortfolioFactory] | Type[RestingOrderStrategy]
 LoadResult = LoadedArtifact | str
 
 
@@ -43,7 +44,9 @@ class StrategyLoader:
         In case of loading errors, the value will be the error traceback string.
         """
         with StrategyLoader._SCAN_LOCK:
-            return StrategyLoader._scan_directory(path)
+            return StrategyLoader._scan_directory(
+                path, kinds={"strategy", "portfolio"}
+            )
 
     @staticmethod
     def scan_production_sources(
@@ -52,6 +55,35 @@ class StrategyLoader:
         break_glass_path: str | None = None,
     ) -> Dict[str, LoadResult]:
         """Load preflighted catalog-only production artifact sources."""
+        return StrategyLoader._scan_production_sources(
+            primary_path,
+            break_glass_path=break_glass_path,
+            kinds={"strategy", "portfolio"},
+        )
+
+    @staticmethod
+    def scan_resting_order_sources(
+        primary_path: str,
+        *,
+        break_glass_path: str | None = None,
+    ) -> Dict[str, Type[RestingOrderStrategy] | str]:
+        """Load preflighted catalog-only resting-order artifact sources."""
+        return cast(
+            Dict[str, Type[RestingOrderStrategy] | str],
+            StrategyLoader._scan_production_sources(
+                primary_path,
+                break_glass_path=break_glass_path,
+                kinds={"resting_order"},
+            ),
+        )
+
+    @staticmethod
+    def _scan_production_sources(
+        primary_path: str,
+        *,
+        break_glass_path: str | None,
+        kinds: set[str],
+    ) -> Dict[str, LoadResult]:
         with StrategyLoader._SCAN_LOCK:
             try:
                 roots = [Path(primary_path)]
@@ -62,12 +94,17 @@ class StrategyLoader:
 
                 combined: Dict[str, LoadResult] = {}
                 for root in roots:
-                    source = StrategyLoader._scan_directory(str(root))
-                    failures = [
+                    source = StrategyLoader._scan_directory(str(root), kinds=kinds)
+                    catalog_error = source.get(
+                        f"{StrategyLoader.CATALOG_NAME}::LoadError"
+                    )
+                    if isinstance(catalog_error, str):
+                        raise ValueError(catalog_error)
+                    entry_failures = [
                         error for error in source.values() if isinstance(error, str)
                     ]
-                    if failures:
-                        raise ValueError(failures[0])
+                    if entry_failures:
+                        raise ValueError(entry_failures[0])
                     duplicate_ids = combined.keys() & source.keys()
                     if duplicate_ids:
                         duplicate = min(duplicate_ids)
@@ -110,7 +147,11 @@ class StrategyLoader:
             raise ValueError("production strategy source must be catalog-only")
 
     @staticmethod
-    def _scan_directory(path: str) -> Dict[str, LoadResult]:
+    def _scan_directory(
+        path: str,
+        *,
+        kinds: set[str],
+    ) -> Dict[str, LoadResult]:
         strategies: Dict[str, LoadResult] = {}
         if not os.path.exists(path):
             logger.warning("Directory %s does not exist.", path)
@@ -118,7 +159,7 @@ class StrategyLoader:
 
         catalog_path = Path(path) / StrategyLoader.CATALOG_NAME
         if catalog_path.exists():
-            return StrategyLoader._scan_catalog(catalog_path)
+            return StrategyLoader._scan_catalog(catalog_path, kinds=kinds)
 
         nested_catalogs = sorted(Path(path).glob(f"*/{StrategyLoader.CATALOG_NAME}"))
         conflicting_modules = StrategyLoader._conflicting_catalog_modules(
@@ -134,7 +175,7 @@ class StrategyLoader:
 
         strategies.update(StrategyLoader._scan_legacy_directory(Path(path)))
         for nested_catalog in nested_catalogs:
-            nested = StrategyLoader._scan_catalog(nested_catalog)
+            nested = StrategyLoader._scan_catalog(nested_catalog, kinds=kinds)
             for strategy_id, result in nested.items():
                 if strategy_id in strategies:
                     strategies[strategy_id] = (
@@ -212,6 +253,8 @@ class StrategyLoader:
     @staticmethod
     def _scan_catalog(
         catalog_path: Path,
+        *,
+        kinds: set[str],
     ) -> Dict[str, LoadResult]:
         try:
             catalog_source = catalog_path.read_bytes()
@@ -234,6 +277,8 @@ class StrategyLoader:
         strategies: Dict[str, LoadResult] = {}
         StrategyLoader._ensure_catalog_package(package_name, snapshot_root)
         for entry in entries:
+            if entry["kind"] not in kinds:
+                continue
             strategy_id = entry["id"]
             try:
                 module_path = StrategyLoader._resolve_pack_file(
@@ -259,6 +304,8 @@ class StrategyLoader:
                 expected_base = (
                     PortfolioFactory
                     if entry["kind"] == "portfolio"
+                    else RestingOrderStrategy
+                    if entry["kind"] == "resting_order"
                     else BaseStrategy
                 )
                 if (
@@ -266,6 +313,10 @@ class StrategyLoader:
                     or not issubclass(artifact_class, expected_base)
                     or artifact_class is expected_base
                     or artifact_class.__module__ != module.__name__
+                    or (
+                        entry["kind"] == "resting_order"
+                        and inspect.isabstract(artifact_class)
+                    )
                 ):
                     raise TypeError(
                         f"{entry['class']} is not a {entry['kind']} defined by "
@@ -291,11 +342,12 @@ class StrategyLoader:
                     "__fluxtrade_catalog_sha256__",
                     catalog_digest,
                 )
-                setattr(
-                    artifact_class,
-                    "__fluxtrade_system_placed_protection__",
-                    entry["system_placed_protection"],
-                )
+                if entry["kind"] != "resting_order":
+                    setattr(
+                        artifact_class,
+                        "__fluxtrade_system_placed_protection__",
+                        entry["system_placed_protection"],
+                    )
                 strategies[strategy_id] = artifact_class
                 logger.info(
                     "Loaded catalog %s: %s",
@@ -317,26 +369,31 @@ class StrategyLoader:
         root: Path,
         catalog: object,
     ) -> tuple[list[dict[str, str]], dict[str, bytes]]:
-        if not isinstance(catalog, dict) or catalog.get("schema_version") not in {
-            1,
-            2,
-        }:
-            raise ValueError("strategy catalog schema_version must be 1 or 2")
+        if not isinstance(catalog, dict):
+            raise ValueError("strategy catalog schema_version must be 1, 2 or 3")
+        schema_version = catalog.get("schema_version")
+        if type(schema_version) is not int or schema_version not in {1, 2, 3}:
+            raise ValueError("strategy catalog schema_version must be 1, 2 or 3")
 
         files = catalog.get("files")
-        schema_version = int(catalog["schema_version"])
         strategy_entries = catalog.get("strategies")
         portfolio_entries = catalog.get("portfolios", [])
+        resting_entries = catalog.get("resting_order_strategies", [])
         if not isinstance(files, dict) or not files:
             raise ValueError("strategy catalog files must be a non-empty mapping")
         if not isinstance(strategy_entries, list) or not isinstance(
             portfolio_entries, list
-        ):
+        ) or not isinstance(resting_entries, list):
             raise ValueError(
-                "strategy catalog strategies and portfolios must be lists"
+                "strategy catalog strategies, portfolios and resting-order "
+                "strategies must be lists"
             )
         if schema_version == 1 and portfolio_entries:
             raise ValueError("strategy catalog portfolios require schema_version 2")
+        if schema_version < 3 and "resting_order_strategies" in catalog:
+            raise ValueError(
+                "strategy catalog resting_order_strategies require schema_version 3"
+            )
         if schema_version == 1 and not strategy_entries:
             raise ValueError(
                 "strategy catalog strategies must be a non-empty list"
@@ -344,10 +401,12 @@ class StrategyLoader:
         entries = [
             *((entry, "strategy") for entry in strategy_entries),
             *((entry, "portfolio") for entry in portfolio_entries),
+            *((entry, "resting_order") for entry in resting_entries),
         ]
         if not entries:
             raise ValueError(
-                "strategy catalog must declare at least one strategy or portfolio"
+                "strategy catalog must declare at least one strategy, portfolio "
+                "or resting-order strategy"
             )
 
         declared_files = set(files)
@@ -414,6 +473,10 @@ class StrategyLoader:
             if readiness not in StrategyLoader.READINESS_VALUES:
                 raise ValueError(f"unknown strategy readiness: {readiness}")
             protection = entry.get("system_placed_protection", "")
+            if kind == "resting_order" and "system_placed_protection" in entry:
+                raise ValueError(
+                    "resting-order entries must not declare system_placed_protection"
+                )
             if (
                 "system_placed_protection" in entry
                 and (

@@ -29,6 +29,7 @@ from src.core.portfolio_runtime import (
     build_portfolio_artifact,
 )
 from src.core.strategy_loader import LoadResult, StrategyLoader
+from src.core.resting_order_strategy import RestingOrderStrategy
 from src.strategies.base import BaseStrategy
 from src.validation.strategy_evidence import portfolio_evidence_identity
 
@@ -163,6 +164,342 @@ def _write_catalog(
     }
     (tmp_path / StrategyLoader.CATALOG_NAME).write_text(json.dumps(catalog))
     return catalog
+
+
+RESTING_CODE = """
+from src.core.resting_order_strategy import RestingOrderStrategy
+
+class ToyRestingStrategy(RestingOrderStrategy):
+    def on_bar(self, bar):
+        return None
+    def on_fill(self, fill):
+        return None
+"""
+
+
+def _write_rest_catalog(
+    root: Path,
+    *,
+    schema: int = 3,
+    code: str = RESTING_CODE,
+    entry_overrides: dict | None = None,
+    extra: dict | None = None,
+) -> dict:
+    module = root / "resting.py"
+    module.write_text(code)
+    entry = {
+        "id": "toy_resting_v1",
+        "module": module.name,
+        "class": "ToyRestingStrategy",
+        "display_name": "Toy Resting",
+        "artifact_version": "1.0",
+        "readiness": "RESEARCH_VALIDATED",
+        **(entry_overrides or {}),
+    }
+    catalog = {
+        "schema_version": schema,
+        "files": {module.name: hashlib.sha256(module.read_bytes()).hexdigest()},
+        "strategies": [],
+        "resting_order_strategies": [entry],
+        **(extra or {}),
+    }
+    (root / StrategyLoader.CATALOG_NAME).write_text(json.dumps(catalog))
+    return catalog
+
+
+def _scan_resting_readonly(root: Path):
+    with _read_only_tree(root):
+        return StrategyLoader.scan_resting_order_sources(str(root))
+
+
+def _strategy_entry(module: str = "strategy.py", strategy_id: str = "toy_strategy_v1"):
+    return {
+        "id": strategy_id,
+        "module": module,
+        "class": "ManifestStrategy",
+        "display_name": "Toy Strategy",
+        "artifact_version": "1.0",
+        "readiness": "RESEARCH_VALIDATED",
+    }
+
+
+class TestRestingOrderProductionSources:
+    def test_legacy_scan_directory_skips_resting_module_that_raises_at_import(
+        self, tmp_path
+    ):
+        (tmp_path / "strategy.py").write_text(STRATEGY_CODE)
+        (tmp_path / "resting.py").write_text(
+            "raise RuntimeError('resting kind must not be imported')\n"
+        )
+        catalog = {
+            "schema_version": 3,
+            "files": {
+                name: hashlib.sha256((tmp_path / name).read_bytes()).hexdigest()
+                for name in ("strategy.py", "resting.py")
+            },
+            "strategies": [_strategy_entry()],
+            "resting_order_strategies": [
+                {
+                    "id": "resting_should_be_skipped_v1",
+                    "module": "resting.py",
+                    "class": "UnavailableRestingStrategy",
+                    "display_name": "Unavailable",
+                    "artifact_version": "1",
+                    "readiness": "RESEARCH_VALIDATED",
+                }
+            ],
+        }
+        (tmp_path / StrategyLoader.CATALOG_NAME).write_text(json.dumps(catalog))
+
+        with _read_only_tree(tmp_path):
+            strategies = StrategyLoader.scan_directory(str(tmp_path))
+
+        assert set(strategies) == {"toy_strategy_v1"}
+        assert isinstance(strategies["toy_strategy_v1"], type)
+
+    def test_resting_source_scanner_returns_resting_id(self, tmp_path):
+        _write_rest_catalog(tmp_path)
+
+        with _read_only_tree(tmp_path):
+            resting = StrategyLoader.scan_resting_order_sources(str(tmp_path))
+
+        assert set(resting) == {"toy_resting_v1"}
+        assert isinstance(resting["toy_resting_v1"], type)
+
+    def test_loads_schema_three_resting_class_and_catalog_identity(self, tmp_path):
+        _write_rest_catalog(tmp_path)
+        digest = hashlib.sha256(
+            (tmp_path / StrategyLoader.CATALOG_NAME).read_bytes()
+        ).hexdigest()
+        with _read_only_tree(tmp_path):
+            result = StrategyLoader.scan_resting_order_sources(str(tmp_path))
+        assert set(result) == {"toy_resting_v1"}
+        cls = result["toy_resting_v1"]
+        assert isinstance(cls, type) and issubclass(cls, RestingOrderStrategy)
+        assert cls.__name__ == "ToyRestingStrategy"
+        assert getattr(cls, "__fluxtrade_artifact_version__") == "1.0"
+        assert getattr(cls, "__fluxtrade_display_name__") == "Toy Resting"
+        assert getattr(cls, "__fluxtrade_readiness__") == "RESEARCH_VALIDATED"
+        assert getattr(cls, "__fluxtrade_catalog_sha256__") == digest
+        assert not hasattr(cls, "__fluxtrade_system_placed_protection__")
+
+    def test_entry_points_import_only_their_declared_kind(self, tmp_path):
+        (tmp_path / "strategy.py").write_text(STRATEGY_CODE)
+        (tmp_path / "resting.py").write_text(RESTING_CODE)
+        (tmp_path / "explode.py").write_text("raise RuntimeError('wrong kind imported')\n")
+        files = {
+            name: hashlib.sha256((tmp_path / name).read_bytes()).hexdigest()
+            for name in ("strategy.py", "resting.py", "explode.py")
+        }
+        catalog = {
+            "schema_version": 3,
+            "files": files,
+            "strategies": [_strategy_entry("explode.py", "bad_strategy_v1")],
+            "resting_order_strategies": [
+                {"id": "toy_resting_v1", "module": "resting.py", "class": "ToyRestingStrategy", "display_name": "Toy", "artifact_version": "1", "readiness": "RESEARCH_FROZEN"},
+            ],
+        }
+        (tmp_path / StrategyLoader.CATALOG_NAME).write_text(json.dumps(catalog))
+        with _read_only_tree(tmp_path):
+            resting = StrategyLoader.scan_resting_order_sources(str(tmp_path))
+        assert set(resting) == {"toy_resting_v1"}
+
+        catalog["strategies"] = [_strategy_entry()]
+        catalog["resting_order_strategies"] = [
+            {**_strategy_entry("explode.py", "bad_resting_v1"), "class": "Bad"}
+        ]
+        (tmp_path / StrategyLoader.CATALOG_NAME).write_text(json.dumps(catalog))
+        with _read_only_tree(tmp_path):
+            strategies = StrategyLoader.scan_production_sources(str(tmp_path))
+        assert set(strategies) == {"toy_strategy_v1"}
+
+    def test_production_scanner_omits_resting_only_catalog(self, tmp_path):
+        _write_rest_catalog(tmp_path)
+        with _read_only_tree(tmp_path):
+            assert StrategyLoader.scan_production_sources(str(tmp_path)) == {}
+
+    def test_resting_scanner_checks_missing_root(self, tmp_path):
+        result = StrategyLoader.scan_resting_order_sources(str(tmp_path / "missing"))
+        assert "does not exist" in _load_error(result)
+
+    @pytest.mark.parametrize("schema", [1, 2])
+    @pytest.mark.parametrize("entries", [None, []])
+    def test_old_schema_rejects_resting_key_and_schema_three_twin_loads(
+        self, tmp_path, schema, entries
+    ):
+        catalog = _write_rest_catalog(tmp_path, schema=schema)
+        if entries is not None:
+            catalog["resting_order_strategies"] = entries
+        (tmp_path / StrategyLoader.CATALOG_NAME).write_text(json.dumps(catalog))
+        rejected = StrategyLoader.scan_directory(str(tmp_path))
+        assert "schema_version 3" in _load_error(rejected)
+        catalog["schema_version"] = 3
+        catalog["resting_order_strategies"] = [
+            {"id": "toy_resting_v1", "module": "resting.py", "class": "ToyRestingStrategy", "display_name": "Toy", "artifact_version": "1.0", "readiness": "RESEARCH_VALIDATED"}
+        ]
+        (tmp_path / StrategyLoader.CATALOG_NAME).write_text(json.dumps(catalog))
+        loaded = _scan_resting_readonly(tmp_path)
+        assert isinstance(loaded["toy_resting_v1"], type)
+
+    @pytest.mark.parametrize("version", [True, 2.0, 4, "3"])
+    def test_schema_version_is_type_exact_and_has_valid_twin(self, tmp_path, version):
+        _write_rest_catalog(tmp_path)
+        path = tmp_path / StrategyLoader.CATALOG_NAME
+        catalog = json.loads(path.read_text())
+        catalog["schema_version"] = version
+        path.write_text(json.dumps(catalog))
+        assert "schema_version must be 1, 2 or 3" in _load_error(
+            StrategyLoader.scan_directory(str(tmp_path))
+        )
+        catalog["schema_version"] = 3
+        path.write_text(json.dumps(catalog))
+        assert isinstance(_scan_resting_readonly(tmp_path)["toy_resting_v1"], type)
+
+    @pytest.mark.parametrize(
+        ("override", "extra", "message"),
+        [
+            ({"system_placed_protection": "NONE"}, {}, "system_placed_protection"),
+            ({"id": "toy_strategy_v1"}, {"strategies": [_strategy_entry()]}, "duplicate strategy id"),
+            ({"readiness": "UNKNOWN"}, {}, "unknown strategy readiness"),
+            ({"class": "ToyRestingStrategy"}, {"strategies": [], "resting_order_strategies": [], "portfolios": []}, "at least one"),
+        ],
+    )
+    def test_resting_field_contract_rejections(self, tmp_path, override, extra, message):
+        _write_rest_catalog(tmp_path, entry_overrides=override, extra=extra)
+        if message == "duplicate strategy id":
+            path = tmp_path / "strategy.py"
+            path.write_text(STRATEGY_CODE)
+            catalog_path = tmp_path / StrategyLoader.CATALOG_NAME
+            catalog = json.loads(catalog_path.read_text())
+            catalog["files"][path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
+            catalog_path.write_text(json.dumps(catalog))
+        error = _load_error(StrategyLoader.scan_directory(str(tmp_path)))
+        assert message in error
+        if message == "duplicate strategy id":
+            (tmp_path / "strategy.py").unlink()
+        _write_rest_catalog(tmp_path)
+        assert isinstance(_scan_resting_readonly(tmp_path)["toy_resting_v1"], type)
+
+    def test_resting_catalog_rejects_missing_field_and_non_list_with_twins(self, tmp_path):
+        catalog = _write_rest_catalog(tmp_path)
+        path = tmp_path / StrategyLoader.CATALOG_NAME
+        catalog["resting_order_strategies"][0].pop("display_name")
+        path.write_text(json.dumps(catalog))
+        assert "require id, module, class" in _load_error(
+            StrategyLoader.scan_directory(str(tmp_path))
+        )
+        catalog = _write_rest_catalog(tmp_path)
+        catalog["resting_order_strategies"] = "bad"
+        path.write_text(json.dumps(catalog))
+        assert "must be lists" in _load_error(StrategyLoader.scan_directory(str(tmp_path)))
+        _write_rest_catalog(tmp_path)
+        assert isinstance(_scan_resting_readonly(tmp_path)["toy_resting_v1"], type)
+
+    def test_schema_three_rejects_all_empty_lists_with_legal_twin(self, tmp_path):
+        _write_rest_catalog(
+            tmp_path,
+            extra={"resting_order_strategies": [], "strategies": [], "portfolios": []},
+        )
+        assert "at least one" in _load_error(StrategyLoader.scan_directory(str(tmp_path)))
+        _write_rest_catalog(tmp_path)
+        assert isinstance(_scan_resting_readonly(tmp_path)["toy_resting_v1"], type)
+
+    def test_resting_class_imported_from_another_pack_module_is_rejected(self, tmp_path):
+        helper = tmp_path / "helper.py"
+        helper.write_text(RESTING_CODE)
+        module = tmp_path / "resting.py"
+        module.write_text("from .helper import ToyRestingStrategy\n")
+        catalog = {
+            "schema_version": 3,
+            "files": {
+                name: hashlib.sha256((tmp_path / name).read_bytes()).hexdigest()
+                for name in ("helper.py", "resting.py")
+            },
+            "strategies": [],
+            "resting_order_strategies": [
+                {"id": "toy_resting_v1", "module": "resting.py", "class": "ToyRestingStrategy", "display_name": "Toy", "artifact_version": "1", "readiness": "RESEARCH_VALIDATED"}
+            ],
+        }
+        (tmp_path / StrategyLoader.CATALOG_NAME).write_text(json.dumps(catalog))
+        with _read_only_tree(tmp_path):
+            result = StrategyLoader.scan_resting_order_sources(str(tmp_path))
+        assert set(result) == {f"{StrategyLoader.CATALOG_NAME}::LoadError"}
+        error = result[f"{StrategyLoader.CATALOG_NAME}::LoadError"]
+        assert isinstance(error, str)
+        assert "TypeError" in error
+        assert "not a resting_order defined by resting.py" in error
+        helper.unlink()
+        _write_rest_catalog(tmp_path)
+        with _read_only_tree(tmp_path):
+            assert isinstance(StrategyLoader.scan_resting_order_sources(str(tmp_path))["toy_resting_v1"], type)
+
+    @pytest.mark.parametrize(
+        "code,class_name",
+        [
+            (STRATEGY_CODE, "ManifestStrategy"),
+            ("from src.core.resting_order_strategy import RestingOrderStrategy\nRestingOrderStrategy = RestingOrderStrategy\n", "RestingOrderStrategy"),
+            ("from abc import abstractmethod\nfrom src.core.resting_order_strategy import RestingOrderStrategy\nclass ToyRestingStrategy(RestingOrderStrategy):\n @abstractmethod\n def extra(self): ...\n def on_bar(self, bar): return None\n def on_fill(self, fill): return None\n", "ToyRestingStrategy"),
+            ("from src.core.resting_order_strategy import RestingOrderStrategy\nclass ToyRestingStrategy(RestingOrderStrategy):\n def on_bar(self, bar): return None\n def on_fill(self, fill): return None\n", "OtherClass"),
+            ("ToyRestingStrategy = 4\n", "ToyRestingStrategy"),
+        ],
+    )
+    def test_resting_base_and_identity_failures_have_entry_tracebacks(self, tmp_path, code, class_name):
+        _write_rest_catalog(tmp_path, code=code, entry_overrides={"class": class_name})
+        with _read_only_tree(tmp_path):
+            result = StrategyLoader.scan_resting_order_sources(str(tmp_path))
+        assert set(result) == {f"{StrategyLoader.CATALOG_NAME}::LoadError"}
+        error = result[f"{StrategyLoader.CATALOG_NAME}::LoadError"]
+        assert isinstance(error, str)
+        assert "TypeError" in error or "AttributeError" in error
+        _write_rest_catalog(tmp_path)
+        with _read_only_tree(tmp_path):
+            assert isinstance(StrategyLoader.scan_resting_order_sources(str(tmp_path))["toy_resting_v1"], type)
+
+    @pytest.mark.parametrize("bad", ["unpin", "digest", "writable", "symlink"])
+    def test_resting_production_preflight_matches_strategy_preflight(self, tmp_path, bad):
+        _write_rest_catalog(tmp_path)
+        if bad == "unpin":
+            (tmp_path / "extra.py").write_text("VALUE = 1\n")
+        elif bad == "digest":
+            path = tmp_path / StrategyLoader.CATALOG_NAME
+            catalog = json.loads(path.read_text())
+            catalog["files"]["resting.py"] = "0" * 64
+            path.write_text(json.dumps(catalog))
+        elif bad == "writable":
+            with _read_only_tree(tmp_path):
+                (tmp_path / "resting.py").chmod(0o644)
+                assert "writable" in _load_error(
+                    StrategyLoader.scan_resting_order_sources(str(tmp_path))
+                )
+            return
+        else:
+            module = tmp_path / "resting.py"
+            outside = tmp_path.parent / "outside_resting.py"
+            outside.write_text(module.read_text())
+            module.unlink()
+            module.symlink_to(outside)
+        with _read_only_tree(tmp_path):
+            result = StrategyLoader.scan_resting_order_sources(str(tmp_path))
+        assert _load_error(result)
+        if bad == "unpin":
+            (tmp_path / "extra.py").unlink()
+        if bad == "symlink":
+            (tmp_path / "resting.py").unlink()
+        _write_rest_catalog(tmp_path)
+        with _read_only_tree(tmp_path):
+            assert isinstance(StrategyLoader.scan_resting_order_sources(str(tmp_path))["toy_resting_v1"], type)
+
+    def test_resting_break_glass_duplicate_id_rejects_combined_result(self, tmp_path):
+        first, second = tmp_path / "first", tmp_path / "second"
+        first.mkdir()
+        second.mkdir()
+        _write_rest_catalog(first)
+        _write_rest_catalog(second)
+        with _read_only_tree(tmp_path):
+            result = StrategyLoader.scan_resting_order_sources(
+                str(first), break_glass_path=str(second)
+            )
+        assert "duplicate strategy id" in _load_error(result)
 
 
 @contextmanager
@@ -910,7 +1247,8 @@ class TestCatalogStrategies:
         calls = 0
         calls_lock = threading.Lock()
 
-        def controlled_scan(_path):
+        def controlled_scan(_path, *, kinds):
+            assert kinds == {"strategy", "portfolio"}
             nonlocal calls
             with calls_lock:
                 calls += 1
@@ -936,7 +1274,7 @@ class TestCatalogStrategies:
     @pytest.mark.parametrize(
         ("catalog_update", "expected_error"),
         [
-            ({"schema_version": 3}, "schema_version"),
+            ({"schema_version": 4}, "schema_version"),
             ({"files": {}}, "non-empty mapping"),
             ({"strategies": []}, "non-empty list"),
         ],
