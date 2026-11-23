@@ -1,12 +1,14 @@
 import ast
+import hashlib
 import math
 from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
-from core.resting_order_sim import SimRecord, simulate
-from core.resting_order_strategy import (
+from test_strategy_loader import _read_only_tree, _write_rest_catalog
+from src.core.resting_order_sim import SimRecord, simulate
+from src.core.resting_order_strategy import (
     DesiredOrder,
     MinuteBar,
     RestingFill,
@@ -14,6 +16,7 @@ from core.resting_order_strategy import (
     RestingOrderStrategy,
     Side,
 )
+from src.core.strategy_loader import StrategyLoader
 
 
 class Ladder(RestingOrderStrategy):
@@ -392,7 +395,7 @@ def test_r1_t8_import_and_environment_isolation() -> None:
     stdlib = set(__import__("sys").stdlib_module_names)
     allowed_project = {
         "core/resting_order_strategy.py": set(),
-        "core/resting_order_sim.py": {"core.resting_order_strategy"},
+        "core/resting_order_sim.py": {"src.core.resting_order_strategy"},
     }
     for name, project_modules in allowed_project.items():
         tree = ast.parse((root / name).read_text())
@@ -440,3 +443,56 @@ def test_r1_t8_import_and_environment_isolation() -> None:
                     isinstance(node.func, ast.Name)
                     and aliases.get(node.func.id, "").startswith("ccxt")
                 )
+
+
+def test_r1_t9_loaded_strategy_uses_simulator_resting_order_types(tmp_path: Path) -> None:
+    code = '''
+from src.core.resting_order_strategy import DesiredOrder, RestingIntent, RestingOrderStrategy
+
+class ToyRestingStrategy(RestingOrderStrategy):
+    def on_bar(self, bar):
+        if bar.ts_ms == 0:
+            return RestingIntent((DesiredOrder("buy", 99, 1),))
+        return RestingIntent(())
+    def on_fill(self, fill):
+        return RestingIntent(())
+'''
+    _write_rest_catalog(tmp_path, schema=3, code=code)
+    catalog_digest = hashlib.sha256(
+        (tmp_path / StrategyLoader.CATALOG_NAME).read_bytes()
+    ).hexdigest()
+    with _read_only_tree(tmp_path):
+        loaded = StrategyLoader.scan_resting_order_sources(str(tmp_path))
+
+    strategy_class = loaded["toy_resting_v1"]
+    assert isinstance(strategy_class, type)
+    assert getattr(strategy_class, "__fluxtrade_catalog_sha256__") == catalog_digest
+    assert SimRecord.__module__ == "src.core.resting_order_sim"
+    assert (
+        __import__("src.core.resting_order_sim", fromlist=["RestingIntent"]).RestingIntent
+        is RestingIntent
+    )
+    assert simulate(
+        strategy_class(),
+        [
+            MinuteBar(0, 100, 100, 100, 100),
+            MinuteBar(60_000, 98, 100, 98, 98),
+        ],
+        0,
+        0,
+    ) == [
+        SimRecord("bar", 0, touch_buy=False, touch_sell=False),
+        SimRecord("bar", 60_000, touch_buy=True, touch_sell=False),
+        SimRecord("fill", 60_000, side="buy", price=99, quantity=1, fee=0),
+    ]
+
+    class ForeignRestingIntent:
+        orders = ()
+        flatten = False
+
+    class ForeignStrategy(SequenceStrategy):
+        def on_bar(self, bar: MinuteBar) -> RestingIntent:
+            return ForeignRestingIntent()  # pyright: ignore[reportReturnType]
+
+    with pytest.raises(ValueError, match="RestingIntent"):
+        simulate(ForeignStrategy([]), [MinuteBar(0, 100, 100, 100, 100)], 0, 0)

@@ -2,7 +2,7 @@ import math
 from collections.abc import Iterable
 from dataclasses import dataclass
 
-from core.resting_order_strategy import (
+from src.core.resting_order_strategy import (
     DesiredOrder,
     MinuteBar,
     RestingFill,
