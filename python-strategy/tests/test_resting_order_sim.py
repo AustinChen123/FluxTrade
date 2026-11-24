@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from test_strategy_loader import _read_only_tree, _write_rest_catalog
-from src.core.resting_order_sim import SimRecord, simulate
+from src.core.resting_order_sim import SimRecord, iter_simulate, simulate
 from src.core.resting_order_strategy import (
     DesiredOrder,
     MinuteBar,
@@ -85,6 +85,21 @@ def test_r1_t1_ladder_oracle() -> None:
     ]
     assert [(r.side, r.price) for r in strategy.fills[-1:]] == [("buy", 99)]
     assert select(records, "bar")[-1].ts_ms == 180_000
+
+
+def test_iter_simulate_yields_before_pulling_next_bar() -> None:
+    strategy = Ladder()
+    pulled: list[int] = []
+
+    def source():
+        for bar in bars([100, 98]):
+            pulled.append(bar.ts_ms)
+            yield bar
+
+    records = iter_simulate(strategy, source(), 0.0002, 0.0005)
+    assert next(records).kind == "bar"
+    assert pulled == [0]
+    assert list(records) == simulate(Ladder(), bars([100, 98]), 0.0002, 0.0005)[1:]
 
 
 class MultiFill(RestingOrderStrategy):
@@ -445,8 +460,10 @@ def test_r1_t8_import_and_environment_isolation() -> None:
                 )
 
 
-def test_r1_t9_loaded_strategy_uses_simulator_resting_order_types(tmp_path: Path) -> None:
-    code = '''
+def test_r1_t9_loaded_strategy_uses_simulator_resting_order_types(
+    tmp_path: Path,
+) -> None:
+    code = """
 from src.core.resting_order_strategy import DesiredOrder, RestingIntent, RestingOrderStrategy
 
 class ToyRestingStrategy(RestingOrderStrategy):
@@ -456,7 +473,7 @@ class ToyRestingStrategy(RestingOrderStrategy):
         return RestingIntent(())
     def on_fill(self, fill):
         return RestingIntent(())
-'''
+"""
     _write_rest_catalog(tmp_path, schema=3, code=code)
     catalog_digest = hashlib.sha256(
         (tmp_path / StrategyLoader.CATALOG_NAME).read_bytes()
@@ -469,7 +486,9 @@ class ToyRestingStrategy(RestingOrderStrategy):
     assert getattr(strategy_class, "__fluxtrade_catalog_sha256__") == catalog_digest
     assert SimRecord.__module__ == "src.core.resting_order_sim"
     assert (
-        __import__("src.core.resting_order_sim", fromlist=["RestingIntent"]).RestingIntent
+        __import__(
+            "src.core.resting_order_sim", fromlist=["RestingIntent"]
+        ).RestingIntent
         is RestingIntent
     )
     assert simulate(
