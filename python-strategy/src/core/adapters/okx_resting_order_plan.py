@@ -169,6 +169,8 @@ def plan_okx_resting_orders(
     for _, side, px, size in rounded:
         found = next((i for i, row in enumerate(ours) if i not in matched and row.side == side and row.px == px and row.remaining_sz == size), None)
         if found is None:
+            found = next((i for i, row in enumerate(ours) if i not in matched and row.side == side and row.px == px and row.remaining_sz < size), None)
+        if found is None:
             places.append((side, px, size))
         else:
             matched.add(found)

@@ -153,6 +153,85 @@ def test_diff_places_expected_side_price_size_and_duplicate_consumption() -> Non
     assert [(row["side"], row["px"], row["sz"]) for row in payloads] == [("buy", "10", "1"), ("sell", "11.5", "2")]
 
 
+def test_p1_partial_own_order_matches_without_cancel_place_or_seq_advance() -> None:
+    prior = IssuedOrder("a" * 64, "b" * 64, "partial-local")
+    resting = OkxOwnRestingOrder("partial-ord", "partialwire", "buy", Decimal("10"), Decimal("1"))
+    got = plan((desired("buy", 10, 3),), (resting,), {"partialwire": prior}, seq=11)
+    assert got.cancel_payloads == ()
+    assert got.place_payloads == ()
+    assert got.next_seq == 11
+
+
+def test_p2_exact_size_order_remains_matched() -> None:
+    prior = IssuedOrder("a" * 64, "b" * 64, "exact-local")
+    resting = OkxOwnRestingOrder("exact-ord", "exactwire", "buy", Decimal("10"), Decimal("3"))
+    got = plan((desired("buy", 10, 3),), (resting,), {"exactwire": prior}, seq=11)
+    assert got.cancel_payloads == ()
+    assert got.place_payloads == ()
+    assert got.next_seq == 11
+
+
+def test_p3_oversized_order_is_cancelled_and_desired_size_placed() -> None:
+    prior = IssuedOrder("a" * 64, "b" * 64, "large-local")
+    resting = OkxOwnRestingOrder("large-ord", "largewire", "buy", Decimal("10"), Decimal("4"))
+    got = plan((desired("buy", 10, 3),), (resting,), {"largewire": prior}, seq=11)
+    assert [m["target_ordId"] for p in got.cancel_payloads for m in cast(list[dict[str, object]], envelope(p)["members"])] == ["large-ord"]
+    members = [m for p in got.place_payloads for m in cast(list[dict[str, object]], envelope(p)["members"])]
+    assert [cast(dict[str, object], m["request_payload"])["sz"] for m in members] == ["3"]
+    assert got.next_seq == 13
+
+
+def test_p4_opposite_side_partial_order_is_not_matched() -> None:
+    prior = IssuedOrder("a" * 64, "b" * 64, "sell-local")
+    resting = OkxOwnRestingOrder("sell-ord", "sellwire", "sell", Decimal("10"), Decimal("1"))
+    got = plan((desired("buy", 10, 3),), (resting,), {"sellwire": prior})
+    assert [m["target_ordId"] for p in got.cancel_payloads for m in cast(list[dict[str, object]], envelope(p)["members"])] == ["sell-ord"]
+    assert len([m for p in got.place_payloads for m in cast(list[dict[str, object]], envelope(p)["members"])]) == 1
+
+
+def test_p5_exact_order_preferred_over_partial_same_level_order() -> None:
+    partial = OkxOwnRestingOrder("partial-ord", "partialwire", "buy", Decimal("10"), Decimal("1"))
+    exact = OkxOwnRestingOrder("exact-ord", "exactwire", "buy", Decimal("10"), Decimal("3"))
+    issued = {
+        "partialwire": IssuedOrder("a" * 64, "b" * 64, "partial-local"),
+        "exactwire": IssuedOrder("c" * 64, "d" * 64, "exact-local"),
+    }
+    for resting in ((partial, exact), (exact, partial)):
+        got = plan((desired("buy", 10, 3),), resting, issued)
+        assert [m["target_ordId"] for p in got.cancel_payloads for m in cast(list[dict[str, object]], envelope(p)["members"])] == ["partial-ord"]
+        assert got.place_payloads == ()
+
+
+def test_p6_partial_match_only_suppresses_place_at_its_price() -> None:
+    prior = IssuedOrder("a" * 64, "b" * 64, "partial-local")
+    resting = OkxOwnRestingOrder("partial-ord", "partialwire", "buy", Decimal("10"), Decimal("1"))
+    got = plan((desired("buy", 10, 3), desired("buy", 11, 2)), (resting,), {"partialwire": prior}, seq=4)
+    members = [m for p in got.place_payloads for m in cast(list[dict[str, object]], envelope(p)["members"])]
+    assert [(cast(dict[str, object], m["request_payload"])["px"], cast(dict[str, object], m["request_payload"])["sz"]) for m in members] == [("11", "2")]
+    assert got.cancel_payloads == ()
+    assert got.next_seq == 5
+
+
+def test_partial_match_requires_same_price() -> None:
+    prior = IssuedOrder("a" * 64, "b" * 64, "partial-local")
+    resting = OkxOwnRestingOrder("partial-ord", "partialwire", "buy", Decimal("10"), Decimal("1"))
+    got = plan((desired("buy", 11, 3),), (resting,), {"partialwire": prior})
+    assert [m["target_ordId"] for p in got.cancel_payloads for m in cast(list[dict[str, object]], envelope(p)["members"])] == ["partial-ord"]
+    members = [m for p in got.place_payloads for m in cast(list[dict[str, object]], envelope(p)["members"])]
+    assert [cast(dict[str, object], m["request_payload"])["px"] for m in members] == ["11"]
+
+
+def test_size_match_exact_pass_has_priority_for_same_level() -> None:
+    partial = OkxOwnRestingOrder("partial-ord", "partialwire", "buy", Decimal("10"), Decimal("1"))
+    exact = OkxOwnRestingOrder("exact-ord", "exactwire", "buy", Decimal("10"), Decimal("3"))
+    issued = {
+        "partialwire": IssuedOrder("a" * 64, "b" * 64, "partial-local"),
+        "exactwire": IssuedOrder("c" * 64, "d" * 64, "exact-local"),
+    }
+    got = plan((desired("buy", 10, 3),), (partial, exact), issued)
+    assert [m["target_ordId"] for p in got.cancel_payloads for m in cast(list[dict[str, object]], envelope(p)["members"])] == ["partial-ord"]
+
+
 def test_rounded_price_at_or_below_zero_is_skipped() -> None:
     instrument = OkxSwapInstrument("TOY:SWAP", Decimal("1"), Decimal("1"), Decimal("1"), Decimal("1"))
     below_tick = DesiredOrder("buy", 0.9, 1)
@@ -284,3 +363,12 @@ def test_rounding_direction_is_exact_beyond_context_precision() -> None:
     assert over.place_payloads == () and over.skipped == (desired("buy", 10, 1),)
     exact = _one("buy", 10, 1, Decimal("1"), Decimal("1"), Decimal("1"))
     assert len(exact.place_payloads) == 1 and exact.skipped == ()
+
+
+def test_one_partial_own_order_matches_at_most_one_desired_with_the_same_rounded_price() -> None:
+    prior = IssuedOrder("a" * 64, "b" * 64, "partial-local")
+    resting = OkxOwnRestingOrder("partial-ord", "partialwire", "buy", Decimal("10"), Decimal("1"))
+    got = plan((desired("buy", 10, 3), desired("buy", 10.2, 3)), (resting,), {"partialwire": prior}, seq=11)
+    assert got.cancel_payloads == ()
+    assert len(got.place_payloads) == 1
+    assert got.next_seq == 12
