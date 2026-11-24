@@ -207,6 +207,79 @@ def _write_rest_catalog(
     return catalog
 
 
+@pytest.mark.parametrize(
+    "reference",
+    [
+        "import src.core.resting_order_strategy",
+        "import src.core.resting_order_sim as resting_sim",
+        "from src.core.resting_order_strategy import RestingOrderStrategy",
+        "from src.core import resting_order_strategy",
+        "from core import resting_order_sim",
+        "__import__('core.resting_order_strategy')",
+        "importlib.import_module('src.core.resting_order_sim')",
+    ],
+)
+def test_legacy_scan_skips_guarded_resting_order_references(
+    tmp_path, caplog, reference
+):
+    guarded_file = tmp_path / "guarded.py"
+    guarded_file.write_text(f"{reference}\nraise RuntimeError('executed')\n")
+    (tmp_path / "normal.py").write_text(STRATEGY_CODE)
+
+    result = StrategyLoader.scan_directory(str(tmp_path))
+
+    assert set(result) == {"normal.py::ManifestStrategy"}
+    assert "guarded.py::" not in result
+    assert "executed" not in caplog.text
+    warning_records = [record for record in caplog.records if record.levelname == "WARNING"]
+    assert len(warning_records) == 1
+    assert "guarded.py" in warning_records[0].message
+    assert "resting-order strategies load only from catalog packs" in warning_records[0].message
+
+
+@pytest.mark.parametrize(
+    "legal_reference",
+    [
+        '"src.core.resting_order_strategy_extra"',
+        '"src.core.resting_order"',
+        '"resting_order_strategy"',
+        "from src.core.models import Signal",
+    ],
+)
+def test_legacy_scan_keeps_legal_near_match_references(tmp_path, legal_reference):
+    (tmp_path / "legal.py").write_text(f"{legal_reference}\n{STRATEGY_CODE}")
+
+    result = StrategyLoader.scan_directory(str(tmp_path))
+
+    assert set(result) == {"legal.py::ManifestStrategy"}
+    assert isinstance(result["legal.py::ManifestStrategy"], type)
+
+
+@pytest.mark.parametrize(
+    "near_import",
+    [
+        "import src.core.resting_order_strategy_extra",
+        "from core.resting_order_sim_extra import x",
+    ],
+)
+def test_legacy_scan_executes_near_match_imports(tmp_path, near_import):
+    (tmp_path / "near.py").write_text(f"{near_import}\n{STRATEGY_CODE}")
+
+    result = StrategyLoader.scan_directory(str(tmp_path))
+
+    assert set(result) == {"near.py::LoadError"}
+    assert "ModuleNotFoundError" in _expect_load_error(result["near.py::LoadError"])
+
+
+def test_legacy_scan_syntax_error_keeps_load_error_result(tmp_path):
+    (tmp_path / "broken.py").write_text("class Broken(\n")
+
+    result = StrategyLoader.scan_directory(str(tmp_path))
+
+    assert set(result) == {"broken.py::LoadError"}
+    assert "SyntaxError" in _expect_load_error(result["broken.py::LoadError"])
+
+
 def _scan_resting_readonly(root: Path):
     with _read_only_tree(root):
         return StrategyLoader.scan_resting_order_sources(str(root))

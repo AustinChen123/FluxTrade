@@ -230,6 +230,24 @@ class StrategyLoader:
                 continue
 
             try:
+                try:
+                    source = Path(file_path).read_bytes()
+                except OSError:
+                    source = None
+                if source is not None:
+                    try:
+                        tree = ast.parse(source, filename=file_path)
+                    except (SyntaxError, UnicodeDecodeError):
+                        tree = None
+                    if tree is not None and StrategyLoader._references_resting_order_module(
+                        tree
+                    ):
+                        logger.warning(
+                            "Skipping %s: resting-order strategies load only from catalog packs",
+                            file_name,
+                        )
+                        continue
+
                 module = StrategyLoader._load_module(
                     Path(file_path),
                     StrategyLoader._legacy_module_name(Path(file_path)),
@@ -257,6 +275,38 @@ class StrategyLoader:
                 strategies[f"{file_name}::LoadError"] = error_trace
 
         return strategies
+
+    @staticmethod
+    def _references_resting_order_module(tree: ast.AST) -> bool:
+        guarded = (
+            "src.core.resting_order_strategy",
+            "src.core.resting_order_sim",
+            "core.resting_order_strategy",
+            "core.resting_order_sim",
+        )
+
+        def matches(name: str) -> bool:
+            return any(
+                name == module or name.startswith(f"{module}.") for module in guarded
+            )
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                if any(matches(alias.name) for alias in node.names):
+                    return True
+            elif isinstance(node, ast.ImportFrom):
+                if node.level == 0 and node.module is not None:
+                    if matches(node.module):
+                        return True
+                    if node.module in {"src.core", "core"} and any(
+                        alias.name in {"resting_order_strategy", "resting_order_sim"}
+                        for alias in node.names
+                    ):
+                        return True
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+                if node.value in guarded:
+                    return True
+        return False
 
     @staticmethod
     def _scan_catalog(
