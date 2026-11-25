@@ -12,6 +12,7 @@ from src.core.adapters.okx_resting_order_plan import (
     OkxOwnRestingOrder,
     OkxPlanScope,
     OkxSwapInstrument,
+    plan_okx_flatten,
     plan_okx_resting_orders,
 )
 from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_canonical
@@ -34,6 +35,76 @@ def plan(desired_rows: tuple[DesiredOrder, ...], resting: tuple[OkxOwnRestingOrd
 def envelope(payload: bytes) -> dict[str, object]:
     assert _decode_batch_request(payload) is not None
     return cast(dict[str, object], decode_canonical(payload))
+
+
+def test_resting_place_payload_bytes_match_pre_refactor_golden() -> None:
+    got = plan_okx_resting_orders(
+        desired=(desired("buy", 10.0, 1.0),), resting=(), instrument=INSTRUMENT,
+        scope=S, run_id="run_1", next_seq=4, issued={},
+    )
+    assert got.place_payloads == (b'{"executing_account_ref":"toy-ref","members":[{"action_id":"b8adf373d8f09131c37a2a39807e9e5fc4feb683db54b8ed04783f672a2e751a","binding_sha256":"ef89f540ec26548ea6943dada7ab119121420f357a9ebd179f2b898f495f40af","local_order_id":"run_1:4","ordId":null,"product_id":"TOY:SWAP","request_payload":{"clOrdId":"raef89f540ec26548ea6943dada7ab11","instId":"TOY:SWAP","ordType":"post_only","posSide":"net","px":"10","reduceOnly":false,"side":"buy","sz":"1","tdMode":"cross"},"wire_clOrdId":"raef89f540ec26548ea6943dada7ab11"}],"operation":"PLACE","payload_sha256":"1adeee7c93baf76a85c58b2cbcf91544986b9f54ed453baaca42efc7cba69ea6","schema_version":"SPIDER_TRANSPORT_BATCH_V1","scope":{"environment":"demo","execution_scope_id":"toy-account","strategy_id":"toy-strategy"},"transmission_group_id":"4e8d21a6c081684414cddc26fdee759e07df58b86ebea58c4608f5ed1e3dbddf"}',)
+
+
+@pytest.mark.parametrize(("position", "side", "size"), [(Decimal("3"), "sell", "3"), (Decimal("-2.5"), "buy", "2.5")])
+def test_flatten_signed_position_closes_exact_size(position: Decimal, side: str, size: str) -> None:
+    got = plan_okx_flatten(position=position, resting=(), instrument=INSTRUMENT, scope=S, run_id="run_1", next_seq=6, issued={})
+    members = [m for payload in got.place_payloads for m in cast(list[dict[str, object]], envelope(payload)["members"])]
+    assert len(members) == 1
+    member = members[0]
+    action = sha256(b"FLUXTRADE_RESTING_OKX_ACTION_V1\0" + canonical_bytes({"run_id": "run_1", "seq": 6, "environment": "demo", "execution_scope_id": "toy-account", "strategy_id": "toy-strategy"})).hexdigest()
+    binding = {"schema_version": "FLUXTRADE_RESTING_OKX_BINDING_V1", "environment": "demo", "execution_scope_id": "toy-account", "strategy_id": "toy-strategy", "action_id": action, "product_id": "TOY:SWAP"}
+    binding_hash = sha256(canonical_bytes(binding)).hexdigest()
+    wire = "ra" + binding_hash[:30]
+    assert member == {"action_id": action, "product_id": "TOY:SWAP", "local_order_id": "run_1:6", "binding_sha256": binding_hash, "wire_clOrdId": wire, "ordId": None, "request_payload": {"instId": "TOY:SWAP", "tdMode": "cross", "side": side, "posSide": "net", "ordType": "market", "sz": size, "clOrdId": wire, "reduceOnly": True}}
+    assert got.new_issued == {wire: IssuedOrder(action, binding_hash, "run_1:6")}
+    assert got.next_seq == 7
+
+
+def test_flatten_zero_position_only_cancels_own_orders_and_returns_foreign() -> None:
+    own_a = OkxOwnRestingOrder("ord-a", "wirea", "buy", Decimal("10"), Decimal("1"))
+    foreign = OkxOwnRestingOrder("ord-f", "wiref", "sell", Decimal("11"), Decimal("2"))
+    own_b = OkxOwnRestingOrder("ord-b", "wireb", "sell", Decimal("12"), Decimal("3"))
+    issued = {"wirea": IssuedOrder("a" * 64, "b" * 64, "local-a"), "wireb": IssuedOrder("c" * 64, "d" * 64, "local-b")}
+    got = plan_okx_flatten(position=Decimal("0"), resting=(own_a, foreign, own_b), instrument=INSTRUMENT, scope=S, run_id="run_1", next_seq=9, issued=issued)
+    cancels = [m for payload in got.cancel_payloads for m in cast(list[dict[str, object]], envelope(payload)["members"])]
+    assert got.place_payloads == ()
+    assert [m["target_ordId"] for m in cancels] == ["ord-a", "ord-b"]
+    assert got.foreign == (foreign,)
+    assert [m["cancel_action_id"] for m in cancels] == [
+        sha256(b"FLUXTRADE_RESTING_OKX_CANCEL_V1\0" + canonical_bytes({"run_id": "run_1", "seq": seq, "target": wire})).hexdigest()
+        for seq, wire in ((9, "wirea"), (10, "wireb"))
+    ]
+    assert got.next_seq == 11
+
+
+def test_flatten_close_sequence_precedes_cancel_sequences_and_all_members_decode() -> None:
+    own = tuple(OkxOwnRestingOrder(f"ord-{i}", f"wire{i}", "buy", Decimal("10"), Decimal("1")) for i in range(2))
+    issued = {f"wire{i}": IssuedOrder(f"{i + 1:064x}", f"{i + 3:064x}", f"local-{i}") for i in range(2)}
+    got = plan_okx_flatten(position=Decimal("3"), resting=own, instrument=INSTRUMENT, scope=S, run_id="run_1", next_seq=12, issued=issued)
+    close = cast(list[dict[str, object]], envelope(got.place_payloads[0])["members"])[0]
+    cancels = [m for payload in got.cancel_payloads for m in cast(list[dict[str, object]], envelope(payload)["members"])]
+    assert close["local_order_id"] == "run_1:12"
+    assert [m["cancel_action_id"] for m in cancels] == [
+        sha256(b"FLUXTRADE_RESTING_OKX_CANCEL_V1\0" + canonical_bytes({"run_id": "run_1", "seq": seq, "target": f"wire{i}"})).hexdigest()
+        for i, seq in enumerate((13, 14))
+    ]
+    assert got.next_seq == 15
+    assert all(_decode_batch_request(payload) is not None for payload in got.place_payloads + got.cancel_payloads)
+
+
+def test_flatten_cancels_batch_at_twenty_members() -> None:
+    resting = tuple(OkxOwnRestingOrder(f"ord-{i}", f"wire{i}", "sell", Decimal("10"), Decimal("1")) for i in range(21))
+    issued = {f"wire{i}": IssuedOrder(f"{i + 1:064x}", f"{i + 22:064x}", f"local-{i}") for i in range(21)}
+    got = plan_okx_flatten(position=Decimal("0"), resting=resting, instrument=INSTRUMENT, scope=S, run_id="run_1", next_seq=0, issued=issued)
+    assert [len(cast(list[object], envelope(payload)["members"])) for payload in got.cancel_payloads] == [20, 1]
+    assert got.next_seq == 21
+
+
+@pytest.mark.parametrize("position", [Decimal("NaN"), Decimal("Infinity"), cast(Decimal, 3.0)])
+def test_flatten_rejects_nonfinite_or_non_decimal_position_with_legal_twin(position: Decimal) -> None:
+    with pytest.raises(ValueError):
+        plan_okx_flatten(position=position, resting=(), instrument=INSTRUMENT, scope=S, run_id="run_1", next_seq=0, issued={})
+    assert plan_okx_flatten(position=Decimal("0"), resting=(), instrument=INSTRUMENT, scope=S, run_id="run_1", next_seq=0, issued={}).next_seq == 0
 
 
 def test_rounding_table_minimum_and_float_repr() -> None:
@@ -372,3 +443,28 @@ def test_one_partial_own_order_matches_at_most_one_desired_with_the_same_rounded
     assert got.cancel_payloads == ()
     assert len(got.place_payloads) == 1
     assert got.next_seq == 12
+
+
+@pytest.mark.parametrize(
+    ("position", "prec", "trap_inexact", "side", "size"),
+    [
+        (Decimal("3"), 2, False, "sell", "3"),
+        (Decimal("2.51"), 2, False, "sell", "2.51"),
+        (Decimal("-2.59"), 2, False, "buy", "2.59"),
+        (Decimal("2.59"), 2, True, "sell", "2.59"),
+        (Decimal("1.23456789012345678901234567895"), 28, False, "sell", "1.23456789012345678901234567895"),
+    ],
+)
+def test_flatten_close_size_ignores_ambient_decimal_context(
+    position: Decimal, prec: int, trap_inexact: bool, side: str, size: str
+) -> None:
+    from decimal import Inexact, localcontext
+
+    with localcontext() as ctx:
+        ctx.prec = prec
+        ctx.traps[Inexact] = trap_inexact
+        got = plan_okx_flatten(position=position, resting=(), instrument=INSTRUMENT, scope=S, run_id="run_1", next_seq=0, issued={})
+    request = cast(dict[str, object], decode_canonical(got.place_payloads[0]))
+    member = cast(list[dict[str, object]], request["members"])[0]
+    payload = cast(dict[str, object], member["request_payload"])
+    assert payload["side"] == side and payload["sz"] == size and payload["reduceOnly"] is True

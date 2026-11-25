@@ -126,13 +126,10 @@ def _grid_value(value: Fraction, step: Decimal, round_up: bool) -> Decimal:
             raise ValueError("value cannot be represented on instrument grid") from error
 
 
-def plan_okx_resting_orders(
-    *, desired: tuple[DesiredOrder, ...], resting: tuple[OkxOwnRestingOrder, ...],
-    instrument: OkxSwapInstrument, scope: OkxPlanScope, run_id: str, next_seq: int,
-    issued: Mapping[str, IssuedOrder],
-) -> OkxRestingPlan:
-    if type(desired) is not tuple or any(type(row) is not DesiredOrder for row in desired):
-        raise ValueError("desired must be tuple of DesiredOrder")
+def _validate_plan_inputs(
+    *, resting: tuple[OkxOwnRestingOrder, ...], instrument: OkxSwapInstrument,
+    scope: OkxPlanScope, run_id: str, next_seq: int, issued: Mapping[str, IssuedOrder],
+) -> None:
     if type(resting) is not tuple or any(type(row) is not OkxOwnRestingOrder for row in resting):
         raise ValueError("resting must be tuple of OkxOwnRestingOrder")
     if type(instrument) is not OkxSwapInstrument or type(scope) is not OkxPlanScope:
@@ -147,6 +144,47 @@ def plan_okx_resting_orders(
         raise ValueError("duplicate resting ord_id")
     if len({row.cl_ord_id for row in resting}) != len(resting):
         raise ValueError("duplicate resting cl_ord_id")
+
+
+def _place_identity(
+    *, run_id: str, seq: int, scope: OkxPlanScope, inst_id: str,
+) -> tuple[str, str, str, IssuedOrder]:
+    scope_fields = {"environment": scope.environment, "execution_scope_id": scope.execution_scope_id, "strategy_id": scope.strategy_id}
+    action_id = sha256(b"FLUXTRADE_RESTING_OKX_ACTION_V1\0" + canonical_bytes({"run_id": run_id, "seq": seq, **scope_fields})).hexdigest()
+    binding = {"schema_version": "FLUXTRADE_RESTING_OKX_BINDING_V1", **scope_fields, "action_id": action_id, "product_id": inst_id}
+    binding_hash = sha256(canonical_bytes(binding)).hexdigest()
+    wire = "ra" + binding_hash[:30]
+    local = f"{run_id}:{seq}"
+    return action_id, wire, local, IssuedOrder(action_id, binding_hash, local)
+
+
+def _cancel_member(
+    *, row: OkxOwnRestingOrder, prior: IssuedOrder, inst_id: str, run_id: str, seq: int,
+) -> dict[str, object]:
+    cancel_id = sha256(b"FLUXTRADE_RESTING_OKX_CANCEL_V1\0" + canonical_bytes({"run_id": run_id, "seq": seq, "target": row.cl_ord_id})).hexdigest()
+    return {"cancel_action_id": cancel_id, "product_id": inst_id, "target_place_action_id": prior.action_id, "target_local_order_id": prior.local_order_id, "target_binding_sha256": prior.binding_sha256, "target_wire_clOrdId": row.cl_ord_id, "target_ordId": row.ord_id, "request_payload": {"instId": inst_id, "ordId": row.ord_id}}
+
+
+def _finish_plan(
+    *, scope: OkxPlanScope, cancels: list[dict[str, object]], places: list[dict[str, object]],
+    skipped: tuple[DesiredOrder, ...], foreign: tuple[OkxOwnRestingOrder, ...],
+    new_issued: dict[str, IssuedOrder], next_seq: int,
+) -> OkxRestingPlan:
+    cancel_payloads = tuple(_batch(scope, "CANCEL", cancels[i:i + 20]) for i in range(0, len(cancels), 20))
+    place_payloads = tuple(_batch(scope, "PLACE", places[i:i + 20]) for i in range(0, len(places), 20))
+    if any(_decode_batch_request(payload) is None for payload in cancel_payloads + place_payloads):
+        raise ValueError("planned batch rejected by transport contract")
+    return OkxRestingPlan(cancel_payloads, place_payloads, skipped, foreign, MappingProxyType(new_issued), next_seq)
+
+
+def plan_okx_resting_orders(
+    *, desired: tuple[DesiredOrder, ...], resting: tuple[OkxOwnRestingOrder, ...],
+    instrument: OkxSwapInstrument, scope: OkxPlanScope, run_id: str, next_seq: int,
+    issued: Mapping[str, IssuedOrder],
+) -> OkxRestingPlan:
+    if type(desired) is not tuple or any(type(row) is not DesiredOrder for row in desired):
+        raise ValueError("desired must be tuple of DesiredOrder")
+    _validate_plan_inputs(resting=resting, instrument=instrument, scope=scope, run_id=run_id, next_seq=next_seq, issued=issued)
 
     rounded: list[tuple[DesiredOrder, str, Decimal, Decimal]] = []
     skipped: list[DesiredOrder] = []
@@ -188,24 +226,45 @@ def plan_okx_resting_orders(
             raise ValueError("duplicate issued cancel identity")
         cancelled_local_ids.add(cancel_identity[0])
         cancelled_action_ids.add(cancel_identity[1])
-        cancel_id = sha256(b"FLUXTRADE_RESTING_OKX_CANCEL_V1\0" + canonical_bytes({"run_id": run_id, "seq": seq, "target": row.cl_ord_id})).hexdigest()
-        cancels.append({"cancel_action_id": cancel_id, "product_id": instrument.inst_id, "target_place_action_id": prior.action_id, "target_local_order_id": prior.local_order_id, "target_binding_sha256": prior.binding_sha256, "target_wire_clOrdId": row.cl_ord_id, "target_ordId": row.ord_id, "request_payload": {"instId": instrument.inst_id, "ordId": row.ord_id}})
+        cancels.append(_cancel_member(row=row, prior=prior, inst_id=instrument.inst_id, run_id=run_id, seq=seq))
         seq += 1
     place_members: list[dict[str, object]] = []
     new_issued: dict[str, IssuedOrder] = {}
-    scope_fields = {"environment": scope.environment, "execution_scope_id": scope.execution_scope_id, "strategy_id": scope.strategy_id}
     for side, px, size in places:
-        action_id = sha256(b"FLUXTRADE_RESTING_OKX_ACTION_V1\0" + canonical_bytes({"run_id": run_id, "seq": seq, **scope_fields})).hexdigest()
-        binding = {"schema_version": "FLUXTRADE_RESTING_OKX_BINDING_V1", **scope_fields, "action_id": action_id, "product_id": instrument.inst_id}
-        binding_hash = sha256(canonical_bytes(binding)).hexdigest()
-        wire = "ra" + binding_hash[:30]
-        local = f"{run_id}:{seq}"
-        issued_order = IssuedOrder(action_id, binding_hash, local)
+        action_id, wire, local, issued_order = _place_identity(run_id=run_id, seq=seq, scope=scope, inst_id=instrument.inst_id)
+        binding_hash = issued_order.binding_sha256
         new_issued[wire] = issued_order
         place_members.append({"action_id": action_id, "product_id": instrument.inst_id, "local_order_id": local, "binding_sha256": binding_hash, "wire_clOrdId": wire, "ordId": None, "request_payload": {"instId": instrument.inst_id, "tdMode": "cross", "side": side, "posSide": "net", "ordType": "post_only", "sz": _fmt(size), "px": _fmt(px), "clOrdId": wire, "reduceOnly": False}})
         seq += 1
-    cancel_payloads = tuple(_batch(scope, "CANCEL", cancels[i:i + 20]) for i in range(0, len(cancels), 20))
-    place_payloads = tuple(_batch(scope, "PLACE", place_members[i:i + 20]) for i in range(0, len(place_members), 20))
-    if any(_decode_batch_request(payload) is None for payload in cancel_payloads + place_payloads):
-        raise ValueError("planned batch rejected by transport contract")
-    return OkxRestingPlan(cancel_payloads, place_payloads, tuple(skipped), foreign, MappingProxyType(new_issued), seq)
+    return _finish_plan(scope=scope, cancels=cancels, places=place_members, skipped=tuple(skipped), foreign=foreign, new_issued=new_issued, next_seq=seq)
+
+
+def plan_okx_flatten(
+    *, position: Decimal, resting: tuple[OkxOwnRestingOrder, ...], instrument: OkxSwapInstrument,
+    scope: OkxPlanScope, run_id: str, next_seq: int, issued: Mapping[str, IssuedOrder],
+) -> OkxRestingPlan:
+    _validate_plan_inputs(resting=resting, instrument=instrument, scope=scope, run_id=run_id, next_seq=next_seq, issued=issued)
+    if type(position) is not Decimal or not position.is_finite():
+        raise ValueError("position must be finite Decimal")
+    foreign = tuple(row for row in resting if row.cl_ord_id not in issued)
+    ours = tuple(row for row in resting if row.cl_ord_id in issued)
+    seq = next_seq
+    places: list[dict[str, object]] = []
+    new_issued: dict[str, IssuedOrder] = {}
+    if position != 0:
+        action_id, wire, local, issued_order = _place_identity(run_id=run_id, seq=seq, scope=scope, inst_id=instrument.inst_id)
+        new_issued[wire] = issued_order
+        places.append({"action_id": action_id, "product_id": instrument.inst_id, "local_order_id": local, "binding_sha256": issued_order.binding_sha256, "wire_clOrdId": wire, "ordId": None, "request_payload": {"instId": instrument.inst_id, "tdMode": "cross", "side": "sell" if position > 0 else "buy", "posSide": "net", "ordType": "market", "sz": _fmt(position.copy_abs()), "clOrdId": wire, "reduceOnly": True}})
+        seq += 1
+    cancels: list[dict[str, object]] = []
+    cancelled_local_ids: set[str] = set()
+    cancelled_action_ids: set[str] = set()
+    for row in ours:
+        prior = issued[row.cl_ord_id]
+        if prior.local_order_id in cancelled_local_ids or prior.action_id in cancelled_action_ids:
+            raise ValueError("duplicate issued cancel identity")
+        cancelled_local_ids.add(prior.local_order_id)
+        cancelled_action_ids.add(prior.action_id)
+        cancels.append(_cancel_member(row=row, prior=prior, inst_id=instrument.inst_id, run_id=run_id, seq=seq))
+        seq += 1
+    return _finish_plan(scope=scope, cancels=cancels, places=places, skipped=(), foreign=foreign, new_issued=new_issued, next_seq=seq)
