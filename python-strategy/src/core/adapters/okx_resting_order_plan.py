@@ -13,6 +13,11 @@ from src.core.resting_order_strategy import DesiredOrder
 from src.core.adapters.okx_spider_transport import _decode_batch_request
 
 
+def validate_okx_text(name: str, value: object) -> None:
+    if type(value) is not str or not 1 <= len(value) <= 64 or not value.isascii() or not value.isprintable():
+        raise ValueError(f"{name} must be 1..64 printable ASCII characters")
+
+
 @dataclass(frozen=True, slots=True)
 class OkxSwapInstrument:
     inst_id: str
@@ -22,8 +27,7 @@ class OkxSwapInstrument:
     tick_sz: Decimal
 
     def __post_init__(self) -> None:
-        if type(self.inst_id) is not str or not self.inst_id:
-            raise ValueError("inst_id must be non-empty str")
+        validate_okx_text("inst_id", self.inst_id)
         for name in ("ct_val", "lot_sz", "min_sz", "tick_sz"):
             _positive_decimal(name, getattr(self, name))
 
@@ -56,9 +60,7 @@ class OkxPlanScope:
 
     def __post_init__(self) -> None:
         for name in ("environment", "execution_scope_id", "strategy_id", "executing_account_ref"):
-            value = getattr(self, name)
-            if type(value) is not str or not value:
-                raise ValueError(f"{name} must be non-empty str")
+            validate_okx_text(name, getattr(self, name))
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,6 +128,11 @@ def _grid_value(value: Fraction, step: Decimal, round_up: bool) -> Decimal:
             raise ValueError("value cannot be represented on instrument grid") from error
 
 
+def validate_okx_run_id(run_id: str) -> None:
+    if type(run_id) is not str or not 1 <= len(run_id) <= 40 or any(not (c.isascii() and (c.isalnum() or c in "_-")) for c in run_id):
+        raise ValueError("invalid run_id")
+
+
 def _validate_plan_inputs(
     *, resting: tuple[OkxOwnRestingOrder, ...], instrument: OkxSwapInstrument,
     scope: OkxPlanScope, run_id: str, next_seq: int, issued: Mapping[str, IssuedOrder],
@@ -134,8 +141,7 @@ def _validate_plan_inputs(
         raise ValueError("resting must be tuple of OkxOwnRestingOrder")
     if type(instrument) is not OkxSwapInstrument or type(scope) is not OkxPlanScope:
         raise ValueError("invalid instrument or scope")
-    if type(run_id) is not str or not 1 <= len(run_id) <= 40 or any(not (c.isascii() and (c.isalnum() or c in "_-")) for c in run_id):
-        raise ValueError("invalid run_id")
+    validate_okx_run_id(run_id)
     if type(next_seq) is not int or next_seq < 0:
         raise ValueError("next_seq must be non-negative int")
     if not isinstance(issued, Mapping) or any(type(k) is not str or type(v) is not IssuedOrder for k, v in issued.items()):

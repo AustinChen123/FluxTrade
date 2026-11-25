@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Protocol
@@ -24,8 +25,17 @@ class OkxRestingSnapshot:
     unlabelled: int
 
 
+_NUMBER = re.compile(r"-?[0-9]{1,20}(\.[0-9]{1,20})?")
+
+
+def _number(value: object, *, nonnegative: bool = False) -> Decimal:
+    if type(value) is not str or _NUMBER.fullmatch(value) is None:
+        raise ValueError("invalid OKX resting order read")
+    return _decimal(value, nonnegative=nonnegative)
+
+
 def _positive_decimal(value: object) -> Decimal:
-    parsed = _decimal(value)
+    parsed = _number(value)
     if parsed <= 0:
         raise ValueError("invalid OKX resting order read")
     return parsed
@@ -82,7 +92,7 @@ def read_okx_own_resting_orders(client: _OkxReadClient, inst_id: str) -> OkxRest
                 raise ValueError("invalid OKX resting order read")
             seen.add(order_id)
             size = _positive_decimal(row.get("sz"))
-            filled = _decimal(row.get("accFillSz"), nonnegative=True)
+            filled = _number(row.get("accFillSz"), nonnegative=True)
             remaining = size - filled
             if remaining <= 0:
                 raise ValueError("invalid OKX resting order read")
@@ -121,4 +131,4 @@ def read_okx_net_position(client: _OkxPositionClient, inst_id: str) -> Decimal:
         or row.get("posSide") != "net"
     ):
         raise ValueError("invalid OKX resting order read")
-    return _decimal(row.get("pos"))
+    return _number(row.get("pos"))

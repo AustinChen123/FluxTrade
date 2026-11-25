@@ -18,6 +18,7 @@ from src.core.adapters.okx_resting_order_plan import (
 from src.core.backtest.spider_run_artifacts import canonical_bytes, decode_canonical
 from src.core.resting_order_strategy import DesiredOrder, Side
 from src.core.adapters.okx_spider_transport import _decode_batch_request
+from src.core.adapters import okx_resting_order_plan as plan_module
 
 
 INSTRUMENT = OkxSwapInstrument("TOY:SWAP", Decimal("1"), Decimal("1"), Decimal("1"), Decimal("0.5"))
@@ -401,17 +402,21 @@ def test_grid_product_inexact_at_precision_fifty_is_rejected() -> None:
         plan_okx_resting_orders(desired=(desired("buy", 1e58, 1),), resting=(), instrument=instrument, scope=S, run_id="inexact", next_seq=0, issued={})
 
 
-def test_batch_decoder_guard_enforces_exact_one_mib_limit() -> None:
-    initial = plan((desired(),))
-    payload_size = len(initial.place_payloads[0])
-    exact_scope_length = 1_048_576 - (payload_size - len(S.execution_scope_id))
-    exact_scope = OkxPlanScope("demo", "x" * exact_scope_length, "toy-strategy", "toy-ref")
-    exact = plan_okx_resting_orders(desired=(desired(),), resting=(), instrument=INSTRUMENT, scope=exact_scope, run_id="run_1", next_seq=0, issued={})
-    assert len(exact.place_payloads[0]) == 1_048_576
-    assert _decode_batch_request(exact.place_payloads[0]) is not None
-    too_large = OkxPlanScope("demo", "x" * (exact_scope_length + 1), "toy-strategy", "toy-ref")
+def test_scope_and_inst_id_are_bounded_printable_ascii() -> None:
+    assert OkxPlanScope("d" * 64, "e" * 64, "s" * 64, "a" * 64).strategy_id == "s" * 64
+    assert OkxSwapInstrument("I" * 64, Decimal("1"), Decimal("1"), Decimal("1"), Decimal("1")).inst_id == "I" * 64
+    for bad in ("", "x" * 65, "caf\u00e9", "tab\there"):
+        with pytest.raises(ValueError, match="printable ASCII"):
+            OkxPlanScope("demo", bad, "toy-strategy", "toy-ref")
+        with pytest.raises(ValueError, match="printable ASCII"):
+            OkxSwapInstrument(bad, Decimal("1"), Decimal("1"), Decimal("1"), Decimal("1"))
+
+
+def test_planner_refuses_batches_the_transport_decoder_rejects(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert plan((desired(),)).place_payloads
+    monkeypatch.setattr(plan_module, "_decode_batch_request", lambda payload: None)
     with pytest.raises(ValueError, match="planned batch rejected by transport contract"):
-        plan_okx_resting_orders(desired=(desired(),), resting=(), instrument=INSTRUMENT, scope=too_large, run_id="run_1", next_seq=0, issued={})
+        plan((desired(),))
 
 
 def _one(side: Side, price: float, quantity: float, tick: Decimal, ct_val: Decimal, lot: Decimal):
