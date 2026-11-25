@@ -14,6 +14,10 @@ class _OkxReadClient(Protocol):
     def privateGetTradeOrdersPending(self, params: dict[str, str], /) -> object: ...
 
 
+class _OkxPositionClient(Protocol):
+    def privateGetAccountPositions(self, params: dict[str, str], /) -> object: ...
+
+
 @dataclass(frozen=True, slots=True)
 class OkxRestingSnapshot:
     orders: tuple[OkxOwnRestingOrder, ...]
@@ -98,3 +102,23 @@ def read_okx_own_resting_orders(client: _OkxReadClient, inst_id: str) -> OkxRest
             raise ValueError("invalid OKX resting order read")
         cursor = _text(rows[-1].get("ordId"))
     raise ValueError("invalid OKX resting order read")
+
+
+def read_okx_net_position(client: _OkxPositionClient, inst_id: str) -> Decimal:
+    envelope = _checked_envelope(client.privateGetAccountPositions({"instType": "SWAP", "instId": inst_id}))
+    if envelope.get("code") != "0":
+        raise ValueError("invalid OKX resting order read")
+    rows = _rows(envelope)
+    if not rows:
+        return Decimal("0")
+    if len(rows) != 1:
+        raise ValueError("invalid OKX resting order read")
+    row = rows[0]
+    if (
+        _text(row.get("instId")) != inst_id
+        or row.get("instType") != "SWAP"
+        or row.get("mgnMode") != "cross"
+        or row.get("posSide") != "net"
+    ):
+        raise ValueError("invalid OKX resting order read")
+    return _decimal(row.get("pos"))

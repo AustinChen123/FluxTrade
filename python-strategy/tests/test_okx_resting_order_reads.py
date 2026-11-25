@@ -5,7 +5,7 @@ from typing import cast
 import pytest
 
 from src.core.adapters.okx_resting_order_plan import IssuedOrder, OkxPlanScope, plan_okx_resting_orders
-from src.core.adapters.okx_resting_order_reads import read_okx_own_resting_orders, read_okx_swap_instrument
+from src.core.adapters.okx_resting_order_reads import read_okx_net_position, read_okx_own_resting_orders, read_okx_swap_instrument
 from src.core.resting_order_strategy import DesiredOrder
 
 
@@ -21,11 +21,18 @@ def order_row(**changes: object) -> dict[str, object]:
 
 
 class FakeClient:
-    def __init__(self, instruments: object = None, pages: Sequence[object] | None = None) -> None:
+    def __init__(
+        self,
+        instruments: object = None,
+        pages: Sequence[object] | None = None,
+        positions: object = None,
+    ) -> None:
         self.instruments = instruments if instruments is not None else {"code": "0", "data": [instrument_row()]}
         self.pages = pages or [{"code": "0", "data": []}]
+        self.positions = positions if positions is not None else envelope([])
         self.public_calls: list[dict[str, str]] = []
         self.private_calls: list[dict[str, str]] = []
+        self.position_calls: list[dict[str, str]] = []
 
     def publicGetPublicInstruments(self, params: dict[str, str]) -> object:
         self.public_calls.append(params)
@@ -35,9 +42,64 @@ class FakeClient:
         self.private_calls.append(params)
         return self.pages[len(self.private_calls) - 1]
 
+    def privateGetAccountPositions(self, params: dict[str, str]) -> object:
+        self.position_calls.append(params)
+        return self.positions
+
 
 def envelope(rows: list[dict[str, object]], code: str = "0") -> dict[str, object]:
     return {"code": code, "data": rows}
+
+
+def position_row(**changes: object) -> dict[str, object]:
+    return {"instId": INST, "instType": "SWAP", "mgnMode": "cross", "posSide": "net", "pos": "3", **changes}
+
+
+@pytest.mark.parametrize(("position", "expected"), [("3", Decimal("3")), ("-2.5", Decimal("-2.5")), ("0", Decimal("0"))])
+def test_net_position_returns_signed_contracts_and_calls_once(position: str, expected: Decimal) -> None:
+    client = FakeClient(positions=envelope([position_row(pos=position)]))
+    assert read_okx_net_position(client, INST) == expected
+    assert client.position_calls == [{"instType": "SWAP", "instId": INST}]
+
+
+def test_net_position_empty_rows_return_zero_after_one_exact_call() -> None:
+    client = FakeClient(positions=envelope([]))
+    assert read_okx_net_position(client, INST) == Decimal("0")
+    assert client.position_calls == [{"instType": "SWAP", "instId": INST}]
+
+
+@pytest.mark.parametrize(("changes", "remove"), [
+    ({"instId": "OTHER:SWAP"}, ()),
+    ({"instType": "FUTURES"}, ()),
+    ({"mgnMode": "isolated"}, ()),
+    ({"posSide": "long"}, ()),
+    ({"pos": "NaN"}, ()),
+    ({"pos": ""}, ()),
+    ({}, ("pos",)),
+])
+def test_net_position_rejects_invalid_row_fields_with_legal_twin(
+    changes: dict[str, object], remove: tuple[str, ...]
+) -> None:
+    bad_row = position_row(**changes)
+    for key in remove:
+        bad_row.pop(key)
+    client = FakeClient(positions=envelope([bad_row]))
+    with pytest.raises(ValueError):
+        read_okx_net_position(client, INST)
+    assert client.position_calls == [{"instType": "SWAP", "instId": INST}]
+    assert read_okx_net_position(FakeClient(positions=envelope([position_row()])), INST) == Decimal("3")
+
+
+def test_net_position_rejects_multiple_rows_and_nonzero_envelope_code() -> None:
+    for response in (
+        envelope([position_row(), position_row(pos="-1")]),
+        envelope([position_row()], "1"),
+    ):
+        client = FakeClient(positions=response)
+        with pytest.raises(ValueError):
+            read_okx_net_position(client, INST)
+        assert client.position_calls == [{"instType": "SWAP", "instId": INST}]
+    assert read_okx_net_position(FakeClient(positions=envelope([position_row()])), INST) == Decimal("3")
 
 
 def test_instrument_accepts_exact_spec_and_requests_one_instrument() -> None:
