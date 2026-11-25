@@ -515,3 +515,12 @@ class ToyRestingStrategy(RestingOrderStrategy):
 
     with pytest.raises(ValueError, match="RestingIntent"):
         simulate(ForeignStrategy([]), [MinuteBar(0, 100, 100, 100, 100)], 0, 0)
+
+
+@pytest.mark.parametrize("ts_ms", [True, -1, 1.0])
+def test_fill_timestamp_is_a_non_negative_integer_millisecond(ts_ms: object) -> None:
+    with pytest.raises(ValueError):
+        RestingFill(ts_ms, "buy", 99, 1)  # pyright: ignore[reportArgumentType]
+    assert RestingFill(1_700_000_040_001, "buy", 99, 1).ts_ms == 1_700_000_040_001
+    with pytest.raises(ValueError):
+        MinuteBar(1_700_000_040_001, 1, 1, 1, 1)

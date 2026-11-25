@@ -22,6 +22,11 @@ def _validate_ts(ts_ms: int) -> None:
         raise ValueError("ts_ms must be an integer minute timestamp")
 
 
+def _validate_fill_ts(ts_ms: int) -> None:
+    if type(ts_ms) is not int or ts_ms < 0:
+        raise ValueError("fill ts_ms must be a non-negative integer millisecond timestamp")
+
+
 @dataclass(frozen=True)
 class MinuteBar:
     ts_ms: int
@@ -88,7 +93,7 @@ class RestingFill:
     quantity: float
 
     def __post_init__(self) -> None:
-        _validate_ts(self.ts_ms)
+        _validate_fill_ts(self.ts_ms)
         _validate_side(self.side)
         _validate_positive_finite("price", self.price)
         _validate_positive_finite("quantity", self.quantity)
